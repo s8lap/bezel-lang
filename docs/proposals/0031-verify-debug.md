@@ -102,8 +102,11 @@ public static class Verify
   // Returns a new VerificationException with the given message.
   // Does NOT throw — the caller's `throw` keyword does.
   // Intended use: `throw Verify.Unreachable(msg)` — the outer `throw` is
-  // what makes the expression bottom-typed (spec §17.12).
-  public static method Unreachable(message: string := "unreachable"): VerificationException;
+  // what makes the expression bottom-typed (spec §17.12). The `owned` return
+  // satisfies the v0.201 factory-announcement rule (a fresh instance whose
+  // ownership transfers to the caller); `throw` is an owned-consuming
+  // position, so the intended idiom is unchanged.
+  public static method Unreachable(message: string := "unreachable"): owned VerificationException;
 end Verify;
 ```
 
@@ -207,9 +210,11 @@ Stack traces in Bezel are therefore **exception-attached**: they are produced au
 ```bezel
 try
   // ... something
-catch ex: SomeException
-  logEntry.StackTrace := ex.StackTrace;  // copy before the arm ends
-  throw;                                  // re-raise preserving the trace
+catch
+  var ex: SomeException => do
+    logEntry.StackTrace := ex.StackTrace;  // copy before the arm ends
+    throw;                                  // re-raise preserving the trace
+  end
 end;
 ```
 
@@ -219,8 +224,8 @@ Or, when the trace is needed outside a catch arm, deliberately create and throw 
 var trace: string := "";
 try
   throw new VerificationException("stack probe");
-catch ex: VerificationException
-  trace := ex.StackTrace;
+catch
+  var ex: VerificationException => do trace := ex.StackTrace; end
 end;
 ```
 

@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | draft |
-| **Tracking issue** | — (none yet) |
+| **Status** | **superseded — graduated v0.232** (owner-accepted 2026-07-29; Q1–Q5 resolutions recorded in the v0.232 changelog entry) |
+| **Tracking issue** | [#2349](https://github.com/s8lap/bezel-lang/issues/2349) (implementation) |
 | **Target module(s)** | `System.Serialization` (existing module, [§2.15](../Bezel_Standard_Library.md#sec-concrete-serialization-formats) — already explicit-import). Additive statics only: no change to the [§2.14](../Bezel_Standard_Library.md#sec-serialization-vocabulary) vocabulary, no agent-surface change, no new fault types. |
 | **Written against** | spec/stdlib **v0.228** |
 | **Origin** | The 2026-07-28 owner-directed stdlib API design review, adversarially critiqued; the critique's corrections — the compiler-known admission (§4), the 0019 engagement (§5), the both-formats scope (§3 Q1) — are binding on this draft. |

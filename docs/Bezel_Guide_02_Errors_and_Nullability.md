@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.227.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.229.*
 
 If you know C#, Kotlin, or Swift, most of this chapter is familiar: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. Skim those parts. The three places where the ownership model changes how you write this code — and where a habit from those languages produces a *compile error* — are headed **How Bezel does it**. Read those.
 
@@ -206,7 +206,7 @@ end;                               // c disposed at the end of the enclosing blo
 
 `out using var c` binds the out value as an owned, scope-disposed local — so a successful call that handed you a `Connection` cannot leak. Its scope is the *enclosing* block, from the call onward (not just the `if`), so the connection is disposed when that block ends. Without the `when true` clause you would still write `UseConnection(c!)` — the bool guard alone does not narrow the nullable; only the postcondition does. (`out owned` in the signature and `out using var` at the call site must match: you cannot write `out using var` for a plain `out` parameter, nor plain `out var` for an `out owned` one — the compiler rejects the mismatch, because the ownership would have nowhere to go.) This is the ownership-aware version of C#'s `TryGet`: the contract is "on `true`, you now own it," and `out using var` discharges that obligation for you.
 
-**The `choice` return** when the failure itself carries information (spec §35). Where the nullable return says only "absent" and the Try pattern carries the failure in out-parameters, a `choice` names every outcome and carries each one's data — and the `case` over it is exhaustiveness-checked, so adding an outcome breaks every consumer at compile time instead of silently falling through a null check:
+**The `choice` return** when the failure is expected, branched on at or near the call site, and its payload is a plain value shape (spec §35; the failure-signal rule's band 3, stdlib §1). Where the nullable return says only "absent" and the Try pattern carries the failure in out-parameters, a `choice` names every outcome and carries each one's data — and the `case` over it is exhaustiveness-checked, so adding an outcome breaks every consumer at compile time instead of silently falling through a null check:
 
 ```bezel
 public method ParsePort(text: string): Result<int, string>
@@ -225,7 +225,7 @@ case ParsePort(arg) of
 end;                                  // exhaustive; no _ arm needed
 ```
 
-`Result<T, E>` (stdlib §2.20) is the stdlib's ready-made shape; a domain-specific choice with named cases (`Fetched`/`NotModified`/`Failed`) is often better still. When a case's payload is an owned resource, the `case` over a fresh call is an *owning match*: bind the payload and adopt it (`using var conn := owned c;`) — see Guide 1 §9. The three idioms compose: `T?` for plain absence, the Try shape for value extraction with a boring failure, the choice return where the failure carries information.
+`Result<T, E>` (stdlib §2.20) is the stdlib's ready-made shape; a domain-specific choice with named cases (`Fetched`/`NotModified`/`Failed`) is often better still. When a case's payload is an owned resource, the `case` over a fresh call is an *owning match*: bind the payload and adopt it (`using var conn := owned c;`) — see Guide 1 §9. The three idioms compose: `T?` for plain absence, the Try shape for value extraction with a boring failure, the choice return where the failure is branched on with a value-shaped payload.
 
 ---
 
@@ -235,7 +235,8 @@ end;                                  // exhaustive; no _ arm needed
 |---|---|
 | Value may legitimately be absent | nullable return `T?`, handle with `?.` / `??` / narrowing |
 | Absent *and* the value would be owned | `Try` pattern: `bool` + `out owned T? when true`, caller uses `out using var` (and drops the `!`) |
-| Failure is expected *and carries information* | `choice` return (`Result<T, E>` or a domain choice, spec §35); consume with an exhaustive `case` |
+| Failure is expected, carries information the caller *branches on* at or near the call, and the error payload is a plain value shape | `choice` return (`Result<T, E>` or a domain choice, spec §35); consume with an exhaustive `case` |
+| Failure is expected but consumed at a *boundary* — logged, retried, converted to a protocol answer, reported — or its payload is an owned resource | a typed exception, producer-local (spec §31.4); read it in the `catch` and copy out what you keep (§3) |
 | Caller violated something a correct caller guarantees (a **bug**, not an outcome) | a `requires(...)` clause (spec §22.16) — always-on, faults `ContractViolationException`; never use `requires` for input whose invalidity is a normal outcome at a trust boundary (that is the `T?`/Try/`choice` territory above) |
 | Invalid input at a boundary with no contract (interop, pre-contract code) | `throw new ArgumentException(...)` — the residual idiom `requires` replaces where a contract is possible |
 | Operation invalid in current state | `throw new InvalidOperationException(...)` (or an `invariant(...)`/`requires(...)` where the condition is a class or caller contract) |
@@ -243,4 +244,6 @@ end;                                  // exhaustive; no _ arm needed
 | Must dispose an owned resource on failure | nothing — ownership handles it automatically |
 | Preserve failure details past a `catch` | copy `ex.Message` / `ex.StackTrace` into owned values; never the exception itself |
 
-Two habits carry most of it: prefer a nullable, `Try`, or `choice` return over an exception whenever the failure is *expected* — and a `requires(...)` clause over a `throw` whenever the condition is something a correct caller already guarantees — and inside a `catch` treat the exception as something you read and let go of — copy out the strings you need, never the instance. The familiar C# syntax mostly transfers; the ownership rules around exceptions and `out` values are the part to internalize.
+The table is the teaching mirror of a normative rule: the **failure-signal rule** (stdlib §1) classifies every fault condition a library surface declares — five bands, first match wins, one mechanism per condition. Two of its sentences are worth restating here. The line between the `choice` row and a typed exception is *where the failure is consumed* and *whether its payload can be a plain value* — never how much information it carries: a fault whose data is read once at a boundary is a typed exception however rich the data; a fault the caller branches on near the call site, with a value-shaped payload, is a `choice` return. And `catch` is a boundary-and-supervision tool — convert, log, retry, report, re-raise; branching program logic on caught exception types at an interior call site is the signal to check the rule for a value-shaped tier.
+
+Two habits carry most of it: prefer a nullable, `Try`, or `choice` return over an exception whenever the failure is *expected and branched on* — and a `requires(...)` clause over a `throw` whenever the condition is something a correct caller already guarantees — and inside a `catch` treat the exception as something you read and let go of — copy out the strings you need, never the instance. The familiar C# syntax mostly transfers; the ownership rules around exceptions and `out` values are the part to internalize.

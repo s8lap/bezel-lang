@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | draft (RFC) |
+| **Status** | **superseded — criterial rule graduated v0.229; R1–R6 ruled 2026-07-29** (accepted as recommended; recorded in the v0.229 changelog entry) |
 | **Tracking issue** | — |
 | **Target** | doctrine (spec §22.16/§31, stdlib §1, Guide 2 §6) |
 | **Written against** | spec/stdlib **v0.228** (Guides re-validated at v0.227) |

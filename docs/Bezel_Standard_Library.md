@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.228 — July 2026**
+**Companion to the Bezel Language Specification, v0.233 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -35,13 +35,30 @@ Throughout this document:
 - Implementations may add internal helper methods and private members. Anything documented here is part of the public contract.
 - Methods returning freshly-allocated class instances annotate the return type with `owned` to communicate the caller's disposal obligation (see [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows) and [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer) of the language spec). Methods returning `string` or other runtime-managed types ([§28.9](Bezel_Language_Spec.md#sec-runtime-managed-types)) do not use `owned`, since those types are exempt from manual disposal. Two further families are deliberately unmarked, their declared return type itself being the transfer announcement (language spec [§28.3](Bezel_Language_Spec.md#sec-producers)): **`Task`-family returns** (v0.190 — every call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` mints a caller-owned task; [§6.7](#sec-task-static-helpers)) and **deferred-activation interface returns** (the lazy [§5](#sec-system-collections-linq) operators, `Drain()`, `ReceiveAll()` — the iterator convention). Where a signature does spell `owned` on such a return (`GetEnumerator`, `Domain.Spawn`), it states the same contract with emphasis (v0.195).
 - Generic constraints are noted where relevant; absence of a constraint clause means "any T."
-- **The Try convention (v0.171, #1336; shape (c) codified v0.184; shape (d) v0.195).** Exactly three Try shapes are sanctioned for payload extraction, plus the payload-free shape (d) at the end of this bullet. **(a) `bool` + nullable out** — `TryX(..., out item: T?): bool` (with `owned` on the out where the payload transfers) — for keyed/positional extraction: the bool distinguishes the outcome from a legitimately-null payload, and, for a **generic or class-typed** payload, the out parameter is *nullable in every form*, because a class payload has no `default` to assign on the false path (spec §17.11) and a generic payload may be instantiated by a class; §22.3 requires every out assigned on every return path (v0.184 wording; throw paths carry no obligation), and the false path assigns `null`. **(b) nullable return** — `TryX(...): owned T?` — when null alone is the signal (e.g. `Mutex.TryAcquire` — simpler call sites; `Weak<T>.TryUpgrade` — the handle payload is statically non-nullable at every instantiation, so a bool would carry no information). **(c) `bool` + non-nullable value-typed out** — `TryX(..., out result: T): bool` with `default(T)` assigned on the false path (spec §22.3) — for APIs whose payload type is a **concrete value type**: the §9 primitive `TryParse` family, `Convert.TryTo*` (§2.3), the `DateTime`/`DateOnly`/`TimeOnly`/`Guid` `TryParse` members (§2.5/§2.6), and the §4.14/§4.15 `TryRead*` accessors. The `when true` postcondition does not apply — the out is never null, so `default(T)` (a real value distinguished only by the `bool`) is what the false path assigns. **Every shape-(a) signature in this document carries the `when true` nullability postcondition** on its out parameter (language spec §22.4, v0.183) — `TryX(..., out item: T? when true): bool` — so in a region where the call is known `true`, the recipient is narrowed non-null and no `!` is needed. The clause is elided from the per-type listings below for brevity but is normative for **every** shape-(a) member in this document (`TryGetValue`, `TryPop`/`TryPeek`/`TryDequeue`, `TryPopFirst`/`TryPopLast`, `Channel<T>.TryReceive`, `OwningSet<T>.TryTake`, `OwningDictionary<K, V>.TryPopValue`, and `IParsable<T>.TryParse` through the constraint). A fourth, payload-free shape exists alongside the three extraction shapes — **(d) bool-only attempt** (v0.195): `TryX(...): bool` with no out parameter, for operations whose only outcome is succeeded/declined and whose payload, if any, was passed *in* — `TryAdd` (§4.10/§4.18), the `TrySet*` completion family (§6.6), and the span `TryWrite*` accessors (§4.14/§4.15). Shape (d) carries no nullability postcondition: there is no out to narrow.
+- **The Try convention (v0.171, #1336; shape (c) codified v0.184; shape (d) v0.195).** Exactly three Try shapes are sanctioned for payload extraction, plus the payload-free shape (d) at the end of this bullet. **(a) `bool` + nullable out** — `TryX(..., out item: T?): bool` (with `owned` on the out where the payload transfers) — for keyed/positional extraction: the bool distinguishes the outcome from a legitimately-null payload, and, for a **generic or class-typed** payload, the out parameter is *nullable in every form*, because a class payload has no `default` to assign on the false path (spec §17.11) and a generic payload may be instantiated by a class; §22.3 requires every out assigned on every return path (v0.184 wording; throw paths carry no obligation), and the false path assigns `null`. **(b) nullable return** — `TryX(...): owned T?` — when null alone is the signal (e.g. `Mutex.TryAcquire` — simpler call sites; `Weak<T>.TryUpgrade` — the handle payload is statically non-nullable at every instantiation, so a bool would carry no information). **(c) `bool` + non-nullable value-typed out** — `TryX(..., out result: T): bool` with `default(T)` assigned on the false path (spec §22.3) — for APIs whose payload type is a **concrete value type**: the §9 primitive `TryParse` family, `Convert.TryTo*` (§2.3), the `DateTime`/`DateOnly`/`TimeOnly`/`Guid` `TryParse` members (§2.5/§2.6), and the §4.14/§4.15 `TryRead*` accessors. The `when true` postcondition does not apply — the out is never null, so `default(T)` (a real value distinguished only by the `bool`) is what the false path assigns. **Every shape-(a) signature in this document carries the `when true` nullability postcondition** on its out parameter (language spec §22.4, v0.183) — `TryX(..., out item: T? when true): bool` — so in a region where the call is known `true`, the recipient is narrowed non-null and no `!` is needed. The clause is elided from the per-type listings below for brevity but is normative for **every** shape-(a) member in this document (`TryGetValue`, `TryPop`/`TryPeek`/`TryDequeue`, `TryPopFirst`/`TryPopLast`, `Channel<T>.TryReceive`, `OwningSet<T>.TryTake`, `OwningDictionary<K, V>.TryPopValue`, and `IParsable<T>.TryParse` through the constraint). A fourth, payload-free shape exists alongside the three extraction shapes — **(d) bool-only attempt** (v0.195): `TryX(...): bool` with no out parameter, for operations whose only outcome is succeeded/declined and whose payload, if any, was passed *in* — `TryAdd` (§4.10/§4.18), the `TrySet*` completion family (§6.6), and the span `TryWrite*` accessors (§4.14/§4.15). Shape (d) carries no nullability postcondition: there is no out to narrow. **The `*OrNull` convenience tier (v0.231).** Beside the Try shapes, a surface may carry a nullable-return **convenience form**, named with the `OrNull` suffix (`ParseOrNull`, `GetOrNull`, `ReadKeyOrNull`, §5's `*OrNull` element accessors) — a recorded tier in the sense of the no-dual rule below, and band 2's nullable-return value shape in the failure-signal rule below. The three access tiers, named: the **throwing form** (`Parse`, the `[key]` indexer) treats absence as a bug, the **`*OrNull` form** returns `T?` for direct `??`/`?.` composition where the payload can carry the signal (where it cannot — a nullable payload type — the surface carries the §7.10 conflation caveat: §4.8, §4.17, §5), and the **`Try` form** remains the only shape that distinguishes the outcomes a collapsed `T?` cannot (spec §7.10). Shape (b)'s `TryX` spelling stays reserved for acquisition-shaped members whose payload is statically non-nullable (`TryAcquire`, `TryUpgrade`).
 - **Negative magnitudes fault (v0.183, #1396).** Every constructor parameter that states a magnitude — `capacity`, `size`, `length` — raises `ArgumentOutOfRangeException` when passed a negative value: `StringBuilder(capacity)`, `Array<T>(capacity)`, `Array<T>(size, fill)`, `OwningArray<T>(capacity)`, the `Dictionary`/`OwningDictionary`/`Set`/`OwningSet` capacity forms, and `OwningBuffer<T>(length)` with its `init` overloads. Zero is valid (an empty container or zero-length buffer). A negative magnitude is a programming error, not a request — the defined-fault stance of `DateTime`'s component validation (§2.5), chosen over a silent empty fallback. (`Channel<T>(capacity)` is stricter under its own v0.174 contract — `capacity >= 1`, `ArgumentException` otherwise — and is unchanged.)
 - **The `Async` suffix (v0.195).** The suffix marks the asynchronous member of a sync/async pair (`Acquire`/`AcquireAsync`, `Send`/`SendAsync`, `ReadAll`/`ReadAllAsync`, `Lock`/`LockAsync`); an operation that exists only in asynchronous form carries no suffix (`Channel<T>.Receive`, `TaskScope.Join`, `Task.Delay`). `Receive` beside `SendAsync` on the §6.9 endpoint pair is this rule at work, not an inconsistency.
 - Compiler-intrinsic types (primitive wrappers, `Range<T>`) may declare `const` members whose values are provided by the compiler rather than by a source-level initializer expression. In the declarations below, a `const` field shown without `:= value` (e.g. `public static const MaxValue: double;`) is such a compiler-provided constant. User-defined code may not omit `const` initializers (see language spec [§22.12](Bezel_Language_Spec.md#sec-static-members)).
 - **Elided interface-required members.** When a class declares it implements an interface, the members required by that interface are part of the class's public contract whether or not the declaration shows them explicitly. Some declarations show every interface-required member; others elide the redundant ones with a marker comment such as `// plus standard ICollection<T> operations` or `// ICollection<T> operations plus:`. Both forms are equivalent — the elided members are still part of the public contract, with signatures determined by the interface declaration plus the implementation's type substitution (per the [§11.2](Bezel_Language_Spec.md#sec-interface-declaration) exact-match rule). For interfaces whose substitution produces a member with the same name but a different parameter type than another method on the class — `Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>` is the leading example, where ICollection's `Add(item: T)` substitutes to `Add(item: DictionaryEntry<K, V>)` while Dictionary also offers `Add(key: K, value: V)` — both forms are public members of the class and both are reachable.
 
+<a id="sec-failure-signal-rule"></a>
+**The failure-signal rule (v0.229).** Every fault **condition** a member of this library declares is classified by the first matching band below, and the band fixes the condition's one primary mechanism. One member may declare conditions in different bands — an absence condition and a corruption condition on the same operation classify separately — but never two mechanisms for one condition. The rule binds declarations, not history: it governs fault conditions declared or re-ruled from this revision forward; an existing spelling stands until its surface is re-ruled, and a landed spelling the rule would place in a different band is a recorded misfit — flagged where it stands, moved only by its own graduation ruling — never a conformance error.
+
+1. **Caller bug.** The condition is something a correct caller already guarantees (a bad argument, protocol misuse, a state violation) → a `requires` clause where a contract is possible (language spec [§22.16](Bezel_Language_Spec.md#sec-contract-clauses)); the residual defect exceptions (such as `Argument*` and `InvalidOperationException`) at pre-contract boundaries. A defect surface is never a recovery surface: its exception exists to report a bug, not to be branched on.
+2. **Expected absence, no information.** The condition is the absence of a **queried value** — a lookup, extraction, or acquisition whose target may legitimately not be there — expected, and carrying no information beyond its occurrence → the value shapes of this section: a nullable return where null alone is the signal, or a Try shape per the Try convention above. An operation that could not be *performed* is not an absence, however expected the failure — it classifies under the bands below.
+3. **Expected failure with information, branch-consumed, value-like payload.** The failure is expected, carries information the caller branches on at or near the call site, and the error payload is spellable as a **value-like** type (language spec [§35.4](Bezel_Language_Spec.md#sec-choice-classification) — a record or choice over values and strings; a plain inline array of value elements serves bounded aggregation) → a `choice` return (`Result<T, E>`, [§2.20](#sec-result), or a domain choice) — the positive half of the language spec's "never with `requires`" boundary ([§22.16](Bezel_Language_Spec.md#sec-contract-clauses)). The payload type is governed by the error-payload governance rule below.
+4. **Boundary-consumed fault (the residual band).** The failure's consumption site is a boundary, supervision, or retry site — the fault is logged, converted to a protocol answer, retried, or reported, rather than branched on for program logic — **or** the condition is band-3-shaped (expected, information-bearing, branch-consumed) but its payload cannot be value-like (language spec [§35.4](Bezel_Language_Spec.md#sec-choice-classification) — an owned payload makes the instantiation owning: consumable only by owning match, language spec [§35.5](Bezel_Language_Spec.md#sec-choice-matching), and never directly sendable, language spec [§35.12](Bezel_Language_Spec.md#sec-choice-sendability)) → a typed exception, producer-local per language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types), **regardless of how much information it carries**, with the classification and its reason recorded beside the surface. The typical inhabitant is the environmental fault (I/O, network, OS state); environmental origin describes the band, it is not a conjunct of the test. Information content never forces band 3: a fault may carry rich data and still sit here, because the data is consumed at a boundary that reads it once — the `catch` copy-out model (language spec [§31.1](Bezel_Language_Spec.md#sec-throwing-and-catching)) — not dispatched on downstream.
+5. **Fatal.** The process cannot meaningfully continue → termination: allocation failure and `StackOverflowException` (language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)), `Debug.Assert` ([§8.2](#sec-debug)).
+
+The band-3/band-4 boundary, stated once: what distinguishes them is **where consumption happens** (call-site branching vs. boundary handling) **and whether the payload can be value-like** — never whether information exists. A condition satisfying band 3's first two conjuncts whose payload cannot be value-like takes band 4's mechanism, and the recorded reason keeps the classification revisitable. One carve: a condition whose value-shaped spelling would have to hand ownership of a value *back* to the caller — the give-back class ([§6.9](#sec-channel)'s send family, whose failure path would need to hand the owned item back) — is neither band's material: its spelling is an ownership-protocol design under the language spec's ownership rules, and the no-dual rule below applies to whatever spelling that design fixes.
+
+**The no-dual rule.** One primary mechanism per fault condition. A member family may additionally offer recorded **tiers** — the assert-shaped throwing access ("failure is a bug at this call site") beside the branch-shaped value access ("failure is expected here"), the [§9.1](#sec-integer-types) `Parse`/`TryParse` pair being the model — because tiers serve different call-site *stances* toward one operation, not the same problem twice. Anything else — two peer spellings of one stance, a `Result` dual beside a Try dual for the same branch-shaped stance, an exception and a choice both offered for branching on the same condition — is a violation, and the newer spelling is the one that yields.
+
+**Error-payload governance (v0.229).** An error-payload type — the `E` of a `Result<T, E>` return, or a domain choice declared to carry a producer's failures — lives with its producer: it is declared alongside the producer whose failures it describes and carries the producer's import (the producer-locality discipline of language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types), transposed from the exception taxonomy). Error-payload types are value-like (language spec [§35.4](Bezel_Language_Spec.md#sec-choice-classification)) unless a recorded ruling states otherwise. One producer family, one payload type: a second module extends by wrapping, never by widening the producer's type. Additions to a shipped payload type's case set are gated by recorded ruling, exactly as growth of the exception taxonomy is — and with sharper consequence here, because a choice is a closed sum: every case addition breaks every exhaustive consumer (language spec [§35.6](Bezel_Language_Spec.md#sec-choice-exhaustiveness)).
+
 **Naming conventions for acronyms and widths (recorded v0.165, #1359, generalizing the v0.148 ruling).** Acronyms in Bezel-coined names are PascalCase (`IeeeEquals`); names inherited verbatim from .NET keep the .NET spelling (`IEEERemainder`, `Encoding.UTF8`, `ToInt64`) — so `Math.IEEERemainder` and `Double.IeeeEquals` are both *correct* under one rule, not an inconsistency. Where a bit-width is the point of the name, the width-bearing .NET type words are used (`Int32`, `Int64` — e.g. `Random.NextInt64`, `BitConverter`'s family). The owning enumeration interfaces carry the `I-` prefix since the v0.168 family rename (#1372).
+
+**`Count` vs `Length` (v0.231).** `Length` measures a fixed or contiguous extent — text (`String`, `StringBuilder`, `ReadOnlyStringSpan`), buffers and spans (§4.14–§4.16), `FrozenArray<T>`, `Stream`, and the §10 FFI carriers; `Count` counts the elements of a collection whose membership grows and shrinks (the `Add`/`Remove`/`Push`/`Enqueue` families). A type declares one or the other, never both, and new types follow the same line — which is why the resizable `Array<T>` says `Count` where .NET's fixed array says `Length`.
 
 **Replay intercept points (v0.204).** The members of this library that consult the world outside the process — the clock and elapsed-time reads (§2.5, §8.1), entropy (§2.6, and §2.7's parameterless constructor), environment, argument, and process information (§2.4), console input (§2.1), and the file system (§7) — together with the scheduling and synchronized-object operations the language spec enumerates (language spec [§30.13](Bezel_Language_Spec.md#sec-determinism), *Determinism*) — are **intercept points**: a conforming runtime may record their results and later substitute the recorded values, and no program may observe the substitution except through the values themselves. Everything not so designated is pure computation and is deliberately not interceptable. A future addition to this library that reads the world must declare itself an intercept point in its own section at the time it is added.
 
@@ -73,6 +90,7 @@ public static class Console
   // Input
   public static method ReadLine(): string?;     // null at EOF
   public static method ReadKey(): char;         // blocks for one key; EndOfStreamException at end of input (v0.195; see below)
+  public static method ReadKeyOrNull(): char?;  // v0.231 (§1 *OrNull tier): null at end of input; otherwise blocks for one key
 
   // Streams
   public static readonly property In: TextReader;
@@ -86,7 +104,7 @@ end Console;
 
 The `Object` overloads invoke `ToString()`. For interpolated strings, the compiler resolves the `string` overload directly.
 
-`ReadKey()` blocks until one key (code point) is available and raises `EndOfStreamException` ([§7.5](#sec-io-exception-types); catching it by name requires `import System.IO;`) at end of input, where no key can exist — `ReadLine`'s null-at-EOF shape has no `char` analog (v0.195). Whether the key is echoed is implementation-defined.
+`ReadKey()` blocks until one key (code point) is available and raises `EndOfStreamException` ([§7.5](#sec-io-exception-types); catching it by name requires `import System.IO;`) at end of input, where no key can exist. `ReadKeyOrNull()` (v0.231) is the [§1](#sec-failure-signal-rule) `*OrNull` tier beside it — `null` at end of input, the key otherwise — resolving the misfit the failure-signal rule recorded at v0.229: end of input is band 2's expected absence, and `char?` is exactly the `ReadLine` null-at-EOF analog the v0.195 note said was missing (`char` is a non-nullable value type, so `null` is unambiguous). `ReadKey` remains the assert-shaped throwing tier — end of input is a bug at its call sites. Whether the key is echoed is implementation-defined.
 
 <a id="sec-math"></a>
 ### 2.2 `Math`
@@ -210,23 +228,23 @@ public static class Environment
   public static readonly property ProcessorCount: int;
   public static readonly property CommandLineArgs: IReadOnlyList<string>;   // read-only view of cached process-lived storage (§4.1); dedicated view object, not an Array — §2.13's downcast rule (#1805)
 
-  public static method GetEnvironmentVariable(name: string): string?;
+  public static method Get(name: string): string?;    // null when the variable is absent (v0.231)
   public static method GetInt(name: string): int?;    // v0.215 convenience tier: null when the variable is
   public static method GetBool(name: string): bool?;  //   absent OR malformed — deliberately conflated
                                                       //   (recorded): callers that must distinguish keep the
-                                                      //   two-step idiom (GetEnvironmentVariable + TryParse).
+                                                      //   two-step idiom (Get + TryParse).
                                                       //   GetBool accepts exactly Boolean.Parse's forms
                                                       //   ("true"/"false", case-insensitive); "1"/"yes" are null.
-  public static method SetEnvironmentVariable(name: string, value: string?);
+  public static method Set(name: string, value: string?);
       // value = null removes the variable; an empty name, or one containing "=",
       //   raises ArgumentException (v0.195)
-  public static method GetEnvironmentVariables(): owned Dictionary<string, string>;
+  public static method Variables(): owned Dictionary<string, string>;
 
   public static method Exit(exitCode: int);
 end Environment;
 ```
 
-`GetEnvironmentVariables()` returns a freshly-allocated `owned Dictionary<string, string>` (per the §1 convention for fresh-instance returns). Although `Environment` itself is auto-imported via `System` ([§2.3](Bezel_Language_Spec.md#sec-always-available-names) of the language spec), the `Dictionary` type lives in `System.Collections.Generic` and is not auto-imported; callers using the return value typically `import System.Collections.Generic;` to access dictionary members.
+`Variables()` (v0.231) returns a freshly-allocated `owned Dictionary<string, string>` (per the §1 convention for fresh-instance returns). Although `Environment` itself is auto-imported via `System` ([§2.3](Bezel_Language_Spec.md#sec-always-available-names) of the language spec), the `Dictionary` type lives in `System.Collections.Generic` and is not auto-imported; callers using the return value typically `import System.Collections.Generic;` to access dictionary members.
 
 <a id="sec-datetime-timespan-dateonly-timeonly"></a>
 ### 2.5 `DateTime`, `TimeSpan`, `DateOnly`, `TimeOnly`
@@ -285,6 +303,9 @@ public record DateTime: IComparable<DateTime>, IEquatable<DateTime>
 
   public static method Parse(s: string): DateTime;
   public static method TryParse(s: string, out result: DateTime): bool;
+  public static method ParseOrNull(s: string): DateTime?;   // v0.231 (§1 *OrNull tier): null exactly
+                                                            //   where Parse(s) raises; otherwise the
+                                                            //   parsed value
 
   public static method operator -(a: DateTime, b: DateTime): TimeSpan;
   public static method operator -(d: DateTime, t: TimeSpan): DateTime;
@@ -356,6 +377,8 @@ public record DateOnly: IComparable<DateOnly>, IEquatable<DateOnly>
   public method ToDateTime(time: TimeOnly): DateTime;     // Kind = Unspecified
   public static method Parse(s: string): DateOnly;        // FormatException on invalid
   public static method TryParse(s: string, out result: DateOnly): bool;
+  public static method ParseOrNull(s: string): DateOnly?; // v0.231: null exactly where Parse(s)
+                                                          //   raises; otherwise the parsed value
   public method ToString(): string;                       // "yyyy-MM-dd"
   public method ToString(format: string): string;         // format vocabulary: §2.18
 end DateOnly;
@@ -369,6 +392,8 @@ public record TimeOnly: IComparable<TimeOnly>, IEquatable<TimeOnly>
   public method CompareTo(other: TimeOnly): int;
   public static method Parse(s: string): TimeOnly;
   public static method TryParse(s: string, out result: TimeOnly): bool;
+  public static method ParseOrNull(s: string): TimeOnly?; // v0.231: null exactly where Parse(s)
+                                                          //   raises; otherwise the parsed value
   public method ToString(): string;                       // "HH:mm:ss"
   public method ToString(format: string): string;         // format vocabulary: §2.18
 end TimeOnly;
@@ -387,7 +412,7 @@ end ArgumentOutOfRangeException;
 
 The no-argument `ToString()` renders a `DateTime` in the round-trippable ISO 8601 form `yyyy-MM-ddTHH:mm:ss` (e.g. `2024-03-15T00:00:00`); it is the value also used when a `DateTime` is interpolated into a string with no format specifier. `ToString(format)` selects an explicit format.
 
-**Parse and range contracts (v0.195).** `DateTime.Parse` accepts exactly the type's own rendered forms — the round-trip form `yyyy-MM-ddTHH:mm:ss`, optionally extended with a fractional-seconds tail `.fff`, and the date-only form `yyyy-MM-dd` (time components zero); the result's `Kind` is `Unspecified` (the rendered forms carry no zone), and any other input raises `FormatException`, the `DateOnly.Parse` stance. `TimeOnly.Parse` accepts `HH:mm:ss` with the same optional `.fff` tail. Every `TryParse` returns `false` exactly where its `Parse` would raise. The `Add*` family, `Add`/`Subtract`, and `FromTicks` raise `ArgumentOutOfRangeException` when the result falls outside `MinValue..MaxValue`. `ToUnixTimeSeconds` converts a `Kind = Local` value via `ToUtc()` first and treats `Unspecified` as already UTC (deterministic — no hidden machine-zone read); `FromUnixTimeSeconds` produces `Kind = Utc`.
+**Parse and range contracts (v0.195).** `DateTime.Parse` accepts exactly the type's own rendered forms — the round-trip form `yyyy-MM-ddTHH:mm:ss`, optionally extended with a fractional-seconds tail `.fff`, and the date-only form `yyyy-MM-dd` (time components zero); the result's `Kind` is `Unspecified` (the rendered forms carry no zone), and any other input raises `FormatException`, the `DateOnly.Parse` stance. `TimeOnly.Parse` accepts `HH:mm:ss` with the same optional `.fff` tail. Every `TryParse` returns `false`, and every `ParseOrNull` returns `null` (v0.231, the §1 `*OrNull` tier), exactly where its `Parse` would raise. The `Add*` family, `Add`/`Subtract`, and `FromTicks` raise `ArgumentOutOfRangeException` when the result falls outside `MinValue..MaxValue`. `ToUnixTimeSeconds` converts a `Kind = Local` value via `ToUtc()` first and treats `Unspecified` as already UTC (deterministic — no hidden machine-zone read); `FromUnixTimeSeconds` produces `Kind = Utc`.
 
 <a id="sec-guid"></a>
 ### 2.6 `Guid`
@@ -404,8 +429,19 @@ public record Guid: IComparable<Guid>, IEquatable<Guid>
   public static readonly property Empty: Guid;
 
   public static method NewGuid(): Guid;
+      // v0.231 pin: a version-4 (random) UUID — the version and variant bits are
+      //   fixed (0100 / 10), the remaining 122 bits drawn from the runtime's
+      //   entropy source (the §1 v0.204 replay-intercept point declared for this
+      //   section). Uniqueness is probabilistic, not checked: no dedup, no
+      //   cross-process coordination. The entropy source is NOT specified as
+      //   cryptographically strong — §2.7's recorded posture: cryptographic
+      //   randomness belongs to the future System.Security.Cryptography module —
+      //   so NewGuid values must not serve as secrets (session tokens,
+      //   capability strings).
   public static method Parse(s: string): Guid;      // accepts the "D" and "N" renderings (§2.18); FormatException otherwise (v0.195)
   public static method TryParse(s: string, out result: Guid): bool;
+  public static method ParseOrNull(s: string): Guid?;   // v0.231 (§1 *OrNull tier): null exactly where
+                                                        //   Parse(s) raises; otherwise the parsed value
 
   public method ToString(): string;          // canonical form
   public method ToString(format: string): string;   // "N", "D" — the §2.18 vocabulary; any other specifier raises FormatException (v0.195)
@@ -581,7 +617,7 @@ end Type;
 
 **`Implements` and `IsAssignableFrom`.** `t.Implements(i)` requires `i.IsInterface` (otherwise it raises `InvalidOperationException`) and returns whether the type `t` conforms to interface `i`. `a.IsAssignableFrom(b)` is the reflective form of the `is` operator (language spec [§12.7](Bezel_Language_Spec.md#sec-type-tests-is-is-not-as)): it returns whether a value whose runtime type is `b` may be assigned to a location of static type `a` — true when `a = b`, when `a` is a base class of `b`, or when `a` is an interface that `b` implements. The two are related: `a.IsAssignableFrom(b)` with `a.IsInterface` is equivalent to `b.Implements(a)`. Both operate on `Type` tokens with no value in hand, which is what distinguishes them from `is`/`as`.
 
-**Enum metadata.** When `IsEnum`, `EnumNames` and `EnumValues` are parallel arrays (same length, same order — declaration order of the enum members) giving each member's source name and its integer value widened to `long` — except for an enum whose underlying type is `ulong` (spec §10.3 admits it), whose values are **bit-reinterpreted** into `long` (`BitConverter.Reinterpret` semantics, [§2.12](#sec-bitconverter): the bit pattern is preserved; callers of such enums reinterpret back to `ulong`), since values above `long.MaxValue` have no widening (v0.195). They are the building blocks for enum-to-string formatting, string-to-enum parsing, and enumerating all members for UI or validation. On any non-enum `Type`, accessing either property raises `InvalidOperationException` (the property is meaningless, and a silent empty array would mask a programming error). The properties are **read-only views** over cached, process-lived storage (`IReadOnlyList<T>`, [§4.1](#sec-borrowing-collection-interfaces)), handed out as borrows (a property getter may not mint — spec §28.6) — the [§4.8](#sec-dictionaryk-v) `Keys`/`Values` shape, **including its backing**: each view is a dedicated view object owned by the `Type` instance, whose class is not nameable in user code and is in particular not `Array<T>`. There is no mutation surface, declared or recoverable: the view type has no mutating members, so the pre-v0.222 hazard of mutating process-wide metadata through the borrow is closed at compile time, and a type-test downcast (spec [§12.7](Bezel_Language_Spec.md#sec-type-tests-is-is-not-as)) cannot reach one — `typeof(E).EnumNames as Array<string>` is `null` (#1805). The same backing rule governs [§2.4](#sec-environment)'s `CommandLineArgs`. `IReadOnlyList` lives in `System.Collections.Generic`; callers touching the view's members import it, as for [§2.4](#sec-environment)'s `GetEnvironmentVariables` result. Example:
+**Enum metadata.** When `IsEnum`, `EnumNames` and `EnumValues` are parallel arrays (same length, same order — declaration order of the enum members) giving each member's source name and its integer value widened to `long` — except for an enum whose underlying type is `ulong` (spec §10.3 admits it), whose values are **bit-reinterpreted** into `long` (`BitConverter.Reinterpret` semantics, [§2.12](#sec-bitconverter): the bit pattern is preserved; callers of such enums reinterpret back to `ulong`), since values above `long.MaxValue` have no widening (v0.195). They are the building blocks for enum-to-string formatting, string-to-enum parsing, and enumerating all members for UI or validation. On any non-enum `Type`, accessing either property raises `InvalidOperationException` (the property is meaningless, and a silent empty array would mask a programming error). The properties are **read-only views** over cached, process-lived storage (`IReadOnlyList<T>`, [§4.1](#sec-borrowing-collection-interfaces)), handed out as borrows (a property getter may not mint — spec §28.6) — the [§4.8](#sec-dictionaryk-v) `Keys`/`Values` shape, **including its backing**: each view is a dedicated view object owned by the `Type` instance, whose class is not nameable in user code and is in particular not `Array<T>`. There is no mutation surface, declared or recoverable: the view type has no mutating members, so the pre-v0.222 hazard of mutating process-wide metadata through the borrow is closed at compile time, and a type-test downcast (spec [§12.7](Bezel_Language_Spec.md#sec-type-tests-is-is-not-as)) cannot reach one — `typeof(E).EnumNames as Array<string>` is `null` (#1805). The same backing rule governs [§2.4](#sec-environment)'s `CommandLineArgs`. `IReadOnlyList` lives in `System.Collections.Generic`; callers touching the view's members import it, as for [§2.4](#sec-environment)'s `Variables` result. Example:
 
 ```bezel
 public method DescribeEnum(t: Type)
@@ -802,7 +838,7 @@ This is the type-driven serialization model: a class declares `: ISerializable`/
 <a id="sec-concrete-serialization-formats"></a>
 ### 2.15 Concrete serialization formats
 
-The standard library provides two concrete implementations of the [§2.14](#sec-serialization-vocabulary) agent interfaces: a JSON pair (`JsonSerializer`/`JsonDeserializer`) and a compact binary pair (`BinarySerializer`/`BinaryDeserializer`). Both are ordinary classes implementing `ISerializer`/`IDeserializer`; they introduce no language feature. They live in `System.Serialization` and are *not* auto-imported (unlike the vocabulary interfaces) — a program that performs serialization names the format explicitly with `import System.Serialization`.
+The standard library provides two concrete implementations of the [§2.14](#sec-serialization-vocabulary) agent interfaces: a JSON pair (`JsonSerializer`/`JsonDeserializer`) and a compact binary pair (`BinarySerializer`/`BinaryDeserializer`). Both are ordinary classes implementing `ISerializer`/`IDeserializer`; they introduce no language feature. They live in `System.Serialization` and are *not* auto-imported (unlike the vocabulary interfaces) — a program that performs serialization names the format explicitly with `import System.Serialization`. The module's one-shot facades `Json` and `Binary` (below, v0.232) are the whole-value front door over these agents.
 
 Both serializers write to, and both deserializers read from, an `OwningBuffer<byte>`-backed stream. The serializer accumulates bytes and exposes the result; the deserializer is constructed over a `ReadOnlySpan<byte>` of the encoded form.
 
@@ -855,7 +891,92 @@ end BinaryDeserializer;
 
 **Binary mapping.** The compact binary format is length-prefixed and self-describing enough to be read back without the schema, but it is *not* a stable interchange format across Bezel versions — it is intended for same-version persistence and IPC, where compactness and speed matter and the producer and consumer share a build. Integers use a variable-length encoding; `BeginObject`/`BeginArray` write the count, so `BinaryDeserializer.BeginObject()` and `BeginArray()` return the actual element count and `HasMoreElements()` is answered from it. Non-finite floats round-trip exactly (the format stores IEEE 754 bit patterns via `BitConverter`, [§2.12](#sec-bitconverter)). Programs needing a documented, version-stable wire format use JSON or an explicit hand-written format; the binary format trades interchange stability for size and speed.
 
-**Ownership and lifetime.** All four classes are `IDisposable`; the serializers own an internal growable byte buffer, the deserializers own parser state. The idiom is scope-bound:
+<a id="sec-one-shot-serialization-facades"></a>
+**The one-shot facades: `Json` and `Binary` (v0.232).** The most common serialization operation — whole value in, encoded form out, and back — needs none of the agent ceremony. Two static classes, declared in `System.Serialization` beside the agents they wrap, provide it; the agents remain the extension point (streaming and incremental writing, multi-value streams, custom `ISerializer`/`IDeserializer` formats, hand-driven [§2.14](#sec-serialization-vocabulary) conformances) — the [§7.3](#sec-file) `File`-over-`FileStream` shape.
+
+```bezel
+// One-shot facades over the agent pairs. The write members are ordinary
+// constrained generics; Parse/ParseOwned are compiler-known (see below).
+public static class Json
+  // Write: value → encoded form. `value` is borrowed for the call; the
+  // options overloads thread to the JsonSerializer constructor.
+  public static method ToText<T>(value: T): string where T: ISerializable;
+  public static method ToText<T>(value: T, options: JsonOptions): string where T: ISerializable;
+  public static method ToBytes<T>(value: T): owned OwningBuffer<byte> where T: ISerializable;
+  public static method ToBytes<T>(value: T, options: JsonOptions): owned OwningBuffer<byte> where T: ISerializable;
+
+  // Read: encoded form → value, for value-type targets (records, enums,
+  // value-like choices — spec §9.8); a class-typed T is a compile-time error
+  // directing to ParseOwned<T>. The input forms mirror the JsonDeserializer
+  // constructor set above one-for-one.
+  public static method Parse<T>(text: string): T where T: IDeserializable;
+  public static method Parse<T>(text: string, options: JsonOptions): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlySpan<byte>): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlySpan<byte>, options: JsonOptions): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlyArraySpan<byte>): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlyArraySpan<byte>, options: JsonOptions): T where T: IDeserializable;
+
+  // Read, class targets: the recognized factory's owned T transfers to the
+  // caller. Same six input forms as Parse<T>.
+  public static method ParseOwned<T>(text: string): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(text: string, options: JsonOptions): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlySpan<byte>): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlySpan<byte>, options: JsonOptions): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlyArraySpan<byte>): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlyArraySpan<byte>, options: JsonOptions): owned T where T: class, IDeserializable;
+end Json;
+
+public static class Binary
+  // The binary format is bytes-only: no text form. It has no options record;
+  // its one knob is the BinaryDeserializer constructor bool, mirrored here.
+  public static method ToBytes<T>(value: T): owned OwningBuffer<byte> where T: ISerializable;
+
+  public static method Parse<T>(input: ReadOnlySpan<byte>): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlyArraySpan<byte>): T where T: IDeserializable;
+      // no (ReadOnlyArraySpan<byte>, ignoreUnknownFields) form: the facade
+      // mirrors the BinaryDeserializer constructor set above, which declares
+      // no such constructor
+
+  public static method ParseOwned<T>(input: ReadOnlySpan<byte>): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlyArraySpan<byte>): owned T where T: class, IDeserializable;
+end Binary;
+```
+
+Each facade member is defined — normatively, not illustratively — as the corresponding agent sequence, with the same options and the same fault surface, and **byte-identical output**: a facade write and a hand-driven agent write of the same value under the same options produce identical bytes, and a facade read accepts exactly the inputs, and raises exactly the exceptions, of the corresponding agent read driven over a whole document. Each member constructs its format's agent with the identically-spelled arguments, invokes `value.Serialize(s)` or the recognized `T.Deserialize(d)` factory, and returns the agent's corresponding result accessor (`ToString()` for `ToText`, `ToBytes()` for `ToBytes`). The scope-bound `SavePoint`/`LoadPoint` bodies under **Ownership and lifetime** below are the definitional expansions of two of the forms:
+
+```bezel
+import System.Serialization;
+import System.IO;
+
+// The SavePoint/LoadPoint pair, restated through the facade (Point: the §2.14
+// example record). The agent-driven bodies below are what these calls mean.
+public method SavePoint(p: Point): owned OwningBuffer<byte>
+  return Json.ToBytes(p);
+end SavePoint;
+
+public method LoadPoint(bytes: ReadOnlySpan<byte>): Point
+  return Json.Parse<Point>(bytes);
+end LoadPoint;
+
+// A class target arrives owned (Order: the §2.14 example class); binary bytes
+// compose with the §7.3 statics — WriteAllBytes' span overload is the
+// zero-copy serializer-output path.
+public method Reencode(text: string, path: string)
+  using var order := Json.ParseOwned<Order>(text);
+  using var blob  := Binary.ToBytes(order);
+  File.WriteAllBytes(path, blob.AsReadOnlySpan());
+end Reencode;
+```
+
+**The write family is ordinary generic code; the read family is compiler-known.** `ISerializable` has a real instance method, so `ToText`/`ToBytes` reach `value.Serialize(s)` through their constraint and are user-writable Bezel. The read family is not: `IDeserializable` is a marker interface with no members ([§2.14](#sec-serialization-vocabulary)), so no generic body can reach the recognized `T.Deserialize(d)` factory through a constraint, and `Parse<T>`/`ParseOwned<T>` (both formats) are **compiler-known generics** — the same mechanism as `Task.FromResult<T>`'s compiler-special-cased class-`T` rejection ([§6.7](#sec-task-static-helpers)). `Parse<T>` requires an `IDeserializable`-conforming **value-type** target — a record, enum, or value-like choice (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) — and rejects a class-typed `T` at compile time with a diagnostic directing to `ParseOwned<T>`; `ParseOwned<T>` requires an `IDeserializable`-conforming class whose recognized factory returns `owned T`. A class whose factory has the third [§2.14](#sec-serialization-vocabulary) shape — `Deserialize(d): owned Shared<C>`, the shared-node entry — has no facade form and is read through the agents; `ParseOwned<C>` over such a class is a compile-time error. Were the recognized factory promoted to a static interface member (the recorded follow-up of rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection), itself gated on the `Self` return type [§2.14](#sec-serialization-vocabulary) separately defers), all four become expressible as ordinary constrained generics with no signature change.
+
+**Ownership at the facade.** `value` is an unmarked parameter — a borrow for the duration of the call at class substitutions (language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)), a value at record/enum substitutions; the caller keeps ownership and the disposal obligation. The results are fresh productions under [§1](#sec-conventions)'s conventions: `ToText` returns a runtime-managed `string`, `ToBytes` returns `owned OwningBuffer<byte>` ([§4.14](#sec-owned-buffers-and-spans)), and `ParseOwned<T>` returns `owned T` (language spec [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer)), discharged by `using var` or an owned field. Inside a facade read the deserializer's input-span borrow is bounded by the call itself, so the caller's obligation to keep the backing bytes alive ends when the call returns — unlike the agent path, where the span must outlive the `using var d` scope.
+
+**Facade faults.** Every facade member faults exactly as its defining agent sequence faults — malformed input, type mismatches, depth violations, trailing data, unknown fields under strict policy, and the JSON write path's non-finite floats — raising `SerializationException` with the same `Offset`/`Line`/`Column` surface, because it is the same code raising it. Under the failure-signal rule ([§1](#sec-failure-signal-rule)) the read-side conditions classify with the agents' own, in band 4 under the rule's second clause: they are band-3-shaped — expected at the decode boundary, information-bearing — but no value-like error-payload type yet exists to carry them (the R3/R2 sequencing recorded at v0.229), so the typed exception is the mechanism, that reason is recorded here, and the classification stays revisitable at the decode-cluster pilot. The write path's non-finite-float condition is a separate condition with no input to locate (all three location properties are `null` there, above): a caller-chose-an-unrepresentable-format condition inherited from the agents, whose existing `SerializationException` spelling stands under [§1](#sec-failure-signal-rule)'s scoping sentence until re-ruled. The throwing form is the surface's one spelling (no value-shaped dual is declared, and no error-payload type). The binary format's interchange caveat (*Binary mapping* above) applies verbatim at the facade: `Binary.ToBytes`/`Parse`/`ParseOwned` produce and consume the compact same-version form — persistence and IPC between builds of one version, not a version-stable wire format.
+
+**Ownership and lifetime.** All four agent classes are `IDisposable`; the serializers own an internal growable byte buffer, the deserializers own parser state. The idiom is scope-bound:
 
 ```bezel
 import System.Serialization;
@@ -874,11 +995,21 @@ end LoadPoint;
 
 `ToBytes()` returns an `owned OwningBuffer<byte>` ([§4.14](#sec-owned-buffers-and-spans)) — a fresh buffer whose ownership transfers to the caller; the serializer may be disposed immediately after. `JsonSerializer.ToString()` is a convenience that UTF-8-decodes the same bytes into a `string`. A deserializer constructed over a `ReadOnlySpan<byte>` borrows that span for the deserializer's lifetime; the backing bytes must outlive the `using var d` scope, which the example satisfies because the span parameter outlives the method body.
 
-**Errors.** Malformed input, type mismatches (a `ReadInt` when the next token is a string), depth-limit violations, and trailing-data conditions raise `SerializationException` (declared in `System.Serialization`). `SerializationException` carries a byte offset (for binary) or line/column (for JSON) to locate the fault. The deserializer interfaces' `Try*`-shaped members (`TryReadNull`) do not throw; every other read member throws on mismatch rather than returning a sentinel, because a deserialization mismatch is a structural error in the input, not an expected control-flow branch.
+**Errors.** Malformed input, type mismatches (a `ReadInt` when the next token is a string), depth-limit violations, and trailing-data conditions raise `SerializationException` (declared in `System.Serialization`). `SerializationException` locates the fault through its declared surface — `Offset` for the binary format, `Line`/`Column` for JSON; the other format's properties are `null` on each instance, and all three are `null` on an instance raised by the write side (e.g. the JSON non-finite-float rule above), where there is no input to locate:
+
+```bezel
+public class SerializationException: Exception
+  public readonly property Offset: long?;   // byte offset of the fault in the input (binary; null for JSON)
+  public readonly property Line: int?;      // line of the fault in the input text (JSON; null for binary)
+  public readonly property Column: int?;    // column of the fault in the input text (JSON; null for binary)
+end SerializationException;
+```
+
+The three properties are value-typed and copy out of a `catch` arm like any other snapshot state (language spec [§31.1](Bezel_Language_Spec.md#sec-throwing-and-catching)). The deserializer interfaces' `Try*`-shaped members (`TryReadNull`) do not throw; every other read member throws on mismatch rather than returning a sentinel, because a deserialization mismatch is a structural error in the input, not an expected control-flow branch.
 
 **Unknown-field policy.** A field present in the input that matches no declared component of the target type is, by default, a `SerializationException` — the strict default established when synthesis shipped (v0.116), because silently dropping unrecognized input masks producer/consumer schema drift and field-name typos. This behavior is a property of the deserialization *operation*, not of the target type: the same type may legitimately be read strictly when consuming a trusted internal message and leniently when consuming a third-party producer that adds fields freely, a decision that belongs to the caller performing the read, not to the type's serialization contract (rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection)). It is therefore configured on the deserializer: `JsonOptions.IgnoreUnknownFields` (default `false`) for JSON, the `ignoreUnknownFields` constructor parameter for `BinaryDeserializer`. When set, the deserializer skips an unrecognized field's value (via `IDeserializer.SkipValue`, [§2.14](#sec-serialization-vocabulary), which consumes the value including any nested object/array structure) and continues rather than raising. The synthesized `Deserialize` (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) is identical regardless of policy — it always delegates an unrecognized field to the deserializer; strictness lives entirely in the deserializer's configuration. This policy governs only *unknown* fields; missing required fields, duplicates, and type mismatches remain unconditional errors regardless of the setting, and a *missing* declared field is tolerated only by the per-member `serialized optional` clause (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) — the two leniencies are orthogonal and compose.
 
-`JsonSerializer`, `JsonDeserializer`, `BinarySerializer`, `BinaryDeserializer`, `JsonOptions`, and `SerializationException` are declared in `System.Serialization` and require an explicit `import System.Serialization`. The vocabulary interfaces they implement (`ISerializer`/`IDeserializer`/`ISerializable`/`IDeserializable`, [§2.14](#sec-serialization-vocabulary)) remain auto-imported, so a type's `: ISerializable` conformance never requires the import — only the code that picks a concrete format does.
+`JsonSerializer`, `JsonDeserializer`, `BinarySerializer`, `BinaryDeserializer`, `JsonOptions`, and `SerializationException` are declared in `System.Serialization` and require an explicit `import System.Serialization`, and the one-shot facades `Json` and `Binary` are declared beside them under the same import. The vocabulary interfaces the agent classes implement (`ISerializer`/`IDeserializer`/`ISerializable`/`IDeserializable`, [§2.14](#sec-serialization-vocabulary)) remain auto-imported, so a type's `: ISerializable` conformance never requires the import — only the code that picks a concrete format does.
 
 <a id="sec-shared-and-weak"></a>
 ### 2.16 `Shared<T>` and `Weak<T>`
@@ -927,7 +1058,7 @@ Usage notes:
 
 The built-in exception hierarchy — `Exception` and the types available without `import` — is normative in the language spec ([§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)); this document does not repeat it. Exceptions whose producers live in this document require the producer's `import` and are declared alongside it (e.g. `KeyNotFoundException` in [§4.8](#sec-dictionaryk-v), the IO exceptions in [§7.5](#sec-io-exception-types)).
 
-One built-in carries surface beyond `Exception`'s and is recorded here for completeness:
+The exception types that carry declared surface beyond `Exception`'s are enumerated by reference rather than counted: the built-ins `ArgumentException` (`ParamName` — language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)) and `TypeInitializationException` (below), and the producer-local `SerializationException` (`Offset`/`Line`/`Column` — [§2.15](#sec-concrete-serialization-formats)) and `DomainFaultedException` (`FaultStackTrace` — [§6.8](#sec-domain)). Of these, `TypeInitializationException` is recorded here for completeness:
 
 ```bezel
 public class TypeInitializationException: Exception
@@ -964,6 +1095,10 @@ Auto-imported. String interpolation dispatches a hole's format spec here (langua
 
 `C` (currency) deliberately does not exist — currency formatting is culture by definition; format money explicitly (`$"{amount:F2} EUR"`).
 
+**`decimal` midpoint rule (v0.230).** For a `decimal` operand, digit reduction under `F`/`Fn`, `P`/`Pn`, and `E`/`En` rounds a midpoint **half-to-even** (banker's rounding), agreeing with `Decimal.Round` ([§9.3](#sec-decimal)): `0.125m` under `F2` renders `"0.12"`, and `P`/`E` apply the same rule to their scaled digit strings — the format specifiers and `Round` are two spellings of one rounding operation and never disagree at a midpoint.
+
+**Temporal patterns: non-specifier characters are literals (v0.230).** In a temporal pattern (`DateTime`, `DateOnly`, `TimeOnly`), every character that does not begin one of the specifiers above is a **literal**, copied to the output verbatim — `T`, `Z`, `-`, `:`, space, and any other non-specifier character alike; the unrecognized-specifier fault governs malformed runs of the specifier letters (`y` `M` `d` `H` `m` `s` `f`), not literal characters. The temporal specifier vocabulary grows only by recorded ruling, and never in a way that reinterprets a character that passes through as a literal — a new specifier letter would be a breaking change for every pattern using it as a literal, and this section's default answer to such a proposal is no.
+
 <a id="sec-static-abstractions"></a>
 ### 2.19 `INumber<T>`, `ISteppable<T>`, `IParsable<T>` (v0.176, #807)
 
@@ -998,7 +1133,7 @@ Conformances: `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`, `long`, `ulong`
 <a id="sec-result"></a>
 ### 2.20 `Result<T, E>` (v0.200)
 
-The outcome type for expected failure with information (language spec [§35](Bezel_Language_Spec.md#sec-choices)): a closed sum of a success payload and an error payload. Auto-imported. The stdlib ships exactly this one choice; `Option<T>` is deliberately absent — `T?` is Bezel's option type (proposals `DECLINED.md` D-0004).
+The outcome type for band 3 of the failure-signal rule ([§1](#sec-failure-signal-rule)) — expected failure, branched on at or near the call site, with a value-like error payload (language spec [§35](Bezel_Language_Spec.md#sec-choices)): a closed sum of a success payload and an error payload. Auto-imported. The stdlib ships exactly this one choice; `Option<T>` is deliberately absent — `T?` is Bezel's option type (proposals `DECLINED.md` D-0004).
 
 ```bezel
 public choice Result<T, E>
@@ -1010,21 +1145,33 @@ public choice Result<T, E>
     Error(_) => false);
 
   public method IsError(): bool => not IsOk();
+
+  // Compiler-provided (spec §35.2): admissible only where the receiver AND the
+  // member's result instantiation are value-like; a call at (or producing) a
+  // borrow-bearing or owning instantiation is rejected at the use site (spec
+  // §3.6 rule 2), the diagnostic naming the classification and the deciding
+  // payload.
+  public method Map<U>(f: (T) -> U): Result<U, E>;
+  public method MapError<F>(f: (E) -> F): Result<T, F>;
+  public method AndThen<U>(f: (T) -> Result<U, E>): Result<U, E>;
+  public method UnwrapOr(fallback: T): T;
 end Result;
 ```
 
-`T` and `E` are unconstrained; the `owned` payload markers follow the per-instantiation erasure of language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear): `Result<int, string>` is value-like (Core; copyable; auto-equality-bearing when the payloads are admissible), while `Result<Connection, IoError>` is owning per instantiation (Extended — the move-only row of Appendix D.2). `Result` declares no interface conformances, keeping every instantiation classification-clean. There is no `Unwrap` — a method receives `this` as a borrow (spec [§35.2](Bezel_Language_Spec.md#sec-choice-members)), so an owned-payload extractor is unspellable as a method, correctly: extraction is consumption, and consumption is the owning match's job, exhaustiveness-checked where `Unwrap` would fault. `Map`/`AndThen` combinators are deliberately absent in this revision (over owned payloads they need ownership-polymorphic function parameters — the retired-and-deferred territory of spec §14.4).
+`T` and `E` are unconstrained; the `owned` payload markers follow the per-instantiation erasure of language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear): `Result<int, string>` is value-like (Core; copyable; auto-equality-bearing when the payloads are admissible), while `Result<Connection, IoError>` is owning per instantiation (Extended — the move-only row of Appendix D.2). `Result` declares no interface conformances, keeping every instantiation classification-clean. There is no `Unwrap` — a method receives `this` as a borrow (spec [§35.2](Bezel_Language_Spec.md#sec-choice-members)), so an owned-payload extractor is unspellable as a method, correctly: extraction is consumption, and consumption is the owning match's job, exhaustiveness-checked where `Unwrap` would fault. (`UnwrapOr` below is not an extractor and does not disturb this record: it is total — a value-in/value-out fold with no fault path — and exists only at the value-like instantiations, where nothing is consumed.)
+
+**The value-payload combinators (v0.233).** `Map`, `MapError`, `AndThen`, and `UnwrapOr` are **compiler-provided per-instantiation members** (spec [§35.2](Bezel_Language_Spec.md#sec-choice-members)): admissible only where the receiver instantiation **and the member's result instantiation** (`Result<U, E>` for `Map`/`AndThen`, `Result<T, F>` for `MapError`) are both **value-like** (spec [§35.4](Bezel_Language_Spec.md#sec-choice-classification) rule 3 — every payload a value, `string`, runtime-managed type, or transitively value-like record or choice; no payload `owned`, move-only, or borrow-bearing; function-typed payloads are classification-neutral and ride), and rejected at the use site otherwise — a borrow-bearing or owning receiver, or an inferred `U`/`F` that would make the result borrow-bearing or owning (spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) rule 2), the diagnostic naming the classification, the deciding payload, and the owning-match remedy. Semantics: `Map(f)` maps `Ok(v)` to `Ok(f(v))` and passes `Error(e)` through unchanged; `MapError(f)` maps `Error(e)` to `Error(f(e))` and passes `Ok(v)` through; `AndThen(f)` returns `f(v)` on `Ok(v)` and passes `Error(e)` through; `UnwrapOr(fallback)` returns `v` on `Ok(v)` and `fallback` on `Error(_)` — `fallback` is an ordinary, eagerly evaluated argument (there is no lazy `UnwrapOrElse`), and the parameter name is API surface under spec [§22.5](Bezel_Language_Spec.md#sec-optional-parameters-and-named-arguments). The function parameters are plain, hence call-bounded (spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters)) — invoked during the call, never retained — and `U`/`F` infer at the call site (spec [§14.5](Bezel_Language_Spec.md#sec-type-argument-inference) phase 2). None of the four is `pure`: invoking a function-typed value is on the pure body's prohibited list (spec [§22.15](Bezel_Language_Spec.md#sec-pure-members)), and `UnwrapOr` — which invokes nothing and would be pure-eligible — stays plain `method` so the four-member family carries one purity posture rather than a lone `pure` sibling (a uniformity choice, recorded liftable; unlike v0.215's `Contains` ruling, which turned on invoking user equality). The receiver is a borrow; at the admissible instantiations the internal match binds copies (value payloads) or shared references (`string`/runtime-managed payloads), and every result is a fresh copyable value — no disposal obligation arises anywhere in a combinator call, and the combinators declare no fault condition (all four are total; the [§1](#sec-failure-signal-rule) failure-signal rule is engaged vacuously). **Owning instantiations carry none of these members**: an owning `Map` would have to consume the payload through a receiver a method only ever borrows, and its `f` would need per-instantiation ownership polymorphism — the retired-and-deferred territory of spec [§14.4](Bezel_Language_Spec.md#sec-owned-and-generic-type-arguments); the owning idiom remains the owning match (`case owned x of …`; adopt with `using var` in the arm — the connect-or-explain example below).
 
 ```bezel
 // Value-like instantiation (Core): parse outcome with information.
 public method ParsePort(text: string): Result<int, string>
   if not int.TryParse(text, out var value) then
-    return Result<int, string>.Error($"not a number: {text}");
+    return Error($"not a number: {text}");    // declared-result position (spec §35.3)
   end;
   if value < 1 or value > 65535 then
-    return Result<int, string>.Error($"out of range: {value}");
+    return Error($"out of range: {value}");
   end;
-  return Result<int, string>.Ok(value);
+  return Ok(value);
 end ParsePort;
 
 case ParsePort(arg) of
@@ -1034,13 +1181,38 @@ end;                                  // exhaustive; no _ needed
 ```
 
 ```bezel
+// Value-payload pipelines over the combinators (value-like instantiations).
+var port := ParsePort(raw).UnwrapOr(8080);
+
+var label := ParsePort(raw)
+    .Map(lambda(p) => $"listening on {p}")
+    .UnwrapOr($"bad port: {raw}");
+
+// Re-code the error at a boundary (MapError):
+public record ConfigError(Key: string, Message: string);
+
+public method PortSetting(raw: string): Result<int, ConfigError>
+  return ParsePort(raw).MapError(lambda(m) => new ConfigError("port", m));
+end PortSetting;
+
+// Sequence two fallible steps without an intermediate case (AndThen); the
+// ascribed lambda's returns are declared-result positions (spec §35.3):
+public method WellKnownPort(text: string): Result<int, string>
+  return ParsePort(text).AndThen(lambda(n): Result<int, string> => do
+    if n > 1023 then return Error($"not a well-known port: {n}"); end;
+    return Ok(n);
+  end);
+end WellKnownPort;
+```
+
+```bezel
 // Owning instantiation (Extended): connect-or-explain.
 public method Connect(host: string): Result<Connection, string>
   var conn := TryOpen(host);          // illustrative TryOpen(host): owned Connection?
   if conn = null then
-    return Result<Connection, string>.Error($"unreachable: {host}");
+    return Error($"unreachable: {host}");
   end;
-  return Result<Connection, string>.Ok(owned conn);    // owned payload slot: marker consumes
+  return Ok(owned conn);                // owned payload slot: marker consumes (spec §35.3)
 end Connect;
 
 case Connect(host) of                 // owning match over the temporary
@@ -1052,7 +1224,7 @@ case Connect(host) of                 // owning match over the temporary
 end;
 ```
 
-The Try shapes of §1 remain the right tool for value extraction with a boring failure; the `Result` return is where the failure carries information — the two idioms compose (`ParsePort` uses `TryParse` internally and returns a choice).
+The Try shapes of §1 remain the right tool for value extraction with a boring failure; the `Result` return is where the caller branches on the failure and its payload is value-like (the failure-signal rule's band 3, [§1](#sec-failure-signal-rule)) — the two idioms compose (`ParsePort` uses `TryParse` internally and returns a choice).
 
 <a id="sec-system-text-auto-imported"></a>
 ## 3. `System.Text` (auto-imported)
@@ -1211,6 +1383,8 @@ For convenience when comparing against string literals, `IndexOf(value: string)`
 **Prefix and suffix.** `StartsWith(prefix)` returns `true` if the prefix matches the leading portion of the span; `EndsWith(suffix)` is the trailing analog. Both compare code-point-by-code-point — no Unicode normalization, no case folding. For locale-aware or Unicode-equivalent comparison, users go through the dedicated string-comparison APIs ([§9.6](#sec-string)). Each method has both a `ReadOnlyStringSpan` and a `string` overload, mirroring the search methods above.
 
 **Equality.** `SequenceEqual(other)` returns `true` if the two spans have the same length and matching code points at every position. The comparison is pairwise; no normalization or case folding. A `SequenceEqual(other: string)` overload is provided for convenience.
+
+**Empty needles and empty receivers (v0.230).** The empty span or string is a valid needle, with the same vacuous-match conventions as the string family ([§9.6](#sec-string)): `IndexOf` of an empty needle returns `0`; `Contains`, `StartsWith`, and `EndsWith` of an empty needle return `true`; `SequenceEqual` against an empty operand is `true` iff the receiver is itself empty (the length rule above). A **zero-length receiver** is likewise well-defined: it reads no source code point, every non-empty needle is not found (`IndexOf` returns `-1`; `Contains`/`StartsWith`/`EndsWith` return `false`), and the empty needle matches per the conventions above.
 
 **Materialization.** `ToString()` returns a `string` containing the span's code points. If the span covers the entire source string (`Start = 0` and `Length = Source.Length`), implementations may return the source string directly (no copy); otherwise materialization is required (a fresh string is allocated). This is the way to "escape" a span into a plain string when the caller needs to retain the chars beyond the source's lifetime.
 
@@ -1679,6 +1853,8 @@ public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
                                                    //   enables `key in dict`
   public method Remove(key: K): bool;
   public method TryGetValue(key: K, out value: V?): bool;   // v0.171 (#1336): false path assigns null; value-typed V reads as V? at the call site
+  public method GetOrNull(key: K): V?;             // v0.231 (§1 *OrNull tier): absent -> null; present -> the
+                                                   //   value — read semantics and caveat in the prose below
   public method GetOrAdd(key: K, factory: (K) -> V): V;
 
   public method Clear();
@@ -1693,7 +1869,7 @@ public interface IEqualityComparer<T>
 end IEqualityComparer;
 ```
 
-Indexer `dict[key]` raises `KeyNotFoundException` if the key is not present. Use `TryGetValue` for safe lookup. The exception is declared here (v0.182), in `System.Collections.Generic` per the producer-locality rule (language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)); it derives directly from `Exception` — deliberately not from `InvalidOperationException`, so that a state-fault catch arm does not silently swallow missing-key lookups:
+Indexer `dict[key]` raises `KeyNotFoundException` if the key is not present. Use `GetOrNull` (the §1 `*OrNull` tier) or `TryGetValue` for safe lookup. The exception is declared here (v0.182), in `System.Collections.Generic` per the producer-locality rule (language spec [§31.4](Bezel_Language_Spec.md#sec-standard-exception-types)); it derives directly from `Exception` — deliberately not from `InvalidOperationException`, so that a state-fault catch arm does not silently swallow missing-key lookups:
 
 ```bezel
 public class KeyNotFoundException: Exception
@@ -1702,7 +1878,9 @@ public class KeyNotFoundException: Exception
 end KeyNotFoundException;
 ```
 
-The write surface is the indexer and `Add`: `dict[key] := value` inserts the key or updates an existing one (add-or-update), while `Add(key, value)` inserts and raises `ArgumentException` if the key is already present. There is no separate `Set` method — neither here nor on any other collection (`OwningDictionary` in [§4.9](#sec-owneddictionaryk-v) writes through its owned-taking indexer-set `dict[key] := value`, and the array/list/stack/queue types write through their own indexer or `Add`/`Push`/`Enqueue`). A call to a `Set` method on any collection is rejected as an unknown member.
+**`GetOrNull` (v0.231).** The §1 `*OrNull` convenience tier's keyed-lookup form, beside the throwing indexer and the distinguishing `TryGetValue`: `null` when the key is absent, otherwise the value under the family's read semantics — a copy for value-typed `V` and `string`, a borrow of the stored value (source: the receiver) for class-typed `V`. (When the value type is itself nullable, `?` is idempotent under substitution — spec §7.10, v0.159 — so a `GetOrNull` result cannot distinguish "absent" from "a present `null`"; use `ContainsKey` or the `Try` shape when the distinction matters.) At class-typed `V` the borrowed result does not meet an owned fallback through `??` (spec §7.7's `if`/`else`-join meet rule): a borrowed fallback composes, and a fresh fallback binds the result first and null-tests — the direct `??` composition is for value-typed and `string` `V` (`counts.GetOrNull(word) ?? 0`, `config.GetOrNull(key) ?? "default"`).
+
+The write surface is the indexer and `Add`: `dict[key] := value` inserts the key or updates an existing one (add-or-update), while `Add(key, value)` inserts and raises `ArgumentException` if the key is already present. There is no separate `Set` method — neither here nor on any other collection (`OwningDictionary` in [§4.9](#sec-owneddictionaryk-v) writes through its owned-taking indexer-set `dict[key] := value`, and the array/list/stack/queue types write through their own indexer or `Add`/`Push`/`Enqueue`). A call to a `Set` method on any collection is rejected as an unknown member. (A rule about the collections' write surface only, not about the name: a `Set` member elsewhere in the library — e.g. `Environment.Set`, [§2.4](#sec-environment) — is unrelated.)
 
 **Counting and update-in-place (v0.195).** `dict[key] += 1` desugars to a getter plus a setter (spec §6.6/§17.6), and the getter raises `KeyNotFoundException` on an absent key — the compound form updates, it never inserts. The counting idiom initializes explicitly:
 
@@ -1757,6 +1935,17 @@ public class OwningDictionary<K, V>: IDisposable where V: class
   public method Contains(key: K): bool;
   public method Remove(key: K): bool;          // disposes the removed value
   public method TryGetValue(key: K, out value: V?): bool;      // out is borrow; v0.171 (#1336)
+  public method GetOrNull(key: K): V?;                         // v0.231 (§1 *OrNull tier): absent -> null;
+                                                               //   present -> a borrow of the stored value, the
+                                                               //   indexer's get posture — ownership stays with
+                                                               //   the dictionary: a look, not a take (the take
+                                                               //   forms remain PopValue/TryPopValue). where V:
+                                                               //   class makes V statically non-nullable at
+                                                               //   every instantiation (spec §7.10), so null
+                                                               //   means absent, unambiguously. The §4.8 ??
+                                                               //   limit (spec §7.7) applies at every
+                                                               //   instantiation here: an owned fallback never
+                                                               //   meets this borrow
   public method GetOrAdd(key: K, factory: (K) -> owned V): V;  // returns borrow
 
   // Drain
@@ -2817,6 +3006,9 @@ public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>> 
   public method ContainsKey(key: K): bool;
   public method Contains(key: K): bool;         // alias for ContainsKey; enables `key in dict` (§4.8 convention; v0.195)
   public method TryGetValue(key: K, out value: V?): bool;   // v0.171 (#1336): nullable out, matching §4.8's revised uniform Try shape
+  public method GetOrNull(key: K): V?;          // v0.231 (§1 *OrNull tier): absent -> null; present -> the
+                                                //   value under §4.8's read semantics — caveat in the prose
+                                                //   below
   public method Remove(key: K): bool;           // false if absent
   public method Clear();
 
@@ -2825,9 +3017,9 @@ public class SortedDictionary<K, V>: IReadOnlyCollection<DictionaryEntry<K, V>> 
 end SortedDictionary;
 ```
 
-Ordering is defined by `K`'s `IComparable<K>.CompareTo` — there is no separate comparer parameter; a type that needs a different order wraps its key in a record with the desired `CompareTo` (the single-order rule keeps equality, ordering, and hashing in one place, on the type). Two keys are the same key exactly when `CompareTo` returns `0`. Point operations (`[k]`, `ContainsKey`, `TryGetValue`, `Remove`) are **O(log n)**; iteration is **O(n)** in ascending key order and is the single-pass borrowing form of [§4.8](#sec-dictionaryk-v) (`for var e in sd` yields entries with `e.Key`/`e.Value` borrows, one live pass at a time, structural modification during iteration raises `InvalidOperationException`).
+Ordering is defined by `K`'s `IComparable<K>.CompareTo` — there is no separate comparer parameter; a type that needs a different order wraps its key in a record with the desired `CompareTo` (the single-order rule keeps equality, ordering, and hashing in one place, on the type). Two keys are the same key exactly when `CompareTo` returns `0`. Point operations (`[k]`, `ContainsKey`, `TryGetValue`, `GetOrNull`, `Remove`) are **O(log n)**; iteration is **O(n)** in ascending key order and is the single-pass borrowing form of [§4.8](#sec-dictionaryk-v) (`for var e in sd` yields entries with `e.Key`/`e.Value` borrows, one live pass at a time, structural modification during iteration raises `InvalidOperationException`).
 
-Value semantics match `Dictionary<K, V>`: values are copied in and out for value types and `string`, borrowed for class types. There is no owning `OwningSortedDictionary` in this revision — owning sorted collections ride the self-hosted-collections work (changelog, v0.136).
+Value semantics match `Dictionary<K, V>`: values are copied in and out for value types and `string`, borrowed for class types. `GetOrNull` (v0.231) follows the same read semantics. (When the value type is itself nullable, `?` is idempotent under substitution — spec §7.10, v0.159 — so a `GetOrNull` result cannot distinguish "absent" from "a present `null`"; use `ContainsKey` or the `Try` shape when the distinction matters.) There is no owning `OwningSortedDictionary` in this revision — owning sorted collections ride the self-hosted-collections work (changelog, v0.136).
 
 <a id="sec-sorted-set"></a>
 ### 4.18 `SortedSet<T>` (added in v0.136)
@@ -3096,7 +3288,7 @@ The predicate overloads of `First`, `Last`, and `Single` (and their `*OrNull` fo
 
 **Element-level semantics (v0.195).** `Zip` ends when either input ends. `Take`/`Skip` **clamp**: a negative count behaves as `0`, and a count beyond the source takes everything / skips everything — they are range operations, not magnitude constructors, so §1's negative-magnitude fault rule deliberately does not apply. `Distinct` and `Union` yield first occurrences in encounter order (`Union`: first input, then the second); `Intersect` and `Except` yield the retained elements, made distinct, in first-input order.
 
-**`GroupBy` semantics (v0.195).** `GroupBy` is lazy until its first enumeration, then **materializes fully** — no complete group can exist before the source is exhausted, so the operator buffers; its §29.11 consumption of the source happens at that point. Groups appear in first-occurrence-of-key order; elements within a group in source order. Each `IGrouping<TKey, T>` is independently single-consumption (spec §29.11) and remains valid after the outer sequence advances past it. When a group is aggregated more than once, materialize it — `for var g in logs.GroupBy(lambda(r) => r.Level) do using var items := g.ToArray(); … end;` — since `g.Count()` followed by `g.Average(…)` would be a second enumeration of `g`.
+**`GroupBy` semantics (v0.195; single-consumption scoping v0.230).** `GroupBy` is lazy until its first enumeration, then **materializes fully** — no complete group can exist before the source is exhausted, so the operator buffers; its §29.11 consumption of the source happens at that point. Groups appear in first-occurrence-of-key order; elements within a group in source order. Single-consumption (spec §29.11) binds to the **outer** `IEnumerable<IGrouping<TKey, T>>` sequence only — the lazy query here. Each `IGrouping<TKey, T>` is a materialized, ordinarily **re-enumerable** collection whose elements are the grouping's own buffer, and it remains valid after the outer sequence advances past it: `g.Count()` followed by `g.Average(…)` is defined and reads the buffer twice. When a group feeds many aggregations, materializing it once — `for var g in logs.GroupBy(lambda(r) => r.Level) do using var items := g.ToArray(); … end;` — remains the advised shape; it is advice, not a rule.
 
 **`Reverse` (naming note, v0.195).** §5 keeps the .NET-heritage operator names, so the lazy `Reverse()` deliberately sits outside §4.4's imperative-mutates/participle-copies convention — recorded as a decision, not an accident (renaming to `Reversed()` was declined: §4.4's participle promises a fresh owned *copy*, which a lazy sequence is not). No call-site ambiguity arises: on an `Array<T>` receiver, instance resolution commits to the in-place `Reverse()` before extensions are consulted (spec §26.4 rule 1); the lazy operator applies only where the receiver's static type has no instance `Reverse`.
 
@@ -3546,8 +3738,9 @@ All six event types live in `System.Threading` and are always available without 
 See [§30.11](Bezel_Language_Spec.md#sec-taskcompletionsourcet-and-ownedtaskcompletionsourcet) of the language spec.
 
 ```bezel
-// For non-class T (value types, string, runtime-managed reference types).
-// Instantiating with a class T is a compile error pointing to OwningTaskCompletionSource<T>.
+// For non-class T (copyable value types, string, runtime-managed reference types).
+// Instantiating with a class T is a compile error pointing to OwningTaskCompletionSource<T>;
+// a move-only value T is rejected per spec §30.5 (its Task<T> is itself ill-formed).
 public class TaskCompletionSource<T>
   public constructor();
   public readonly property Task: Task<T>;
@@ -3605,14 +3798,16 @@ See [§30.10](Bezel_Language_Spec.md#sec-standard-library-task-helpers) of the l
 
 ```bezel
 public class Task
-  // For non-class T (value types, string, runtime-managed reference types).
-  // For class T, use FromOwnedResult instead.
+  // For non-class T (copyable value types, string, runtime-managed reference types).
+  // For class T, use FromOwnedResult instead; a move-only value T is rejected
+  // per spec §30.5.
   public static method FromResult<T>(value: T): Task<T>;
 
   // For class T. Produces a Pattern B task; awaiters consume under `using var x := await ...`.
   public static method FromOwnedResult<T>(owned value: T): OwningTask<T> where T: class;
 
-  // For any T: a faulted task never produces its result, so the Pattern A vs
+  // For any T over which Task<T> is well-formed (spec §30.5 — move-only value T
+  // is not): a faulted task never produces its result, so the Pattern A vs
   // Pattern B distinction does not apply. `FromException<MyClass>(ex)` is correctly
   // typed as Task<MyClass> even when MyClass is a class type — there is no value
   // to transfer ownership of, only an exception to re-raise on await.
@@ -4270,6 +4465,8 @@ public enum FileAccess: byte
 end FileAccess;
 ```
 
+**Constructor contract (v0.230).** The two-argument constructor implies **`FileAccess.ReadWrite`**: `new FileStream(path, mode)` behaves as `new FileStream(path, mode, FileAccess.ReadWrite)`. A construction that cannot open the file raises the [§7.5](#sec-io-exception-types) types: `FileNotFoundException` when `FileMode.Open` names a file that does not exist, `DirectoryNotFoundException` when a directory component of `path` does not exist, and `IOException` otherwise (an existing file under `FileMode.CreateNew`, a permission failure, and every other OS-level open failure — where the OS reports a too-long path, as [§7.5](#sec-io-exception-types)'s `IOException`-derived `PathTooLongException`).
+
 **Disposal (flush-on-dispose).** Disposing a `FileStream` — at `using var` scope exit or an explicit `Dispose()` — flushes any buffered writes and releases the OS file handle. A `FileStream` opened for writing must be disposed (or explicitly `Flush()`ed) for buffered data to reach the file; the `using var` idiom guarantees this on every exit edge, including exceptions. `FileStream` overrides `ReadAsync`/`WriteAsync` ([§7.1](#sec-stream)) with genuinely asynchronous OS I/O — not the blocking base default.
 
 <a id="sec-file"></a>
@@ -4422,6 +4619,13 @@ public record Int32: IComparable<int>, IEquatable<int>
 
   public static pure method Parse(s: string): int;
   public static method TryParse(s: string, out result: int): bool;
+  public static pure method ParseOrNull(s: string): int?;             // v0.231 (§1 *OrNull tier): null exactly
+                                                                      //   where Parse(s) raises (the
+                                                                      //   FormatException/OverflowException
+                                                                      //   contract); otherwise the parsed
+                                                                      //   value. Same strict input grammar as
+                                                                      //   Parse — no whitespace tolerance
+                                                                      //   (v0.137); string form only
   public static pure method Parse(s: string, radix: int): int;        // radix in {2, 8, 10, 16}; any other
                                                                       //   radix raises ArgumentException — a
                                                                       //   caller bug, not input failure (v0.228 pin)
@@ -4446,7 +4650,7 @@ end Int32;
 
 Records implement `IEquatable<T>` implicitly through the auto-generated equality (language spec [§9.2](Bezel_Language_Spec.md#sec-body-records)): `Equals(other: int): bool` exists on `Int32` and is invoked when calling `someInt.Equals(otherInt)` directly or when an `IEquatable<int>`-constrained generic uses `Equals` through the constraint. The same convention applies to every primitive declaration in [§9.1](#sec-integer-types)–[§9.5](#sec-char).
 
-The span overloads (v0.222, #1810) accept exactly the inputs the string forms accept — same `FormatException`/`OverflowException` contract, no whitespace tolerance (v0.137) — over a `ReadOnlyStringSpan` window without materializing a substring; `TryParse` is shape (c) of the §1 Try convention. `IParsable<T>` (§2.19) is unchanged — the span forms are per-type members, not constraint surface.
+The span overloads (v0.222, #1810) accept exactly the inputs the string forms accept — same `FormatException`/`OverflowException` contract, no whitespace tolerance (v0.137) — over a `ReadOnlyStringSpan` window without materializing a substring; `TryParse` is shape (c) of the §1 Try convention. `IParsable<T>` (§2.19) is unchanged — the span forms are per-type members, not constraint surface. The `ParseOrNull` members (v0.231) are the §1 `*OrNull` convenience tier's parse form — string input only, no radix or span duals — and share the span forms' per-type, non-constraint status.
 
 <a id="sec-double-and-float"></a>
 ### 9.2 `Double` and `Float`
@@ -4469,6 +4673,8 @@ public record Double: IComparable<double>, IEquatable<double>
 
   public static pure method Parse(s: string): double;
   public static method TryParse(s: string, out result: double): bool;
+  public static pure method ParseOrNull(s: string): double?;          // v0.231: null exactly where Parse(s)
+                                                                      //   raises; otherwise the parsed value
   public static pure method Parse(s: ReadOnlyStringSpan): double;                  // v0.222 (#1810): span form
   public static method TryParse(s: ReadOnlyStringSpan, out result: double): bool;
 
@@ -4504,6 +4710,8 @@ public record Float: IComparable<float>, IEquatable<float>
 
   public static pure method Parse(s: string): float;
   public static method TryParse(s: string, out result: float): bool;
+  public static pure method ParseOrNull(s: string): float?;           // v0.231: null exactly where Parse(s)
+                                                                      //   raises; otherwise the parsed value
   public static pure method Parse(s: ReadOnlyStringSpan): float;                   // v0.222 (#1810): span form
   public static method TryParse(s: ReadOnlyStringSpan, out result: float): bool;
 
@@ -4532,6 +4740,8 @@ public record Decimal: IComparable<decimal>, IEquatable<decimal>
 
   public static pure method Parse(s: string): decimal;
   public static method TryParse(s: string, out result: decimal): bool;
+  public static pure method ParseOrNull(s: string): decimal?;         // v0.231: null exactly where Parse(s)
+                                                                      //   raises; otherwise the parsed value
   public static pure method Parse(s: ReadOnlyStringSpan): decimal;                 // v0.222 (#1810): span form
   public static method TryParse(s: ReadOnlyStringSpan, out result: decimal): bool;
 
@@ -4554,6 +4764,9 @@ end Decimal;
 public record Boolean: IEquatable<bool>
   public static pure method Parse(s: string): bool;            // "true"/"false", case-insensitive
   public static method TryParse(s: string, out result: bool): bool;
+  public static pure method ParseOrNull(s: string): bool?;     // v0.231 (§1 *OrNull tier): null exactly
+                                                               //   where Parse(s) raises; otherwise the
+                                                               //   parsed value
 
   public pure method ToString(): string;                       // "True" or "False"
 end Boolean;
@@ -4582,6 +4795,8 @@ public record Char: IComparable<char>, IEquatable<char>
 
   public static pure method Parse(s: string): char;                 // exactly one code point
   public static method TryParse(s: string, out result: char): bool;
+  public static pure method ParseOrNull(s: string): char?;          // v0.231: null exactly where Parse(s)
+                                                                    //   raises; otherwise the parsed value
 
   public pure method ToString(): string;
   public pure method CompareTo(other: char): int;
@@ -4598,6 +4813,7 @@ The most extensive primitive type. `String` is treated as both a primitive (with
 ```bezel
 public class String: IEnumerable<char>, IComparable<string>, IEquatable<string>     // alias: string
   public pure readonly property Length: int;            // number of code points (O(1))
+  public pure readonly property IsEmpty: bool;          // Length = 0 — §3.3's spelling (O(1)) (v0.231)
   public pure readonly property IsAscii: bool;          // true iff every code point < 128 (O(1))
   public pure readonly property [i: int]: char;                  // O(1)
 
@@ -4621,6 +4837,9 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   public pure method Contains(value: char): bool;
   public pure method StartsWith(value: string): bool;
   public pure method EndsWith(value: string): bool;
+                              // Empty needle (v0.230): Contains("") = true; StartsWith("") = true;
+                              //   EndsWith("") = true — the vacuous-match convention of IndexOf("") = 0;
+                              //   the §3.3 span family mirrors the whole set.
   public pure method IndexOf(value: char): int;       // code-point index of first occurrence, or -1 (v0.195)
   public pure method IndexOf(value: string): int;     // -1 when absent; IndexOf("") = 0 (v0.195)
   public pure method IndexOf(value: char, startIndex: int): int;    // v0.215: search from the code-point
@@ -4959,7 +5178,7 @@ end Interop;
 The following standard library modules are anticipated but not specified in this version. Their absence is intentional; the current scope focuses on what the language specification depends on.
 
 - `System.Net` and `System.Net.Http` — networking and HTTP. The language specification's async examples use a hypothetical `HttpClient`; a real one will live here.
-- `System.Text.Json` and `System.Text.Regex` — a general JSON DOM/streaming API and regular expressions. Note this is distinct from the serialization JSON *format agent* (`JsonSerializer`/`JsonDeserializer` in `System.Serialization`, [§2.15](#sec-concrete-serialization-formats)), which is provided: `System.Serialization` maps the [§2.14](#sec-serialization-vocabulary) token stream to and from JSON for whole-value (de)serialization, whereas a future `System.Text.Json` would offer document-tree navigation and ad-hoc querying of arbitrary JSON not driven by a target type. The two are complementary, as they are in other ecosystems that provide both a serializer and a document API.
+- `System.Text.Json` and `System.Text.Regex` — a general JSON DOM/streaming API and regular expressions. Note this is distinct from the serialization JSON *format agent* (`JsonSerializer`/`JsonDeserializer` and the one-shot `Json` facade in `System.Serialization`, [§2.15](#sec-concrete-serialization-formats)), which is provided: `System.Serialization` maps the [§2.14](#sec-serialization-vocabulary) token stream to and from JSON for whole-value (de)serialization, whereas a future `System.Text.Json` would offer document-tree navigation and ad-hoc querying of arbitrary JSON not driven by a target type. The two are complementary, as they are in other ecosystems that provide both a serializer and a document API.
 - `System.Security.Cryptography` — cryptographic primitives.
 - `System.Globalization` — culture-aware formatting and comparison.
 - `System.Reflection` — runtime metadata beyond `typeof` and `GetType`. This splits three ways (rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred)): type-lattice metadata is **delivered** on the `Type` class ([§2.13](#sec-the-type-class), v0.113); member-access reflection is **declined, not deferred**; generic-instantiation decomposition remains deferred, pending an unbound-generic `typeof`.
