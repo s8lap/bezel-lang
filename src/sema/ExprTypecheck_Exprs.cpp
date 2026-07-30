@@ -2892,12 +2892,18 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         // Resolution to the concrete type's operator (or the primitive
         // intrinsic op) happens at instantiation in codegen.
         {
+            // §2.8.2/§11.8 (#2359 bug 2b): the SAME imported-TypeRef gap as
+            // bug 2a — `total`'s exprType (from `var total := T.Zero();`,
+            // resolved through an imported constraint interface) carries no
+            // `astNode`. Read the bare-parameter name via `headName()`
+            // (alias-transparent, falls back to `importedName`) instead of
+            // requiring `astNode` directly, so `total + x` is recognized as
+            // a type-parameter-typed BinaryExpr for a cross-module `T`.
             auto typeParamNameOf = [&](const ast::Expr* e) -> std::string_view {
                 if (!e) return {};
                 const TypeRef* t = ctx_.exprType(*e);
                 if (!t || t->kind != TypeRef::Kind::Named || t->declaration ||
-                    t->nullable || !t->astNode || !t->astNode->name ||
-                    t->astNode->name->parts.size() != 1)
+                    t->nullable || t->headName().empty())
                     return {};
                 std::string_view n = t->headName();
                 return isInScopeTypeParam(n) ? n : std::string_view{};
@@ -2917,6 +2923,14 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                             iop->decl)) {
                         if (od->returnType)
                             resTy = ctx_.resolvedType(*od->returnType);
+                    } else if (ctx_.isImported(iop)) {
+                        // §2.5/§11.8 (#2359 bug 2b): the constraint interface
+                        // itself is imported, so `iop` (its static operator
+                        // member) carries no AST at all (`decl == nullptr`)
+                        // — mirror the `isImported(opm)` fallback above for
+                        // the NAMED-type operator case: read the loader's
+                        // stashed resolved return type keyed on the symbol.
+                        resTy = ctx_.importedReturnType(iop);
                     }
                     if (resTy && resTy->kind == TypeRef::Kind::Named &&
                         !resTy->declaration) {

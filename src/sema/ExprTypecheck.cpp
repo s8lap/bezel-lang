@@ -6141,16 +6141,27 @@ MethodSymbol* ExprTC::findConstraintStaticOperator(std::string_view paramName,
                 if (ms->params.size() != 2) continue;
                 // Both parameters must be the recurrence parameter itself so
                 // the substituted signature is (paramName, paramName).
+                // §2.8.2/§11.8 (#2359 bug 2a): an IMPORTED interface's
+                // operator parameter carries no syntactic `declType` at all
+                // (ModuleLoader::convertParams populates `resolvedDeclType`
+                // instead, since there is no ast::Type to attach) — fall
+                // back to it exactly as the #2294 conformance-check fix
+                // does for imported members elsewhere. Read the bare-
+                // parameter name via the shared alias-transparent
+                // `TypeRef::headName()` (falls back to `importedName` when
+                // `astNode` is null) instead of requiring `astNode`
+                // directly, so an imported bare-type-parameter reference is
+                // recognized rather than unconditionally rejected.
                 bool bothRecur = true;
                 for (Symbol* ps : ms->params) {
                     auto* par = dynamic_cast<ParameterSymbol*>(ps);
-                    TypeRef* pt = (par && par->declType)
-                                      ? ctx_.resolvedType(*par->declType)
-                                      : nullptr;
+                    TypeRef* pt = par ? (par->declType
+                                             ? ctx_.resolvedType(*par->declType)
+                                             : par->resolvedDeclType)
+                                       : nullptr;
                     if (!pt || pt->kind != TypeRef::Kind::Named ||
-                        pt->declaration || pt->nullable || !pt->astNode ||
-                        !pt->astNode->name ||
-                        pt->astNode->name->parts.size() != 1 ||
+                        pt->declaration || pt->nullable ||
+                        pt->headName().empty() ||
                         !ifaceParams.count(pt->headName())) {
                         bothRecur = false;
                         break;

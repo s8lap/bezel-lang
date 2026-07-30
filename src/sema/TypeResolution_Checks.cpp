@@ -3384,8 +3384,22 @@ void Resolver::checkStaticInterfaceConformance() {
         -> TypeRef* {
         if (!d) return d;
         if (d->kind != TypeRef::Kind::Named) return d;
-        if (!d->declaration && d->astNode && d->astNode->name &&
-            d->astNode->name->parts.size() == 1 && d->genericArgs.empty()) {
+        // §2.8.2/§11.8 (#2359 bug 2d): the SAME imported-TypeRef gap as bugs
+        // 2a/2b/2c. `d` is a bare-type-parameter reference substituted here
+        // for BOTH the direct-conformance case and (since 4349fdc) the
+        // ancestor-interface-chain case; when the ancestor interface is
+        // IMPORTED, its own declared return/param TypeRef (e.g. IBase3's
+        // `owned T`, read via `ctx_.importedReturnType`) carries no `astNode`
+        // at all — only `importedName`. The old `astNode`-only guard made
+        // this substitution a silent no-op for an imported ancestor's bare
+        // `T`, so the return type stayed unsubstituted "T" and the
+        // subsequent `typesMatch` comparison against the conforming type's
+        // concrete return spuriously failed ("different signature"). Read
+        // the name via the shared alias-transparent `TypeRef::headName()`
+        // (falls back to `importedName`) instead, matching the fix shape at
+        // the other three sites.
+        if (!d->declaration && !d->headName().empty() &&
+            d->genericArgs.empty()) {
             auto it = map.find(d->headName());
             if (it != map.end() && it->second) {
                 TypeRef* s = it->second;

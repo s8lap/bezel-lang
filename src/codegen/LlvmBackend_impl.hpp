@@ -8574,12 +8574,24 @@ private:
     // #1414 stage 4: const-qualified (pure reads of genericSubstSemaTy_) so the
     // `const` isFreshOwnedClassProducer wrapper can inject it as the shared
     // ownership-facts core's TypeParamResolver hook.
+    // §2.8.2/§11.8 (#2359 bug 2c): a bare type-parameter TypeRef resolved
+    // through an IMPORTED constraint interface (e.g. `T.Zero()`'s return,
+    // or a constraint-static-operator operand, when the interface itself
+    // came from a dependency artifact) carries no `astNode` at all — same
+    // gap as bugs 2a/2b/2d (ModuleLoader's metadata-built TypeRef has only
+    // `importedName`). The old `astNode`-only guard left the param
+    // unresolved for exactly this shape, so the redirect below in
+    // lowerBinary saw `concrete == lt` (unsubstituted) and fell through to
+    // the primitive/placeholder intrinsic path — emitting a raw pointer
+    // `add` on two class-typed operands (malformed IR). Read the name via
+    // the shared alias-transparent `TypeRef::headName()` (falls back to
+    // `importedName`) instead, matching the fix shape used at the sema
+    // sites.
     const sema::TypeRef* resolveTypeParamRef(const sema::TypeRef* ty) const {
         if (!ty || ty->kind != sema::TypeRef::Kind::Named || ty->declaration ||
-            genericSubstSemaTy_.empty() || !ty->astNode || !ty->astNode->name ||
-            ty->astNode->name->parts.size() != 1)
+            genericSubstSemaTy_.empty() || ty->headName().empty())
             return ty;
-        auto it = genericSubstSemaTy_.find(ty->astNode->name->parts[0]);
+        auto it = genericSubstSemaTy_.find(ty->headName());
         if (it != genericSubstSemaTy_.end() && it->second) return it->second;
         return ty;
     }
