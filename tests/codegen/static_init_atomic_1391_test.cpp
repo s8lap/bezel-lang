@@ -142,7 +142,15 @@ std::string sliceEnsureInit(const std::string& ir, const std::string& typeName) 
     // marker's trailing "() {" disambiguates; searching for just `...()`
     // matches the FIRST call site instead and silently slices the calling
     // function's body (found the hard way: #1391 test debugging).
-    std::string marker = "@\"bz$" + typeName + "$ensureinit\"() {";
+    // The `bz$` prefix is deliberately NOT part of the marker: #1488 qualified
+    // every cross-module symbol by its declaring module, so the definition is
+    // now `@"bz$<module>.<Type>$ensureinit"() {` (e.g. `bz$M.Counter$...`) and
+    // a marker anchored at `bz$<Type>` stopped matching — `fn` came back empty
+    // and every assertion below failed at once, which is what a gate caught.
+    // Matching on the `<Type>$ensureinit"() {` tail is robust to the module
+    // qualifier while still being specific to this one function, and still
+    // distinguishes the DEFINITION from a call site via the trailing "() {".
+    std::string marker = typeName + "$ensureinit\"() {";
     auto start = ir.find(marker);
     if (start == std::string::npos) return "";
     auto bodyStart = ir.find('{', start);
