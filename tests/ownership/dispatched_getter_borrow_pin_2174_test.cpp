@@ -62,7 +62,15 @@ BEZEL_TEST(dispatched_getter_borrow_pin_2174,
     JitResult r = runAotChecked(
         std::string(kWidget) +
         "interface IHas "
-        "  property W: Widget; "
+        // `readonly` per §11.2 / §23.3 (#2413): `Owner` below satisfies this
+        // obligation with a getter-only expression-bodied property
+        // (`=> _w`), and a getter-only implementation of a READ-WRITE
+        // interface property is a compile error as of #2413 (it left an
+        // unfillable null itable setter slot — SIGSEGV on write). These
+        // tests only ever READ `W`, so declaring the obligation `readonly`
+        // preserves exactly what they pin (§28.10 borrow pinning through a
+        // dispatched getter) while making the program well-formed.
+        "  readonly property W: Widget; "
         "end IHas; "
         "class Owner: IHas "
         "  private owned _w: Widget; "
@@ -100,7 +108,15 @@ BEZEL_TEST(dispatched_getter_borrow_pin_2174,
     JitResult r = runAotChecked(
         std::string(kWidget) +
         "interface IHas "
-        "  property W: Widget; "
+        // `readonly` per §11.2 / §23.3 (#2413): `Owner` below satisfies this
+        // obligation with a getter-only expression-bodied property
+        // (`=> _w`), and a getter-only implementation of a READ-WRITE
+        // interface property is a compile error as of #2413 (it left an
+        // unfillable null itable setter slot — SIGSEGV on write). These
+        // tests only ever READ `W`, so declaring the obligation `readonly`
+        // preserves exactly what they pin (§28.10 borrow pinning through a
+        // dispatched getter) while making the program well-formed.
+        "  readonly property W: Widget; "
         "end IHas; "
         "class Owner: IHas "
         "  private owned _w: Widget; "
