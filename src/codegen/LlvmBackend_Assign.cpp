@@ -55,20 +55,55 @@ std::size_t indexerParamCount(const sema::PropertySymbol* ps) {
 }
 }  // namespace
 
+// fix #2437 (§11.2/§23.4, v0.235): find `ts`'s indexer whose FULL parameter
+// list — arity AND every parameter type (§23.4: "Indexers may be overloaded
+// by parameter type list") — matches `ifaceIdx`'s. The prior match compared
+// ONLY the first index parameter's type, so an interface obligation
+// `[i:int,j:int]` matched a class's narrower `[i:int]` overload whenever the
+// two shared a first parameter type — confirmed: installed the WRONG getter
+// into the itable slot (the issue's repro returned 77, the `[i:int]`
+// getter's constant, instead of 17 from `[i:int,j:int]`'s `5+i+j`), silently,
+// no diagnostic.
+//
+// There is also no more "fall back to the first indexer found when nothing
+// matches exactly": that fallback was itself an UNBOUNDED version of the
+// same arity-blind defect (it would accept ANY indexer of ANY shape, once no
+// exact match existed, as if it implemented the obligation) — installing a
+// getter/setter whose actual parameter types differ from what an interface
+// caller passes is itable-level type confusion, strictly worse than a null
+// slot (which #2438's sema-side mirror already turns into a compile-time
+// reject rather than letting a mismatched candidate reach codegen at all).
+//
+// Returns null when no member of `ts` matches by full parameter list.
+// `checkAbstractImplementations`'s ifaceIndexerObligations loop (sema,
+// TypeResolution_Checks.cpp) deliberately mirrors this exact selection — see
+// that function's comment for why the two must move together — so a null
+// return here always corresponds to a program sema has already rejected,
+// never a silently-wrong itable install.
+//
+// Scoped to `ts->members` only (no base-class walk): a class satisfying the
+// obligation only through an INHERITED indexer is a separate, independent
+// defect (`findIndexer` never calls `baseClassOf`, unlike its named-property
+// sibling `classPropertyByName`) — filed as #2442, not attempted here.
 const sema::PropertySymbol* Emitter::findIndexer(
-    const sema::TypeSymbol* ts, const sema::TypeRef* argTy) const {
-    const sema::PropertySymbol* first = nullptr;
+    const sema::TypeSymbol* ts, const sema::PropertySymbol* ifaceIdx) const {
+    if (!ts || !ifaceIdx) return nullptr;
+    const std::size_t nparams = indexerParamCount(ifaceIdx);
     for (const sema::Symbol* m : ts->members) {
         auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
         if (!ps || !ps->isIndexer) continue;
-        if (!first) first = ps;
-        if (!argTy) continue;  // no argument type → first indexer (legacy)
-        if (indexerParamCount(ps) == 0) continue;
-        if (indexerArgMatches(indexerParamType(ctx_, ps, 0), argTy))
-            return ps;  // §23.4: the overload whose param type matches the arg
+        if (indexerParamCount(ps) != nparams) continue;
+        bool all = true;
+        for (std::size_t k = 0; k < nparams; ++k) {
+            if (!indexerArgMatches(indexerParamType(ctx_, ps, k),
+                                   indexerParamType(ctx_, ifaceIdx, k))) {
+                all = false;
+                break;
+            }
+        }
+        if (all) return ps;  // §11.2/§23.4: full parameter-list match
     }
-    return first;  // single indexer, or an argument matching no overload
-                   // exactly (e.g. a widening index) → the first indexer
+    return nullptr;
 }
 
 // §23.4 (#1172): select the indexer OVERLOAD for `ix` by its FULL parameter
@@ -2820,18 +2855,14 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
 }
 
 
-// #730 / §13 / §23.4: the class `cls`'s concrete indexer implementing the
-// interface indexer `ifaceIdx`. Indexers are anonymous (all named ".this"), so
-// classPropertyByName can't be used; match by the first index-parameter type
-// via findIndexer (which falls back to the sole indexer when there is one).
+// #730/#2437 / §13 / §11.2 / §23.4: the class `cls`'s concrete indexer
+// implementing the interface indexer `ifaceIdx`. Indexers are anonymous (all
+// named ".this"), so classPropertyByName can't be used; match by FULL
+// parameter list (arity + every parameter type) via findIndexer — see its
+// own comment for the arity-blind defect (#2437) this fixes.
 const sema::PropertySymbol* Emitter::classIndexerImplementing(
     const sema::TypeSymbol* cls, const sema::PropertySymbol* ifaceIdx) {
-    if (!cls || !ifaceIdx) return nullptr;
-    const sema::TypeRef* firstParamTy = nullptr;
-    if (auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ifaceIdx->decl))
-        if (!ipd->indexerParams.empty() && ipd->indexerParams[0].type)
-            firstParamTy = ctx_.resolvedType(*ipd->indexerParams[0].type);
-    return findIndexer(cls, firstParamTy);
+    return findIndexer(cls, ifaceIdx);
 }
 
 

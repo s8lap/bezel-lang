@@ -3311,14 +3311,23 @@ private:
                                              bool srcUnsigned = false,
                                              bool sourceIsNullableRef = false);
 
-    // §22.10 / §23.4: find the indexer PropertySymbol on a TypeSymbol, if any.
-    // When `argTy` is non-null, select the OVERLOAD (#774) whose first
-    // parameter type matches the index argument's type, falling back to the
-    // first indexer found (single-indexer types, and index types that match no
-    // overload exactly, keep their existing behavior).
+    // §11.2 / §23.4 (#2437, v0.235): the indexer PropertySymbol declared on
+    // `ts` whose FULL parameter list (arity AND every parameter type, §23.4:
+    // "Indexers may be overloaded by parameter type list") matches interface
+    // indexer `ifaceIdx`'s. Replaces the prior first-parameter-only match
+    // (#774), which was arity-blind: it matched a `[i:int,j:int]` obligation
+    // against a narrower `[i:int]` overload whenever the two shared a first
+    // parameter type (confirmed: silently installed the wrong getter).
+    // Returns null when no member matches — never a partial/best-effort
+    // candidate: `checkAbstractImplementations` (sema,
+    // TypeResolution_Checks.cpp) mirrors this exact selection, so null here
+    // always corresponds to a compile-time reject, never a silently-wrong
+    // itable install. Scoped to `ts`'s own members only — a candidate
+    // reachable only through an inherited indexer is a separate, filed gap
+    // (#2442), not attempted here.
     const sema::PropertySymbol* findIndexer(
         const sema::TypeSymbol* ts,
-        const sema::TypeRef* argTy = nullptr) const;
+        const sema::PropertySymbol* ifaceIdx) const;
 
     // §23.4 (#1172): select the indexer OVERLOAD for the access `ix` by its
     // FULL parameter list — the candidate's parameter count must equal the
@@ -3328,9 +3337,11 @@ private:
     // per-argument coercion at the call site). Candidates are gathered over the
     // receiver type and its base types (an inherited indexer is a valid
     // candidate), mirroring the sema selector in ExprTypecheck_Exprs.cpp.
-    // Returns null when no candidate's arity matches. Unlike findIndexer (which
-    // keys only on the first parameter, #774), this never drops or mis-binds
-    // later index arguments.
+    // Returns null when no candidate's arity matches. Unlike findIndexer
+    // (matched against a fixed interface indexer's DECLARED parameter list
+    // for §11.2 conformance, with no implicit-conversion fallback), this
+    // selects against a real call site's ARGUMENT expressions and accepts an
+    // arity-only match for implicit conversion at the call.
     const sema::PropertySymbol* selectIndexer(
         const sema::TypeSymbol* ts, const ast::IndexExpr& ix) const;
 
@@ -3512,8 +3523,9 @@ private:
     llvm::Function* ensureIndexerSetterFn(const sema::TypeSymbol* cls,
                                           const sema::PropertySymbol* ps);
 
-    // #730: the class `cls`'s concrete indexer that implements the interface
-    // indexer `ifaceIdx` (matched by first index-param type via findIndexer).
+    // #730/#2437: the class `cls`'s concrete indexer that implements the
+    // interface indexer `ifaceIdx`, matched by FULL parameter list via
+    // findIndexer.
     const sema::PropertySymbol* classIndexerImplementing(
         const sema::TypeSymbol* cls, const sema::PropertySymbol* ifaceIdx);
 

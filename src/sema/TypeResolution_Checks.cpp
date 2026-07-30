@@ -3694,27 +3694,32 @@ void Resolver::checkAbstractImplementations() {
         // property whose name is replaced by `[parameters]`").
         //
         // MATCHING (the hard part): indexers are anonymous, and §23.4 admits
-        // overloading by index-parameter type list, so — unlike a plain
-        // property, matched by name — the obligation must be paired with a
-        // concrete candidate by parameter shape. The candidate this check
-        // selects is not a fresh §11.2 full-parameter-list matcher; it
+        // overloading by index-parameter type list ("Indexers may be
+        // overloaded by parameter type list"), so — unlike a plain property,
+        // matched by name — the obligation must be paired with a concrete
+        // candidate by parameter shape. The candidate this check selects is
+        // not a fresh, independent §11.2 full-parameter-list matcher; it
         // deliberately MIRRORS the exact selection codegen's own
-        // `classIndexerImplementing` (LlvmBackend_Assign.cpp) uses to fill
-        // the itable slot: `t`'s OWN indexer members only (no base-class
-        // walk — `findIndexer` never calls `baseClassOf`), matched by the
-        // interface indexer's FIRST index-parameter type, falling back to
-        // the first-declared indexer when no exact match is found. A
-        // "more correct" full-parameter-list-under-substitution matcher (the
-        // §11.2 rule `checkOverrideSignatureMatch`'s indexer branch
-        // implements for the OVERRIDE case, ~line 2556 above) was considered
-        // and rejected: it could select a DIFFERENT candidate than codegen's
-        // actual (weaker) selection on an overloaded indexer set — sema
-        // would then validate the accessor set of a candidate codegen never
-        // installs, which is worse than doing nothing (a false ACCEPT of the
-        // exact SIGSEGV shape this check exists to close). Mirroring the
-        // real dispatch is what makes the check sound; that codegen
-        // selection is itself arity-blind for an overloaded indexer set is a
-        // separate, pre-existing gap — filed as #2437, not fixed here.
+        // `classIndexerImplementing`/`findIndexer` (LlvmBackend_Assign.cpp)
+        // uses to fill the itable slot, so sema never accepts a candidate
+        // codegen would not itself install (a false ACCEPT of the exact
+        // SIGSEGV shape this check exists to close — see #2417's own commit
+        // for why an independent, "more correct" matcher was considered and
+        // rejected).
+        //
+        // #2437 / §11.2 / §23.4 (v0.235): matching is by the interface
+        // indexer's FULL parameter list — arity AND every parameter type —
+        // not just the first. The prior first-parameter-only match matched a
+        // `[i:int,j:int]` obligation against a class's narrower `[i:int]`
+        // overload whenever the two shared a first parameter type
+        // (confirmed: installed the wrong getter, silently returning a value
+        // from the WRONG indexer — the issue's own repro). There is also no
+        // more "fall back to the first-declared indexer when nothing matches
+        // exactly": that fallback was an UNBOUNDED version of the same
+        // arity-blind defect (it would accept ANY indexer of ANY shape as
+        // "the implementation" once no exact match existed). `candidate ==
+        // nullptr` after a full search is now the sole, correctly-scoped "no
+        // implementation" condition — see the `!candidate` branch below.
         //
         // Local-only, per #2413's confirmed scope: `ips->decl` is null for
         // an IMPORTED interface indexer (ModuleLoader reconstructs
@@ -3742,10 +3747,10 @@ void Resolver::checkAbstractImplementations() {
         // extra machinery.
         //
         // #2438 / §11.2 / §23.4: this loop ALSO reports when `t` provides no
-        // matching indexer AT ALL (candidate stays null even after the
-        // first-declared fallback) — the more severe sibling #2417 itself
-        // deferred: `classIndexerImplementing` returns null in that shape,
-        // so `declareVtables` Pass D installs `ConstantPointerNull` in the
+        // matching indexer AT ALL (candidate stays null after the full
+        // search) — the more severe sibling #2417 itself deferred:
+        // `classIndexerImplementing` returns null in that shape, so
+        // `declareVtables` Pass D installs `ConstantPointerNull` in the
         // GETTER slot too, not just the setter (confirmed by probe: a plain
         // READ SIGSEGVs, exit 139, even for a `readonly` obligation — the
         // getter-only-vs-read-write branch below never even runs in that
@@ -3782,7 +3787,7 @@ void Resolver::checkAbstractImplementations() {
         // change (teaching `findIndexer`/`classIndexerImplementing` to walk
         // `baseClassOf`, mirroring what `classPropertyByName` already does
         // for named properties) — filed as #2442, separate from this
-        // sema-side reject and from #2437's sibling arity-blindness gap.
+        // sema-side reject and from #2437's own fix here.
         // #2442 landing would make this reject a false one for that specific
         // shape; the two are cross-referenced so they get revisited
         // together.
@@ -3792,12 +3797,16 @@ void Resolver::checkAbstractImplementations() {
             if (!ipd) continue;  // imported interface indexer — left to a
                                   // future #2406-shaped fix, same as ifaceProps
 
-            const TypeRef* firstParamTy = nullptr;
-            if (!ipd->indexerParams.empty() && ipd->indexerParams[0].type)
-                firstParamTy = resolvedOf(ipd->indexerParams[0].type.get());
+            const std::size_t nparams = ipd->indexerParams.size();
+            auto ifaceParamTy = [&](std::size_t k) -> TypeRef* {
+                return (k < ipd->indexerParams.size() &&
+                        ipd->indexerParams[k].type)
+                           ? resolvedOf(ipd->indexerParams[k].type.get())
+                           : nullptr;
+            };
 
+            // #2437: full parameter-list match — see the block comment above.
             PropertySymbol* candidate = nullptr;
-            PropertySymbol* firstDeclared = nullptr;
             for (Symbol* m : t->members) {
                 auto* cps = dynamic_cast<PropertySymbol*>(m);
                 if (!cps || !cps->isIndexer) continue;
@@ -3805,20 +3814,24 @@ void Resolver::checkAbstractImplementations() {
                 for (auto mod : cps->modifiers)
                     if (mod == "static") { isStaticIdx = true; break; }
                 if (isStaticIdx) continue;
-                if (!firstDeclared) firstDeclared = cps;
-                if (!firstParamTy) continue;
                 auto* cpd = dynamic_cast<const ast::PropertyDecl*>(cps->decl);
-                if (!cpd || cpd->indexerParams.empty() ||
-                    !cpd->indexerParams[0].type)
-                    continue;
-                const TypeRef* candTy =
-                    resolvedOf(cpd->indexerParams[0].type.get());
-                if (candTy && typeRefEqual(firstParamTy, candTy)) {
-                    candidate = cps;
-                    break;
+                if (!cpd) continue;  // `t` is always LOCAL — see note above
+                if (cpd->indexerParams.size() != nparams) continue;
+                bool all = true;
+                for (std::size_t k = 0; k < nparams; ++k) {
+                    TypeRef* pty = (k < cpd->indexerParams.size() &&
+                                    cpd->indexerParams[k].type)
+                                       ? resolvedOf(
+                                             cpd->indexerParams[k].type.get())
+                                       : nullptr;
+                    TypeRef* ity = ifaceParamTy(k);
+                    if (!pty || !ity || !typeRefEqual(pty, ity)) {
+                        all = false;
+                        break;
+                    }
                 }
+                if (all) { candidate = cps; break; }
             }
-            if (!candidate) candidate = firstDeclared;
 
             if (!candidate) {
                 // #2438: no non-static indexer of any shape declared
