@@ -898,91 +898,704 @@ llvm::GlobalVariable* Emitter::staticFieldGlobal(const ast::Expr& e) {
         bool allConcrete = std::all_of(substIds.begin(), substIds.end(),
                                        [](const void* id) { return id != nullptr; });
         if (!substTypes.empty() && allConcrete) {
-            // #738: include the recursive type-arg mangle in the key so nested
-            // instantiations (Counter<Box<int>> vs Counter<Box<string>>), which
-            // share llvm type `ptr` AND the per-declaration `Box` identity token,
-            // resolve to DISTINCT per-instantiation globals (§22.12).
-            auto key = std::make_pair(
-                static_cast<const sema::Symbol*>(fs),
-                std::make_pair(std::make_pair(substTypes, substIds),
-                               typeArgMangle));
-            auto git = genericInstStaticGlobals_.find(key);
-            if (git != genericInstStaticGlobals_.end()) return git->second;
-
-            // First access for this (field, instantiation) pair — check
-            // staticGlobals_ has the template-level global so we can copy its
-            // type and initializer.
-            auto baseIt = staticGlobals_.find(fs);
-            if (baseIt == staticGlobals_.end()) return nullptr;
-            llvm::GlobalVariable* base = baseIt->second;
-
-            // Name: bz$Counter$int$n — insert the type-arg mangle between
-            // the class name and the field name.
-            std::string cls = fs->parent ? std::string(fs->parent->name) : "";
-            std::string fname = std::string(fs->name);
-            std::string gname = "bz$" + cls + "$" + typeArgMangle + "$" + fname;
-
-            // Create the per-instantiation global with the correct concrete type.
-            //
-            // §22.12 / #1116: the template-level global's LLVM type was lowered
-            // from the field's UNSPECIALIZED type in declareStatics (no active
-            // substitution there), so e.g. `owned T?` (T class-constrained) maps
-            // to the placeholder {i8,i32} nullable-value-struct instead of the
-            // concrete `ptr` for T=Cell.  Storing a class reference (ptr) into a
-            // {i8,i32} global then loading it as {i8,i32} silently miscompiles
-            // the pointer — the null-check reads the pointer's low byte (zero for
-            // any heap-aligned alloc) as the hasValue tag, and the unwrapped
-            // "value" is a 32-bit fragment of the address.  Recompute the
-            // concrete LLVM type by temporarily installing the type-arg
-            // substitution and calling lowerType, mirroring how a monomorphized
-            // method body would see the field.  Per §22.12 / §28.5.
-            llvm::Type* instTy = base->getValueType();
-            auto* fieldDecl = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-            if (fieldDecl &&
-                substSemaTys.size() == fs->parent->genericParams.size()) {
-                auto savedSubst     = std::move(genericSubst_);
-                auto savedSubstSema = std::move(genericSubstSemaTy_);
-                for (std::size_t i = 0; i < fs->parent->genericParams.size(); ++i) {
-                    genericSubst_[fs->parent->genericParams[i]->name] =
-                        substTypes[i];
-                    if (substSemaTys[i])
-                        genericSubstSemaTy_[fs->parent->genericParams[i]->name] =
-                            substSemaTys[i];
-                }
-                instTy = lowerType(fieldDecl->type.get());
-                genericSubst_     = std::move(savedSubst);
-                genericSubstSemaTy_ = std::move(savedSubstSema);
-            }
-            //
-            // §22.12 / #684: for an imported generic, the template-level global
-            // is an external declaration created in declareStatics with nullptr
-            // initializer (ExternalLinkage, no definition here). Calling
-            // base->getInitializer() on such a global asserts in LLVM because
-            // external declarations have no initializer. Use zero-init for the
-            // per-instantiation copy; each importing module owns its own
-            // InternalLinkage instance (per §22.12 "each distinct instantiation
-            // has its own static state"). Any non-trivial constant initializer
-            // only occurs for locally-defined generics (non-imported), where
-            // base->hasInitializer() is always true.
-            // When instTy differs from base->getValueType() (e.g. ptr vs
-            // {i8,i32}), the base's typed initializer cannot be reused — use a
-            // fresh null of the concrete type instead.
-            llvm::Constant* instInit =
-                (instTy == base->getValueType() && base->hasInitializer())
-                    ? base->getInitializer()
-                    : llvm::Constant::getNullValue(instTy);
-            auto* gv = new llvm::GlobalVariable(
-                *module_, instTy, /*isConstant=*/false,
-                llvm::GlobalValue::InternalLinkage,
-                instInit,
-                gname);
-            genericInstStaticGlobals_[key] = gv;
-            return gv;
+            return getOrCreateGenericInstStaticGlobal(
+                fs, substTypes, substIds, substSemaTys, typeArgMangle);
         }
     }
 
     auto it = staticGlobals_.find(fs);
     return it == staticGlobals_.end() ? nullptr : it->second;
+}
+
+
+// #1513 / §2.8.3 rule 4 / §2.8.4 rule 5: get-or-create the SHARED, LinkOnceODR,
+// per-instantiation static-field global for `fs` under substitution
+// (substTypes, substIds, substSemaTys, typeArgMangle) — the exact redirect
+// condition/key staticFieldGlobal's generic branch computes. Factored out (of
+// what used to be inline in staticFieldGlobal) so genericInstSfinitFn can also
+// materialize a SIBLING field's per-instantiation global: one instantiation has
+// ONE ensureinit covering every static field of that instantiation, mirroring
+// the per-type design where one ensureinit covers a whole type's fields.
+llvm::GlobalVariable* Emitter::getOrCreateGenericInstStaticGlobal(
+        const sema::FieldSymbol* fs,
+        const std::vector<llvm::Type*>& substTypes,
+        const std::vector<const void*>& substIds,
+        const std::vector<const sema::TypeRef*>& substSemaTys,
+        const std::string& typeArgMangle) {
+    // #738: include the recursive type-arg mangle in the key so nested
+    // instantiations (Counter<Box<int>> vs Counter<Box<string>>), which
+    // share llvm type `ptr` AND the per-declaration `Box` identity token,
+    // resolve to DISTINCT per-instantiation globals (§22.12).
+    auto key = std::make_pair(
+        static_cast<const sema::Symbol*>(fs),
+        std::make_pair(std::make_pair(substTypes, substIds), typeArgMangle));
+    auto git = genericInstStaticGlobals_.find(key);
+    if (git != genericInstStaticGlobals_.end()) {
+        // #1513: refresh the instantiation bookkeeping even on a cache hit — a
+        // SIBLING field may be the first to need genericInstArgsOf_ (touched
+        // later than this field), and genericInstGlobalKeyOf_ is consulted at
+        // every static-access call site to route to the right ensureinit.
+        if (fs->parent) {
+            GenericInstKey ik{fs->parent, typeArgMangle};
+            genericInstArgsOf_[ik] = GenericInstArgs{substTypes, substIds,
+                                                      substSemaTys};
+            genericInstGlobalKeyOf_[git->second] = ik;
+        }
+        return git->second;
+    }
+
+    // First access for this (field, instantiation) pair — check
+    // staticGlobals_ has the template-level global so we can copy its
+    // type and initializer.
+    auto baseIt = staticGlobals_.find(fs);
+    if (baseIt == staticGlobals_.end()) return nullptr;
+    llvm::GlobalVariable* base = baseIt->second;
+
+    // #1513 / §2.8.3 rule 3: module-qualify the class component via #1488's
+    // mangledTypeName ("<declaring-module>.<TypeName>") — required now that
+    // this global is LinkOnceODR (below): two DIFFERENT modules each
+    // declaring an unrelated generic class of the same bare name (two
+    // libraries each declaring `public class Reg<T>`, say) must not
+    // collide/merge just because both instantiate `<int>`. (An EARLIER
+    // revision of this fix, written before rebasing onto the main that
+    // carries #1488, used the bare name here as a documented interim step;
+    // now that #1488's TypeSymbol::moduleName / Emitter::mangledTypeName are
+    // available, use them directly — mirrors every other cross-module symbol
+    // #1488 already qualifies.)
+    // Name: bz$GBase.Reg$int$Hits — insert the type-arg mangle between the
+    // module-qualified class name and the field name.
+    std::string cls = mangledTypeName(fs->parent);
+    std::string fname = std::string(fs->name);
+    std::string gname = "bz$" + cls + "$" + typeArgMangle + "$" + fname;
+
+    // Create the per-instantiation global with the correct concrete type.
+    //
+    // §22.12 / #1116: the template-level global's LLVM type was lowered
+    // from the field's UNSPECIALIZED type in declareStatics (no active
+    // substitution there), so e.g. `owned T?` (T class-constrained) maps
+    // to the placeholder {i8,i32} nullable-value-struct instead of the
+    // concrete `ptr` for T=Cell.  Storing a class reference (ptr) into a
+    // {i8,i32} global then loading it as {i8,i32} silently miscompiles
+    // the pointer — the null-check reads the pointer's low byte (zero for
+    // any heap-aligned alloc) as the hasValue tag, and the unwrapped
+    // "value" is a 32-bit fragment of the address.  Recompute the
+    // concrete LLVM type by temporarily installing the type-arg
+    // substitution and calling lowerType, mirroring how a monomorphized
+    // method body would see the field.  Per §22.12 / §28.5.
+    llvm::Type* instTy = base->getValueType();
+    auto* fieldDecl = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+    if (fieldDecl && fs->parent &&
+        substSemaTys.size() == fs->parent->genericParams.size()) {
+        auto savedSubst     = std::move(genericSubst_);
+        auto savedSubstSema = std::move(genericSubstSemaTy_);
+        for (std::size_t i = 0; i < fs->parent->genericParams.size(); ++i) {
+            genericSubst_[fs->parent->genericParams[i]->name] =
+                substTypes[i];
+            if (substSemaTys[i])
+                genericSubstSemaTy_[fs->parent->genericParams[i]->name] =
+                    substSemaTys[i];
+        }
+        instTy = lowerType(fieldDecl->type.get());
+        genericSubst_     = std::move(savedSubst);
+        genericSubstSemaTy_ = std::move(savedSubstSema);
+    }
+    //
+    // §22.12 / #684: for an imported generic, the template-level global
+    // is an external declaration created in declareStatics with nullptr
+    // initializer (ExternalLinkage, no definition here). Calling
+    // base->getInitializer() on such a global asserts in LLVM because
+    // external declarations have no initializer. Use zero-init for the
+    // per-instantiation copy — every module that touches this instantiation
+    // computes the SAME zero-init deterministically (ODR-safe to merge, next).
+    // Any non-trivial constant initializer only occurs for locally-defined
+    // generics (non-imported), where base->hasInitializer() is always true.
+    // When instTy differs from base->getValueType() (e.g. ptr vs
+    // {i8,i32}), the base's typed initializer cannot be reused — use a
+    // fresh null of the concrete type instead.
+    llvm::Constant* instInit =
+        (instTy == base->getValueType() && base->hasInitializer())
+            ? base->getInitializer()
+            : llvm::Constant::getNullValue(instTy);
+    // #1513 / §2.8.3 rule 4 / §2.8.4 rule 5: LinkOnceODR (not Internal) — "a
+    // process contains exactly ONE copy of ... each type's ... static state
+    // ... exactly one runtime identity ... regardless of how many compilations
+    // emitted code for the type." Before this fix each importing module's
+    // independent compilation created its OWN InternalLinkage `bz$Reg$int$Hits`
+    // — two private, never-synchronized copies (§1513's "0/0, not even 1/1"
+    // repro: neither copy is ever the ONE process-wide instance the runtime
+    // initializer described below actually populates). ODR-safety: `instInit`
+    // is deterministic from (fs, the concrete substitution) alone — every
+    // consuming module's independently-compiled copy lowers the SAME field
+    // declaration under the SAME substTypes to the SAME instTy/instInit, so
+    // the merge is byte-identical (never an arbitrary pick among differing
+    // definitions — the §2.8.3 rule 4 closing sentence's "duplicate code
+    // copies ... permitted only where observationally indistinguishable"
+    // requirement). The address stays significant (no unnamed_addr) — mirrors
+    // the btd$<name> LinkOnceODR precedent above: every reader must land on
+    // the SAME storage, not merely an equal-valued copy.
+    auto* gv = new llvm::GlobalVariable(
+        *module_, instTy, /*isConstant=*/false,
+        llvm::GlobalValue::LinkOnceODRLinkage,
+        instInit,
+        gname);
+    genericInstStaticGlobals_[key] = gv;
+    if (fs->parent) {
+        GenericInstKey ik{fs->parent, typeArgMangle};
+        genericInstArgsOf_[ik] = GenericInstArgs{substTypes, substIds,
+                                                  substSemaTys};
+        genericInstGlobalKeyOf_[gv] = ik;
+    }
+    return gv;
+}
+
+
+// #1513 / §22.13: lazily build (once per instantiation, LinkOnceODR) the
+// "sfinit" function that stores every one of `ts`'s non-constant static field
+// initializers into instantiation `typeArgMangle`'s per-instantiation globals
+// — the generic-instantiation counterpart of emitStaticConstructorBody's field
+// loop (LlvmBackend_Setup.cpp, the "fix #582 / §22.13" loop), duplicated rather
+// than reused because that function assumes a LOCAL, single-compilation-unit
+// type and targets the TEMPLATE-level staticGlobals_ storage; this one targets
+// the per-instantiation globals and is itself LinkOnceODR so every consumer's
+// independently-compiled copy converges on ONE definition, matching
+// getOrCreateGenericInstStaticGlobal's linkage above. T-independent
+// initializers only (mirrors the #709 loop's own limitation: an initializer
+// whose VALUE depends on the instantiation's type argument needs per-
+// instantiation lowering that is not yet supported — tracked exactly like the
+// existing local-generic limitation, not a new gap this fix introduces).
+llvm::Function* Emitter::genericInstSfinitFn(const sema::TypeSymbol* ts,
+                                             const std::string& typeArgMangle) {
+    GenericInstKey key{ts, typeArgMangle};
+    auto cached = genericInstSfinitFns_.find(key);
+    if (cached != genericInstSfinitFns_.end()) return cached->second;
+
+    // #1513: matches getOrCreateGenericInstStaticGlobal's naming choice above
+    // — module-qualified via #1488's mangledTypeName.
+    std::string base = mangledTypeName(ts) + "$" + typeArgMangle;
+    auto* voidFnTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(
+        voidFnTy, llvm::GlobalValue::LinkOnceODRLinkage,
+        "bz$" + base + "$sfinit", module_.get());
+    genericInstSfinitFns_[key] = fn;
+
+    // This runs LAZILY, mid-emission of whatever body first touched this
+    // instantiation's static state (e.g. while lowering an inlined generic
+    // method's body) — unlike the per-type sfinit, which the top-level
+    // declareStaticInitializers/run() pipeline builds before any method body
+    // is emitted. Save the FULL caller context and restore it below, mirroring
+    // LlvmBackend_Calls2.cpp's specialized-method-body lazy-build save/restore.
+    llvm::Function* savedFn = currentFn_;
+    llvm::BasicBlock* savedInsert = builder_.GetInsertBlock();
+    llvm::Value* savedThis = currentThis_;
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    auto savedRef = refParams_;
+    auto savedOutOwned = outOwnedRecipients_;
+    auto savedDispose = disposeStack_;
+    auto savedLoop = loopStack_;
+    auto savedFinally = finallyStack_;
+    llvm::BasicBlock* savedProp = propagateBB_;
+    llvm::BasicBlock* savedUnwind = unwindTarget_;
+    llvm::Value* savedCaught = currentCaughtExc_;
+    std::string_view savedCaughtName = currentCaughtName_;
+    std::size_t savedUnwindDepth = unwindScopeDepth_;
+    bool savedDiverged = diverged_;
+    const ast::Type* savedRetNode = currentReturnTypeNode_;
+    auto savedSubst = genericSubst_;
+    auto savedSubstSema = genericSubstSemaTy_;
+
+    // Fresh per-function state, mirroring emitStaticConstructorBody's reset.
+    currentFn_ = fn;
+    currentReturnTypeNode_ = nullptr;
+    currentThis_ = nullptr;
+    locals_.clear();
+    paramSlots_.clear();
+    refParams_.clear();
+    outOwnedRecipients_.clear();
+    disposeStack_.clear();
+    loopStack_.clear();
+    finallyStack_.clear();
+    propagateBB_ = nullptr;
+    unwindTarget_ = nullptr;
+    currentCaughtExc_ = nullptr;
+    currentCaughtName_ = {};
+    unwindScopeDepth_ = 0;
+    diverged_ = false;
+
+    // Install this instantiation's type-parameter substitution — every field
+    // initializer below lowers under it (mirrors staticFieldGlobal's #1116
+    // instTy recomputation / getOrCreateGenericInstStaticGlobal above).
+    auto argsIt = genericInstArgsOf_.find(key);
+    genericSubst_.clear();
+    genericSubstSemaTy_.clear();
+    if (argsIt != genericInstArgsOf_.end() &&
+        argsIt->second.substTypes.size() == ts->genericParams.size()) {
+        for (std::size_t i = 0; i < ts->genericParams.size(); ++i) {
+            genericSubst_[ts->genericParams[i]->name] =
+                argsIt->second.substTypes[i];
+            if (argsIt->second.substSemaTys[i])
+                genericSubstSemaTy_[ts->genericParams[i]->name] =
+                    argsIt->second.substSemaTys[i];
+        }
+    }
+
+    // §22.7 / §22.13: mirror emitStaticConstructorBody's propagate-block
+    // preamble — any exception escaping the field initializers below is
+    // wrapped in TypeInitializationException before returning, so
+    // genericInstEnsureInitFn (which calls this function as an opaque callee,
+    // exactly like emitEnsureInitFns calls the per-type sfinit) can rely on
+    // bz_exc already holding a TIE on the failure path.
+    auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    builder_.SetInsertPoint(entryBB);
+    propagateBB_ = llvm::BasicBlock::Create(llvm_, "sinit.propagate", fn);
+    {
+        auto* savedInsertLocal = builder_.GetInsertBlock();
+        builder_.SetInsertPoint(propagateBB_);
+        llvm::Value* origExc = builder_.CreateLoad(ptrTy(), emitExcSlot());
+        auto vit = builtinVtable_.find("TypeInitializationException");
+        if (vit != builtinVtable_.end()) {
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            auto* retBB     = llvm::BasicBlock::Create(llvm_, "sinit.prop.ret",  fn);
+            auto* notNullBB = llvm::BasicBlock::Create(llvm_, "sinit.prop.nn",   fn);
+            auto* wrapBB    = llvm::BasicBlock::Create(llvm_, "sinit.prop.wrap", fn);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                origExc, llvm::ConstantPointerNull::get(ptrTy()));
+            builder_.CreateCondBr(isNull, retBB, notNullBB);
+
+            builder_.SetInsertPoint(notNullBB);
+            llvm::Value* vt = builder_.CreateLoad(ptrTy(), origExc);
+            llvm::Value* isTie = builder_.CreateICmpEQ(vt, vit->second);
+            builder_.CreateCondBr(isTie, retBB, wrapBB);
+
+            builder_.SetInsertPoint(wrapBB);
+            llvm::Value* tie = builder_.CreateCall(
+                callocFn(),
+                {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
+            builder_.CreateStore(vit->second, tie);
+            llvm::Value* innerSlot = builder_.CreateGEP(
+                i8Ty, tie, builder_.getInt64(kExcInnerOffset));
+            builder_.CreateStore(origExc, innerSlot);
+            builder_.CreateStore(tie, emitExcSlot());
+            builder_.CreateBr(retBB);
+
+            builder_.SetInsertPoint(retBB);
+            builder_.CreateRetVoid();
+        } else {
+            builder_.CreateRetVoid();
+        }
+        builder_.SetInsertPoint(savedInsertLocal);
+    }
+
+    // Store this instantiation's non-constant static field initializers into
+    // the per-instantiation globals, in textual declaration order (§22.13).
+    //
+    // #1513 fix (a regression the gate caught, corrected here): this loop
+    // USED TO discover fields by scanning genericInstStaticGlobals_ for
+    // entries already created for (ts, typeArgMangle) — but that map only
+    // contains whichever field(s) staticFieldGlobal had ALREADY redirected by
+    // the moment this sfinit function is lazily built (on the FIRST touch of
+    // ANY field of this instantiation, which caches the ensureinit/sfinit
+    // pair for every SUBSEQUENT touch too). A generic class with TWO static
+    // fields accessed in the same expression — e.g. `Mixed<int>.literal * 100
+    // + Mixed<int>.computed` — touches `literal` first, which lazily builds
+    // (and closes over) sfinit's body seeing ONLY `literal`'s entry;
+    // `computed`'s per-instantiation global is created moments later by its
+    // OWN access, but genericInstSfinitFn has already been finalized and
+    // cached, so `computed`'s initializer is silently never stored — exactly
+    // the "the non-constant field's initializer never runs" shape the gate's
+    // canary (codegen_generic_static_nonconst_init_709 /
+    // codegen_generic_static_sameclass_715, run alongside another producer
+    // touching the same file) exposed. Iterating ts->members instead
+    // discovers EVERY static field of the type upfront, regardless of touch
+    // order, and getOrCreateGenericInstStaticGlobal below materializes each
+    // one's per-instantiation global on demand (idempotent — a cache hit for
+    // a field some OTHER access already redirected, a fresh creation
+    // otherwise), closing the gap.
+    //
+    // Identity note: for a LOCALLY-declared generic (this loop's only
+    // currently-supported case with a non-null fs2->decl, see the KNOWN GAP
+    // below), ts->members holds the EXACT SAME FieldSymbol objects
+    // declareStatics()/staticGlobals_ and every staticFieldGlobal redirect
+    // are keyed by — SymbolCollection populates both from the one AST, no
+    // reconstruction involved. For an IMPORTED generic, ts->members'
+    // FieldSymbol objects come straight from ModuleLoader's metadata
+    // reconstruction (the SAME objects staticGlobals_'s importedSymbols()
+    // loop above uses) — also consistent identity; the KNOWN GAP below is
+    // about decl being null for an import, a property of the FieldSymbol
+    // itself, not an identity mismatch between collections.
+    //
+    // #1513 KNOWN GAP (tracked, not silently dropped — see the follow-up
+    // filed alongside this fix): fs2->decl is null for every field reached
+    // through an IMPORTED TypeSymbol. Field metadata
+    // (ModuleMetadataBuilder::convertMember, "Static fields are exported as
+    // EXTERNAL storage globals... they need no valueText here") never
+    // carried the initializer EXPRESSION text across the artifact boundary —
+    // only ctorBodyText/methodBodyText exist for that (§14/#662c, §14.1/
+    // #783). So for an imported field this loop finds the entry but
+    // fd/fd->initializer below are null and the store is skipped — the
+    // per-instantiation global stays at its getOrCreateGenericInstStaticGlobal
+    // zero-init. Consequence: the LINKAGE half of #1513 is fixed here (one
+    // shared global, one shared guard, process-wide — verified: two
+    // importers write/read the SAME storage), but a generic static's field
+    // INITIALIZER only actually runs when the field is first touched from
+    // the DECLARING module's own compilation (or, for a mutable field,
+    // whenever any module first WRITES a real value into it) — exactly like
+    // a same-module generic, where fs2->decl is populated and this loop's
+    // store fires (verified). Closing this fully needs a metadata extension
+    // mirroring ctorBodyText/methodBodyText for a generic class's static
+    // field initializers; filed as a follow-up.
+    std::vector<std::pair<int, std::pair<const sema::FieldSymbol*,
+                                         llvm::GlobalVariable*>>> ordered;
+    for (const sema::Symbol* m : ts->members) {
+        auto* fs2 = dynamic_cast<const sema::FieldSymbol*>(m);
+        if (!fs2 || !isStaticField(fs2)) continue;
+        llvm::GlobalVariable* instGV2 = getOrCreateGenericInstStaticGlobal(
+            fs2,
+            argsIt != genericInstArgsOf_.end() ? argsIt->second.substTypes
+                                                : std::vector<llvm::Type*>{},
+            argsIt != genericInstArgsOf_.end() ? argsIt->second.substIds
+                                                : std::vector<const void*>{},
+            argsIt != genericInstArgsOf_.end()
+                ? argsIt->second.substSemaTys
+                : std::vector<const sema::TypeRef*>{},
+            typeArgMangle);
+        if (!instGV2) continue;  // no template-level global — nothing to init
+        ordered.push_back({staticFieldInitIndex(fs2), {fs2, instGV2}});
+    }
+    std::stable_sort(ordered.begin(), ordered.end(),
+                     [](const auto& a, const auto& b) {
+                         return a.first < b.first;
+                     });
+    for (auto& [idx, entry] : ordered) {
+        const sema::FieldSymbol* fs2 = entry.first;
+        llvm::GlobalVariable* instGV = entry.second;
+        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs2->decl);
+        if (!fd || !fd->initializer) continue;
+        const ast::Expr* initExpr = fd->initializer.get();
+        if (isBakedStaticFieldInit(fs2, initExpr)) continue;
+
+        // #1513: collection-literal / inline-array static initializers are NOT
+        // yet supported on the cross-module per-instantiation path (mirrors
+        // the T-independent-only scope note above) — left zero-initialized
+        // rather than risk a malformed store. A follow-up can extend this loop
+        // exactly as emitStaticConstructorBody's #709 loop does for the local-
+        // generic path, if/when a real case needs it.
+        if (dynamic_cast<const ast::CollectionLiteralExpr*>(initExpr)) continue;
+
+        llvm::Value* val = lowerExpr(*initExpr);
+        if (!val) continue;
+        // #1116 guard, mirrors the #709 loop's getValueType() check: a
+        // T-DEPENDENT initializer whose value type doesn't match this
+        // instantiation's field type is skipped rather than mis-stored.
+        if (val->getType() != instGV->getValueType()) continue;
+        builder_.CreateStore(val, instGV);
+        // §22.13 (#1212): register an owned class/interface field for
+        // program-exit disposal, exactly as emitStaticConstructorBody's #709
+        // loop does. This runs exactly once (the guard in
+        // genericInstEnsureInitFn ensures this whole function's body executes
+        // exactly once process-wide), so registration cannot double-fire.
+        if (isOwnedReferenceField(fs2) || isOwnedBuiltinExceptionField(fs2)) {
+            auto* regFn = declareC("bz_register_static_owned",
+                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(regFn, {val});
+        }
+    }
+    builder_.CreateRetVoid();
+
+    // --- Restore the caller's context ---
+    currentFn_ = savedFn;
+    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals);
+    paramSlots_ = std::move(savedParams);
+    refParams_ = std::move(savedRef);
+    outOwnedRecipients_ = std::move(savedOutOwned);
+    disposeStack_ = std::move(savedDispose);
+    loopStack_ = std::move(savedLoop);
+    finallyStack_ = std::move(savedFinally);
+    propagateBB_ = savedProp;
+    unwindTarget_ = savedUnwind;
+    currentCaughtExc_ = savedCaught;
+    currentCaughtName_ = savedCaughtName;
+    unwindScopeDepth_ = savedUnwindDepth;
+    diverged_ = savedDiverged;
+    currentReturnTypeNode_ = savedRetNode;
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSubstSema);
+
+    return fn;
+}
+
+
+// #1513 / #1391 / §22.12 rule 1 / §22.13: lazily build (once per instantiation,
+// LinkOnceODR) the ensureinit function for generic type `ts`'s instantiation
+// `typeArgMangle` — the generic-instantiation counterpart of emitEnsureInitFns,
+// now brought to FULL parity with that function's #1391 hardening (atomic CAS
+// + cross-domain blocking), per owner review: this guard's state is
+// LinkOnceODR (genuinely shared cross-domain, unlike a per-process-private
+// state), so a racing double-init here is REACHABLE, not theoretical, and
+// §22.12 rule 1 ("a type's static initializer runs exactly once process-wide
+// ... blocks until initialization completes") applies to it exactly as it
+// does to the per-type case below.
+//
+// The guard's state/exc/owner globals are LinkOnceODR + module-and-
+// instantiation-qualified (matching getOrCreateGenericInstStaticGlobal's
+// static-STATE globals above), so the GUARD and the STATE it guards are
+// deduplicated by the SAME linker merge — avoiding the "one shared state cell
+// but two independent init flags" failure mode (each importer's own guard
+// independently deciding to run the shared sfinit against an already-
+// initialized shared cell — an ABA-style double-init that would silently
+// violate §22.12 rule 1's "exactly once" in a NEW way even after the state
+// global itself was fixed).
+//
+// bz_static_init_wait/notify (bezel_runtime_concurrency.cpp) are keyed by the
+// STATE GLOBAL'S OWN ADDRESS in a process-wide registry (not by TypeSymbol or
+// any compile-time identity) — this instantiation's LinkOnceODR `stateGV`
+// merges to one address process-wide exactly like the per-type case's, so
+// reusing the SAME wait/notify pair here (no new runtime entry points needed)
+// is correct with no further plumbing: every domain touching THIS
+// instantiation, in any importing module, resolves to the SAME registry entry.
+llvm::Function* Emitter::genericInstEnsureInitFn(
+        const sema::TypeSymbol* ts, const std::string& typeArgMangle) {
+    GenericInstKey key{ts, typeArgMangle};
+    auto cached = genericInstEnsureInitFns_.find(key);
+    if (cached != genericInstEnsureInitFns_.end()) return cached->second;
+
+    // #1513: matches getOrCreateGenericInstStaticGlobal's naming choice above
+    // — module-qualified via #1488's mangledTypeName.
+    std::string base = mangledTypeName(ts) + "$" + typeArgMangle;
+    auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+
+    auto* stateGV = new llvm::GlobalVariable(
+        *module_, i8Ty, /*isConstant=*/false,
+        llvm::GlobalValue::LinkOnceODRLinkage,
+        llvm::ConstantInt::get(i8Ty, 0), "bz$" + base + "$initstate");
+    auto* excGV = new llvm::GlobalVariable(
+        *module_, ptrTy(), /*isConstant=*/false,
+        llvm::GlobalValue::LinkOnceODRLinkage,
+        llvm::ConstantPointerNull::get(ptrTy()), "bz$" + base + "$initexc");
+    // #1391 / §22.13 (v0.181): owner-thread tracking — the per-instantiation
+    // counterpart of emitEnsureInitFns's ownerTidGV, same role: set (plain
+    // store — same-thread-scoped use only, matching the per-type comment) by
+    // whichever thread's CAS wins the uninit->in-progress claim, read back to
+    // tell a same-thread re-entrant touch from a genuine cross-domain one.
+    auto* ownerTidGV = new llvm::GlobalVariable(
+        *module_, i64(), /*isConstant=*/false,
+        llvm::GlobalValue::LinkOnceODRLinkage,
+        llvm::ConstantInt::get(i64(), 0), "bz$" + base + "$initowner");
+    genericInstInitStateGV_[key] = stateGV;
+    genericInstInitExcGV_[key] = excGV;
+    genericInstInitOwnerGV_[key] = ownerTidGV;
+
+    llvm::Function* sfinitFn = genericInstSfinitFn(ts, typeArgMangle);
+
+    // #1391: the same process-wide runtime entry points emitEnsureInitFns
+    // uses — declareC is idempotent (module_->getFunction lookup first), so
+    // whichever of the two functions runs first in a given compilation just
+    // wins the declaration; both resolve to the SAME external symbol either
+    // way (bezel_runtime_concurrency.cpp defines each exactly once).
+    llvm::Function* tidFn = declareC("bz_current_thread_id", i64(), {});
+    llvm::Function* waitFn =
+        declareC("bz_static_init_wait", i8Ty, {ptrTy()});
+    llvm::Function* notifyFn =
+        declareC("bz_static_init_notify", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+
+    auto* voidFnTy = llvm::FunctionType::get(
+        llvm::Type::getVoidTy(llvm_), {}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(
+        voidFnTy, llvm::GlobalValue::LinkOnceODRLinkage,
+        "bz$" + base + "$ensureinit", module_.get());
+    genericInstEnsureInitFns_[key] = fn;
+
+    llvm::Function* savedFn = currentFn_;
+    auto* savedInsert = builder_.GetInsertBlock();
+
+    currentFn_ = fn;
+    // Block layout mirrors emitEnsureInitFns exactly (entry/chkfail/tryclaim/
+    // chkold/chkoldfail/chksame/crosswait/doinit/setfail/setdone/reraise/ret).
+    auto* entry        = llvm::BasicBlock::Create(llvm_, "entry",      fn);
+    auto* chkFailed     = llvm::BasicBlock::Create(llvm_, "chkfail",    fn);
+    auto* tryClaim      = llvm::BasicBlock::Create(llvm_, "tryclaim",   fn);
+    auto* chkOld        = llvm::BasicBlock::Create(llvm_, "chkold",     fn);
+    auto* chkOldFailed  = llvm::BasicBlock::Create(llvm_, "chkoldfail", fn);
+    auto* chkSameThread = llvm::BasicBlock::Create(llvm_, "chksame",    fn);
+    auto* crossWait     = llvm::BasicBlock::Create(llvm_, "crosswait",  fn);
+    auto* initB         = llvm::BasicBlock::Create(llvm_, "doinit",     fn);
+    auto* failB         = llvm::BasicBlock::Create(llvm_, "setfail",    fn);
+    auto* doneB         = llvm::BasicBlock::Create(llvm_, "setdone",    fn);
+    auto* reraiseB      = llvm::BasicBlock::Create(llvm_, "reraise",    fn);
+    auto* retB          = llvm::BasicBlock::Create(llvm_, "ret",        fn);
+
+    // entry: fast DONE check — atomic ACQUIRE load, pairs with the RELEASE
+    // stores in doneB/failB (#1391) so a domain observing state==2 also
+    // observes every static-field write sfinit performed before that release.
+    builder_.SetInsertPoint(entry);
+    llvm::LoadInst* sLI = builder_.CreateLoad(i8Ty, stateGV, "state");
+    sLI->setAlignment(llvm::Align(1));
+    sLI->setAtomic(llvm::AtomicOrdering::Acquire);
+    llvm::Value* s = sLI;
+    llvm::Value* isDone =
+        builder_.CreateICmpEQ(s, llvm::ConstantInt::get(i8Ty, 2));
+    builder_.CreateCondBr(isDone, retB, chkFailed);
+
+    builder_.SetInsertPoint(chkFailed);
+    llvm::Value* isFailed =
+        builder_.CreateICmpEQ(s, llvm::ConstantInt::get(i8Ty, 3));
+    builder_.CreateCondBr(isFailed, reraiseB, tryClaim);
+
+    // tryclaim: #1391 pattern — the UNINIT/IN-PROGRESS cases collapse to a
+    // single atomic compare-exchange (0->1, strong, AcquireRelease-on-success
+    // / Acquire-on-failure), closing the TOCTOU race a plain "load; if==0,
+    // store 1" pair would have: two domains racing to first-touch this SAME
+    // instantiation could otherwise both observe state==0 and both run
+    // genericInstSfinitFn's function — a double-init, and (for an owned
+    // field) a double bz_register_static_owned call. At most one domain's CAS
+    // observes old==0 and wins (becomes the sole initializer, initB); every
+    // other domain's CAS necessarily fails and dispatches on the ACTUAL
+    // current value (never stale), exactly like the done/failed checks above.
+    builder_.SetInsertPoint(tryClaim);
+    llvm::Value* zero8 = llvm::ConstantInt::get(i8Ty, 0);
+    llvm::Value* one8  = llvm::ConstantInt::get(i8Ty, 1);
+    llvm::AtomicCmpXchgInst* cas = builder_.CreateAtomicCmpXchg(
+        stateGV, zero8, one8, llvm::MaybeAlign(1),
+        llvm::AtomicOrdering::AcquireRelease,
+        llvm::AtomicOrdering::Acquire);
+    llvm::Value* won = builder_.CreateExtractValue(cas, 1, "cas.won");
+    builder_.CreateCondBr(won, initB, chkOld);
+
+    builder_.SetInsertPoint(chkOld);
+    llvm::Value* old = builder_.CreateExtractValue(cas, 0, "cas.old");
+    llvm::Value* oldDone =
+        builder_.CreateICmpEQ(old, llvm::ConstantInt::get(i8Ty, 2));
+    builder_.CreateCondBr(oldDone, retB, chkOldFailed);
+
+    builder_.SetInsertPoint(chkOldFailed);
+    llvm::Value* oldFailed =
+        builder_.CreateICmpEQ(old, llvm::ConstantInt::get(i8Ty, 3));
+    builder_.CreateCondBr(oldFailed, reraiseB, chkSameThread);
+
+    // chksame: old==1 (in-progress). §22.12 rule 1 / #1391: a SAME-thread
+    // re-entrant touch (this instantiation's own initializer, transitively,
+    // touching itself again — e.g. one static field's initializer reading a
+    // sibling static of the SAME instantiation) proceeds immediately; a
+    // genuine CROSS-domain touch on a DIFFERENT thread BLOCKS.
+    builder_.SetInsertPoint(chkSameThread);
+    llvm::Value* ownerTidLoad =
+        builder_.CreateLoad(i64(), ownerTidGV, "cw.owner");
+    llvm::Value* curTid = builder_.CreateCall(tidFn, {}, "cw.self");
+    llvm::Value* sameThread = builder_.CreateICmpEQ(ownerTidLoad, curTid);
+    builder_.CreateCondBr(sameThread, retB, crossWait);
+
+    // crosswait: genuine cross-domain touch of an in-progress init — BLOCK
+    // (§22.12 rule 1's second clause) until the owning thread's initializer
+    // completes or fails, via bz_static_init_wait. The returned state is
+    // always terminal (2 or 3); the wait loop never returns 1.
+    builder_.SetInsertPoint(crossWait);
+    llvm::Value* waited = builder_.CreateCall(waitFn, {stateGV}, "cw.state");
+    llvm::Value* waitedFailed =
+        builder_.CreateICmpEQ(waited, llvm::ConstantInt::get(i8Ty, 3));
+    builder_.CreateCondBr(waitedFailed, reraiseB, retB);
+
+    // doinit: state is already 1 (the winning CAS above set it); record the
+    // owner thread (plain store — same-thread-scoped use only, matching the
+    // per-type comment), then run sfinit with the same pre/post bz_exc
+    // snapshot discipline as before.
+    builder_.SetInsertPoint(initB);
+    builder_.CreateStore(builder_.CreateCall(tidFn, {}, "owntid"), ownerTidGV);
+    llvm::Value* preExc = builder_.CreateLoad(ptrTy(), emitExcSlot(), "gi.preexc");
+    builder_.CreateCall(sfinitFn, {});
+    llvm::Value* postExc = builder_.CreateLoad(ptrTy(), emitExcSlot(), "gi.postexc");
+    llvm::Value* thrown = builder_.CreateICmpNE(preExc, postExc);
+    builder_.CreateCondBr(thrown, failB, doneB);
+
+    builder_.SetInsertPoint(doneB);
+    // #1391: RELEASE store — publishes every static-field write sfinit just
+    // performed together with the state transition, so another domain's
+    // Acquire-ordered observation of state==2 is guaranteed to see the
+    // completed initialization, not a torn or reordered view.
+    {
+        llvm::StoreInst* doneSI =
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 2), stateGV);
+        doneSI->setAlignment(llvm::Align(1));
+        doneSI->setAtomic(llvm::AtomicOrdering::Release);
+    }
+    // #1391: wake any thread parked in bz_static_init_wait for this
+    // instantiation — MUST come after the release store and before return.
+    builder_.CreateCall(notifyFn, {stateGV});
+    builder_.CreateBr(retB);
+
+    // setfail: bz_exc holds the TypeInitializationException genericInstSfinitFn's
+    // own propagate block already wrapped. Save the INNER (original) exception —
+    // not the TIE itself, whose heap block a catch-arm disposer may reclaim —
+    // mirroring emitEnsureInitFns's failB exactly.
+    builder_.SetInsertPoint(failB);
+    llvm::Value* tie0 = builder_.CreateLoad(ptrTy(), emitExcSlot());
+    llvm::Value* inner0 = builder_.CreateLoad(
+        ptrTy(), builder_.CreateGEP(i8Ty, tie0, builder_.getInt64(kExcInnerOffset)));
+    builder_.CreateStore(inner0, excGV);
+    // #1391: RELEASE store, same rationale as doneB — publishes the excGV
+    // write just above (and the failed state itself) to any domain that
+    // later observes state==3 via an Acquire load or bz_static_init_wait.
+    {
+        llvm::StoreInst* failSI =
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 3), stateGV);
+        failSI->setAlignment(llvm::Align(1));
+        failSI->setAtomic(llvm::AtomicOrdering::Release);
+    }
+    // #1391: wake any waiter — an initializer that THREW still must publish
+    // the failed state to every blocked cross-domain waiter, or they would
+    // block forever.
+    builder_.CreateCall(notifyFn, {stateGV});
+    builder_.CreateBr(retB);
+
+    // reraise: failed state — wrap a FRESH TypeInitializationException around
+    // the saved original each time (a reclaimed prior TIE must never be
+    // re-raised), mirroring emitEnsureInitFns's failedB exactly. Reached both
+    // from the fast chkfail path (state was already 3) and from crosswait
+    // (bz_static_init_wait returned 3) — both leave excGV already populated
+    // (by whichever domain's failB ran first), so both wrap the SAME saved
+    // inner exception.
+    builder_.SetInsertPoint(reraiseB);
+    llvm::Value* savedInner = builder_.CreateLoad(ptrTy(), excGV);
+    auto tieVit = builtinVtable_.find("TypeInitializationException");
+    if (tieVit != builtinVtable_.end()) {
+        llvm::Value* tie = builder_.CreateCall(
+            callocFn(), {builder_.getInt64(1), builder_.getInt64(kExcObjSize)});
+        builder_.CreateStore(tieVit->second, tie);
+        builder_.CreateStore(
+            savedInner,
+            builder_.CreateGEP(i8Ty, tie, builder_.getInt64(kExcInnerOffset)));
+        builder_.CreateStore(tie, emitExcSlot());
+    } else {
+        builder_.CreateStore(savedInner, emitExcSlot());
+    }
+    builder_.CreateBr(retB);
+
+    builder_.SetInsertPoint(retB);
+    builder_.CreateRetVoid();
+
+    currentFn_ = savedFn;
+    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+    return fn;
+}
+
+
+// #1513 / §22.13: emit a call to the per-instantiation ensureinit for `key`
+// (found via genericInstGlobalKeyOf_ from a global staticFieldGlobal
+// returned), then route a possible TypeInitializationException through the
+// current unwind target — the generic-instantiation counterpart of
+// emitEnsureStaticInit(TypeSymbol*); same pre/post bz_exc snapshot so a
+// PRE-EXISTING in-flight exception (e.g. an unwind touching this instantiation
+// mid-propagation) is never misattributed to this access.
+void Emitter::emitEnsureGenericInstStaticInit(const GenericInstKey& key) {
+    llvm::Function* fn = genericInstEnsureInitFn(key.first, key.second);
+    llvm::Value* preExc =
+        builder_.CreateLoad(ptrTy(), emitExcSlot(), "gsi.preexc");
+    builder_.CreateCall(fn, {});
+    llvm::Value* postExc =
+        builder_.CreateLoad(ptrTy(), emitExcSlot(), "gsi.postexc");
+    emitPendingCheckIf(builder_.CreateICmpNE(preExc, postExc, "gsi.raised"));
 }
 
 
@@ -17904,9 +18517,37 @@ void Emitter::setupBoxDescriptors() {
         const char* nm = primBoxName(p);
         if (!nm || primBoxDesc_.count(nm)) continue;
         auto* descTy = llvm::ArrayType::get(ptrTy(), 2);
+        // #2301 / §2.8.3 rule 4 / §8.6 / §28.9: LinkOnceODR (not Internal) —
+        // every compilation unit previously minted its OWN private `ptd$int`
+        // (etc.); §2.8.3 rule 4 wants ONE runtime type identity program-wide,
+        // and two InternalLinkage copies are two distinct addresses. ODR-
+        // safety: the initializer is `{self, null}` — deterministic and
+        // identical in every module (a compiler-fixed primitive name, not a
+        // user declaration, so no cross-module name collision risk either;
+        // mirrors the btd$<name> LinkOnceODR precedent above). The address
+        // stays significant (no unnamed_addr) — every reader must land on the
+        // SAME storage.
+        //
+        // VERIFICATION NOTE (honest, not a closure claim): applying ONLY this
+        // linkage change and re-running #2301's own repro (LibX.MakeBox/
+        // TakeBox boxing/testing `int` across two artifacts) still prints
+        // `0|1|0`, not the expected `1|1|1` — confirmed via `nm` that both
+        // objects now emit `ptd$int` as `V` (weak/ODR, merges at link) and the
+        // link succeeds with no duplicate-definition error, so THIS specific
+        // descriptor is provably deduplicated — yet the observable symptom is
+        // UNCHANGED. This means #2301 has at least one MORE component beyond
+        // ptd$<prim> linkage (the box's construction path, or emitIsA's
+        // comparison for this exact shape, does not yet route through the
+        // now-shared descriptor the way the issue's diagnosis predicted) — the
+        // box VTABLE (pvt$<nm>, below) stays InternalLinkage per the issue's
+        // own suggested fix (only slot [0] should matter), which did not
+        // change the outcome either. Left in as a necessary-but-INSUFFICIENT,
+        // spec-correct step (§2.8.3 rule 4 is unambiguous that two identity
+        // copies are wrong regardless), with a follow-up filed for the
+        // residual — see this commit's message / the tracker.
         auto* desc = new llvm::GlobalVariable(
             *module_, descTy, /*isConstant=*/true,
-            llvm::GlobalValue::InternalLinkage, nullptr,
+            llvm::GlobalValue::LinkOnceODRLinkage, nullptr,
             std::string("ptd$") + nm);
         desc->setInitializer(llvm::ConstantArray::get(
             descTy, {desc, llvm::ConstantPointerNull::get(ptrTy())}));

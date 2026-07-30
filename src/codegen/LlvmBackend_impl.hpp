@@ -580,6 +580,57 @@ private:
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> sfinitFnOf_;
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> cctorFnOf_;
 
+    // #1513 / §2.8.3 rule 4 / §22.12 rule 1: cross-module per-INSTANTIATION lazy
+    // static init for a generic class's static state — the generic-instantiation
+    // counterpart of the ensureInitFns_/initStateGV_ family above, keyed by
+    // (generic TypeSymbol*, recursive type-arg mangle) instead of by type alone.
+    // A generic's static state is per-instantiation (§22.12: "each distinct
+    // instantiation has its own static state"), and — the specific gap #1513
+    // closes — one instantiation (e.g. `Reg<int>`) may be independently
+    // monomorphized by SEVERAL importing modules' separate compilations
+    // (§2.8.2's definition-site visibility re-monomorphizes carried generic
+    // bodies at each consumer). The guard, its state, and the state it guards
+    // are all named "<declaring-module>.<Class>$<mangle>$..." (mangledTypeName
+    // + the SAME typeArgMangle genericInstStaticGlobals_ already uses) and
+    // linked LinkOnceODR, so every consumer's independently-compiled, byte-
+    // identical copy converges on ONE runtime definition, ONE state cell, and
+    // ONE execution — §2.8.4 rule 5's "one copy per process" applied to
+    // generic-instantiation state. (Deliberately mirrors, rather than reuses,
+    // the per-type FSM in emitEnsureInitFns/emitStaticConstructorBody: those
+    // functions assume a LOCAL, single-compilation-unit type and are not
+    // parameterized by instantiation; duplicating the (proven) pattern here
+    // keeps that delicate, heavily-fixed per-type path untouched.)
+    using GenericInstKey = std::pair<const sema::TypeSymbol*, std::string>;
+    // The type-argument substitution for one instantiation, recorded the first
+    // time ANY of its static fields is touched (staticFieldGlobal's redirect)
+    // and reused when genericInstSfinitFn later needs to lower a SIBLING
+    // field's initializer under the same substitution.
+    struct GenericInstArgs {
+        std::vector<llvm::Type*> substTypes;
+        std::vector<const void*> substIds;
+        std::vector<const sema::TypeRef*> substSemaTys;
+    };
+    std::map<GenericInstKey, GenericInstArgs> genericInstArgsOf_;
+    std::map<GenericInstKey, llvm::Function*> genericInstSfinitFns_;
+    std::map<GenericInstKey, llvm::Function*> genericInstEnsureInitFns_;
+    std::map<GenericInstKey, llvm::GlobalVariable*> genericInstInitStateGV_;
+    std::map<GenericInstKey, llvm::GlobalVariable*> genericInstInitExcGV_;
+    // #1513 / #1391 / §22.12 rule 1: per-instantiation owner-thread global —
+    // the per-instantiation counterpart of initOwnerGV_ above, recorded by
+    // whichever thread's CAS wins the 0(uninit)->1(in-progress) claim in
+    // genericInstEnsureInitFn, so a same-thread re-entrant touch (proceed) can
+    // be told apart from a genuine cross-domain touch (block via
+    // bz_static_init_wait) exactly as emitEnsureInitFns does for the per-type
+    // case.
+    std::map<GenericInstKey, llvm::GlobalVariable*> genericInstInitOwnerGV_;
+    // Reverse lookup: a per-instantiation static-field global (as returned by
+    // staticFieldGlobal) to the (type, typeArgMangle) key that owns it, so a
+    // static-access call site can find/build the right ensureinit function
+    // without re-deriving the generic-instantiation key from the AST a second
+    // time (staticFieldGlobal's own Path A / Path B logic already computed it).
+    std::unordered_map<llvm::GlobalVariable*, GenericInstKey>
+        genericInstGlobalKeyOf_;
+
     // CG11: enclosing-loop branch targets for `break`/`continue` (§A.6).
     // `continue` jumps to `continueTarget` (the loop's condition block),
     // `break` to `breakTarget` (the loop's exit block). Innermost loop is
@@ -6387,6 +6438,52 @@ private:
     // TypeInitializationException through the current unwind target. No-op for a
     // type without lazy static state (generic types, types with no static init).
     void emitEnsureStaticInit(const sema::TypeSymbol* owner);
+
+    // #1513 / §2.8.3 rule 4 / §22.12 rule 1: get-or-create the shared,
+    // LinkOnceODR, per-instantiation static-field global for `fs` under the
+    // substitution described by (substTypes, substIds, substSemaTys,
+    // typeArgMangle) — the SAME redirect condition/key staticFieldGlobal's
+    // generic branch already computes. Factored out so genericInstSfinitFn can
+    // materialize a SIBLING field's per-instantiation global (one instantiation
+    // has ONE ensureinit covering every static field of that instantiation,
+    // mirroring the per-type design where one ensureinit covers a whole type).
+    llvm::GlobalVariable* getOrCreateGenericInstStaticGlobal(
+        const sema::FieldSymbol* fs,
+        const std::vector<llvm::Type*>& substTypes,
+        const std::vector<const void*>& substIds,
+        const std::vector<const sema::TypeRef*>& substSemaTys,
+        const std::string& typeArgMangle);
+
+    // #1513: lazily build (once per instantiation, LinkOnceODR) the "sfinit"
+    // function that stores every one of `ts`'s non-constant static field
+    // initializers into instantiation `typeArgMangle`'s per-instantiation
+    // globals. T-independent initializers only (mirrors the #709 loop's
+    // limitation in emitStaticConstructorBody — an initializer whose VALUE
+    // depends on the instantiation's type argument needs per-instantiation
+    // lowering that is not yet supported, tracked as a follow-up exactly like
+    // the existing local-generic limitation).
+    llvm::Function* genericInstSfinitFn(const sema::TypeSymbol* ts,
+                                        const std::string& typeArgMangle);
+
+    // #1513 / #1391: lazily build (once per instantiation, LinkOnceODR) the
+    // ensureinit function for generic type `ts`'s instantiation
+    // `typeArgMangle` — the generic-instantiation counterpart of
+    // emitEnsureInitFns's per-type functions, at FULL parity with that
+    // function's #1391 hardening: an atomic cmpxchg for the uninit->
+    // in-progress claim, same-thread owner-tracking for the re-entrancy
+    // backstop, and genuine cross-domain blocking (bz_static_init_wait/
+    // notify) — required because this guard's state is LinkOnceODR (shared
+    // across domains for real), so a racing double-init is reachable here
+    // exactly as it is for the per-type case.
+    llvm::Function* genericInstEnsureInitFn(const sema::TypeSymbol* ts,
+                                            const std::string& typeArgMangle);
+
+    // #1513: emit a call to the per-instantiation ensureinit for `key` (looked
+    // up via genericInstGlobalKeyOf_ from a global staticFieldGlobal returned),
+    // then route a possible TypeInitializationException through the current
+    // unwind target — the generic-instantiation counterpart of
+    // emitEnsureStaticInit(TypeSymbol*).
+    void emitEnsureGenericInstStaticInit(const GenericInstKey& key);
 
     // #1553 / §22.13 (v0.181): the ordinal of `fs` among its type's non-constant
     // static-field initializers in textual declaration order (the sequence sfinit

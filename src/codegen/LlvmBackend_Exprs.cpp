@@ -4383,12 +4383,22 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // fields have no instance slot, so fieldAddr misses; read the
         // backing global directly.
         if (llvm::GlobalVariable* gv = staticFieldGlobal(e)) {
-            // #720 / §22.13: lazily initialize the owning type on first use.
-            if (auto* sym = ctx_.exprSymbol(e)) {
+            // #720 / §22.13 / #1513: lazily initialize the owning type — or,
+            // for a generic instantiation's per-instantiation global, the
+            // SHARED cross-module instantiation state (§2.8.3 rule 4) — on
+            // first use.
+            if (auto giIt = genericInstGlobalKeyOf_.find(gv);
+                giIt != genericInstGlobalKeyOf_.end()) {
+                emitEnsureGenericInstStaticInit(giIt->second);
+            } else if (auto* sym = ctx_.exprSymbol(e)) {
                 emitEnsureStaticInit(memberOwner(sym));
+            }
+            if (auto* sym = ctx_.exprSymbol(e)) {
                 // #1553 / §22.13 (v0.181): a re-entrant read, on the owner thread,
                 // of a static this type's in-progress initializer has not assigned
                 // yet raises the cycle backstop rather than observing partial state.
+                // (No-op for a generic-instantiation field: initProgressGV_ has no
+                // entry for a generic TypeSymbol, matching pre-#1513 behavior.)
                 if (auto* fsym = dynamic_cast<const sema::FieldSymbol*>(sym))
                     emitStaticPartialReadGuard(memberOwner(sym), fsym);
             }
@@ -4436,12 +4446,22 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // CG12: a bare identifier resolving to a static field reads
         // its backing global.
         if (llvm::GlobalVariable* gv = staticFieldGlobal(e)) {
-            // #720 / §22.13: lazily initialize the owning type on first use.
-            if (auto* sym = ctx_.exprSymbol(e)) {
+            // #720 / §22.13 / #1513: lazily initialize the owning type — or,
+            // for a generic instantiation's per-instantiation global, the
+            // SHARED cross-module instantiation state (§2.8.3 rule 4) — on
+            // first use.
+            if (auto giIt = genericInstGlobalKeyOf_.find(gv);
+                giIt != genericInstGlobalKeyOf_.end()) {
+                emitEnsureGenericInstStaticInit(giIt->second);
+            } else if (auto* sym = ctx_.exprSymbol(e)) {
                 emitEnsureStaticInit(memberOwner(sym));
+            }
+            if (auto* sym = ctx_.exprSymbol(e)) {
                 // #1553 / §22.13 (v0.181): a re-entrant read, on the owner thread,
                 // of a static this type's in-progress initializer has not assigned
                 // yet raises the cycle backstop rather than observing partial state.
+                // (No-op for a generic-instantiation field: initProgressGV_ has no
+                // entry for a generic TypeSymbol, matching pre-#1513 behavior.)
                 if (auto* fsym = dynamic_cast<const sema::FieldSymbol*>(sym))
                     emitStaticPartialReadGuard(memberOwner(sym), fsym);
             }

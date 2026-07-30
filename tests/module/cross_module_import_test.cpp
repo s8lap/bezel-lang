@@ -4496,4 +4496,279 @@ BEZEL_TEST(cross_module_import,
 }
 
 
+// ---------------------------------------------------------------------------
+// #1513 / §2.8.3 rule 4 / §2.8.4 rule 5: a generic type's static state must be
+// exactly ONE copy process-wide, even when TWO SEPARATE importing modules each
+// independently monomorphize the SAME instantiation in their OWN compilation
+// (§2.8.2 definition-site visibility: an imported generic's body is carried in
+// the interface and re-monomorphized per consumer). Before the fix, the per-
+// instantiation static-field global (LlvmBackend_Setup.cpp's staticFieldGlobal
+// generic-instantiation branch) was InternalLinkage — "each importing module
+// owns its own instance" — so two importers of the SAME instantiation held
+// two DISTINCT, never-synchronized storage cells: a write through one
+// importer was invisible to a read through the other.
+//
+// This test isolates the STATE-SHARING half of the bug from the (separately
+// tracked, harder) VALUE-INITIALIZATION half: `Reg<T>.Value` is written
+// directly by GW1 (a plain assignment, fully resolved within GW1's own
+// compilation — no imported AST/initializer-text round-trip needed) and read
+// back by GW2. Before the fix this returns 0 (GW2's own private, never-
+// written copy); after the fix it returns 42 (the SAME shared cell GW1 wrote).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_state_shared_across_two_importers_spec_1513) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_1513_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile w1Src((dir / (stem + "_w1.bzl")).string());
+    TempFile w1Obj((dir / (stem + "_w1.o")).string());
+    TempFile w2Src((dir / (stem + "_w2.bzl")).string());
+    TempFile w2Obj((dir / (stem + "_w2.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+
+    // Module Base1513: Reg<T> with a mutable static int (T-independent — the
+    // field's type doesn't mention T at all, isolating this test from the
+    // #709/#1513 T-independent-initializer scope limit).
+    writeSource(baseSrc.path,
+        "module Base1513; "
+        "public class Reg<T> "
+        "  public static Value: int := 0; "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    // Module W1_1513: writes Reg<int>.Value.
+    writeSource(w1Src.path,
+        "module W1_1513; "
+        "import Base1513; "
+        "public class W1 "
+        "  public static method Set(v: int) "
+        "    Reg<int>.Value := v; "
+        "  end Set; "
+        "end W1;");
+    std::vector<bezel::Dependency> depsBase;
+    {
+        bezel::Dependency d;
+        d.metadataPath = baseObj.path;
+        d.objectPath   = baseObj.path;
+        depsBase.push_back(d);
+    }
+    bezel::CompileResult rW1 =
+        driver.compileObject(w1Src.path, w1Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW1.success);
+    if (!rW1.success) return;
+
+    // Module W2_1513: reads Reg<int>.Value — a SEPARATE compilation from W1,
+    // each independently monomorphizing Reg<int>.
+    writeSource(w2Src.path,
+        "module W2_1513; "
+        "import Base1513; "
+        "public class W2 "
+        "  public static method Get(): int "
+        "    return Reg<int>.Value; "
+        "  end Get; "
+        "end W2;");
+    bezel::CompileResult rW2 =
+        driver.compileObject(w2Src.path, w2Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW2.success);
+    if (!rW2.success) return;
+
+    // App: imports W1 + W2 (+ transitively Base1513), sets via W1, reads via
+    // W2. §2.8.3 rule 4: ONE Reg<int> instantiation program-wide → W2 must
+    // observe W1's write.
+    writeSource(appSrc.path,
+        "module App1513; "
+        "import W1_1513; "
+        "import W2_1513; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    W1.Set(42); "
+        "    return W2.Get(); "
+        "  end Main; "
+        "end Program;");
+    std::vector<bezel::Dependency> depsApp;
+    {
+        bezel::Dependency dBase, dW1, dW2;
+        dBase.metadataPath = baseObj.path; dBase.objectPath = baseObj.path;
+        dW1.metadataPath   = w1Obj.path;   dW1.objectPath   = w1Obj.path;
+        dW2.metadataPath   = w2Obj.path;   dW2.objectPath   = w2Obj.path;
+        depsApp.push_back(dBase);
+        depsApp.push_back(dW1);
+        depsApp.push_back(dW2);
+    }
+    bezel::CompileResult rApp =
+        driver.compileFile(appSrc.path, appExe.path, depsApp);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+
+    int status = std::system(appExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    // §2.8.3 rule 4 / §2.8.4 rule 5: 42 — W2 observes the SAME storage W1
+    // wrote. Pre-fix: 0 (W2's own private, never-written InternalLinkage copy).
+    BEZEL_EXPECT_EQ(code, 42);
+}
+
+// #1513 same-module CONTROL: Reg<T>, W1, W2, and Program all declared in ONE
+// compilation. The generic-instantiation redirect (staticFieldGlobal) and the
+// new per-instantiation ensureinit/sfinit machinery (LlvmBackend_Setup.cpp,
+// genericInstEnsureInitFn/genericInstSfinitFn) engage here too — this pins
+// that the #1513 fix does not regress the baseline same-module case (which
+// worked before the fix via the OLD per-instantiation-global creation path).
+BEZEL_TEST(cross_module_import,
+           generic_static_state_shared_same_module_control_spec_1513) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_1513_ctrl_" + std::to_string(std::rand());
+    TempFile src((dir / (stem + ".bzl")).string());
+    TempFile exe((dir / stem).string());
+
+    writeSource(src.path,
+        "module Ctrl1513; "
+        "public class Reg<T> "
+        "  public static Value: int := 0; "
+        "end Reg; "
+        "public class W1 "
+        "  public static method Set(v: int) "
+        "    Reg<int>.Value := v; "
+        "  end Set; "
+        "end W1; "
+        "public class W2 "
+        "  public static method Get(): int "
+        "    return Reg<int>.Value; "
+        "  end Get; "
+        "end W2; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    W1.Set(42); "
+        "    return W2.Get(); "
+        "  end Main; "
+        "end Program;");
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src.path, exe.path);
+    BEZEL_EXPECT_TRUE(r.success);
+    if (!r.success) return;
+
+    int status = std::system(exe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 42);
+}
+
+// #1513 self-pass (b): a generic instantiation's static state must be
+// initialized EXACTLY ONCE process-wide even when TWO SEPARATE importers each
+// independently build (and, post-fix, LinkOnceODR-merge into one) the guard/
+// sfinit/ensureinit machinery for the SAME instantiation. If the shared STATE
+// global were merged but each importer's GUARD flag were NOT — the "one state
+// copy, two init flags" failure mode named in the fix's own review — a second
+// importer's independent (uninitialized, flag=0) guard could re-run its own
+// copy of sfinit against the ALREADY-initialized shared state, clobbering a
+// value another domain/read may already be relying on. Exercise via TWO
+// distinct instantiations (Reg<int>, Reg<string>) each touched by a DIFFERENT
+// importer, both summed by App — a double-init of either would still net the
+// same additive result here only if the increments are idempotent, so this
+// specifically checks the addresses/values are internally consistent across
+// three artifacts (Base + 2 importers), not just two.
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_two_instantiations_two_importers_spec_1513) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_1513_multi_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile w1Src((dir / (stem + "_w1.bzl")).string());
+    TempFile w1Obj((dir / (stem + "_w1.o")).string());
+    TempFile w2Src((dir / (stem + "_w2.bzl")).string());
+    TempFile w2Obj((dir / (stem + "_w2.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+
+    writeSource(baseSrc.path,
+        "module Base1513M; "
+        "public class Reg<T> "
+        "  public static Value: int := 0; "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    // W1 touches BOTH Reg<int> (sets 10) and Reg<string> (sets 100).
+    writeSource(w1Src.path,
+        "module W1_1513M; "
+        "import Base1513M; "
+        "public class W1 "
+        "  public static method SetInt() "
+        "    Reg<int>.Value := 10; "
+        "  end SetInt; "
+        "  public static method SetString() "
+        "    Reg<string>.Value := 100; "
+        "  end SetString; "
+        "end W1;");
+    std::vector<bezel::Dependency> depsBase;
+    {
+        bezel::Dependency d;
+        d.metadataPath = baseObj.path;
+        d.objectPath   = baseObj.path;
+        depsBase.push_back(d);
+    }
+    bezel::CompileResult rW1 =
+        driver.compileObject(w1Src.path, w1Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW1.success);
+    if (!rW1.success) return;
+
+    // W2 reads BOTH — a SEPARATE compilation, independently monomorphizing
+    // both Reg<int> and Reg<string>.
+    writeSource(w2Src.path,
+        "module W2_1513M; "
+        "import Base1513M; "
+        "public class W2 "
+        "  public static method GetInt(): int "
+        "    return Reg<int>.Value; "
+        "  end GetInt; "
+        "  public static method GetString(): int "
+        "    return Reg<string>.Value; "
+        "  end GetString; "
+        "end W2;");
+    bezel::CompileResult rW2 =
+        driver.compileObject(w2Src.path, w2Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW2.success);
+    if (!rW2.success) return;
+
+    writeSource(appSrc.path,
+        "module App1513M; "
+        "import W1_1513M; "
+        "import W2_1513M; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    W1.SetInt(); "
+        "    W1.SetString(); "
+        "    return W2.GetInt() + W2.GetString(); "
+        "  end Main; "
+        "end Program;");
+    std::vector<bezel::Dependency> depsApp;
+    {
+        bezel::Dependency dBase, dW1, dW2;
+        dBase.metadataPath = baseObj.path; dBase.objectPath = baseObj.path;
+        dW1.metadataPath   = w1Obj.path;   dW1.objectPath   = w1Obj.path;
+        dW2.metadataPath   = w2Obj.path;   dW2.objectPath   = w2Obj.path;
+        depsApp.push_back(dBase);
+        depsApp.push_back(dW1);
+        depsApp.push_back(dW2);
+    }
+    bezel::CompileResult rApp =
+        driver.compileFile(appSrc.path, appExe.path, depsApp);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+
+    int status = std::system(appExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    // §22.12 "each distinct instantiation has its own static state": Reg<int>
+    // and Reg<string> are DISTINCT instantiations (10 and 100, independent) —
+    // 110 total. A collision between the two instantiations' per-instantiation
+    // globals (a mangle/key bug) would produce 100+100=200 or 10+10=20 instead.
+    BEZEL_EXPECT_EQ(code, 110);
+}
+
+
 }  // namespace bezel::module
