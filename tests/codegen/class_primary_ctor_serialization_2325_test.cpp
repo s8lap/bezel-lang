@@ -488,3 +488,40 @@ BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
     // ASan/LSan leg: no leak of the partial Order/Customer reconstruction.
     BEZEL_EXPECT_EQ(runChecked(kProg), 42);
 }
+
+// ===========================================================================
+// Bonus verification (informs #718's Shared<T> spine work, not this fix's
+// scope): a primary-ctor class with an `owned Shared<T>` field (§9.8's
+// identity-participant / graph-mode component) round-trips cleanly. §9.8's
+// PRE-PASS (checkSerializationEligibility, unaffected by this fix) already
+// classifies a class with a Shared<T>/Weak<T> field as graph-mode from field
+// TYPES alone; this pins that the primary-ctor construction path this fix
+// adds composes correctly with that pre-existing graph-mode machinery
+// (identity-tag table, bz_shared_new/Clone) — including disposal, since a
+// naive probe of this shape WITHOUT the `owned` keyword on both the
+// primary-ctor parameter and the explicit field leaks (stdlib §2.16:
+// "Handles are ordinary owned class instances" — the same `owned` discipline
+// as any other owned field, unrelated to serialization).
+// ===========================================================================
+
+BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
+           owned_shared_field_primary_ctor_roundtrip_spec_9_8_sec2_16) {
+    BEZEL_EXPECT_EQ(runChecked(
+        std::string("module M; ") + kImport +
+        "class Leaf(v: int): ISerializable, IDeserializable "
+        "  public property V: int => v; "
+        "end Leaf; "
+        "class Hub(owned target: Shared<Leaf>): ISerializable, IDeserializable "
+        "  public owned Target: Shared<Leaf> := target; "
+        "end Hub; "
+        "class C public static method Main(): int "
+        "  using var leaf := new Shared<Leaf>(new Leaf(9)); "
+        "  using var hub := new Hub(leaf.Clone()); "
+        "  using var s := new BinarySerializer(); "
+        "  hub.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var hub2 := Hub.Deserialize(d); "
+        "  return (if hub2.Target.Get().V = 9 then 42 else 91); "
+        "end Main; end C;"), 42);
+}
