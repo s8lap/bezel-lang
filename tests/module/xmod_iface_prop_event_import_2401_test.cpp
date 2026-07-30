@@ -296,8 +296,19 @@ BEZEL_TEST(xmod_iface_prop_event_import_2401,
                     "public class BaseWithPropL2401T4 "
                     "  public property Name: int => 1; "
                     "end BaseWithPropL2401T4; "
+                    // §11.2/§23.3 (#2413): DerivedL2401T4 satisfies this
+                    // interface's `Name` obligation entirely via inheritance
+                    // from BaseWithPropL2401T4, whose `Name` is getter-only;
+                    // this test never writes through the interface, so the
+                    // obligation is declared `readonly` — a getter-only
+                    // implementation (direct OR inherited) of a read-write
+                    // interface property is now a compile error (#2413's own
+                    // fix). Found by #2413's gate-canary widening the sweep
+                    // to tests/module after the initial breadth pass (which
+                    // only checked DIRECTLY-declared properties) missed this
+                    // inherited-property shape.
                     "public interface IHasNameL2401T4 "
-                    "  property Name: int; "
+                    "  readonly property Name: int; "
                     "end IHasNameL2401T4; "
                     "public class DerivedL2401T4: BaseWithPropL2401T4, "
                     "IHasNameL2401T4 end DerivedL2401T4; "
