@@ -76,6 +76,26 @@ public:
         return builtinTypeArity(n) != kNotBuiltin;
     }
 
+    // §9.8 / #2325: the CLASS half of checkSerializationEligibility's
+    // component-eligibility and constructor-selection checks. Split into its
+    // own LATE pass — called by the driver AFTER typecheckExpressions(), not
+    // as part of resolveTypes() (this class's run()) — because §9.8 counts a
+    // primary-constructor parameter CAPTURED into a private field (§11.1:
+    // referenced in a body position — a method/property/constructor/
+    // destructor body, e.g. `property Id: int => id;`) as a genuine
+    // serialized component, and that classification
+    // (FieldSymbol::posParamBodyRef/posParamInitRef) is only computed by
+    // ExprTypecheck's expression walk (ExprTypecheck_Exprs.cpp), which runs
+    // strictly after resolveTypes(). Running this check at resolveTypes()
+    // time — where checkSerializationEligibility's other branches (record/
+    // enum/choice) run, none of which touch posParam capture classification
+    // — would always see the flags at their unset default (false), which is
+    // the root cause issue #2325 traces to a component set that was silently
+    // empty for exactly this shape. Public so the free-function wrapper
+    // `bezel::sema::checkClassSerializationEligibilityLate` (TypeResolution.hpp)
+    // can call it from a fresh Resolver, exactly like run() itself.
+    void checkClassSerializationEligibilityLate();
+
 private:
     // Lookup environment in scope. A stack of scopes (module-level + per-type
     // + per-method). Each scope contributes a small name → Symbol table.
@@ -258,7 +278,12 @@ private:
     // `: IDeserializable` must satisfy the synthesis-eligibility rule.  Types
     // that declare the conformance but are ineligible (ineligible component
     // type, no hand-written Serialize/Deserialize) are a compile error at the
-    // conformance declaration.
+    // conformance declaration.  (Classes are NOT checked here — see the
+    // PUBLIC checkClassSerializationEligibilityLate() above — but the
+    // PRE-PASS at the top of this function's definition still synthesizes
+    // each class's `serializedClass` tree/graph shape from field types,
+    // because ExprTypecheck's `.Serialize()`/`.Deserialize()` call
+    // resolution depends on that shape already being set.)
     void checkSerializationEligibility();
 
     // Slice S22 (§13.2): a top-level type may be `public` or `internal`

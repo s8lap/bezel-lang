@@ -393,4 +393,15 @@ bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx) {
     return !ctx.diagnostics().hasErrors();
 }
 
+// §9.8 / #2325: see the declaration comment (TypeResolution.hpp) and
+// Resolver::checkClassSerializationEligibilityLate's own comment
+// (TypeResolution_impl.hpp) for why this runs as a separate late pass.
+bool checkClassSerializationEligibilityLate(const ast::SourceFile& src,
+                                            SemaContext& ctx) {
+    (void)src;
+    Resolver r(ctx);
+    r.checkClassSerializationEligibilityLate();
+    return !ctx.diagnostics().hasErrors();
+}
+
 } // namespace bezel::sema

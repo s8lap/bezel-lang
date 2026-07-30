@@ -39,6 +39,17 @@ namespace bezel::sema {
 
 bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx);
 
+// §9.8 / #2325: the CLASS half of serialization synthesis-eligibility
+// checking (component eligibility + constructor selection). Split out from
+// resolveTypes()'s checkSerializationEligibility because it needs
+// FieldSymbol::posParamBodyRef/posParamInitRef (§11.1 primary-constructor
+// parameter capture classification), which typecheckExpressions computes —
+// so the driver must call this AFTER typecheckExpressions(), not as part of
+// resolveTypes(). See TypeResolution_impl.hpp's declaration comment on
+// Resolver::checkClassSerializationEligibilityLate for the full rationale.
+bool checkClassSerializationEligibilityLate(const ast::SourceFile& src,
+                                            SemaContext& ctx);
+
 // Structural equality of two resolved TypeRefs (§19/§22.6 "exact match").
 // Returns false (conservatively) when either is null or an Error kind.
 // Exposes the resolver's existing structural-equality utility for reuse by

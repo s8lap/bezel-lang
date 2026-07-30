@@ -5536,13 +5536,291 @@ void Resolver::checkSerializationEligibility() {
             continue;
         }
 
-        // Classes: §9.8 tier-2 eligibility checking.
-        if (isClass) {
+        // Classes: §9.8 tier-2 eligibility checking — MOVED to the late pass
+        // checkClassSerializationEligibilityLate() (see the declaration
+        // comment in TypeResolution_impl.hpp / #2325): the check needs
+        // FieldSymbol::posParamBodyRef, which ExprTypecheck computes AFTER
+        // resolveTypes() (this function) has already run. The PRE-PASS above
+        // (synthesizing td->serializedClass's tree/graph shape from field
+        // TYPES alone, which does not need posParam capture classification)
+        // still runs here, unchanged, because ExprTypecheck's own
+        // `.Serialize()`/`.Deserialize()` call resolution depends on that
+        // shape already being set.
+        if (isClass) continue;
+
+        // Record: check hand-written suppression and then eligibility.
+        // §9.8: "Hand-writing `Serialize` suppresses synthesis of that direction."
+        bool hasHandWrittenSerialize   = typeHasHandWrittenMethod(t, "Serialize");
+        bool hasHandWrittenDeserialize = typeHasHandWrittenMethod(t, "Deserialize");
+
+        // For ISerializable: need to check eligibility unless hand-written.
+        bool needsSerializeCheck   = wantsIS  && !hasHandWrittenSerialize;
+        bool needsDeserializeCheck = wantsID  && !hasHandWrittenDeserialize;
+        if (!needsSerializeCheck && !needsDeserializeCheck) continue;
+
+        // Collect the serialized components of this record (§9.8).
+        // For a positional record: the positional fields (minus skip-marked ones).
+        // For a body record: the auto-properties (minus skip-marked ones).
+        // A `serialized skip` field is excluded from the component set (§9.8).
+        std::unordered_set<const TypeSymbol*> visited;
+        visited.insert(t);  // guard self-reference
+
+        auto reportIneligible = [&](std::string_view memberName,
+                                    std::string_view reason) {
+            ctx_.diagnostics().report(
+                Severity::Error, t->declLoc,
+                std::string(isRecord ? "record" : "type") +
+                " `" + std::string(t->name) + "` declares `ISerializable`/"
+                "`IDeserializable` but is not serialization-eligible (§9.8): "
+                "field `" + std::string(memberName) + "` " +
+                std::string(reason) + "; remove the conformance declaration, "
+                "mark the field `serialized skip`, make the field type "
+                "serializable, or hand-write `Serialize`/`Deserialize`");
+        };
+
+        bool foundError = false;
+
+        // Positional record: check positional fields.
+        if (td->hasPositionalFields) {
+            for (const auto& pf : td->positionalFields) {
+                if (positionalFieldIsSkip(pf)) continue;  // skip → excluded
+                // §2.15 v0.139: `serialized "xxx"` rename whose name begins with
+                // `$` is reserved for JSON graph-identity tokens — compile error.
+                if (pf.serialized && !pf.serialized->name.empty() &&
+                    pf.serialized->name.front() == '$') {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "record `" + std::string(t->name) + "`: `serialized` "
+                        "rename `" + std::string(pf.serialized->name) +
+                        "` for field `" + std::string(pf.name) +
+                        "` begins with `$`, which is reserved for JSON "
+                        "graph-identity tokens (§2.15 v0.139); choose a name "
+                        "that does not start with `$`");
+                    foundError = true;
+                    break;
+                }
+                if (!pf.type) continue;
+                const TypeRef* tr = ctx_.resolvedType(*pf.type);
+                if (!tr) continue;
+                // §9.8 v0.182: checked as a RECORD component — class-,
+                // interface-, `Shared<T>`-, and `Weak<T>`-typed fields are
+                // never eligible here, only within a class.
+                if (!isSerializationEligibleType(tr, visited, ctx_,
+                                                  /*forRecordComponent=*/true)) {
+                    reportIneligible(pf.name,
+                        "has a type that is not serialization-eligible");
+                    foundError = true;
+                    break;  // report first offending member only (§9.8)
+                }
+            }
+        } else {
+            // Body record: check auto-properties.
+            for (const Symbol* m : t->members) {
+                if (!isAutoPropertySymbol(m)) continue;
+                auto* ps = dynamic_cast<const PropertySymbol*>(m);
+                if (!ps) continue;
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                if (!pd) continue;
+                // Check for serialized skip on the auto-property.
+                if (pd->serialized && pd->serialized->isSkip) continue;
+                // §2.15 v0.139: `serialized "xxx"` rename beginning with `$` reserved.
+                if (pd->serialized && !pd->serialized->name.empty() &&
+                    pd->serialized->name.front() == '$') {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "record `" + std::string(t->name) + "`: `serialized` "
+                        "rename `" + std::string(pd->serialized->name) +
+                        "` for property `" + std::string(m->name) +
+                        "` begins with `$`, which is reserved for JSON "
+                        "graph-identity tokens (§2.15 v0.139); choose a name "
+                        "that does not start with `$`");
+                    foundError = true;
+                    break;
+                }
+                if (!pd->type) continue;
+                const TypeRef* tr = ctx_.resolvedType(*pd->type);
+                if (!tr) continue;
+                // §9.8 v0.182: checked as a RECORD component (see the
+                // positional-field case above).
+                if (!isSerializationEligibleType(tr, visited, ctx_,
+                                                  /*forRecordComponent=*/true)) {
+                    reportIneligible(m->name,
+                        "has a type that is not serialization-eligible");
+                    foundError = true;
+                    break;
+                }
+            }
+            if (!foundError) {
+                // §9.8/§9.2: a body record must also be auto-equality-bearing
+                // for synthesis to apply (same membership conditions as §9.2).
+                // If it is not auto-equality-bearing AND doesn't have hand-written
+                // Serialize/Deserialize, the synthesis cannot proceed.
+                // (We don't require auto-equality-bearing for synthesis per the
+                // spec wording; we require the §9.8 body-record conditions which
+                // are the same as §9.2 "auto-equality-bearing" conditions. The
+                // spec says "under exactly the auto-equality membership conditions"
+                // so treat them identically.)
+                // Note: we only report this if there are actually auto-properties
+                // to serialize — an empty record body is still eligible (trivially).
+            }
+        }
+
+        // §9.8 v0.182 (#1572): record constructor-selection check — the
+        // record-side counterpart to the class check above (same rule,
+        // written out at the top of this function's `else if (isClass)`
+        // branch). Applies only when Deserialize synthesis is actually
+        // needed and the record body declares one or more EXPLICIT
+        // constructors: "If the record declares one or more explicit
+        // constructors, the synthesized Deserialize calls the unique
+        // explicit constructor whose parameter list binds exactly the
+        // serialized components, matched by name — compared
+        // case-insensitively... If explicit constructors exist but none
+        // matches, more than one matches, ... the conformance declaration
+        // is a compile error naming the candidates." A record with NO
+        // explicit constructor (the common case — a purely positional
+        // record, or a body record with no author-declared constructor) is
+        // "constructed directly from the read components at the storage
+        // level" — no ambiguity is possible, so the check below is a no-op
+        // whenever `allCtors` comes back empty.
+        if (!foundError && needsDeserializeCheck) {
+            auto toLower = [](std::string_view sv) {
+                std::string r(sv);
+                for (char& c : r)
+                    c = (char)std::tolower((unsigned char)c);
+                return r;
+            };
+
+            // Collect the lowercased declared identifiers of ALL serialized
+            // components — including `serialized skip` ones, which still
+            // bind a constructor parameter (their value is default(T)).
+            std::unordered_set<std::string> compNamesLower;
+            std::vector<std::string> compNamesOrig;
+            if (td->hasPositionalFields) {
+                for (const auto& pf : td->positionalFields) {
+                    compNamesLower.insert(toLower(pf.name));
+                    compNamesOrig.push_back(std::string(pf.name));
+                }
+            } else {
+                for (const Symbol* m : t->members) {
+                    if (!isAutoPropertySymbol(m)) continue;
+                    compNamesLower.insert(toLower(m->name));
+                    compNamesOrig.push_back(std::string(m->name));
+                }
+            }
+
+            // Collect non-static explicit constructors and check which match.
+            std::vector<std::string> matchingCtors;
+            std::vector<std::string> allCtors;
+            for (const Symbol* m : t->members) {
+                auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
+                if (!cs || cs->isStatic) continue;
+                auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                if (!cd) continue;
+
+                std::string ctorDesc = "constructor(";
+                for (unsigned pi = 0; pi < cd->params.size(); ++pi) {
+                    if (pi) ctorDesc += ", ";
+                    ctorDesc += std::string(cd->params[pi].name);
+                }
+                ctorDesc += ")";
+                allCtors.push_back(ctorDesc);
+
+                // Match: param count == component count AND every param name
+                // (lowered) appears among the component names (bijection).
+                if (cd->params.size() != compNamesLower.size()) continue;
+                bool allMatch = true;
+                for (const auto& p : cd->params) {
+                    if (compNamesLower.find(toLower(p.name)) ==
+                            compNamesLower.end()) {
+                        allMatch = false;
+                        break;
+                    }
+                }
+                if (allMatch) matchingCtors.push_back(ctorDesc);
+            }
+
+            // No explicit constructor at all: storage-level construction
+            // applies (§9.8 v0.182) — nothing to disambiguate, skip.
+            if (!allCtors.empty() && matchingCtors.size() != 1) {
+                std::string candidates;
+                for (const auto& c : allCtors) {
+                    if (!candidates.empty()) candidates += ", ";
+                    candidates += c;
+                }
+                std::string compSet;
+                for (const auto& n : compNamesOrig) {
+                    if (!compSet.empty()) compSet += ", ";
+                    compSet += n;
+                }
+                if (matchingCtors.empty()) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "record `" + std::string(t->name) + "` declares "
+                        "`IDeserializable`: no explicit constructor has "
+                        "parameter names matching the serialized component "
+                        "set {" + compSet + "} — candidates: " + candidates +
+                        " (§9.8 v0.182: constructor selection is by name, "
+                        "case-insensitive, order-insensitive)");
+                } else {
+                    std::string matchList;
+                    for (const auto& c : matchingCtors) {
+                        if (!matchList.empty()) matchList += ", ";
+                        matchList += c;
+                    }
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "record `" + std::string(t->name) + "` declares "
+                        "`IDeserializable`: more than one explicit "
+                        "constructor matches the serialized component set — "
+                        "ambiguous: " + matchList +
+                        " (§9.8 v0.182: the unique matching constructor is "
+                        "required)");
+                }
+                foundError = true;
+            }
+        }
+
+        (void)foundError;  // error was already reported if true
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resolver::checkClassSerializationEligibilityLate  §9.8 / #2325
+//
+// The CLASS half of checkSerializationEligibility's component-eligibility and
+// constructor-selection checks (see that function's declaration comment,
+// TypeResolution_impl.hpp, for why this is a separate LATE pass called by the
+// driver after typecheckExpressions() rather than as part of resolveTypes()).
+// Logic is otherwise unchanged from the original (pre-#2325) class branch,
+// plus the #2325 posParam-capture handling: a primary-constructor parameter
+// captured into a private field (§11.1 — referenced in a body position, e.g.
+// `property Id: int => id;`) is a genuine serialized component (its type via
+// `posParam->type`, ownership via `posParam->modifier`), and the class's own
+// implicit PRIMARY constructor (`td->positionalFields`) is itself a
+// constructor-selection match candidate alongside any explicit
+// `constructor(...)` members (there is no ConstructorSymbol for it —
+// SymbolCollection.cpp creates one only for an explicit ast::ConstructorDecl).
+// ---------------------------------------------------------------------------
+void Resolver::checkClassSerializationEligibilityLate() {
+    if (!ctx_.module()) return;
+
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t || t->kind != ast::TypeDeclKind::Class) continue;
+
+        auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+        if (!td) continue;
+
+        bool wantsIS = declaredConformance(*td, "ISerializable");
+        bool wantsID = declaredConformance(*td, "IDeserializable");
+        if (!wantsIS && !wantsID) continue;
+
             if (!td->serializedClass) {
-                // §9.8 v0.141: after the synthesis pre-pass at the top of this
-                // function, a class with no clause here is fully hand-written
-                // (Serialize + Deserialize) — it satisfies the conformance
-                // without synthesis, so there is nothing to check.
+                // §9.8 v0.141: after the synthesis pre-pass in
+                // checkSerializationEligibility, a class with no clause here
+                // is fully hand-written (Serialize + Deserialize) — it
+                // satisfies the conformance without synthesis, so there is
+                // nothing to check.
                 continue;
             }
 
@@ -6019,242 +6297,6 @@ void Resolver::checkSerializationEligibility() {
                     }
                 }
             }
-            continue;
-        }
-
-        // Record: check hand-written suppression and then eligibility.
-        // §9.8: "Hand-writing `Serialize` suppresses synthesis of that direction."
-        bool hasHandWrittenSerialize   = typeHasHandWrittenMethod(t, "Serialize");
-        bool hasHandWrittenDeserialize = typeHasHandWrittenMethod(t, "Deserialize");
-
-        // For ISerializable: need to check eligibility unless hand-written.
-        bool needsSerializeCheck   = wantsIS  && !hasHandWrittenSerialize;
-        bool needsDeserializeCheck = wantsID  && !hasHandWrittenDeserialize;
-        if (!needsSerializeCheck && !needsDeserializeCheck) continue;
-
-        // Collect the serialized components of this record (§9.8).
-        // For a positional record: the positional fields (minus skip-marked ones).
-        // For a body record: the auto-properties (minus skip-marked ones).
-        // A `serialized skip` field is excluded from the component set (§9.8).
-        std::unordered_set<const TypeSymbol*> visited;
-        visited.insert(t);  // guard self-reference
-
-        auto reportIneligible = [&](std::string_view memberName,
-                                    std::string_view reason) {
-            ctx_.diagnostics().report(
-                Severity::Error, t->declLoc,
-                std::string(isRecord ? "record" : "type") +
-                " `" + std::string(t->name) + "` declares `ISerializable`/"
-                "`IDeserializable` but is not serialization-eligible (§9.8): "
-                "field `" + std::string(memberName) + "` " +
-                std::string(reason) + "; remove the conformance declaration, "
-                "mark the field `serialized skip`, make the field type "
-                "serializable, or hand-write `Serialize`/`Deserialize`");
-        };
-
-        bool foundError = false;
-
-        // Positional record: check positional fields.
-        if (td->hasPositionalFields) {
-            for (const auto& pf : td->positionalFields) {
-                if (positionalFieldIsSkip(pf)) continue;  // skip → excluded
-                // §2.15 v0.139: `serialized "xxx"` rename whose name begins with
-                // `$` is reserved for JSON graph-identity tokens — compile error.
-                if (pf.serialized && !pf.serialized->name.empty() &&
-                    pf.serialized->name.front() == '$') {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t->declLoc,
-                        "record `" + std::string(t->name) + "`: `serialized` "
-                        "rename `" + std::string(pf.serialized->name) +
-                        "` for field `" + std::string(pf.name) +
-                        "` begins with `$`, which is reserved for JSON "
-                        "graph-identity tokens (§2.15 v0.139); choose a name "
-                        "that does not start with `$`");
-                    foundError = true;
-                    break;
-                }
-                if (!pf.type) continue;
-                const TypeRef* tr = ctx_.resolvedType(*pf.type);
-                if (!tr) continue;
-                // §9.8 v0.182: checked as a RECORD component — class-,
-                // interface-, `Shared<T>`-, and `Weak<T>`-typed fields are
-                // never eligible here, only within a class.
-                if (!isSerializationEligibleType(tr, visited, ctx_,
-                                                  /*forRecordComponent=*/true)) {
-                    reportIneligible(pf.name,
-                        "has a type that is not serialization-eligible");
-                    foundError = true;
-                    break;  // report first offending member only (§9.8)
-                }
-            }
-        } else {
-            // Body record: check auto-properties.
-            for (const Symbol* m : t->members) {
-                if (!isAutoPropertySymbol(m)) continue;
-                auto* ps = dynamic_cast<const PropertySymbol*>(m);
-                if (!ps) continue;
-                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-                if (!pd) continue;
-                // Check for serialized skip on the auto-property.
-                if (pd->serialized && pd->serialized->isSkip) continue;
-                // §2.15 v0.139: `serialized "xxx"` rename beginning with `$` reserved.
-                if (pd->serialized && !pd->serialized->name.empty() &&
-                    pd->serialized->name.front() == '$') {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t->declLoc,
-                        "record `" + std::string(t->name) + "`: `serialized` "
-                        "rename `" + std::string(pd->serialized->name) +
-                        "` for property `" + std::string(m->name) +
-                        "` begins with `$`, which is reserved for JSON "
-                        "graph-identity tokens (§2.15 v0.139); choose a name "
-                        "that does not start with `$`");
-                    foundError = true;
-                    break;
-                }
-                if (!pd->type) continue;
-                const TypeRef* tr = ctx_.resolvedType(*pd->type);
-                if (!tr) continue;
-                // §9.8 v0.182: checked as a RECORD component (see the
-                // positional-field case above).
-                if (!isSerializationEligibleType(tr, visited, ctx_,
-                                                  /*forRecordComponent=*/true)) {
-                    reportIneligible(m->name,
-                        "has a type that is not serialization-eligible");
-                    foundError = true;
-                    break;
-                }
-            }
-            if (!foundError) {
-                // §9.8/§9.2: a body record must also be auto-equality-bearing
-                // for synthesis to apply (same membership conditions as §9.2).
-                // If it is not auto-equality-bearing AND doesn't have hand-written
-                // Serialize/Deserialize, the synthesis cannot proceed.
-                // (We don't require auto-equality-bearing for synthesis per the
-                // spec wording; we require the §9.8 body-record conditions which
-                // are the same as §9.2 "auto-equality-bearing" conditions. The
-                // spec says "under exactly the auto-equality membership conditions"
-                // so treat them identically.)
-                // Note: we only report this if there are actually auto-properties
-                // to serialize — an empty record body is still eligible (trivially).
-            }
-        }
-
-        // §9.8 v0.182 (#1572): record constructor-selection check — the
-        // record-side counterpart to the class check above (same rule,
-        // written out at the top of this function's `else if (isClass)`
-        // branch). Applies only when Deserialize synthesis is actually
-        // needed and the record body declares one or more EXPLICIT
-        // constructors: "If the record declares one or more explicit
-        // constructors, the synthesized Deserialize calls the unique
-        // explicit constructor whose parameter list binds exactly the
-        // serialized components, matched by name — compared
-        // case-insensitively... If explicit constructors exist but none
-        // matches, more than one matches, ... the conformance declaration
-        // is a compile error naming the candidates." A record with NO
-        // explicit constructor (the common case — a purely positional
-        // record, or a body record with no author-declared constructor) is
-        // "constructed directly from the read components at the storage
-        // level" — no ambiguity is possible, so the check below is a no-op
-        // whenever `allCtors` comes back empty.
-        if (!foundError && needsDeserializeCheck) {
-            auto toLower = [](std::string_view sv) {
-                std::string r(sv);
-                for (char& c : r)
-                    c = (char)std::tolower((unsigned char)c);
-                return r;
-            };
-
-            // Collect the lowercased declared identifiers of ALL serialized
-            // components — including `serialized skip` ones, which still
-            // bind a constructor parameter (their value is default(T)).
-            std::unordered_set<std::string> compNamesLower;
-            std::vector<std::string> compNamesOrig;
-            if (td->hasPositionalFields) {
-                for (const auto& pf : td->positionalFields) {
-                    compNamesLower.insert(toLower(pf.name));
-                    compNamesOrig.push_back(std::string(pf.name));
-                }
-            } else {
-                for (const Symbol* m : t->members) {
-                    if (!isAutoPropertySymbol(m)) continue;
-                    compNamesLower.insert(toLower(m->name));
-                    compNamesOrig.push_back(std::string(m->name));
-                }
-            }
-
-            // Collect non-static explicit constructors and check which match.
-            std::vector<std::string> matchingCtors;
-            std::vector<std::string> allCtors;
-            for (const Symbol* m : t->members) {
-                auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
-                if (!cs || cs->isStatic) continue;
-                auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-                if (!cd) continue;
-
-                std::string ctorDesc = "constructor(";
-                for (unsigned pi = 0; pi < cd->params.size(); ++pi) {
-                    if (pi) ctorDesc += ", ";
-                    ctorDesc += std::string(cd->params[pi].name);
-                }
-                ctorDesc += ")";
-                allCtors.push_back(ctorDesc);
-
-                // Match: param count == component count AND every param name
-                // (lowered) appears among the component names (bijection).
-                if (cd->params.size() != compNamesLower.size()) continue;
-                bool allMatch = true;
-                for (const auto& p : cd->params) {
-                    if (compNamesLower.find(toLower(p.name)) ==
-                            compNamesLower.end()) {
-                        allMatch = false;
-                        break;
-                    }
-                }
-                if (allMatch) matchingCtors.push_back(ctorDesc);
-            }
-
-            // No explicit constructor at all: storage-level construction
-            // applies (§9.8 v0.182) — nothing to disambiguate, skip.
-            if (!allCtors.empty() && matchingCtors.size() != 1) {
-                std::string candidates;
-                for (const auto& c : allCtors) {
-                    if (!candidates.empty()) candidates += ", ";
-                    candidates += c;
-                }
-                std::string compSet;
-                for (const auto& n : compNamesOrig) {
-                    if (!compSet.empty()) compSet += ", ";
-                    compSet += n;
-                }
-                if (matchingCtors.empty()) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t->declLoc,
-                        "record `" + std::string(t->name) + "` declares "
-                        "`IDeserializable`: no explicit constructor has "
-                        "parameter names matching the serialized component "
-                        "set {" + compSet + "} — candidates: " + candidates +
-                        " (§9.8 v0.182: constructor selection is by name, "
-                        "case-insensitive, order-insensitive)");
-                } else {
-                    std::string matchList;
-                    for (const auto& c : matchingCtors) {
-                        if (!matchList.empty()) matchList += ", ";
-                        matchList += c;
-                    }
-                    ctx_.diagnostics().report(
-                        Severity::Error, t->declLoc,
-                        "record `" + std::string(t->name) + "` declares "
-                        "`IDeserializable`: more than one explicit "
-                        "constructor matches the serialized component set — "
-                        "ambiguous: " + matchList +
-                        " (§9.8 v0.182: the unique matching constructor is "
-                        "required)");
-                }
-                foundError = true;
-            }
-        }
-
-        (void)foundError;  // error was already reported if true
     }
 }
 
