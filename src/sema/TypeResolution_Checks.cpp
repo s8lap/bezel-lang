@@ -3377,10 +3377,44 @@ void Resolver::checkAbstractImplementations() {
         // can be compared, which is deferred (so generic conformance is never
         // false-rejected here).
         if (t->genericParams.empty()) {
+            // §2.8.2/§11.2/§12.5 (#2380): the PROPERTY sibling of #2373's
+            // METHOD fix in this same function. `ps` here is applied to BOTH
+            // sides of the comparison below (`ips`, always from an interface
+            // reached by the ancestor BFS above, and `cit->second`, from a
+            // non-interface `cur` in that SAME BFS — which, per the BFS's own
+            // reach, can be a base CLASS from another module just as readily
+            // as `ips`'s interface can be) — so either side may be an
+            // IMPORTED PropertySymbol: an interface property declared on an
+            // imported interface, or a property inherited from an imported
+            // base class that happens to satisfy a (possibly local)
+            // interface's obligation. Confirmed reachable for both shapes by
+            // probe before this fix (an imported interface's property and,
+            // separately, a local interface satisfied by a property inherited
+            // from an imported base class both silently accepted a type
+            // mismatch).
+            //
+            // ModuleLoader::convertMember's Property case never attaches an
+            // ast::PropertyDecl to a body-less imported declaration (there is
+            // no syntactic AST to attach — "the getter BODY is not
+            // reconstructed here"); the resolved property type instead rides
+            // the same importedMemberType side table used for imported
+            // fields/consts (ModuleLoader.cpp ~445, comment: "The resolved
+            // property TYPE rides fieldTypes_ ... so ctx.importedMemberType()
+            // can read it"). The old decl-only read made `propType` return
+            // null for EVERY imported property, silently skipping the §11.2
+            // exact-type-match check below via `if (!itype || !ctype)
+            // continue;` — a false ACCEPT of any property-type mismatch
+            // (verified: a `string`-typed local property satisfying an
+            // imported `Name: int` interface property compiled clean and,
+            // read through the interface reference, produced a garbage `int`
+            // off the string's representation).
             auto propType = [&](PropertySymbol* ps) -> const TypeRef* {
                 auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-                if (!pd || !pd->type) return nullptr;
-                return ctx_.resolvedType(*pd->type);
+                if (pd) {
+                    if (!pd->type) return nullptr;
+                    return ctx_.resolvedType(*pd->type);
+                }
+                return ctx_.importedMemberType(ps);
             };
             for (auto& [name, info] : ifaceProps) {
                 PropertySymbol* ips = info.first;
