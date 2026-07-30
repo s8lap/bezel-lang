@@ -72,7 +72,7 @@
 //     #973a/#2154 GetEnumerator claim (LlvmBackend_Iterators.cpp), simplified
 //     to claim EVERY owned param uniformly on the first call rather than
 //     replicating that path's finer-grained "only claim if actually
-//     consumed" sharing (tracked as a follow-up, #2362, for whoever wants
+//     consumed" sharing (tracked as a follow-up, #2377, for whoever wants
 //     the extra throughput of letting a never-consumed capture be safely
 //     read from multiple independent clones the way the sync path allows).
 //     This eliminates the aliasing at its ROOT for the compiler's own

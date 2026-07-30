@@ -1775,7 +1775,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     // uniformly by the first call (no attempt to distinguish a param the body
     // never moves out from one it does — that finer-grained sharing the sync
     // path allows for a never-consumed capture is intentionally NOT replicated
-    // here, tracked as a follow-up, #2362, for whoever revisits this for
+    // here, tracked as a follow-up, #2377, for whoever revisits this for
     // throughput; claim-once is conservative but sound for every shape).
     // `await for`'s desugaring (lowerAwaitFor) already drives exclusively
     // through the RETURNED enumerator pointer (never `self` directly), so it
