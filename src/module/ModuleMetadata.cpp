@@ -136,6 +136,13 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     hashU64(h, m.modifiers.size());
     for (const std::string& s : m.modifiers) hashStr(h, s);
     hashBool(h, m.isPure);
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 3): hasSetter is part of a Property's
+    // signature identity — a library changing a property from getter-only to
+    // read-write (or vice versa) changes the cross-module contract exactly
+    // the way #2392's outNullWhen does for a postcondition, so it must fold
+    // into the semantic hash or a consumer's staleness check cannot see the
+    // change (§2.8.3 rule 3: staleness is an error, not a negotiation).
+    hashBool(h, m.hasSetter);
     hashU64(h, m.contracts.size());
     for (const MetaContractRecord& c : m.contracts) hashContract(h, c);
     hashType(h, m.type);
@@ -274,7 +281,7 @@ MetaMember::MetaMember(const MetaMember& o)
       modifiers(o.modifiers), type(o.type), valueText(o.valueText),
       ctorBodyText(o.ctorBodyText), methodBodyText(o.methodBodyText),
       fieldInitText(o.fieldInitText),
-      isPure(o.isPure), contracts(o.contracts),
+      isPure(o.isPure), hasSetter(o.hasSetter), contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
       hasEnumValue(o.hasEnumValue), enumValue(o.enumValue) {
@@ -288,7 +295,7 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         modifiers = o.modifiers; type = o.type; valueText = o.valueText;
         ctorBodyText = o.ctorBodyText; methodBodyText = o.methodBodyText;
         fieldInitText = o.fieldInitText;
-        isPure = o.isPure; contracts = o.contracts;
+        isPure = o.isPure; hasSetter = o.hasSetter; contracts = o.contracts;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
         hasEnumValue = o.hasEnumValue; enumValue = o.enumValue;
@@ -305,7 +312,13 @@ bool MetaMember::operator==(const MetaMember& o) const {
         (nestedType && o.nestedType && *nestedType == *o.nestedType);
     return kind == o.kind && name == o.name && visibility == o.visibility &&
            modifiers == o.modifiers && type == o.type &&
-           isPure == o.isPure && contracts == o.contracts &&
+           isPure == o.isPure &&
+           // fix #2400 (§23/§2.8.2/§2.8.3 rule 3): hasSetter is part of a
+           // Property's signature identity — see the hashMember comment
+           // above for why it must compare unequal when it differs (a
+           // getter-only vs. read-write property are NOT the same member,
+           // structurally or semantically).
+           hasSetter == o.hasSetter && contracts == o.contracts &&
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
            hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
