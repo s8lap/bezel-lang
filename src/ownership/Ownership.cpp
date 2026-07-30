@@ -4112,6 +4112,55 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
             bool isAsync = false;
             for (std::string_view mod : md->modifiers)
                 if (mod == "async") { isAsync = true; break; }
+            // fix #2443 (§29.1 "The protocol", §28.10 using-var-from-a-borrow,
+            // v0.235): a manual, zero-arg `.GetEnumerator()` call whose
+            // sema-inferred result is the builtin `IEnumerator<T>`/
+            // `IOwningEnumerator<T>` sentinel is NEVER a recognized borrow,
+            // whatever `md`'s body shape scans as. §29.1 declares the
+            // protocol's signature as `method GetEnumerator(): owned
+            // IEnumerator<T>` and states plainly: "the caller takes ownership
+            // of the enumerator and must dispose it" — for EVERY call through
+            // this protocol, not merely ones whose implementation body is
+            // itself a fresh producer. The self-returning idiom (#2384: a
+            // class implementing both `IEnumerable<T>` and `IEnumerator<T>`,
+            // `GetEnumerator(): IEnumerator<int> return this; end
+            // GetEnumerator;`) spells its return type WITHOUT the `owned`
+            // keyword — the builtin sentinel is reached structurally, not via
+            // an interface-matching `owned` echo — so `md->returnOwned` reads
+            // false and the body-scan below would otherwise see a bare
+            // `return this;` and (correctly, IN GENERAL, for an ordinary
+            // receiver-returning method, §28.6 "Methods returning `this`")
+            // recognize it as a borrow-pin. But THIS specific call shape is
+            // never handed the raw receiver: LlvmBackend_Calls2.cpp's manual-
+            // `.GetEnumerator()` lowering (the #2388/#2440 fix site,
+            // `wrapUserClassAsIEnumerable`) always wraps the result in a
+            // freshly calloc'd adapter struct that the calling scope alone
+            // names and must dispose (its own Dispose, hardened by #2389/
+            // #2424/#2440, already resolves the self-returning alias
+            // correctly via a runtime pointer-equality guard so disposing the
+            // wrapper here is sound, not a double-free) — a purely codegen-
+            // level fact the body-shape scan below cannot see. Gated on the
+            // EXACT sema-type shape (Named, no `declaration`, an `astNode`
+            // with a single-part head of `IEnumerator`/`IOwningEnumerator`)
+            // codegen's own `resultIsEnumeratorSentinel` gate uses
+            // (LlvmBackend_Calls2.cpp `wrapUserClassAsIEnumerable` call site)
+            // so this carve fires on exactly the call shape codegen wraps and
+            // no other: the two-class idiom (`GetEnumerator()` returning a
+            // separate, freshly-`new`'d enumerator class) already fails the
+            // body-scan below on its own (a `new` producer is not receiver-
+            // sourced) and is unaffected either way. // per §29.1, §28.10,
+            // §28.6, #2443
+            bool isManualGetEnumeratorWrap = false;
+            if (md->name == "GetEnumerator") {
+                const sema::TypeRef* resultTy = ctx_.exprType(*ce);
+                isManualGetEnumeratorWrap =
+                    resultTy && resultTy->kind == sema::TypeRef::Kind::Named &&
+                    !resultTy->declaration && resultTy->astNode &&
+                    resultTy->astNode->name &&
+                    !resultTy->astNode->name->parts.empty() &&
+                    (resultTy->headName() == "IEnumerator" ||
+                     resultTy->headName() == "IOwningEnumerator");
+            }
             // #2137(b): the scan is the RECEIVER-SOURCED generalization — it
             // accepts, on every return path, a bare `this` (§28.6 "Methods
             // returning `this`"; for an extension method `this` IS the
@@ -4122,7 +4171,7 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
             // callee's definition (§28.3 "Borrow lifetime rules" — "a borrowed
             // *local or parameter* with no source that outlives the call may
             // not be returned"). // per §28.10, §28.6, §26.7, #2137
-            if (!isAsync && !md->returnOwned &&
+            if (!isAsync && !isManualGetEnumeratorWrap && !md->returnOwned &&
                 methodReturnsOnlyReceiverSourcedBorrows(*md))
                 return true;
         }
