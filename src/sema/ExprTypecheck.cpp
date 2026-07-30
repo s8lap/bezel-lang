@@ -10445,6 +10445,39 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                         "here (§13.6)");
                                 }
                             }
+                        } else {
+                            // fix #2412 (§23.3, §2.8.2/§2.8.3 rule 4,
+                            // v0.235): an IMPORTED PropertySymbol has no
+                            // ast::PropertyDecl (`ps->decl` is unconditionally
+                            // null — ModuleLoader never reconstructs a
+                            // body-less imported property's decl), so the
+                            // `pd`-gated check above silently skipped every
+                            // imported property, accepting a write to a
+                            // getter-only imported property that the
+                            // identical same-module shape correctly rejects
+                            // (confirmed asymmetry — a #2374-family instance).
+                            // Fall back to the hasSetter side table #2400
+                            // publishes from MetaMember::hasSetter, which is
+                            // false both for a genuinely getter-only property
+                            // (expression-bodied or block-getter-only) and
+                            // for a readonly auto-property (mirrors
+                            // ModuleMetadataBuilder.cpp's export-time
+                            // computation) — either way, no assignment is
+                            // ever valid on it from outside its declaring
+                            // module, so one message covers both source
+                            // shapes the same way the local `!hasSetter`
+                            // branch's message already does. (A settable
+                            // imported property's setter-VISIBILITY, §13.6,
+                            // is not checked here — that is a separate,
+                            // further #2374 instance, filed as its own issue
+                            // rather than folded into this fix's scope.)
+                            if (!ctx_.importedPropertyHasSetter(ps)) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, as->span.begin,
+                                    "cannot assign to read-only property `" +
+                                    propName +
+                                    "` — it has no setter (§23.3)");
+                            }
                         }
                 }
             }
