@@ -984,6 +984,20 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
             Disposal rd{slots[i], cty->declaration};
             rd.recordStringFields = true;
             disposeStack_.back().push_back(rd);
+        } else if (!cty->nullable && cty->kind == sema::TypeRef::Kind::Named &&
+                   cty->declaration &&
+                   cty->declaration->kind == ast::TypeDeclKind::Choice &&
+                   choiceHasStringFields(cty->declaration)) {
+            // fix #2425 / §9.8 / §28.3/§28.9 / §35.4: a record component may
+            // itself be a value-like CHOICE (record-admissible per §9.8)
+            // that owns a string somewhere reachable from its active case —
+            // the residual gap #2405 documented (no release walker existed
+            // for choices at all). Released via emitChoiceStringFieldReleases,
+            // a separate tag-switched walker (see the Disposal.choiceStringFields
+            // comment in LlvmBackend_impl.hpp).
+            Disposal cd{slots[i], cty->declaration};
+            cd.choiceStringFields = true;
+            disposeStack_.back().push_back(cd);
         }
     }
 
@@ -2008,6 +2022,19 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                     Disposal rd{slots[pi], pty->declaration};
                     rd.recordStringFields = true;
                     disposeStack_.back().push_back(rd);
+                } else if (!pty->nullable &&
+                           pty->kind == sema::TypeRef::Kind::Named &&
+                           pty->declaration &&
+                           pty->declaration->kind == ast::TypeDeclKind::Choice &&
+                           choiceHasStringFields(pty->declaration)) {
+                    // fix #2425 / §9.8 / §28.3/§28.9 / §35.4: a choice
+                    // payload field may itself be a value-like CHOICE
+                    // (record-admissible per §9.8, nested at any depth) —
+                    // see the matching branch in emitRecordDeserialize above
+                    // for the full rationale.
+                    Disposal cd{slots[pi], pty->declaration};
+                    cd.choiceStringFields = true;
+                    disposeStack_.back().push_back(cd);
                 }
             }
 

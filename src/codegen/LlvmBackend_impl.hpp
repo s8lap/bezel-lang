@@ -850,6 +850,19 @@ private:
         // double-free). `slot` is the record's struct alloca; `cls` is the
         // record TypeSymbol (used to GEP each string storage member).
         bool recordStringFields = false;
+        // fix #2425 / §9.8 / §28.3 / §28.9 / §35.4 v0.235: an ALREADY-
+        // POPULATED deserialize component/payload slot (#2398 disposal
+        // scope, LlvmBackend_Serialization.cpp) whose declared type is a
+        // value-like CHOICE that owns a string somewhere reachable from its
+        // active case (directly, or through a nested record/choice
+        // payload). Guards the slot against a LATER sibling's read
+        // throwing, the choice-side counterpart of `recordStringFields`
+        // just above — released via emitChoiceStringFieldReleases, a
+        // separate tag-switched walker (the choice struct's `$case`-tagged
+        // variant layout differs from a record's plain field sequence, so
+        // it cannot reuse `emitRecordStringFieldReleases` verbatim). `slot`
+        // is the choice's struct alloca; `cls` is the choice TypeSymbol.
+        bool choiceStringFields = false;
         // §2.15 / issue #550: a `using var` bound to a BinarySerializer or
         // BinaryDeserializer.  These are opaque heap handles with no user
         // TypeSymbol and no vtable.  At scope end they are freed via
@@ -2539,10 +2552,26 @@ private:
     // isRecordWithStringFieldsTypeRef's own PRE-EXISTING top-level
     // exclusion (unchanged by this fix): it lowers to a {i8, P} wrapper
     // struct, not the bare record layout this walker (and
-    // recordHasStringFields, below) assume. A value-like CHOICE component
-    // (nested at any depth, in a record OR directly) is a separate,
-    // documented residual gap: no release walker analogous to this one
-    // exists for choices at all yet -- #2425 filed.
+    // recordHasStringFields, below) assume.
+    //
+    // fix #2425 / §9.8 / §28.9 / §35.4 v0.235: a record component may also
+    // be a value-like CHOICE (§9.8 record-admissibility: "a value-like
+    // serialization-eligible choice" is a record-admissible component type,
+    // matching §9.2's admission of value-like choices as equality
+    // components). Recurse into a non-nullable choice-typed storage member
+    // exactly as into a nested record: the choice struct is likewise
+    // embedded INLINE (§35.1 — a choice is a value type regardless of its
+    // §35.4 classification), so a GEP off this SAME outer struct address
+    // reaches it, and the recursion terminates for the same reason (§35.1's
+    // choice self-containment check, TypeResolution_Checks.cpp's
+    // checkChoiceSelfContainment/recordValueContainsSelf, rejects a choice
+    // that transitively contains itself through value-typed payloads — the
+    // combined record+choice value-type graph reachable from any
+    // declaration is a finite DAG regardless of which kind starts the
+    // walk). The actual per-case, tag-switched release lives in
+    // emitChoiceStringFieldReleases_impl (LlvmBackend_Disposal.cpp) — the
+    // choice-side counterpart this comment's prior revision (#2405) noted
+    // was missing.
     void emitRecordStringFieldReleases_impl(llvm::Value* recAddr,
                                             const sema::TypeSymbol* ts) {
         if (!recAddr || !ts || ts->kind != ast::TypeDeclKind::Record) return;
@@ -2572,6 +2601,17 @@ private:
                 llvm::Value* nestedAddr = builder_.CreateStructGEP(
                     st, recAddr, idxIt->second, "recstrf.nested.addr");
                 emitRecordStringFieldReleases_impl(nestedAddr, mty->declaration);
+                continue;
+            }
+            // fix #2425: a nested value-like CHOICE component (see the
+            // function comment above).
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
+                mty->declaration->kind == ast::TypeDeclKind::Choice &&
+                choiceHasStringFields(mty->declaration)) {
+                llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                    st, recAddr, idxIt->second, "recstrf.nested.ch.addr");
+                emitChoiceStringFieldReleases_impl(nestedAddr, mty->declaration);
             }
         }
     }
@@ -6042,6 +6082,14 @@ private:
     // references to the caller" — a fact that holds compositionally at any
     // nesting depth, since a by-value struct copy/embed never touches a
     // refcount).
+    // fix #2425 / §9.8 / §35.4 v0.235: ALSO recurses into a non-nullable
+    // CHOICE-typed storage member — a record component may itself be a
+    // value-like choice (§9.8's record-admissibility clause), whose own
+    // payload fields (in any declared case) may own a string directly or
+    // transitively through a further nested record/choice payload. This is
+    // the choice-side mirror of the #2405 nested-record recursion just
+    // above; see choiceHasStringFields (LlvmBackend_Disposal.cpp) for the
+    // choice-side termination argument (§35.1 self-containment).
     bool recordHasStringFields(const sema::TypeSymbol* ts) {
         if (!ts || ts->kind != ast::TypeDeclKind::Record) return false;
         std::vector<const sema::Symbol*> storage;
@@ -6054,8 +6102,49 @@ private:
                 mty->declaration->kind == ast::TypeDeclKind::Record &&
                 recordHasStringFields(mty->declaration))
                 return true;
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
+                mty->declaration->kind == ast::TypeDeclKind::Choice &&
+                choiceHasStringFields(mty->declaration))
+                return true;
         }
         return false;
+    }
+
+    // fix #2425 / §9.8 / §28.9 / §35.4 v0.235: does value-like choice `ts`
+    // own, directly (a `string` payload field in some declared case) or
+    // transitively (through a non-nullable nested-record or nested-choice
+    // payload field), at least one `string`? Mirrors recordHasStringFields's
+    // mutual recursion just above. Termination: §35.1's choice
+    // self-containment check (TypeResolution_Checks.cpp's
+    // checkChoiceSelfContainment, which reuses recordValueContainsSelf —
+    // "a choice cannot recursively contain itself by value through its case
+    // payloads") rejects a choice/record graph cycle at DECLARATION time
+    // exactly as §9 rejects a self-containing record, so the combined
+    // record+choice value-type graph reachable from any record or choice
+    // declaration is a finite DAG regardless of which kind starts the walk
+    // — the same basis emitStructEquality and the #2405 record recursion
+    // rely on. Defined in LlvmBackend_Disposal.cpp, next to the release
+    // walker it gates. Declared here so recordHasStringFields (above) and
+    // emitRecordStringFieldReleases_impl (above) can call it.
+    bool choiceHasStringFields(const sema::TypeSymbol* ts);
+
+    // fix #2425 / §9.8 / §28.3 / §28.9 / §35.4 v0.235: release the ACTIVE
+    // case's `string`-owning payload(s) of value-like choice `choiceTy` at
+    // struct ADDRESS `choiceAddr`, recursing into a non-nullable nested
+    // record/choice payload field to ARBITRARY depth — the choice-side
+    // counterpart to emitRecordStringFieldReleases/_impl. Defined in
+    // LlvmBackend_Disposal.cpp. Used by the #2398/#2425 deserialize
+    // disposal-scope registration (LlvmBackend_Serialization.cpp); NOT the
+    // same mechanism as #2115's emitValueLikeChoiceActiveCaseStrRelease
+    // (a separate, VALUE-based, one-level walker for the scope-end LOCAL
+    // release, LlvmBackend_Setup.cpp/_Disposal.cpp) — see the #2425/#2428
+    // lane report for which mechanism covers which shape.
+    void emitChoiceStringFieldReleases_impl(llvm::Value* choiceAddr,
+                                            const sema::TypeSymbol* choiceTy);
+    void emitChoiceStringFieldReleases(llvm::Value* choiceAddr,
+                                       const sema::TypeSymbol* choiceTy) {
+        emitChoiceStringFieldReleases_impl(choiceAddr, choiceTy);
     }
 
     // fix #1747 / §28.9 / §9.7 / §28.3: is `tr` a (non-nullable) record

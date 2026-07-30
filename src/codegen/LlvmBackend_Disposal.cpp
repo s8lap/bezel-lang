@@ -1799,6 +1799,171 @@ void Emitter::emitValueLikeChoiceActiveCaseStrRelease(
 }
 
 
+// fix #2425 / §9.8 / §28.9 / §35.4 v0.235: does value-like choice `ts` own,
+// directly or transitively (through a non-nullable nested-record or
+// nested-choice payload field), at least one `string`? See the declaration
+// in LlvmBackend_impl.hpp for the full termination argument (§35.1's choice
+// self-containment check makes the record+choice value-type graph a finite
+// DAG). GENERIC choices are excluded (returns false unconditionally): a
+// generic choice's payload struct layout is per-instantiation
+// (choiceStruct's #2047 specialization), and neither this classifier nor
+// emitChoiceStringFieldReleases_impl below installs a RecordSubstGuard for
+// a NESTED generic choice/record reached mid-recursion — the same narrow,
+// documented scope #2405's record recursion already has (it does not
+// thread generic substitution through nested levels either). A generic
+// value-like choice component/payload is therefore a residual gap, not a
+// new one this fix introduces — filed if found in a live shape (none of
+// this issue's own repros are generic).
+bool Emitter::choiceHasStringFields(const sema::TypeSymbol* ts) {
+    if (!ts || ts->kind != ast::TypeDeclKind::Choice) return false;
+    if (!ts->genericParams.empty()) return false;
+    for (const sema::ChoiceCaseSymbol* cc : choiceCasesOf(ts)) {
+        if (!cc || !cc->caseDecl) continue;
+        for (const ast::Param& pf : cc->caseDecl->payload) {
+            if (!pf.type) continue;
+            const sema::TypeRef* ft = ctx_.resolvedType(*pf.type);
+            if (!ft) continue;
+            if (ft->kind == sema::TypeRef::Kind::Primitive &&
+                ft->primitive == sema::PrimitiveType::String)
+                return true;
+            if (ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
+                !ft->declaration)
+                continue;
+            if (ft->declaration->kind == ast::TypeDeclKind::Record &&
+                recordHasStringFields(ft->declaration))
+                return true;
+            if (ft->declaration->kind == ast::TypeDeclKind::Choice &&
+                choiceHasStringFields(ft->declaration))
+                return true;
+        }
+    }
+    return false;
+}
+
+
+// fix #2425 / §9.8 / §28.3 / §28.9 / §35.4 v0.235: release the ACTIVE case's
+// `string`-owning payload(s) of value-like choice `choiceTy` at struct
+// ADDRESS `choiceAddr`, recursing into a non-nullable nested-record or
+// nested-choice payload field to ARBITRARY depth. This is the choice-side
+// counterpart to emitRecordStringFieldReleases_impl's #2405 arbitrary-depth
+// recursion, and the address-based (GEP, not load+extractvalue) analog of
+// #2115's emitValueLikeChoiceActiveCaseStrRelease above — that function is
+// VALUE-based (loads the whole struct once, ExtractValue per field) and
+// stops at ONE level (direct string payload fields only); this one is
+// ADDRESS-based so a nested record/choice payload's OWN storage can be
+// reached by a further GEP off the same base, exactly as
+// emitRecordStringFieldReleases_impl reaches a nested record. The two
+// functions are NOT merged: this one is used only by the #2398/#2425
+// deserialize disposal-scope registration (LlvmBackend_Serialization.cpp),
+// which already holds an ADDRESS (an alloca'd component/payload slot); the
+// #2115 mechanism is used by the scope-end LOCAL release
+// (LlvmBackend_Setup.cpp), which arms off a VALUE-level escape analysis
+// unrelated to this one. See choiceHasStringFields just above for the
+// termination argument and the (documented, narrow) generic exclusion this
+// function shares via that gate.
+//
+// A NULLABLE nested-record/nested-choice payload field is excluded, matching
+// emitRecordStringFieldReleases_impl's own exclusion: it lowers to a
+// `{i8, T}` wrapper struct, not the bare layout this walker assumes.
+void Emitter::emitChoiceStringFieldReleases_impl(
+        llvm::Value* choiceAddr, const sema::TypeSymbol* choiceTy) {
+    if (!choiceAddr || !choiceTy || choiceTy->kind != ast::TypeDeclKind::Choice)
+        return;
+    if (!choiceHasStringFields(choiceTy)) return;  // also excludes generics
+    auto cases = choiceCasesOf(choiceTy);
+    if (cases.empty()) return;
+    llvm::StructType* st = choiceStruct(choiceTy);
+    if (!st) return;
+    llvm::Value* tagAddr =
+        builder_.CreateStructGEP(st, choiceAddr, 0, "chsfr.tag.addr");
+    llvm::Value* tag = builder_.CreateLoad(i32(), tagAddr, "chsfr.tag");
+    auto* joinBB = llvm::BasicBlock::Create(llvm_, "chsfr.join", currentFn_);
+    auto* switchBB = llvm::BasicBlock::Create(llvm_, "chsfr.switch", currentFn_);
+    builder_.CreateBr(switchBB);
+    builder_.SetInsertPoint(switchBB);
+    auto* sw = builder_.CreateSwitch(
+        tag, joinBB, static_cast<unsigned>(cases.size()));
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const sema::ChoiceCaseSymbol* cc = cases[i];
+        if (!cc || !cc->caseDecl) continue;
+        // Does THIS case own a string, directly or transitively? Skip the
+        // arm entirely (collapses to the join) if not — mirrors #2115's own
+        // per-case caseHasStringPayload guard.
+        bool caseOwnsString = false;
+        for (const ast::Param& pf : cc->caseDecl->payload) {
+            if (!pf.type) continue;
+            const sema::TypeRef* ft = ctx_.resolvedType(*pf.type);
+            if (!ft) continue;
+            if (ft->kind == sema::TypeRef::Kind::Primitive &&
+                ft->primitive == sema::PrimitiveType::String) {
+                caseOwnsString = true;
+                break;
+            }
+            if (ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
+                !ft->declaration)
+                continue;
+            if ((ft->declaration->kind == ast::TypeDeclKind::Record &&
+                 recordHasStringFields(ft->declaration)) ||
+                (ft->declaration->kind == ast::TypeDeclKind::Choice &&
+                 choiceHasStringFields(ft->declaration))) {
+                caseOwnsString = true;
+                break;
+            }
+        }
+        if (!caseOwnsString) continue;
+        auto* armBB = llvm::BasicBlock::Create(llvm_, "chsfr.arm", currentFn_);
+        sw->addCase(llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_), i),
+                    armBB);
+        builder_.SetInsertPoint(armBB);
+        // GEP into the case's payload slot (field 1+i) — embedded inline in
+        // the SAME outer struct, exactly like a record's nested-record
+        // member (§35.1: a choice's case payloads are value-typed storage).
+        llvm::Value* payloadAddr = builder_.CreateStructGEP(
+            st, choiceAddr, 1 + (unsigned)i, "chsfr.case.addr");
+        llvm::Type* payloadTy = st->getElementType(1 + (unsigned)i);
+        auto* payloadStruct = llvm::dyn_cast<llvm::StructType>(payloadTy);
+        for (std::size_t j = 0; j < cc->caseDecl->payload.size(); ++j) {
+            const ast::Param& pf = cc->caseDecl->payload[j];
+            if (!pf.type) continue;
+            const sema::TypeRef* ft = ctx_.resolvedType(*pf.type);
+            if (!ft || !payloadStruct || j >= payloadStruct->getNumElements())
+                continue;
+            if (ft->kind == sema::TypeRef::Kind::Primitive &&
+                ft->primitive == sema::PrimitiveType::String) {
+                llvm::Value* fAddr = builder_.CreateStructGEP(
+                    payloadStruct, payloadAddr, (unsigned)j, "chsfr.str.addr");
+                llvm::Value* fVal =
+                    builder_.CreateLoad(ptrTy(), fAddr, "chsfr.str.val");
+                emitStringRelease(fVal);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), fAddr);
+                continue;
+            }
+            if (ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
+                !ft->declaration)
+                continue;
+            if (ft->declaration->kind == ast::TypeDeclKind::Record &&
+                recordHasStringFields(ft->declaration)) {
+                llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                    payloadStruct, payloadAddr, (unsigned)j,
+                    "chsfr.nested.rec.addr");
+                emitRecordStringFieldReleases_impl(nestedAddr, ft->declaration);
+                continue;
+            }
+            if (ft->declaration->kind == ast::TypeDeclKind::Choice &&
+                choiceHasStringFields(ft->declaration)) {
+                llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                    payloadStruct, payloadAddr, (unsigned)j,
+                    "chsfr.nested.ch.addr");
+                emitChoiceStringFieldReleases_impl(nestedAddr, ft->declaration);
+            }
+        }
+        builder_.CreateBr(joinBB);
+    }
+    builder_.SetInsertPoint(joinBB);
+}
+
+
 void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
                                           llvm::Value* recvPtr,
                                           const sema::TypeRef* resultTy,
@@ -2559,6 +2724,19 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // TypeSymbol used to GEP each string storage member.
         if (it->recordStringFields) {
             emitRecordStringFieldReleases(it->slot, it->cls);
+            continue;
+        }
+        // fix #2425 / §9.8 / §28.3/§28.9 / §35.4: the choice-side counterpart
+        // just above — an already-populated deserialize component/payload
+        // slot whose type is a value-like choice owning a string (directly
+        // or through a nested record/choice payload), guarded against a
+        // LATER sibling's read throwing. Runs on BOTH the normal and unwind
+        // exit for the same reason `recordStringFields` does (the #2398/
+        // #2425 registration is popped WITHOUT disposal once every required
+        // component is confirmed present, so this only ever fires on the
+        // throw path this scope exists to guard).
+        if (it->choiceStringFields) {
+            emitChoiceStringFieldReleases(it->slot, it->cls);
             continue;
         }
         // #429 / §27.5: a boxed capture cell (shared heap allocation from
