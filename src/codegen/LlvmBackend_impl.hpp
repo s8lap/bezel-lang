@@ -6207,6 +6207,53 @@ private:
     void collectRecordCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+    // fix #2428 / §9.8 / §28.9 / §35.4: is `call` a call to a value-like
+    // choice type's own SYNTHESIZED `Deserialize(d: IDeserializer)` factory
+    // — the ONE call shape admitted for the #2428 call-result release below
+    // (deliberately narrower than #1747's own "any CallExpr returning the
+    // type" gate — mirroring that general gate was found, during this
+    // issue's own scoping, to be UNSOUND even for records: a callee that
+    // returns a BORROWED value rather than a fresh construction has no
+    // genuine +1 for the caller to release; a heap-use-after-free,
+    // empirically confirmed and filed as #2448, not fixed here). A
+    // SYNTHESIZED Deserialize is provably always a fresh construction — it
+    // is compiler-generated, so there is no user body that could instead
+    // return a borrowed field/param — so admitting ONLY this shape keeps
+    // the release sound without a whole-callee-body analysis. Structurally
+    // mirrors the EXACT recognition LlvmBackend_Serialization.cpp's own
+    // call-site dispatch uses to route `Type.Deserialize(d)` to
+    // emitChoiceDeserialize (methodName=="Deserialize", one arg, callee
+    // target is an IdentifierExpr naming a TypeSymbol, the type declares
+    // IDeserializable, and has no hand-written "Deserialize" method — a
+    // hand-written Deserialize suppresses synthesis, §9.8, and need not be
+    // fresh-construction-shaped). Defined in LlvmBackend_Setup.cpp, next to
+    // its sole caller (collectValueLikeChoiceCallResultReleaseEligible).
+    // GENERIC choices are excluded (ts->genericParams must be empty),
+    // matching #2425's own documented generic decline.
+    bool isSynthesizedValueLikeChoiceDeserializeCall(
+        const ast::CallExpr* call) const;
+
+    // fix #2428 / §9.8 / §28.9 / §35.4: the set of plain `var` VALUE-LIKE
+    // CHOICE LocalDecl nodes whose initializer is a call recognized by
+    // isSynthesizedValueLikeChoiceDeserializeCall, whose resolved type
+    // (declared or inferred) is that SAME non-nullable, non-generic choice
+    // with at least one string reachable from its active case
+    // (choiceHasStringFields, #2425), and which the conservative escape
+    // walk proved never to escape. Consulted in lowerLocalDecl
+    // (LlvmBackend_Setup.cpp), mirroring recordCallResultReleaseEligible_
+    // exactly. Released via the SAME choiceStringFields Disposal / arbitrary-
+    // depth emitChoiceStringFieldReleases walker #2425 built for the
+    // deserialize disposal scope — reused here rather than a third ad hoc
+    // mechanism, per #2425's own filed recommendation ("one shared...
+    // walker... rather than two parallel ad hoc mechanisms").
+    std::unordered_set<const void*> valueLikeChoiceCallResultReleaseEligible_;
+    llvm::Function* valueLikeChoiceCallResultReleaseEligibleFn_ = nullptr;
+
+    // fix #2428: walk the function body, classifying each plain-`var`
+    // value-like-choice call-result LocalDecl by escape verdict.
+    void collectValueLikeChoiceCallResultReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
     // #429: is the resolved TypeRef `rt` a (non-nullable) `string`? Used to
     // zero-init a no-initializer `var s: string;` slot so reassignment's
     // release-old is null-safe. Nullable string? is excluded (left untouched).

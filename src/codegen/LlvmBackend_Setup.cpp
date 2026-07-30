@@ -5791,6 +5791,15 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // return type and a conservative non-escape verdict).
     recordCallResultReleaseEligible_.clear();
     recordCallResultReleaseEligibleFn_ = fn;
+    // fix #2428 / §9.8 / §28.9 / §35.4: which plain `var` VALUE-LIKE CHOICE
+    // locals bound from a call to the type's own synthesized `Deserialize`
+    // factory may have their reachable strings released at scope end
+    // (mirrors recordCallResultReleaseEligible_ just above; consulted in
+    // lowerLocalDecl). See isSynthesizedValueLikeChoiceDeserializeCall for
+    // why the admitted call shape is narrower than #1747's own record-side
+    // gate.
+    valueLikeChoiceCallResultReleaseEligible_.clear();
+    valueLikeChoiceCallResultReleaseEligibleFn_ = fn;
     boxReleaseEligibleFn_ = fn;
     // §27.5 / §28.9 / #672: which +1-box-producer locals are captured by exactly
     // one lambda env, so the owning lambda's envdtor may perform the deferred
@@ -5809,6 +5818,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
         collectMoveOnlyArrayTransferred(*ci.stmts);
         collectStringReleaseEligible(*ci.stmts);
         collectRecordCallResultReleaseEligible(*ci.stmts);  // fix #1747
+        collectValueLikeChoiceCallResultReleaseEligible(*ci.stmts);  // fix #2428
         collectBorrowingArrayFreeEligible(*ci.stmts);  // #1003
         collectClosureReleaseEligible(*ci.stmts);
         collectBoxReleaseEligible(*ci.stmts);
@@ -9069,6 +9079,35 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         if (recTs) {
             Disposal d{slot, recTs};
             d.recordStringFields = true;
+            disposeStack_.back().push_back(d);
+        }
+    }
+    // fix #2428 / §9.8 / §28.9 / §35.4: if this plain `var` VALUE-LIKE CHOICE
+    // local was bound from a call to the type's own SYNTHESIZED Deserialize
+    // factory (`var v := Msg.Deserialize(d);`) and proven NON-escaping by the
+    // conservative escape walk (valueLikeChoiceCallResultReleaseEligible_),
+    // register a scope-end release of every string reachable from the active
+    // case (choiceStringFields Disposal — #2425's arbitrary-depth walker).
+    // #2115 only recognized a DIRECT choice-case-construction initializer
+    // (`Msg.Text(...)`); a call that ITSELF constructs and returns the same
+    // shape (the synthesized Deserialize's body) was never recognized — this
+    // is #1747's own record-call-result precedent, applied to choices.
+    // Gated on currentFn_ matching the analyzed function, mirroring every
+    // other eligibility-set consumer in this function.
+    if (v && currentFn_ == valueLikeChoiceCallResultReleaseEligibleFn_ &&
+        valueLikeChoiceCallResultReleaseEligible_.count(
+            static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        const sema::TypeRef* tr = nullptr;
+        if (declType) tr = ctx_.resolvedType(*declType);
+        if (!tr && init) tr = ctx_.exprType(*init);
+        tr = resolveTypeParamRef(tr);
+        if (tr && !tr->nullable && tr->kind == sema::TypeRef::Kind::Named &&
+            tr->declaration &&
+            tr->declaration->kind == ast::TypeDeclKind::Choice &&
+            choiceHasStringFields(tr->declaration)) {
+            Disposal d{slot, tr->declaration};
+            d.choiceStringFields = true;
             disposeStack_.back().push_back(d);
         }
     }
@@ -15049,6 +15088,130 @@ void Emitter::collectRecordCallResultReleaseEligible(
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             recordCallResultReleaseEligible_.insert(
+                static_cast<const void*>(ld));
+    }
+}
+
+
+// fix #2428 / §9.8 / §28.9 / §35.4: see the declaration in
+// LlvmBackend_impl.hpp for the full rationale (why this call shape, and why
+// it is narrower than #1747's own gate). Structurally mirrors the EXACT
+// recognition LlvmBackend_Serialization.cpp's own call-site dispatch uses
+// for `Type.Deserialize(d)` (methodName=="Deserialize", one arg, callee
+// target is an IdentifierExpr naming a TypeSymbol, the type declares
+// IDeserializable, no hand-written "Deserialize" method) — duplicated here
+// (rather than exposed cross-TU) since the two `declaresConformance`/
+// `hasHandWrittenMethod` helpers in LlvmBackend_Serialization.cpp are file-
+// static and small.
+bool Emitter::isSynthesizedValueLikeChoiceDeserializeCall(
+        const ast::CallExpr* call) const {
+    if (!call || !call->callee || call->args.size() != 1) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || ma->member != "Deserialize" || !ma->target) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id) return false;
+    const auto* ts =
+        dynamic_cast<const sema::TypeSymbol*>(ctx_.exprSymbol(*ma->target));
+    if (!ts || ts->kind != ast::TypeDeclKind::Choice) return false;
+    if (!ts->genericParams.empty()) return false;  // #2425's own generic decline
+    const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
+    if (!td) return false;
+    bool declaresIDeserializable = false;
+    for (const auto& bt : td->baseTypes) {
+        if (bt && bt->name && !bt->name->parts.empty() &&
+            bt->name->parts[0] == "IDeserializable") {
+            declaresIDeserializable = true;
+            break;
+        }
+    }
+    if (!declaresIDeserializable) return false;
+    for (const sema::Symbol* m : ts->members) {
+        // A hand-written "Deserialize" method suppresses synthesis (§9.8) —
+        // its body is not provably a fresh construction, so it must NOT be
+        // admitted here.
+        if (m->name == "Deserialize" &&
+            dynamic_cast<const sema::MethodSymbol*>(m))
+            return false;
+    }
+    return true;
+}
+
+
+// fix #2428 / §9.8 / §28.9 / §35.4: walk the function body, classifying
+// each plain-`var` value-like-choice call-result LocalDecl by escape
+// verdict. See the declaration in LlvmBackend_impl.hpp for the full
+// rationale; mirrors collectRecordCallResultReleaseEligible just above.
+void Emitter::collectValueLikeChoiceCallResultReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    valueLikeChoiceCallResultReleaseEligible_.clear();
+    std::vector<const ast::LocalDecl*> candidates;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (!ld->isUsing && ld->initializer) {
+                if (auto* call = dynamic_cast<const ast::CallExpr*>(
+                        ld->initializer.get())) {
+                    if (isSynthesizedValueLikeChoiceDeserializeCall(call)) {
+                        // The resolved local type (declared annotation, or
+                        // — for an inferred `var v := Msg.Deserialize(d)` —
+                        // the initializer's exprType) must be the SAME
+                        // non-nullable, non-generic choice with at least
+                        // one string reachable from its active case
+                        // (choiceHasStringFields, #2425) — otherwise there
+                        // is nothing to release. A NULLABLE declared type
+                        // (`var v: Msg? := Msg.Deserialize(d);`) is
+                        // excluded: its slot is the `{i8, T}` wrapper
+                        // layout emitChoiceStringFieldReleases_impl does
+                        // not handle, matching #2425's own nullable
+                        // exclusion.
+                        const sema::TypeRef* tr = nullptr;
+                        if (ld->type) tr = ctx_.resolvedType(*ld->type);
+                        if (!tr) tr = ctx_.exprType(*ld->initializer);
+                        if (tr && !tr->nullable &&
+                            tr->kind == sema::TypeRef::Kind::Named &&
+                            tr->declaration &&
+                            tr->declaration->kind ==
+                                ast::TypeDeclKind::Choice &&
+                            choiceHasStringFields(tr->declaration))
+                            candidates.push_back(ld);
+                    }
+                }
+            }
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+
+    for (const ast::LocalDecl* ld : candidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        // Every mode stays false, mirroring #2115's OWN value-like-choice
+        // release walk (collectStringReleaseEligible's valueLikeChoiceCandidates
+        // loop): a choice-typed store/arg-pass is a raw aggregate memcpy with
+        // no per-field retain, so every non-trivial use (case-match scrutinee,
+        // arg-pass, field/collection store, reassignment) stays a
+        // conservative escape — the SAME leak-over-UAF discipline #2115
+        // already established for this type family.
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            valueLikeChoiceCallResultReleaseEligible_.insert(
                 static_cast<const void*>(ld));
     }
 }
