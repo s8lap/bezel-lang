@@ -266,6 +266,28 @@ for f in "$@"; do
   # suite split this must be judged over ALL binaries, never one.
   if [ -z "$matches" ]; then
     echo "agent_check: ERROR filter '$f' matched 0 tests in any of $(test_binaries | wc -l) test binaries — a typo, or you passed the FILE basename instead of the gtest suite-or-name substring. Nothing was verified; treating as FAILURE (not a false green)."
+    # Suggest what they probably meant. Suite names are area-prefixed and
+    # abbreviated, so they routinely differ from the FILE name that inspired
+    # the filter (file `..._case_type_ws_2419_test.cpp` -> suite
+    # `codegen_serialization_case_ws_2419`). Every such mistake observed so far
+    # still carried the issue number, so try tokens in order of how much they
+    # NARROW the search: numeric tokens (issue numbers) first — they are the
+    # shortest but by far the most distinctive — then longest-first for the
+    # rest. Stop at the first token that finds anything.
+    for tok in $(printf '%s\n' "$f" | tr -cs 'A-Za-z0-9' '\n' |
+                 awk 'length($0)>=3 {k = ($0 ~ /^[0-9]+$/) ? 0 : 1;
+                                     print k"\t"length($0)"\t"$0}' |
+                 sort -k1,1n -k2,2nr | cut -f3); do
+      hits="$(for b in $(test_binaries); do
+                BEZEL_TEST_ENUMERATE=1 "$b" 2>/dev/null
+              done | grep -iF "$tok" | cut -d. -f1 | sort -u | head -8)"
+      if [ -n "$hits" ]; then
+        echo "agent_check: did you mean one of these? (suites containing '$tok')"
+        printf '    %s\n' $hits
+        echo "agent_check: (list all with: BEZEL_TEST_ENUMERATE=1 <binary from build/tests/test_binaries.txt>)"
+        break
+      fi
+    done
     rc_all=1
     continue
   fi
