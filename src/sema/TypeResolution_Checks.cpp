@@ -2948,7 +2948,36 @@ void Resolver::checkAbstractImplementations() {
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t) continue;
-        if (t->kind != ast::TypeDeclKind::Class) continue;
+        // #2416 / §11.2 / §9.6: records may implement interfaces exactly like
+        // classes ("A record may implement any number of interfaces" — §9.6)
+        // and are bound by the identical §11.2 conformance obligations, but
+        // this function's outer loop previously filtered to Class only, so a
+        // record got NONE of the checks below — not #489's "field doesn't
+        // satisfy a property" check, not #2380's property-type-match check,
+        // and not #2413's accessor-set check. That reproduced #2413's exact
+        // null-itable-setter-slot SIGSEGV for a record's getter-only property
+        // satisfying a read-write interface property obligation (confirmed by
+        // probe before this fix). Widened to admit Record here; each check
+        // below was individually audited for class-specific assumptions (see
+        // the per-check comments) before being left enabled for records.
+        const char* kindWord =
+            (t->kind == ast::TypeDeclKind::Record) ? "record" : "class";
+        if (t->kind != ast::TypeDeclKind::Class &&
+            t->kind != ast::TypeDeclKind::Record)
+            continue;
+        // #2416: `isAbstract` — records cannot be inherited from and are
+        // implicitly sealed (§9.6), and the grammar's shared Modifier*
+        // production over-admits `abstract` on a RecordDecl the same way it
+        // over-admits `ref`/`out`/`scoped` on primary-constructor parameters
+        // (§22.10) — sema is the semantic gate, per the parser's own comment
+        // at parseTopDecl. No existing check rejects `abstract record`
+        // (verified: checkClassModifierCombinations, the only §11.7 modifier-
+        // combination check, filters to Class only and never reports on a
+        // record). Whether `abstract record` should itself be a compile error
+        // is a separate, pre-existing question this fix does not decide either
+        // way — out of scope for #2416 (filed as #2431); this loop simply
+        // preserves the existing "abstract types need not implement
+        // obligations" reading for whichever type kind carries the modifier.
         bool isAbstract = false;
         for (auto mod : t->modifiers) {
             if (mod == "abstract") { isAbstract = true; break; }
@@ -3010,6 +3039,18 @@ void Resolver::checkAbstractImplementations() {
         std::unordered_map<std::string_view,
                            std::pair<PropertySymbol*, TypeSymbol*>> ifaceProps;
         std::unordered_map<std::string_view, PropertySymbol*> concreteProps;
+        // §9.1 / #2416: a RECORD's positional field auto-generates a public
+        // read-only property of the same name (§9.1), but is represented
+        // internally as a FieldSymbol with `posParam` set, not a
+        // PropertySymbol (#815 — the optimization codegen's
+        // classPositionalFieldProperty / the box-vtable Pass C fallback both
+        // key off). concreteProps above is typed to PropertySymbol* and
+        // cannot hold it, so it is tracked separately here — the accessor-set
+        // (#2413) and type-match (§2380) checks below both consult this map
+        // when concreteProps has no entry, so a positional-field satisfaction
+        // is checked exactly like a declared property one (always getter-
+        // only, since §9.1's generated property never has a setter).
+        std::unordered_map<std::string_view, FieldSymbol*> concretePosFields;
         // #2186: BFS over the inheritance chain tracking the per-node
         // substitution the path induces. Dedup is by (TypeSymbol, subst-key)
         // — not TypeSymbol alone — so a generic interface reached through two
@@ -3111,6 +3152,29 @@ void Resolver::checkAbstractImplementations() {
                         concreteProps.emplace(ps->name, ps);
                     }
                 }
+                // §9.1 / #2416: a record's POSITIONAL field stands in for a
+                // public read-only property (see concretePosFields'
+                // declaration above) — record it as a satisfying candidate
+                // the same way the PropertySymbol branch above does. Gated on
+                // `cur->kind == Record` specifically, NOT merely `fs->
+                // posParam != nullptr`: a CLASS's primary-constructor
+                // parameter also produces a posParam-carrying FieldSymbol
+                // (§22.10), but §22.10 is explicit that a class's primary-
+                // ctor parameters are "not automatically promoted to public
+                // properties" — unlike a record's positional fields (§9.1),
+                // a class's positional field must NOT satisfy a property
+                // obligation. `cur` here is never a record reached from a
+                // class's ancestor chain (§9.6: records cannot be inherited
+                // from, and cannot derive from a class), so this is
+                // equivalent to (and simpler than) gating on `t->kind`.
+                if (cur->kind == ast::TypeDeclKind::Record) {
+                    if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                        if (fs->posParam) {
+                            concretePropertyNames.insert(fs->name);
+                            concretePosFields.emplace(fs->name, fs);
+                        }
+                    }
+                }
             }
             for (std::size_t bi = 0; bi < cur->baseTypes.size(); ++bi) {
                 TypeSymbol* b = cur->baseTypes[bi];
@@ -3144,7 +3208,7 @@ void Resolver::checkAbstractImplementations() {
             if (!concreteNames.count(name)) {
                 ctx_.diagnostics().report(
                     Severity::Error, t->declLoc,
-                    std::string("concrete class `") +
+                    std::string("concrete ") + kindWord + " `" +
                     std::string(t->name) +
                     "` does not implement inherited abstract member `" +
                     std::string(name) + "` (§12.5)");
@@ -3163,7 +3227,7 @@ void Resolver::checkAbstractImplementations() {
                 if (cit == concreteArities.end() || !cit->second.count(arity)) {
                     ctx_.diagnostics().report(
                         Severity::Error, t->declLoc,
-                        std::string("class `") + std::string(t->name) +
+                        std::string(kindWord) + " `" + std::string(t->name) +
                         "` does not implement inherited member `" +
                         std::string(name) + "` with the required " +
                         std::to_string(arity) + "-parameter signature — the "
@@ -3442,7 +3506,7 @@ void Resolver::checkAbstractImplementations() {
             if (!concretePropertyNames.count(name)) {
                 ctx_.diagnostics().report(
                     Severity::Error, t->declLoc,
-                    std::string("class `") + std::string(t->name) +
+                    std::string(kindWord) + " `" + std::string(t->name) +
                     "` does not implement interface property `" +
                     std::string(name) +
                     "` — a field does not satisfy a property contract;"
@@ -3490,31 +3554,59 @@ void Resolver::checkAbstractImplementations() {
         for (auto& [name, info] : ifaceProps) {
             PropertySymbol* ips = info.first;
             TypeSymbol* iface = info.second;
-            auto cit = concreteProps.find(name);
-            if (cit == concreteProps.end()) continue;  // missing → reported above
             auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ips->decl);
-            auto* cpd = dynamic_cast<const ast::PropertyDecl*>(cit->second->decl);
-            if (!ipd || !cpd) continue;  // imported side — left to #2406
-            if (propertyDeclHasSetter(ipd) && !propertyDeclHasSetter(cpd)) {
-                // Reported at t->declLoc, not cit->second->declLoc: probed
-                // and confirmed (during this fix) that PropertySymbol::
-                // declLoc — like every other non-TypeSymbol member kind — is
-                // never populated by SymbolCollection.cpp's collectMember
-                // (only TypeSymbol::declLoc is set, a few hundred lines away
-                // in a different function), so it always reads as 0:0. That
-                // pre-existing, broadly-scoped gap is out of scope for #2413
-                // (filed separately); t->declLoc is populated and already
-                // the choice the sibling #489 "missing interface property"
-                // diagnostic three lines above uses for the same reason.
+            auto cit = concreteProps.find(name);
+            if (cit != concreteProps.end()) {
+                auto* cpd =
+                    dynamic_cast<const ast::PropertyDecl*>(cit->second->decl);
+                if (!ipd || !cpd) continue;  // imported side — left to #2406
+                if (propertyDeclHasSetter(ipd) && !propertyDeclHasSetter(cpd)) {
+                    // Reported at t->declLoc, not cit->second->declLoc: probed
+                    // and confirmed (during this fix) that PropertySymbol::
+                    // declLoc — like every other non-TypeSymbol member kind — is
+                    // never populated by SymbolCollection.cpp's collectMember
+                    // (only TypeSymbol::declLoc is set, a few hundred lines away
+                    // in a different function), so it always reads as 0:0. That
+                    // pre-existing, broadly-scoped gap is out of scope for #2413
+                    // (filed separately); t->declLoc is populated and already
+                    // the choice the sibling #489 "missing interface property"
+                    // diagnostic three lines above uses for the same reason.
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        std::string("property `") + std::string(name) +
+                        "` implements interface `" + std::string(iface->name) +
+                        "` with a getter-only implementation, but `" +
+                        std::string(iface->name) + "." + std::string(name) +
+                        "` is declared read-write — an implementation of a "
+                        "read-write interface property must provide a setter "
+                        "(§11.2 / §23.3)");
+                }
+                continue;
+            }
+            // §9.1 / #2416: satisfied by a RECORD's positional-field-backed
+            // property (concretePosFields, see its declaration above) instead
+            // of a declared PropertySymbol. §9.1's positional-field property
+            // is always getter-only ("Properties auto-generated from
+            // positional fields are read-only" — §9.4), so — exactly like a
+            // getter-only PropertySymbol above — it cannot satisfy a
+            // read-write interface property obligation; codegen has no setter
+            // to install there either (the identical null-itable-setter-slot
+            // SIGSEGV shape #2413 fixed, reproduced for this record shape and
+            // confirmed by probe before this fix).
+            auto pfit = concretePosFields.find(name);
+            if (pfit == concretePosFields.end())
+                continue;  // missing → reported above
+            if (!ipd) continue;  // imported interface side — left to #2406
+            if (propertyDeclHasSetter(ipd)) {
                 ctx_.diagnostics().report(
                     Severity::Error, t->declLoc,
                     std::string("property `") + std::string(name) +
                     "` implements interface `" + std::string(iface->name) +
-                    "` with a getter-only implementation, but `" +
-                    std::string(iface->name) + "." + std::string(name) +
-                    "` is declared read-write — an implementation of a "
-                    "read-write interface property must provide a setter "
-                    "(§11.2 / §23.3)");
+                    "` with a positional field (§9.1), which is always "
+                    "getter-only, but `" + std::string(iface->name) + "." +
+                    std::string(name) + "` is declared read-write — an "
+                    "implementation of a read-write interface property must "
+                    "provide a setter (§9.1 / §9.4 / §11.2 / §23.3)");
             }
         }
         // R39 / §11.2 ("Return types must match exactly — no covariance"): a
@@ -3570,21 +3662,47 @@ void Resolver::checkAbstractImplementations() {
                 PropertySymbol* ips = info.first;
                 TypeSymbol* iface = info.second;
                 if (!iface || !iface->genericParams.empty()) continue;
-                auto cit = concreteProps.find(name);
-                if (cit == concreteProps.end()) continue;  // missing → reported above
                 const TypeRef* itype = propType(ips);
-                const TypeRef* ctype = propType(cit->second);
+                auto cit = concreteProps.find(name);
+                if (cit != concreteProps.end()) {
+                    const TypeRef* ctype = propType(cit->second);
+                    if (!itype || !ctype) continue;
+                    if (itype->kind == TypeRef::Kind::Error ||
+                        ctype->kind == TypeRef::Kind::Error) continue;
+                    if (!typeRefEqual(itype, ctype)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, cit->second->declLoc,
+                            std::string("property `") + std::string(name) +
+                            "` implements interface `" +
+                            std::string(iface->name) +
+                            "` with a different type than the interface "
+                            "declares — property types must match exactly "
+                            "(no covariance) (§11.2)");
+                    }
+                    continue;
+                }
+                // §9.1 / #2416: the positional-field-backed satisfaction —
+                // compare the interface property's type against the field's
+                // own declared type (`posParam->type`) the same way.
+                auto pfit = concretePosFields.find(name);
+                if (pfit == concretePosFields.end())
+                    continue;  // missing → reported above
+                FieldSymbol* fs = pfit->second;
+                const TypeRef* ctype =
+                    (fs->posParam && fs->posParam->type)
+                        ? ctx_.resolvedType(*fs->posParam->type)
+                        : nullptr;
                 if (!itype || !ctype) continue;
                 if (itype->kind == TypeRef::Kind::Error ||
                     ctype->kind == TypeRef::Kind::Error) continue;
                 if (!typeRefEqual(itype, ctype)) {
                     ctx_.diagnostics().report(
-                        Severity::Error, cit->second->declLoc,
+                        Severity::Error, t->declLoc,
                         std::string("property `") + std::string(name) +
                         "` implements interface `" + std::string(iface->name) +
-                        "` with a different type than the interface declares — "
-                        "property types must match exactly (no covariance) "
-                        "(§11.2)");
+                        "` with a positional field of a different type than "
+                        "the interface declares — property types must match "
+                        "exactly (no covariance) (§9.1 / §11.2)");
                 }
             }
         }

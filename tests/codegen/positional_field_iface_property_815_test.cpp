@@ -8,6 +8,19 @@
 // field as the property implementation and emits a struct-GEP+load getter at
 // both the itable-build and the constraint-dispatch sites.
 //
+// #2416 (§9.1/§9.4/§11.2/§23.3, v0.235): every interface property below is
+// declared `readonly`. Before #2416, checkAbstractImplementations skipped
+// records entirely, so a getter-only positional-field property silently
+// satisfied a nominally READ-WRITE interface property obligation — the exact
+// null-itable-setter-slot SIGSEGV shape #2413 fixed for classes, just never
+// checked for records. None of these tests ever write through the interface
+// reference (only `ipt.A` / `ip.X` / `ip.Y` reads), so per #2413's own
+// remediation precedent the intent-preserving fix is to mark the obligation
+// `readonly` — a positional field's auto-generated property can never
+// provide a setter (§9.4: "Properties auto-generated from positional fields
+// are read-only"), so `readonly` is not merely intent-preserving here, it is
+// the ONLY accessor set a positional field can ever satisfy.
+//
 // Value (dispatch) tests — runJit returns the raw int.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration, P1)
@@ -28,7 +41,7 @@ int run(const std::string& prog) {
 BEZEL_TEST(positional_field_iface_property_815, via_interface_variable) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IFoo property A: int; end IFoo; "
+        "interface IFoo readonly property A: int; end IFoo; "
         "record FooPoint(A: int) : IFoo end FooPoint; "
         "class C public static method Main(): int "
         "  var pt := new FooPoint(42); "
@@ -42,7 +55,7 @@ BEZEL_TEST(positional_field_iface_property_815, via_interface_variable) {
 BEZEL_TEST(positional_field_iface_property_815, via_generic_constraint) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IFoo property A: int; end IFoo; "
+        "interface IFoo readonly property A: int; end IFoo; "
         "record FooPoint(A: int) : IFoo end FooPoint; "
         "static class G "
         "  public static method Get<T>(p: T): int where T: IFoo => p.A; "
@@ -57,7 +70,7 @@ BEZEL_TEST(positional_field_iface_property_815, via_generic_constraint) {
 BEZEL_TEST(positional_field_iface_property_815, two_positional_fields_via_interface) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IPt property X: int; property Y: int; end IPt; "
+        "interface IPt readonly property X: int; readonly property Y: int; end IPt; "
         "record P(X: int, Y: int) : IPt end P; "
         "class C public static method Main(): int "
         "  var p := new P(2, 3); "
@@ -71,7 +84,7 @@ BEZEL_TEST(positional_field_iface_property_815, two_positional_fields_via_interf
 BEZEL_TEST(positional_field_iface_property_815, explicit_property_unaffected) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IFoo property A: int; end IFoo; "
+        "interface IFoo readonly property A: int; end IFoo; "
         "record FooPoint(v: int) : IFoo "
         "  public property A: int => v; "
         "end FooPoint; "
