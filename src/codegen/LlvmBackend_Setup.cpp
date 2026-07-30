@@ -8233,6 +8233,21 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // initializer kinds (a CallExpr/NewExpr producer, or an init wrapped at the
     // decl site) — a bare alias (`using var b := a;`) is excluded so the aliased
     // owner remains the sole disposer.
+    //
+    // fix #1525 (piece 2 discovery) / §29.7/§29.11/§30.7 (v0.228): the SAME leak
+    // affects the async ENUMERABLE names (`IAsyncEnumerable<T>` /
+    // `IOwningAsyncEnumerable<T>` — an async iterator method's OWN declared
+    // return type, e.g. `using var src := Gen();`). Disposal here is always
+    // SYNCHRONOUS (the iterator-format vtable's slot-1 Dispose, exactly as for
+    // the sync names) — `IAsyncEnumerable<T>` does not itself extend
+    // `IAsyncDisposable` (only the ENUMERATOR interfaces
+    // `IAsyncEnumerator<T>`/`IOwningAsyncEnumerator<T>` do, handled separately
+    // below in the `ld->isAwaitUsing` branch for the `await using var en :=
+    // src.GetAsyncEnumerator(...)` manual-protocol spelling, #759/#1268), so a
+    // plain (non-`await`) `using var` is the only legal spelling and was falling
+    // through every branch below to no disposal registration at all — a 64-byte
+    // frame leak confirmed under LSan with a single `await for` loop, no
+    // abandonment or re-iteration required to trigger it.
     if (!ld->isAwaitUsing && ld->initializer) {
         const sema::TypeRef* lt = ld->type ? ctx_.resolvedType(*ld->type)
                                            : ctx_.exprType(*ld->initializer);
@@ -8250,7 +8265,9 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             (lt->headName() == "IEnumerable" ||
              lt->headName() == "IOwningEnumerable" ||
              lt->headName() == "IEnumerator" ||
-             lt->headName() == "IOwningEnumerator");
+             lt->headName() == "IOwningEnumerator" ||
+             lt->headName() == "IAsyncEnumerable" ||       // fix #1525
+             lt->headName() == "IOwningAsyncEnumerable");  // fix #1525
         if (isSyncIterEnum) {
             const sema::TypeRef* initTR = ctx_.exprType(*ld->initializer);
             bool wrappedHere = initTR && initTR->kind == sema::TypeRef::Kind::Named &&
