@@ -3393,6 +3393,13 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                                               i32(), {ptrTy(), ptrTy()});
                 llvm::Value* marker = builder_.CreateCall(
                     readMarkerFn, {derPtr, tagSlot}, "cdeser.sh.mk");
+                // fix #2396 / §9.8 v0.235 (Bug-A pattern): the JSON path can
+                // raise inside bz_jder_parse_int on a malformed/truncated
+                // $id/$ref tag_id while still returning a "successful" marker
+                // (tag_id left at 0) — propagate the pending exception before
+                // acting on that bogus marker/tag, mirroring
+                // bz_binder_read_case_discriminator's call sites in this file.
+                emitPendingCheck();
                 llvm::Value* tagId =
                     builder_.CreateLoad(i32(), tagSlot, "cdeser.sh.tag");
                 // BZ_SER_INLINE = 0x01, BZ_SER_REF = 0x02 (runtime constants).
@@ -3494,6 +3501,10 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 auto* readMarkerFn = declareC("bz_binder_read_graph_marker",
                                               i32(), {ptrTy(), ptrTy()});
                 builder_.CreateCall(readMarkerFn, {derPtr, wkTagSlot});
+                // fix #2396 / §9.8 v0.235 (Bug-A pattern): see the Shared<C>
+                // branch above — propagate a pending exception from a
+                // malformed/truncated $ref tag_id before resolving it.
+                emitPendingCheck();
                 llvm::Value* wkTag =
                     builder_.CreateLoad(i32(), wkTagSlot, "cdeser.wk.tag");
                 auto* wkResolveFn = declareC("bz_binder_graph_resolve_tag",
@@ -3552,8 +3563,13 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 builder_.CreateStore(builder_.getInt32(0), tagSlot);
                 auto* readMarkerFn = declareC("bz_binder_read_graph_marker",
                                               i32(), {ptrTy(), ptrTy()});
-                // (marker result not checked — trust wire format is REF here)
+                // (marker VALUE not checked beyond this — trust wire format
+                // is REF here — but fix #2396 / §9.8 v0.235: a malformed/
+                // truncated $ref tag_id can leave a pending exception behind
+                // a "successful" marker (tag_id left at 0), so check for
+                // that pending exception before resolving the bogus tag.)
                 builder_.CreateCall(readMarkerFn, {derPtr, tagSlot});
+                emitPendingCheck();
                 llvm::Value* tagId = builder_.CreateLoad(i32(), tagSlot, "cdeser.be.tag");
                 auto* resolveFn = declareC("bz_binder_graph_resolve_tag",
                                            ptrTy(), {ptrTy(), i32()});
@@ -3586,6 +3602,12 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 auto* readMarkerFn = declareC("bz_binder_read_graph_marker",
                                               i32(), {ptrTy(), ptrTy()});
                 builder_.CreateCall(readMarkerFn, {derPtr, tagSlot});
+                // fix #2396 / §9.8 v0.235 (Bug-A pattern): see the Shared<C>
+                // branch above — a malformed/truncated $id tag_id on this
+                // INLINE path can leave a pending exception behind a
+                // "successful" marker; propagate it before marking the tag
+                // in-progress and recursing into the (now-desynced) stream.
+                emitPendingCheck();
                 llvm::Value* tagId = builder_.CreateLoad(i32(), tagSlot, "cdeser.ot.tag");
                 // Mark the tag as in-progress (cycle sentinel).
                 auto* markFn = declareC("bz_binder_graph_mark_in_progress",
