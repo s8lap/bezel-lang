@@ -11642,6 +11642,30 @@ struct UnwindIneligibleWalker {
             // per §28.3
             bool nullingCtor = newExprRoutesThroughNullingCtor(ctx, n);
             for (auto& a : n->args) {
+                // §22.4 / §28.3 (v0.235, #2411 adversarial follow-up): an
+                // `out`/`out var`/`out using var`/`out owned`/`out owned var`
+                // CONSTRUCTOR argument is an OUTPUT, not a consuming read —
+                // mirrors walkCallArgs' unconditional `isOutArg` gate just
+                // above (a CallExpr/NullCondCallExpr argument in one of
+                // these modes is never taken as consuming, regardless of
+                // the callee). This NewExpr arm's own arg walk never
+                // received that exemption, so a constructor's inline
+                // `out owned var n` recipient (#2409's sema registration,
+                // #2411's codegen slot) was wrongly marked unwind-
+                // INELIGIBLE here — which in turn suppressed
+                // ensureCtorOutVarSlots' null-guarded `unwindOnly` disposal
+                // registration (LlvmBackend_Calls2.cpp) and leaked the
+                // just-assigned owned value on a throw-after-assign edge
+                // from the constructor body (confirmed live: LSan flagged
+                // a 16-byte direct leak from inside the generated
+                // constructor for `n := new Item(); throw ...;`, closed by
+                // this exemption). Checked FIRST, exactly as walkCallArgs
+                // orders it, so an out-family modifier is never consuming
+                // regardless of the separate `owned`-transfer untaint below.
+                if (isOutArg(a.modifier)) {
+                    expr(a.value.get(), /*consuming=*/false);
+                    continue;
+                }
                 bool untaint = false;
                 if (nullingCtor && a.modifier == "owned" && a.value) {
                     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(

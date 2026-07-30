@@ -1710,6 +1710,105 @@ void Emitter::ensureCtorOutVarSlots(const ast::NewExpr& ne,
 
     std::size_t pos = 0;
     for (const auto& a : ne.args) {
+        // §22.4 / §22.3 / §28.3 (v0.235, #2411): `out owned var x` at a
+        // CONSTRUCTOR call site — the ctor analogue of ensureOutVarSlots'
+        // identical CallExpr block above (mirrors it verbatim, adapted to
+        // this function's ctorDecl/pos lookup instead of a MethodSymbol).
+        // `ensureCtorOutVarSlots` previously handled ONLY the plain
+        // "out var" modifier (the block below), so a constructor's
+        // `out owned var` recipient never got a slot created at all: sema
+        // registers the recipient (ExprTypecheck_Exprs.cpp's NewExpr
+        // `out owned var` block, ~line 5162, #2409) but codegen's
+        // `buildOrderedArgs` then found no `locals_` entry for the fresh
+        // identifier when resolving the by-ref argument address
+        // (`lvalueAddr`, gated by `isByRefMod` which already lists
+        // "out owned var"), hit its generic null-value guard, and reported
+        // the #1386 ICE unconditionally — confirmed live (issue's own
+        // repro) and confirmed pre-existing (reproduces identically before
+        // and after #2409, which fixed the sema-registration asymmetry but
+        // deliberately left this codegen gap for this issue, per #2409's
+        // own commit message).
+        //
+        // `x` is declared fresh here — no pre-existing LocalDecl. An owned
+        // recipient is always OBJECT-typed (§22.4's `out owned` is only
+        // ever admitted on a class/interface parameter — a value/runtime-
+        // managed substitution erases the marker entirely, §28.1), so the
+        // slot is a bare pointer alloca — no per-parameter slotTy lookup is
+        // needed, exactly as ensureOutVarSlots' identical block.
+        if (a.modifier == "out owned var" && a.value) {
+            auto* idoo =
+                dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+            if (idoo) {
+                sema::Symbol* symoo = ctx_.exprSymbol(*idoo);
+                auto* locoo = dynamic_cast<sema::LocalSymbol*>(symoo);
+                bool alreadyMapped = (locoo && locoo->decl &&
+                                      locals_.count(locoo->decl)) ||
+                                     locals_.count(idoo);
+                if (!alreadyMapped) {
+                    llvm::AllocaInst* outSlot = entryAlloca(ptrTy());
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), outSlot);
+                    locals_[idoo] = outSlot;
+                    if (locoo && locoo->decl) locals_[locoo->decl] = outSlot;
+                    // Record as out-owned recipient so an explicit
+                    // `x?.Dispose()` / `x.Dispose()` reclaims the slot,
+                    // exactly as for a method's inline `out owned var`.
+                    const void* declKey =
+                        locoo && locoo->decl
+                            ? static_cast<const void*>(locoo->decl)
+                            : static_cast<const void*>(idoo);
+                    outOwnedRecipients_.insert(declKey);
+                    // §28.3 / §22.3 / §22.4 (v0.235, #2411, mirroring the
+                    // CallExpr block's identical disposal registration):
+                    // normal-exit or exception-path disposal for the
+                    // RECIPIENT, exactly as for a method's inline
+                    // `out owned var` — see that block's comment (above in
+                    // this file) for the full autoDropAtScopeEnd/unwindOnly
+                    // rationale, which applies unchanged to a constructor
+                    // call: this registration covers ownership ONCE it has
+                    // reached the caller (normal return, per §22.3's
+                    // copy-out-on-normal-return rule for `out`/`out owned`).
+                    //
+                    // The THROW-PARTWAY case — the constructor assigns the
+                    // out-owned parameter, then later throws — is covered
+                    // on the CALLEE side, not here: §22.3 states "For
+                    // `out owned`, the callee-local slot is an owned slot:
+                    // a value assigned to it before a later `throw` is
+                    // discharged by the callee's ordinary exception-path
+                    // discharge (§28.3), its disposal established at the
+                    // assignment (§28.10) — ownership reaches the caller
+                    // only on normal return, so the value has exactly one
+                    // owner at every instant." On that edge the callee (the
+                    // constructor body's own out-owned-parameter exception
+                    // discharge — the same machinery a method with an
+                    // `out owned` parameter already uses, unaffected by
+                    // this fix) disposes the value, and copy-out to this
+                    // recipient's slot never happens (mirrors plain `out`:
+                    // "on an exception exit the recipient is untouched") —
+                    // this slot is left at its null store above, so this
+                    // registration is a correct, null-guarded no-op on that
+                    // edge (no double-free: the callee disposed it, the
+                    // caller's slot is still null).
+                    const sema::TypeRef* recipTy =
+                        (locoo && locoo->declType) ? locoo->declType
+                                                   : ctx_.exprType(*idoo);
+                    if (!disposeStack_.empty() &&
+                        currentFn_ == unwindIneligibleFn_ &&
+                        !emittingDisposerBody_ &&
+                        outOwnedRecipientDisposes(recipTy) &&
+                        !unwindIneligible_.count(declKey)) {
+                        Disposal d{outSlot, nullptr};
+                        if (locoo && locoo->autoDropAtScopeEnd)
+                            d.dynamicDispose = true;
+                        else
+                            d.unwindOnly = true;
+                        disposeStack_.back().push_back(d);
+                    }
+                }
+            }
+            pos++;
+            continue;
+        }
         if (a.modifier != "out var" || !a.value) { pos++; continue; }
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
         if (!id) { pos++; continue; }
