@@ -1,6 +1,6 @@
 # Bezel: Design Rationale
 
-**Companion to the Bezel Language Specification, v0.232 — July 2026**
+**Companion to the Bezel Language Specification, v0.233 — July 2026**
 
 The spec describes the language. This document explains the choices that aren't obvious from reading the spec — places where Bezel diverges from its inheritance, places where two reasonable designs were possible and we picked one, and places where the spec's stated rule has a less-stated rule behind it.
 
@@ -1869,7 +1869,7 @@ The deletion is the cheap-to-reverse direction, and the re-addition condition is
 
 Not in this version; the design is open to them in future revisions.
 
-- **Sum types / discriminated unions.** *Shipped in v0.200 (proposal 0041, spec §35)* — closed nominal sums as the `choice` kind, with the three-way payload-derived ownership classification and static exhaustiveness by case name; the reasons and declined alternatives are [§9.6](#sec-choices-why-a-new-kind). What remains open is what the proposal deliberately excluded: structural/anonymous unions (declined — §9.6), GADTs, multi-level exhaustiveness counting, and `Result` combinators (each recorded liftable in proposal 0041).
+- **Sum types / discriminated unions.** *Shipped in v0.200 (proposal 0041, spec §35)* — closed nominal sums as the `choice` kind, with the three-way payload-derived ownership classification and static exhaustiveness by case name; the reasons and declined alternatives are [§9.6](#sec-choices-why-a-new-kind). What remains open is what the proposal deliberately excluded: structural/anonymous unions (declined — §9.6), GADTs, multi-level exhaustiveness counting, and `Result` combinators over **owned payloads** (each recorded liftable in proposal 0041; the value-payload combinators and declared-result construction target-typing shipped in v0.233 — proposal 0075 stages 1–2, spec §35.3, stdlib §2.20 — while the owning-payload form waits on ownership-polymorphic function parameters, recorded as 0075's stage 3(a)).
 - **Static interface members.** *Shipped in v0.176 (#807, spec §11.8)* — abstract-only, recurrence-constrained, with compiler-provided primitive conformances. The follow-ups it unblocks (FromCollectionLiteral/IDeserializable promotion, Range<T> de-intrinsicking) are tracked issues.
 - **Trait/typeclass-style polymorphism.** Interfaces handle most of what traits do; the gap is associated types.
 - **Const generics.** Generic parameters that are values, not types.

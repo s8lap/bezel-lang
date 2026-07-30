@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.232 — July 2026**
+**Companion to the Bezel Language Specification, v0.233 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -1145,21 +1145,32 @@ public choice Result<T, E>
     Error(_) => false);
 
   public method IsError(): bool => not IsOk();
+
+  // Compiler-provided (spec §35.2): admissible at value-like instantiations only;
+  // a call at a borrow-bearing or owning instantiation is rejected at the use
+  // site (spec §3.6 rule 2), the diagnostic naming the classification and the
+  // deciding payload.
+  public method Map<U>(f: (T) -> U): Result<U, E>;
+  public method MapError<F>(f: (E) -> F): Result<T, F>;
+  public method AndThen<U>(f: (T) -> Result<U, E>): Result<U, E>;
+  public method UnwrapOr(fallback: T): T;
 end Result;
 ```
 
-`T` and `E` are unconstrained; the `owned` payload markers follow the per-instantiation erasure of language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear): `Result<int, string>` is value-like (Core; copyable; auto-equality-bearing when the payloads are admissible), while `Result<Connection, IoError>` is owning per instantiation (Extended — the move-only row of Appendix D.2). `Result` declares no interface conformances, keeping every instantiation classification-clean. There is no `Unwrap` — a method receives `this` as a borrow (spec [§35.2](Bezel_Language_Spec.md#sec-choice-members)), so an owned-payload extractor is unspellable as a method, correctly: extraction is consumption, and consumption is the owning match's job, exhaustiveness-checked where `Unwrap` would fault. `Map`/`AndThen` combinators are deliberately absent in this revision (over owned payloads they need ownership-polymorphic function parameters — the retired-and-deferred territory of spec §14.4).
+`T` and `E` are unconstrained; the `owned` payload markers follow the per-instantiation erasure of language spec [§28.1](Bezel_Language_Spec.md#sec-where-the-owned-modifier-can-appear): `Result<int, string>` is value-like (Core; copyable; auto-equality-bearing when the payloads are admissible), while `Result<Connection, IoError>` is owning per instantiation (Extended — the move-only row of Appendix D.2). `Result` declares no interface conformances, keeping every instantiation classification-clean. There is no `Unwrap` — a method receives `this` as a borrow (spec [§35.2](Bezel_Language_Spec.md#sec-choice-members)), so an owned-payload extractor is unspellable as a method, correctly: extraction is consumption, and consumption is the owning match's job, exhaustiveness-checked where `Unwrap` would fault. (`UnwrapOr` below is not an extractor and does not disturb this record: it is total — a value-in/value-out fold with no fault path — and exists only at the value-like instantiations, where nothing is consumed.)
+
+**The value-payload combinators (v0.233).** `Map`, `MapError`, `AndThen`, and `UnwrapOr` are **compiler-provided per-instantiation members** (spec [§35.2](Bezel_Language_Spec.md#sec-choice-members)): admissible at **value-like instantiations only** (spec [§35.4](Bezel_Language_Spec.md#sec-choice-classification) rule 3 — every payload a non-move-only value, `string`, or runtime-managed; function-typed payloads are classification-neutral and ride), and rejected at every borrow-bearing or owning instantiation at the use site (spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties) rule 2), the diagnostic naming the classification, the deciding payload, and the owning-match remedy. Semantics: `Map(f)` maps `Ok(v)` to `Ok(f(v))` and passes `Error(e)` through unchanged; `MapError(f)` maps `Error(e)` to `Error(f(e))` and passes `Ok(v)` through; `AndThen(f)` returns `f(v)` on `Ok(v)` and passes `Error(e)` through; `UnwrapOr(fallback)` returns `v` on `Ok(v)` and `fallback` on `Error(_)` — `fallback` is an ordinary, eagerly evaluated argument (there is no lazy `UnwrapOrElse`), and the parameter name is API surface under spec [§22.5](Bezel_Language_Spec.md#sec-optional-parameters-and-named-arguments). The function parameters are plain, hence call-bounded (spec [§28.14](Bezel_Language_Spec.md#sec-scoped-callback-parameters)) — invoked during the call, never retained — and `U`/`F` infer at the call site (spec [§14.5](Bezel_Language_Spec.md#sec-type-argument-inference) phase 2). None of the four is `pure`: invoking a function-typed value is on the pure body's prohibited list (spec [§22.15](Bezel_Language_Spec.md#sec-pure-members)), and `UnwrapOr` — which invokes nothing — stays plain `method` as the family-uniformity posture (the v0.215 rule that keeps the `Contains` family impure). The receiver is a borrow; at the admissible instantiations the internal match binds copies (value payloads) or shared references (`string`/runtime-managed payloads), and every result is a fresh copyable value — no disposal obligation arises anywhere in a combinator call, and the combinators declare no fault condition (all four are total; the [§1](#sec-failure-signal-rule) failure-signal rule is engaged vacuously). **Owning instantiations carry none of these members**: an owning `Map` would have to consume the payload through a receiver a method only ever borrows, and its `f` would need per-instantiation ownership polymorphism — the retired-and-deferred territory of spec [§14.4](Bezel_Language_Spec.md#sec-owned-and-generic-type-arguments); the owning idiom remains the owning match (`case owned x of …`; adopt with `using var` in the arm — the connect-or-explain example below).
 
 ```bezel
 // Value-like instantiation (Core): parse outcome with information.
 public method ParsePort(text: string): Result<int, string>
   if not int.TryParse(text, out var value) then
-    return Result<int, string>.Error($"not a number: {text}");
+    return Error($"not a number: {text}");    // declared-result position (spec §35.3)
   end;
   if value < 1 or value > 65535 then
-    return Result<int, string>.Error($"out of range: {value}");
+    return Error($"out of range: {value}");
   end;
-  return Result<int, string>.Ok(value);
+  return Ok(value);
 end ParsePort;
 
 case ParsePort(arg) of
@@ -1169,13 +1180,38 @@ end;                                  // exhaustive; no _ needed
 ```
 
 ```bezel
+// Value-payload pipelines over the combinators (value-like instantiations).
+var port := ParsePort(raw).UnwrapOr(8080);
+
+var label := ParsePort(raw)
+    .Map(lambda(p) => $"listening on {p}")
+    .UnwrapOr($"bad port: {raw}");
+
+// Re-code the error at a boundary (MapError):
+public record ConfigError(Key: string, Message: string);
+
+public method PortSetting(raw: string): Result<int, ConfigError>
+  return ParsePort(raw).MapError(lambda(m) => new ConfigError("port", m));
+end PortSetting;
+
+// Sequence two fallible steps without an intermediate case (AndThen); the
+// ascribed lambda's returns are declared-result positions (spec §35.3):
+public method ParsePercent(text: string): Result<int, string>
+  return ParsePort(text).AndThen(lambda(n): Result<int, string> => do
+    if n > 100 then return Error($"not a percentage: {n}"); end;
+    return Ok(n);
+  end);
+end ParsePercent;
+```
+
+```bezel
 // Owning instantiation (Extended): connect-or-explain.
 public method Connect(host: string): Result<Connection, string>
   var conn := TryOpen(host);          // illustrative TryOpen(host): owned Connection?
   if conn = null then
-    return Result<Connection, string>.Error($"unreachable: {host}");
+    return Error($"unreachable: {host}");
   end;
-  return Result<Connection, string>.Ok(owned conn);    // owned payload slot: marker consumes
+  return Ok(owned conn);                // owned payload slot: marker consumes (spec §35.3)
 end Connect;
 
 case Connect(host) of                 // owning match over the temporary
