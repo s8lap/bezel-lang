@@ -7877,12 +7877,65 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         args.push_back(recv);
     }
     argExprs.push_back(nullptr);  // receiver has no widening signedness
-    for (const auto& a : call.args) {
-        if (!a.value) return nullptr;
-        llvm::Value* v = lowerExpr(*a.value);
-        if (!v) return nullptr;
-        args.push_back(v);
-        argExprs.push_back(a.value.get());
+    // fix #2318 / §22.3: route the argument list through `buildOrderedArgs` —
+    // the SAME helper `lowerCall` (the `.` form) uses — instead of the old
+    // bare positional loop, which lowered every argument as a plain VALUE
+    // regardless of a `ref`/`out` modifier. That dropped the modifier
+    // entirely: the callee's `ref`/`out` parameter expects the ARGUMENT'S
+    // ADDRESS (CG50), so a value-typed argument (`int`) produced malformed IR
+    // (caught by the verifier) while a pointer-represented one (a class,
+    // interface, or `string` `ref` parameter — same LLVM type as the address
+    // the callee expects) passed verification and silently miscompiled: the
+    // callee wrote through the argument's VALUE as if it were an address,
+    // corrupting memory. Using `buildOrderedArgs` also composes with #1302's
+    // accessor bracket (§22.3 "accessor targets bracket"): a `ref`/`out`
+    // argument naming an indexer slot or property is copy-in/copy-out via
+    // `accessorRefArgs`, flushed below only once the call has returned
+    // normally. Because this whole block runs solely inside `callBB` —
+    // reached only when the receiver is non-null — a null receiver never
+    // evaluates any argument expression at all, matching §7.5's "if any
+    // segment of a chain is null, the remainder is not evaluated": the
+    // callee's `ref` alias is left untouched and an accessor target's
+    // getter/setter never run, with no special-casing needed beyond this
+    // placement. (A plain/`owned`/`scoped` argument's own value-lowering is
+    // unaffected — only the `ref`/`out` shaping changes.)
+    std::vector<AccessorRefArg> accessorRefArgs;
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        if (!buildOrderedArgs(md->params, call.args, args, &argExprs,
+                              /*nullTransferredOwned=*/true,
+                              &accessorRefArgs)) {
+            // #1302: the call never runs, so no §22.3 write-back is owed —
+            // release the pinned receiver/index values.
+            emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
+            return nullptr;
+        }
+    } else {
+        // §22.3 / #1221: an imported method has no ast::MethodDecl — mirror
+        // lowerCall's cross-module fallback: consult the imported
+        // ParameterSymbol's modifier and pass the argument's ADDRESS for a
+        // ref/out parameter. No accessor bracket on this path (matching the
+        // `.` form's identical limitation there).
+        std::size_t pi = 0;
+        for (const auto& a : call.args) {
+            if (!a.value) return nullptr;
+            std::string_view formalMod;
+            if (pi < ms->params.size())
+                if (auto* ps =
+                        dynamic_cast<sema::ParameterSymbol*>(ms->params[pi]))
+                    formalMod = ps->modifier;
+            bool byRef = isByRefMod(a.modifier) || isByRefMod(formalMod);
+            llvm::Value* v;
+            if (byRef) {
+                llvm::Type* et = nullptr;
+                v = lvalueAddr(*a.value, et);
+            } else {
+                v = lowerExpr(*a.value);
+            }
+            if (!v) return nullptr;
+            args.push_back(v);
+            argExprs.push_back(a.value.get());
+            ++pi;
+        }
     }
     // per §14.1/§14.2 + §7.5 (issue #1278): install the method-level generic
     // substitution BEFORE calling emitMethodCall, exactly as lowerCall does
@@ -7898,6 +7951,13 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false, &argExprs);
     genericSubst_ = std::move(savedNcSubst);
     genericSubstSemaTy_ = std::move(savedNcSemaTy);
+    // fix #1302 / §22.3: the copy-OUT half of every accessor-mediated
+    // `ref`/`out` argument — "on normal return the setter is called once
+    // with the slot's final value" — emitted here because reaching this
+    // point in `callBB` IS the call's normal-return continuation (an
+    // exception from emitMethodCall unwinds via unwindTarget_ and never
+    // reaches here). Mirrors lowerCall's `!diverged_` guard.
+    emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/!diverged_);
     if (!r && (refResult || valueResult)) return nullptr;
     // Lift the call result to the §7.5 result form. A value-typed return wraps
     // into {i8 1, r}; an already-nullable return passes its own hasValue through.

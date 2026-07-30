@@ -7432,6 +7432,45 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // slot) see the §7.5 result type. A unit/void result and an already-nullable
     // return are left unchanged.
     if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get())) {
+        // fix #2318 / §7.5 / §22.3: reject an `out`/`out owned` argument on a
+        // null-conditional call `recv?.M(..., out x, ...)`. §7.5's
+        // short-circuit ("if any segment of a chain is null, the remainder
+        // is not evaluated") means the callee may simply never run — a THIRD
+        // outcome §22.3's `out` contract does not enumerate ("the callee
+        // must assign every `out` parameter on every normal-completion
+        // (return) path"; the alternative is only "an exception exit", where
+        // the recipient is untouched). §22.4 gives per-path definite-
+        // assignment treatment for an inline `out var` recipient whose
+        // introducing call may not run ("assigned only on control-flow paths
+        // where the introducing call was actually evaluated") — but that
+        // machinery is built for `and`/`or` short-circuiting only; nothing
+        // extends it to `?.`, and DefiniteAssignment.cpp's NullCondMemberExpr-
+        // callee CallExpr walk visits `out` arguments exactly like an
+        // ordinary `.` call's (unconditionally marking the recipient
+        // "assigned" on the straight-line path). Left unrejected, a
+        // non-nullable-reference-typed inline `out var` recipient could read
+        // as definitely-assigned on the null-receiver path where it was
+        // never written — the exact §22.4 violation that clause exists to
+        // prevent. Rather than silently admit that gap (or silently invent a
+        // narrower rule the spec does not state), decline the whole shape
+        // uniformly — `out` and the pre-declared-local sub-case alike, since
+        // splitting the two would itself be an uncited invention — with a
+        // clear diagnostic; #2345 tracks lifting this once `?.` gets the
+        // same per-path DA modeling `and`/`or` already have.
+        for (const auto& a : ce.args) {
+            if (a.modifier.rfind("out", 0) == 0) {
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    "an `out` argument is not admitted on a null-conditional "
+                    "call (`?.`) — the callee may never run when the "
+                    "receiver is null, so `out`'s every-normal-path "
+                    "assignment obligation cannot be discharged on that path "
+                    "(§22.3, §7.5); guard the call explicitly instead: "
+                    "`if recv <> null then recv.M(out x); end;` (#2318, "
+                    "#2345)");
+                return;
+            }
+        }
         // §8.1/§8.3/§8.5 (#1075): an inherited Object value-semantics method
         // (`ToString`/`GetHashCode`/`Equals`) on a VALUE-type/enum/record
         // receiver has no MethodSymbol, so the member-access value-method typing
