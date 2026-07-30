@@ -141,6 +141,26 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // module with no exported extension produces byte-identical metadata to before
 // (the 6th scalar is only emitted when there is at least one, mirroring the
 // #783 methodBodyText precedent).
+//
+// §2.8.2 / §22.12 / §22.13 (#2351, additive within v7): MetaMember::
+// fieldInitText — for a STATIC Field member of a GENERIC class, the
+// initializer EXPRESSION source text (span-extracted from `FieldDecl::
+// initializer`, not the whole declaration — an Expr carries its own span).
+// Mirrors ctorBodyText/methodBodyText exactly: a SECOND trailing REC_STRING
+// in MEMBER_BLOCK after valueText for Field members (valueText itself is
+// reserved for an INSTANCE field's constant-foldable initializer, §22.8, and
+// stays empty for a static field — see ModuleMetadataBuilder), emitted ONLY
+// when non-empty, so a module with no generic-class static-field initializer
+// produces byte-identical metadata to before. Closes the gap #1513's own
+// fix left open: before this, an imported generic type's static field
+// reached codegen with `FieldSymbol::decl == nullptr` (ModuleLoader never
+// reconstructed one for an imported field), so genericInstSfinitFn's
+// `dynamic_cast<const ast::FieldDecl*>(fs2->decl)` was always null and the
+// field's initializer never ran on the importing side — §2.8.2 clause 2
+// ("an external instantiation behaves identically to a same-module
+// instantiation") was violated silently (the shared LinkOnceODR cell #1513
+// wired up stayed zero forever). No bump: purely additive, same rule as
+// methodBodyText.
 inline constexpr std::uint32_t kSchemaVersion = 7;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
@@ -357,6 +377,15 @@ struct MetaMember {
     // trailing string is additive: a current reader ignores it for Method
     // members (caps[1] is null), and a v4 reader rejects a v5 blob outright.
     std::string methodBodyText;       // §14.1/#783: method source text for generics
+
+    // §2.8.2 / §22.12 / §22.13 (#2351): for a STATIC Field member of a GENERIC
+    // class, the initializer EXPRESSION source text (see the schema-header
+    // comment above kSchemaVersion for the full rationale). Empty for a
+    // non-generic type's static field (it initializes in the declaring
+    // module's own compilation and needs no cross-module replay), for an
+    // instance field (which uses valueText instead), and for a static field
+    // with no initializer.
+    std::string fieldInitText;        // §2.8.2/#2351: static field init text
 
     // §22.15 / §2.8.2: whether this member is declared pure. It is kept as
     // an explicit bit in addition to the general modifier list so consumers

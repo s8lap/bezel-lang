@@ -149,6 +149,9 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // classes — part of the cross-module interface (a body change must mark
     // dependents stale, since the importer monomorphizes it per instantiation).
     hashStr(h, m.methodBodyText);
+    // §2.8.2 / #2351: static field initializer source text for generic
+    // classes — same staleness reasoning as ctorBodyText/methodBodyText.
+    hashStr(h, m.fieldInitText);
     // §11.3 (issue #502): hash nested type when present.
     hashBool(h, m.nestedType != nullptr);
     if (m.nestedType) hashTypeDecl(h, *m.nestedType);
@@ -264,6 +267,7 @@ MetaMember::MetaMember(const MetaMember& o)
     : kind(o.kind), name(o.name), visibility(o.visibility),
       modifiers(o.modifiers), type(o.type), valueText(o.valueText),
       ctorBodyText(o.ctorBodyText), methodBodyText(o.methodBodyText),
+      fieldInitText(o.fieldInitText),
       isPure(o.isPure), contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
@@ -277,6 +281,7 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         kind = o.kind; name = o.name; visibility = o.visibility;
         modifiers = o.modifiers; type = o.type; valueText = o.valueText;
         ctorBodyText = o.ctorBodyText; methodBodyText = o.methodBodyText;
+        fieldInitText = o.fieldInitText;
         isPure = o.isPure; contracts = o.contracts;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
@@ -300,6 +305,7 @@ bool MetaMember::operator==(const MetaMember& o) const {
            hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
            valueText == o.valueText && ctorBodyText == o.ctorBodyText &&
            methodBodyText == o.methodBodyText &&
+           fieldInitText == o.fieldInitText &&
            nestedEq;
 }
 
@@ -459,6 +465,14 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // Method members; a v4 reader rejects v5 outright).
     if (m.kind == MetaMemberKind::Method && !m.methodBodyText.empty())
         emitString(w, m.methodBodyText);
+    // §2.8.2 / #2351 (schema v7 additive): for a Field member of a generic
+    // class with a carryable static initializer, a second trailing
+    // REC_STRING carries the initializer EXPRESSION source text. Emitted
+    // ONLY when non-empty, mirroring methodBodyText's own additive shape —
+    // a module with no generic-class static-field initializer produces
+    // byte-identical metadata to before this fix.
+    if (m.kind == MetaMemberKind::Field && !m.fieldInitText.empty())
+        emitString(w, m.fieldInitText);
     // §11.3 (schema v4, issue #502): when kind == NestedType, emit the nested
     // type's full declaration as an embedded TYPE_BLOCK. The trailing
     // finishBlockImpl in readMemberBody skips it for v3 readers (they never
@@ -965,6 +979,10 @@ bool readMemberBody(Reader& r, MetaMember& m) {
         // present) is the generic method body source text.
         else if (m.kind == MetaMemberKind::Method)
             caps[1] = &m.methodBodyText;
+        // §2.8.2 / #2351: a Field member's second trailing REC_STRING (when
+        // present) is the static field's initializer EXPRESSION source text.
+        else if (m.kind == MetaMemberKind::Field)
+            caps[1] = &m.fieldInitText;
         int capIdx = 0;
         while (true) {
             unsigned id = 0;

@@ -832,14 +832,41 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
         // the §22.12 const valueText path). renderConstExpr returns "" for a
         // non-foldable initializer (`new Array()`, `DateTime.Now`, an expression
         // referencing other members) — that initializer does NOT cross the
-        // boundary and is a documented limitation. Static fields are exported as
-        // EXTERNAL storage globals (their initializer runs in the exporter), so
-        // they need no valueText here.
+        // boundary and is a documented limitation.
+        //
+        // Static fields of a NON-generic type are exported as EXTERNAL storage
+        // globals (their initializer runs once in the DECLARING module's own
+        // compilation, §22.12 rule 1), so they need no textual carriage here —
+        // no other compilation ever needs to run that initializer.
+        //
+        // §2.8.2 clause 2 / §22.12 rule 1 / §22.13 (#2351): a GENERIC type's
+        // static field is different — each consumer's compilation independently
+        // monomorphizes its OWN copy of the per-instantiation static state
+        // (#1513's LinkOnceODR-shared cell), and the exporting module's own
+        // compilation never itself instantiates every consumer's type
+        // arguments, so it cannot run the initializer on the consumer's behalf.
+        // §2.8.2 clause 2 requires "an external instantiation behaves
+        // identically to a same-module instantiation of the same generic at
+        // the same arguments" — so the initializer EXPRESSION source text must
+        // cross the boundary (mirrors ctorBodyText/methodBodyText) for the
+        // importer to reconstruct and run it. See fieldInitText's doc comment
+        // (ModuleMetadata.hpp) for the wire shape.
         bool isStaticField = false;
         for (auto mod : m.modifiers)
             if (mod == "static") isStaticField = true;
-        if (!isStaticField && fd->initializer)
+        if (!isStaticField && fd->initializer) {
             out.valueText = renderConstExpr(fd->initializer.get());
+        } else if (isStaticField && isGenericType && fd->initializer &&
+                   !source.empty()) {
+            const ast::Expr* init = fd->initializer.get();
+            if (init->span.begin.offset < init->span.end.offset &&
+                init->span.end.offset <= source.size()) {
+                out.fieldInitText = std::string(
+                    source.substr(init->span.begin.offset,
+                                  init->span.end.offset -
+                                      init->span.begin.offset));
+            }
+        }
         return true;
     }
     // §9.1 positional record field — the FieldSymbol's decl is the TypeDecl and

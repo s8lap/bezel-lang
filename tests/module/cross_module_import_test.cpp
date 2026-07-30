@@ -4770,5 +4770,291 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_EQ(code, 110);
 }
 
+// ---------------------------------------------------------------------------
+// #2351 / §2.8.2 clause 2 / §22.12 rule 1 / §22.13: an imported generic
+// type's STATIC FIELD INITIALIZER must actually run on the importing side,
+// not just share storage (#1513's own fix). #1513's OWN repro shape — a
+// `static readonly` field with a NON-TRIVIAL initializer (`new
+// AtomicInteger<int>(0)`), touched through two SEPARATE consumer artifacts —
+// returned 0/0 before this fix (FieldSymbol::decl stayed null for the
+// imported field, so genericInstSfinitFn's `dynamic_cast<const
+// ast::FieldDecl*>(fs2->decl)` was always null and the store was skipped).
+// This test is the "spec-cited regression test" for #2351: two SEPARATE
+// importers each call Increment() once — 1 then 2, matching the same-module
+// baseline (generic_static_state_shared_same_module_control_spec_1513-style)
+// rather than the pre-fix 0/0.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_field_initializer_runs_once_across_two_importers_spec_1513_2351) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2351_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile w1Src((dir / (stem + "_w1.bzl")).string());
+    TempFile w1Obj((dir / (stem + "_w1.o")).string());
+    TempFile w2Src((dir / (stem + "_w2.bzl")).string());
+    TempFile w2Obj((dir / (stem + "_w2.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+
+    // Module Base2351: Reg<T> with a NON-TRIVIAL static initializer —
+    // `new AtomicInteger<int>(0)` — T-independent (AtomicInteger's own type
+    // argument is the fixed `int`, not T; the T-dependent case is the
+    // separately-tracked #803 scope note genericInstSfinitFn's own comments
+    // name, not this issue's job) and a compiler-intrinsic type (stdlib
+    // §6.4), so it needs no `import` in the synthetic reconstruction.
+    writeSource(baseSrc.path,
+        "module Base2351; "
+        "public class Reg<T> "
+        "  public static readonly Hits: AtomicInteger<int> := "
+        "new AtomicInteger<int>(0); "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    // W1_2351: touches Reg<int>.Hits once.
+    writeSource(w1Src.path,
+        "module W1_2351; "
+        "import Base2351; "
+        "public class W1 "
+        "  public static method Bump(): int "
+        "    return Reg<int>.Hits.Increment(); "
+        "  end Bump; "
+        "end W1;");
+    std::vector<bezel::Dependency> depsBase;
+    {
+        bezel::Dependency d;
+        d.metadataPath = baseObj.path;
+        d.objectPath   = baseObj.path;
+        depsBase.push_back(d);
+    }
+    bezel::CompileResult rW1 =
+        driver.compileObject(w1Src.path, w1Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW1.success);
+    if (!rW1.success) return;
+
+    // W2_2351: touches Reg<int>.Hits once — a SEPARATE compilation from W1,
+    // each independently monomorphizing Reg<int> and independently
+    // reconstructing the field's initializer text (this fix's mechanism).
+    writeSource(w2Src.path,
+        "module W2_2351; "
+        "import Base2351; "
+        "public class W2 "
+        "  public static method Bump(): int "
+        "    return Reg<int>.Hits.Increment(); "
+        "  end Bump; "
+        "end W2;");
+    bezel::CompileResult rW2 =
+        driver.compileObject(w2Src.path, w2Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW2.success);
+    if (!rW2.success) return;
+
+    // App: imports W1 + W2 (+ transitively Base2351), bumps via W1 then W2.
+    writeSource(appSrc.path,
+        "module App2351; "
+        "import W1_2351; "
+        "import W2_2351; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var a := W1.Bump(); "
+        "    var b := W2.Bump(); "
+        "    return a * 10 + b; "
+        "  end Main; "
+        "end Program;");
+    std::vector<bezel::Dependency> depsApp;
+    {
+        bezel::Dependency dBase, dW1, dW2;
+        dBase.metadataPath = baseObj.path; dBase.objectPath = baseObj.path;
+        dW1.metadataPath   = w1Obj.path;   dW1.objectPath   = w1Obj.path;
+        dW2.metadataPath   = w2Obj.path;   dW2.objectPath   = w2Obj.path;
+        depsApp.push_back(dBase);
+        depsApp.push_back(dW1);
+        depsApp.push_back(dW2);
+    }
+    bezel::CompileResult rApp =
+        driver.compileFile(appSrc.path, appExe.path, depsApp);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+
+    int status = std::system(appExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    // 1 then 2 (a=1, b=2 -> 12): the SAME shared AtomicInteger cell
+    // (#1513's LinkOnceODR fix), genuinely INITIALIZED (this fix) exactly
+    // once before either Increment() call. Pre-fix: 0/0 (Hits stayed at its
+    // zero-init default — a null AtomicInteger<int> reference — since the
+    // initializer never ran on the importing side); a double-init bug would
+    // instead produce 1 then 1 (a fresh AtomicInteger(0) re-constructed and
+    // re-stored between the two touches, resetting the count).
+    BEZEL_EXPECT_EQ(code, 12);
+}
+
+// #2351 self-pass (a) / §2.8.2 "no restrictions beyond visibility... must
+// reject the export, or the import, with a diagnostic naming the shape; it
+// must not alter the instantiation's semantics": a static field initializer
+// that references a name NOT visible inside the importer's synthetic
+// reconstruction (an INTERNAL sibling type's method, carried nowhere near
+// Reg<T>'s own metadata — a different failure surface than #710/#2290 bug 2's
+// ctor-body sibling-type gap, but the same root limitation: the synthetic
+// class declares only the type being reconstructed) must fail CLEANLY with a
+// diagnostic naming the field, not silently leave `Hits` at its zero-init
+// default (the pre-#2351 behavior for EVERY shape, correct or not).
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_field_init_unresolvable_reference_rejected_spec_2351) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Base2351NV; "
+        "internal class Helper2351NV "
+        "  internal static method Seed(): int "
+        "    return 7; "
+        "  end Seed; "
+        "end Helper2351NV; "
+        "public class Reg<T> "
+        "  public static readonly Hits: AtomicInteger<int> := "
+        "new AtomicInteger<int>(Helper2351NV.Seed()); "
+        "end Reg;");
+    auto r = runImporter(
+        dep,
+        "module W1_2351NV; "
+        "import Base2351NV; "
+        "public class W1 "
+        "  public static method Bump(): int "
+        "    return Reg<int>.Hits.Increment(); "
+        "  end Bump; "
+        "end W1;");
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+    bool foundDiag = false;
+    for (const Diagnostic& d : r->diags.diagnostics()) {
+        if (d.message.find("cannot import static field") != std::string::npos &&
+            d.message.find("Hits") != std::string::npos) {
+            foundDiag = true;
+            break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(foundDiag);
+}
+
+// #2351 self-pass (c) / §22.13 "Disposal of static owned fields": an `owned`
+// static field's exit disposal must run EXACTLY ONCE process-wide even when
+// TWO SEPARATE importers each independently reconstruct the field's
+// initializer and register it for exit disposal (genericInstSfinitFn's
+// `bz_register_static_owned` call, reachable for an imported generic field
+// only via this fix — it was dead code for that case before, since fd/
+// initExpr were always null). Mirrors #2290/#710's runCrossModuleChecked
+// ASan/LSan technique, extended to THREE artifacts (Base + two importers).
+// A double-dispose (once per importer) would abort under ASan
+// (heap-corruption / double-free); a never-registered dispose would report
+// an LSan leak. Neither fires -> exactly once.
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_owned_field_disposed_once_across_two_importers_spec_2351_22_13) {
+    namespace aot_detail = bezel::test::aot_detail;
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2351_owned_asan_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile w1Src((dir / (stem + "_w1.bzl")).string());
+    TempFile w1Obj((dir / (stem + "_w1.o")).string());
+    TempFile w2Src((dir / (stem + "_w2.bzl")).string());
+    TempFile w2Obj((dir / (stem + "_w2.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+    TempFile sanOut((dir / (stem + ".san.txt")).string());
+    TempFile stdOut((dir / (stem + ".out.txt")).string());
+
+    writeSource(baseSrc.path,
+        "module Base2351Owned; "
+        "public class Reg<T> "
+        "  public static owned readonly Hits: AtomicInteger<int> := "
+        "new AtomicInteger<int>(0); "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    writeSource(w1Src.path,
+        "module W1_2351Owned; "
+        "import Base2351Owned; "
+        "public class W1 "
+        "  public static method Bump(): int "
+        "    return Reg<int>.Hits.Increment(); "
+        "  end Bump; "
+        "end W1;");
+    std::vector<bezel::Dependency> depsBase;
+    {
+        bezel::Dependency d;
+        d.metadataPath = baseObj.path;
+        d.objectPath   = baseObj.path;
+        depsBase.push_back(d);
+    }
+    bezel::CompileResult rW1 =
+        driver.compileObject(w1Src.path, w1Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW1.success);
+    if (!rW1.success) return;
+
+    writeSource(w2Src.path,
+        "module W2_2351Owned; "
+        "import Base2351Owned; "
+        "public class W2 "
+        "  public static method Bump(): int "
+        "    return Reg<int>.Hits.Increment(); "
+        "  end Bump; "
+        "end W2;");
+    bezel::CompileResult rW2 =
+        driver.compileObject(w2Src.path, w2Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW2.success);
+    if (!rW2.success) return;
+
+    writeSource(appSrc.path,
+        "module App2351Owned; "
+        "import W1_2351Owned; "
+        "import W2_2351Owned; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var a := W1.Bump(); "
+        "    var b := W2.Bump(); "
+        "    return a * 10 + b; "
+        "  end Main; "
+        "end Program;");
+    std::vector<bezel::Dependency> depsApp;
+    {
+        bezel::Dependency dBase, dW1, dW2;
+        dBase.metadataPath = baseObj.path; dBase.objectPath = baseObj.path;
+        dW1.metadataPath   = w1Obj.path;   dW1.objectPath   = w1Obj.path;
+        dW2.metadataPath   = w2Obj.path;   dW2.objectPath   = w2Obj.path;
+        depsApp.push_back(dBase);
+        depsApp.push_back(dW1);
+        depsApp.push_back(dW2);
+    }
+    // §2.6's own "--sanitize=address applies to the executable build" rule —
+    // only the FINAL link is instrumented; the ASan RUNTIME's allocator
+    // interposition (malloc/free/calloc) still catches a leak or double-free
+    // from the dependency objects' pre-compiled code, exactly as
+    // runCrossModuleChecked (#2290/#710) relies on.
+    codegen::CodegenOptions opts;
+    opts.sanitizeAddress = true;
+    bezel::CompileResult rApp =
+        driver.compileFile(appSrc.path, appExe.path, depsApp, opts);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+
+    bool timedOut = false;
+    int status = aot_detail::spawnCaptured(
+        {appExe.path}, stdOut.path, sanOut.path, aot_detail::aotTimeoutSec(),
+        timedOut, {{"ASAN_OPTIONS", "detect_leaks=1:exitcode=99:abort_on_error=0"}});
+    BEZEL_EXPECT_TRUE(!timedOut);
+    if (timedOut) return;
+
+    std::string sanText = aot_detail::slurp(sanOut.path);
+    bool crashed = WIFSIGNALED(status);
+    bool sanitizerFired = crashed || aot_detail::hasSanitizerReport(sanText);
+    // CLAUDE.md trap (iii): LeakSanitizer forces exitcode=99 on a leak/error
+    // (set explicitly above) rather than letting Main's own return value
+    // through, so check the sanitizer verdict FIRST, independent of the
+    // masked exit code.
+    BEZEL_EXPECT_TRUE(!sanitizerFired);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 12);  // same 1-then-2 baseline as the plain test
+}
 
 }  // namespace bezel::module

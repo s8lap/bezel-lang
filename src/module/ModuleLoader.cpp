@@ -1347,6 +1347,233 @@ static bool parseAndAttachMethodBody(
     return true;
 }
 
+// §2.8.2 / §22.12 / §22.13 (#2351): build a synthetic class source for
+// re-parsing an imported generic class's static field INITIALIZER
+// expression(s). Shape mirrors buildSyntheticMethodSource: every field is
+// (re)declared with its type, and — for whichever field(s) carry their own
+// fieldInitText (every static field of this class the exporter carried one
+// for, not just the one field this call is reconstructing right now: a
+// sibling static field the initializer references then type-checks against
+// its REAL initializer rather than a bare, potentially
+// `readonly`-without-assignment stub; no DEFINITE-ASSIGNMENT pass runs over
+// this reduced 3-pass pipeline, so a still-bare sibling would not itself
+// fault, but embedding the real text is more faithful and costs nothing
+// extra since the text is already on hand) — the `:=` initializer text is
+// appended too. Every method is a signature-only stub (self-call
+// resolution, e.g. `Hits: int := ComputeInitial();`).
+static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td) {
+    std::string src = "module _2351_reparsed_field_;\n";
+    src += metaVisibilityToKeyword(td.visibility);
+    src += " class ";
+    src += td.name;
+    if (!td.genericParams.empty()) {
+        src += "<";
+        for (std::size_t i = 0; i < td.genericParams.size(); ++i) {
+            if (i) src += ", ";
+            if (!td.genericParams[i].variance.empty() &&
+                td.genericParams[i].variance != "none")
+                src += td.genericParams[i].variance + " ";
+            src += td.genericParams[i].name;
+        }
+        src += ">";
+    }
+    src += "\n";
+    // Fields: any field carrying its own fieldInitText gets its real
+    // initializer; every other field is a bare type re-declaration (name
+    // resolution only — see comment above).
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Field) continue;
+        src += "  " + metaVisibilityToKeyword(mm.visibility);
+        for (const std::string& mod : mm.modifiers) src += " " + mod;
+        src += " " + mm.name + " : " + metaTypeToSourceText(mm.type);
+        if (!mm.fieldInitText.empty()) src += " := " + mm.fieldInitText;
+        src += ";\n";
+    }
+    // Method stubs, for any self-call the initializer makes.
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Method) continue;
+        if (mm.isOperator) continue;
+        std::string stub = buildMethodStub(mm);
+        if (!stub.empty()) src += stub + "\n";
+    }
+    src += "end " + td.name + ";\n";
+    return src;
+}
+
+// §2.8.2 / §22.12 / §22.13 (#2351): parse `target.fieldInitText` for a static
+// field of an imported generic class, run the three sema passes in a FRESH
+// SemaContext, remap the initializer's exprSymbols (field / self-method)
+// into mainCtx, and attach the re-parsed ast::FieldDecl (whose `initializer`
+// is now a live AST) to the imported FieldSymbol's `decl` slot — mirroring
+// ConstructorSymbol::decl / MethodSymbol::decl for the ctor/method-body
+// precedents. After this, codegen's genericInstSfinitFn (LlvmBackend_Setup.
+// cpp) finds `dynamic_cast<const ast::FieldDecl*>(fs->decl)` non-null and
+// lowers+stores the initializer exactly as it already does for a LOCALLY-
+// declared generic's own field — no codegen change needed.
+//
+// §2.8.2's "no restrictions beyond visibility... must reject the export, or
+// the import, with a diagnostic naming the shape; it must not alter the
+// instantiation's semantics" governs the failure path: unlike the ctor-body
+// path (tolerant of benign sema errors) and the method-body path (silently
+// declines to attach, falling back to the pre-existing degraded behavior),
+// an unattached static field initializer has NO fallback — genericInstSfinitFn
+// leaves the shared per-instantiation cell at its zero-init forever, which
+// IS an altered instantiation semantics (§2.8.2 clause 2: "an external
+// instantiation behaves identically to a same-module instantiation"). So a
+// parse/sema failure here is reported as a hard diagnostic into the
+// IMPORTING compilation's own DiagnosticEngine (mainCtx.diagnostics()) —
+// causing that build to fail cleanly, naming the field and module, rather
+// than silently shipping a static field that always reads zero/default.
+//
+// This is scoped to the reconstruction step itself. It does NOT extend to
+// genericInstSfinitFn's own pre-existing, separately-tracked skips
+// (collection-literal / inline-array initializers, and a T-DEPENDENT
+// initializer whose value type doesn't match the instantiation's field
+// type, per #1513's "KNOWN GAP" comment and issue #803) — those remain
+// silent zero-inits, an already-recorded limitation this fix does not
+// widen or narrow.
+static bool parseAndAttachFieldInit(
+    const MetaTypeDecl& td,
+    const std::string& moduleName,
+    const MetaMember& target,
+    sema::FieldSymbol* importedFs,
+    const sema::TypeSymbol& importedType,
+    sema::SemaContext& mainCtx) {
+    std::string source = buildSyntheticFieldInitSource(td);
+
+    auto reject = [&](const char* reason) {
+        mainCtx.diagnostics().report(
+            Severity::Error, SourceLocation{},
+            "cannot import static field '" + td.name + "." + target.name +
+                "' from module '" + moduleName +
+                "': its initializer could not be reconstructed across the "
+                "module boundary (" + reason +
+                "); per spec §2.8.2 the import is rejected rather "
+                "than silently observing an uninitialized value");
+    };
+
+    DiagnosticEngine freshDiag;
+    Lexer freshLex(source, freshDiag);
+    Parser freshParser(freshLex, freshDiag);
+    auto sf = freshParser.parseCompilationUnit();
+    if (!sf || freshDiag.hasErrors()) {
+        reject("the initializer text failed to re-parse");
+        return false;
+    }
+
+    // Fresh context/diagnostics must OUTLIVE this function on success — see
+    // the ctor/method-body precedents' identical keep-alive discipline.
+    auto semaDiag = std::make_shared<DiagnosticEngine>();
+    auto freshCtxPtr = std::make_shared<sema::SemaContext>(*semaDiag);
+    sema::SemaContext& freshCtx = *freshCtxPtr;
+    sema::collectSymbols(*sf, freshCtx);
+    if (semaDiag->hasErrors()) {
+        reject("symbol collection failed on the reconstructed declaration");
+        return false;
+    }
+    sema::resolveTypes(*sf, freshCtx);
+    if (semaDiag->hasErrors()) {
+        reject("a referenced type did not resolve inside the module "
+               "boundary");
+        return false;
+    }
+    sema::typecheckExpressions(*sf, freshCtx);
+    // §14.1/#783 SOUNDNESS GATE, applied here for the same reason: a static
+    // field's value is exactly the class of "silently wrong" risk a method's
+    // return value is (§2.8.2/#2351 doc comment above) — require a fully
+    // clean typecheck of the WHOLE synthetic class (every field's carried
+    // initializer, not just `target`'s), since a sibling's ill-typed
+    // initializer would leave the module resolvable but ill-formed.
+    if (semaDiag->hasErrors()) {
+        reject("the initializer references a name not visible across the "
+               "module boundary");
+        return false;
+    }
+
+    sema::TypeSymbol* freshType = nullptr;
+    if (freshCtx.module()) {
+        for (sema::Symbol* child : freshCtx.module()->children) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(child);
+            if (ts && std::string(ts->name) == td.name) { freshType = ts; break; }
+        }
+    }
+    if (!freshType) {
+        reject("the reconstructed type could not be located");
+        return false;
+    }
+
+    sema::FieldSymbol* freshFs = nullptr;
+    for (sema::Symbol* m : freshType->members) {
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+        if (fs && std::string(fs->name) == target.name) { freshFs = fs; break; }
+    }
+    if (!freshFs) {
+        reject("the reconstructed field could not be located");
+        return false;
+    }
+
+    auto* parsedFd = dynamic_cast<const ast::FieldDecl*>(freshFs->decl);
+    if (!parsedFd || !parsedFd->initializer) {
+        reject("the reconstructed declaration carries no initializer");
+        return false;
+    }
+
+    // Field remap map (every field of the class, so a sibling reference in
+    // `target`'s initializer binds to the REAL imported FieldSymbol).
+    std::unordered_map<std::string_view, sema::Symbol*> importedFields;
+    for (sema::Symbol* m : importedType.members) {
+        if (dynamic_cast<sema::FieldSymbol*>(m) && !m->name.empty())
+            importedFields[m->name] = m;
+    }
+
+    // Self-method remap map (signature-keyed, as in the ctor/method paths).
+    std::unordered_map<std::string, sema::Symbol*> importedMethods;
+    {
+        std::size_t importedIdx = 0;
+        for (const MetaMember& mmItem : td.members) {
+            if (!metaMemberProducesSymbol(mmItem)) continue;
+            if (importedIdx >= importedType.members.size()) break;
+            sema::Symbol* sym = importedType.members[importedIdx++];
+            if (mmItem.kind == MetaMemberKind::Method && !mmItem.isOperator)
+                importedMethods[metaMemberSigKey(mmItem.name, mmItem.params)] =
+                    sym;
+        }
+    }
+
+    for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
+        if (!expr || !freshSym) continue;
+        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+            auto it = importedFields.find(freshSym->name);
+            if (it != importedFields.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        } else if (auto* fms = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
+            auto it = importedMethods.find(freshMethodSigKey(fms));
+            if (it != importedMethods.end())
+                mainCtx.setExprSymbol(expr, it->second);
+        }
+        // No ParameterSymbol/LocalSymbol case: a field initializer is not a
+        // body — it has no parameters, and per §22.8/§22.13 a field
+        // initializer expression admits no local declarations either.
+    }
+
+    // Copy resolved-type / expr-type entries so codegen's lowerExpr finds a
+    // type for every sub-expression of the initializer (e.g. `new
+    // AtomicInteger<int>(0)`'s constructed-type node).
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        if (expr && ref) mainCtx.setExprType(expr, ref);
+
+    // Attach: importedFs->decl now points at a live ast::FieldDecl whose
+    // `initializer` genericInstSfinitFn's existing loop lowers and stores.
+    importedFs->decl = parsedFd;
+    mainCtx.ownImportedSource(std::move(source));
+    mainCtx.ownImportedAst(std::move(sf));
+    mainCtx.ownImportedAuxiliary(semaDiag);
+    mainCtx.ownImportedAuxiliary(freshCtxPtr);
+    return true;
+}
+
 }  // namespace
 
 void stripContractFacts(MetaMember& member) {
@@ -1547,6 +1774,29 @@ static void loadMetadataPass2(
             }
             if (importedMs)
                 parseAndAttachMethodBody(td, mm, importedMs, *t, ctx);
+        }
+
+        // §2.8.2 / §22.12 / §22.13 (#2351): static field initializers — find
+        // each Field member with a non-empty fieldInitText and attach the
+        // re-parsed ast::FieldDecl to the matching imported FieldSymbol, so
+        // codegen's genericInstSfinitFn can lower+store the initializer into
+        // the #1513 shared per-instantiation cell. Fields are never
+        // overloaded (§22.6 is a method/constructor/indexer concept), so a
+        // name match is sufficient — no signature-key matching needed.
+        for (const MetaMember& mm : td.members) {
+            if (mm.kind != MetaMemberKind::Field || mm.fieldInitText.empty())
+                continue;
+            sema::FieldSymbol* importedFs = nullptr;
+            for (sema::Symbol* m : t->members) {
+                auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+                if (fs && std::string(fs->name) == mm.name) {
+                    importedFs = fs;
+                    break;
+                }
+            }
+            if (importedFs)
+                parseAndAttachFieldInit(td, md.moduleName, mm, importedFs, *t,
+                                        ctx);
         }
 
         // Dtor body: the dtorBodyText is on the MetaTypeDecl itself.
