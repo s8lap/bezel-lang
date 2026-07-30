@@ -189,19 +189,48 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             // operand-category rule — see recordMovesInArgs' twin call.
             checkRefOutOwnedOperand(a);
             // §28.8 / §28.13: is this argument position an owned sink? A ctor
-            // `owned` (or `out owned`) formal, or the implicit owned parameter
-            // of `new Shared<T>(value)` at position 0. The `owned`/`move`/borrow
+            // `owned` formal, or the implicit owned parameter of
+            // `new Shared<T>(value)` at position 0. The `owned`/`move`/borrow
             // classification below is identical to the method-call path
             // (recordMovesInArgs); the call-site `owned` marker (§22.3, v0.169)
             // is layered on top of the SAME classification.
+            //
+            // #2436: deliberately does NOT include `"out owned"` here — an
+            // `out owned` ctor formal is the owned-OUT direction (the argument
+            // RECEIVES ownership, marked Owned by markOutOwnedArgs below, not
+            // an owned-IN sink that CONSUMES the caller's argument), exactly
+            // as recordMovesInArgs's `userOwned` check (this function's
+            // method-call analogue, ~line 339-341) already documents: "an
+            // `out owned` formal is the owned-OUT direction ... NOT an owned-IN
+            // sink; only a plain `owned` formal consumes the argument here."
+            // This ctor-specific classifier had DIVERGED from that documented
+            // rule (a #2429 copy/paste-era bug, not something #2429 itself
+            // introduced deliberately): including `"out owned"` made THIS loop
+            // route a fresh `out owned var n` recipient identifier through
+            // `markMovedByName` (below) as if `n` were an existing owned value
+            // being MOVED INTO the constructor. On a first straight-line
+            // occurrence this was silently harmless (`n` is not yet in
+            // `states_`, so `markMovedByName`'s `lookupState` finds nothing and
+            // no-ops) — but on a for/while loop's second logical iteration,
+            // where the SAME inline recipient symbol re-enters this call with
+            // its PRIOR iteration's discharged (Disposed) state already
+            // present in `states_` (see the markOutOwnedArgsCore fix above),
+            // this misclassification reported a spurious "cannot move from
+            // disposed local `n`" — a second, independent defect compounding
+            // the same false-reject repro #2436 files under the ctor form.
+            // Excluding `"out owned"` here restores the method-call path's
+            // (correct) behavior: the identifier falls through to the plain
+            // `recordMovesIn(*a.value)` tail below, a no-op for a bare
+            // identifier (recordMovesIn has no IdentifierExpr arm) — out-owned
+            // marking is handled exclusively by `markOutOwnedArgs(ne->args,
+            // ctorParams)` at the end of this function. // per §28.8, §28.3, #2436
             // §22.5 (v0.184, #1973): key off the BOUND ctor parameter (named-arg
             // binding), not the source position — see boundParamIndex.
             const std::size_t boundPos =
                 ctorParams ? boundParamIndex(ne->args, pos, *ctorParams) : pos;
             const bool ctorOwnedSink =
                 ctorParams && boundPos < ctorParams->size() &&
-                ((*ctorParams)[boundPos].modifier == "owned" ||
-                 (*ctorParams)[boundPos].modifier == "out owned");
+                (*ctorParams)[boundPos].modifier == "owned";
             const bool ownedSink =
                 ctorOwnedSink || (isSharedNew && pos == 0);
             // §22.3 (v0.169, #1348): the `owned` marker is only valid on an
@@ -1412,8 +1441,39 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // Treat the callee as a member-access-target for discharge
         // tolerance (so `x.M(x)` doesn't flag x).
         if (call->callee) checkRead(*call->callee, true);
+        std::size_t pos = 0;
         for (const auto& a : call->args) {
-            if (a.value) checkRead(*a.value, false);
+            if (!a.value) { ++pos; continue; }
+            // §28.3 / §28.11 (#860 / #892, #2436): an `out owned var` argument
+            // is a WRITE target — the call DEPOSITS a fresh owned value into
+            // the local; it does not read whatever `n` happened to be tracked
+            // as before this call. Skip the read-check for it, mirroring
+            // handleDischarge's identical carve-out for the bare-statement
+            // call form (this file, ~line 792-804: "an `out owned` arg is a
+            // WRITE target ... Skip read-checking it (a stale Disposed state
+            // from a prior loop iteration would otherwise produce a spurious
+            // use-after-dispose warning)"). checkRead walks the WHOLE
+            // initializer/RHS expression BEFORE recordMovesIn/markOutOwnedArgs
+            // runs (handleLocalDecl calls checkRead first, then classifies the
+            // state later), so on a for/while loop's second logical iteration
+            // — where the recipient's PRIOR-iteration Disposed/MovedFrom state
+            // is still the one carried into this block's entry state (the O3b
+            // loop back-edge's union-key meet) — this blanket recursion read
+            // that STALE state and reported a spurious use-after-dispose
+            // warning on a value that is about to be freshly re-minted by
+            // THIS call. This was invisible on the FIRST occurrence (the
+            // recipient is not yet in `states_` at all, so `checkRead`'s
+            // IdentifierExpr arm early-returns) and invisible on the
+            // bare-statement call form (handleDischarge already carves it
+            // out) — only the LocalDecl-initializer / assignment-RHS forms
+            // (which route through THIS function, per recordMovesInArgs' own
+            // comment) were exposed. // per §28.3, §28.11, #2436
+            if (a.modifier == "out owned var" ||  // per §22.4 / v0.160
+                builtinOutOwnedArg(call->callee.get(), pos)) {
+                ++pos; continue;
+            }
+            checkRead(*a.value, false);
+            ++pos;
         }
         return;
     }
@@ -6481,15 +6541,46 @@ void MethodOwnership::markOutOwnedArgsCore(
                 // `everOwnedPlainLocals_` so the end-of-method discharge check
                 // catches it even if its enclosing block exits before the method
                 // return. per §22.4, §28.3
+                //
+                // #2436: this seed is UNCONDITIONAL — every visit re-establishes
+                // Owned, mirroring handleLocalDecl's unconditional
+                // `states_[lsym] = lo;` (Ownership.cpp ~line 4360) and
+                // seedOwnedIterVar's per-iteration reseed of a for-loop's owned
+                // iteration variable (Ownership.cpp ~line 2288). The prior
+                // "only if states_ lacks an entry" guard was correct for a
+                // straight-line call site but false-rejected the idiomatic
+                // pattern of declaring-and-fully-discharging this SAME inline
+                // recipient on every loop iteration: `states_` is reset from
+                // computeEntry() at the start of every block visit, and O3b's
+                // loop back-edge / zero-trip-skip merge is a UNION-KEY meet
+                // (joinInto's unionKeys branch) that carries a symbol present on
+                // only one incoming edge through VERBATIM — so a recipient
+                // symbol discharged (Disposed) at the end of iteration N is
+                // carried, unchanged, into the entry state of the block that
+                // re-declares it for iteration N+1 (the declaring call sits
+                // inside the loop body, or — for the while-condition
+                // `TryPop(out owned var item)` idiom, §28.3/#892 — inside the
+                // loop-header block itself, both revisited every iteration via
+                // the back edge). The stale "not absent" guard then read that
+                // carried-forward Disposed/MovedFrom state as "already seeded"
+                // and skipped the reseed, so iteration N+1 inherited iteration
+                // N's terminal state instead of a fresh Owned value — reported
+                // as "already moved out" (ctor form) or "used after dispose"
+                // (method-call form), even though the call mints a genuinely
+                // NEW value every time control reaches it — exactly like an
+                // ordinary `var w := new Widget();` inside a loop body, which
+                // handleLocalDecl already resets unconditionally on every
+                // visit. Removing the guard makes the two forms consistent: the
+                // inline `out owned var` recipient is a fresh binding at its
+                // declaring call site, on every iteration, no different from a
+                // ordinary LocalDecl. per §22.4, §28.3, #2436
                 if (a.modifier == "out owned var") {
                     if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
-                        if (states_.find(sym) == states_.end()) {
-                            LocalOwnership lo;
-                            lo.state = OwnershipState::Owned;
-                            lo.obligationOrigin = id;
-                            states_[sym] = lo;
-                            everOwnedPlainLocals_.insert(sym);
-                        }
+                        LocalOwnership lo;
+                        lo.state = OwnershipState::Owned;
+                        lo.obligationOrigin = id;
+                        states_[sym] = lo;
+                        everOwnedPlainLocals_.insert(sym);
                     }
                 } else {
                     // Pre-declared local (plain `out x`) or `out using var x`
