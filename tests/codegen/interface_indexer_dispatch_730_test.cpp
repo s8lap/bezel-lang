@@ -74,11 +74,19 @@ BEZEL_TEST(interface_indexer_dispatch_730, getter_and_setter_via_interface) {
 BEZEL_TEST(interface_indexer_dispatch_730, indexer_interleaved_with_members) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
+        // §11.2/§23.3 (#2413): Box's `Size` and `Name` are getter-only and
+        // this test never writes through the interface for either, so both
+        // obligations are declared `readonly` — a getter-only
+        // implementation of a read-write interface property is now a
+        // compile error (#2413). The indexer is untouched: #2413's fix is
+        // scoped to plain (non-indexer) properties (indexers are excluded
+        // from the same conformance loop at their own §23.4 call site) —
+        // filed as a separate issue for the identical indexer-shaped gap.
         "interface IBox "
         "  method Tag(): int; "
-        "  property Size: int; "
+        "  readonly property Size: int; "
         "  property [i: int]: int; "
-        "  property Name: int; "
+        "  readonly property Name: int; "
         "end IBox; "
         "class Box: IBox "
         "  private _v: int; "

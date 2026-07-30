@@ -272,8 +272,15 @@ BEZEL_TEST(xmod_itable_prop_inherited_import_2387,
                     "public class BaseWithPropSM2387T4 "
                     "  public property Name: int => 1; "
                     "end BaseWithPropSM2387T4; "
+                    // §11.2/§23.3 (#2413): BaseWithPropSM2387T4's `Name` is
+                    // getter-only and this test never writes through the
+                    // interface, so IHasNameSM2387T4's obligation is
+                    // declared `readonly` — a getter-only implementation of
+                    // a read-write interface property is now a compile
+                    // error (#2413's own fix, the LOCAL/single-module
+                    // sibling of this file's cross-module #2387 defect).
                     "public interface IHasNameSM2387T4 "
-                    "  property Name: int; "
+                    "  readonly property Name: int; "
                     "end IHasNameSM2387T4; "
                     "public class DerivedSM2387T4: BaseWithPropSM2387T4, "
                     "IHasNameSM2387T4 end DerivedSM2387T4; "

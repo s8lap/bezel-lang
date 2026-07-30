@@ -193,7 +193,11 @@ BEZEL_TEST(constraint_dispatch_gaps, r1_2_record_property_in_arithmetic_spec_14_
 BEZEL_TEST(constraint_dispatch_gaps, control_class_property_via_constraint_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface ICode  property Code: int; end ICode; "
+        // §11.2/§23.3 (#2413): Tag's `Code` is getter-only and this test
+        // never writes through the interface, so ICode's obligation is
+        // declared `readonly` — a getter-only implementation of a
+        // read-write interface property is now a compile error (#2413).
+        "interface ICode  readonly property Code: int; end ICode; "
         "class Tag : ICode "
         "  public _c: int := 0; "
         "  public constructor(c: int) _c := c; end constructor; "

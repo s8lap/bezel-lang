@@ -136,7 +136,11 @@ BEZEL_TEST(property_accessor_types_510, interface_enum_property) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "enum Level Low, Mid, High; end Level; "
-        "interface ILeveled property L: Level; end ILeveled; "
+        // §11.2/§23.3 (#2413): HighLevel's `L` is getter-only and this test
+        // never writes through the interface, so ILeveled's obligation is
+        // declared `readonly` — a getter-only implementation of a
+        // read-write interface property is now a compile error (#2413).
+        "interface ILeveled readonly property L: Level; end ILeveled; "
         "class HighLevel : ILeveled "
         "  public property L: Level => Level.High; "
         "  destructor end destructor; "
@@ -156,7 +160,10 @@ BEZEL_TEST(property_accessor_types_510, interface_enum_property_mid_value) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
         "enum Priority Low, Medium, High; end Priority; "
-        "interface ITask property Urgency: Priority; end ITask; "
+        // §11.2/§23.3 (#2413): MedTask's `Urgency` is getter-only and this
+        // test never writes through the interface (see the identical note
+        // on interface_enum_property above).
+        "interface ITask readonly property Urgency: Priority; end ITask; "
         "class MedTask : ITask "
         "  public property Urgency: Priority => Priority.Medium; "
         "  destructor end destructor; "
@@ -275,7 +282,10 @@ BEZEL_TEST(property_accessor_types_510, virtual_nullable_bool_property_null) {
 BEZEL_TEST(property_accessor_types_510, interface_nullable_int_property) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IMaybeValue property Val: int?; end IMaybeValue; "
+        // §11.2/§23.3 (#2413): HasValue's `Val` is getter-only and this test
+        // never writes through the interface (see the identical note on
+        // interface_enum_property above).
+        "interface IMaybeValue readonly property Val: int?; end IMaybeValue; "
         "class HasValue : IMaybeValue "
         "  public property Val: int? => 7; "
         "  destructor end destructor; "
@@ -331,7 +341,10 @@ BEZEL_TEST(property_accessor_types_510, control_abstract_string_property) {
 BEZEL_TEST(property_accessor_types_510, control_interface_int_property) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IShape property Size: int; end IShape; "
+        // §11.2/§23.3 (#2413): Square's `Size` is getter-only and this test
+        // never writes through the interface (see the identical note on
+        // interface_enum_property above).
+        "interface IShape readonly property Size: int; end IShape; "
         "class Square : IShape public property Size: int => 9; "
         "  destructor end destructor; end Square; "
         "class C "

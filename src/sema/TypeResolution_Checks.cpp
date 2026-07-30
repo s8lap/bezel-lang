@@ -3450,6 +3450,73 @@ void Resolver::checkAbstractImplementations() {
                     ": T` (§11.2 / §23)");
             }
         }
+        // §11.2 / §23.3 (v0.235, #2413): the ACCESSOR-SET sibling of #489's
+        // "field doesn't satisfy a property" check just above and #2380's
+        // property TYPE-match check below. §11.2's "matches" rule requires an
+        // implementation to provide the accessors the interface obligation
+        // declares; §11.2's diamond-resolution note states the one-directional
+        // relaxation explicitly — "A read-write member satisfies a read-only
+        // interface member of the same name and type" — which by omission
+        // means the converse does NOT hold: a read-only (getter-only) member
+        // does not satisfy a read-write interface property obligation.
+        // Before this fix, only the INTERFACE's own declared accessor set
+        // gated whether codegen's declareVtables Pass D
+        // (LlvmBackend_Setup.cpp) allocated an itable setter slot for that
+        // interface property — the ACTUAL implementing property's accessor
+        // set was never consulted here. A getter-only class property was
+        // therefore accepted as satisfying a read-write interface property
+        // obligation; ensurePropertyAccessorFn(ts, impl, isSet=true)
+        // correctly returns nullptr for the getter-only impl (its
+        // PropertyBodyKind::Expression branch), so Pass D silently installed
+        // ConstantPointerNull in the unfillable setter slot with no
+        // diagnostic anywhere — `iface.Prop := v` then called through that
+        // null pointer (SIGSEGV, confirmed via gdb: RIP=0x0).
+        //
+        // Accessor PRESENCE is a shape fact, not a typed one — unlike the
+        // type-match check below, substituting a generic interface's type
+        // parameters does not change which accessors it declares, so this
+        // check is intentionally NOT gated on t->genericParams.empty() /
+        // iface->genericParams.empty() (it is sound, and strictly more
+        // complete, to run it unconditionally).
+        //
+        // Local-only, per #2413's confirmed scope: `ps->decl` is null for an
+        // IMPORTED property (no syntactic AST for a body-less imported
+        // declaration — ModuleLoader::convertMember's Property case), and
+        // there is no accessor-presence side table for that case yet (#2406,
+        // in flight separately, covers the cross-module
+        // propertyHasSetter/importedPropertyHasSetter gap). Skipping when
+        // either side is imported keeps this check to the confirmed local
+        // shape rather than guessing at the cross-module one.
+        for (auto& [name, info] : ifaceProps) {
+            PropertySymbol* ips = info.first;
+            TypeSymbol* iface = info.second;
+            auto cit = concreteProps.find(name);
+            if (cit == concreteProps.end()) continue;  // missing → reported above
+            auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ips->decl);
+            auto* cpd = dynamic_cast<const ast::PropertyDecl*>(cit->second->decl);
+            if (!ipd || !cpd) continue;  // imported side — left to #2406
+            if (propertyDeclHasSetter(ipd) && !propertyDeclHasSetter(cpd)) {
+                // Reported at t->declLoc, not cit->second->declLoc: probed
+                // and confirmed (during this fix) that PropertySymbol::
+                // declLoc — like every other non-TypeSymbol member kind — is
+                // never populated by SymbolCollection.cpp's collectMember
+                // (only TypeSymbol::declLoc is set, a few hundred lines away
+                // in a different function), so it always reads as 0:0. That
+                // pre-existing, broadly-scoped gap is out of scope for #2413
+                // (filed separately); t->declLoc is populated and already
+                // the choice the sibling #489 "missing interface property"
+                // diagnostic three lines above uses for the same reason.
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string("property `") + std::string(name) +
+                    "` implements interface `" + std::string(iface->name) +
+                    "` with a getter-only implementation, but `" +
+                    std::string(iface->name) + "." + std::string(name) +
+                    "` is declared read-write — an implementation of a "
+                    "read-write interface property must provide a setter "
+                    "(§11.2 / §23.3)");
+            }
+        }
         // R39 / §11.2 ("Return types must match exactly — no covariance"): a
         // provided property must have the SAME type the interface declares.
         // A mismatch installs a getter of the wrong return type into the itable

@@ -46,7 +46,11 @@ int run(const std::string& prog) {
 BEZEL_TEST(generic_constraint_property_dispatch, interface_constraint_string_property_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IHasName  property Name: string; end IHasName; "
+        // §11.2/§23.3 (#2413): Person's `Name` is getter-only and this test
+        // never writes through the interface, so IHasName's obligation is
+        // declared `readonly` — a getter-only implementation of a
+        // read-write interface property is now a compile error (#2413).
+        "interface IHasName  readonly property Name: string; end IHasName; "
         "class Person : IHasName "
         "  public _name: string; "
         "  public constructor(n: string) _name := n; end constructor; "
@@ -70,7 +74,9 @@ BEZEL_TEST(generic_constraint_property_dispatch, interface_constraint_string_pro
 BEZEL_TEST(generic_constraint_property_dispatch, interface_constraint_expr_body_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IHasName  property Name: string; end IHasName; "
+        // §11.2/§23.3 (#2413): see interface_constraint_string_property_spec_14_2
+        // above for why this interface property is declared `readonly`.
+        "interface IHasName  readonly property Name: string; end IHasName; "
         "class Person : IHasName "
         "  public _name: string; "
         "  public constructor(n: string) _name := n; end constructor; "
@@ -167,7 +173,11 @@ BEZEL_TEST(generic_constraint_property_dispatch, virtual_class_constraint_proper
 BEZEL_TEST(generic_constraint_property_dispatch, constraint_property_result_in_arithmetic_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface INum  property Val: int; end INum; "
+        // §11.2/§23.3 (#2413): Num's `Val` is getter-only and this test
+        // never writes through the interface, so INum's obligation is
+        // declared `readonly` (see interface_constraint_string_property_spec_14_2
+        // above for the general rationale).
+        "interface INum  readonly property Val: int; end INum; "
         "class Num : INum "
         "  public _n: int := 0; "
         "  public constructor(n: int) _n := n; end constructor; "
@@ -192,8 +202,12 @@ BEZEL_TEST(generic_constraint_property_dispatch, constraint_property_result_in_a
 BEZEL_TEST(generic_constraint_property_dispatch, two_constrained_type_params_property_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IVal   property Val: int;  end IVal; "
-        "interface IBase  property Base: int; end IBase; "
+        // §11.2/§23.3 (#2413): A's `Val` and B's `Base` are getter-only and
+        // this test never writes through either interface, so both
+        // obligations are declared `readonly` (see
+        // interface_constraint_string_property_spec_14_2 above).
+        "interface IVal   readonly property Val: int;  end IVal; "
+        "interface IBase  readonly property Base: int; end IBase; "
         "class A : IVal "
         "  public _v: int := 0; "
         "  public constructor(v: int) _v := v; end constructor; "
@@ -227,7 +241,10 @@ BEZEL_TEST(generic_constraint_property_dispatch, two_constrained_type_params_pro
 BEZEL_TEST(generic_constraint_property_dispatch, interface_constraint_int_property_compare_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface ICode  property Code: int; end ICode; "
+        // §11.2/§23.3 (#2413): Tag's `Code` is getter-only and this test
+        // never writes through the interface (see
+        // interface_constraint_string_property_spec_14_2 above).
+        "interface ICode  readonly property Code: int; end ICode; "
         "class Tag : ICode "
         "  public _c: int := 0; "
         "  public constructor(c: int) _c := c; end constructor; "

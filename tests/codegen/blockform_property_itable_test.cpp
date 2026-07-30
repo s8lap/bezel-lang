@@ -67,7 +67,13 @@ BEZEL_TEST(codegen_blockform_property_itable, record_blockgetter_via_interface) 
 BEZEL_TEST(codegen_blockform_property_itable, class_blockgetter_via_interface) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IBar  property Val: int; end IBar; "
+        // §11.2/§23.3 (#2413): Impl's `Val` is a getter-only block-form
+        // property (no `set` arm) and this test never writes through the
+        // interface, so IBar's obligation is declared `readonly` — a
+        // getter-only implementation of a read-write interface property is
+        // now a compile error (#2413's own fix), and `readonly` is the
+        // accurate declaration of what this test actually exercises.
+        "interface IBar  readonly property Val: int; end IBar; "
         "class Impl : IBar "
         "  protected _v: int := 7; "
         "  public property Val: int "
@@ -158,7 +164,11 @@ BEZEL_TEST(codegen_blockform_property_itable, record_arrow_getter_via_interface_
 BEZEL_TEST(codegen_blockform_property_itable, class_arrow_getter_via_interface_control) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface ITag  property Tag: int; end ITag; "
+        // §11.2/§23.3 (#2413): Tagged's `Tag` is getter-only (expression-
+        // bodied) and this test never writes through the interface, so
+        // ITag's obligation is declared `readonly` (see the identical note
+        // on class_blockgetter_via_interface above).
+        "interface ITag  readonly property Tag: int; end ITag; "
         "class Tagged : ITag "
         "  public property Tag: int => 55; "
         "  destructor end destructor; "
