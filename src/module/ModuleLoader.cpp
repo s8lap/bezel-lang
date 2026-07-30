@@ -1432,6 +1432,20 @@ static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td) {
 // type, per #1513's "KNOWN GAP" comment and issue #803) — those remain
 // silent zero-inits, an already-recorded limitation this fix does not
 // widen or narrow.
+//
+// Known coverage gap (tracked, not silently dropped — issue #2375): the
+// synthetic source (buildSyntheticFieldInitSource) declares only the type
+// being reconstructed, so an initializer referencing a SIBLING type — even
+// as simple as `new SomeOtherClass()` for the field's own type — fails
+// resolveTypes and is rejected via the `reject` path above, not silently
+// wrong (the strict gate this function applies makes that the CORRECT
+// outcome per §2.8.2), but it IS a real capability gap shared with #710 /
+// #2290 bug 2's identical "synthetic source omits sibling/base types"
+// limitation on the ctor-body path. Every #2351 regression test uses
+// AtomicInteger<T> (stdlib §6.4) specifically because it is compiler-known
+// and needs no `import` inside the synthetic reconstruction; a static field
+// of a plain user-defined class type is unsupported today and rejects
+// cleanly rather than reconstructing.
 static bool parseAndAttachFieldInit(
     const MetaTypeDecl& td,
     const std::string& moduleName,
