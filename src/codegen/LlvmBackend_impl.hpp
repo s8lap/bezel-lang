@@ -2520,6 +2520,29 @@ private:
     // (null-/sentinel-safe), and null the slot so a re-read sees a defined
     // null (matching the boxRelease / closureRelease / stringRelease
     // semantics). Used by the recordStringFields scope-end Disposal.
+    //
+    // fix #2405 / §9.7 / §28.9: RECURSE into a non-nullable nested-record
+    // storage member so a string owned two-or-more levels deep is also
+    // released, not just the outer record's OWN direct string fields (the
+    // #1747 one-level scope this helper originally had). A nested record
+    // is embedded INLINE (records are value types, §9), so its storage sits
+    // at a GEP off the SAME outer struct address `recAddr` -- no load/
+    // indirection needed to reach it, exactly like reaching a direct string
+    // field's slot. The recursion is guaranteed to terminate: sema rejects
+    // a record that transitively contains itself by value at the
+    // declaration site (TypeResolution_Checks.cpp's recordValueContainsSelf,
+    // "` cannot recursively contain itself by value" §9), so the nested-
+    // record type graph reachable from any `ts` is a finite DAG -- no cycle
+    // guard is needed, mirroring emitStructEquality's identical unconditional
+    // recursion into nested-record fields for `=`/`<>` (LlvmBackend_Layout.cpp).
+    // A NULLABLE nested-record field (`P?`) is excluded here, matching
+    // isRecordWithStringFieldsTypeRef's own PRE-EXISTING top-level
+    // exclusion (unchanged by this fix): it lowers to a {i8, P} wrapper
+    // struct, not the bare record layout this walker (and
+    // recordHasStringFields, below) assume. A value-like CHOICE component
+    // (nested at any depth, in a record OR directly) is a separate,
+    // documented residual gap: no release walker analogous to this one
+    // exists for choices at all yet -- #2425 filed.
     void emitRecordStringFieldReleases_impl(llvm::Value* recAddr,
                                             const sema::TypeSymbol* ts) {
         if (!recAddr || !ts || ts->kind != ast::TypeDeclKind::Record) return;
@@ -2528,16 +2551,28 @@ private:
         std::vector<const sema::Symbol*> storage;
         collectRecordStorage(ts, storage);
         for (const sema::Symbol* m : storage) {
-            if (!isStringStorageMember(m)) continue;
             auto idxIt = fieldIndex_.find(m);
             if (idxIt == fieldIndex_.end()) continue;
-            llvm::Value* addr =
-                builder_.CreateStructGEP(st, recAddr, idxIt->second,
-                                          "recstrf.addr");
-            llvm::Value* val =
-                builder_.CreateLoad(ptrTy(), addr, "recstrf.val");
-            emitStringRelease(val);
-            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+            if (isStringStorageMember(m)) {
+                llvm::Value* addr =
+                    builder_.CreateStructGEP(st, recAddr, idxIt->second,
+                                              "recstrf.addr");
+                llvm::Value* val =
+                    builder_.CreateLoad(ptrTy(), addr, "recstrf.val");
+                emitStringRelease(val);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), addr);
+                continue;
+            }
+            const sema::TypeRef* mty = recordMemberType(m);
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
+                mty->declaration->kind == ast::TypeDeclKind::Record &&
+                recordHasStringFields(mty->declaration)) {
+                llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                    st, recAddr, idxIt->second, "recstrf.nested.addr");
+                emitRecordStringFieldReleases_impl(nestedAddr, mty->declaration);
+            }
         }
     }
 
@@ -5952,12 +5987,39 @@ private:
     // Such a field holds a runtime-managed reference whose +1 must be
     // released when the record value dies (§28.9, §9.7 — a record has no
     // disposer, so the discipline falls on the caller / disposal walker).
+    //
+    // fix #2405 / §9.7 / §28.9: RECURSES into a non-nullable nested-record
+    // storage member — a string owned two-or-more levels deep still needs
+    // releasing, matching emitRecordStringFieldReleases_impl's mirrored
+    // recursion (see its comment for the termination argument: sema rejects
+    // a record that transitively contains itself by value, §9, so this walk
+    // is over a finite DAG). This is the SHARED classifier both the
+    // deserialize disposal-scope registration (#2398/#2405,
+    // LlvmBackend_Serialization.cpp) and the #1747 record-call-result
+    // scope-end release (LlvmBackend_Setup.cpp) key off of via
+    // isRecordWithStringFieldsTypeRef below — recursing here is required
+    // for BOTH sites' matching release walk to ever recurse past one level
+    // (each site's own release walker calls this same function to decide
+    // whether to descend into a nested-record member), and is safe for the
+    // #1747 site: a record value's fields carry whatever +1 was minted at
+    // ITS OWN construction (no separate per-level retain step exists to
+    // fall out of sync with — #1747's own landed commit message: "no extra
+    // +1 mint is needed ... the record VALUE carries its fields' +1
+    // references to the caller" — a fact that holds compositionally at any
+    // nesting depth, since a by-value struct copy/embed never touches a
+    // refcount).
     bool recordHasStringFields(const sema::TypeSymbol* ts) {
         if (!ts || ts->kind != ast::TypeDeclKind::Record) return false;
         std::vector<const sema::Symbol*> storage;
         collectRecordStorage(ts, storage);
         for (const sema::Symbol* m : storage) {
             if (isStringStorageMember(m)) return true;
+            const sema::TypeRef* mty = recordMemberType(m);
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
+                mty->declaration->kind == ast::TypeDeclKind::Record &&
+                recordHasStringFields(mty->declaration))
+                return true;
         }
         return false;
     }
