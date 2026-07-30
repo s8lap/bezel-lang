@@ -5078,13 +5078,35 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         ctorDecl->params[posn].type) {
                         lsym->declType = ctx_.resolvedType(
                             *ctorDecl->params[posn].type);
-                        // out params are nullable refs — strip nullable (the
-                        // variable holds the non-nullable value), as for methods.
-                        if (lsym->declType && lsym->declType->nullable) {
-                            TypeRef* nn = ctx_.makeTypeRef(*lsym->declType);
-                            nn->nullable = false;
-                            lsym->declType = nn;
-                        }
+                        // §22.4 / §7.9 (#2409, mirroring #1597's CallExpr
+                        // fix): record whether a read of this inline
+                        // constructor out var on a path where the `new` call
+                        // did not run is a definite-assignment error — true
+                        // only for a NON-nullable reference-typed out param
+                        // (no default). Captured from the DECLARED type
+                        // BEFORE any nullable-strip, exactly as the
+                        // method-call path (~line 4357) does.
+                        lsym->outVarNeedsDefiniteAssignment =
+                            isNonNullableReferenceType(lsym->declType);
+                        // §22.4 / §7.9 (#2409, mirroring #1597): do NOT strip
+                        // the out-param's declared nullability — see the
+                        // CallExpr case's #1597 comment (~line 4359) for the
+                        // full rationale, which applies identically here: a
+                        // nullable ctor `out` param (`T?`) must produce a
+                        // `T?` inline recipient so §7.4's nullable-member-
+                        // access rule and §22.4's `when true`/`when false`
+                        // narrowing have a nullable type to narrow from. This
+                        // block used to unconditionally clear `nullable`
+                        // here (the pre-#1597 CallExpr behavior, never
+                        // updated when constructor out-vars gained this
+                        // same inline form, #968/#1305) — harmless for
+                        // codegen's pointer lowering but wrong for the type
+                        // checker, which then treated the recipient as
+                        // provably non-null forever after and silently
+                        // widened past the constructor's declared `T?`
+                        // signature. A non-nullable out param's declType
+                        // already has `nullable == false`, so removing the
+                        // strip is a no-op for that case.
                     }
                     currentScope_->names[id->name] = lsym;
                 }
@@ -5101,11 +5123,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         ctorDecl->params[posn].type) {
                         lsym->declType = ctx_.resolvedType(
                             *ctorDecl->params[posn].type);
-                        if (lsym->declType && lsym->declType->nullable) {
-                            TypeRef* nn = ctx_.makeTypeRef(*lsym->declType);
-                            nn->nullable = false;
-                            lsym->declType = nn;
-                        }
+                        // §22.4 / §7.9 (#2409, mirroring #1597's CallExpr
+                        // `out owned var` fix): do NOT strip the declared
+                        // nullability — same reasoning as the plain `out var`
+                        // case just above. Deliberately NOT setting
+                        // `outVarNeedsDefiniteAssignment` here, matching
+                        // #1597's own CallExpr `out owned var` block exactly
+                        // (~line 4408 above): DefiniteAssignment.cpp's
+                        // `visitCallArg` only consults that flag when
+                        // `a.modifier == "out var"` literally, never for
+                        // `out owned var` — per its own comment, the owning
+                        // inline forms carry a per-path disposal obligation
+                        // handled by the OWNERSHIP pass instead, and are
+                        // deliberately not DA-tracked here.
                     }
                     currentScope_->names[id->name] = lsym;
                 }

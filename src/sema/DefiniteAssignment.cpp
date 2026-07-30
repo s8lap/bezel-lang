@@ -1299,8 +1299,33 @@ private:
             return;
         }
         if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+            // §22.4 / §7.9 (v0.235, #2409): route each constructor argument
+            // through visitCallArg, exactly as the CallExpr case below does
+            // for a method call's arguments — an inline `out var`/`out owned
+            // var` recipient of a constructor call is a pure WRITE (marks
+            // `assigned_`, and — when `inlineOutVarNeedsDA` says the
+            // recipient is a non-nullable reference type — `declared_`, so a
+            // later read on a path where the `new` call did not run is
+            // diagnosed), not a plain read of a not-yet-declared name. Before
+            // this fix every constructor argument (including an `out var`
+            // recipient's own declaring occurrence) fell through to a bare
+            // `visitExpr`, whose IdentifierExpr leaf case is `checkRead` —
+            // never `assigned_.insert`/`declared_.insert` — so a ctor
+            // out-var's name was NEVER registered with this pass at all: a
+            // later read on a short-circuit-skipped path (`flag and new
+            // T(..., out var n).ok`) silently passed DA (n not in
+            // `declared_`, so `checkRead` is a no-op) instead of being
+            // rejected per §22.4's "a read of a non-nullable-reference-typed
+            // out variable [on a path where the call may not have run] is a
+            // compile error" — confirmed live as a SEGFAULT (garbage-pointer
+            // comparison), not a diagnostic, before this fix. This mirrors
+            // #2409's sema-registration fix (ExprTypecheck_Exprs.cpp's
+            // NewExpr `out var` handling, which now sets
+            // `outVarNeedsDefiniteAssignment`) — that fix alone left this gap
+            // live, because `inlineOutVarNeedsDA` is only ever consulted from
+            // inside `visitCallArg`, which the NewExpr case never called.
             for (const auto& a : ne->args) {
-                if (a.value) visitExpr(*a.value);
+                visitCallArg(a);
             }
             return;
         }
