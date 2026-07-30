@@ -2224,6 +2224,20 @@ void* bz_binder_read_case_discriminator(void* derp) {
         }
 
         int32_t total_count = bz_jder_count_object_fields(d);
+        // fix #2427 (§9.8 / stdlib §2.15, v0.235): bz_jder_count_object_fields
+        // itself raises SerializationException (and returns -1) when the object
+        // is truncated before its closing '}' — an already-in-flight exception.
+        // total_count == -1 also satisfies `total_count <= 0` below, so without
+        // this check the unconditional bz_ser_throw a few lines down would
+        // SUPERSEDE that exception with a second, unrelated one ("missing
+        // \"$case\"") — orphaning/leaking the first exception object (its own
+        // heap-allocated message string included). Bail out immediately instead,
+        // mirroring the pending-check idiom used throughout this file (e.g.
+        // bezel_runtime_decimal_guid.cpp's `if (bz_exc) return 0;`) and the
+        // RECORD-side sibling (bz_binder_begin_object's JSON path), which does
+        // not double-throw because it propagates total_count/-1 straight to its
+        // codegen caller's own emitPendingCheck() rather than re-inspecting it.
+        if (bz_exc) return nullptr;
         if (total_count <= 0) {
             bz_ser_throw("Choice deserialize: empty object, missing \"$case\" "
                          "discriminator (§9.8)", nullptr);
