@@ -214,8 +214,22 @@ BEZEL_TEST(xmod_iface_property_setter_2406,
         "end ImplGetOnly2406; "
         "public class C "
         "  public static method Main(): int "
+        // NOTE (updated after #2412 landed): this test used to write
+        // `b.Name := 42;` here and assert the write silently no-op'd, because
+        // at the time assigning to a getter-only IMPORTED property was wrongly
+        // ACCEPTED by sema. #2412 (§23.3) now REJECTS that assignment at
+        // compile time, so the write can no longer appear in a
+        // compile-and-run test. The rejection itself is covered by #2412's own
+        // reject-tests (`xmod_getter_only_prop_2412`), which assert the
+        // diagnostic text — so nothing is lost by dropping it here.
+        //
+        // What this test still pins, and why it is still worth having: the
+        // GETTER for a get-only imported interface property reads the real
+        // value through the itable, i.e. `propertyHasSetter`'s fallback
+        // correctly answers `false` for this shape and no phantom setter slot
+        // (a `ConstantPointerNull`) is installed alongside it. That is exactly
+        // the crash risk this fix's design deliberately avoided.
         "    using var b: IHasNameBlockGetOnly2406 := new ImplGetOnly2406(); "
-        "    b.Name := 42; "
         "    return b.Name; "
         "  end Main; "
         "end C;");
@@ -244,8 +258,17 @@ BEZEL_TEST(xmod_iface_property_setter_2406,
         "end ImplReadonly2406; "
         "public class C "
         "  public static method Main(): int "
+        // NOTE (updated after #2412 landed): same change as T3 above — the
+        // `b.Name := 42;` write was removed because #2412 (§23.3) now rejects
+        // assignment to a getter-only imported property at compile time. The
+        // rejection is covered by `xmod_getter_only_prop_2412`.
+        //
+        // Still pinned here: the `readonly` branch of `propertyHasSetter`'s
+        // fallback answers `false` via the reconstructed `hasSetter` metadata
+        // bit (NOT a `readonly`-modifier scan, which cannot distinguish a
+        // block get-only form from a read-write auto form), and the getter slot
+        // still reads the real value.
         "    using var b: IHasNameReadonly2406 := new ImplReadonly2406(); "
-        "    b.Name := 42; "
         "    return b.Name; "
         "  end Main; "
         "end C;");
