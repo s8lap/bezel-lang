@@ -1635,8 +1635,46 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
 void Emitter::hoistSkippableOutVarSlots(const ast::Expr& e) {
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
         ensureOutVarSlots(*ce);
+        // #2402: also recurse into the CALLEE, not just the arguments — a
+        // constructor out-var naturally chains a method call onto the fresh
+        // instance (`new Widget(out var n).SomeMethod()`), whose callee is a
+        // MemberAccessExpr targeting the NewExpr. Without this the nested
+        // `new`'s slot was never hoisted for that shape (an ordinary method
+        // call's callee is just a bare name/simple member access with no
+        // out-var-producing subexpression, so this was a latent no-op gap
+        // for #2395's own CallExpr-only domain — it only becomes observable
+        // once a NewExpr can appear here, added below).
+        if (ce->callee) hoistSkippableOutVarSlots(*ce->callee);
         for (const auto& a : ce->args)
             if (a.value) hoistSkippableOutVarSlots(*a.value);
+        return;
+    }
+    // #2402 (§22.4 / §7.9, mirroring #2395's own CallExpr case): a
+    // constructor out-var recipient, `new T(out var x)`. This is the
+    // ensureCtorOutVarSlots analogue of the CallExpr branch above — same
+    // idempotent "skip if slot already created" guard, so pre-creating it
+    // here and letting lowerNew's own later call to ensureCtorOutVarSlots
+    // re-check it is a safe no-op. `rt` is resolved exactly as lowerNew
+    // resolves it (LlvmBackend_Exprs2.cpp): the explicit `ne->type` when
+    // present, else the inferred target-typed `new(...)` shorthand's own
+    // recorded exprType (§17.7, #979).
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        sema::TypeRef* rt = ne->type
+            ? ctx_.resolvedType(*ne->type)
+            : const_cast<sema::TypeRef*>(ctx_.exprType(*ne));
+        ensureCtorOutVarSlots(*ne, rt);
+        for (const auto& a : ne->args)
+            if (a.value) hoistSkippableOutVarSlots(*a.value);
+        return;
+    }
+    // #2402: the issue's own repro shape — `new Widget(...).ok`, a property/
+    // member access on the fresh instance used directly as (part of) the
+    // `and`/`or` operand — is a MemberAccessExpr wrapping the NewExpr, not a
+    // CallExpr. Without recursing into `target` here, the NewExpr case just
+    // above is never reached for that shape and the whole fix is a no-op for
+    // the issue's own reported repro.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        if (ma->target) hoistSkippableOutVarSlots(*ma->target);
         return;
     }
     if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
@@ -1680,12 +1718,57 @@ void Emitter::ensureCtorOutVarSlots(const ast::NewExpr& ne,
         if ((loc && loc->decl && locals_.count(loc->decl)) ||
             locals_.count(id)) { pos++; continue; }
         llvm::Type* slotTy = i32();
+        sema::TypeRef* pt = nullptr;
         if (ctorDecl && pos < ctorDecl->params.size() &&
             ctorDecl->params[pos].type) {
-            sema::TypeRef* pt = ctx_.resolvedType(*ctorDecl->params[pos].type);
+            pt = ctx_.resolvedType(*ctorDecl->params[pos].type);
             if (pt) slotTy = lowerTypeRef(pt);
         }
         llvm::AllocaInst* slot = entryAlloca(slotTy);
+        // §7.9 "Default initialization" / §22.4 (v0.235, #2402 mirroring
+        // #2395): the constructor analogue of ensureOutVarSlots' own fix —
+        // see that function's comment (above in this file) for the full §22.4
+        // / DA-exemption rationale, which applies identically here: every
+        // inline `new T(out var x)` recipient except a non-nullable
+        // REFERENCE-typed one is promised §7.9's default on a path where the
+        // constructor call was SKIPPED (`and`/`or` short-circuiting). Without
+        // this store, `new Widget("x", out var n).ok` inside a false `and`
+        // conjunct left `n` reading raw stack garbage (confirmed empirically
+        // for a nullable primitive, a nullable reference, and a plain
+        // non-nullable value type — #2402's issue and this fix's own
+        // regression tests).
+        //
+        // Deliberately checked against `pt` — the constructor parameter's
+        // type resolved FRESH from `ctorDecl->params[pos].type` (already
+        // computed above for slotTy) — rather than `loc->declType`, unlike
+        // ensureOutVarSlots' otherwise-identical predicate. Reason: the
+        // sema-side registration for a CONSTRUCTOR out-var
+        // (ExprTypecheck_Exprs.cpp's NewExpr `out var` handling,
+        // ~line 5071-5091) unconditionally STRIPS the declared-nullable flag
+        // off `lsym->declType` before storing it — a latent divergence from
+        // the METHOD-call registration (ExprTypecheck_Exprs.cpp ~line 4321),
+        // which stopped doing that per #1597 specifically because it made
+        // `isNonNullableReferenceType` unable to tell a nullable recipient
+        // from a non-nullable one. Confirmed empirically while verifying
+        // this fix: `var x: int := n;` (an implicit non-nullable narrowing
+        // that would be a compile error against a genuine `n: int?`)
+        // compiles CLEAN for a ctor out-var, i.e. sema already believes `n`
+        // is non-nullable regardless of the constructor parameter's own
+        // declared nullability. Using `loc->declType` here would inherit
+        // that bug and wrongly classify a NULLABLE reference recipient
+        // (`out n: string?`) as `isNonNullableReferenceType == true`, and
+        // skip storing its `null` default — reintroducing this fix's own
+        // bug for that one case. `pt` is resolved before any such stripping
+        // (identical to what codegen already uses to size the slot itself,
+        // and to what sema's own registration reads before it mutates the
+        // copy), so it reflects the constructor parameter's TRUE declared
+        // nullability. The sema stripping bug itself is a separate,
+        // sema-level defect (affects narrowing/definite-assignment, not
+        // codegen) — filed separately, not fixed here (different function,
+        // different subsystem, per this project's small-PR discipline).
+        if (!pt || !sema::isNonNullableReferenceType(pt)) {
+            builder_.CreateStore(llvm::Constant::getNullValue(slotTy), slot);
+        }
         locals_[id] = slot;
         if (loc && loc->decl) locals_[loc->decl] = slot;
         pos++;

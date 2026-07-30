@@ -8914,23 +8914,29 @@ private:
     // the call. Must be called at the start of lowerCall.
     void ensureOutVarSlots(const ast::CallExpr& call);
 
-    // §22.4 / §7.9 (v0.235, #2395): recursively pre-create (and, via
-    // ensureOutVarSlots, §7.9-default-zero-initialize) the slot for every
-    // inline `out var` call found inside `e` — called from lowerShortCircuit
+    // §22.4 / §7.9 (v0.235, #2395; extended #2402): recursively pre-create
+    // (and, via ensureOutVarSlots / ensureCtorOutVarSlots,
+    // §7.9-default-zero-initialize) the slot for every inline `out var` call
+    // OR constructor call found inside `e` — called from lowerShortCircuit
     // BEFORE its conditional branch is emitted, mirroring the placement
     // lowerNullCondCall already uses for `?.` (#2345): entryAlloca hoists the
     // ALLOCA to the function entry regardless of insertion point, but the
-    // zero-STORE ensureOutVarSlots emits lands wherever the builder currently
-    // is — inside `and`/`or`'s conditionally-reached RHS block if called from
-    // there, which does not dominate the skip path. Calling this first, while
-    // still in the block that dominates both the skip and the taken path,
-    // fixes that. Bounded to the shapes a short-circuit skip can directly
-    // wrap — nested `and`/`or`, `not`, and a call combined with a further
-    // operator (`recv?.M(out var x) = true`) — the same scope
-    // DefiniteAssignment.cpp's evalCond/evalNullCondCallArgs track; a call
-    // nested in a lambda/conditional-expression body is out of scope for both
-    // (§22.4 does not extend inline out-var path-sensitivity there; see
-    // #2395's own PR notes for the discovery boundary).
+    // zero-STORE ensureOutVarSlots/ensureCtorOutVarSlots emits lands wherever
+    // the builder currently is — inside `and`/`or`'s conditionally-reached
+    // RHS block if called from there, which does not dominate the skip path.
+    // Calling this first, while still in the block that dominates both the
+    // skip and the taken path, fixes that. Bounded to the shapes a
+    // short-circuit skip can directly wrap — nested `and`/`or`, `not`, a
+    // call (and its callee) combined with a further operator
+    // (`recv?.M(out var x) = true`), a `new T(out var x)` constructor call,
+    // and a member access on one (`new T(out var x).field`, #2402's own
+    // repro shape) — the same scope DefiniteAssignment.cpp's
+    // evalCond/evalNullCondCallArgs track (its leaf case falls through to the
+    // general visitExpr walker, which recurses into MemberAccessExpr/NewExpr
+    // exactly as this does); a call nested in a lambda/conditional-expression
+    // body is out of scope for both (§22.4 does not extend inline out-var
+    // path-sensitivity there; see #2395's own PR notes for the discovery
+    // boundary).
     void hoistSkippableOutVarSlots(const ast::Expr& e);
 
     // §28.3 / §28.11 / §22.4 (#1466): is the argument at `pos` in `call` a
