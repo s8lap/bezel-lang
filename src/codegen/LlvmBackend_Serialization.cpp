@@ -877,18 +877,29 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     // fix #668: §9.8 / §2.15: allocate seen-flags for required components.
     // Required = non-skip AND non-optional. `serialized optional` exempts a
     // component; naked nullable T? (no optional clause) is still required.
+    //
+    // fix #2399 / §9.8 v0.235 + stdlib §2.15 v0.235 ("a duplicate field
+    // name ... raises SerializationException unconditionally"; "missing
+    // required fields, duplicates, and type mismatches remain unconditional
+    // errors regardless of the [unknown-field] setting"): a seen-flag is now
+    // allocated for EVERY non-skip component, not just required ones -- a
+    // duplicate `serialized optional` field is equally a structural fault,
+    // so the per-field dispatch loop below needs a flag to re-check even for
+    // an optional component. `required` gates ONLY the missing-field check
+    // further down (optional: missing is still fine).
     struct RecordSeenEntry {
         unsigned compIdx;
         std::string declName;
         llvm::AllocaInst* seenSlot;  // i8: 0=unseen, 1=seen
+        bool required;               // false for `serialized optional` components
     };
     std::vector<RecordSeenEntry> recSeenFlags;
     for (unsigned i = 0; i < components.size(); ++i) {
         if (components[i].isSkip) continue;
-        if (components[i].isOptional) continue;
         llvm::AllocaInst* sf = entryAlloca(i8());
         builder_.CreateStore(builder_.getInt8(0), sf);
-        recSeenFlags.push_back({i, components[i].declName, sf});
+        recSeenFlags.push_back(
+            {i, components[i].declName, sf, !components[i].isOptional});
     }
 
     // §9.8 / #1635 leak-safety: the per-iteration field-name string returned by
@@ -1057,6 +1068,39 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         builder_.CreateCondBr(isMatch, readBB, nextBB);
 
         builder_.SetInsertPoint(readBB);
+
+        // fix #2399 / §9.8 v0.235 + stdlib §2.15 v0.235 (quoted above the
+        // recSeenFlags allocation): a component matched a SECOND time by the
+        // wire (its seen-flag already 1) is a duplicate field name -- raised
+        // BEFORE reading anything for this occurrence, so the value already
+        // sitting in slots[ci] from the first occurrence is left untouched
+        // for the #2398 disposal scope (pushed above) to release on the
+        // emitThrowBuiltin unwind below -- mirrors emitClassDeserialize's
+        // identical fix.
+        {
+            llvm::AllocaInst* mySeenSlot = nullptr;
+            for (const auto& rse : recSeenFlags) {
+                if (rse.compIdx == ci) { mySeenSlot = rse.seenSlot; break; }
+            }
+            if (mySeenSlot) {
+                llvm::Value* alreadySeen = builder_.CreateLoad(
+                    i8(), mySeenSlot, "rdeser.dup.seen");
+                llvm::Value* isDup = builder_.CreateICmpNE(
+                    alreadySeen, builder_.getInt8(0), "rdeser.dup.isdup");
+                auto* dupBB = llvm::BasicBlock::Create(
+                    llvm_, "rdeser.dup", currentFn_);
+                auto* freshBB = llvm::BasicBlock::Create(
+                    llvm_, "rdeser.fresh", currentFn_);
+                builder_.CreateCondBr(isDup, dupBB, freshBB);
+
+                builder_.SetInsertPoint(dupBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+
+                builder_.SetInsertPoint(freshBB);
+            }
+        }
         // Read the field value into its slot.
         llvm::Value* fieldVal = emitDeserializeField(comp.ty, derPtr);
         if (fieldVal && slots[ci]) {
@@ -1120,7 +1164,11 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     // point — it is popped only below, once construction is about to
     // begin) — an already-read string/nested-record slot is disposed on
     // this path too, not just a sibling's-read-throws path.
+    // fix #2399: recSeenFlags now also holds entries for OPTIONAL components
+    // (so the dispatch loop's duplicate check above can see them); skip
+    // those here -- missing stays fine for an optional field.
     for (const auto& rse : recSeenFlags) {
+        if (!rse.required) continue;
         llvm::Value* seen = builder_.CreateLoad(i8(), rse.seenSlot, "rdeser.seen");
         llvm::Value* notSeen = builder_.CreateICmpEQ(seen, builder_.getInt8(0), "rdeser.nseen");
         auto* missBB = llvm::BasicBlock::Create(llvm_, "rdeser.miss", currentFn_);
@@ -1855,7 +1903,20 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
             std::vector<const sema::TypeRef*> ptys(np, nullptr);
             std::vector<std::string> wireNames(np);
             std::vector<bool> skip(np, false);
-            struct SeenEntry { std::size_t pi; llvm::AllocaInst* seenSlot; };
+            // fix #2399 / §9.8 v0.235 + stdlib §2.15 v0.235 ("a duplicate
+            // field name ... raises SerializationException unconditionally";
+            // "missing required fields, duplicates, and type mismatches
+            // remain unconditional errors regardless of the [unknown-field]
+            // setting"): `required` records whether a MISSING occurrence is
+            // tolerated (`serialized optional`) -- a seen-flag is now
+            // allocated for every non-skip payload field regardless, since a
+            // DUPLICATE occurrence is a structural fault even for an
+            // optional payload.
+            struct SeenEntry {
+                std::size_t pi;
+                llvm::AllocaInst* seenSlot;
+                bool required;
+            };
             std::vector<SeenEntry> seenFlags;
 
             for (std::size_t pi = 0; pi < np; ++pi) {
@@ -1870,13 +1931,13 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                 slots[pi] = entryAlloca(et);
                 builder_.CreateStore(llvm::Constant::getNullValue(et), slots[pi]);
                 // §9.8 / §serialized optional: a `serialized optional` payload is
-                // exempt from the required-field check (missing → default(T)).
+                // exempt from the required-field check (missing → default(T)),
+                // but NOT from the duplicate check (fix #2399) -- so a seen-flag
+                // is allocated unconditionally here.
                 bool optional = pf.serialized && pf.serialized->isOptional;
-                if (!optional) {
-                    llvm::AllocaInst* sf = entryAlloca(i8());
-                    builder_.CreateStore(builder_.getInt8(0), sf);
-                    seenFlags.push_back({pi, sf});
-                }
+                llvm::AllocaInst* sf = entryAlloca(i8());
+                builder_.CreateStore(builder_.getInt8(0), sf);
+                seenFlags.push_back({pi, sf, !optional});
             }
 
             // fix #2398 / §9.8 / §28.3/§28.9: a dedicated scope guarding
@@ -1960,6 +2021,40 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                 builder_.CreateCondBr(isM, rdBB, ndBB);
 
                 builder_.SetInsertPoint(rdBB);
+
+                // fix #2399 / §9.8 v0.235 + stdlib §2.15 v0.235 (quoted at
+                // the seenFlags allocation above): a payload field matched a
+                // SECOND time by the wire (its seen-flag already 1) is a
+                // duplicate field name -- raised BEFORE reading anything for
+                // this occurrence, so the value already sitting in
+                // slots[pi] from the first occurrence is left for the
+                // #2398 per-case disposal scope (pushed above) to release on
+                // the emitThrowBuiltin unwind below -- mirrors
+                // emitClassDeserialize/emitRecordDeserialize's identical fix.
+                {
+                    llvm::AllocaInst* mySeenSlot = nullptr;
+                    for (const auto& se : seenFlags) {
+                        if (se.pi == pi) { mySeenSlot = se.seenSlot; break; }
+                    }
+                    if (mySeenSlot) {
+                        llvm::Value* alreadySeen = builder_.CreateLoad(
+                            i8(), mySeenSlot, "chdes.dup.seen");
+                        llvm::Value* isDup = builder_.CreateICmpNE(
+                            alreadySeen, builder_.getInt8(0), "chdes.dup.isdup");
+                        auto* dupBB = llvm::BasicBlock::Create(
+                            llvm_, "chdes.dup", currentFn_);
+                        auto* freshBB = llvm::BasicBlock::Create(
+                            llvm_, "chdes.fresh", currentFn_);
+                        builder_.CreateCondBr(isDup, dupBB, freshBB);
+
+                        builder_.SetInsertPoint(dupBB);
+                        emitThrowBuiltin("SerializationException");
+                        if (!builder_.GetInsertBlock()->getTerminator())
+                            builder_.CreateUnreachable();
+
+                        builder_.SetInsertPoint(freshBB);
+                    }
+                }
                 llvm::Value* fv = emitDeserializeField(ptys[pi], derPtr);
                 if (fv && slots[pi] && payloadStruct &&
                     pi < payloadStruct->getNumElements() &&
@@ -2002,7 +2097,12 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
 
             // §9.8: a required payload field (present neither in the input nor as
             // `serialized optional`) that was not seen is a structural fault.
+            // fix #2399: seenFlags now also holds entries for OPTIONAL payload
+            // fields (so the dispatch loop's duplicate check above can see
+            // them); skip those here -- missing stays fine for an optional
+            // payload field.
             for (const auto& se : seenFlags) {
+                if (!se.required) continue;
                 llvm::Value* seen = builder_.CreateLoad(i8(), se.seenSlot, "chdes.seen");
                 llvm::Value* miss = builder_.CreateICmpEQ(
                     seen, builder_.getInt8(0), "chdes.nseen");
@@ -2841,32 +2941,72 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     }
 
     // fix #668: §9.8 / §2.15: "missing required fields remain unconditional
-    // errors."  For each non-skip, non-optional component allocate an i8 seen-
-    // flag alloca (entry-block init to 0); the flag is set to 1 when the field
-    // is matched in the loop.  After EndObject, any flag still 0 means a
+    // errors."  For each non-skip component allocate an i8 seen-flag alloca
+    // (entry-block init to 0); the flag is set to 1 when the field is matched
+    // in the loop.  After EndObject, any REQUIRED flag still 0 means a
     // required component was absent → raise SerializationException.
     //
     // Nullable T? fields without `serialized optional` are REQUIRED: nullability
     // does not confer optionality.  Only the `serialized optional` clause exempts
     // a field from the missing-field check (§9.8: "serialized optional is the
     // per-field missing-field tolerant-mode opt-in").
+    //
+    // fix #2399 / §9.8 v0.235 ("A missing required component ..., a
+    // **duplicate** field name, a type mismatch, or a name not matching any
+    // enum constant raises SerializationException unconditionally -- these
+    // are structural faults in the input regardless of policy"; stdlib
+    // §2.15 v0.235 Errors: "missing required fields, duplicates, and type
+    // mismatches remain unconditional errors regardless of the [unknown-
+    // field] setting"): a seen-flag is now allocated for EVERY non-skip
+    // component, not just required ones -- a duplicate `serialized optional`
+    // field is equally an unconditional structural fault, so the per-field
+    // dispatch loop below needs a flag to re-check even for an optional
+    // component. `required` gates ONLY the missing-field check further down
+    // (optional: missing is still fine); the duplicate check the dispatch
+    // loop performs applies to every entry here regardless of `required`.
     struct SeenEntry {
         std::size_t compIdx;      // index into comps[]
         std::string declName;     // for the error message
         llvm::AllocaInst* slot;   // i8 flag: 0=unseen, 1=seen
+        bool required;            // false for `serialized optional` components
     };
     std::vector<SeenEntry> seenFlags;
     for (std::size_t i = 0; i < comps.size(); ++i) {
         if (comps[i].isSkip) continue;      // skip excluded from wire
-        if (comps[i].isOptional) continue;  // optional: missing is fine
-        // Required component: allocate a seen-flag, zero in entry block.
+        // Seen-flag for every non-skip component (required or optional):
+        // allocate (hoisted to the entry block, as always) but zero it at the
+        // CURRENT insertion point, not forced into the entry block.
+        //
+        // fix #2399 adversarial self-pass (regression caught by the existing
+        // #2325 `repeated_roundtrip_no_accumulating_leak` test, which calls
+        // `Widget.Deserialize` 50x in a loop around ONE inlined copy of this
+        // function's generated code): unlike namePtrSlot/slots[] below --
+        // which fix #669 deliberately zero-inits in the entry block because
+        // a DIFFERENT code path's disposal sweep can read them before this
+        // invocation's own code has run at all -- a seen-flag is consulted
+        // ONLY by this SAME straight-line invocation's own dispatch loop and
+        // missing-field check, never externally. Forcing its zero-init into
+        // the entry block (as originally written) makes it run ONCE per
+        // FUNCTION rather than once per logical Deserialize call: inside a
+        // loop calling Deserialize repeatedly, the flag set to 1 on
+        // iteration 1 stays 1 forever after, so iteration 2's very first
+        // field read looks like a "duplicate" of iteration 1's already-
+        // consumed-and-freed value -- a false-positive throw whose unwind
+        // then bz_string_release's a STALE (already-freed) slots[] pointer
+        // left over from iteration 1 -> a use-after-free crash (confirmed:
+        // reverting this one hunk while keeping the rest of the #2399 fix
+        // reproduces the crash; restoring it fixes it, exit 42 clean under
+        // ASan). Resetting at the current insertion point instead makes the
+        // flag correctly per-invocation, matching emitRecordDeserialize's
+        // and emitChoiceDeserialize's seenFlags loops, which never had this
+        // bug (they always used a plain builder_.CreateStore here). As a
+        // side effect this also fixes the SAME staleness in fix #668's own
+        // missing-required-field check for a class Deserialize called
+        // repeatedly in a loop -- a latent, pre-existing gap this happens to
+        // repair, not a new behavior change for any single (non-looped) call.
         llvm::AllocaInst* sf = entryAlloca(i8());
-        {
-            llvm::BasicBlock& eb = currentFn_->getEntryBlock();
-            llvm::IRBuilder<> eb_b(&eb, std::next(sf->getIterator()));
-            eb_b.CreateStore(builder_.getInt8(0), sf);
-        }
-        seenFlags.push_back({i, comps[i].declName, sf});
+        builder_.CreateStore(builder_.getInt8(0), sf);
+        seenFlags.push_back({i, comps[i].declName, sf, !comps[i].isOptional});
     }
 
     // §9.8 / #550 leak-safety: the per-iteration field-name string returned by
@@ -3105,6 +3245,47 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         builder_.CreateCondBr(isMatch, readBB, nextBB);
 
         builder_.SetInsertPoint(readBB);
+
+        // fix #2399 / §9.8 v0.235 + stdlib §2.15 v0.235 (quoted above the
+        // seenFlags allocation): a component matched a SECOND time by the
+        // wire (its seen-flag is already 1) is a duplicate field name -- an
+        // unconditional structural fault, raised BEFORE reading anything for
+        // this occurrence (§9.8: "a duplicate field name ... raises
+        // SerializationException unconditionally"). Without this check the
+        // dispatch below would silently overwrite slots[ci] with the new
+        // value and drop the earlier one, which the disposeStack_ scope
+        // pushed above never gets a chance to release (issue #2399's
+        // reported 73-byte leak: the FIRST value silently orphaned while the
+        // SECOND "wins"). Raising here instead lets that SAME scope's unwind
+        // sweep (emitThrowBuiltin -> emitUnwindDisposals) dispose the
+        // earlier-read value that IS already sitting in slots[ci] -- no
+        // separate manual release needed. namePtrSlot already holds this
+        // iteration's namePtr (stored in contBB above) and is registered for
+        // stringRelease, so it too is released by the same unwind sweep.
+        {
+            llvm::AllocaInst* mySeenSlot = nullptr;
+            for (const auto& se : seenFlags) {
+                if (se.compIdx == ci) { mySeenSlot = se.slot; break; }
+            }
+            if (mySeenSlot) {
+                llvm::Value* alreadySeen = builder_.CreateLoad(
+                    i8(), mySeenSlot, "cdeser.dup.seen");
+                llvm::Value* isDup = builder_.CreateICmpNE(
+                    alreadySeen, builder_.getInt8(0), "cdeser.dup.isdup");
+                auto* dupBB = llvm::BasicBlock::Create(
+                    llvm_, "cdeser.dup", currentFn_);
+                auto* freshBB = llvm::BasicBlock::Create(
+                    llvm_, "cdeser.fresh", currentFn_);
+                builder_.CreateCondBr(isDup, dupBB, freshBB);
+
+                builder_.SetInsertPoint(dupBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+
+                builder_.SetInsertPoint(freshBB);
+            }
+        }
         {
             bool isClassComp = (comp.ty &&
                                 comp.ty->kind == sema::TypeRef::Kind::Named &&
@@ -3422,7 +3603,12 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     // is still 0 means the field was absent → SerializationException.
     // Checked after EndObject so the deserializer has consumed the full object
     // token, but before calloc so no allocation cleanup is needed on this path.
+    // fix #2399: seenFlags now also holds entries for OPTIONAL components (so
+    // the dispatch loop's duplicate check above can see them); skip those
+    // here -- "missing" stays fine for an optional field, only `required`
+    // entries feed this check.
     for (const auto& se : seenFlags) {
+        if (!se.required) continue;
         llvm::Value* seen = builder_.CreateLoad(i8(), se.slot, "cdeser.seen");
         llvm::Value* notSeen = builder_.CreateICmpEQ(seen, builder_.getInt8(0), "cdeser.nseen");
         auto* missBB = llvm::BasicBlock::Create(llvm_, "cdeser.miss", currentFn_);
