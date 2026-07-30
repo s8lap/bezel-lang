@@ -3421,21 +3421,25 @@ void Emitter::declareVtables() {
                 // `void set(ptr this, idx..., value)`), matched by index-param
                 // type rather than name (all indexers are anonymous ".this").
                 if (ip->isIndexer) {
+                    // fix #2449 (§11.2/§23.4, v0.235): iimpl may now be a
+                    // LOCAL or an IMPORTED (inherited-from-imported-base)
+                    // candidate — indexerItableAccessor resolves the right
+                    // function either way (own-body vs. cross-module ABI
+                    // stub); see its own comment.
                     const sema::PropertySymbol* iimpl =
                         classIndexerImplementing(ts, ip);
                     llvm::Constant* getFp =
                         llvm::ConstantPointerNull::get(ptrTy());
-                    if (iimpl)
-                        if (llvm::Function* acc = ensureIndexerGetterFn(ts, iimpl))
-                            getFp = llvm::cast<llvm::Constant>(acc);
+                    if (llvm::Function* acc =
+                            indexerItableAccessor(ts, iimpl, /*isSet=*/false))
+                        getFp = llvm::cast<llvm::Constant>(acc);
                     itabElems.push_back(getFp);
                     if (propertyHasSetter(ip)) {
                         llvm::Constant* setFp =
                             llvm::ConstantPointerNull::get(ptrTy());
-                        if (iimpl)
-                            if (llvm::Function* acc =
-                                    ensureIndexerSetterFn(ts, iimpl))
-                                setFp = llvm::cast<llvm::Constant>(acc);
+                        if (llvm::Function* acc = indexerItableAccessor(
+                                ts, iimpl, /*isSet=*/true))
+                            setFp = llvm::cast<llvm::Constant>(acc);
                         itabElems.push_back(setFp);
                     }
                     continue;
@@ -19346,7 +19350,16 @@ void Emitter::setupBoxDescriptors() {
                 // #730 / §23.4: a record's interface-indexer slot holds a box
                 // thunk over the record's concrete indexer accessor (the thunk
                 // GEPs past the box header to the record bytes, then forwards
-                // the index params / value).
+                // the index params / value). NOT routed through #2449's
+                // indexerItableAccessor: §9.6 forbids a record from deriving
+                // from a class ("records may only implement interfaces",
+                // confirmed by probe — `record R: Base` where `Base` is a
+                // class is a compile error), so #2442's base-class walk in
+                // classIndexerImplementing never finds a base for a record
+                // `ts` — `iimpl` here is always a member declared directly
+                // on `ts`, which is always LOCAL, so `iimpl->decl` is always
+                // a real ast::PropertyDecl and ensureIndexerGetterFn/
+                // -SetterFn (below) always succeed on their own.
                 if (ip->isIndexer) {
                     const sema::PropertySymbol* iimpl =
                         classIndexerImplementing(ts, ip);

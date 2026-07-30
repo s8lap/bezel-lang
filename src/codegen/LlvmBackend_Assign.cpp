@@ -84,25 +84,30 @@ std::size_t indexerParamCount(const sema::PropertySymbol* ps) {
 //   through an inherited indexer (declared on a base, never redeclared)
 //   never found a candidate at all — SIGSEGV (confirmed by probe, exit
 //   139): declareVtables Pass D installs `ConstantPointerNull` into BOTH
-//   the getter and setter slots whenever this function returns null. A
-//   candidate found only through the base walk is accepted only when it
-//   carries a genuine LOCAL `ast::PropertyDecl` — `ensureIndexerGetterFn`/
-//   `-SetterFn` (below) require one unconditionally and return null
-//   without it, so an indexer reached only through an IMPORTED base class
-//   cannot actually be wired into the itable today; selecting it here would
-//   report a match that then silently degrades to a null slot anyway — the
-//   same false-accept shape #2437's own fallback removal avoids. `ts`
-//   itself is always the LOCAL class being processed (declareVtables'
-//   caller), so this gate only ever excludes a candidate reached through a
-//   cross-module base; left as a follow-up (itable wiring for an imported
-//   base's indexer), not attempted here.
+//   the getter and setter slots whenever this function returns null.
+//
+// A candidate reached ONLY through an IMPORTED base class needed a THIRD,
+// later fix (#2449) to actually wire: `ensureIndexerGetterFn`/`-SetterFn`
+// build a body from `ps->decl`, which is always null for an imported
+// symbol (ModuleLoader reconstructs no AST — mirrors Property's #503
+// limitation). #2449 admits such a candidate here only when it is
+// wireable through #2414's non-virtual external-stub ABI
+// (`declareImportedIndexerGetters`/`-Setters`, `bz$<Class>$idxget$<arity>`/
+// `$idxset$<arity>`) — see `indexerCandidateWireable` below and
+// `Emitter::indexerItableAccessor` (LlvmBackend_Setup.cpp), which resolves
+// the actual function to install (local body vs. imported stub) once a
+// candidate is selected. A VIRTUAL imported indexer is deliberately still
+// excluded (dispatches through a vtable slot, not this ABI — devirtualizing
+// it into a static itable-slot constant is a separate, harder problem, out
+// of scope here and for #2414 alike).
 //
 // Returns null when no member, own or inherited, matches by full parameter
-// list. `checkAbstractImplementations`'s ifaceIndexerObligations loop
-// (sema, TypeResolution_Checks.cpp) deliberately mirrors this exact
-// selection — see that function's comment for why the two must move
-// together — so a null return here always corresponds to a program sema
-// has already rejected, never a silently-wrong itable install.
+// list AND is wireable. `checkAbstractImplementations`'s
+// ifaceIndexerObligations loop (sema, TypeResolution_Checks.cpp)
+// deliberately mirrors this exact selection — see that function's comment
+// for why the two must move together — so a null return here always
+// corresponds to a program sema has already rejected, never a
+// silently-wrong itable install.
 const sema::PropertySymbol* Emitter::findIndexer(
     const sema::TypeSymbol* ts, const sema::PropertySymbol* ifaceIdx) const {
     if (!ts || !ifaceIdx) return nullptr;
@@ -111,9 +116,7 @@ const sema::PropertySymbol* Emitter::findIndexer(
         for (const sema::Symbol* m : t->members) {
             auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
             if (!ps || !ps->isIndexer) continue;
-            // #2442: unwireable without a local decl — see the comment
-            // above.
-            if (!dynamic_cast<const ast::PropertyDecl*>(ps->decl)) continue;
+            if (!indexerCandidateWireable(ps)) continue;
             if (indexerParamCount(ps) != nparams) continue;
             bool all = true;
             for (std::size_t k = 0; k < nparams; ++k) {
@@ -3124,6 +3127,34 @@ llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
     genericSubst_     = std::move(savedGSubst);
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
     return fn;
+}
+
+
+// fix #2449 (§11.2/§23.4, v0.235): the itable-slot accessor function for
+// concrete indexer `iimpl` (`classIndexerImplementing`'s result), covering
+// BOTH the shapes that reach here now that #2442 walks the base-class
+// chain: a LOCAL indexer (own or inherited from a LOCAL base) builds its
+// body from the AST via ensureIndexerGetterFn/-SetterFn, exactly as before
+// #2449; an IMPORTED indexer (inherited from an imported base class, no
+// `ast::PropertyDecl` to build a body from) reuses the already-declared
+// cross-module ABI stub #2414 installed in importedIndexerGetterFns_/
+// -SetterFns_ (`declareImportedIndexerGetters`/`-Setters`, called earlier
+// in `declareVtables`, before Pass D — the only caller of this function).
+// `iimpl` reaching here is always `indexerCandidateWireable` per
+// `findIndexer`'s own gate, so the imported-map lookup should always hit;
+// a miss (defensive) falls through to null, installing a null itable slot
+// — sound (matches #2438's existing "missing implementation" contract),
+// not silently wrong.
+llvm::Function* Emitter::indexerItableAccessor(const sema::TypeSymbol* ts,
+                                               const sema::PropertySymbol* iimpl,
+                                               bool isSet) {
+    if (!iimpl) return nullptr;
+    if (dynamic_cast<const ast::PropertyDecl*>(iimpl->decl))
+        return isSet ? ensureIndexerSetterFn(ts, iimpl)
+                     : ensureIndexerGetterFn(ts, iimpl);
+    auto& map = isSet ? importedIndexerSetterFns_ : importedIndexerGetterFns_;
+    auto it = map.find(iimpl);
+    return it != map.end() ? it->second : nullptr;
 }
 
 

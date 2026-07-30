@@ -3735,19 +3735,31 @@ void Resolver::checkAbstractImplementations() {
         // `findMethodByName` and properties via `classPropertyByName`), so a
         // class satisfying the obligation only through an INHERITED indexer
         // (declared on a base class, never redeclared) is a valid
-        // implementation. A candidate reached this way is accepted only when
-        // it carries a genuine LOCAL `ast::PropertyDecl` (`cpd` in the loop
-        // below): codegen's `ensureIndexerGetterFn`/`-SetterFn`
-        // (LlvmBackend_Assign.cpp) require one unconditionally and return
-        // null without it, so an indexer reached only through an IMPORTED
-        // base class cannot actually be wired into the itable today —
-        // accepting one here would be a false ACCEPT of a program that still
-        // crashes, the exact anti-pattern this whole check exists to avoid.
-        // `t` itself is always LOCAL (this function's outer loop walks
-        // `ctx_.module()->children` only), so this gate only ever excludes a
-        // candidate reached through a cross-module base; left as a filed
-        // follow-up (itable wiring for an imported base's indexer), not
-        // attempted here.
+        // implementation.
+        //
+        // #2449 / §11.2 / §23.4 (v0.235): a candidate reached through the
+        // base walk is accepted when it is either LOCAL (a genuine
+        // `ast::PropertyDecl`, `candWireable` below) or a wireable IMPORTED
+        // indexer — non-static, non-virtual, not itself an interface member.
+        // `candWireable`/`candParamCount`/`candParamTy` below deliberately
+        // mirror codegen's `indexerCandidateWireable`/`indexerParamCount`/
+        // `indexerParamType` (LlvmBackend_Assign.cpp/-_impl.hpp) exactly:
+        // #2449's codegen half teaches `ensureIndexerGetterFn`/`-SetterFn`'s
+        // caller (`Emitter::indexerItableAccessor`, LlvmBackend_Setup.cpp
+        // Pass D) to install #2414's already-declared cross-module ABI stub
+        // (`bz$<Class>$idxget$<arity>`/`$idxset$<arity>`,
+        // `declareImportedIndexerGetters`/`-Setters`) for a candidate that
+        // has no local body to build one from — so an inherited indexer from
+        // an IMPORTED base is now ALSO actually wireable, not just an
+        // inherited LOCAL one. A VIRTUAL (or interface-declared) imported
+        // candidate stays excluded: it dispatches through a vtable/itable
+        // slot instead of this direct-call ABI, and
+        // declareImportedIndexerGetters/-Setters themselves never declare a
+        // stub for one — accepting it here would be a false ACCEPT of a
+        // program codegen still cannot wire, the exact anti-pattern this
+        // whole check exists to avoid. `t` itself is always LOCAL (this
+        // function's outer loop walks `ctx_.module()->children` only), so
+        // `cur` only becomes IMPORTED after the first `baseTypes` hop.
         //
         // Accessor PRESENCE is a shape fact, not a typed one (see the
         // sibling property check's identical note above) — substituting a
@@ -3810,8 +3822,50 @@ void Resolver::checkAbstractImplementations() {
                            : nullptr;
             };
 
-            // #2437/#2442: full parameter-list match over `t`'s own members
-            // then its base-class chain, gated on a genuine local decl — see
+            // #2449: a candidate's arity/k-th param type, read from its
+            // local ast::PropertyDecl OR — for an imported candidate, no
+            // ast::PropertyDecl to read — its reconstructed indexerParams
+            // (ParameterSymbols with resolvedDeclType, ModuleLoader.cpp's
+            // Indexer case). Mirrors codegen's identically-shaped
+            // indexerParamType/indexerParamCount (LlvmBackend_Assign.cpp)
+            // so sema and codegen agree on what a candidate's signature IS,
+            // not just on which candidate wins.
+            auto candParamCount = [](PropertySymbol* cand) -> std::size_t {
+                if (auto* cpd = dynamic_cast<const ast::PropertyDecl*>(cand->decl))
+                    return cpd->indexerParams.size();
+                return cand->indexerParams.size();
+            };
+            auto candParamTy = [&](PropertySymbol* cand,
+                                   std::size_t k) -> TypeRef* {
+                if (auto* cpd =
+                        dynamic_cast<const ast::PropertyDecl*>(cand->decl)) {
+                    return (k < cpd->indexerParams.size() &&
+                            cpd->indexerParams[k].type)
+                               ? resolvedOf(cpd->indexerParams[k].type.get())
+                               : nullptr;
+                }
+                if (k < cand->indexerParams.size())
+                    if (auto* p =
+                            dynamic_cast<ParameterSymbol*>(cand->indexerParams[k]))
+                        return p->resolvedDeclType;
+                return nullptr;
+            };
+            // #2449: mirrors codegen's indexerCandidateWireable exactly —
+            // see the block comment above for why.
+            auto candWireable = [](PropertySymbol* cand) -> bool {
+                if (dynamic_cast<const ast::PropertyDecl*>(cand->decl))
+                    return true;  // local
+                if (cand->decl) return false;  // defensive
+                for (auto mod : cand->modifiers)
+                    if (mod == "virtual" || mod == "override" ||
+                        mod == "abstract")
+                        return false;
+                return !(cand->parent &&
+                         cand->parent->kind == ast::TypeDeclKind::Interface);
+            };
+
+            // #2437/#2442/#2449: full parameter-list match over `t`'s own
+            // members then its base-class chain, gated on wireability — see
             // the block comment above.
             PropertySymbol* candidate = nullptr;
             for (TypeSymbol* cur = t; cur && !candidate;) {
@@ -3822,16 +3876,11 @@ void Resolver::checkAbstractImplementations() {
                     for (auto mod : cps->modifiers)
                         if (mod == "static") { isStaticIdx = true; break; }
                     if (isStaticIdx) continue;
-                    auto* cpd = dynamic_cast<const ast::PropertyDecl*>(cps->decl);
-                    if (!cpd) continue;  // unwireable — see comment above
-                    if (cpd->indexerParams.size() != nparams) continue;
+                    if (!candWireable(cps)) continue;
+                    if (candParamCount(cps) != nparams) continue;
                     bool all = true;
                     for (std::size_t k = 0; k < nparams; ++k) {
-                        TypeRef* pty =
-                            (k < cpd->indexerParams.size() &&
-                             cpd->indexerParams[k].type)
-                                ? resolvedOf(cpd->indexerParams[k].type.get())
-                                : nullptr;
+                        TypeRef* pty = candParamTy(cps, k);
                         TypeRef* ity = ifaceParamTy(k);
                         if (!pty || !ity || !typeRefEqual(pty, ity)) {
                             all = false;
@@ -3870,12 +3919,19 @@ void Resolver::checkAbstractImplementations() {
             if (!propertyDeclHasSetter(ipd))
                 continue;  // read-only obligation, candidate found: satisfied
 
+            // #2449: an IMPORTED candidate has no ast::PropertyDecl to read
+            // accessor presence off; use the reconstructed hasSetter bit
+            // instead (#2400/#2414's propHasSetter_ side table, published
+            // through ctx_.importedPropertyHasSetter — the SAME bit
+            // declareImportedIndexerSetters, LlvmBackend_Setup.cpp, gates
+            // stub declaration on, so sema and codegen read one source of
+            // truth for accessor presence here too).
             auto* cpd = dynamic_cast<const ast::PropertyDecl*>(candidate->decl);
-            if (!cpd) continue;  // defensive: the search above only ever
-                                  // selects a candidate that already passed
-                                  // this same cast
+            bool candidateHasSetter =
+                cpd ? propertyDeclHasSetter(cpd)
+                    : ctx_.importedPropertyHasSetter(candidate);
 
-            if (!propertyDeclHasSetter(cpd)) {
+            if (!candidateHasSetter) {
                 ctx_.diagnostics().report(
                     Severity::Error, t->declLoc,
                     std::string(kindWord) + " `" + std::string(t->name) +

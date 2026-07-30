@@ -2057,7 +2057,10 @@ private:
     // vtable slot so `base[i]` and `this[i]` dispatch to the most-derived getter
     // — the indexer analog of isVirtualProperty (the non-indexer guard there
     // deliberately excludes indexers, which historically had no slot).
-    bool isVirtualIndexer(const sema::PropertySymbol* ps) {
+    // #2449: marked `const` (pure predicate over `ps`, no Emitter state
+    // touched) so the const `findIndexer`/`indexerCandidateWireable` below
+    // can call it.
+    bool isVirtualIndexer(const sema::PropertySymbol* ps) const {
         if (!ps || !ps->isIndexer) return false;
         for (auto mod : ps->modifiers) {
             if (mod == "static") return false;
@@ -2065,6 +2068,29 @@ private:
                 return true;
         }
         return ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface;
+    }
+
+    // #2449 (§11.2/§23.4, v0.235): can `ps` actually be installed as an
+    // interface-indexer itable slot? A LOCAL indexer (real `ast::PropertyDecl`)
+    // always can — `ensureIndexerGetterFn`/`-SetterFn` build its body from
+    // the AST. An IMPORTED indexer (`ps->decl == nullptr` — ModuleLoader
+    // reconstructs no AST, mirrors Property's #503 limitation) can ONLY
+    // through #2414's non-virtual external-stub ABI
+    // (`declareImportedIndexerGetters`/`-Setters`,
+    // `bz$<Class>$idxget$<arity>`/`$idxset$<arity>`) — those two functions
+    // themselves skip a VIRTUAL or interface-declared indexer (dispatches
+    // through a vtable/itable slot instead, not this direct-call ABI), so
+    // this predicate excludes the identical shape rather than reporting a
+    // candidate that would silently find no entry in
+    // importedIndexerGetterFns_/-SetterFns_ (see `indexerItableAccessor`,
+    // LlvmBackend_Setup.cpp, which resolves the actual function once a
+    // candidate passes this gate). `findIndexer` (LlvmBackend_Assign.cpp)
+    // is the sole caller.
+    bool indexerCandidateWireable(const sema::PropertySymbol* ps) const {
+        if (!ps) return false;
+        if (dynamic_cast<const ast::PropertyDecl*>(ps->decl)) return true;
+        if (ps->decl) return false;  // defensive: not a PropertyDecl either
+        return !isVirtualIndexer(ps);
     }
 
     // #481 / §23: does this property declare a setter? An auto-property without
@@ -3570,11 +3596,20 @@ private:
     llvm::Function* ensureIndexerSetterFn(const sema::TypeSymbol* cls,
                                           const sema::PropertySymbol* ps);
 
-    // #730/#2437/#2442: the class `cls`'s (or an inherited base's) concrete
-    // indexer that implements the interface indexer `ifaceIdx`, matched by
-    // FULL parameter list via findIndexer.
+    // #730/#2437/#2442/#2449: the class `cls`'s (or an inherited local OR
+    // imported base's) concrete indexer that implements the interface
+    // indexer `ifaceIdx`, matched by FULL parameter list via findIndexer.
     const sema::PropertySymbol* classIndexerImplementing(
         const sema::TypeSymbol* cls, const sema::PropertySymbol* ifaceIdx);
+
+    // fix #2449 (§11.2/§23.4, v0.235): the itable-slot function for
+    // classIndexerImplementing's result `iimpl` — LOCAL (own or inherited
+    // from a local base) via ensureIndexerGetterFn/-SetterFn, IMPORTED
+    // (inherited from an imported base) via the importedIndexerGetterFns_/
+    // -SetterFns_ cross-module ABI stub. See the .cpp definition.
+    llvm::Function* indexerItableAccessor(const sema::TypeSymbol* ts,
+                                          const sema::PropertySymbol* iimpl,
+                                          bool isSet);
 
     // §22.9: the block-form setter accessor of the property `target` names,
     // or null (auto-properties have backing storage and use the normal
