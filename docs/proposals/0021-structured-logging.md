@@ -353,7 +353,7 @@ public async method Main(): Task<int>
 
   var app := new HttpApp();
   // the logger is a constructor dependency of the service object (an owned field):
-  var api := new TodoApi(new(new Dictionary<int, Todo>()), hub.NewLogger("Http"));
+  var api := new TodoApi(new Dictionary<int, Todo>(), hub.NewLogger("Http"));
   app.Get("/todos/{id}", api.GetById);
 
   var code := await app.Listen(port := 8080);       // serves until Stop()/signal

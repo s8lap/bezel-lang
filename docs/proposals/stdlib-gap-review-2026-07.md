@@ -53,6 +53,7 @@ Synthesized from 9 per-domain surveys (io-fs, text, time, collections, async-con
 | 29 | LINQ over IOwningEnumerable<T> | collections | P1 | naming ruling (rationale §18) |
 | 30 | Random: NextFloat, NextInt64(min,max), Shuffle | numerics | P2 | — |
 | 31 | Unicode normalization (NFC/NFD/NFKC/NFKD) | text | P2 | Unicode-table size decision |
+| 32 | String→enum parse: compiler-known `Enum.Parse<E>`/`TryParse`/`ParseOrNull` where `E: enum` (name-table lookup, not reflection; the §18 boundary to be stated) | numerics, text | P1 | [#2244](https://github.com/s8lap/bezel-lang/issues/2244); own small proposal when picked up (owner-accepted 2026-07-29) |
 
 **Blocked (do not design yet):** OwningSortedDictionary/OwningSortedSet — genuinely blocked on self-hosted collections (#545, tree-rotation ownership); OwningPriorityQueue — rides the #1334 two-axis review; RingBuffer (fault-on-full form) — buildable on OwningBuffer<T>, P2 backlog.
 

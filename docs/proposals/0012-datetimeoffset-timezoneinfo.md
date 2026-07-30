@@ -97,6 +97,8 @@ Deferred to v2: constructing a `DateTimeOffset` from a bare local `DateTime` + a
 
 **Type shape.** `TimeZoneInfo` is a `sealed class` (like `Type`, §2.13): an **immutable, process-interned** reference. `FindSystemTimeZoneById` / `Local` / `Utc` return a **borrowed** reference into a process-lived cache; instances are never `owned` and never disposed — there is no ownership or `IDisposable` question (the `Type` precedent, §2.13, "exactly one instance per distinct type," borrowed for the process lifetime).
 
+> **Owner direction (2026-07-29, recorded for the graduation pass).** The lookup re-shapes to **registry access** — a static-property/indexer-shaped surface in the §22.13/`Encoding.UTF8` admitted family — rather than a new static-*method* borrow admission, which the v0.201/v0.223 factory-announcement line declined to widen; the final spelling is settled at this proposal's graduation critique. In the same pass, `TryFindSystemTimeZoneById` re-scopes to the absence axis only — a corrupt or unreadable database propagates as `InvalidTimeZoneException` rather than folding into the `false` return — per the graduation-checklist tracker [#2338](https://github.com/s8lap/bezel-lang/issues/2338).
+
 ### D6 — tzdata packaging (the question the gap review promised) + IANA-only lookup
 
 **The question (recorded).** Should Bezel **bundle** its own copy of the IANA time-zone database inside the compiler/runtime, or **read the host system's** database (e.g. `/usr/share/zoneinfo`)?
