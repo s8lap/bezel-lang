@@ -201,6 +201,41 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
                 builder_.CreateLoad(ptrTy(), emitExcSlot(), "postdtor.exc");
             llvm::Value* isNew = builder_.CreateICmpNE(
                 excNow, llvm::ConstantPointerNull::get(ptrTy()));
+            // fix #2358 / §28.4 + §31.2 (finally-supersession discipline, cited
+            // by §28.4's "the later exception supersedes the earlier one"
+            // multi-value-cleanup-pass rule): when the destructor body ITSELF
+            // threw (isNew) while an exception was ALREADY propagating at this
+            // disposal's entry (parkedDtorExc non-null AT RUNTIME — an
+            // "exception-path discharge", §28.3), the new exception supersedes
+            // the parked one. Per §31.2, "the superseded exception is disposed
+            // by the runtime exactly once, as if its handling had completed" —
+            // dispose+reclaim it HERE, exactly as emitPendingCheckIf /
+            // emitNewPendingCheck already do for the sibling finally/catch-guard
+            // supersede (#1216/#1149), including the #1288/§30.9 deferred-fault
+            // clear so a superseded task-owned fault's single-dispose invariant
+            // still holds. Without this, parkedDtorExc was silently dropped on
+            // the floor by the select below — losing the original exception's
+            // disposal and leaking its object (the reported #2358 48-byte leak).
+            // Gated on BOTH conditions at runtime (not just isNew) so the
+            // ordinary non-unwind throwing-destructor path (parkedDtorExc ==
+            // null here — no exception was in flight) takes the plain-select
+            // path unchanged: freeing a null parkedDtorExc would be wrong.
+            llvm::Value* hadPending = builder_.CreateICmpNE(
+                parkedDtorExc, llvm::ConstantPointerNull::get(ptrTy()));
+            llvm::Value* supersedes = builder_.CreateAnd(isNew, hadPending);
+            auto* supersedeBB =
+                llvm::BasicBlock::Create(llvm_, "dtor.supersede", currentFn_);
+            auto* restoreBB =
+                llvm::BasicBlock::Create(llvm_, "dtor.restore", currentFn_);
+            builder_.CreateCondBr(supersedes, supersedeBB, restoreBB);
+            builder_.SetInsertPoint(supersedeBB);
+            builder_.CreateCall(
+                declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
+                         {ptrTy()}),
+                {parkedDtorExc});
+            emitDisposeAndReclaim(parkedDtorExc);
+            builder_.CreateBr(restoreBB);
+            builder_.SetInsertPoint(restoreBB);
             llvm::Value* restored =
                 builder_.CreateSelect(isNew, excNow, parkedDtorExc);
             builder_.CreateStore(restored, emitExcSlot());
