@@ -3740,13 +3740,57 @@ void Resolver::checkAbstractImplementations() {
         // record's indexer, if it declares one at all, is necessarily
         // getter-only, so it already falls out of this same check with no
         // extra machinery.
+        //
+        // #2438 / §11.2 / §23.4: this loop ALSO reports when `t` provides no
+        // matching indexer AT ALL (candidate stays null even after the
+        // first-declared fallback) — the more severe sibling #2417 itself
+        // deferred: `classIndexerImplementing` returns null in that shape,
+        // so `declareVtables` Pass D installs `ConstantPointerNull` in the
+        // GETTER slot too, not just the setter (confirmed by probe: a plain
+        // READ SIGSEGVs, exit 139, even for a `readonly` obligation — the
+        // getter-only-vs-read-write branch below never even runs in that
+        // shape, since there is no accessor set to compare against). This is
+        // NOT implemented by widening #489's own ifacePropertyNames/
+        // concretePropertyNames name-keyed "does not implement interface
+        // property" check a few hundred lines above (the naturally-looking
+        // fix, and the literal reading of "extend the existing check"):
+        // EVERY indexer's PropertySymbol::name is the same synthetic
+        // ".this" (SymbolCollection.cpp), regardless of parameter list —
+        // that collision is exactly why indexers were excluded from that
+        // name-keyed check in the first place (pre-dating both #2417 and
+        // #2438). Widening it would report `t` as satisfying ANY interface
+        // indexer obligation as soon as `t` declares ANY indexer of ANY
+        // shape — a false ACCEPT for a class whose only indexer has the
+        // wrong parameter list. This loop's own candidate search is already
+        // shape-aware (mirrors codegen's classIndexerImplementing/
+        // findIndexer, per the comment above), so `candidate == nullptr`
+        // here is the already-computed, sound condition: `t` has ZERO
+        // non-static indexer members of any shape declared directly on it.
+        //
+        // "Declared directly on it" also catches indexer satisfaction
+        // reached ONLY THROUGH INHERITANCE (a base class declares the
+        // indexer; a derived class lists the interface but does not
+        // redeclare the indexer itself) — confirmed by probe to be an
+        // INDEPENDENT instance of the identical crash (`findIndexer` never
+        // calls `baseClassOf`, so `classIndexerImplementing(derived, ip)`
+        // returns null even though the base class's indexer works
+        // perfectly on its own). Rejecting that shape too is deliberate,
+        // not collateral: since codegen cannot currently wire it either way,
+        // accepting it would still crash — this is not a case where a
+        // "more correct" check would trade a real crash for a false reject.
+        // Making inherited indexer satisfaction actually WORK is a codegen
+        // change (teaching `findIndexer`/`classIndexerImplementing` to walk
+        // `baseClassOf`, mirroring what `classPropertyByName` already does
+        // for named properties) — filed as #2442, separate from this
+        // sema-side reject and from #2437's sibling arity-blindness gap.
+        // #2442 landing would make this reject a false one for that specific
+        // shape; the two are cross-referenced so they get revisited
+        // together.
         for (auto& obl : ifaceIndexerObligations) {
             PropertySymbol* ips = obl.ips;
             auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ips->decl);
             if (!ipd) continue;  // imported interface indexer — left to a
                                   // future #2406-shaped fix, same as ifaceProps
-            if (!propertyDeclHasSetter(ipd))
-                continue;  // read-only obligation: no setter to check for
 
             const TypeRef* firstParamTy = nullptr;
             if (!ipd->indexerParams.empty() && ipd->indexerParams[0].type)
@@ -3775,12 +3819,27 @@ void Resolver::checkAbstractImplementations() {
                 }
             }
             if (!candidate) candidate = firstDeclared;
-            // `t` declares no indexer at all: a different, pre-existing gap
-            // (missing implementation entirely — the GETTER itable slot is
-            // ALSO null in that shape, not just the setter, confirmed by
-            // probe: SIGSEGV on a plain READ) that #2417 does not attempt —
-            // filed as #2438; see the comment block above this loop.
-            if (!candidate) continue;
+
+            if (!candidate) {
+                // #2438: no non-static indexer of any shape declared
+                // directly on `t` — mirrors #489's "does not implement
+                // interface property" message a few hundred lines above,
+                // adapted for indexers (see the block comment above this
+                // loop for why that check itself isn't reused directly).
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string(kindWord) + " `" + std::string(t->name) +
+                    "` does not implement interface `" +
+                    std::string(obl.iface->name) + "`'s indexer — declare a "
+                    "matching `public property [params]: T` directly on `" +
+                    std::string(t->name) + "` (an indexer inherited from a "
+                    "base class does not currently satisfy an interface "
+                    "indexer obligation — §11.2 / §23.4)");
+                continue;
+            }
+
+            if (!propertyDeclHasSetter(ipd))
+                continue;  // read-only obligation, candidate found: satisfied
 
             auto* cpd = dynamic_cast<const ast::PropertyDecl*>(candidate->decl);
             if (!cpd) continue;  // defensive: `candidate` is always a member
