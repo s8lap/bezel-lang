@@ -2355,6 +2355,33 @@ private:
     void markOutOwnedArgs(const std::vector<ast::CallArgument>& args,
                           const ast::Expr* callee);
 
+    // §28.3 / §22.4 (issue #2429): the constructor-call overload. A `new
+    // T(...)` call has no "callee" Expr in the CallExpr sense — its
+    // parameter list is resolved via resolveCtorParams (recordMovesIn's
+    // NewExpr branch already does this into `ctorParams`) rather than via
+    // `ctx_.exprSymbol(*callee)` + MethodSymbol. This overload takes the
+    // resolved parameter list directly and shares markOutOwnedArgsCore with
+    // the callee-based overload above, so a constructor's `out owned`
+    // recipient is marked Owned by the SAME logic a method call's is —
+    // fixing #2429's root cause (recordMovesIn's NewExpr branch never
+    // called any out-owned-marking equivalent, so a constructor's `out
+    // owned var` recipient never entered the ownership dataflow's `states_`
+    // and was invisible to the §28.3 affine auto-drop / must-use-warning
+    // end-of-scope check — a silent leak, no diagnostic at all).
+    // // per §28.3, §22.4
+    void markOutOwnedArgs(const std::vector<ast::CallArgument>& args,
+                          const std::vector<ast::Param>* params);
+
+    // Shared implementation for both markOutOwnedArgs overloads above.
+    // `callee` is threaded through only for builtinOutOwnedArg's dispatch
+    // (which requires a MemberAccessExpr callee); the constructor overload
+    // passes nullptr, so builtinOutOwnedArg(nullptr, pos) correctly returns
+    // false for every arg — no builtin type is constructed via `new` with an
+    // out-owned recipient. // per §28.3, §28.11, §22.4, issue #2429
+    void markOutOwnedArgsCore(const std::vector<ast::CallArgument>& args,
+                              const std::vector<ast::Param>* params,
+                              const ast::Expr* callee);
+
     // §28.3 / §28.11 (#1466, #1407): scan an if/elif CONDITION expression for
     // PRE-DECLARED out-owned recipients (`if coll.TryX(out item) then …`) — a
     // bare `out item` argument at an `out owned` position (userOutOwned /

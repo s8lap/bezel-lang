@@ -271,6 +271,19 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             recordMovesIn(*a.value);
             ++pos;
         }
+        // §28.3 / §22.4 (v0.235, issue #2429): mirror recordMovesInArgs'
+        // final `markOutOwnedArgs(args, callee)` call — after the owned-IN
+        // consume walk above, model the caller-side owned-OUT transfer for
+        // the ctor's `out owned` formal(s): the recipient RECEIVES ownership
+        // and becomes Owned, arming the §28.3 affine auto-drop / must-use
+        // warning end-of-scope check (Ownership.cpp) exactly as a method
+        // call's `out owned var` recipient already does. Without this call
+        // the recipient's LocalSymbol never enters `states_`, so it is
+        // invisible to that scan: no warning, no scope-end disposal — a
+        // silent leak (root cause of #2429; found during #2411's adversarial
+        // self-pass). Uses the ctorParams-taking overload since a NewExpr
+        // has no "callee" Expr to resolve a parameter list from.
+        markOutOwnedArgs(ne->args, ctorParams);
         return;
     }
 }
@@ -6407,6 +6420,25 @@ void MethodOwnership::markOutOwnedArgs(
                 params = &md->params;
         }
     }
+    markOutOwnedArgsCore(args, params, callee);
+}
+
+// §28.3 / §22.4 (issue #2429): the constructor-call overload — see the
+// header for why a NewExpr call has no "callee" Expr to resolve `params`
+// from and instead takes the already-resolved constructor parameter list
+// directly (recordMovesIn's NewExpr branch resolves it via
+// resolveCtorParams into `ctorParams`).
+void MethodOwnership::markOutOwnedArgs(
+        const std::vector<ast::CallArgument>& args,
+        const std::vector<ast::Param>* params) {
+    markOutOwnedArgsCore(args, params, /*callee=*/nullptr);
+}
+
+// §28.3 / §28.11 / §22.4 (issue #860, #2429): shared core. See the header.
+void MethodOwnership::markOutOwnedArgsCore(
+        const std::vector<ast::CallArgument>& args,
+        const std::vector<ast::Param>* params,
+        const ast::Expr* callee) {
     std::size_t pos = 0;
     for (const auto& a : args) {
         if (!a.value) { ++pos; continue; }
