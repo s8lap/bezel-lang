@@ -3873,6 +3873,70 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         }
     }
     auto* ms = dynamic_cast<sema::MethodSymbol*>(calleeSym);
+    // fix #2388 (§11.2/§12.1 member matching, §29.1/§29.11, v0.235): explicit
+    // `s.GetEnumerator()` on a CONCRETE user-class-typed receiver (a real
+    // `TypeSymbol` declaration, e.g. `using var s := new IntRange(...)`, no
+    // `IEnumerable<T>` annotation) implementing the enumerable protocol via an
+    // ordinary, sema-resolved `GetEnumerator()` method — `ms` above is
+    // non-null for this shape, so the `if (!ms)` special-casing just below
+    // (which only ever sees declaration-LESS builtin receivers like Array<T>
+    // or an already vtable-backed IEnumerable<T>) never triggers for it at
+    // all. Falling through to the generic `ms`-based call path (several
+    // hundred lines down, `emitMethodCall(ms, ...)`) would just invoke the
+    // user's method and hand back the RAW enumerator class instance, whose
+    // OWN vtable is the ordinary CG35-itable class layout ([0]=td,
+    // [1]=itmap$,[2]=Dispose,[3]=ToString,...) — NOT the §29.11 iterator-
+    // vtable format ([0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current,
+    // [4]=GetEnumerator) every consumer of an `IEnumerator<T>`-typed value
+    // assumes (the #494 MoveNext dispatch, the TakeCurrent dispatch, and the
+    // iterEnumDispose scope-end disposal a `using var e := …` wires up via
+    // registerUsingDisposal all unconditionally read slot 1/2/3 assuming the
+    // wrapper layout). On the raw class instance that reads itmap$<Enum> (a
+    // DATA pointer, not code) out of slot 1 and calls it: a wild jump landing
+    // inside the itmap$ global itself (confirmed ASan SEGV "PC ... in
+    // itmap$IntRangeEnum", issue #2388's repro). `wrapUserClassAsIEnumerable`
+    // (LlvmBackend_Assign.cpp, #552/#2384) already builds exactly the wrapper
+    // this call needs — it independently re-resolves `GetEnumerator` on the
+    // source TypeSymbol and eagerly invokes it — so reuse it here instead of
+    // duplicating the resolution. Gated on the CALL's own sema-inferred type
+    // being the declaration-less builtin `IEnumerator<T>`/`IOwningEnumerator<T>`
+    // sentinel (the same shape #494/#1002 already established sema assigns
+    // any spec-conformant `GetEnumerator()` result) so an unrelated method
+    // that merely happens to be named "GetEnumerator" but returns something
+    // else is left to the ordinary `ms`-based call path untouched. Each
+    // call-EXPRESSION lowering re-invokes wrapUserClassAsIEnumerable fresh
+    // (it is not memoized per source), so a second `.GetEnumerator()` call on
+    // the same named receiver independently re-fetches the source's own
+    // `GetEnumerator()` too — §29.11's "each call produces an independent
+    // enumerator" holds exactly as it already does for the interface-typed
+    // path (isVtableBackedIEnumerableType, below).
+    if (ms && call.args.empty()) {
+        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                call.callee.get())) {
+            if (ma->member == "GetEnumerator" && ma->target) {
+                const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                const sema::TypeRef* resultTy = ctx_.exprType(call);
+                bool resultIsEnumeratorSentinel =
+                    resultTy && resultTy->kind == sema::TypeRef::Kind::Named &&
+                    !resultTy->declaration && resultTy->astNode &&
+                    resultTy->astNode->name &&
+                    !resultTy->astNode->name->parts.empty() &&
+                    (resultTy->headName() == "IEnumerator" ||
+                     resultTy->headName() == "IOwningEnumerator");
+                if (resultIsEnumeratorSentinel && recvTy &&
+                        recvTy->kind == sema::TypeRef::Kind::Named &&
+                        recvTy->declaration &&
+                        recvTy->declaration->kind == ast::TypeDeclKind::Class) {
+                    llvm::Value* src = lowerExpr(*ma->target);
+                    if (src && src->getType()->isPointerTy()) {
+                        llvm::Value* wrapped = wrapUserClassAsIEnumerable(
+                            src, recvTy->declaration, resultTy);
+                        if (wrapped) return wrapped;
+                    }
+                }
+            }
+        }
+    }
     if (!ms) {
         // §8.5 / §8.6 (#417): `o.ToString()` where o: Object / interface (the
         // universal Object.ToString, no MethodSymbol — the receiver's static
