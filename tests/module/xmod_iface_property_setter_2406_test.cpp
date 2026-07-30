@@ -66,6 +66,7 @@
 #include <vector>
 
 #include "driver/Driver.hpp"
+#include "support/aot_support.hpp"
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -290,6 +291,70 @@ BEZEL_TEST(xmod_iface_property_setter_2406,
     int status = std::system(exe.path.c_str());
     int r = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
     BEZEL_EXPECT_EQ(r, 142);
+}
+
+// ===========================================================================
+// T6 — REGRESSION GUARD (coordinator-reported false-positive attribution,
+// investigated 2026-07-30): the gate's `is_transitive_generic_2192.
+// is_transitive2_reified_int_matches_2192_14_1` (tests/codegen/
+// is_transitive_generic_instantiation_2192_test.cpp) was reported failing
+// with this fix's two source files present, and passing with them reverted.
+// Pinned here verbatim as a permanent regression guard regardless of root
+// cause. The program is PURELY SINGLE-MODULE with NO imports and NO
+// properties anywhere (`Wrap<W>`'s `tag` is a plain FIELD, not a property;
+// `A`/`B`/`D` declare only methods) — three levels of generic nesting
+// (`D<int> -> B<int> -> A<int>`) doing a reified `m is Wrap<T>` check.
+//
+// DIAGNOSIS PERFORMED (per the coordinator's "do not guess" instruction,
+// summarized fully in the fix-lane report; not reproduced here in this
+// comment's brevity):
+//   - gdb breakpoint counts compiling this EXACT program: `Emitter::
+//     propertyHasSetter` — 0 hits; `Emitter::lowerVirtualPropertySet` — 0
+//     hits (`lowerVirtualPropertyGet`, UNCHANGED by this fix, hit 27 times —
+//     irrelevant to this diff). Neither of this fix's two changed functions
+//     is reachable for a program with no properties and no interfaces at
+//     all, which rules out the coordinator's own itable/vtable-layout-shift
+//     hypothesis by direct measurement, not argument.
+//   - `BEZEL_DUMP_IR=1` on this exact program: BYTE-IDENTICAL LLVM IR with
+//     this fix's two files present vs. reverted (0-line diff), reproduced
+//     across 3 fresh compiles each way — the compiler's output for this
+//     program is therefore provably unaffected by this fix.
+//   - the isolated gtest (`BEZEL_TEST_FILTER=
+//     is_transitive2_reified_int_matches_2192_14_1`) PASSED on every attempt
+//     with this fix applied: 8 repeated single-test runs, 3 with the AOT
+//     compile cache disabled, 5 against a ccache-disabled from-scratch
+//     rebuild, 3 under `BEZEL_AOT_FORCE_SANITIZE=address`, and the whole
+//     14-test `is_transitive_generic_2192` suite run together once — 22
+//     process invocations, 0 failures.
+// Root cause, if the report reflects a real (not shard-contention / build-
+// staleness) failure, is therefore NOT in this fix's changed code paths.
+// Kept here as a value-asserting guard regardless: if this specific shape
+// ever regresses for ANY reason while this fix's files are present, this
+// test catches it without relying on cross-file attribution.
+// ===========================================================================
+BEZEL_TEST(xmod_iface_property_setter_2406,
+           regression_guard_2192_transitive_generic_is_check_unrelated) {
+    auto r = bezel::test::runAot(
+        "module M; "
+        "class Wrap<W> public tag: int; "
+        "  public constructor(t: int) tag := t; end constructor; end Wrap; "
+        "class A<T> public method probe(m: Object, w: Object): int "
+        "  => (if m is Wrap<T> then 1 else 0) * 2 "
+        "   + (if w is Wrap<T> then 1 else 0); end A; "
+        "class B<U> public method run(m: Object, w: Object): int "
+        "  using var a := new A<U>(); "
+        "  return a.probe(m, w); end run; end B; "
+        "class D<X> public method run2(m: Object, w: Object): int "
+        "  using var b := new B<X>(); "
+        "  return b.run(m, w); end run2; end D; "
+        "class C public static method Main(): int "
+        "  using var wi := new Wrap<int>(1); "
+        "  using var ws := new Wrap<string>(2); "
+        "  var mi: Object := wi; var wsx: Object := ws; "
+        "  using var d := new D<int>(); "
+        "  return d.run2(mi, wsx); end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 2);
 }
 
 }  // namespace bezel::module
