@@ -4710,7 +4710,43 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
         return f;
     };
 
-    // Dispose: call enum.Dispose() then free(self).
+    // Dispose: call enum.Dispose(), reclaim the inner enumerator block, then
+    // free(self).
+    //
+    // fix #2389 (§28.2 Dispose contract / §28.3, §28.6 "every heap object is
+    // disposed exactly once", v0.235): `enumDisposeFn` is `disposerFns_[enumTs]`
+    // — the flag-guarded PUBLIC Dispose (destructor + owned-field disposal,
+    // §28.2), which only DISPATCHES; per emitDynamicDispose's own contract
+    // ("This does NOT free the object's heap block") it never reclaims the
+    // block. Every other terminal disposal site pairs that dispatch with a
+    // reclaim (emitDisposeAndReclaim, LlvmBackend_Disposal.cpp); this wrapper
+    // was the one terminal site that dispatched Dispose on the retained inner
+    // enumerator (`enumPtr`, slot 1) and then freed only the WRAPPER struct
+    // (`self`) — every IntRangeEnum-shaped instance minted along the way (the
+    // eager fetch this wrapper's own construction performs, plus one per
+    // wrapGetEnumFn clone) leaked unconditionally (confirmed under LSan,
+    // issue #2389's repro: 72 bytes / 3 allocations for the two-class idiom).
+    //
+    // This wrapper IS the sole owner of `enumPtr`'s block UNLESS `enumPtr`
+    // ALIASES the retained source object at slot 2 — the single-object
+    // self-returning idiom (#2384: a class implementing BOTH `IEnumerable<T>`
+    // and `IEnumerator<T>` whose own `GetEnumerator()` returns `this`).
+    // There `enumPtr == srcObj` by runtime identity (a compile-time-only
+    // structural fact cannot distinguish this from a fresh-instance return,
+    // mirroring the `enumPtr == srcPtr` RUNTIME guard `lowerIEnumerableFor`
+    // already uses for the same alias, LlvmBackend_Stmts.cpp), and `srcObj`
+    // is independently owned — reclaimed by ITS OWN scope-end/using-var
+    // disposal — so freeing it again here would be a double-free. The
+    // two-class idiom (the common case, e.g. IntRange/IntRangeEnum) never
+    // aliases: `enumPtr` is always a distinct, solely-owned allocation this
+    // wrapper is the sole owner of, so the runtime guard below is a no-op
+    // there and the block is freed unconditionally, closing the leak.
+    //
+    // `self`'s own reclaim (just below) has always been unconditional,
+    // ignoring `checkedDisposal_`'s debug-mode quarantine (§28.2 v0.134); the
+    // inner enumerator's reclaim added here matches that existing, established
+    // convention for this wrapper rather than introducing new asymmetric
+    // gating not part of this fix's scope.
     llvm::Function* wrapDisposeFn = getOrCreate(prefix + "Dispose",
         llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
         [&](llvm::Function* f) {
@@ -4725,9 +4761,24 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
             auto* freeFnCallee = module_->getOrInsertFunction(
                 "free", llvm::FunctionType::get(
                     llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
-            b.CreateCall(llvm::FunctionType::get(
-                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
-                freeFnCallee, {self});
+            auto* freeFnTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+            // fix #2389: reclaim enumPtr's block unless it aliases the
+            // retained source (slot 2) — see the block comment above.
+            llvm::Value* srcF = b.CreateStructGEP(stTy, self, 2);
+            llvm::Value* srcObj = b.CreateLoad(ptrTy(), srcF);
+            llvm::Value* aliasesSrc =
+                b.CreateICmpEQ(enumPtr, srcObj, "wrapdispose.enum_is_src");
+            auto* freeEnumBB =
+                llvm::BasicBlock::Create(llvm_, "wrapdispose.freeenum", f);
+            auto* afterEnumBB =
+                llvm::BasicBlock::Create(llvm_, "wrapdispose.afterenum", f);
+            b.CreateCondBr(aliasesSrc, afterEnumBB, freeEnumBB);
+            b.SetInsertPoint(freeEnumBB);
+            b.CreateCall(freeFnTy, freeFnCallee, {enumPtr});
+            b.CreateBr(afterEnumBB);
+            b.SetInsertPoint(afterEnumBB);
+            b.CreateCall(freeFnTy, freeFnCallee, {self});
             b.CreateRetVoid();
         });
 
