@@ -3310,15 +3310,29 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         }
     }
 
-    // Run field initializers (emitInstanceInit) — for the primary-ctor path
-    // above this reads the just-stored parameter values (mirrors lowerNew's
-    // ordering exactly); for the explicit-ctor path below this runs BEFORE
-    // the ctor call, matching ordinary construction order (field
-    // initializers execute before the constructor body).
+    // emitInstanceInit installs ONLY the vtable (LlvmBackend_Setup.cpp) — it
+    // does NOT run field initializers despite the name; those are run by
+    // emitOwnFieldInit, normally invoked from inside a constructor's own
+    // compiled LLVM body (the explicit-ctor path below reaches it that way)
+    // or, for a no-explicit-ctor `new` expression, explicitly at the call
+    // site (LlvmBackend_Exprs2.cpp's `!hasAnyConstructor(t)` branch). The
+    // primary-ctor path above has no ctor function to call, so — mirroring
+    // that no-explicit-ctor `new` site exactly — emitOwnFieldInit must be
+    // called explicitly here too, or an explicit field whose initializer
+    // reads a primary-ctor parameter (`Id: int := id;`) is silently left at
+    // its calloc-zeroed default (verified: this was the #2325 bug — a
+    // Widget2-shaped class round-tripped Id=0 instead of the deserialized
+    // value, because only emitInstanceInit ran, not emitOwnFieldInit).
+    // NOT replicated here: the no-explicit-ctor `new` site's throw-safety
+    // cleanup around emitOwnFieldInit (disposing already-initialized owned
+    // fields if a LATER field initializer throws) — no test in this slice
+    // exercises a throwing field initializer during Deserialize, and that
+    // unwind-safety replication is scoped out as a follow-up (filed).
     {
         llvm::Value* savedThis = currentThis_;
         currentThis_ = obj;
         emitInstanceInit(ts, obj, st);
+        if (primaryCtorUsed) emitOwnFieldInit(ts, obj, st);
         currentThis_ = savedThis;
     }
 
