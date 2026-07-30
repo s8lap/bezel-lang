@@ -921,6 +921,47 @@ void Resolver::checkRecordRestrictions() {
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t || t->kind != ast::TypeDeclKind::Record) continue;
+        // §9.6 / §12.5 (issue #2431): `abstract` is defined ONLY for a
+        // class — §12.5 ("Abstract classes and members") states "`abstract`
+        // on a class permits abstract members and forbids direct
+        // instantiation," with every example and every other mention of
+        // `abstract` in the spec written in terms of a class. §9.6
+        // ("Records and inheritance") states plainly "Records are
+        // implicitly sealed" and "A record cannot derive from another
+        // record or from a class" — so a record can never have a subclass
+        // through ANY route, which an `abstract` class awaits (possibly in
+        // a different, later-compiled module). An `abstract record` would
+        // therefore be permanently uninstantiable with no concrete type
+        // ever able to provide bodies for its abstract members — a
+        // meaningless combination the parser over-admits (it deliberately
+        // defers all modifier-combination validity to sema, matching its
+        // own §11.7-citing comment in Parser_Decls.cpp) and that nothing
+        // previously rejected. `checkClassModifierCombinations`
+        // (§11.7-driven `static`+`abstract` / `static`+`sealed` exclusion)
+        // is filtered to `TypeDeclKind::Class` only and never inspects a
+        // record's modifiers at all — this is a DECLINE-WITH-REASONS
+        // interpretation (CLAUDE.md rule 4), not a spec ruling: the spec
+        // does not explicitly forbid the token sequence `abstract record`,
+        // but simply never defines a meaning for it, and per CLAUDE.md's
+        // "when the spec is unclear ... implement the simplest
+        // interpretation, document it" guidance, rejecting is the chosen,
+        // recorded reading (see issue #2431 for the full analysis and the
+        // alternative considered — declining to write code and instead
+        // requesting a human ruling — before this was judged clear enough
+        // to implement directly).
+        bool recordIsAbstract = false;
+        for (auto mod : t->modifiers)
+            if (mod == "abstract") { recordIsAbstract = true; break; }
+        if (recordIsAbstract) {
+            ctx_.diagnostics().report(
+                Severity::Error, t->declLoc,
+                std::string("record `") + std::string(t->name) +
+                "` may not be `abstract` — records are implicitly sealed "
+                "and can never be derived from (§9.6), so an abstract "
+                "record could never have a concrete subclass to provide "
+                "bodies for its abstract members; `abstract` is defined "
+                "only for a class (§12.5)");
+        }
         for (Symbol* m : t->members) {
             if (dynamic_cast<DestructorSymbol*>(m)) {
                 ctx_.diagnostics().report(
