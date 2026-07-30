@@ -5839,6 +5839,98 @@ void Resolver::checkClassSerializationEligibilityLate() {
             bool hwD2 = typeHasHandWrittenMethod(t, "Deserialize");
             if (hwS2 && hwD2) continue;  // fully hand-written: always valid
 
+            // §9.8 does not specify the inheritance × synthesis interaction
+            // (a documented spec silence — serialization_tier2_classes_test.cpp
+            // SILENCE-1). The synthesized Deserialize (emitClassDeserialize,
+            // LlvmBackend_Serialization.cpp) does not construct a base-class
+            // subobject at all on EITHER the primary-ctor or explicit-ctor
+            // construction path (no emitImplicitBase / base-ctor-chain call
+            // exists there) — so a derived class's INHERITED fields are
+            // silently left at their calloc-zeroed defaults on Deserialize.
+            // Verified reachable (not merely theoretical): `class Derived():
+            // Base(999), ISerializable, IDeserializable ... end;` compiles
+            // and RUNS, round-tripping Base's field as 0 instead of 999, with
+            // no diagnostic — instance-corrupting, not merely incomplete.
+            // Per the spec's governing principle for a shape an
+            // implementation cannot carry correctly (§2.8.2: "An
+            // implementation unable to carry some body shape ... must reject
+            // the export, or the import, with a diagnostic naming the shape;
+            // it must not alter the instantiation's semantics" — §2.8.2
+            // itself governs cross-module artifact interfaces, not
+            // serialization, but the same reasoning applies: silently
+            // altering semantics is strictly worse than a clean rejection),
+            // reject synthesis of Deserialize specifically for a class whose
+            // base chain actually carries storage, rather than emit a
+            // deserializer that silently corrupts the base portion of the
+            // instance. Serialize alone is UNAFFECTED and not rejected:
+            // writing an already-fully-constructed instance's inherited
+            // fields is sound today (collectInstanceStorage /
+            // emitClassSerialize already walk the base chain correctly —
+            // verified) — only CONSTRUCTION (Deserialize) has no
+            // base-subobject path. This turns the live corruption bug into a
+            // clean compile-time rejection until inheritance is supported
+            // (tracked: issue #2364).
+            //
+            // NOT a blanket "any base class" rejection: the §9.8 tier-4
+            // `polymorphic` pattern (serialization_tier2_classes_test.cpp)
+            // has an abstract base (`Shape`) that carries NO storage of its
+            // own (only the `polymorphic` registry — a member clause, not a
+            // field — and an abstract method) — a base with zero own
+            // components has nothing for Deserialize to lose, so it is not
+            // rejected here. `baseHasOwnStorage` walks the FULL base chain
+            // (mirroring collectInstanceStorage's own recursion) checking
+            // each level's OWN fields/auto-properties/captured posParams —
+            // any single level with storage is disqualifying.
+            auto classHasOwnStorage = [](const TypeSymbol* cls) -> bool {
+                for (const Symbol* m : cls->members) {
+                    auto* fs = dynamic_cast<const FieldSymbol*>(m);
+                    if (fs) {
+                        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                        if (fd) {
+                            bool isStat = false;
+                            for (auto mod : fd->modifiers)
+                                if (mod == "static") { isStat = true; break; }
+                            if (!isStat) return true;
+                        } else if (fs->posParam && fs->posParamBodyRef) {
+                            return true;
+                        }
+                        continue;
+                    }
+                    if (isAutoPropertySymbol(m)) return true;
+                }
+                return false;
+            };
+            bool needsDeserHere = wantsID && !hwD2;
+            bool hasBaseClass = !t->baseTypes.empty() &&
+                                t->baseTypes[0]->kind == ast::TypeDeclKind::Class;
+            bool baseHasOwnStorage = false;
+            if (hasBaseClass) {
+                for (const TypeSymbol* cur = t->baseTypes[0]; cur; ) {
+                    if (classHasOwnStorage(cur)) { baseHasOwnStorage = true; break; }
+                    cur = (!cur->baseTypes.empty() &&
+                           cur->baseTypes[0]->kind == ast::TypeDeclKind::Class)
+                              ? cur->baseTypes[0] : nullptr;
+                }
+            }
+            if (needsDeserHere && hasBaseClass && baseHasOwnStorage) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    "class `" + std::string(t->name) + "` declares "
+                    "`IDeserializable` and inherits from `" +
+                    std::string(t->baseTypes[0]->name) + "`, which carries "
+                    "its own serialized storage — synthesized class "
+                    "deserialization does not yet support inheritance over a "
+                    "base with storage (§9.8 does not specify base-class "
+                    "field construction, and the synthesized Deserialize "
+                    "does not construct the base subobject, which would "
+                    "silently leave inherited fields at their default value "
+                    "instead of the deserialized data — issue #2364); "
+                    "remove the `IDeserializable` conformance declaration, "
+                    "remove the base class, or hand-write a static "
+                    "`Deserialize` yourself");
+                continue;
+            }
+
             // Check: ineligible polymorphic registered types (§9.8).
             // A registered type that is not serialization-eligible is a compile
             // error at the registry.  Also: each registered type must be

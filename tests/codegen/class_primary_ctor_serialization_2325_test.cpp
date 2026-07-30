@@ -525,3 +525,153 @@ BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
         "  return (if hub2.Target.Get().V = 9 then 42 else 91); "
         "end Main; end C;"), 42);
 }
+
+// ===========================================================================
+// Coordinator-directed follow-up self-pass (does recognizing the primary
+// constructor as a §9.8 constructor-selection candidate newly ADMIT any
+// class the spec says is INELIGIBLE?). Three findings from that review:
+//
+//   1. A primary-ctor class with a base class that carries its OWN storage,
+//      declaring IDeserializable, is a REAL, REACHABLE silent-corruption bug
+//      this fix's recognition of the primary constructor opens: the
+//      synthesized Deserialize (both this fix's primary-ctor path AND the
+//      pre-existing explicit-ctor path — the underlying defect is shared,
+//      neither ever constructs a base subobject) round-trips the base's
+//      field as its calloc-zeroed default instead of the deserialized
+//      value, with NO diagnostic, prior to the fix below. Confirmed by
+//      directly printing the round-tripped base field (not merely asserting
+//      a wrong exit code): `Derived().V` came back 0 instead of the
+//      serialized 999. Closed by rejecting synthesis of Deserialize for a
+//      class whose base chain carries storage (issue #2364) — this pins the
+//      rejection, mechanically distinguishing it from the ALREADY-PASSING
+//      §9.8 tier-4 polymorphic pattern (an abstract base with ZERO storage,
+//      serialization_tier2_classes_test.cpp's polymorphic_dispatch_*
+//      tests), which remains admitted because there is no base storage to
+//      lose.
+//   2. A borrowing (non-owned) class-typed field captured ONLY via a body
+//      reference (no explicit field) is STILL correctly rejected under
+//      `serialized tree` mode — the back-edge-forbidden-under-tree check
+//      (checkComponentType, shared verbatim between the FieldDecl and
+//      posParam branches) was not weakened by this fix.
+//   3. An OWNED class-typed field captured ONLY via a computed property (no
+//      explicit field) — a case this run's hand-off had flagged as
+//      "untested, narrow risk" — round-trips AND disposes cleanly. Verified
+//      empirically rather than left as a guess.
+// ===========================================================================
+
+// Finding 1 (negative): primary-ctor class inheriting from a base with its
+// own storage, declaring IDeserializable, is a compile error naming the
+// base and issue #2364 — not a silent corruption.
+BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
+           primary_ctor_class_inheriting_base_with_storage_is_error_spec_9_8_2364) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        std::string("module M; ") + kImport +
+        "class Base(v: int): ISerializable, IDeserializable "
+        "  public property V: int => v; "
+        "end Base; "
+        "class Derived(): Base(999), ISerializable, IDeserializable "
+        "  public property Tag: int => 42; "
+        "end Derived; "
+        "class C public static method Main(): int return 0; end Main; end C;"));
+}
+
+// Finding 1 (positive control): the identical inheritance shape but
+// ISerializable ONLY (no IDeserializable) is NOT rejected — writing an
+// already-constructed instance's inherited fields has no construction step,
+// so there is nothing unsound to reject. Also confirms Serialize actually
+// walks the base chain correctly (a non-empty buffer proves the base field
+// was written, not merely that compilation succeeded).
+BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
+           primary_ctor_class_inheriting_base_serialize_only_still_works_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "class Base(v: int): ISerializable "
+        "  public property V: int => v; "
+        "end Base; "
+        "class Derived(): Base(999), ISerializable "
+        "  public property Tag: int => 42; "
+        "end Derived; "
+        "class C public static method Main(): int "
+        "  using var d1 := new Derived(); "
+        "  using var s := new BinarySerializer(); "
+        "  d1.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  return (if bytes.Count > 0 then 42 else 91); "
+        "end Main; end C;"), 42);
+}
+
+// Finding 1 (positive control): the §9.8 tier-4 polymorphic pattern — a base
+// with NO storage of its own (only a `polymorphic` registry member and an
+// abstract method) — is NOT newly rejected by the base-storage check, even
+// though `Circle`/`Square` do inherit from a class (`Shape`) and declare
+// IDeserializable. Mirrors serialization_tier2_classes_test.cpp's
+// polymorphic_dispatch_circle_roundtrip_spec_9_8 with a scalar-valued
+// (rather than owned-collection-valued) Container field, kept minimal here
+// since that file already covers the full round-trip.
+BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
+           polymorphic_zero_storage_base_not_rejected_spec_9_8) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "abstract class Shape : ISerializable, IDeserializable "
+        "  polymorphic(\"circle\": Circle); "
+        "  public abstract method Kind(): int; "
+        "end Shape; "
+        "class Circle(radius: double) : Shape, ISerializable, IDeserializable "
+        "  public property Radius: double => radius; "
+        "  public override method Kind(): int return 1; end Kind; "
+        "end Circle; "
+        "class Container(owned s: Shape): ISerializable, IDeserializable "
+        "  public owned S: Shape := s; "
+        "end Container; "
+        "class C public static method Main(): int "
+        "  using var box := new Container(new Circle(5.0)); "
+        "  using var s := new BinarySerializer(); "
+        "  box.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var box2 := Container.Deserialize(d); "
+        "  return (if box2.S.Kind() = 1 then 42 else 91); "
+        "end Main; end C;"), 42);
+}
+
+// Finding 2: a borrowing class-typed field captured ONLY via a body
+// reference (no explicit field) is still correctly rejected under
+// `serialized tree` (the default shape absent a Shared<T>/Weak<T>/back-edge
+// field) — the back-edge-forbidden check was not weakened by recognizing
+// captured posParam fields as components.
+BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
+           borrowing_backedge_captured_only_by_body_still_rejected_under_tree_spec_9_8) {
+    BEZEL_EXPECT_TRUE(compileFails(
+        std::string("module M; ") + kImport +
+        "class Leaf(v: int): ISerializable, IDeserializable "
+        "  public property V: int => v; "
+        "end Leaf; "
+        "class Hub(leaf: Leaf): ISerializable, IDeserializable "
+        "  public method Peek(): int return leaf.V; end Peek; "
+        "end Hub; "
+        "class C public static method Main(): int return 0; end Main; end C;"));
+}
+
+// Finding 3: an OWNED class-typed field captured ONLY via a computed
+// property (no explicit field consuming it) round-trips AND disposes
+// cleanly — verified rather than left as an untested risk.
+BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
+           owned_class_captured_only_by_property_roundtrip_no_leak_spec_9_8) {
+    BEZEL_EXPECT_EQ(runChecked(
+        std::string("module M; ") + kImport +
+        "class Leaf(v: int): ISerializable, IDeserializable "
+        "  public property V: int => v; "
+        "end Leaf; "
+        "class Hub(owned leaf: Leaf): ISerializable, IDeserializable "
+        "  public property Peek: int => leaf.V; "
+        "end Hub; "
+        "class C public static method Main(): int "
+        "  using var hub := new Hub(new Leaf(9)); "
+        "  using var s := new BinarySerializer(); "
+        "  hub.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var hub2 := Hub.Deserialize(d); "
+        "  return (if hub2.Peek = 9 then 42 else 91); "
+        "end Main; end C;"), 42);
+}
