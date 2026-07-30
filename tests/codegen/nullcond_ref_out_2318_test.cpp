@@ -50,27 +50,52 @@
 // a null-conditional call's null-receiver path, on which the callee never
 // runs at all — a third outcome beyond "returned normally" / "threw".
 // DefiniteAssignment.cpp already gives `and`/`or` short-circuiting this
-// per-path treatment (evalCond's branch-local `assigned_` sets) but has NO
-// equivalent for `?.`: a `NullCondMemberExpr`-callee `CallExpr`'s args are
+// per-path treatment (evalCond's branch-local `assigned_` sets) but had NO
+// equivalent for `?.`: a `NullCondMemberExpr`-callee `CallExpr`'s args were
 // walked exactly like an ordinary `.` call's (visitCallArg unconditionally
-// marks an `out` recipient "assigned" on the straight-line path — see
-// DefiniteAssignment.cpp ~line 1344). Admitting `out` through `?.` today
-// would therefore let a non-nullable-reference-typed inline `out var`
-// recipient read as "definitely assigned" on a path where it was never
-// written — exactly the read §22.4 exists to forbid. Rather than invent an
-// uncited narrower rule (e.g. "admit only a pre-declared, already-assigned
-// recipient" — the one sub-case that happens to be safe, verified in an
-// early probe: `n := 10; hh?.Set(out n);` with `hh = null` left `n == 10`,
-// no crash) this fix REJECTS the whole `out`/`out owned`-through-`?.` shape
-// uniformly, with a diagnostic citing §22.3/§7.5 (ExprTypecheck_Calls.cpp,
-// the `NullCondMemberExpr` block). #2345 tracks lifting this once `?.` gets
-// the same per-path DA modeling `and`/`or` already have. `ref` carries no
-// such hazard — it requires the argument already assigned BEFORE the call,
-// so a skipped call leaves an already-valid value; DA does not newly assert
-// anything about it. #2319 (accessor-mediated `ref`/`out` on CONSTRUCTOR
-// calls — ctor sites have no post-call flush point) is a distinct AST shape
-// (`NewExpr`, not this `CallExpr`/`NullCondMemberExpr` pair) and is not
-// touched here.
+// marked an `out` recipient "assigned" on the straight-line path — see
+// DefiniteAssignment.cpp ~line 1344). Admitting `out` through `?.` at the
+// time would therefore have let a non-nullable-reference-typed inline
+// `out var` recipient read as "definitely assigned" on a path where it was
+// never written — exactly the read §22.4 exists to forbid. Rather than
+// invent an uncited narrower rule (e.g. "admit only a pre-declared,
+// already-assigned recipient" — the one sub-case that happens to be safe,
+// verified in an early probe: `n := 10; hh?.Set(out n);` with `hh = null`
+// left `n == 10`, no crash) this fix REJECTED the whole `out`/`out
+// owned`-through-`?.` shape uniformly, with a diagnostic citing §22.3/§7.5
+// (ExprTypecheck_Calls.cpp, the `NullCondMemberExpr` block), and filed
+// #2345 to track lifting this once `?.` gets the same per-path DA modeling
+// `and`/`or` already have. `ref` carries no such hazard — it requires the
+// argument already assigned BEFORE the call, so a skipped call leaves an
+// already-valid value; DA does not newly assert anything about it. #2319
+// (accessor-mediated `ref`/`out` on CONSTRUCTOR calls — ctor sites have no
+// post-call flush point) is a distinct AST shape (`NewExpr`, not this
+// `CallExpr`/`NullCondMemberExpr` pair) and is not touched here.
+//
+// #2345 UPDATE (this file, v0.235): DefiniteAssignment.cpp now has that
+// per-path modeling (evalNullCondCallArgs, mirroring evalCond's and/or
+// split — see DefiniteAssignment.cpp), and ExprTypecheck_Calls.cpp's
+// NullCondMemberExpr block narrows the ban to the two shapes NOT yet
+// verified safe: any `out owned` callee parameter (every caller spelling —
+// the ownership pass's own treatment of a conditionally-run `out owned`
+// assignment through `?.` is unaudited) and an accessor-mediated
+// pre-declared target (`out arr[i]`, `out obj.Prop` — #1302's bracket has
+// only been verified composed with `?.` for `ref`, never `out`). Both
+// remain rejected below (filed #2393). A pre-declared bare-identifier
+// local/parameter recipient and the inline `out var x` form are now
+// admitted, gated on DA: a non-nullable-reference inline recipient is
+// definitely-assigned only immediately within the call's own live
+// continuation, so ANY later read is a DA "read of unassigned local" error
+// — regardless of the receiver's actual runtime nullness, since DA does not
+// perform cross-statement null-flow narrowing of the receiver — while a
+// NULLABLE inline recipient (never DA-tracked, §22.4's
+// `inlineOutVarNeedsDA`) is always definitely-assigned and usable behind an
+// ordinary nullable-narrowing guard. See
+// nullcond_out_da_2345_test.cpp for the DA-focused coverage (chained
+// access, the null-forgiving `!` non-interaction, and the accepted/
+// rejected shape matrix); the two tests immediately below are updated in
+// place because their expected OUTCOME changed, per this task's explicit
+// instruction that a lifted rejection's test must change.
 
 #include "support/aot_support.hpp"   // runAot — the real bezelc AOT oracle
 #include "support/codegen_support.hpp"
@@ -259,21 +284,32 @@ BEZEL_TEST(nullcond_ref_out_2318, ref_to_string_local_writes_back_no_miscompile)
 }
 
 // =============================================================================
-// `out` through `?.` — declined uniformly (see the file header's recorded
-// decision). Both the inline `out var` form (the one with a live DA hazard)
-// and a pre-declared-local form (the one that happens to be runtime-safe)
-// are rejected identically, and the diagnostic text is asserted per the
-// task's "reject-tests must assert the diagnostic text" requirement.
+// `out` through `?.` — narrowed by #2345 (see the file header's updated
+// decision). The inline `out var` form (v0.235: admitted at sema, but a
+// non-nullable recipient is now caught by DefiniteAssignment.cpp's own
+// per-path split whenever it is READ afterward) and the pre-declared-local
+// form (now admitted outright — runtime-safe and DA-transparent, since the
+// recipient was already assigned before the call) diverge in outcome; the
+// `out owned` shape remains rejected. Reject-test diagnostic text is
+// asserted per the task's requirement.
 // =============================================================================
 
-// The inline `out var` form: this is the shape with the actual DA hazard
-// (a non-nullable-reference-typed recipient that DefiniteAssignment.cpp does
-// not currently gate on `?.`'s short-circuit). Rejected before it can reach
-// codegen (which — absent the sema check — hit a DIFFERENT internal failure
-// here, `internal: lowerExpr returned null for call argument in
-// buildOrderedArgs — #1386`, confirmed live while developing this fix; the
-// sema rejection below preempts it with a clean, spec-cited diagnostic).
-BEZEL_TEST(nullcond_ref_out_2318, out_var_through_nullcond_call_is_rejected) {
+// The inline `out var` form, READ afterward: this is the shape with the DA
+// hazard (a non-nullable-reference-typed recipient). v0.235: no longer
+// blocked by ExprTypecheck_Calls.cpp's blanket ban — it now reaches
+// DefiniteAssignment.cpp, whose new per-path split (evalNullCondCallArgs)
+// marks `b` assigned only within the call's own non-null continuation, so
+// the read at `return b.V;` is DA's ordinary "read of unassigned local"
+// diagnostic, not the old §22.3/§7.5 sema message. This is deliberately
+// unconditional on the receiver's actual runtime nullness (`hh` is null
+// here, but the SAME rejection fires even with a non-null `hh` — see
+// nullcond_out_da_2345_test.cpp's
+// out_var_read_afterwards_rejected_even_when_receiver_provably_nonnull —
+// because DA does not perform cross-statement null-flow narrowing of the
+// receiver; only the per-path split WITHIN the `?.` call's own args gets the
+// and/or-style precision).
+BEZEL_TEST(nullcond_ref_out_2318,
+           out_var_through_nullcond_call_used_afterwards_is_rejected_by_da) {
     auto r = runAot(
         "module M; class Box public V: int := 42; end Box; "
         "class Helper "
@@ -285,22 +321,40 @@ BEZEL_TEST(nullcond_ref_out_2318, out_var_through_nullcond_call_is_rejected) {
         "    return b.V; "
         "  end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    bool cited22_3 = false, cited7_5 = false;
+    bool citedUnassigned = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
-        if (d.message.find("§22.3") != std::string::npos) cited22_3 = true;
-        if (d.message.find("§7.5") != std::string::npos) cited7_5 = true;
+        if (d.message.find("read of unassigned local `b`") !=
+            std::string::npos)
+            citedUnassigned = true;
     }
-    BEZEL_EXPECT_TRUE(cited22_3);
-    BEZEL_EXPECT_TRUE(cited7_5);
+    BEZEL_EXPECT_TRUE(citedUnassigned);
 }
 
-// The pre-declared-local form: even though this specific sub-case is
-// runtime-safe (verified in an early probe: it compiles and runs correctly
-// both null and non-null before the sema rejection was added), it is
-// rejected too — a uniform rule rather than an uncited two-tier one (see the
-// file header). Same diagnostic as the inline-`out var` case.
-BEZEL_TEST(nullcond_ref_out_2318, out_predeclared_local_through_nullcond_call_is_rejected) {
-    auto r = runAot(
+// The pre-declared-local form: this sub-case is DA-transparent (the
+// recipient was already in `assigned_` before the call, so DA's new
+// intersection — {n} on both the call-ran and call-skipped continuations —
+// leaves it assigned unconditionally afterward) AND runtime-safe
+// (#2318's own probe: `n := 10; hh?.Set(out n);` with `hh = null` left
+// `n == 10`, no crash) — so #2345 admits it outright. Null-receiver case
+// (companion non-null case immediately below).
+BEZEL_TEST(nullcond_ref_out_2318,
+           out_predeclared_local_through_nullcond_call_is_accepted_null_receiver) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Helper "
+        "  public method Set(out a: int) a := 99; end Set; "
+        "end Helper; class C "
+        "  public static method Main(): int "
+        "    var hh: Helper? := null; "
+        "    var n := 10; "
+        "    hh?.Set(out n); "
+        "    return n; "
+        "  end Main; end C;"), 10);
+}
+
+// Same shape, non-null receiver: the call runs and `n` is overwritten.
+BEZEL_TEST(nullcond_ref_out_2318,
+           out_predeclared_local_through_nullcond_call_is_accepted_nonnull_receiver) {
+    BEZEL_EXPECT_EQ(run(
         "module M; class Helper "
         "  public method Set(out a: int) a := 99; end Set; "
         "end Helper; class C "
@@ -310,17 +364,14 @@ BEZEL_TEST(nullcond_ref_out_2318, out_predeclared_local_through_nullcond_call_is
         "    var n := 10; "
         "    hh?.Set(out n); "
         "    return n; "
-        "  end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    bool cited = false;
-    for (const auto& d : r.diagnostics.diagnostics())
-        if (d.message.find("§22.3") != std::string::npos) cited = true;
-    BEZEL_EXPECT_TRUE(cited);
+        "  end Main; end C;"), 99);
 }
 
-// `out owned` through `?.` is rejected by the same check (the modifier
-// string starts with "out" either way) — pinned so a future refactor of the
-// check's string match cannot silently narrow it to plain `out` only.
+// `out owned` through `?.` remains rejected: the OWNERSHIP pass's own
+// treatment of a conditionally-run `out owned` assignment through `?.`
+// is unaudited by #2345 (filed #2393) — admitting it risks reintroducing
+// #2318's hazard in a different pass. Same §22.3/§7.5-citing diagnostic
+// family, now naming the specific reason.
 BEZEL_TEST(nullcond_ref_out_2318, out_owned_through_nullcond_call_is_rejected) {
     auto r = runAot(
         "module M; class Cell public N: int; "
@@ -335,6 +386,16 @@ BEZEL_TEST(nullcond_ref_out_2318, out_owned_through_nullcond_call_is_rejected) {
         "    return c.N; "
         "  end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    bool cited22_3 = false, cited7_5 = false, citedOwned = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.message.find("§22.3") != std::string::npos) cited22_3 = true;
+        if (d.message.find("§7.5") != std::string::npos) cited7_5 = true;
+        if (d.message.find("out owned") != std::string::npos)
+            citedOwned = true;
+    }
+    BEZEL_EXPECT_TRUE(cited22_3);
+    BEZEL_EXPECT_TRUE(cited7_5);
+    BEZEL_EXPECT_TRUE(citedOwned);
 }
 
 // =============================================================================

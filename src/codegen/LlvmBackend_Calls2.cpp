@@ -7833,8 +7833,14 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     // value-slot creation — so this is safe regardless of whether the
     // receiver ends up null; the owned inline forms ("out owned var" /
     // "out using var") and any `out owned` callee parameter remain rejected
-    // by ExprTypecheck_Calls.cpp's NullCondMemberExpr check (#2345/#2385),
+    // by ExprTypecheck_Calls.cpp's NullCondMemberExpr check (#2345/#2393),
     // so their disposal-registering branches are never reached through `?.`.
+    // PRE-EXISTING, SEPARATE gap noted while verifying this fix (not touched
+    // here — #2395): that same "out var" branch does not zero-initialize a
+    // NULLABLE recipient's slot, so a nullable inline `out var` read on the
+    // call-skipped path sees uninitialized memory instead of the §7.9/§22.4
+    // default `null` — reproduces identically through plain `and`/`or`
+    // (this call site is new; the branch's own logic is unmodified).
     ensureOutVarSlots(call);
     auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
     // §28.11 / §28.2 / #889: `local?.Dispose()` — the canonical null-safe

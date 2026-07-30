@@ -7494,13 +7494,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         //     (src/ownership/) treatment of a conditionally-run `out owned`
         //     assignment through `?.` has not been audited by this fix;
         //     lifting it risks reintroducing #2318's hazard in the ownership
-        //     pass instead of DA. Filed #2385.
+        //     pass instead of DA. Filed #2393.
         //   - an ACCESSOR-mediated pre-declared target (`out arr[i]`,
         //     `out obj.Prop`) — #1302's copy-in/copy-out bracket composed
         //     with `?.`'s conditional-run has only been verified for `ref`
         //     (nullcond_ref_out_2318_test.cpp's indexer-slot tests), never
         //     for `out`; kept rejected pending that verification. Filed
-        //     #2385.
+        //     #2393.
         MethodSymbol* outMs = dynamic_cast<MethodSymbol*>(calleeSym);
         std::size_t outPos = 0;
         for (const auto& a : ce.args) {
@@ -7546,12 +7546,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             if (ownedCallee) {
                 why = "the parameter is `out owned` — the ownership pass's "
                       "treatment of a conditionally-run `out owned` "
-                      "assignment through `?.` is not yet verified (#2385)";
+                      "assignment through `?.` is not yet verified (#2393)";
             } else if (!bareIdent || targetsField) {
                 why = "the recipient is not a bare local/parameter "
                       "identifier — an indexer-slot/property/field `out` "
                       "target composed with `?.` is not yet verified "
-                      "(#2385)";
+                      "(#2393)";
             } else {
                 why = "the callee may never run when the receiver is null, "
                       "so `out`'s every-normal-path assignment obligation "
@@ -7563,7 +7563,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 "admitted on a null-conditional call (`?.`) — " + why +
                 " (§22.3, §7.5); guard the call explicitly instead: "
                 "`if recv <> null then recv.M(out x); end;` (#2318, #2345, "
-                "#2385)");
+                "#2393)");
             return;
         }
         // §8.1/§8.3/§8.5 (#1075): an inherited Object value-semantics method
