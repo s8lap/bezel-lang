@@ -136,6 +136,51 @@ build_tests() {
     n=$(( n + 1 ))
   done < <(test_binaries)
   [ "$n" -gt 0 ] || die "the test-binary manifest is empty ($MANIFEST)"
+  warn_stale_other_areas
+}
+
+# #2426 (build-tooling, not a compiler bug): --area restricts the BUILD to one
+# area's binary on purpose (that's the whole point — relink ~50 MB instead of
+# ~600 MB after a src/ change). Every OTHER area's binary is therefore left
+# EXACTLY as it was before this run, including possibly still linked against
+# an OLDER libbezel_core.a. That is harmless as long as nothing ever executes
+# those binaries directly without coming back through this script (or a full
+# rebuild) first: agent_check.sh's own default (no --area) mode and
+# scripts/gate.sh both unconditionally rebuild the FULL `bezel_tests` target
+# before running anything, so neither path is exposed to it. But a stale
+# OTHER-area binary invoked directly — e.g. `BEZEL_TEST_FILTER=...
+# build/tests/bezel_tests_ownership` by hand while chasing a specific
+# failure, a very natural thing to do mid-investigation — silently reports
+# results computed against pre-edit object code. This is a real, mechanically
+# confirmed hazard (not a CMake dependency-graph bug: a full `--target
+# bezel_tests` rebuild was verified, repeatedly, to correctly detect and
+# relink every stale area binary here) and a plausible contributor to at
+# least one of the three false failures #2426 catalogs — dispatched_getter_
+# borrow_pin_2174 (tests/ownership) went red the same day a codegen-area fix
+# touched LlvmBackend_impl.hpp and was very likely tested with `--area
+# codegen`/`--area module`, never rebuilding ownership.
+#
+# So: after any --area build, compare every OTHER area binary's mtime against
+# the just-(possibly-)rebuilt libbezel_core.a and warn, loudly and by name,
+# about any that are older. Purely additive (stderr only) — no behaviour or
+# timing change to the build itself.
+warn_stale_other_areas() {
+  [ -n "$AREA" ] || return 0
+  [ -r "$MANIFEST" ] || return 0
+  local core_a="$BUILD_DIR/libbezel_core.a"
+  [ -f "$core_a" ] || return 0
+  local grp path rest stale=()
+  while IFS=$'\t' read -r grp path rest; do
+    [ -n "$grp" ] || continue
+    [ "$grp" = "$AREA" ] && continue
+    [ -x "$path" ] || continue
+    [ "$path" -ot "$core_a" ] && stale+=("$grp: $path")
+  done < "$MANIFEST"
+  if [ "${#stale[@]}" -gt 0 ]; then
+    echo "agent_check: WARNING (#2426) — --area $AREA left ${#stale[@]} other area binar$([ "${#stale[@]}" -eq 1 ] && echo y || echo ies) OLDER than the just-built libbezel_core.a:" >&2
+    printf '  %s\n' "${stale[@]}" >&2
+    echo "  They still hold PRE-EDIT object code. Do not run them directly — re-run agent_check.sh without --area, or rebuild that target explicitly, first." >&2
+  fi
 }
 
 # Which binaries hold at least one test matching $1? BEZEL_TEST_ENUMERATE lists

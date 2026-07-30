@@ -109,6 +109,16 @@ scripted by `scripts/extract_diag_to_lit.py`.
   (the binaries ignore `--gtest_filter`). `BEZEL_TEST_ENUMERATE=1` prints what a
   process *would* run (`suite.name` per line) and exits without running — use it
   to find which area holds a test, or to verify a shard partition.
+  ⚠ **This form does NOT rebuild anything.** After a `src/` change,
+  `scripts/agent_check.sh --area <group> <filter>` legitimately relinks only
+  *that* group's binary (that's the point — ~50 MB instead of ~600 MB), so
+  every OTHER group's binary on disk is left exactly as it was, possibly still
+  linked against an older `libbezel_core.a` (`agent_check.sh` now warns about
+  this by name — see #2426). Running one of those stale binaries directly
+  reports results computed against pre-edit object code with no indication
+  anything is wrong. Rebuild first (`agent_check.sh` with no `--area`, or
+  `cmake --build build --target bezel_tests_<group>`) before trusting a
+  by-hand run of a binary you didn't just build yourself.
 - Exact-list subset (#2100): `BEZEL_TEST_LIST=<file>` — one `suite.name` per
   line, exact match, composable with the filter. Each binary's summary then
   carries an explicit `N selected` field and `run_parallel.sh` switches its
