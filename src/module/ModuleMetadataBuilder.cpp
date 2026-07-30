@@ -735,6 +735,16 @@ MetaParam convertParam(const sema::ParameterSymbol& p, sema::SemaContext& ctx) {
         mp.type = convertType(p.resolvedDeclType);
     else
         mp.type = convertAstType(p.declType, ctx);
+    // §22.4 / §12.1 (#2392): carry the `when true`/`when false` out-
+    // nullability postcondition so an importer can reconstruct
+    // ParameterSymbol::outNullPostcond for an override-signature comparison
+    // against this (possibly base) parameter. The `when` clause is ALSO
+    // exported as a contract record (below, canonical text like
+    // "not result or %0 <> null") — that is the §2.8.2 contract-record
+    // mechanism for §22.16 proving/consumption, a distinct purpose from this
+    // per-parameter field, which exists so the override-match check has a
+    // structured value to compare rather than needing to parse contract text.
+    mp.outNullWhen = static_cast<std::uint8_t>(p.outNullPostcond);
     // §22.5 default value (textual). The ast::Param carries the default
     // expression; the ParameterSymbol's `decl` is not the Param, so we read the
     // default from the owning declaration where available. We only have the

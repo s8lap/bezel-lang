@@ -113,6 +113,11 @@ void hashParam(std::uint64_t& h, const MetaParam& p) {
     hashType(h, p.type);
     hashBool(h, p.hasDefault);
     hashStr(h, p.defaultText);
+    // §22.4 / §12.1 (#2392): part of the parameter's signature identity —
+    // §2.8.3 rule 3 requires every embedded description of a type/member to
+    // agree, and a differing postcondition is exactly the kind of signature
+    // disagreement that rule flags as staleness.
+    hashByte(h, p.outNullWhen);
 }
 
 void hashContract(std::uint64_t& h, const MetaContractRecord& c) {
@@ -256,7 +261,8 @@ bool MetaGenericParam::operator==(const MetaGenericParam& o) const {
 
 bool MetaParam::operator==(const MetaParam& o) const {
     return name == o.name && modifier == o.modifier && type == o.type &&
-           hasDefault == o.hasDefault && defaultText == o.defaultText;
+           hasDefault == o.hasDefault && defaultText == o.defaultText &&
+           outNullWhen == o.outNullWhen;
 }
 
 // §11.3 / §9.2 (issue #501 / #502): MetaMember copy — needed because
@@ -400,7 +406,13 @@ void emitGeneric(llvm::BitstreamWriter& w, const MetaGenericParam& g) {
 
 void emitParam(llvm::BitstreamWriter& w, const MetaParam& p) {
     w.EnterSubblock(PARAM_BLOCK, 4);
-    llvm::SmallVector<std::uint64_t, 1> sc{p.hasDefault ? 1u : 0u};
+    // §2392: outNullWhen is a 2nd, additive trailing scalar (see the
+    // kSchemaVersion comment in ModuleMetadata.hpp) — old readers only
+    // consult sc[0] and ignore the rest.
+    llvm::SmallVector<std::uint64_t, 2> sc{
+        p.hasDefault ? 1u : 0u,
+        static_cast<std::uint64_t>(p.outNullWhen),
+    };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, p.name);
     emitString(w, p.modifier);
@@ -857,9 +869,13 @@ bool readGeneric(Reader& r, MetaGenericParam& g) {
 }
 
 bool readParamBody(Reader& r, MetaParam& p) {
-    llvm::SmallVector<std::uint64_t, 1> sc;
+    llvm::SmallVector<std::uint64_t, 2> sc;
     if (!expectScalars(r, sc) || sc.empty()) return false;
     p.hasDefault = sc[0] != 0;
+    // §2392: outNullWhen is a 2nd, additive trailing scalar — absent (a
+    // pre-#2392 blob) reads as 0/None, matching every such blob's implicit
+    // value before this field existed.
+    p.outNullWhen = sc.size() >= 2 ? static_cast<std::uint8_t>(sc[1]) : 0;
     if (!expectString(r, p.name)) return false;
     if (!expectString(r, p.modifier)) return false;
     if (!expectString(r, p.defaultText)) return false;

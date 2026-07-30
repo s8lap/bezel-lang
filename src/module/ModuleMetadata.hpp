@@ -161,6 +161,29 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // instantiation") was violated silently (the shared LinkOnceODR cell #1513
 // wired up stayed zero forever). No bump: purely additive, same rule as
 // methodBodyText.
+//
+// §22.4 / §12.1 (#2392, additive within v7): MetaParam::outNullWhen — the
+// `when true`/`when false` out-nullability postcondition (0/1/2 mirroring
+// ast::OutNullWhen), a SECOND scalar appended to PARAM_BLOCK's existing
+// REC_SCALARS record (previously just `[hasDefault]`). No bump: the rule
+// above is that a bump is reserved for a change that makes an OLD reader
+// misinterpret an EXISTING field; this only adds a trailing scalar a v<=7
+// reader's `sc.size() < 1` check still accepts (it never looks past index 0),
+// and a v8+ reader given a pre-#2392 blob (only 1 scalar present) reads the
+// missing second scalar as 0/None — the same value every such blob's
+// parameters implicitly had before this field existed, so no blob is
+// misread. Before this field, ModuleLoader::convertParams built every
+// imported ParameterSymbol with outNullPostcond stuck at its default None
+// regardless of the exporting module's actual declaration, so
+// checkOverrideSignatureMatch's exact-match comparison
+// (dp->outNullPostcond != bp->outNullPostcond, §12.1) false-rejected any
+// correct override of an imported base method/indexer whose base parameter
+// declared `when true`/`when false` — recompiling the base module against
+// this field picks the fix up for existing dependents (§2.8.5 disclaims ABI
+// stability across recompilation; this project's model is recompile-the-
+// world, so a stale pre-#2392 dependency artifact keeps the old false-reject
+// behavior until its own module is recompiled, same as any other additive
+// field in this schema).
 inline constexpr std::uint32_t kSchemaVersion = 7;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
@@ -280,6 +303,16 @@ struct MetaParam {
     MetaType type;
     bool hasDefault = false;
     std::string defaultText; // §22.5 textual default; empty when !hasDefault
+    // §22.4 (v0.183, #1585) / §12.1 (v0.235, #2392): the `when true`/`when
+    // false` out-nullability postcondition, mirroring ast::OutNullWhen
+    // (0 = None, 1 = WhenTrue, 2 = WhenFalse). §12.1 requires an override to
+    // match this exactly, so ModuleLoader::convertParams must be able to
+    // reconstruct sema::ParameterSymbol::outNullPostcond for an IMPORTED base
+    // method's parameter — without this field the reconstructed parameter
+    // always read None regardless of what the exporting module declared,
+    // producing a false reject of a correct override (issue #2392). Absent
+    // (reads as 0/None) on a pre-#2392 blob — see the kSchemaVersion comment.
+    std::uint8_t outNullWhen = 0;
 
     bool operator==(const MetaParam&) const;
 };

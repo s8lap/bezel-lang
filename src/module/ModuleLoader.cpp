@@ -256,6 +256,16 @@ struct Loader {
             // no syntactic ast::Type to attach), via resolvedDeclType — the
             // field identifier resolution / codegen reads when declType is null.
             p->resolvedDeclType = convert(mp.type);
+            // §22.4 / §12.1 (#2392): reconstruct the `when true`/`when false`
+            // out-nullability postcondition from MetaParam::outNullWhen, the
+            // same way resolvedDeclType is reconstructed just above. Without
+            // this, an imported base parameter's outNullPostcond stayed stuck
+            // at its default None regardless of what the exporting module
+            // declared, so checkOverrideSignatureMatch's exact-match
+            // comparison (§12.1) false-rejected any correct override that
+            // faithfully repeated the base's `when` clause.
+            p->outNullPostcond =
+                static_cast<ast::OutNullWhen>(mp.outNullWhen);
             out.push_back(p);
         }
         return out;
