@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | **Status** | **superseded — graduated v0.231** (owner-accepted 2026-07-29; Q1–Q3/Q5 resolutions recorded in the v0.231 changelog entry; item 4/Q4 landed ahead at v0.230 with the #2243 ruling) |
-| **Tracking issue** | — |
+| **Tracking issue** | [#2348](https://github.com/s8lap/bezel-lang/issues/2348) (implementation) |
 | **Target module(s)** | stdlib only — `System` ([§2.4](../Bezel_Standard_Library.md#sec-environment) `Environment`, [§2.6](../Bezel_Standard_Library.md#sec-guid) `Guid`, [§2.18](../Bezel_Standard_Library.md#sec-iformattable) format specifiers), the [§9.6](../Bezel_Standard_Library.md#sec-string) `String` primitive, plus one [§1](../Bezel_Standard_Library.md#sec-conventions) convention sentence and one [§4.8](../Bezel_Standard_Library.md#sec-dictionaryk-v) disambiguating clause. **No spec change, no new types, no new grammar.** |
 | **Written against** | stdlib/spec v0.228 |
 | **Origin** | The 2026-07-28 owner-directed API design review ("we copy .NET too often — can the common use cases be clearer/simpler/easier?"), adversarially critiqued; every item below survived the critique, and the candidates it killed are recorded in §7 with the critique's reasons. The review's single recurring *design* question — the nullable-return tier — is not here; it has its own home (proposal [0072](0072-nullable-return-convenience-tier.md)). |
