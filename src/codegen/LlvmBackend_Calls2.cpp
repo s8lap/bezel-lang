@@ -4083,8 +4083,53 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         recvTy->declaration->kind == ast::TypeDeclKind::Class) {
                     llvm::Value* src = lowerExpr(*ma->target);
                     if (src && src->getType()->isPointerTy()) {
+                        // fix #2440 (§28 preamble/§28.9, §29.1, v0.235; the
+                        // #2424 root cause, extended to this call site): a
+                        // bare TEMPORARY receiver (`new IntRange(1, 5)
+                        // .GetEnumerator()` — the `new` result is bound to no
+                        // other name anywhere) has no independent disposer —
+                        // wrapUserClassAsIEnumerable's returned wrapper is the
+                        // ONLY thing the caller ever names (via its own
+                        // `using var e := ...` / scope-end disposal), so the
+                        // wrapper itself must own reclaiming `src` too.
+                        // A NAMED receiver (`s.GetEnumerator()` on a
+                        // local/param/field/auto-property `s`) is disposed at
+                        // ITS OWN lifetime end by the ordinary disposal
+                        // machinery — freeing it again here would
+                        // double-free. Classification is IDENTICAL to the
+                        // already-shipped #2376 sibling fix just below in
+                        // this same `.GetEnumerator()` handling (the
+                        // isVtableBackedIEnumerableType branch's
+                        // `sourceIsNamed` — same ctx_.exprSymbol test, same
+                        // Local/Parameter/Field/auto-property gate), reused
+                        // here verbatim rather than re-derived, since both
+                        // sites are classifying the SAME kind of expression
+                        // (a `.GetEnumerator()` call's receiver) for the SAME
+                        // reason. Unlike #2376's branch, there is no separate
+                        // "clone vs original" split here — src is CONSUMED
+                        // directly into the one wrapper struct the caller
+                        // will dispose, so the classification feeds
+                        // wrapUserClassAsIEnumerable's ownsSrc runtime flag
+                        // (struct slot 3) rather than a second disposeStack_
+                        // registration.
+                        bool srcIsNamedOwner = false;
+                        if (sema::Symbol* sym = ctx_.exprSymbol(*ma->target)) {
+                            if (dynamic_cast<sema::LocalSymbol*>(sym) !=
+                                    nullptr ||
+                                dynamic_cast<sema::ParameterSymbol*>(sym) !=
+                                    nullptr ||
+                                dynamic_cast<sema::FieldSymbol*>(sym) !=
+                                    nullptr) {
+                                srcIsNamedOwner = true;
+                            } else if (auto* ps = dynamic_cast<
+                                           sema::PropertySymbol*>(sym)) {
+                                srcIsNamedOwner =
+                                    sema::isAutoPropertySymbol(ps);
+                            }
+                        }
                         llvm::Value* wrapped = wrapUserClassAsIEnumerable(
-                            src, recvTy->declaration, resultTy);
+                            src, recvTy->declaration, resultTy,
+                            /*ownsSrc=*/!srcIsNamedOwner);
                         if (wrapped) return wrapped;
                     }
                 }
