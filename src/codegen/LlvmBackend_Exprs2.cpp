@@ -1068,8 +1068,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         if (!alreadyBoxed && !wasGuardedParam &&
             currentFn_ == cellFreeEligibleFn_ &&
             cellFreeEligible_.count(static_cast<const void*>(sym))) {
-            lastLambdaCapturedCells_.push_back({newSlot,
-                                                static_cast<const void*>(sym)});
+            LastCellEntry lce{newSlot, static_cast<const void*>(sym)};
+            // fix #2334: propagate the TaskScope.Spawn unwind-unsafety onto
+            // this entry so consumeLastLambdaCapturedCells suppresses the
+            // free on the unwind edge (Disposal::skipCellFreeOnUnwind).
+            lce.unwindUnsafe =
+                unwindUnsafeCellFree_.count(static_cast<const void*>(sym)) !=
+                0;
+            lastLambdaCapturedCells_.push_back(lce);
         }
         // #429/#672: resolve sema type for retain/release classification.
         if (auto* par = dynamic_cast<const sema::ParameterSymbol*>(sym)) {
@@ -1279,10 +1285,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // iteration can re-enter the arm.
             bool guardedOk = !wasGuardedLocal || isPatternBinding ||
                              (inlineN > 0 && loopStack_.empty());
-            if (guardedOk)
-                lastLambdaCapturedCells_.push_back({newSlot,
-                                                    static_cast<const void*>(decl),
-                                                    inlineN});
+            if (guardedOk) {
+                LastCellEntry lce{newSlot, static_cast<const void*>(decl),
+                                  inlineN};
+                // fix #2334: see the param-capture site above.
+                lce.unwindUnsafe = unwindUnsafeCellFree_.count(
+                                       static_cast<const void*>(decl)) != 0;
+                lastLambdaCapturedCells_.push_back(lce);
+            }
         }
         // #429/#672: resolve sema type for retain/release classification.
         for (const sema::Symbol* s : capturedSyms) {

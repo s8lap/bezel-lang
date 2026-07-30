@@ -5314,6 +5314,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // #429 / §27.5: which captured locals/params have ALL-non-escaping lambdas
     // and may have their boxed cells freed at outer-scope exit.
     cellFreeEligible_.clear();
+    unwindUnsafeCellFree_.clear();  // fix #2334
     cellFreeEligibleFn_ = fn;
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts) {
         collectUnwindIneligible(*ci.stmts);
@@ -8745,6 +8746,7 @@ void Emitter::consumeLastLambdaCapturedCells() {
                 if (!alreadyDeferred) {
                     Disposal dcd{ce.newSlot, nullptr};
                     dcd.boxedCellFreeDeferred = true;
+                    dcd.skipCellFreeOnUnwind = ce.unwindUnsafe;  // fix #2334
                     disposeStack_[ownerScopeIdx].push_back(dcd);
                 }
             }
@@ -8784,6 +8786,7 @@ void Emitter::consumeLastLambdaCapturedCells() {
                 if (!alreadyDeferred) {
                     Disposal dcd{ce.newSlot, nullptr};
                     dcd.boxedCellFreeDeferred = true;
+                    dcd.skipCellFreeOnUnwind = ce.unwindUnsafe;  // fix #2334
                     disposeStack_[ownerScopeIdx].push_back(dcd);
                     if (ce.inlineArrayN > 0) {
                         Disposal da{ce.newSlot, nullptr};
@@ -8797,6 +8800,7 @@ void Emitter::consumeLastLambdaCapturedCells() {
         }
         Disposal dc{ce.newSlot, nullptr};
         dc.boxedCellFree = true;
+        dc.skipCellFreeOnUnwind = ce.unwindUnsafe;  // fix #2334
         disposeStack_.back().push_back(dc);
         // #782: a captured move-only OWNING inline-array's elements live in the
         // boxed cell. Dispose each non-null element THROUGH the cell, then null
@@ -15809,10 +15813,13 @@ void Emitter::collectDefinitelyEscapingLambdas(
 void Emitter::collectCellFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     cellFreeEligible_.clear();
+    unwindUnsafeCellFree_.clear();  // fix #2334
 
     // Sets to accumulate captured entities per classification.
     std::unordered_set<const void*> capturedByNonEscaping; // LocalDecl* / Symbol*
     std::unordered_set<const void*> capturedByEscaping;    // same keys
+    // fix #2334: see LambdaFinder::capturedByNonEscapingUnwindUnsafe.
+    std::unordered_set<const void*> capturedByNonEscapingUnwindUnsafe;
 
     // Walk ALL expressions in the function body looking for LambdaExpr nodes.
     // We use two walkers:
@@ -15829,6 +15836,12 @@ void Emitter::collectCellFreeEligible(
         const std::unordered_set<const void*>& closureNonEscaping; // closureReleaseEligible_
         std::unordered_set<const void*>& capturedByNonEscaping;
         std::unordered_set<const void*>& capturedByEscaping;
+        // fix #2334: symbols added to capturedByNonEscaping specifically via
+        // the TaskScope.Spawn special case below (as opposed to the IIFE /
+        // ordinary `var f := lambda` non-escaping forms, which are sound on
+        // BOTH exit edges). See Disposal::skipCellFreeOnUnwind for why a
+        // Spawn-sourced capture needs the unwind edge suppressed.
+        std::unordered_set<const void*>& capturedByNonEscapingUnwindUnsafe;
 
         // Track whether we're inside a "direct initializer" position for a
         // `var` local that is in closureReleaseEligible_. Only at the TOP
@@ -15957,7 +15970,8 @@ void Emitter::collectCellFreeEligible(
         }
 
         void collectLambdaCaptures(const ast::LambdaExpr* lam,
-                                   Emitter& /*em*/, bool isNonEscaping) {
+                                   Emitter& /*em*/, bool isNonEscaping,
+                                   bool unwindUnsafe = false) {
             std::unordered_set<const sema::Symbol*> syms;
             if (lam->exprBody) walkExpr(ctx, lam->exprBody.get(), syms);
             for (auto& s : lam->stmts) walkStmt(ctx, s.get(), syms);
@@ -15970,6 +15984,23 @@ void Emitter::collectCellFreeEligible(
                     } else if (dynamic_cast<const sema::ParameterSymbol*>(s)) {
                         capturedByNonEscaping.insert(
                             static_cast<const void*>(s));
+                    }
+                }
+                // fix #2334: tag the same symbols unwind-unsafe when this
+                // capture's non-escaping proof came from the TaskScope.Spawn
+                // special case (see the field's own comment for why).
+                if (unwindUnsafe) {
+                    for (const sema::Symbol* s : syms) {
+                        if (auto* loc =
+                                dynamic_cast<const sema::LocalSymbol*>(s)) {
+                            if (loc->decl)
+                                capturedByNonEscapingUnwindUnsafe.insert(
+                                    static_cast<const void*>(loc->decl));
+                        } else if (dynamic_cast<const sema::ParameterSymbol*>(
+                                       s)) {
+                            capturedByNonEscapingUnwindUnsafe.insert(
+                                static_cast<const void*>(s));
+                        }
                     }
                 }
             } else {
@@ -16160,7 +16191,124 @@ void Emitter::collectCellFreeEligible(
                 } else {
                     expr(c->callee.get(), false);
                 }
-                for (auto& a : c->args) expr(a.value.get(), false); return; }
+                // fix #2334 / §28.14 / §28.9 (v0.235): a lambda LITERAL passed
+                // directly as the sole argument of `scope.Spawn(...)` — stdlib
+                // §6.10's `scoped` callback parameter — where `scope` is a
+                // `using var`/`await using var` LOCAL of the CURRENT function,
+                // is treated as NON-ESCAPING for cellFreeEligible_ purposes,
+                // exactly like the IIFE case above — though for a DIFFERENT
+                // reason: the closure genuinely outlives the call (§28.14's
+                // storage-bounded admission), it just never outlives the
+                // captured local's own scope.
+                //
+                // Soundness: §28.14's admission for a `scoped` argument whose
+                // bounding object is the plain call RECEIVER (form 5, no
+                // owned-field chain or using-var-initializer return in play)
+                // requires the receiver itself to resolve to a `using var`/
+                // `await using var` local `L`, and every captured LOCAL
+                // source to be declared BEFORE `L` in the same or an
+                // enclosing scope — a precondition the ownership pass has
+                // ALREADY verified for this program to have reached codegen
+                // at all. So every captured local's own enclosing scope ends
+                // AT OR AFTER `L` (`scope`) does. `scope`'s disposal
+                // (`TaskScope.DisposeAsync`, stdlib §6.10) is contractually
+                // QUIESCENT (§28.14 "Quiescence": disposal must guarantee no
+                // stored callback runs after disposal completes) — the
+                // runtime backs this: bz_task_scope_spawn's per-child
+                // completion callback drops the closure's transferred +1
+                // (bezel_runtime_concurrency.cpp) strictly before the scope's
+                // pending count reaches zero, which is strictly before
+                // Join()/DisposeAsync() settle. So by the time a captured
+                // local's OWN scope-end is reached, the closure has already
+                // run its last invocation.
+                //
+                // Marking the capture non-escaping here routes it through the
+                // EXISTING, already-sound cellFreeEligible_ /
+                // consumeLastLambdaCapturedCells() "owner-disposal-deferred"
+                // machinery: the cell is freed AFTER any of the captured
+                // local's OWN disposal reads (the #966/#1017 guard), at the
+                // captured local's OWN scope end — NEVER inside the closure's
+                // own envdtor. This is a deliberate DEPARTURE from the
+                // envdtor-based free the issue's root-cause note sketched
+                // (mirroring #694's `definitelyEscapingLambdas_`): that
+                // mechanism frees the cell whenever the closure itself is
+                // last-dropped, which — for a Spawn'd task — can run
+                // arbitrarily EARLIER than the captured local's own scope end
+                // (e.g. while a SIBLING child is still draining), racing a
+                // later same-scope read/disposal of the captured local
+                // through the same cell (verified UAF-prone by tracing
+                // bz_task_scope_spawn's completion-callback ordering against
+                // `using var` disposal order — see the issue's fix commit for
+                // the full trace). The scope-end mechanism used here has no
+                // such race: it is governed by lexical program order, not by
+                // when the closure itself happens to drop.
+                //
+                // Narrowed to TaskScope.Spawn specifically, not every
+                // `scoped` call position: the same "declared-before +
+                // quiescent disposal" argument also holds for other §28.14
+                // register positions bound by a using-var (e.g. a `using var
+                // sub := pub.Clicked.Subscribe(h)`), but a `this`-bounded
+                // scoped registration (the common event-handler idiom,
+                // `this._clicked.Add(h)`) has NO current-method-scoped bound
+                // at all — the closure can run for as long as `this` lives,
+                // far past the subscribing method's own return — so blindly
+                // widening this optimization to every `scoped` position would
+                // free a captured local's cell while a long-lived
+                // registration could still invoke the stored callback: a real
+                // use-after-free. Widening beyond TaskScope.Spawn to the
+                // other declared-before-bounded register positions is left to
+                // a follow-up (bounding-object resolution would need to
+                // mirror MethodOwnership::scopedFormalAt's callee matching,
+                // Ownership_Checks.cpp) — filed as issue #2383.
+                bool spawnArgHandled = false;
+                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                        c->callee.get())) {
+                    if (ma->member == "Spawn" && ma->target &&
+                            c->args.size() == 1 && c->args[0].value) {
+                        if (auto* spawnLam =
+                                dynamic_cast<const ast::LambdaExpr*>(
+                                    c->args[0].value.get())) {
+                            // Mirrors MethodOwnership::typeRefIsTaskScope's
+                            // name resolution (Ownership_Checks.cpp);
+                            // duplicated here since that helper lives on a
+                            // different pass and is not reachable from this
+                            // codegen pre-scan.
+                            const sema::TypeRef* rt = ctx.exprType(*ma->target);
+                            bool isTaskScope =
+                                rt && rt->kind == sema::TypeRef::Kind::Named &&
+                                (rt->declaration
+                                     ? rt->declaration->name == "TaskScope"
+                                     : (rt->astNode && rt->astNode->name &&
+                                                !rt->astNode->name->parts
+                                                     .empty()
+                                            ? rt->headName() == "TaskScope"
+                                            : rt->importedName ==
+                                                  "TaskScope"));
+                            if (isTaskScope) {
+                                if (auto* loc =
+                                        dynamic_cast<sema::LocalSymbol*>(
+                                            ctx.exprSymbol(*ma->target))) {
+                                    if (auto* ld = dynamic_cast<
+                                            const ast::LocalDecl*>(
+                                                loc->decl)) {
+                                        if (ld->isUsing) {
+                                            collectLambdaCaptures(
+                                                spawnLam, em,
+                                                /*isNonEscaping=*/true,
+                                                /*unwindUnsafe=*/true);
+                                            spawnArgHandled = true;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for (std::size_t ai = 0; ai < c->args.size(); ++ai) {
+                    if (spawnArgHandled && ai == 0) continue;
+                    expr(c->args[ai].value.get(), false);
+                }
+                return; }
             if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
                 expr(c->callee.get(), false);
                 for (auto& a : c->args) expr(a.value.get(), false); return; }
@@ -16250,7 +16398,8 @@ void Emitter::collectCellFreeEligible(
     };
 
     LambdaFinder finder{ctx_, *this, closureReleaseEligible_,
-                        capturedByNonEscaping, capturedByEscaping};
+                        capturedByNonEscaping, capturedByEscaping,
+                        capturedByNonEscapingUnwindUnsafe};
     for (auto& s : body) finder.stmt(s.get());
 
     // A captured entity qualifies iff:
@@ -16258,9 +16407,17 @@ void Emitter::collectCellFreeEligible(
     //     captures it → it was boxed and should be freed), AND
     //   - it does NOT appear in capturedByEscaping (no escaping lambda holds
     //     a cell pointer that would outlive the scope).
+    // fix #2334: ANY Spawn-sourced capture of this key taints the whole cell
+    // as unwind-unsafe, regardless of whether an ordinary-safe capture ALSO
+    // exists — the hazard is that the Spawn-registered closure may still be
+    // live on the unwind edge (TaskScope.DisposeAsync's non-blocking zombie
+    // drain, #1422), independent of any other lambda's own safety.
     for (const void* key : capturedByNonEscaping) {
-        if (!capturedByEscaping.count(key))
+        if (!capturedByEscaping.count(key)) {
             cellFreeEligible_.insert(key);
+            if (capturedByNonEscapingUnwindUnsafe.count(key))
+                unwindUnsafeCellFree_.insert(key);
+        }
     }
 }
 

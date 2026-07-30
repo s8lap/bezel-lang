@@ -476,6 +476,13 @@ private:
         // by this (non-escaping) lambda — drives an element-dispose-through-cell
         // disposal next to the boxedCellFree. 0 otherwise.
         unsigned inlineArrayN = 0;
+        // fix #2334 / §28.14 / §28.9: true when `key`'s ONLY route into
+        // cellFreeEligible_ includes the TaskScope.Spawn special case
+        // (unwindUnsafeCellFree_ pre-scan result) — propagated onto the
+        // Disposal::skipCellFreeOnUnwind entries consumeLastLambdaCapturedCells
+        // registers, so the cell-free is skipped on the unwind edge (see that
+        // flag's declaration for the full soundness argument).
+        bool unwindUnsafe = false;
     };
     std::vector<LastCellEntry> lastLambdaCapturedCells_;
     // §27.5 / §28.9 (#969): block-nesting depth (== disposeStack_.size()) of each
@@ -1035,6 +1042,30 @@ private:
         // escaping env holds the cell past scope exit → no UAF). `slot` is the
         // cell-holder ptr-alloca; the cell ptr may be null (free(null) no-op).
         bool boxedCellFreeDeferred = false;
+        // fix #2334 / §28.14 / §28.9: applies to `boxedCellFree` /
+        // `boxedCellFreeDeferred` ONLY. `boxedCellFree`'s "fires on BOTH
+        // normal and unwind paths" soundness argument (above) rests on every
+        // capturing lambda being PROVABLY non-escaping BY SCOPE END on
+        // EITHER exit edge — true for the ordinary IIFE / `var f := lambda`
+        // forms, where the closure's own release is registered in the SAME
+        // disposeStack_ scope and fires on both edges symmetrically. The
+        // collectCellFreeEligible TaskScope.Spawn special case (LlvmBackend_
+        // Setup.cpp) is different: its "non-escaping by scope end" argument
+        // depends on the bounding `using var`'s disposal being QUIESCENT —
+        // true for the properly-awaited NORMAL edge, but NOT for the unwind
+        // edge, where TaskScope.DisposeAsync is a documented (#1422)
+        // NON-BLOCKING zombie drain that returns before children finish (the
+        // synchronous-fallback path noted in taskscope_asan_808_test.cpp /
+        // taskscope_behavior_610_test.cpp's exception_edge_drain_is_
+        // nonblocking_zombie_1422). Freeing the cell on the unwind edge in
+        // that shape is a genuine use-after-free: a still-running child can
+        // read the cell after it is freed (confirmed by ASan — the adversarial
+        // regression test in taskscope_asan_2334_test.cpp derives from the
+        // actual crash this flag fixes). Set true only for cellFreeEligible_
+        // captures the pre-scan additionally flagged unwindUnsafeCellFree_;
+        // emitDisposals skips the free on the unwind edge for such an entry,
+        // leaving the ordinary conservative leak instead of freeing early.
+        bool skipCellFreeOnUnwind = false;
         // §15.3 / §15.1.1 (#747): a move-only OWNING inline-array local
         // ([N owned]T? / [N owned]T) whose ownership is NOT transferred out of
         // the local anywhere in the body (per the inlineOwnedArrayTransferred_
@@ -7283,6 +7314,16 @@ private:
     // closureReleaseEligibleFn_): a lambda/thunk body lowered mid-function
     // is NOT analyzed; its cells continue to leak (never double-freed).
     llvm::Function* cellFreeEligibleFn_ = nullptr;
+    // fix #2334 / §28.14 / §28.9: the subset of cellFreeEligible_ whose ONLY
+    // eligibility route includes the TaskScope.Spawn special case
+    // (collectCellFreeEligible) — see Disposal::skipCellFreeOnUnwind for the
+    // full soundness argument for why such a cell's free must be skipped on
+    // the unwind edge specifically (TaskScope.DisposeAsync's unwind path is a
+    // documented (#1422) non-blocking zombie drain, so a captured local's
+    // quiescence guarantee does not hold there). Computed alongside
+    // cellFreeEligible_ by the same pre-scan; consulted by lowerLambda when
+    // populating lastLambdaCapturedCells_.
+    std::unordered_set<const void*> unwindUnsafeCellFree_;
     // Compute cellFreeEligible_ for a block body (see the .cpp).
     void collectCellFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);

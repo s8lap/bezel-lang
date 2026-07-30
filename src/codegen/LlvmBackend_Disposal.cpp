@@ -2575,7 +2575,16 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // BOTH normal and unwind paths: the cell has no live external references
         // at this point (all lambdas referencing it are non-escaping and have
         // been released), so freeing on either path is safe.
+        //
+        // fix #2334: EXCEPT when skipCellFreeOnUnwind is set — the TaskScope.
+        // Spawn special case's "non-escaping" proof depends on the bounding
+        // `using var`'s disposal being quiescent, which holds only on the
+        // properly-awaited NORMAL edge (see Disposal::skipCellFreeOnUnwind's
+        // declaration for the full argument and the #1422 non-blocking-
+        // zombie-drain citation). Skip the free on the unwind edge for such
+        // an entry — the cell leaks there instead of a use-after-free.
         if (it->boxedCellFree) {
+            if (isUnwind && it->skipCellFreeOnUnwind) continue;
             llvm::Value* cell =
                 builder_.CreateLoad(ptrTy(), it->slot, "cell.ptr");
             builder_.CreateCall(freeFn(), {cell});
@@ -3807,9 +3816,12 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     // entry is registered ONLY where boxedCellFree was suppressed (mutually
     // exclusive with boxedCellFree) and deduped per slot, so the cell is freed
     // exactly once across both the normal and the unwind exit (a given exit goes
-    // one way only). Fires on both paths, symmetric with boxedCellFree.
+    // one way only). Fires on both paths, symmetric with boxedCellFree —
+    // EXCEPT skipCellFreeOnUnwind entries (fix #2334; see boxedCellFree's own
+    // handling above and Disposal::skipCellFreeOnUnwind's declaration).
     for (const auto& d : scope) {
         if (!d.boxedCellFreeDeferred) continue;
+        if (isUnwind && d.skipCellFreeOnUnwind) continue;
         llvm::Value* cell =
             builder_.CreateLoad(ptrTy(), d.slot, "cell.deferred.ptr");
         builder_.CreateCall(freeFn(), {cell});

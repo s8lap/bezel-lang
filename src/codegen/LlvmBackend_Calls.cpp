@@ -6350,6 +6350,25 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         llvm::Value* closure = lowerEventHandlerClosure(
                             call.args[0].value.get(), /*payload=*/nullptr);
                         if (!closure) return nullptr;
+                        // fix #2334 / §28.14 / §28.9: lowerEventHandlerClosure
+                        // -> lowerLambda just populated
+                        // lastLambdaCapturedCells_ for any cellFreeEligible_
+                        // captures IFF the argument is a lambda LITERAL on a
+                        // `using var`/`await using var` TaskScope receiver
+                        // (collectCellFreeEligible's TaskScope.Spawn special
+                        // case, mirroring the IIFE arm's own consume call —
+                        // LlvmBackend_Calls2.cpp). A method-reference argument
+                        // does not go through lowerLambda and would leave the
+                        // vector stale/empty from whatever lambda last ran
+                        // elsewhere in this function — guard on the AST shape
+                        // here, exactly like the IIFE arm, so this never
+                        // consumes an unrelated lambda's cells. Consuming is a
+                        // harmless no-op when the pre-scan did not flag
+                        // anything (an ordinary capture-free Spawn lambda, or
+                        // one whose receiver isn't a using-var local).
+                        if (dynamic_cast<const ast::LambdaExpr*>(
+                                call.args[0].value.get()))
+                            consumeLastLambdaCapturedCells();
                         llvm::Value* ioeVt =
                             llvm::ConstantPointerNull::get(ptrTy());
                         {   auto vit = builtinVtable_.find(
