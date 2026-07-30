@@ -4768,8 +4768,22 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v) {
     if (isIfaceProp && ifSetIt == ifacePropertySetIndex_.end()) return false;
 
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-    if (!pd) return false;
-    llvm::Type* valTy = lowerType(pd->type.get());
+    // fix #2406 (§2.5 / §22.9 / §12.1, mirroring lowerVirtualPropertyGet's
+    // #503 fallback above): for an IMPORTED interface's own read-write
+    // PropertySymbol, ps->decl is null (no ast::PropertyDecl in the
+    // importer). propertyHasSetter's #2406 companion fix now reserves an
+    // itable setter slot for such a property (ifacePropertySetIndex_
+    // contains it, so the `!isIfaceProp && ...` guard above admits us here),
+    // so this function must be able to derive the value type without `pd`
+    // too, instead of bailing out — the value type rides the
+    // importedMemberType side table, exactly like the getter already reads.
+    llvm::Type* valTy = nullptr;
+    if (pd) {
+        valTy = lowerType(pd->type.get());
+    } else {
+        if (sema::TypeRef* tr = ctx_.importedMemberType(ps))
+            valTy = lowerTypeRef(tr);
+    }
     if (!valTy) valTy = i32();
     auto* fnTy = llvm::FunctionType::get(
         llvm::Type::getVoidTy(llvm_), {ptrTy(), valTy}, false);

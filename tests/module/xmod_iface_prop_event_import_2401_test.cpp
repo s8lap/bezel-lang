@@ -45,27 +45,31 @@
 // "right" observed byte (a mistake this file's own author made once while
 // probing #2401 and caught only by re-deriving the modulus).
 //
-// SCOPE / WHAT REMAINS BROKEN (probed, NOT fixed here, filed separately):
-//   - SETTER, property declared LOCALLY on the implementing class (no
-//     cross-module accessor export needed at all — unlike #2400's shape),
-//     satisfying an IMPORTED interface's read-write property obligation:
-//     STILL silently no-ops (T5 below, compile-only, mirrors #2387 T5's
-//     documentation pattern). Root cause, confirmed by probe: this fix's own
-//     mirror correctly widens `ifacePropertySetIndex_`'s reserved index
-//     space, but `Emitter::propertyHasSetter(ps)` (LlvmBackend_impl.hpp) is
-//     gated on `dynamic_cast<const ast::PropertyDecl*>(ps->decl)` with NO
-//     fallback — and `ps->decl` is unconditionally null for ANY imported
-//     symbol (ModuleLoader.cpp's `MetaMemberKind::Property` case: "the getter
-//     BODY is not reconstructed here... there is no ast::PropertyDecl in the
-//     importer"). Called on the IMPORTED INTERFACE's own read-write
-//     `PropertySymbol` (to decide whether Pass 0/its mirror should reserve a
-//     setter slot at all), `propertyHasSetter` unconditionally returns
-//     `false` regardless of the interface's real (reconstructed-in-
-//     `modifiers`, just not consulted) read-write shape, so NO setter slot is
-//     ever reserved — a DIFFERENT `astNode`/`decl`-only-gate instance of
-//     #2374's audit pattern, filed as its own issue (not #2401's filed root
-//     cause, and not #2400's cross-module-export gap, since no export is
-//     needed for a locally-implemented property).
+// UPDATE (fix #2406, §23/§11.2/§2.8.2/§2.8.3 rule 4, v0.235): T5 below —
+// SETTER, property declared LOCALLY on the implementing class, satisfying an
+// IMPORTED interface's read-write property obligation — is now FIXED and its
+// value assertion restored (it was compile-only pending this fix; see the
+// removed paragraph this replaces). Root cause was exactly as diagnosed here:
+// `Emitter::propertyHasSetter(ps)` (LlvmBackend_impl.hpp) was gated on
+// `dynamic_cast<const ast::PropertyDecl*>(ps->decl)` with no fallback and
+// unconditionally returned `false` for an imported PropertySymbol, so no
+// itable setter slot was ever reserved for a read-write property declared on
+// an imported interface. The fix falls back to
+// `ctx_.importedPropertyHasSetter(ps)` — the `MetaMember::hasSetter` bit
+// #2400 already added and threads through (builder -> loader -> SemaContext)
+// for its own, narrower shape — rather than a naive `modifiers`-only
+// heuristic (confirmed insufficient by probe: on a BLOCK-form property
+// `readonly` is a compile error whether or not a `set` arm is present, so a
+// get-only block form and a read-write auto form are indistinguishable by
+// modifiers alone; the real hasSetter bit has no such ambiguity). A second,
+// necessary companion fix: `Emitter::lowerVirtualPropertySet`
+// (LlvmBackend_Exprs.cpp) had the identical `!pd -> return false` gate on the
+// VALUE TYPE it needs to build the call — fixed to fall back to
+// `ctx_.importedMemberType(ps)`, mirroring `lowerVirtualPropertyGet`'s
+// pre-existing #503 fallback right above it. Both were required: fixing only
+// propertyHasSetter reserves the slot but `lowerVirtualPropertySet` still
+// bails before reaching it (the exact #2387-lesson shape — a fix that looks
+// complete but changes nothing without tracing every consumer).
 //   - EVENT, `.Subscribe` through an IMPORTED interface's `event` member:
 //     STILL silently no-ops (observed: exit 100, not the expected 110 — the
 //     subscribe call compiles and runs but never reaches the real backing
@@ -310,18 +314,18 @@ BEZEL_TEST(xmod_iface_prop_event_import_2401,
 }
 
 // ===========================================================================
-// T5 — ACCEPT-CONTROL (compiles only — see the file header for why the value
-// is not asserted, mirroring #2387 T5's pattern): a SETTABLE property declared
-// LOCALLY on the implementing class, satisfying an IMPORTED interface's
-// read-write property obligation, still compiles clean. Does NOT assert the
-// runtime value: `b.Name := 42; return b.Name;` currently still returns the
-// property's ORIGINAL value (the set silently no-ops) — a separate,
-// still-open `propertyHasSetter`-decl-gate bug (see file header), filed as
-// its own issue rather than fixed here.
+// T5 — fix #2406 (§23/§11.2/§2.8.2/§2.8.3 rule 4, v0.235): RESTORED to a
+// value-asserting RUN (was compile-only accept-control; see the file
+// header's UPDATE paragraph). A SETTABLE property declared LOCALLY on the
+// implementing class, satisfying an IMPORTED interface's read-write property
+// obligation. Pre-#2406-fix: `b.Name := 42; return b.Name + 100;` returned
+// `101` (the set silently no-op'd, leaving `_n` at its initializer `1`).
+// Post-fix: `142` (`42 + 100`), proving the write actually reached `_n`
+// through the itable dispatch, not just that compilation still succeeds.
 // ===========================================================================
 BEZEL_TEST(xmod_iface_prop_event_import_2401,
-           setter_through_imported_interface_still_compiles_accept_control) {
-    bool ok = compileImportSucceeds2401(
+           setter_through_imported_interface_dispatches_correct_value) {
+    int r = compileImportAndRun2401(
         "module SetPropLib2401T5; "
         "public interface IHasNameSet2401T5 "
         "  property Name: int; "
@@ -341,7 +345,8 @@ BEZEL_TEST(xmod_iface_prop_event_import_2401,
         "    return b.Name + 100; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(ok);
+    if (r == -2) return;  // dependency toolchain unavailable — skip
+    BEZEL_EXPECT_EQ(r, 142);
 }
 
 }  // namespace bezel::module

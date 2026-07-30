@@ -2006,9 +2006,39 @@ private:
     // block getter-only property has only a getter. Checked off the PropertyDecl
     // so it matches across base/override (the override must match the base's
     // accessor set per §12.1).
-    static bool propertyHasSetter(const sema::PropertySymbol* ps) {
+    //
+    // fix #2406 (§23 / §11.2 / §2.8.2 / §2.8.3 rule 4, v0.235): `ps->decl` is
+    // unconditionally null for an IMPORTED PropertySymbol (ModuleLoader never
+    // reconstructs an ast::PropertyDecl for a body-less imported declaration).
+    // Called on an IMPORTED INTERFACE's own PropertySymbol (to decide whether
+    // declareVtables's Pass 0/its import-mirror should reserve an itable
+    // setter slot at all, and whether Pass D should attempt to fill one),
+    // this used to unconditionally return `false`, so NO setter slot was ever
+    // reserved for a read-write property declared on an imported interface —
+    // `b.Name := v` through such a reference silently no-op'd even when the
+    // implementing class and its setter were entirely local (#2400's own
+    // declareImportedPropertySetters comment flags this exact gate as "filed
+    // separately" — this is that follow-up).
+    //
+    // Fall back to `ctx_.importedPropertyHasSetter(ps)` — the MetaMember::
+    // hasSetter bit #2400 added (ModuleMetadata.hpp) and already threads
+    // builder -> loader -> this same SemaContext side table for its own
+    // (non-interface, direct cross-module set) shape. `ps->modifiers` alone is
+    // NOT sufficient here: on a BLOCK-form property, `readonly` is a compile
+    // error whether or not a `set` arm is present (Bezel_Language_Spec.md
+    // §22.3/§23.1, v0.235 — "on a block form declaring a setter it is
+    // contradictory and likewise an error", and equally an error on a
+    // get-only block form since the shape already expresses read-onlyness),
+    // so a get-only block-form interface property and a read-write auto-form
+    // interface property are INDISTINGUISHABLE by modifiers alone — a naive
+    // "no `readonly`" fallback would wrongly reserve a setter slot for the
+    // former, and Pass D would fill it with ConstantPointerNull (no real
+    // setter exists to find), planting the #2387 null-itable-slot SIGSEGV
+    // shape on any write attempt. The real hasSetter bit (computed at EXPORT
+    // time from the actual PropertyDecl shape) has no such ambiguity.
+    bool propertyHasSetter(const sema::PropertySymbol* ps) {
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-        if (!pd) return false;
+        if (!pd) return ctx_.importedPropertyHasSetter(ps);
         if (pd->bodyKind == ast::PropertyBodyKind::Expression) return false;
         if (pd->bodyKind == ast::PropertyBodyKind::Auto) {
             // Auto-property: read-write unless readonly. (Auto-properties are

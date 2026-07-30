@@ -382,9 +382,9 @@ BEZEL_TEST(xmod_abstract_impl_prop_2380,
 }
 
 // ===========================================================================
-// T6 — ACCEPT-CONTROL (compiles only; the VALUE assertion this test carried
-// was retired — see the note below): a correct SETTABLE implementation of an
-// imported interface's property still compiles clean.
+// T6 — RESTORED to a value-asserting RUN by fix #2406 (§23/§11.2/§2.8.2/
+// §2.8.3 rule 4, v0.235); the accept-control retirement below is now
+// history, kept for context.
 //
 // NOTE added while investigating #2401 (§12.1/§11.2/§23/§2.8.2/§2.8.3 rule 4,
 // v0.235 — `ifacePropertyGetIndex_`/`ifacePropertySetIndex_` not mirrored for
@@ -393,31 +393,32 @@ BEZEL_TEST(xmod_abstract_impl_prop_2380,
 // through the imported `IHasName2380T6` interface reference) did not dispatch
 // through the itable at all — #2401's own filed root cause — so this
 // assertion's "pass" was not evidence of correct dispatch. After #2401's fix,
-// the GET now genuinely dispatches through the itable (confirmed: this
-// exact program's `b.Name` read, verified independently via #2401's own test
-// file, xmod_iface_prop_event_import_2401_test.cpp), and the SET (`b.Name :=
-// 55`) is now visibly a no-op: `_n` stays at its initializer value `0`, so
-// `b.Name - 55` correctly-per-the-remaining-bug evaluates to `-55` (observed
-// exit `201` — `WEXITSTATUS`-masked). Root cause, confirmed by probe/code-
-// read (out of #2401's scope; filed as its own issue, not fixed here):
-// `Emitter::propertyHasSetter(ps)` (`LlvmBackend_impl.hpp`) is gated on
-// `dynamic_cast<const ast::PropertyDecl*>(ps->decl)` with no fallback;
-// `ps->decl` is unconditionally null for an IMPORTED symbol (ModuleLoader.cpp
-// `MetaMemberKind::Property`: "the getter BODY is not reconstructed here...
-// there is no ast::PropertyDecl in the importer"). Called on the imported
-// INTERFACE's own read-write `PropertySymbol` (to decide whether a setter
-// itable slot should be reserved at all, in `declareVtables`'s Pass 0 and its
-// import-mirror), `propertyHasSetter` unconditionally returns `false`
-// regardless of the interface's real (reconstructed-in-`modifiers`, just not
-// consulted) read-write shape — so no setter slot is ever reserved, and the
-// SET silently no-ops. Retiring the value assertion here (rather than
-// updating it to pin `201`) follows this file's own T3/T7 precedent: a
-// still-open, separately-filed bug is documented, not asserted as the
-// expected behavior.
+// the GET genuinely dispatched through the itable but the SET (`b.Name :=
+// 55`) was visibly a no-op (`_n` stayed at `0`, observed exit `201`), traced
+// to `Emitter::propertyHasSetter(ps)` (`LlvmBackend_impl.hpp`) unconditionally
+// returning `false` for an imported PropertySymbol (`ps->decl` is
+// unconditionally null for one) — so no setter itable slot was ever reserved
+// for the imported interface's read-write property. The value assertion was
+// retired to an accept-control pending that fix.
+//
+// fix #2406: `propertyHasSetter` now falls back to
+// `ctx_.importedPropertyHasSetter(ps)` — the `MetaMember::hasSetter` bit
+// #2400 added — instead of a naive `modifiers`-only heuristic (confirmed
+// insufficient: `readonly` is a compile error on any block-form property
+// regardless of setter presence, so a get-only block form and a read-write
+// auto form are indistinguishable by modifiers alone). A companion fix to
+// `Emitter::lowerVirtualPropertySet` (the actual SET dispatch, which had the
+// identical `!pd`-gated bailout on the value type it needs) was also
+// required — mirroring #503's pre-existing fallback on the GET side
+// (`lowerVirtualPropertyGet`) — confirmed necessary by probe: fixing
+// `propertyHasSetter` alone reserved the slot but the write still silently
+// no-op'd, the exact #2387-lesson shape (verify the runtime OUTCOME, not
+// that a fix compiles). `b.Name := 55; return b.Name - 55;` now correctly
+// returns `0`.
 // ===========================================================================
 BEZEL_TEST(xmod_abstract_impl_prop_2380,
-           settable_correct_implementation_still_compiles_accept_control) {
-    bool ok = compileImportSucceeds2380(
+           settable_correct_implementation_runs_and_dispatches) {
+    int r = compileImportAndRun2380(
         "module PropIfaceLib2380T6; "
         "public interface IHasName2380T6 "
         "  property Name: int; "
@@ -437,7 +438,8 @@ BEZEL_TEST(xmod_abstract_impl_prop_2380,
         "    return b.Name - 55; "
         "  end Main; "
         "end C;");
-    BEZEL_EXPECT_TRUE(ok);
+    if (r == -2) return;  // dependency toolchain unavailable — skip
+    BEZEL_EXPECT_EQ(r, 0);
 }
 
 // ===========================================================================
