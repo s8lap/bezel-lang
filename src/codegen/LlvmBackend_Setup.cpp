@@ -2632,7 +2632,7 @@ void Emitter::declareVtables() {
             if (propertyHasSetter(ps)) ifacePropertySetIndex_[ps] = idx++;
         }
     }
-    // §13 / §2.5 / §2.6 (issue #426 / #328): populate ifaceMethodIndex_ for
+    // §12.1 / §2.5 / §2.6 (issue #426 / #328): populate ifaceMethodIndex_ for
     // IMPORTED interfaces too. A cross-module interface call (either on an
     // imported object or through an imported interface type held by the importer)
     // reaches the dispatch path in LlvmBackend_Calls.cpp with ms->parent being an
@@ -2645,6 +2645,33 @@ void Emitter::declareVtables() {
     // letting bz_itable_lookup + GEP(itab, k) reach the correct function pointer.
     // Imported symbols live in a separate list (ctx_.importedSymbols()), so the
     // local Pass 0 loop never touched them; this is the only place they are indexed.
+    //
+    // fix #2401 (§12.1 / §11.2 / §23 / §2.8.2 clause 1 / §2.8.3 rule 4, v0.235):
+    // this mirror originally stopped at ifaceMethodIndex_ — events and properties
+    // are populated by the EXACT SAME Pass 0 loop above for local interfaces (see
+    // the ifaceEventIndex_/ifacePropertyGetIndex_/ifacePropertySetIndex_ fills a
+    // few lines up), continuing the SAME running `idx` after the methods, but the
+    // import mirror never extended past methods. A property/event resolved through
+    // an IMPORTED interface (`b: IHasName` where IHasName itself comes from an
+    // `import`, as opposed to #2387's shape — a LOCAL interface satisfied by an
+    // IMPORTED base class) left ifacePropertyGetIndex_/ifacePropertySetIndex_/
+    // ifaceEventIndex_ with no entry for that ImportedInterface's PropertySymbol/
+    // EventSymbol. §2.8.3 rule 4 requires one runtime type identity "regardless of
+    // which artifact produced the value" — the imported interface here is exactly
+    // such a cross-artifact-produced type, and a consumer program built against it
+    // must dispatch through it identically to a same-module interface (§11.2's
+    // interface-matching contract makes no artifact distinction). Unlike the
+    // METHOD case (#426/#328), which fails LOUD (ifaceMethodIndex_.find sites gate
+    // and bail dispatch entirely, e.g. LlvmBackend_Calls2.cpp:6634-6636), the
+    // property/event lookup sites (lowerVirtualPropertyGet/-Set in
+    // LlvmBackend_Exprs.cpp, eventSourcePtr in LlvmBackend_Calls2.cpp) each fall
+    // through to OTHER fallback paths that are also unpopulated for an
+    // interface-parented member (no PropertyDecl body, no computed/block getter),
+    // so the read/write/subscribe silently produces a default value or no-ops
+    // instead of failing to compile or crashing — the worse failure mode #2401
+    // documents. Continue idx from the running count (matching Pass 0's own
+    // event-then-property ordering) so the importer computes the SAME per-(class×
+    // interface) itable index the exporter assigned.
     if (ctx_.hasImports()) {
         for (sema::Symbol* sym : ctx_.importedSymbols()) {
             auto* ts = dynamic_cast<sema::TypeSymbol*>(sym);
@@ -2654,6 +2681,23 @@ void Emitter::declareVtables() {
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
                 if (ms && !isStaticMethod(ms))
                     ifaceMethodIndex_[ms] = idx++;
+            }
+            // fix #2401: mirror ifaceEventIndex_ for imported interfaces, exactly
+            // as Pass 0 does for local ones above (§24.7 / #477 B7).
+            for (sema::Symbol* m : ts->members) {
+                auto* es = dynamic_cast<sema::EventSymbol*>(m);
+                if (!es) continue;
+                auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
+                if (ed && !ed->isAsync) ifaceEventIndex_[es] = idx++;
+            }
+            // fix #2401: mirror ifacePropertyGetIndex_/ifacePropertySetIndex_ for
+            // imported interfaces, exactly as Pass 0 does for local ones above
+            // (#481 / §23 / #730 / §23.4).
+            for (sema::Symbol* m : ts->members) {
+                auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+                if (!ps) continue;
+                ifacePropertyGetIndex_[ps] = idx++;
+                if (propertyHasSetter(ps)) ifacePropertySetIndex_[ps] = idx++;
             }
         }
     }
