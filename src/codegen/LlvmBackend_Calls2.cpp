@@ -7621,7 +7621,25 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     paramSlots_.clear();
     propagateBB_ = nullptr;
     currentCaughtExc_ = nullptr;
-    unwindScopeDepth_ = 0;
+    // fix #2361 / §28.3: unlike buildSpecializedMethodFn (which also clears
+    // disposeStack_ — a fresh function starts with an empty one, so 0 is the
+    // right boundary there), emitInlineGenericMethod does NOT touch
+    // disposeStack_ at all (see the #628 comment above: it emits into the
+    // CALLER's own function, sharing the caller's disposeStack_). Resetting
+    // unwindScopeDepth_ to 0 here left every ALREADY-LIVE caller scope entry
+    // (e.g. an owning `using var xs: Array<T>` declared before this call) at
+    // or above the boundary, so a pending-check reached while emitting/
+    // calling the specialized body (emitGenericSpecialization's own
+    // emitPendingCheck right after `CreateCall(specFn, args)`) walked the
+    // FULL shared disposeStack_ and disposed those caller locals immediately
+    // — duplicating the disposal the try/catch's own shared unwind target
+    // (unwindTarget_, deliberately left untouched below) performs again when
+    // it is reached, a double free (bz_array_free called twice on the same
+    // `Array<T>` header). `disposeStack_.size()` is the same "nothing already
+    // on the stack is mine" boundary lowerTry uses when entering a try body
+    // (LlvmBackend_Stmts.cpp) — correct here for the same reason: this call
+    // is not a fresh function, just a normal call within the current scope.
+    unwindScopeDepth_ = disposeStack_.size();
     diverged_ = false;
     // Bind user params (skip leading `this`).
     std::size_t paramStart = isStaticMethod(ms) ? 0 : 1;
