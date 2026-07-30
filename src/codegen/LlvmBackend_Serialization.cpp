@@ -3323,16 +3323,49 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     // its calloc-zeroed default (verified: this was the #2325 bug — a
     // Widget2-shaped class round-tripped Id=0 instead of the deserialized
     // value, because only emitInstanceInit ran, not emitOwnFieldInit).
-    // NOT replicated here: the no-explicit-ctor `new` site's throw-safety
-    // cleanup around emitOwnFieldInit (disposing already-initialized owned
-    // fields if a LATER field initializer throws) — no test in this slice
-    // exercises a throwing field initializer during Deserialize, and that
-    // unwind-safety replication is scoped out as a follow-up (filed).
+    //
+    // fix #2363 / §9.8 v0.234 ("each owned object is constructed by an
+    // ordinary call to its constructor") + §22.9 v0.234 "Owned fields and
+    // exception safety": "An exception during a field initializer (step 2)
+    // triggers disposal of any earlier derived owned fields whose
+    // initializers completed, in reverse declaration order, followed by the
+    // base subobject's Dispose() ... The exception then propagates" and "the
+    // derived instance is never observable". Since §9.8 construction is
+    // specified as an ordinary constructor call, the same exception-safety
+    // guarantee applies here: mirror the no-explicit-ctor `new` site's
+    // throw-safety cleanup (LlvmBackend_Exprs2.cpp's `!hasAnyConstructor(t)`
+    // branch) around this emitOwnFieldInit call, so a throwing own field
+    // initializer disposes the already-populated primary-ctor-param fields
+    // (stored above — §22.9's step-0 capture fields, "whose initialization
+    // completed first") and any earlier own-field initializer's owned value,
+    // plus the base subobject (a no-op today: #2325/#2364 reject base
+    // storage pre-codegen, but mirrored so the cleanup stays exact if that
+    // restriction is ever lifted), then reclaims the instance block, before
+    // re-propagating outward — exactly as an ordinary `new` on this shape
+    // would.
     {
         llvm::Value* savedThis = currentThis_;
         currentThis_ = obj;
         emitInstanceInit(ts, obj, st);
-        if (primaryCtorUsed) emitOwnFieldInit(ts, obj, st);
+        if (primaryCtorUsed) {
+            llvm::BasicBlock* savedUnwind = unwindTarget_;
+            std::size_t savedDepth = unwindScopeDepth_;
+            auto* savedInsert = builder_.GetInsertBlock();
+            llvm::BasicBlock* enclosingUnwind = unwindBB();
+            auto* cleanupBB = llvm::BasicBlock::Create(
+                llvm_, "cdeser.pcfield.cleanup", currentFn_);
+            builder_.SetInsertPoint(cleanupBB);
+            emitOwnedFieldDisposals(ts);
+            emitBaseDisposeChain(ts);
+            builder_.CreateCall(freeFn(), {obj});
+            builder_.CreateBr(enclosingUnwind);
+            builder_.SetInsertPoint(savedInsert);
+            unwindTarget_ = cleanupBB;
+            unwindScopeDepth_ = disposeStack_.size();
+            emitOwnFieldInit(ts, obj, st);
+            unwindTarget_ = savedUnwind;
+            unwindScopeDepth_ = savedDepth;
+        }
         currentThis_ = savedThis;
     }
 
