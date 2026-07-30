@@ -8755,6 +8755,33 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // without an initializer (like all locals with explicit type).
         builder_.CreateStore(llvm::ConstantAggregateZero::get(slotTy),
                              slot);
+    } else if (!v) {
+        // #2423: a last-resort safety net for any OTHER slot shape (a scalar,
+        // a struct — e.g. the `{i1, i64}` layout of a nullable value-type
+        // local — or any future case this function does not special-case)
+        // when the initializer failed to lower (`v == nullptr`) for a reason
+        // none of the branches above cover. Before this, such a slot's
+        // `alloca` was left completely unwritten: declared once and later
+        // loaded with whatever bytes happened to occupy that stack address —
+        // a silent, non-deterministic uninitialized-stack read (confirmed via
+        // `BEZEL_DUMP_IR=1` for the #2423 repro: the destination local's
+        // alloca was declared and loaded but never stored to anywhere in the
+        // function). The known trigger for `v == nullptr` here — an
+        // unresolved member access on a declaration-less built-in exception
+        // type — is now rejected at compile time by
+        // `ExprTC::resolveMemberAccess` (src/sema/ExprTypecheck_Calls.cpp),
+        // so this branch should be unreachable in a correctly functioning
+        // compiler; it exists as defense in depth for any OTHER lowering
+        // failure this function does not yet know about, mirroring the two
+        // zero-initializing branches immediately above (a null pointer /
+        // zero-filled array is already this function's established answer to
+        // "no initializer value" — this extends the same policy uniformly).
+        // `getNullValue` covers every LLVM type shape generically: pointers
+        // (null), scalars (zero), and aggregates (zero-filled), so a
+        // zero-initialized owned-pointer-bearing struct slot disposes nothing
+        // (a moved-from/absent owned value), consistent with the existing
+        // string-slot branch's reasoning above.
+        builder_.CreateStore(llvm::Constant::getNullValue(slotTy), slot);
     }
     // §28.3 / §28.10 (v0.180, #1978): a `var y := owned x;` / `using var y :=
     // owned x;` binding marker (#1962) MOVES a named owned source into this new
