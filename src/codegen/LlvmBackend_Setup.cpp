@@ -8892,40 +8892,37 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 dynamic_cast<const ast::CallExpr*>(ld->initializer.get()) ||
                 dynamic_cast<const ast::NewExpr*>(ld->initializer.get()) ||
                 wrappedHere;
-            // §29.11 (#1294): `using var e := src.GetEnumerator()` where `src` is a
-            // NAMED value (IdentifierExpr) and GetEnumerator on a vtable-backed
-            // IEnumerable returns the RECEIVER IDENTITY (LlvmBackend_Calls.cpp
-            // #1102C) — so `e` ALIASES `src`. If `src` is a separately-disposed
-            // owned local, registering a second disposal here double-frees the
-            // same struct (SIGSEGV). Treat it as a bare alias — the named receiver
-            // is the sole disposer. The receiver-is-a-TEMPORARY form
-            // `Gen().GetEnumerator()` has no named owner, so `e` still owns it (its
-            // receiver is a CallExpr, not an IdentifierExpr) and is unaffected.
+            // fix #2376 / §29.11: `using var e := src.GetEnumerator()` on a
+            // NAMED (IdentifierExpr) vtable-backed-IEnumerable `src` used to
+            // ALIAS `src` — GetEnumerator returned the receiver's identity
+            // (the old #1102C behavior, LlvmBackend_Calls2.cpp) — so this
+            // function used to carve it out as a bare alias (#1294) to avoid
+            // double-freeing `src`. #2376 makes that call site dispatch vtable
+            // slot 4 (clone) UNCONDITIONALLY instead, mirroring the #1268/#2356
+            // async GetAsyncEnumerator fix: `e` is now a genuinely independent
+            // frame in every case (named or temporary receiver alike), and
+            // `src` is disposed separately — at its own using-var/scope-end
+            // cascade for a named receiver, or inline at the call site itself
+            // for a temporary (LlvmBackend_Calls2.cpp). So `e` must ALWAYS get
+            // its own iterEnumDispose registration now; the #1294 GetEnumerator
+            // alias carve is removed (keeping ownsSource at its default `true`
+            // for this shape). The unrelated #2146 Drain() carve below is a
+            // genuine identity return (Drain() is untouched by #2376) and still
+            // applies.
             if (ownsSource) {
                 if (auto* ce = dynamic_cast<const ast::CallExpr*>(
                         ld->initializer.get())) {
-                    if (auto* gma = dynamic_cast<const ast::MemberAccessExpr*>(
-                            ce->callee.get())) {
-                        if (gma->member == "GetEnumerator" && gma->target &&
-                            dynamic_cast<const ast::IdentifierExpr*>(
-                                gma->target.get()) &&
-                            isVtableBackedIEnumerableType(
-                                ctx_.exprType(*gma->target)))
-                            ownsSource = false;
-                    }
                     // §28.10 / stdlib §4.5 v0.195 (#2146): `using var d :=
                     // recv.Drain();` over a NAMED owning collection — the
                     // drain view IS the receiver ("no separate enumerable
-                    // object"), the same receiver-identity aliasing as the
-                    // #1294 GetEnumerator case above; the named receiver's
-                    // owner is the sole disposer. Normally unreachable — the
-                    // ownership pass flags the decl usingVarSourceIsBorrow and
-                    // this function early-returns — but kept here so a body
-                    // the ownership pass does not annotate can never register
-                    // the slot-1 iterator dispose against a bz_array (type
-                    // confusion → SEGV). // per §28.10, stdlib §4.5, #2146
-                    if (ownsSource &&
-                        common::isOwningCollectionDrainAliasCall(*ce, ctx_))
+                    // object"); the named receiver's owner is the sole
+                    // disposer. Normally unreachable — the ownership pass
+                    // flags the decl usingVarSourceIsBorrow and this function
+                    // early-returns — but kept here so a body the ownership
+                    // pass does not annotate can never register the slot-1
+                    // iterator dispose against a bz_array (type confusion →
+                    // SEGV). // per §28.10, stdlib §4.5, #2146
+                    if (common::isOwningCollectionDrainAliasCall(*ce, ctx_))
                         ownsSource = false;
                 }
             }

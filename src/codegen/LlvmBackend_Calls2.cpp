@@ -4086,19 +4086,121 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     call.args.empty()) {
                 const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
                 std::string_view rbn = builtinTypeName(recvTy);
-                // #1102C / §29.11: GetEnumerator() on a vtable-backed
-                // IEnumerable<T> (a yield-method result / interface-typed value)
-                // — the source value the yield method returns IS the enumerator
-                // (its vtable is [0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current,
-                // [4]=GetEnumerator; the consumer drives slots 2/3 directly).
-                // Return the receiver unchanged — the SAME identity the §30.7
-                // GetAsyncEnumerator path returns for the async iterator — so a
-                // `using var it := C.Gen().GetEnumerator()` disposes exactly that
-                // one struct (slot 1) with no separate leaked source temp and no
-                // double-free. (The Array/OwningArray case below instead wraps +
-                // clones because the array is a distinct long-lived object.)
+                // fix #2376 / §29.11 (v0.234) "Each `GetEnumerator()` call
+                // produces an independent enumerator"; §29.3 "re-iterable: each
+                // call to `GetEnumerator()` runs the body again from the start".
+                // GetEnumerator() on a vtable-backed IEnumerable<T> (a
+                // yield-method result / interface-typed value) used to return
+                // the receiver UNCHANGED (#1102C) — sound only for an
+                // unbound-temporary receiver (`C.Gen().GetEnumerator()`, no
+                // other owner, so handing back the source struct itself is
+                // harmless since nothing else can call GetEnumerator() on that
+                // value again), but the SAME identity-return also fired for a
+                // NAMED receiver (`src.GetEnumerator()` on a local/param/
+                // field), where a second call on the SAME binding is legal,
+                // spec-expected code (§29.11) — the old code silently handed
+                // back the SAME cursor instead of an independent replay from
+                // the start (#2376: a silent wrong-value bug, not a crash).
+                // Dispatch vtable slot 4 unconditionally instead — the #943
+                // clone machinery every other sync consumer (for-in,
+                // materializeVtableIEnumerableToArray, the array-wrapper path
+                // below) already uses, and which never self-returns for any
+                // sync producer (emitIteratorMethod's getEnumFn,
+                // wrapUserClassAsIEnumerable's wrapGetEnumFn, and the array-
+                // owning wrapper's owning GetEnumerator all `calloc` a fresh
+                // struct on every call, or raise InvalidOperationException for
+                // an owned-param iterator's second claim, #973a/#2154 — never
+                // hand back `self`). A user-written `IEnumerable<T>` class that
+                // legitimately returns `this` from its OWN `GetEnumerator()` is
+                // unaffected: the wrapper's clone still re-invokes the user's
+                // method each time (wrapGetEnumFn), so the user's own
+                // self-return idiom is preserved verbatim — only the COMPILER's
+                // wrapper identity is fresh per call.
                 if (isVtableBackedIEnumerableType(recvTy)) {
-                    return lowerExpr(*ma->target);
+                    llvm::Value* src = lowerExpr(*ma->target);
+                    if (src && src->getType()->isPointerTy()) {
+                        llvm::Value* srcVt = builder_.CreateLoad(ptrTy(), src);
+                        llvm::Value* geSlot = builder_.CreateGEP(
+                            ptrTy(), srcVt, {builder_.getInt32(4)});
+                        llvm::Value* geFn = builder_.CreateLoad(ptrTy(), geSlot);
+                        auto* geTy =
+                            llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+                        llvm::Value* en = builder_.CreateCall(
+                            geTy, geFn, {src}, "getenum.clone");
+                        // §29.8 (#973a/#2154): a second claim on an owned-param
+                        // iterator's clone slot raises InvalidOperationException
+                        // instead of aliasing the first clone's captures —
+                        // surface it here, mirroring every other dispatched
+                        // vtable call in this file (MoveNext, TakeCurrent,
+                        // GetAsyncEnumerator).
+                        emitPendingCheck();
+                        // §29.11 / §29.2 / §28.5 — mirrors lowerIEnumerableBuiltinFor's
+                        // `sourceIsNamedLocal` check (LlvmBackend_Stmts.cpp #1642/
+                        // #1840, the for-in analogue of this same source-ownership
+                        // question): a NAMED receiver — a local/param, a field
+                        // (bare `seq` or qualified `this.seq`/`obj.seq`), or an
+                        // AUTO-property — is disposed at its own lifetime end
+                        // (registerUsingDisposal's iterEnumDispose path / the
+                        // field-owner cascade), never here. A COMPUTED property
+                        // getter returns a fresh value the receiver expression
+                        // itself owns, exactly like a plain call, so it is treated
+                        // as a temporary. An UNBOUND TEMPORARY receiver
+                        // (`C.Gen().GetEnumerator()`) has no other owner, and
+                        // slot 4 always returns a genuine clone (never `self`, per
+                        // the comment above), so the source frame must be
+                        // disposed here or it leaks.
+                        bool sourceIsNamed = false;
+                        if (sema::Symbol* sym = ctx_.exprSymbol(*ma->target)) {
+                            if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+                                dynamic_cast<sema::ParameterSymbol*>(sym) !=
+                                    nullptr ||
+                                dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
+                                sourceIsNamed = true;
+                            } else if (auto* ps =
+                                           dynamic_cast<sema::PropertySymbol*>(
+                                               sym)) {
+                                sourceIsNamed = sema::isAutoPropertySymbol(ps);
+                            }
+                        }
+                        // fix #2376 adversarial self-pass (a): do NOT dispose
+                        // `src` immediately here. §29.8's BASELINE rule ("the
+                        // state machine disposes any owned parameter that has
+                        // not been moved out of by the body") applies to the
+                        // SOURCE's own Dispose regardless of clone/claim
+                        // status — the narrower #973a/#2154 claim-and-null
+                        // only arms for the CONDITIONALLY-discharged parameter
+                        // shape. For the common, non-conditional owned-param
+                        // iterator (the body only READS the parameter, never
+                        // adopts it), the clone slot's memcpy is a SHALLOW
+                        // copy that shares the same owned-parameter pointer
+                        // with the source (unlike the async #2356 twin, whose
+                        // simplified mechanism nulls EVERY owned param on
+                        // EVERY clone unconditionally) — disposing `src`
+                        // immediately, before `en` is ever driven, freed the
+                        // shared owned parameter out from under `en` and
+                        // produced a heap-use-after-free the moment the
+                        // caller's `MoveNext()`/`Current` read it (confirmed
+                        // under ASan during this fix's own adversarial pass).
+                        // Defer `src`'s disposal onto the SAME disposal scope
+                        // `en`'s own `using var` (or scope-end auto-drop)
+                        // disposal will be registered onto next — LIFO unwind
+                        // then disposes `en` FIRST (already-registered `src`
+                        // sits below it on the stack), so any capture `en`
+                        // still shares with `src` has been fully consumed
+                        // before `src` frees it. Mirrors
+                        // lowerIEnumerableBuiltinFor's own `srcSlot` +
+                        // `iterEnumDispose` registration for exactly this
+                        // temporary-source case (LlvmBackend_Stmts.cpp #943).
+                        if (!sourceIsNamed && !disposeStack_.empty()) {
+                            llvm::AllocaInst* srcSlot = entryAlloca(ptrTy());
+                            builder_.CreateStore(src, srcSlot);
+                            Disposal ds{srcSlot, nullptr};
+                            ds.iterEnumDispose = true;
+                            disposeStack_.back().push_back(ds);
+                        }
+                        return en;
+                    }
+                    return src;
                 }
                 if ((rbn == "Array" || rbn == "OwningArray") && recvTy &&
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
