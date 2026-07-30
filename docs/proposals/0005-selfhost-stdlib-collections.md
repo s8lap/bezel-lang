@@ -7,110 +7,124 @@
 **Context:** Issue #545 direction; rationale §5.11 (v0.97) and §5.20 (v0.132).  
 **Provenance:** Drafted mid-June 2026; committed 2026-07-04 as proposal 0005 (it had
 sat untracked at the repo root — the custody gap the coverage audit flagged). Written
-pre-v0.168 Owning-rename and pre-#1414-stage-3 registry; re-verify name references
-against current docs before acting on it.
+pre-v0.168 Owning-rename and pre-#1414-stage-3 registry; the mechanical refresh
+recorded in the provenance note below has since brought its names and anchors current.
 
 ---
 
-> ⚠️ **PROVENANCE BANNER — mechanical refresh required before any run acts on this.**
-> This document's type names (`OwnedStack` / `OwnedBuffer` / `OwnedArray` /
-> `OwnedQueue` / `IOwnedCollection`, …) and its `src/` file:line anchors
-> **predate the v0.168 Owning-rename and the #1414 stage-3 registry work.** The
-> current family is `OwningStack` / `OwningBuffer` / `OwningArray` /
-> `OwningQueue` / `IOwningCollection` (spec §14.4, `Bezel_Language_Spec.md:143`
-> / `:1927`), and every quoted line number below has almost certainly drifted.
-> Before scheduling SH-1/SH-2/SH-3, do a mechanical rename pass and re-grep each
-> cited compiler anchor. The architecture and slice plan need no change — only
-> the names and line numbers do.
+> **Provenance note — mechanical refresh performed 2026-07-30 (owner-directed
+> 2026-07-29).** The pre-v0.168 type names this draft was written with
+> (`OwnedStack` / `OwnedBuffer` / `OwnedArray` / `OwnedQueue` / `IOwnedCollection`, …)
+> were renamed to the current `Owning*` / `IOwning*` family (stdlib v0.231; spec
+> §14.4); every `src/` file:line anchor was re-verified against the current tree
+> and updated (several cited mechanisms have moved or been superseded — notably
+> the collection-name predicates now read the #1414 stage-3 registry in
+> `src/common/BuiltinRegistry.cpp`, and the former monolithic
+> `bezel_runtime.cpp` was split into per-domain `bezel_runtime_*.cpp` files);
+> and the §5 POC's conformance claim was corrected for the v0.222
+> `OwningStack`/`OwningQueue` demotion (#1811). The architecture and slice plan
+> were not changed.
 
 ## 1. Current State
 
 ### 1.1 C++ Runtime Implementations
 
 Every stdlib collection is implemented in
-`src/runtime/bezel_runtime.cpp` (~10,928 lines) as `extern "C"` functions
-the LLVM backend calls directly.
+`src/runtime/bezel_runtime_collections.cpp` (~2,980 lines; the former monolithic
+`bezel_runtime.cpp` has been split into per-domain `bezel_runtime_*.cpp` files)
+as `extern "C"` functions the LLVM backend calls directly.
 
-**`bz_array_t`** (lines 42–52) backs `Array<T>`, `OwnedArray<T>`, `Stack<T>`,
-`OwnedStack<T>`, `Queue<T>`, `OwnedQueue<T>`, `Set<T>`, `OwnedSet<T>`, and
-`OwnedBuffer<T>`.  Key functions (lines 54–348):
+**`bz_array_t`** (struct in `bezel_runtime_internal.hpp:94–108`) backs `Array<T>`,
+`OwningArray<T>`, `Stack<T>`, `OwningStack<T>`, `Queue<T>`, `OwningQueue<T>`,
+`Set<T>`, `OwningSet<T>`, and `OwningBuffer<T>`.  Key functions
+(`bezel_runtime_collections.cpp` lines 10–222; the LIFO drain helper at 1191):
 
 | Function | Serves |
 |---|---|
 | `bz_array_alloc` | `new Array<T>()`, `new Stack<T>()`, etc. |
 | `bz_array_add` | `xs.Add(x)`, `xs.Push(x)`, `xs.Enqueue(x)` |
 | `bz_array_get` / `bz_array_set` | `xs[i]` get/set (value elements) |
-| `bz_array_set_disposing` | `xs[i] := v` (class elements, OwnedArray) |
+| `bz_array_set_disposing` | `xs[i] := v` (class elements, OwningArray) |
 | `bz_array_free` | scope-end `Dispose()`, class elements reversed (§28.11) |
 | `bz_array_mark_disposed` | checked-disposal quarantine (§28.2/§621) |
-| `bz_array_pop_at` | `OwnedArray.PopAt(i)` — transfer ownership without disposal |
-| `bz_array_clear_disposing` | `OwnedArray.Clear()` |
+| `bz_array_pop_at` | `OwningArray.PopAt(i)` — transfer ownership without disposal |
+| `bz_array_clear_disposing` | `OwningArray.Clear()` |
 | `bz_array_drain_next_lifo` | Stack drain (LIFO order) |
 
-**`bz_dict_*`** (lines 471–997) backs `Dictionary<K,V>` and
-`OwnedDictionary<K,V>`.  Includes separate string-key (`bz_dict_*_str`) and
+**`bz_dict_*`** (lines 320–1163) backs `Dictionary<K,V>` and
+`OwningDictionary<K,V>`.  Includes separate string-key (`bz_dict_*_str`) and
 generic-key (`bz_dict_*_gen`) variants because Dictionary key hashing is
 runtime-polymorphic.
 
-**`bz_llist_*`** (lines 1178–1360) backs `LinkedList<T>` and
-`OwnedLinkedList<T>`.  Uses a separate doubly-linked node struct.
+**`bz_llist_*`** (lines 1330–1601) backs `LinkedList<T>` and
+`OwningLinkedList<T>`.  Uses a separate doubly-linked node struct.
 
-**`bz_buffer_*`** (lines 10877–10928) backs `Buffer<T>` (value-element fixed-
+**`bz_buffer_*`** (lines 2931–2978) backs `Buffer<T>` (value-element fixed-
 capacity primitive, issue #545).  Three functions only: `bz_buffer_new`,
 `bz_buffer_get_ptr`, `bz_buffer_free`.
 
-**`OwnedBuffer<T>`** with class-typed T is *not* `bz_buffer_*`; it reuses
-`bz_array_t` (see `bz_array_alloc_count_n`, line 70; confirmed in
-`LlvmBackend_Exprs.cpp` line 5775).
+**`OwningBuffer<T>`** with class-typed T is *not* `bz_buffer_*`; it reuses
+`bz_array_t` (see `bz_array_alloc_count_n`, `bezel_runtime_collections.cpp:31`;
+confirmed in `LlvmBackend_Exprs2.cpp:2743–2760`).
 
 ### 1.2 Codegen Lowering — How `new Array<T>()`, `xs.Add(x)`, `xs[i]` are Lowered
 
-**Construction** — `LlvmBackend_Exprs.cpp` lines 5723–5825: a name-switch on
-`colName` dispatches each collection type to the appropriate runtime allocator.
-`Stack<T>`, `OwnedStack<T>`, `Queue<T>`, `OwnedQueue<T>`, `Set<T>`, `OwnedSet<T>`,
-`Array<T>`, `OwnedArray<T>`, `OwnedBuffer<T>` all reach `bz_array_alloc`
-(line 5793). `LinkedList<T>` reaches `bz_llist_alloc` (line 5768).
-`Dictionary<K,V>` reaches `bz_dict_alloc` or `bz_dict_alloc_generic` (line 5797).
+**Construction** — `LlvmBackend_Exprs2.cpp` lines 2611–3010 (the dispatch moved
+out of `LlvmBackend_Exprs.cpp`): a name-switch on `colName` (line 2613) dispatches
+each collection type to the appropriate runtime allocator.
+`Stack<T>`, `OwningStack<T>`, `Queue<T>`, `OwningQueue<T>`, `Set<T>`, `OwningSet<T>`,
+`Array<T>`, `OwningArray<T>` all reach `bz_array_alloc` (line 2918);
+`OwningBuffer<T>(n)` reaches `bz_array_alloc_count_n` (line 2756).
+`LinkedList<T>` reaches `bz_llist_alloc` (line 2730).
+`Dictionary<K,V>` reaches `bz_dict_alloc` or `bz_dict_alloc_generic` (lines 2985–2990).
 
 **Method calls** — `LlvmBackend_Calls.cpp` `tryLowerCollectionInstanceCall`
-(entry at line 632). The function opens with three predicate calls
-(`isCollectionTypeName`, `isLinkedListTypeName`, `isDictTypeName`, lines 639–665),
-then dispatches on method name strings (`"Add"`, `"Push"`, `"Enqueue"` at line 2525;
-`"Pop"`, `"Dequeue"` at line 2811; etc.).
+(entry at line 681). The function opens with the type-name predicate calls
+(`isCollectionTypeName`/`isDictTypeName` at lines 701–702, `isLinkedListTypeName`
+at line 751), then dispatches on method name strings (`"Add"`, `"Push"`,
+`"Enqueue"` at line 3954; `"Pop"`, `"Dequeue"` at line 4507; etc.).
 
-**Indexer get/set** — `LlvmBackend_Assign.cpp` (`lowerCollectionIndexerSet`) and
-`LlvmBackend_Exprs.cpp` (`tryLowerIndexExpr`) dispatch on the same type-name
+**Indexer get/set** — `LlvmBackend_Assign.cpp`: `lowerCollectionIndexerSet`
+(line 655) and `lowerCollectionIndexerGet` (line 164; it superseded the former
+`tryLowerIndexExpr` in `LlvmBackend_Exprs.cpp`) dispatch on the same type-name
 predicates.
 
 ### 1.3 Quantified "Hardcoded Collection Name" Surface
 
-A grep for `"Array"`, `"OwnedArray"`, `"Dictionary"`, `"OwnedDictionary"`,
-`"Stack"`, `"OwnedStack"`, `"Queue"`, `"OwnedQueue"`, `"Set"`, `"OwnedSet"`,
-`"LinkedList"`, `"OwnedLinkedList"`, `"OwnedBuffer"`, `"Buffer"` across
-`src/` (excluding `.h` headers and test/ directories) yields **~180 sites**:
+A grep for `"Array"`, `"OwningArray"`, `"Dictionary"`, `"OwningDictionary"`,
+`"Stack"`, `"OwningStack"`, `"Queue"`, `"OwningQueue"`, `"Set"`, `"OwningSet"`,
+`"LinkedList"`, `"OwningLinkedList"`, `"OwningBuffer"`, `"Buffer"` across
+`src/` (excluding `.h`/`.hpp` headers and test/ directories) yields **~385 sites**
+(re-counted 2026-07-30; the surface has grown since drafting):
 
 | Subsystem | Approximate count |
 |---|---|
-| `src/sema/` | ~96 |
-| `src/codegen/` | ~79 |
-| `src/ownership/` | ~5 |
+| `src/sema/` | ~194 |
+| `src/codegen/` | ~137 |
+| `src/ownership/` | ~38 |
+| `src/common/` (the #1414 stage-3 registry) | ~15 |
 
 Representative clusters (the ones a self-host migration would have to displace):
 
-- **`TypeResolution_Names.cpp:55–99`** — `builtinTypeArity`: the master list of
-  which names are built-in generics. Stack, Queue, Set, LinkedList, OwnedBuffer
-  are listed here; removing them from this list requires they resolve as ordinary
-  imported TypeSymbols instead.
-- **`LlvmBackend_Calls.cpp:387–411`** — `isCollectionTypeName`,
+- **`TypeResolution_Names.cpp:44–296`** — `builtinTypeArity`: the master list of
+  which names are built-in generics (collection entries at lines 137–190). Stack,
+  Queue, Set, LinkedList, OwningBuffer are listed here; removing them from this
+  list requires they resolve as ordinary imported TypeSymbols instead.
+- **`LlvmBackend_Calls.cpp:397–427`** — `isCollectionTypeName`,
   `isLinkedListTypeName`, `isDictTypeName` predicates that gate every method-call
-  lowering path.
-- **`LlvmBackend_Exprs.cpp:5723–5825`** — the `new Coll<T>()` dispatch switch.
-- **`ExprTypecheck_Exprs.cpp:291–296, 606–616, 706–711`** — sema checks that
+  lowering path. The name sets themselves now live in the #1414 stage-3 registry
+  (`src/common/BuiltinRegistry.cpp:69–87` — `kArrayBackedCollections` /
+  `kDictionaryNames` / `kLinkedListNames`), which superseded the predicates'
+  former inline hand-lists.
+- **`LlvmBackend_Exprs2.cpp:2611–3010`** — the `new Coll<T>()` dispatch switch.
+- **`ExprTypecheck_Exprs.cpp:914–919, 1487–1519, 1996–2001`** — sema checks that
   resolve member types and indexer validity based on literal collection name
   strings.
-- **`LlvmBackend_Setup.cpp:2001–2100`** — `emitOwnedFieldDisposals`: the owned-
-  field disposal loop that identifies a field as a "collection" (hence requiring
-  `bz_array_free` / `bz_llist_free`) by checking `isCollectionTypeName(rt)`.
+- **`LlvmBackend_Disposal.cpp:415`** — `emitOwnedFieldDisposals` (moved out of
+  `LlvmBackend_Setup.cpp`): the owned-field disposal loop that identifies a field
+  as a "collection" (hence requiring `bz_array_free` / `bz_llist_free`) via
+  `ownedCollectionFieldType` (`LlvmBackend_impl.hpp:5498`), which applies
+  `isCollectionTypeName`/`isLinkedListTypeName`/`isDictTypeName`.
   **This is the deepest coupling**: a self-hosted collection FIELD in another
   class must still trigger the correct destructor sequence at the field owner's
   Dispose time. If the collection is a user class, the standard vtable-dispatch
@@ -122,7 +136,7 @@ Representative clusters (the ones a self-host migration would have to displace):
 
 ### 2.1 Element-Policy Unification
 
-`src/codegen/LlvmBackend_ElementPolicy.cpp` (219 lines) implements
+`src/codegen/LlvmBackend_ElementPolicy.cpp` (280 lines) implements
 `Emitter::elementPolicyFor(elemTy, owningFamily)` — the §28.11 v0.135 table
 translated into code (line 72). This factory returns an `ElementPolicy` struct
 whose `disposerThunk` field is the correct LLVM thunk for any element category
@@ -136,24 +150,25 @@ vtable (which standard user classes do).
 
 ### 2.2 `Buffer<T>` Primitive (Value-Element Fixed-Capacity)
 
-`TypeResolution_Names.cpp:99`: `Buffer<T>` registered with arity 1.
-`src/runtime/bezel_runtime.cpp` lines 10877–10928: three C functions
+`TypeResolution_Names.cpp:233`: `Buffer<T>` registered with arity 1.
+`src/runtime/bezel_runtime_collections.cpp` lines 2931–2978: three C functions
 (`bz_buffer_new`, `bz_buffer_get_ptr`, `bz_buffer_free`).
-`LlvmBackend_Exprs.cpp` line 6026–6065: `new Buffer<T>(n)` lowered to
+`LlvmBackend_Exprs2.cpp` lines 3289–3335: `new Buffer<T>(n)` lowered to
 `bz_buffer_new(len, elem_size)`.
 
 `Buffer<T>` is restricted to primitive value types (int/byte/short/long/double/
-decimal/char/bool) per `TypeResolution_Names.cpp:98` comment and
-`src/codegen/LlvmBackend_impl.hpp:701`. Class-element `Buffer<T>` is the §5.20
-deferred design pass.
+decimal/char/bool) per the `TypeResolution_Names.cpp:230–232` comment and the
+sema enforcement at `ExprTypecheck_Exprs.cpp:2380–2405` (which superseded the
+comment-only note formerly cited in `LlvmBackend_impl.hpp`). Class-element
+`Buffer<T>` is the §5.20 deferred design pass.
 
-### 2.3 `OwnedBuffer<T>` with Class T
+### 2.3 `OwningBuffer<T>` with Class T
 
-Per spec stdlib §4.14 and the `OwnedArray<T>` reference implementation at
-`tests/conformance/cases/stdlib_0039.bzl`, `OwnedBuffer<T>` with class T is the
+Per spec stdlib §4.14 and the `OwningArray<T>` reference implementation at
+`tests/conformance/cases/stdlib_0039.bzl`, `OwningBuffer<T>` with class T is the
 intended storage primitive for every self-hosted owning collection.
 
-The compiler currently lowers `OwnedBuffer<T>` (class T case) as a `bz_array_t*`
+The compiler currently lowers `OwningBuffer<T>` (class T case) as a `bz_array_t*`
 with `bz_array_alloc_count_n` (construction), `bz_array_get/set/set_disposing`
 (indexer), and `bz_array_free` with the element disposer from `elementPolicyFor`
 (disposal). The `move buf[i]` / field-restoration pattern that the reference
@@ -161,9 +176,9 @@ implementation uses is exercised by `generic_owned_field_disposal_test.cpp` (the
 `Box<T>` test, lines 145–166) and the move-interface-slot tests in
 `tests/ownership/`.
 
-**Conclusion:** `OwnedBuffer<T>` for class T is implemented and tested at
-the intrinsic level. The stdlib reference implementation of `OwnedArray<T>`
-(stdlib §4.14 and `tests/conformance/cases/stdlib_0039.bzl`) is purely
+**Conclusion:** `OwningBuffer<T>` for class T is implemented and tested at
+the intrinsic level. The stdlib reference implementation of `OwningArray<T>`
+(stdlib §4.5 and `tests/conformance/cases/stdlib_0039.bzl`) is purely
 expressed in Bezel source and is the template for self-hosting. The compiler
 already understands every operation that source uses.
 
@@ -174,9 +189,11 @@ already understands every operation that source uses.
 ### 3.1 How Stdlib Types Are Registered Today
 
 There is **no `.bzl` prelude**. Every stdlib type is registered as a builtin by
-name inside `builtinTypeArity` (`TypeResolution_Names.cpp:5–149`). A type not in
-that function gets `kNotBuiltin` (line 148) and causes an "unresolved type name"
-diagnostic.
+name inside `builtinTypeArity` (`TypeResolution_Names.cpp:44–296`). A type not in
+that function gets `kNotBuiltin` (line 296) and causes an "unresolved type name"
+diagnostic. (The `injectStdlibPrelude` hook that now exists at `Driver.cpp:80` is
+not such a prelude — it injects one synthesized AST declaration, `Result<T, E>`
+(#2047), not a compiled `.bzl` file.)
 
 The `TypeRef` for a builtin resolves with `Kind::Named`, `declaration = nullptr`
 (no `TypeSymbol`), and an `astNode` pointing at the AST type reference node. All
@@ -193,24 +210,27 @@ standard class dispatch.
 their `TypeSymbol*` into `SemaContext`, and let codegen handle them via the
 standard user-class path.
 
-**Hook point:** `Driver::compileFile` (`src/driver/Driver.cpp` lines 81–204).
-The pipeline today is:
+**Hook point:** `Driver::compileFile` (`src/driver/Driver.cpp` lines 165–339;
+thin forwarding overloads at 153/159). The pipeline today is:
 
 ```
-readFile → Lexer → Parser → collectSymbols → (loadDependency*) → resolveTypes
-  → typecheckExpressions → checkDefiniteAssignment → checkOwnership → codegen
+readFile → Lexer → Parser → injectStdlibPrelude → collectSymbols
+  → (loadDependencies) → resolveTypes → typecheckExpressions → checkPureBodies
+  → checkDefiniteAssignment → checkStaticInitCycles → checkOwnership → codegen
 ```
 
-The prelude loader would run between `SemaContext semaCtx(diagnostics)` and
-`collectSymbols(*unit, semaCtx)` — or equivalently, as the first step of
-`collectSymbols`, loading the prelude's symbols before the user unit's symbols so
-user code can reference them.
+The prelude loader would run between `SemaContext semaCtx(diagnostics)`
+(line 203) and `collectSymbols(*unit, semaCtx)` (line 204) — or equivalently, as
+the first step of `collectSymbols`, loading the prelude's symbols before the user
+unit's symbols so user code can reference them.
 
 **Mechanism:** Reuse the existing cross-module loader infrastructure
-(`module::loadDependency` / `ModuleLoader.cpp`). The stdlib prelude is compiled
-once to an object + metadata (`bezel.meta`) and loaded as a special "always-
-present" dependency. The `SemaContext::importedByModule_` table (lines 171–198
-of `SemaContext.hpp`) would map a `"System"` or `"System.Collections"` module
+(`module::loadDependency` / the batched `loadDependencies`,
+`ModuleLoader.cpp:1523/1546`). The stdlib prelude is compiled
+once to an object + metadata (the `.bezel.meta` section) and loaded as a special
+"always-present" dependency. The `SemaContext::importedByModule_` table
+(`SemaContext.hpp:382`; registration/lookup at lines 201–239) would map a
+`"System"` or `"System.Collections"` module
 name to the prelude's exported `TypeSymbol*` objects.
 
 **What changes in name resolution:** `TypeResolution_Names.cpp`'s
@@ -238,42 +258,44 @@ Option (a) is the cleanest; the cross-module loader already handles this workflo
 ### 4.1 The Problem
 
 A user-written Bezel class **cannot today hold runtime-sized owning storage
-as a field** without `OwnedBuffer<T>`. But `OwnedBuffer<T>` is itself a
+as a field** without `OwningBuffer<T>`. But `OwningBuffer<T>` is itself a
 compiler intrinsic — it has no user `TypeSymbol`; its construction, indexer,
 `move buf[i]`, and disposal are all hardcoded in the backend.
 
-The reference implementation of `OwnedArray<T>` (stdlib §4.14) uses
-`OwnedBuffer<T>` as its backing field. A self-hosted `OwnedStack<T>` would do the
-same: `private owned _storage: OwnedBuffer<T>`. That is **already valid Bezel
+The reference implementation of `OwningArray<T>` (stdlib §4.5) uses
+`OwningBuffer<T>` as its backing field. A self-hosted `OwningStack<T>` would do the
+same: `private owned _storage: OwningBuffer<T>`. That is **already valid Bezel
 source** because:
 
-1. `OwnedBuffer<T>` is a compiler-known type — `builtinTypeArity` returns 1
-   for it (line 81 of `TypeResolution_Names.cpp`).
+1. `OwningBuffer<T>` is a compiler-known type — `builtinTypeArity` returns 1
+   for it (line 183 of `TypeResolution_Names.cpp`).
 2. Its owned field in a user class triggers `ownedCollectionFieldType` in
-   `LlvmBackend_impl.hpp:3213`, which returns the TypeRef so
-   `emitOwnedFieldDisposals` (Setup.cpp ~line 2030) calls `bz_array_free` with
+   `LlvmBackend_impl.hpp:5498`, which returns the TypeRef so
+   `emitOwnedFieldDisposals` (`LlvmBackend_Disposal.cpp:415`; moved out of
+   Setup.cpp) calls `bz_array_free` with
    the correct element disposer from `elementPolicyFor`.
 3. The `move buf[i]` and `buf[i] := value` indexer operations on an
-   `OwnedBuffer<T>` field are lowered by the existing intrinsic paths in
-   `LlvmBackend_Exprs.cpp` and `LlvmBackend_Assign.cpp`.
+   `OwningBuffer<T>` field are lowered by the existing intrinsic paths in
+   `LlvmBackend_Assign.cpp` (indexer get/set/move) and `LlvmBackend_Exprs2.cpp`
+   (construction).
 
-**`OwnedBuffer<T>` as the owned-storage primitive is NOT a gap.** The spec
+**`OwningBuffer<T>` as the owned-storage primitive is NOT a gap.** The spec
 already designates it as the intrinsic boundary (rationale §5.14, §5.15,
 §5.20). After v0.99, "the intrinsic surface of the entire owning-collection
-family reduces to one well-scoped primitive (`OwnedBuffer<T>`)" (rationale §5.14).
+family reduces to one well-scoped primitive (`OwningBuffer<T>`)" (rationale §5.14).
 
 ### 4.2 Options for Any Remaining Gap
 
-The **only residual gap** is that `OwnedBuffer<T>` itself remains a compiler
+The **only residual gap** is that `OwningBuffer<T>` itself remains a compiler
 intrinsic — users cannot rewrite it. The spec explicitly accepts this (stdlib
 §4.14: "Why this is a compiler-known primitive"). If the goal is to self-host the
-*collections that compose over* `OwnedBuffer<T>`, no additional primitive is
+*collections that compose over* `OwningBuffer<T>`, no additional primitive is
 needed.
 
-If in the future even `OwnedBuffer<T>` must be expressible in Bezel source, the
+If in the future even `OwningBuffer<T>` must be expressible in Bezel source, the
 options are:
 
-- **(a) Expose `OwnedBuffer<T>` as a full user TypeSymbol** with a compiler-
+- **(a) Expose `OwningBuffer<T>` as a full user TypeSymbol** with a compiler-
   synthesized body for its one intrinsic operation (runtime-sized heap allocation).
   Compiler knows the allocation; everything else (indexer, move, disposal) is
   already standard user-class machinery. Risk: moderate — requires extending the
@@ -283,54 +305,61 @@ options are:
   requires spec amendment (out of scope for implementation PRs per CLAUDE.md).
 - **(c) Defer to the §5.20 design pass** — the spec explicitly defers class-
   element `Buffer<T>` and the borrow-storing primitive to future design work.
-  Accept `OwnedBuffer<T>` as the permanent intrinsic floor.
+  Accept `OwningBuffer<T>` as the permanent intrinsic floor.
 
-**Recommendation:** Option (c). Keep `OwnedBuffer<T>` as the intrinsic floor
+**Recommendation:** Option (c). Keep `OwningBuffer<T>` as the intrinsic floor
 and self-host only the collections that compose over it. This matches the spec's
 own stated intent and avoids a spec amendment.
 
-**Owner decision required (D2):** Confirm that `OwnedBuffer<T>` remains the
+**Owner decision required (D2):** Confirm that `OwningBuffer<T>` remains the
 permanent intrinsic floor for this run, and that the self-hosting goal is
-"collections composed over `OwnedBuffer<T>`" rather than `OwnedBuffer<T>` itself.
+"collections composed over `OwningBuffer<T>`" rather than `OwningBuffer<T>` itself.
 
 ---
 
-## 5. Proof-of-Concept Target: `OwnedStack<T>`
+## 5. Proof-of-Concept Target: `OwningStack<T>`
 
-### 5.1 Why `OwnedStack<T>` First
+### 5.1 Why `OwningStack<T>` First
 
-- **Smallest API surface** (6 methods: `Push`, `Pop`, `Peek`, `TryPop`,
-  `TryPeek`, `Clear`, `Drain` — stdlib §4.11). No resize-with-insert semantics.
-- **Composes trivially** over `OwnedArray<T>` (whose reference implementation
+- **Smallest API surface** (8 declared members: `Push`, `Contains`, `Pop`,
+  `Peek`, `TryPop`, `TryPeek`, `Clear`, `Drain` — stdlib §4.11; the explicit
+  `Contains` was added at v0.222, #1811). No resize-with-insert semantics.
+- **Composes trivially** over `OwningArray<T>` (whose reference implementation
   in Bezel is already written at `tests/conformance/cases/stdlib_0039.bzl`).
-  In fact, `OwnedStack<T>` IS just an `OwnedArray<T>` where `Push = Add` and
+  In fact, `OwningStack<T>` IS just an `OwningArray<T>` where `Push = Add` and
   `Pop = PopLast`. The self-hosted implementation is approximately 40 lines.
 - **No dictionary/hash machinery** (unlike `Set<T>` or `Dictionary<K,V>`).
 - **No linked-node pointer chasing** (unlike `LinkedList<T>`).
 - **Has an existing working codegen test** at
-  `tests/codegen/collection_test.cpp:80–88` (value-element `Stack<int>`); the
-  owned-element variant is not yet tested in a JIT round-trip but `OwnedArray`
+  `tests/codegen/collection_test.cpp:81–90` (value-element `Stack<int>`), and the
+  owned-element variant is exercised in AOT round-trips by
+  `owned_collection_pop_dispose_746_test.cpp` and
+  `owned_collection_accessors_test.cpp` (the round-trip harness is now the AOT
+  path, `runAot`; the former in-process JIT harness was retired). `OwningArray`
   element disposal is thoroughly tested.
 
 ### 5.2 Bezel Source for the POC
 
-The self-hosted `OwnedStack<T>` composes directly over the `OwnedArray<T>`
-reference implementation, or equivalently over `OwnedBuffer<T>` directly:
+The self-hosted `OwningStack<T>` composes directly over the `OwningArray<T>`
+reference implementation, or equivalently over `OwningBuffer<T>` directly:
 
 ```bezel
 module System.Collections;
 
-public class OwnedStack<T>: IOwnedCollection<T> where T: class
-  private owned _buf: OwnedBuffer<T>;
+public class OwningStack<T>: IReadOnlyCollection<T> where T: class
+  // conformance per v0.222 (#1811): OwningStack was demoted to
+  // IReadOnlyCollection<T> only; the IOwningCollection<T> conformance
+  // this draft originally declared was removed at that revision.
+  private owned _buf: OwningBuffer<T>;
   private _count: int := 0;
 
   public constructor()
-    _buf := new OwnedBuffer<T>(8);
+    _buf := new OwningBuffer<T>(8);
   end constructor;
 
   public method Push(owned item: T)
     if _count = _buf.Length then
-      var fresh := new OwnedBuffer<T>(_buf.Length * 2);
+      var fresh := new OwningBuffer<T>(_buf.Length * 2);
       for var i in 0..<_count do
         var m := move _buf[i];
         _buf[i] := null;
@@ -377,17 +406,25 @@ public class OwnedStack<T>: IOwnedCollection<T> where T: class
     _count := 0;
   end Clear;
 
-  // Drain: see OwnedEnumerable pattern (§4.13); deferred to later slice
-end OwnedStack;
+  // Drain: see the IOwningEnumerable pattern (§4.13); deferred to later slice
+end OwningStack;
 ```
 
+[Editorial note, 2026-07-30 refresh: beyond the conformance-header correction
+above, this sketch's member set has drifted from the current stdlib §4.11
+surface in ways the mechanical refresh did not rewrite — the Try outs are
+nullable under the v0.171 Try convention (`TryPop(out owned item: T?): bool`,
+`TryPeek(out item: T?): bool`), and v0.222 (#1811) added an explicit
+`Contains(item: T): bool`. Bring the POC body up to the v0.231 signatures when
+SH-3 is actually scheduled.]
+
 All operations in this source body are already working in the compiler:
-- `new OwnedBuffer<T>(n)` — lowered via `bz_array_alloc_count_n`
-- `_buf[i]` indexer get — lowered by intrinsic OwnedBuffer indexer path
+- `new OwningBuffer<T>(n)` — lowered via `bz_array_alloc_count_n`
+- `_buf[i]` indexer get — lowered by intrinsic OwningBuffer indexer path
 - `move _buf[i]` — ownership-checker proven by `generic_owned_field_disposal_test.cpp`
 - `_buf[i] := null` — field-restoration rule enforced by ownership checker
 - `m!.Dispose()` — vtable dispatch to element's Dispose
-- `_buf.Dispose()` — OwnedBuffer intrinsic disposal (bz_array_free with disposer)
+- `_buf.Dispose()` — OwningBuffer intrinsic disposal (bz_array_free with disposer)
 - `owned item: T` parameter and `return item!` owned-return — proven by
   `generic_owned_field_disposal_test.cpp` (Box pattern at line 156–166)
 - `where T: class` constraint — sema registered and codegen monomorphization
@@ -395,38 +432,38 @@ All operations in this source body are already working in the compiler:
 
 ### 5.3 What the Compiler Must Do
 
-When `OwnedStack<T>` is compiled from the prelude (a self-hosted `.bzl` file):
+When `OwningStack<T>` is compiled from the prelude (a self-hosted `.bzl` file):
 
-1. **Sema:** resolve `OwnedBuffer<T>` as the intrinsic builtin it already is;
+1. **Sema:** resolve `OwningBuffer<T>` as the intrinsic builtin it already is;
    resolve `move _buf[i]`, `_buf[i] := null`, `item!.Dispose()` via the
    normal expression-typecheck paths for class fields and owned returns.
 
 2. **Codegen:** lower the class through the standard `emitClass` path. The
    `Push` method's `_buf[_count] := item` lowers via the standard
-   `lowerCollectionIndexerSet` **because `_buf` is still an OwnedBuffer
-   intrinsic field** — codegen recognizes OwnedBuffer fields and emits
+   `lowerCollectionIndexerSet` **because `_buf` is still an OwningBuffer
+   intrinsic field** — codegen recognizes OwningBuffer fields and emits
    `bz_array_set_disposing`. The Clear loop's `m!.Dispose()` emits vtable
    dispatch.
 
-3. **Disposal:** the compiler-generated `Dispose` for `OwnedStack<T>` sees
-   `private owned _buf: OwnedBuffer<T>`. `ownedCollectionFieldType` in
-   `LlvmBackend_impl.hpp:3213` recognizes OwnedBuffer as a collection field
-   (via `isCollectionTypeName(rt)` or — since OwnedBuffer is in the intrinsic
-   set — via the `n == "OwnedBuffer"` branch in `LlvmBackend_Layout.cpp:395`).
+3. **Disposal:** the compiler-generated `Dispose` for `OwningStack<T>` sees
+   `private owned _buf: OwningBuffer<T>`. `ownedCollectionFieldType` in
+   `LlvmBackend_impl.hpp:5498` recognizes OwningBuffer as a collection field
+   (via `isCollectionTypeName(rt)` or — since OwningBuffer is in the intrinsic
+   set — via the `n == "OwningBuffer"` branch in `LlvmBackend_Layout.cpp:649`).
    The emitted disposal calls `bz_array_free` with the element disposer derived
    from `elementPolicyFor`. This is **unchanged from the current fully-intrinsic
    path** — the self-hosted class's Dispose works identically to today's.
 
 4. **Prelude bootstrap:** after loading the prelude, `TypeSymbol*` for
-   `OwnedStack` exists in `SemaContext`. Name resolution finds it via the normal
-   imported-type path. `builtinTypeArity` returns `kNotBuiltin` for `OwnedStack`
+   `OwningStack` exists in `SemaContext`. Name resolution finds it via the normal
+   imported-type path. `builtinTypeArity` returns `kNotBuiltin` for `OwningStack`
    (it has been removed from the list). `isCollectionTypeName` returns `false`
-   (because `rt->declaration != nullptr`). Method calls on `OwnedStack` go
+   (because `rt->declaration != nullptr`). Method calls on `OwningStack` go
    through `tryLowerBuiltinClassCall` → standard vtable dispatch path.
 
-The net result: user code `using var s := new OwnedStack<MyClass>();` compiles
+The net result: user code `using var s := new OwningStack<MyClass>();` compiles
 through the same path as any user-defined generic class, with no special-casing
-in the backend for `OwnedStack`.
+in the backend for `OwningStack`.
 
 ---
 
@@ -439,7 +476,7 @@ within a dedicated self-hosting run.
 
 **What:** Add a mechanism to compile a stdlib `.bzl` prelude before user code
 and register its `TypeSymbol*` into `SemaContext`. Hook into `Driver.cpp` at the
-`compileFile` entry (line 85). Reuse `module::loadDependency` or implement a
+`compileFile` entry (line 165). Reuse `module::loadDependency` or implement a
 dedicated `loadStdlibPrelude(path, semaCtx)` that compiles the prelude to a
 `.bezel.meta` object and loads it.
 
@@ -458,43 +495,48 @@ order — the prelude must be compiled before any user program using it).
 
 **Owner decision required (D1):** Prelude file location and build-system model.
 
-### Slice SH-2: Expose `OwnedBuffer<T>` as Holdable Owned Field for Generic Classes
+### Slice SH-2: Expose `OwningBuffer<T>` as Holdable Owned Field for Generic Classes
 
 **What:** This is mostly already done. Verify and test that a user-written generic
-class `class Foo<T> where T: class` can declare `private owned _buf: OwnedBuffer<T>`
+class `class Foo<T> where T: class` can declare `private owned _buf: OwningBuffer<T>`
 and that:
-- Construction (`_buf := new OwnedBuffer<T>(n)`) compiles.
+- Construction (`_buf := new OwningBuffer<T>(n)`) compiles.
 - Indexer get (`_buf[i]!`) and owned-move (`move _buf[i]`) compile.
 - Indexed set (`_buf[i] := value`) and null-restore (`_buf[i] := null`) compile.
-- Class-level Dispose cascades through the OwnedBuffer field correctly.
+- Class-level Dispose cascades through the OwningBuffer field correctly.
 
 If any of these are untested or broken, fix them before SH-3.
 
-**Tests:** Write a JIT round-trip test (`tests/codegen/owned_buffer_generic_field_test.cpp`)
-with a Box-like class that holds `OwnedBuffer<T>`, fills some slots, and verifies
+**Tests:** Write an AOT round-trip test (`tests/codegen/owning_buffer_generic_field_test.cpp`)
+with a Box-like class that holds `OwningBuffer<T>`, fills some slots, and verifies
 the element destructor count at Dispose time.
 
 **Size:** Small-medium (2–3 days). Primarily test writing; may expose 1–2 bugs.
 
-**Risk:** Low. The conformance file `stdlib_0039.bzl` (the `OwnedArray<T>` Bezel
+**Risk:** Low. The conformance file `stdlib_0039.bzl` (the `OwningArray<T>` Bezel
 source) already exercises all these operations — the risk is in translating from
-conformance-check form to JIT round-trip proof.
+conformance-check form to AOT round-trip proof.
 
-### Slice SH-3: Self-Host `OwnedStack<T>` (Proof of Concept)
+### Slice SH-3: Self-Host `OwningStack<T>` (Proof of Concept)
 
-**What:** Write `src/stdlib/owned_stack.bzl` containing the `OwnedStack<T>`
-source above. Wire it into the prelude loader from SH-1. Remove `"OwnedStack"`
-from `builtinTypeArity` (TypeResolution_Names.cpp line 69) and from the
-`isCollectionTypeName` predicate (LlvmBackend_Calls.cpp line 391). Add or
-migrate the existing `OwnedStack<T>` codegen tests to confirm the self-hosted
+**What:** Write `src/stdlib/owning_stack.bzl` containing the `OwningStack<T>`
+source above. Wire it into the prelude loader from SH-1. Remove `"OwningStack"`
+from `builtinTypeArity` (TypeResolution_Names.cpp line 171) and from the
+`isCollectionTypeName` name set (the #1414 stage-3 registry's
+`kArrayBackedCollections`, `src/common/BuiltinRegistry.cpp:69` — the predicate
+itself, `LlvmBackend_Calls.cpp:397`, reads that registry). Add or
+migrate the existing `OwningStack<T>` codegen tests to confirm the self-hosted
 path produces the same results as the previous intrinsic path.
 
-**What does NOT change:** `OwnedBuffer<T>` intrinsic handling stays. The
-`Push`/`Pop`/`Peek` operations on `OwnedStack` now reach vtable dispatch instead
+**What does NOT change:** `OwningBuffer<T>` intrinsic handling stays. The
+`Push`/`Pop`/`Peek` operations on `OwningStack` now reach vtable dispatch instead
 of `bz_array_*` calls. The Drain() implementation is deferred.
 
-**Tests:** Migrate `tests/codegen/owned_collection_ops_test.cpp` OwnedStack
-sub-cases; add a new test verifying element disposal via the self-hosted destructor.
+**Tests:** Migrate the existing OwningStack codegen tests
+(`tests/codegen/owned_collection_pop_dispose_746_test.cpp`,
+`owned_collection_accessors_test.cpp`; `owned_collection_ops_test.cpp` now covers
+only `OwningArray` Remove/Insert); add a new test verifying element disposal via
+the self-hosted destructor.
 
 **Size:** Medium (3–5 days). This is the highest-value proof: if it passes, the
 architecture is validated.
@@ -508,29 +550,32 @@ probes exactly that boundary, but with a simpler case (no multi-module separatio
 of definition site from instantiation site; the prelude is always co-loaded).
 
 **Owner decision required (D3):** Accept that `Drain()` is deferred to a
-subsequent slice (it requires `OwnedEnumerable<T>` machinery — stdlib §4.13 —
+subsequent slice (it requires `IOwningEnumerable<T>` machinery — stdlib §4.13 —
 which is a larger codegen feature).
 
-### Slice SH-4: Self-Host Borrowing `Stack<T>` and `Queue<T>` / `OwnedQueue<T>`
+### Slice SH-4: Self-Host Borrowing `Stack<T>` and `Queue<T>` / `OwningQueue<T>`
 
 **What:** Write `src/stdlib/stack.bzl`, `src/stdlib/queue.bzl`,
-`src/stdlib/owned_queue.bzl`. Borrowing `Stack<T>` and `Queue<T>` are simpler
+`src/stdlib/owning_queue.bzl`. Borrowing `Stack<T>` and `Queue<T>` are simpler
 (no owned-element disposal). Remove their entries from `builtinTypeArity` and
 `isCollectionTypeName`.
 
 **Size:** Small-medium per type (1–2 days each).
 
 **Risk:** Low after SH-3 is proven. The borrowing variants use `Array<T>` or a
-value `OwnedBuffer<int>` as backing, which avoids the owned-element complexity.
+value `OwningBuffer<int>` as backing, which avoids the owned-element complexity.
 
 ### Slice SH-5: Incremental Codegen De-Hardcoding
 
-**What:** For each type migrated off the intrinsic path, audit the 180 name-
+**What:** For each type migrated off the intrinsic path, audit the ~385 name-
 string sites in `src/sema/` and `src/codegen/` and remove or conditionalize the
 entries that are now dead. Focus on the high-impact clusters:
-- `LlvmBackend_Calls.cpp:387–393` — `isCollectionTypeName` predicate.
-- `ExprTypecheck_Exprs.cpp:291–296, 706–711` — sema member access gates.
-- `LlvmBackend_Setup.cpp:2020–2044` — owned-field disposal classification.
+- `LlvmBackend_Calls.cpp:397–406` — `isCollectionTypeName` predicate (its name
+  set is the #1414 stage-3 registry's `kArrayBackedCollections`,
+  `src/common/BuiltinRegistry.cpp:69`).
+- `ExprTypecheck_Exprs.cpp:914–919, 1996–2001` — sema member access gates.
+- `LlvmBackend_Disposal.cpp:415` + `LlvmBackend_impl.hpp:5498` — owned-field
+  disposal classification (moved out of `LlvmBackend_Setup.cpp`).
 
 For each type removed from the predicate, add a regression test that previously-
 passing codegen tests still pass.
@@ -547,10 +592,10 @@ This is a multi-run endeavor. Rough ordering by complexity:
 
 | Collection | Complexity | Blocker |
 |---|---|---|
-| `OwnedArray<T>` | Medium | SH-3 proven; reference impl at `stdlib_0039.bzl` |
-| `LinkedList<T>` / `OwnedLinkedList<T>` | High | Needs node-type definition; `bz_llist_*` is the runtime; self-hosting would need a Bezel-source node class or keep bz_llist_* as the intrinsic floor |
-| `Set<T>` / `OwnedSet<T>` | High | Hash/eq dispatch is runtime-polymorphic; needs design for how a Bezel-source set class expresses the hash function |
-| `Dictionary<K,V>` / `OwnedDictionary<K,V>` | Very High | Two type params; generic-key hash table; drain-and-rebuild bucket mutation pattern |
+| `OwningArray<T>` | Medium | SH-3 proven; reference impl at `stdlib_0039.bzl` |
+| `LinkedList<T>` / `OwningLinkedList<T>` | High | Needs node-type definition; `bz_llist_*` is the runtime; self-hosting would need a Bezel-source node class or keep bz_llist_* as the intrinsic floor |
+| `Set<T>` / `OwningSet<T>` | High | Hash/eq dispatch is runtime-polymorphic; needs design for how a Bezel-source set class expresses the hash function |
+| `Dictionary<K,V>` / `OwningDictionary<K,V>` | Very High | Two type params; generic-key hash table; drain-and-rebuild bucket mutation pattern |
 
 **Owner decision required (D4):** Whether `LinkedList<T>` and `Dictionary<K,V>`
 should remain C++ intrinsics long-term (they have the most complex runtime
@@ -567,25 +612,25 @@ runs, none of the self-hosting replacements can be wired in. That loader does no
 exist today.
 
 **The keystone prerequisite is SH-1**, followed immediately by SH-2 (verifying
-OwnedBuffer<T> as a generic class's owned field works end-to-end in JIT tests).
-Once both pass, SH-3 (`OwnedStack<T>` as the proof of concept) is the high-
+OwningBuffer<T> as a generic class's owned field works end-to-end in AOT tests).
+Once both pass, SH-3 (`OwningStack<T>` as the proof of concept) is the high-
 value architectural validation: if a self-hosted generic class with an
-`OwnedBuffer<T>` field compiles through the prelude path, produces correct JIT
+`OwningBuffer<T>` field compiles through the prelude path, produces correct AOT
 results, and passes element-disposal tests, the architecture is proven and the
 remaining collections are mechanical repetition.
 
 **This is a multi-run architectural endeavor.** A single dedicated run should
-target SH-1 + SH-2 + SH-3 (prelude bootstrap + OwnedBuffer field proof +
-`OwnedStack<T>` POC). That is four owner-decision gates (D1–D4) and approximately
+target SH-1 + SH-2 + SH-3 (prelude bootstrap + OwningBuffer field proof +
+`OwningStack<T>` POC). That is four owner-decision gates (D1–D4) and approximately
 two weeks of focused work. The remaining collections (SH-4 through SH-6) are
-follow-on runs once the POC run validates the architecture. The 180 hardcoded
+follow-on runs once the POC run validates the architecture. The ~385 hardcoded
 name-string sites cannot all be removed in one run without risk of silent
 regressions; the correct discipline is to remove each type's entries only after
 that type's self-hosted round-trip tests pass.
 
 **First recommended dedicated-run slice:** SH-1 (prelude bootstrap loader) as the
-one essential infrastructure piece, immediately followed by SH-2 (OwnedBuffer
-field JIT proof) and SH-3 (self-hosted `OwnedStack<T>`). Commit to these three
+one essential infrastructure piece, immediately followed by SH-2 (OwningBuffer
+field AOT proof) and SH-3 (self-hosted `OwningStack<T>`). Commit to these three
 and defer SH-4 through SH-6 to subsequent runs. If SH-3 uncovers a fundamental
 blocker in cross-module generic instantiation for prelude-loaded types, the run
 ends cleanly with a decline-with-reasons issue filed, without having disturbed the
