@@ -56,20 +56,21 @@
 //     wrapped {i8, T} struct, not the bare layout that helper expects).
 //   * value-like choice component, and inline `[N]string`/`[N]RecordType`
 //     array components: NOT covered by this fix (no equivalent release
-//     helper exists yet) — a residual, documented gap; see #2402.
+//     helper exists yet) — a residual, documented gap; see #2405 (which
+//     covers this alongside the two-level-nesting gap below).
 //   * A record/choice component that is itself a record TWO OR MORE levels
 //     of nesting deep (a nested record whose own nested-record field owns
 //     a string) is NOT fully covered — the reused #1747 helper is only
 //     ONE level deep, matching its own established scope. Confirmed
 //     leaking via probe (`Root(mid: Mid(leaf: Leaf(tag: string)), second:
 //     int)`, cut inside `second`: "60 byte(s) leaked in 2 allocation(s)")
-//     — filed as #2401 (a residual, narrower version of the same bug this
+//     — filed as #2405 (a residual, narrower version of the same bug this
 //     fix addresses one level deep).
 //
 // Two SEPARATE, more severe bugs were discovered while designing test cases
 // and are explicitly NOT fixed here (different root cause, different fix
 // site, filed separately per the project's decline-with-reasons discipline):
-//   * #2400: a truncated `string` VALUE (not a structural field/name/count)
+//   * #2403: a truncated `string` VALUE (not a structural field/name/count)
 //     in the BINARY format never raises SerializationException at all —
 //     bz_binder_read_bz_string (and its bz_binder_read_string /
 //     bz_binder_read_field_name callers) return null on truncation WITHOUT
@@ -85,7 +86,7 @@
 //     a length-prefixed count, which DOES throw reliably) as the field
 //     whose truncation drives the exception, rather than truncating
 //     directly inside a trailing string value.
-//   * #2400 (same repro family): emitRecordDeserialize / emitChoiceDeserialize
+//   * #2404 (same repro family): emitRecordDeserialize / emitChoiceDeserialize
 //     never null-check the `bz_binder_read_field_name` return before
 //     dereferencing it (unlike emitClassDeserialize's explicit `errBB`
 //     null check) — a truncation landing inside a field NAME's own
@@ -178,7 +179,7 @@ BEZEL_TEST(serialization_sibling_leak_2398,
 // "Record with two string components truncated after the first": BOTH
 // already-read string siblings (`a`, `b`) leak, not just one, when the
 // trailing `int` field `c` throws. (A truncation landing directly inside a
-// trailing STRING value never raises at all in the binary format — #2400 —
+// trailing STRING value never raises at all in the binary format — #2403 —
 // so `c: int` is what reliably drives the exception here; the point under
 // test is that MULTIPLE already-read string slots are all disposed, not
 // just the first one populated.)
@@ -291,8 +292,12 @@ BEZEL_TEST(serialization_sibling_leak_2398,
 // this success path REGARDLESS of this fix (confirmed via probe: the
 // nested-record shape leaks 55 bytes here on both pre-fix and post-fix
 // main, an unrelated pre-existing gap in the #1747 caller-side mechanism,
-// not emitRecordDeserialize/emitChoiceDeserialize -- filed as #2401,
-// folded with the two-level-nesting follow-up). Keeping this control flat
+// not emitRecordDeserialize/emitChoiceDeserialize -- #1747's own code
+// comments already document this exact one-level scope as a deliberate,
+// recorded narrow-scope decision, so no new issue is filed for it here;
+// see #2405 for the (related but distinct) throw-path residual gap this
+// fix's own reused helper leaves at 2+ levels of nesting). Keeping this
+// control flat
 // isolates it to exactly what THIS fix touches: the exception/unwind path
 // inside the deserializer itself.
 BEZEL_TEST(serialization_sibling_leak_2398,

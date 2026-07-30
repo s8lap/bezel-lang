@@ -942,8 +942,10 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     // is the wrapped {i8, T} struct, not the bare record layout
     // emitRecordStringFieldReleases expects — isRecordWithStringFieldsTypeRef
     // already guards both. A record component that is itself a value-like
-    // CHOICE with a string payload is a documented residual gap: no
-    // equivalent release helper exists for choices yet — issue filed.)
+    // CHOICE with a string payload, or a record nested TWO OR MORE levels
+    // deep, is a documented residual gap: no equivalent release helper
+    // exists for choices yet, and the reused helper here is one level
+    // only — issue #2405 filed.)
     // Popped WITHOUT disposal once every required component is confirmed
     // present (below, just before construction begins) — by then each
     // slot's value is about to be consumed into the constructed record.
