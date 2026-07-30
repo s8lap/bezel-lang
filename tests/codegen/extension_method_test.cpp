@@ -476,6 +476,12 @@ BEZEL_TEST(codegen_extension,
 // body on an INDEXER INTERFACE.  Before the fix, indexReceiverDecl returned
 // null for `this` inside an extension method (extension methods have no
 // parent TypeSymbol), so lowerIndexerGet returned null → caller got 0.
+//
+// fix #2417 (§11.2/§23.4, v0.235): `IIdx` is declared `readonly` in both
+// tests below — `Arr`'s indexer is getter-only (expression-bodied) and
+// neither test ever writes through the interface, so a read-write
+// obligation here would be the exact getter-only-satisfying-read-write
+// shape #2417's accessor-set conformance check now rejects at compile time.
 // ===========================================================================
 
 // §26.5 / #1237 Facet B – basic repro: `this[0]` inside an extension on an
@@ -484,7 +490,7 @@ BEZEL_TEST(codegen_extension,
            iface_extension_this_indexer_dispatch_1237_B) {
     BEZEL_EXPECT_EQ(runMod(
         "module M; "
-        "interface IIdx property [i: int]: int; end IIdx; "
+        "interface IIdx readonly property [i: int]: int; end IIdx; "
         "class Arr: IIdx "
         "  private _v: int := 0; "
         "  public constructor(v: int) _v := v; end constructor; "
@@ -507,7 +513,7 @@ BEZEL_TEST(codegen_extension,
            iface_indexer_direct_dispatch_regression_1237_B) {
     BEZEL_EXPECT_EQ(runMod(
         "module M; "
-        "interface IIdx property [i: int]: int; end IIdx; "
+        "interface IIdx readonly property [i: int]: int; end IIdx; "
         "class Arr: IIdx "
         "  private _v: int := 0; "
         "  public constructor(v: int) _v := v; end constructor; "

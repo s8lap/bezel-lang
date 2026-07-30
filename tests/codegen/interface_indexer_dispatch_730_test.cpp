@@ -21,13 +21,26 @@ int run(const std::string& prog) {
 const char* iface =
     "module M; "
     "interface IIndexable property [i: int]: int; end IIndexable; ";
+// fix #2417 (§11.2 / §23.4, v0.235): a SEPARATE, read-only interface for the
+// two tests below that dispatch a getter-only indexer through the interface
+// and never write through it. `iface` above stays read-write (no `readonly`)
+// because `getter_and_setter_via_interface` genuinely needs a settable
+// obligation to exercise the setter path; reusing it for a getter-only
+// implementer is exactly the latent shape #2417's own accessor-set
+// conformance check now rejects (a getter-only implementation of a
+// read-write interface indexer installs a null function pointer in the
+// itable setter slot — SIGSEGV on write, never exercised by these two
+// read-only tests, but now a compile error regardless of use).
+const char* ifaceReadOnly =
+    "module M; "
+    "interface IIndexable readonly property [i: int]: int; end IIndexable; ";
 }  // namespace
 
 // §23.4 / §13: the canonical #730 B2 repro — an expression-bodied class indexer
 // dispatched through an interface-typed parameter. 40 + 2 = 42 (was 0).
 BEZEL_TEST(interface_indexer_dispatch_730, expression_getter_via_interface) {
     BEZEL_EXPECT_EQ(run(
-        std::string(iface) +
+        std::string(ifaceReadOnly) +
         "class SingleInt: IIndexable "
         "  private _v: int; "
         "  public constructor(v: int) _v := v; end constructor; "
@@ -74,18 +87,16 @@ BEZEL_TEST(interface_indexer_dispatch_730, getter_and_setter_via_interface) {
 BEZEL_TEST(interface_indexer_dispatch_730, indexer_interleaved_with_members) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        // §11.2/§23.3 (#2413): Box's `Size` and `Name` are getter-only and
-        // this test never writes through the interface for either, so both
-        // obligations are declared `readonly` — a getter-only
-        // implementation of a read-write interface property is now a
-        // compile error (#2413). The indexer is untouched: #2413's fix is
-        // scoped to plain (non-indexer) properties (indexers are excluded
-        // from the same conformance loop at their own §23.4 call site) —
-        // filed as a separate issue for the identical indexer-shaped gap.
+        // §11.2/§23.3 (#2413) / §11.2/§23.4 (#2417): Box's `Size`, `Name`,
+        // and indexer are all getter-only and this test never writes through
+        // the interface for any of them, so all three obligations are
+        // declared `readonly` — a getter-only implementation of a
+        // read-write interface property/indexer is a compile error (#2413
+        // for the property case, #2417 for the indexer sibling here).
         "interface IBox "
         "  method Tag(): int; "
         "  readonly property Size: int; "
-        "  property [i: int]: int; "
+        "  readonly property [i: int]: int; "
         "  readonly property Name: int; "
         "end IBox; "
         "class Box: IBox "
@@ -110,7 +121,7 @@ BEZEL_TEST(interface_indexer_dispatch_730, indexer_interleaved_with_members) {
 // thunk GEPs past the box header to the record bytes. 40 + 2 = 42.
 BEZEL_TEST(interface_indexer_dispatch_730, record_indexer_via_interface) {
     BEZEL_EXPECT_EQ(run(
-        std::string(iface) +
+        std::string(ifaceReadOnly) +
         "record Pt(x: int): IIndexable "
         "  public property [i: int]: int => x + i; "
         "end Pt; "

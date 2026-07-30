@@ -3092,6 +3092,21 @@ void Resolver::checkAbstractImplementations() {
         // is checked exactly like a declared property one (always getter-
         // only, since §9.1's generated property never has a setter).
         std::unordered_map<std::string_view, FieldSymbol*> concretePosFields;
+        // #2417 / §11.2 / §23.4: interface INDEXER obligations, tracked
+        // separately from ifaceProps just above (whose loop below skips
+        // indexers outright) because indexers are ANONYMOUS — §23.4: "An
+        // indexer is a property whose name is replaced by `[parameters]`" —
+        // so there is no name to key a map on, and §23.4 permits overloading
+        // by index-parameter type list ("Indexers may be overloaded by
+        // parameter type list"). Kept as a flat vector, not deduped: two
+        // DIFFERENT interfaces each declaring a read-write indexer are two
+        // separate obligations. Checked after the BFS below (search
+        // "ifaceIndexerObligations" for the check itself).
+        struct IfaceIndexerObligation {
+            PropertySymbol* ips;
+            TypeSymbol* iface;
+        };
+        std::vector<IfaceIndexerObligation> ifaceIndexerObligations;
         // #2186: BFS over the inheritance chain tracking the per-node
         // substitution the path induces. Dedup is by (TypeSymbol, subst-key)
         // — not TypeSymbol alone — so a generic interface reached through two
@@ -3178,7 +3193,24 @@ void Resolver::checkAbstractImplementations() {
                 // §11.2 / §23 (#489): interface properties require a matching
                 // PropertySymbol, not merely a same-named FieldSymbol.
                 if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
-                    if (ps->isIndexer) continue;  // indexers are separate
+                    if (ps->isIndexer) {
+                        // #2417 / §23.5 "Static indexers are not supported" —
+                        // the isStatic guard is defensive parity with the
+                        // named-property branch below (and with codegen's
+                        // own indexer helpers, which carry the identical
+                        // guard despite the same restriction).
+                        bool isStaticIdx = false;
+                        for (auto mod : ps->modifiers)
+                            if (mod == "static") { isStaticIdx = true; break; }
+                        if (curIsIface && !isStaticIdx)
+                            ifaceIndexerObligations.push_back({ps, cur});
+                        continue;  // indexers have no name; concrete side is
+                                   // matched directly off `t->members` below,
+                                   // not tracked through this BFS (mirrors
+                                   // codegen's classIndexerImplementing,
+                                   // which never walks the base chain either
+                                   // — see the check itself for why).
+                    }
                     bool isStatic = false;
                     for (auto mod : ps->modifiers)
                         if (mod == "static") { isStatic = true; break; }
@@ -3648,6 +3680,121 @@ void Resolver::checkAbstractImplementations() {
                     std::string(name) + "` is declared read-write — an "
                     "implementation of a read-write interface property must "
                     "provide a setter (§9.1 / §9.4 / §11.2 / §23.3)");
+            }
+        }
+        // #2417 / §11.2 / §23.4: the INDEXER sibling of #2413's/#2416's
+        // accessor-set check just above. `declareVtables` Pass D
+        // (LlvmBackend_Setup.cpp, the `ip->isIndexer` branch) installs
+        // `ConstantPointerNull` into an interface indexer's setter itable
+        // slot whenever the implementing class's matched indexer has no
+        // setter, with no diagnostic anywhere — `iface[i] := v` then calls
+        // through that null pointer (SIGSEGV, confirmed by the issue's own
+        // repro via gdb: RIP=0x0). Exactly #2413's bug, on the sibling
+        // accessor-presence gap §23.4 shares with §23.3 ("An indexer is a
+        // property whose name is replaced by `[parameters]`").
+        //
+        // MATCHING (the hard part): indexers are anonymous, and §23.4 admits
+        // overloading by index-parameter type list, so — unlike a plain
+        // property, matched by name — the obligation must be paired with a
+        // concrete candidate by parameter shape. The candidate this check
+        // selects is not a fresh §11.2 full-parameter-list matcher; it
+        // deliberately MIRRORS the exact selection codegen's own
+        // `classIndexerImplementing` (LlvmBackend_Assign.cpp) uses to fill
+        // the itable slot: `t`'s OWN indexer members only (no base-class
+        // walk — `findIndexer` never calls `baseClassOf`), matched by the
+        // interface indexer's FIRST index-parameter type, falling back to
+        // the first-declared indexer when no exact match is found. A
+        // "more correct" full-parameter-list-under-substitution matcher (the
+        // §11.2 rule `checkOverrideSignatureMatch`'s indexer branch
+        // implements for the OVERRIDE case, ~line 2556 above) was considered
+        // and rejected: it could select a DIFFERENT candidate than codegen's
+        // actual (weaker) selection on an overloaded indexer set — sema
+        // would then validate the accessor set of a candidate codegen never
+        // installs, which is worse than doing nothing (a false ACCEPT of the
+        // exact SIGSEGV shape this check exists to close). Mirroring the
+        // real dispatch is what makes the check sound; that codegen
+        // selection is itself arity-blind for an overloaded indexer set is a
+        // separate, pre-existing gap — filed as #2437, not fixed here.
+        //
+        // Local-only, per #2413's confirmed scope: `ips->decl` is null for
+        // an IMPORTED interface indexer (ModuleLoader reconstructs
+        // indexerParams as ParameterSymbols but attaches no ast::
+        // PropertyDecl — #2414's own T4 accept-control test pins this
+        // shape staying accepted). `t` is always LOCAL (this function's
+        // outer loop walks `ctx_.module()->children`), so the candidate's
+        // own `->decl` needs no such fallback.
+        //
+        // Accessor PRESENCE is a shape fact, not a typed one (see the
+        // sibling property check's identical note above) — substituting a
+        // generic interface's type parameters does not change which
+        // accessors an indexer declares, so this runs unconditionally, not
+        // gated on genericParams.empty().
+        //
+        // Records get this check for free: this function's outer loop
+        // already admits Record (#2416), and an indexer obligation is
+        // resolved the same way regardless of `t->kind` (unlike a named
+        // property, an indexer has no positional-field analog to special-
+        // case — §9.1's auto-generated property applies to named fields
+        // only). §23.4 ("positional-only records may not [declare read-
+        // write indexers]") is not re-derived here: a positional-only
+        // record's indexer, if it declares one at all, is necessarily
+        // getter-only, so it already falls out of this same check with no
+        // extra machinery.
+        for (auto& obl : ifaceIndexerObligations) {
+            PropertySymbol* ips = obl.ips;
+            auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ips->decl);
+            if (!ipd) continue;  // imported interface indexer — left to a
+                                  // future #2406-shaped fix, same as ifaceProps
+            if (!propertyDeclHasSetter(ipd))
+                continue;  // read-only obligation: no setter to check for
+
+            const TypeRef* firstParamTy = nullptr;
+            if (!ipd->indexerParams.empty() && ipd->indexerParams[0].type)
+                firstParamTy = resolvedOf(ipd->indexerParams[0].type.get());
+
+            PropertySymbol* candidate = nullptr;
+            PropertySymbol* firstDeclared = nullptr;
+            for (Symbol* m : t->members) {
+                auto* cps = dynamic_cast<PropertySymbol*>(m);
+                if (!cps || !cps->isIndexer) continue;
+                bool isStaticIdx = false;
+                for (auto mod : cps->modifiers)
+                    if (mod == "static") { isStaticIdx = true; break; }
+                if (isStaticIdx) continue;
+                if (!firstDeclared) firstDeclared = cps;
+                if (!firstParamTy) continue;
+                auto* cpd = dynamic_cast<const ast::PropertyDecl*>(cps->decl);
+                if (!cpd || cpd->indexerParams.empty() ||
+                    !cpd->indexerParams[0].type)
+                    continue;
+                const TypeRef* candTy =
+                    resolvedOf(cpd->indexerParams[0].type.get());
+                if (candTy && typeRefEqual(firstParamTy, candTy)) {
+                    candidate = cps;
+                    break;
+                }
+            }
+            if (!candidate) candidate = firstDeclared;
+            // `t` declares no indexer at all: a different, pre-existing gap
+            // (missing implementation entirely — the GETTER itable slot is
+            // ALSO null in that shape, not just the setter, confirmed by
+            // probe: SIGSEGV on a plain READ) that #2417 does not attempt —
+            // filed as #2438; see the comment block above this loop.
+            if (!candidate) continue;
+
+            auto* cpd = dynamic_cast<const ast::PropertyDecl*>(candidate->decl);
+            if (!cpd) continue;  // defensive: `candidate` is always a member
+                                  // of local `t`, so this should not happen
+
+            if (!propertyDeclHasSetter(cpd)) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string(kindWord) + " `" + std::string(t->name) +
+                    "` implements interface `" + std::string(obl.iface->name) +
+                    "`'s indexer with a getter-only implementation, but the "
+                    "interface's indexer is declared read-write — an "
+                    "implementation of a read-write interface indexer must "
+                    "provide a setter (§11.2 / §23.4)");
             }
         }
         // R39 / §11.2 ("Return types must match exactly — no covariance"): a
