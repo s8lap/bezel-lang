@@ -2791,8 +2791,23 @@ void Resolver::checkAbstractImplementations() {
         -> TypeRef* {
         if (!d) return d;
         if (d->kind != TypeRef::Kind::Named) return d;
-        if (!d->declaration && d->astNode && d->astNode->name &&
-            d->astNode->name->parts.size() == 1 && d->genericArgs.empty()) {
+        // §2.8.2/§12.5 (#2373): the §11.2 instance-member twin of #2359 bug
+        // 2d's `checkStaticInterfaceConformance::subst()` fix. `d` is a
+        // bare-type-parameter reference read off the interface/abstract
+        // member's own declared signature; when that member is IMPORTED
+        // (an interface reached from another module), its declared type
+        // carries no `astNode` at all — only `importedName`
+        // (ModuleLoader::convert). The old `astNode`-only guard made this
+        // substitution a silent no-op for an imported ancestor's bare `T`,
+        // so the return/param type stayed unsubstituted "T" and the
+        // subsequent `typesMatch` comparison against the implementation's
+        // concrete type spuriously failed ("does not match ... on
+        // parameter"/"does not match ... return type" — a false REJECT of a
+        // correct generic implementation). Read the name via the shared
+        // alias-transparent `TypeRef::headName()` (falls back to
+        // `importedName`) instead, matching #2359's fix shape at its four
+        // sibling sites.
+        if (!d->declaration && !d->headName().empty() && d->genericArgs.empty()) {
             auto it = map.find(d->headName());
             if (it != map.end() && it->second) {
                 const TypeRef* s = it->second;
@@ -3170,19 +3185,50 @@ void Resolver::checkAbstractImplementations() {
                 auto* imDecl = dynamic_cast<const ast::MethodDecl*>(im->decl);
                 auto* implDecl =
                     dynamic_cast<const ast::MethodDecl*>(impl->decl);
-                if (imDecl && implDecl &&
-                    imDecl->returnOwned != implDecl->returnOwned) {
+                // §2.8.2/§12.5 (#2373): `im` may be an IMPORTED interface/
+                // abstract member. ModuleLoader never attaches an
+                // ast::MethodDecl to a body-less imported member (there is
+                // no syntactic AST to attach), so `imDecl` is unconditionally
+                // null for every cross-module obligation — which silently
+                // skipped BOTH this `owned`-return check and the return-type
+                // match below for any imported interface (a false ACCEPT of
+                // any return-type/`owned`-return mismatch). Derive the
+                // interface member's return the same way #2294 already
+                // established for `checkStaticInterfaceConformance`'s twin
+                // loop: from the AST when present, else from
+                // ctx_.importedReturnType/importedReturnOwned (ModuleLoader::
+                // setImportedReturnType). `impl` is always a LOCAL class
+                // member (obligation witnesses only ever come from `t`'s own
+                // module's BFS above), so `implDecl` needs no fallback.
+                const bool imHasAstDecl = (imDecl != nullptr);
+                const ast::Type* imRetNode =
+                    imDecl ? imDecl->returnType.get() : nullptr;
+                bool imRetOwned = imDecl ? imDecl->returnOwned : false;
+                TypeRef* imRetRef = nullptr;
+                bool imDeclaresReturn;
+                if (imHasAstDecl) {
+                    imRetRef = resolvedOf(imRetNode);
+                    imDeclaresReturn = (imRetNode != nullptr);
+                } else {
+                    imRetOwned = ctx_.importedReturnOwned(im);
+                    TypeRef* r = ctx_.importedReturnType(im);
+                    if (r && r->kind != TypeRef::Kind::Unit) imRetRef = r;
+                    imDeclaresReturn = (imRetRef != nullptr);
+                }
+                const bool implRetOwned = implDecl ? implDecl->returnOwned
+                                                    : false;
+                if (implDecl && imRetOwned != implRetOwned) {
                     ctx_.diagnostics().report(
                         Severity::Error, impl->declLoc,
                         std::string("method `") + std::string(name) +
                         "` does not match interface member `" +
                         std::string(name) + "`'s `owned` return modifier "
                         "(§11.2): the interface declares the return type " +
-                        (imDecl->returnOwned
+                        (imRetOwned
                              ? std::string("`owned`")
                              : std::string("without `owned`")) +
                         "; the implementation declares it " +
-                        (implDecl->returnOwned
+                        (implRetOwned
                              ? std::string("`owned`")
                              : std::string("without `owned`")) +
                         " (§11.2)");
@@ -3222,7 +3268,22 @@ void Resolver::checkAbstractImplementations() {
                     auto* cp = dynamic_cast<ParameterSymbol*>(impl->params[pi]);
                     if (!ip || !cp) continue;
                     if (ip->modifier != cp->modifier) continue;  // reported above
-                    TypeRef* it = resolvedOf(ip->declType);
+                    // §2.8.2/§12.5 (#2373): `im` (and so `ip`) may belong to
+                    // an IMPORTED interface/abstract member — its parameters
+                    // carry no syntactic `declType` at all;
+                    // ModuleLoader::convertParams stashes the already-
+                    // resolved type on `resolvedDeclType` instead (no
+                    // ast::Type exists to attach). Reading `declType` alone
+                    // made `it` null for every imported obligation, which
+                    // silently skipped this whole parameter-type check (a
+                    // false ACCEPT of any parameter-type mismatch) — the
+                    // fallback mirrors #2294's established fix for
+                    // `checkStaticInterfaceConformance`'s twin loop. `cp` is
+                    // always a LOCAL class member here (impl candidates only
+                    // ever come from `t`'s own module's BFS above), so only
+                    // the interface side needs the fallback.
+                    TypeRef* it = ip->declType ? resolvedOf(ip->declType)
+                                                : ip->resolvedDeclType;
                     TypeRef* ct = resolvedOf(cp->declType);
                     if (!it || !ct) continue;
                     if (it->kind == TypeRef::Kind::Error ||
@@ -3257,17 +3318,22 @@ void Resolver::checkAbstractImplementations() {
                 // wrong-typed interface dispatch the issue calls out (a
                 // statically int?-typed call dispatching to a string?-
                 // returning body).
-                const ast::Type* imRetNode =
-                    imDecl ? imDecl->returnType.get() : nullptr;
+                //
+                // §2.8.2/§12.5 (#2373): reuses `imRetRef`/`imDeclaresReturn`
+                // derived above (AST for a local interface, ctx_.
+                // importedReturnType for an imported one) rather than
+                // re-deriving from `imDecl` here — `imDecl` is unconditionally
+                // null for an imported member, so re-deriving from it (the
+                // pre-fix shape) silently skipped this entire return-type
+                // check for every cross-module obligation.
                 const ast::Type* implRetNode =
                     implDecl ? implDecl->returnType.get() : nullptr;
-                if (imRetNode && implRetNode) {
-                    TypeRef* irt = resolvedOf(imRetNode);
+                if (imDeclaresReturn && implRetNode) {
                     TypeRef* crt = resolvedOf(implRetNode);
-                    if (irt && crt &&
-                        irt->kind != TypeRef::Kind::Error &&
+                    if (imRetRef && crt &&
+                        imRetRef->kind != TypeRef::Kind::Error &&
                         crt->kind != TypeRef::Kind::Error) {
-                        const TypeRef* irtSub = substTypeRef(irt, obl.subst);
+                        const TypeRef* irtSub = substTypeRef(imRetRef, obl.subst);
                         const TypeRef* crtSub = substTypeRef(crt, implSubst);
                         if (!typesMatch(irtSub, crtSub)) {
                             ctx_.diagnostics().report(
