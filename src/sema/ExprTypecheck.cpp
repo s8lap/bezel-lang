@@ -6102,47 +6102,79 @@ MethodSymbol* ExprTC::findConstraintStaticOperator(std::string_view paramName,
     MethodSymbol* found = nullptr;          // exact-token witness (preferred)
     MethodSymbol* groupWitness = nullptr;   // complete-group sibling witness
     TypeRef* groupBound = nullptr;
-    forEachConstraintBound(paramName, [&](TypeRef* ctr) -> bool {
-        TypeSymbol* iface = ctr->declaration;
-        if (iface->kind != ast::TypeDeclKind::Interface) return false;
-        // The interface's own type-parameter names (`T` in `INumber<T>`).
-        std::unordered_set<std::string_view> ifaceParams;
-        for (Symbol* gp : iface->genericParams)
-            if (gp) ifaceParams.insert(gp->name);
-        for (Symbol* m : iface->members) {
-            auto* ms = dynamic_cast<MethodSymbol*>(m);
-            if (!ms || !ms->isOperator) continue;
-            bool exact = ms->operatorToken == op;
-            bool group = !exact && sameGroup(op, ms->operatorToken);
-            if (!exact && !group) continue;
-            if (ms->params.size() != 2) continue;
-            // Both parameters must be the recurrence parameter itself so the
-            // substituted signature is (paramName, paramName).
-            bool bothRecur = true;
-            for (Symbol* ps : ms->params) {
-                auto* par = dynamic_cast<ParameterSymbol*>(ps);
-                TypeRef* pt = (par && par->declType)
-                                  ? ctx_.resolvedType(*par->declType)
-                                  : nullptr;
-                if (!pt || pt->kind != TypeRef::Kind::Named ||
-                    pt->declaration || pt->nullable || !pt->astNode ||
-                    !pt->astNode->name ||
-                    pt->astNode->name->parts.size() != 1 ||
-                    !ifaceParams.count(pt->headName())) {
-                    bothRecur = false;
-                    break;
+    // §11.8 (#1425 sub-item 1): `where T: IRich<T>` where `IRich<T>: INumber<T>`
+    // — IRich declares no operators of its own, they live on the ANCESTOR
+    // INumber. forEachConstraintBound yields only the DIRECT bound (IRich<T>);
+    // scanning `iface->members` alone (the pre-fix body) misses every operator
+    // declared on an interface `iface` merely EXTENDS. Fix: from each direct
+    // bound, BFS the interface's own `baseTypes` (populated for an interface's
+    // `: Base<...>` list exactly like a class's, TypeResolution_Names.cpp) to
+    // visit the whole ancestor closure. The "both params are the recurrence
+    // parameter" check below is entirely local to whichever interface in the
+    // closure is being scanned (it tests the OPERATOR's own declared shape,
+    // `static operator +(a: T, b: T)` against THAT interface's own type
+    // parameter) — it needs no generic-argument composition across the chain,
+    // because the caller (the BinaryExpr handler in ExprTypecheck_Exprs.cpp)
+    // re-derives the call-site result type from the ROOT paramName's own
+    // operand type, not from the chain. A visited set guards a diamond
+    // re-visit (`IRich<T>: INumber<T>, IPrintable<T>` both possibly reaching a
+    // common ancestor) against a double report; it can never be a true cycle
+    // (interface inheritance cycles are rejected elsewhere, §12.10).
+    auto scanClosure = [&](TypeSymbol* rootIface, TypeRef* rootBound) -> bool {
+        std::vector<TypeSymbol*> frontier{rootIface};
+        std::unordered_set<TypeSymbol*> visited;
+        std::size_t i = 0;
+        while (i < frontier.size()) {
+            TypeSymbol* iface = frontier[i++];
+            if (!iface || !visited.insert(iface).second) continue;
+            if (iface->kind != ast::TypeDeclKind::Interface) continue;
+            // The interface's own type-parameter names (`T` in `INumber<T>`).
+            std::unordered_set<std::string_view> ifaceParams;
+            for (Symbol* gp : iface->genericParams)
+                if (gp) ifaceParams.insert(gp->name);
+            for (Symbol* m : iface->members) {
+                auto* ms = dynamic_cast<MethodSymbol*>(m);
+                if (!ms || !ms->isOperator) continue;
+                bool exact = ms->operatorToken == op;
+                bool group = !exact && sameGroup(op, ms->operatorToken);
+                if (!exact && !group) continue;
+                if (ms->params.size() != 2) continue;
+                // Both parameters must be the recurrence parameter itself so
+                // the substituted signature is (paramName, paramName).
+                bool bothRecur = true;
+                for (Symbol* ps : ms->params) {
+                    auto* par = dynamic_cast<ParameterSymbol*>(ps);
+                    TypeRef* pt = (par && par->declType)
+                                      ? ctx_.resolvedType(*par->declType)
+                                      : nullptr;
+                    if (!pt || pt->kind != TypeRef::Kind::Named ||
+                        pt->declaration || pt->nullable || !pt->astNode ||
+                        !pt->astNode->name ||
+                        pt->astNode->name->parts.size() != 1 ||
+                        !ifaceParams.count(pt->headName())) {
+                        bothRecur = false;
+                        break;
+                    }
                 }
+                if (!bothRecur) continue;
+                if (exact) {
+                    found = ms;
+                    if (outBound) *outBound = rootBound;
+                    return true;  // exact token wins — stop scanning
+                }
+                // Remember the first group sibling; keep scanning for an
+                // exact hit.
+                if (!groupWitness) { groupWitness = ms; groupBound = rootBound; }
             }
-            if (!bothRecur) continue;
-            if (exact) {
-                found = ms;
-                if (outBound) *outBound = ctr;
-                return true;  // exact token wins — stop scanning
-            }
-            // Remember the first group sibling; keep scanning for an exact hit.
-            if (!groupWitness) { groupWitness = ms; groupBound = ctr; }
+            for (TypeSymbol* b : iface->baseTypes)
+                if (b) frontier.push_back(b);
         }
         return false;
+    };
+    forEachConstraintBound(paramName, [&](TypeRef* ctr) -> bool {
+        TypeSymbol* iface = ctr->declaration;
+        if (!iface || iface->kind != ast::TypeDeclKind::Interface) return false;
+        return scanClosure(iface, ctr);
     });
     if (found) return found;
     if (groupWitness && outBound) *outBound = groupBound;

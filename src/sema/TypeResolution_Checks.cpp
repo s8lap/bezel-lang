@@ -3454,9 +3454,35 @@ void Resolver::checkStaticInterfaceConformance() {
         if (t->kind != ast::TypeDeclKind::Class &&
             t->kind != ast::TypeDeclKind::Record)
             continue;
-        for (std::size_t bi = 0; bi < t->baseTypes.size(); ++bi) {
-            TypeSymbol* iface = t->baseTypes[bi];
-            if (!iface || iface->kind != ast::TypeDeclKind::Interface) continue;
+        // §11.8 (#1425 sub-item 1): a class conforms via a DERIVED interface
+        // (`class Meters: IRich<Meters>` where `IRich<T>: INumber<T>`) —
+        // IRich declares no statics of its own, they live on the ANCESTOR
+        // INumber. The pre-fix loop below scanned only `iface->members` for
+        // each DIRECT base interface, so a class conforming via IRich was
+        // never required to supply INumber's statics: a Meters with NONE of
+        // Zero/One/+/-/*//< implemented compiled clean (a false-accept —
+        // confirmed by probe before this fix). checkIfaceStatics is now a
+        // recursive walk: run the existing per-interface check on `iface`,
+        // then recurse into `iface`'s OWN base interfaces (`iface->baseTypes`
+        // / `baseTypeRefs`, populated for an interface's `: Base<...>` list
+        // exactly like a class's — TypeResolution_Names.cpp), composing the
+        // substitution map at each hop (ancestor's own generic-param names →
+        // `subst(ancestor-arg, the-CALLER's-map)`) so a multi-hop chain
+        // resolves the recurrence parameter all the way down to `t`'s own
+        // conformance argument. `visited` guards a diamond re-visit
+        // (`IRich<T>: INumber<T>, IOrderable<T>` both reaching a common
+        // ancestor) against a duplicate diagnostic; it can never be a true
+        // cycle (interface-inheritance cycles are rejected elsewhere, the
+        // §12.10 checkCycleFrom pass below runs over the same `baseTypes`).
+        std::function<void(TypeSymbol*,
+                           const std::unordered_map<std::string_view, TypeRef*>&,
+                           std::unordered_set<TypeSymbol*>&)>
+            checkIfaceStatics =
+            [&](TypeSymbol* iface,
+                const std::unordered_map<std::string_view, TypeRef*>& map,
+                std::unordered_set<TypeSymbol*>& visited) {
+            if (!iface || iface->kind != ast::TypeDeclKind::Interface) return;
+            if (!visited.insert(iface).second) return;
             // Collect the interface's static members (static methods and
             // operators — every interface operator is static per §11.8).
             std::vector<MethodSymbol*> statics;
@@ -3465,21 +3491,6 @@ void Resolver::checkStaticInterfaceConformance() {
                 if (!ms) continue;
                 if (ms->isOperator || hasMod(ms, "static"))
                     statics.push_back(ms);
-            }
-            if (statics.empty()) continue;
-            // Bind the interface's type-parameter names to the conformance
-            // declaration's arguments (`: INumber<Meters>` → T → Meters).
-            std::unordered_map<std::string_view, TypeRef*> map;
-            TypeRef* baseRef = bi < t->baseTypeRefs.size()
-                                   ? t->baseTypeRefs[bi] : nullptr;
-            if (!iface->genericParams.empty()) {
-                if (!baseRef || baseRef->genericArgs.size() !=
-                                    iface->genericParams.size())
-                    continue;  // arity error reported elsewhere
-                for (std::size_t gi = 0; gi < iface->genericParams.size(); ++gi)
-                    if (iface->genericParams[gi] && baseRef->genericArgs[gi])
-                        map[iface->genericParams[gi]->name] =
-                            baseRef->genericArgs[gi];
             }
             for (MethodSymbol* im : statics) {
                 // The interface member's declared signature pieces.
@@ -3651,6 +3662,54 @@ void Resolver::checkStaticInterfaceConformance() {
                         "return type including `owned` (§11.2 / §11.8)");
                 }
             }
+            // §11.8 (#1425 sub-item 1): recurse into THIS interface's own
+            // base interfaces, composing the substitution — `anc`'s own
+            // generic-param names map to `subst(anc's-arg-as-written-on-
+            // iface, map)`, i.e. resolved one hop further toward `t`'s
+            // concrete conformance argument. E.g. `IRich<T>: INumber<T>`
+            // conformed via `Meters: IRich<Meters>`: iface=IRich,
+            // map={T(IRich's)->Meters}; anc=INumber, ancRef=INumber<T> (T is
+            // IRich's own param), ancMap={T(INumber's)->subst(T(IRich's),
+            // map)=Meters}.
+            for (std::size_t bi2 = 0; bi2 < iface->baseTypeRefs.size(); ++bi2) {
+                TypeSymbol* anc = bi2 < iface->baseTypes.size()
+                                       ? iface->baseTypes[bi2] : nullptr;
+                if (!anc || anc->kind != ast::TypeDeclKind::Interface) continue;
+                TypeRef* ancRef = iface->baseTypeRefs[bi2];
+                std::unordered_map<std::string_view, TypeRef*> ancMap;
+                if (!anc->genericParams.empty()) {
+                    if (!ancRef || ancRef->genericArgs.size() !=
+                                       anc->genericParams.size())
+                        continue;  // arity error reported elsewhere
+                    for (std::size_t gi = 0; gi < anc->genericParams.size();
+                         ++gi)
+                        if (anc->genericParams[gi] && ancRef->genericArgs[gi])
+                            ancMap[anc->genericParams[gi]->name] =
+                                subst(ancRef->genericArgs[gi], map);
+                }
+                checkIfaceStatics(anc, ancMap, visited);
+            }
+        };
+
+        for (std::size_t bi = 0; bi < t->baseTypes.size(); ++bi) {
+            TypeSymbol* iface = t->baseTypes[bi];
+            if (!iface || iface->kind != ast::TypeDeclKind::Interface) continue;
+            // Bind the interface's type-parameter names to the conformance
+            // declaration's arguments (`: INumber<Meters>` → T → Meters).
+            std::unordered_map<std::string_view, TypeRef*> map;
+            TypeRef* baseRef = bi < t->baseTypeRefs.size()
+                                   ? t->baseTypeRefs[bi] : nullptr;
+            if (!iface->genericParams.empty()) {
+                if (!baseRef || baseRef->genericArgs.size() !=
+                                    iface->genericParams.size())
+                    continue;  // arity error reported elsewhere
+                for (std::size_t gi = 0; gi < iface->genericParams.size(); ++gi)
+                    if (iface->genericParams[gi] && baseRef->genericArgs[gi])
+                        map[iface->genericParams[gi]->name] =
+                            baseRef->genericArgs[gi];
+            }
+            std::unordered_set<TypeSymbol*> visited;
+            checkIfaceStatics(iface, map, visited);
         }
     }
 }
