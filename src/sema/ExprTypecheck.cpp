@@ -12210,6 +12210,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
 bool typecheckExpressions(const ast::SourceFile& src, SemaContext& ctx) {
     ExprTC tc(ctx);
     tc.run(src);
+    // §9.8 / #2325: the class half of serialization-eligibility checking
+    // needs FieldSymbol::posParamBodyRef/posParamInitRef, which the walk
+    // above just finished computing (ExprTypecheck_Exprs.cpp) — see
+    // checkClassSerializationEligibilityLate's declaration comment
+    // (TypeResolution_impl.hpp) for the full rationale. Run it here, inside
+    // typecheckExpressions() itself, rather than as a separate call the
+    // driver must remember to sequence after this function: resolveTypes()
+    // and typecheckExpressions() are called together from many independent
+    // pipeline constructions across the driver AND the test harness (fresh
+    // SemaContext + collectSymbols + resolveTypes + typecheckExpressions,
+    // repeated ad hoc in dozens of call sites) — a separately-invoked pass
+    // would need every one of those threaded through by hand, and a single
+    // missed call site would silently readmit an ineligible class (verified:
+    // this happened — the codegen_serialization_t2_classes negative tests,
+    // which go through the test harness's OWN independent pipeline rather
+    // than Driver::compileFile, regressed when this was a separate call).
+    // Folding it into typecheckExpressions() itself means every existing and
+    // future caller gets it for free, with no separate wiring.
+    checkClassSerializationEligibilityLate(src, ctx);
     return !ctx.diagnostics().hasErrors();
 }
 

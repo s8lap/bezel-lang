@@ -44,8 +44,12 @@ bool resolveTypes(const ast::SourceFile& src, SemaContext& ctx);
 // resolveTypes()'s checkSerializationEligibility because it needs
 // FieldSymbol::posParamBodyRef/posParamInitRef (§11.1 primary-constructor
 // parameter capture classification), which typecheckExpressions computes —
-// so the driver must call this AFTER typecheckExpressions(), not as part of
-// resolveTypes(). See TypeResolution_impl.hpp's declaration comment on
+// so it cannot run as part of resolveTypes(). typecheckExpressions() itself
+// calls this at the end of its own body (ExprTypecheck.cpp) so every one of
+// its many callers (the driver, module loading, the test harness) gets it
+// for free with no separate wiring; it is exposed here as a free function
+// only so ExprTypecheck.cpp can call it without depending on the Resolver
+// class directly. See TypeResolution_impl.hpp's declaration comment on
 // Resolver::checkClassSerializationEligibilityLate for the full rationale.
 bool checkClassSerializationEligibilityLate(const ast::SourceFile& src,
                                             SemaContext& ctx);

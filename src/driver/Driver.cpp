@@ -400,10 +400,6 @@ CompileResult Driver::compileExecutableObject(
         }
         sema::resolveTypes(*unit, semaCtx);
         sema::typecheckExpressions(*unit, semaCtx);
-        // §9.8 / #2325: the class half of serialization eligibility needs
-        // posParamBodyRef/posParamInitRef, computed by typecheckExpressions
-        // above — see TypeResolution.hpp's declaration comment.
-        sema::checkClassSerializationEligibilityLate(*unit, semaCtx);
         // §22.15 (v0.202, #2052): enforce the pure-body rule set on every
         // pure member. Runs after typecheck so resolved call targets and
         // expression types are available.
@@ -535,8 +531,6 @@ CompileResult Driver::compileObject(const std::string& path,
         }
         sema::resolveTypes(*unit, semaCtx);
         sema::typecheckExpressions(*unit, semaCtx);
-        // §9.8 / #2325: see the matching call site above.
-        sema::checkClassSerializationEligibilityLate(*unit, semaCtx);
         // §22.15 (v0.202, #2052): enforce the pure-body rule set on every
         // pure member. Runs after typecheck so resolved call targets and
         // expression types are available.

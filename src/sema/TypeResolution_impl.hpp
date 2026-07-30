@@ -78,22 +78,30 @@ public:
 
     // §9.8 / #2325: the CLASS half of checkSerializationEligibility's
     // component-eligibility and constructor-selection checks. Split into its
-    // own LATE pass — called by the driver AFTER typecheckExpressions(), not
-    // as part of resolveTypes() (this class's run()) — because §9.8 counts a
+    // own LATE pass — called from INSIDE typecheckExpressions() itself
+    // (ExprTypecheck.cpp, via the free-function wrapper below), not as part
+    // of resolveTypes() (this class's run()) — because §9.8 counts a
     // primary-constructor parameter CAPTURED into a private field (§11.1:
     // referenced in a body position — a method/property/constructor/
     // destructor body, e.g. `property Id: int => id;`) as a genuine
     // serialized component, and that classification
     // (FieldSymbol::posParamBodyRef/posParamInitRef) is only computed by
-    // ExprTypecheck's expression walk (ExprTypecheck_Exprs.cpp), which runs
-    // strictly after resolveTypes(). Running this check at resolveTypes()
-    // time — where checkSerializationEligibility's other branches (record/
-    // enum/choice) run, none of which touch posParam capture classification
-    // — would always see the flags at their unset default (false), which is
-    // the root cause issue #2325 traces to a component set that was silently
-    // empty for exactly this shape. Public so the free-function wrapper
+    // ExprTypecheck's OWN expression walk (ExprTypecheck_Exprs.cpp) — so this
+    // check cannot run any earlier than the end of that same function.
+    // Originally this was wired as a separate call the DRIVER made after
+    // typecheckExpressions(); that broke the moment a test-harness pipeline
+    // (which builds its own fresh SemaContext + resolveTypes +
+    // typecheckExpressions independent of Driver::compileFile — there are
+    // dozens of such call sites, not just the driver's) called
+    // typecheckExpressions() without ALSO separately calling this — silently
+    // readmitting classes that should have been rejected (verified: this
+    // regressed 4 tests in serialization_tier2_classes_test.cpp before the
+    // fix). Living inside typecheckExpressions() itself means every existing
+    // and future caller gets it automatically, with no separate wiring to
+    // remember or to miss. Public so the free-function wrapper
     // `bezel::sema::checkClassSerializationEligibilityLate` (TypeResolution.hpp)
-    // can call it from a fresh Resolver, exactly like run() itself.
+    // — which ExprTypecheck.cpp calls — can reach it from a fresh Resolver,
+    // exactly like run() itself.
     void checkClassSerializationEligibilityLate();
 
 private:
