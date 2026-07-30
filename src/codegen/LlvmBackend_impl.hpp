@@ -264,10 +264,9 @@ public:
         // non-virtual public properties (exporter side). After declareVtables so
         // propGetSlot_ is populated; virtual properties are skipped.
         emitExportedPropertyGetters();
-        // §2.5 / §22.9 (issue #503): declare external getter stubs for imported
-        // non-virtual property getters (importer side). After declareVtables
-        // so propGetSlot_ correctly reflects which imported properties are virtual.
-        if (ctx_.hasImports()) declareImportedPropertyGetters();
+        // fix #2387: declareImportedPropertyGetters (importer-side external
+        // getter stubs) now runs INSIDE declareVtables() itself, between the
+        // buildVtable loops and Pass D — see the call site there for why.
         setupBoxDescriptors();  // §8.6: after descArray_/vtable globals exist
         declareExterns();  // CG26
         // #429 (box RETURN + FIELD-STORE category) / §8.6 / §28.9: before any

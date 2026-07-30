@@ -2680,6 +2680,23 @@ void Emitter::declareVtables() {
             if (ts && ts->kind == ast::TypeDeclKind::Class) buildVtable(ts);
         }
     }
+    // fix #2387 (§2.8.2/§2.8.3 rule 4; v0.235): declareImportedPropertyGetters
+    // populates importedPropGetterFns_, which ensurePropertyAccessorFn's
+    // imported-property fallback (LlvmBackend_Assign.cpp) now consults from
+    // Pass D below (the itable-building loop) so a property INHERITED from an
+    // imported base class, satisfying an interface obligation, gets a real
+    // function pointer in its itable slot instead of ConstantPointerNull.
+    // MUST run here — after propGetSlot_ is fully populated by the buildVtable
+    // loops just above (both local and imported), which
+    // declareImportedPropertyGetters itself reads to skip virtual properties
+    // — and BEFORE Pass D, which is the first consumer. The call used to sit
+    // after this whole function returned (still fine for the ordinary,
+    // non-itable property-read path, which only runs during method-body
+    // lowering, well after declareVtables() completes) — but Pass D runs
+    // INSIDE declareVtables(), so that later call left importedPropGetterFns_
+    // empty during Pass D and the fallback never found anything (confirmed by
+    // probe: the fix silently did nothing until this call moved here).
+    if (ctx_.hasImports()) declareImportedPropertyGetters();
     // Pass B: declare a descriptor-array global (correctly sized, no
     // initializer yet) for every class/interface, so descriptors can
     // cross-reference each other in pass C.

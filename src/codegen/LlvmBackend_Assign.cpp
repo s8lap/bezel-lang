@@ -2338,7 +2338,47 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
         return it->second;
 
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-    if (!pd) return nullptr;
+    if (!pd) {
+        // fix #2387 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): an IMPORTED
+        // PropertySymbol carries no reconstructed ast::PropertyDecl —
+        // ModuleLoader never attaches one to a body-less imported
+        // declaration (the getter/setter BODY is not reconstructed there;
+        // only the resolved type rides the importedMemberType side table,
+        // ModuleLoader.cpp ~445). This is true whether `ps` was resolved
+        // directly OR reached by walking an imported base class's chain
+        // (classPropertyByName, called from the itable-building loop in
+        // LlvmBackend_Setup.cpp when a LOCAL class satisfies an interface
+        // obligation via a property it INHERITS from an imported base — the
+        // vertical codegen partner of #2380's sema fix, which correctly
+        // accepts that program). Pre-fix this unconditionally returned
+        // nullptr, so the itable-building loop
+        // (LlvmBackend_Setup.cpp declareVtables Pass D) left the property's
+        // itable slot as ConstantPointerNull — a call through the interface
+        // reference (`b.Name`) then calls address 0x0 (confirmed SIGSEGV).
+        //
+        // Fall back to the external accessor stub already declared for
+        // ordinary cross-module property access — declareImportedPropertyGetters
+        // (LlvmBackend_Setup.cpp), which the non-itable property-read path
+        // already consults the same way (LlvmBackend_Exprs.cpp ~4283-4300,
+        // issue #503). Its ABI (`T get(ptr this)`) is exactly the itable
+        // slot's expected signature, so the itable can install it directly.
+        //
+        // No setter-side stub exists yet: declareImportedPropertyGetters only
+        // ever declares a GETTER external (LlvmBackend_Setup.cpp ~2054); a
+        // settable property inherited from an imported base class still
+        // crashes identically on its SETTER slot (confirmed by probe — a
+        // write-only repro segfaults the same way). That requires a new
+        // export/import mechanism symmetric to this one and is filed
+        // separately (out of this fix's scope) rather than widened here.
+        if (!isSet) {
+            if (auto git = importedPropGetterFns_.find(ps);
+                git != importedPropGetterFns_.end()) {
+                propAccessorFns_[key] = git->second;
+                return git->second;
+            }
+        }
+        return nullptr;
+    }
 
     llvm::Type* valTy = lowerType(pd->type.get());
     if (!valTy) valTy = i32();
