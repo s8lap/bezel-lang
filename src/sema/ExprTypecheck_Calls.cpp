@@ -11714,6 +11714,123 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // #2423 / language spec §31.4 "Standard exception types" (v0.235):
+        // every fallthrough above has now been tried for a member access on a
+        // declaration-less built-in Named type. When the receiver is
+        // specifically a built-in EXCEPTION type (name ends "Exception") or
+        // the built-in `ExceptionInfo` record — §31.4 declares each such
+        // type as an ordinary `public class`/`public record` with a CLOSED
+        // member surface ("public class Exception … Message … StackTrace …
+        // CauseChain … end Exception;") — a member name matching none of the
+        // hand-written cases above is not a member of that closed surface and
+        // must be rejected, exactly as an unknown member on any other
+        // known-complete type is rejected below (the `knownCompleteUserType`
+        // path, citing §11.3/§12.1) and on a primitive receiver is rejected
+        // above (citing stdlib §9/§8.1). Before this fix, `ctx_.setExprType`
+        // was simply never called for such a member and `resolveMemberAccess`
+        // returned silently: no diagnostic, and codegen's mirrored
+        // hand-written-list fallthrough (`Emitter::lowerExpr`,
+        // LlvmBackend_Exprs.cpp) then made `lowerLocalDecl`
+        // (LlvmBackend_Setup.cpp) store nothing into the destination local's
+        // `alloca` — an uninitialized-stack read at runtime, confirmed to
+        // leak raw pointer-shaped bytes. `Dispose`/`ReferenceEquals` and the
+        // other §8.1 universal Object members are exempted: every built-in
+        // exception is `class Exception`'s descendant (K4.1 generates
+        // `Dispose` for every non-static class) and those names are resolved
+        // by the enclosing CallExpr machinery independent of whether this
+        // function ever set `ma`'s type (mirrored from the identical
+        // `isUniversalObjectMember` exemption a few hundred lines below).
+        if (ma.target && !ctx_.exprType(ma)) {
+            if (const TypeRef* rtt = ctx_.exprType(*ma.target)) {
+                if (rtt->kind == TypeRef::Kind::Named && !rtt->declaration) {
+                    std::string_view rn = rtt->headName();
+                    bool isBuiltinExcType =
+                        rn.size() >= 9 &&
+                        rn.substr(rn.size() - 9) == "Exception";
+                    bool isBuiltinExcInfo = rn == "ExceptionInfo";
+                    if (isBuiltinExcType || isBuiltinExcInfo) {
+                        const auto& mbr = ma.member;
+                        bool isUniversalObjectMember =
+                            mbr == "ToString"    || mbr == "Equals" ||
+                            mbr == "GetHashCode" || mbr == "GetType" ||
+                            mbr == "ReferenceEquals" || mbr == "Dispose";
+                        // #1107/#1266: `TypeInitializationException.InnerException`
+                        // is genuinely IMPLEMENTED (LlvmBackend_Exprs.cpp reads
+                        // byte offset 16 by matching `ma->member == "InnerException"`
+                        // structurally — it does not need sema to have set `ma`'s
+                        // exprType, and several codegen test files exercise it: an
+                        // explicit-typed `var inner: Exception? := ex.InnerException;`
+                        // works today because the LOCAL's declared type supplies the
+                        // slot type, bypassing the need for `ma`'s own exprType).
+                        // This is therefore not an "unknown member" — exempt it so
+                        // this fix does not regress a working, tested feature.
+                        bool isWorkingInnerException =
+                            mbr == "InnerException" &&
+                            rn == "TypeInitializationException";
+                        if (!isUniversalObjectMember && !isWorkingInnerException) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            // stdlib §2.17 (cross-reference) names the built-in
+                            // exception types whose documented surface goes beyond
+                            // Exception's: SerializationException.{Offset,Line,
+                            // Column} (stdlib §2.15) and DomainFaultedException.
+                            // FaultStackTrace (stdlib §6.8). #2337/#2408 already
+                            // track these as genuinely-declared-but-NEVER-
+                            // implemented at any layer (confirmed: no sema case, no
+                            // codegen lowering, no runtime field). Rejecting them
+                            // with the ordinary "no member" text would misstate a
+                            // documented fact (they ARE declared members); reject
+                            // with distinct, accurate wording instead — this closes
+                            // the same uninitialized-stack-read hole for them
+                            // without implementing the getters (#2337's job, kept
+                            // out of this fix's scope per its issue text).
+                            bool isDeclaredButUnimplemented =
+                                (rn == "SerializationException" &&
+                                 (mbr == "Offset" || mbr == "Line" ||
+                                  mbr == "Column")) ||
+                                (rn == "DomainFaultedException" &&
+                                 mbr == "FaultStackTrace");
+                            if (isDeclaredButUnimplemented) {
+                                std::string_view stdlibSec =
+                                    rn == "SerializationException" ? "2.15"
+                                                                    : "6.8";
+                                ctx_.diagnostics().report(
+                                    Severity::Error, loc,
+                                    std::string("member `") +
+                                        std::string(mbr) + "` on `" +
+                                        std::string(rn) +
+                                        "` is declared (stdlib \xC2\xA7"
+                                        + std::string(stdlibSec) +
+                                        ") but is not yet implemented by "
+                                        "this compiler (tracked #2337)");
+                                return;
+                            }
+                            std::string surface =
+                                isBuiltinExcInfo
+                                    ? "TypeName, Message, StackTrace"
+                                    : (rn == "ArgumentException" ||
+                                               rn == "ArgumentNullException" ||
+                                               rn == "ArgumentOutOfRangeException"
+                                           ? "Message, StackTrace, CauseChain, "
+                                             "ParamName"
+                                           : "Message, StackTrace, CauseChain");
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("no member `") +
+                                    std::string(mbr) + "` on `" +
+                                    std::string(rn) +
+                                    "`; documented surface: " + surface +
+                                    " and the universal `ToString`/`Equals`/"
+                                    "`GetHashCode`/`GetType` (\xC2\xA7""8.1) "
+                                    "(language spec \xC2\xA7""31.4, v0.235; "
+                                    "stdlib \xC2\xA7""2.17)");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         return;
     }
     // Lookup member by name. Slice S5: walks own members first,
