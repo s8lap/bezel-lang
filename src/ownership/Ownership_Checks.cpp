@@ -1336,6 +1336,25 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // diverted to markDisposedByName for a precise double-dispose message
         // via skipCalleeReadForDispose below. Poison to suppress cascades
         // (and the redundant scope-end leak diagnostic).
+        // #2439 sweep: as with markMovedByName below (see that function's
+        // comment for the full mechanism), do NOT poison the record while
+        // suppressDiag_ (the O3b fixpoint phase) is still iterating. This
+        // branch's own guard (`state == Owned`) makes the failure mode even
+        // more direct than markMovedByName's: the VERY FIRST suppressed-pass
+        // evaluation of a loop-carried maybe-consumed read poisons the
+        // record, and since checkRead has no Poisoned-reviving fallthrough
+        // (unlike the pre-fix markMovedByName, it correctly leaves a
+        // Poisoned record alone on every later visit — no oscillation), the
+        // state simply STAYS Poisoned through convergence and into the final
+        // (unsuppressed, diagnosing) pass — where this branch's own
+        // `state == Owned` guard then permanently refuses to re-fire,
+        // because poisoning already overwrote the very fact (Owned +
+        // maybeConsumed) it needs to observe to report for real. Confirmed
+        // via a probe mirroring the issue's own repro with the consuming
+        // operation swapped for an unmarked (borrowing) read: `if i = 0 then
+        // Sink.Take(move n); end; Reader.Peek(n);` inside a loop compiled
+        // clean with zero diagnostics even after the markMovedByName fix
+        // below, silently accepting a borrow of what may be freed memory.
         if (st->maybeConsumed &&
             st->state == OwnershipState::Owned) {
             report(
@@ -1345,7 +1364,7 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
                 "not be read here (maybe-consumed join, §28.3) — equalize the "
                 "branches before the merge, or confine every use of `" +
                 std::string(id->name) + "` to a single branch");
-            st->state = OwnershipState::Poisoned;
+            if (!suppressDiag_) st->state = OwnershipState::Poisoned;
             return;
         }
         // §28.3 (#1883): the OWNED ⊓ DISPOSED join — one branch disposed
@@ -1366,6 +1385,14 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // is the proper discharge on the still-owned path and a no-op
         // on the disposed path, and rejecting it would over-reject that
         // valid program. // per §28.3, §28.2
+        // #2439 sweep: identical shape/fix rationale to the maybeConsumed
+        // branch just above — a loop-carried `disposedOnSomePath` fact is
+        // permanently destroyed by poisoning during the suppressed fixpoint
+        // phase (the `state == Owned` guard then never re-fires on the
+        // final pass). Confirmed via a probe: `if i = 0 then n.Dispose();
+        // end; Reader.Peek(n);` inside a loop compiled clean with zero
+        // diagnostics, silently accepting a read on the disposed-branch
+        // path every iteration after the first.
         if (st->disposedOnSomePath &&
             st->state == OwnershipState::Owned) {
             report(
@@ -1376,7 +1403,7 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
                 "/ §28.2 — confine every read of `" +
                 std::string(id->name) + "` to a single branch, or "
                 "reassign it after the discharge to clear the obligation)");
-            st->state = OwnershipState::Poisoned;
+            if (!suppressDiag_) st->state = OwnershipState::Poisoned;
             return;
         }
         if (st->state == OwnershipState::MovedFrom) {
@@ -5348,6 +5375,21 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
     // not an error. The scope-end per-path auto-drop is the ONLY disposal a
     // maybe-consumed local still permits (and that runs only on the still-
     // owned branch). Poison to suppress the redundant scope-end leak diagnostic.
+    // #2439 sweep: identical shape/fix rationale to markMovedByName's own
+    // maybeConsumed branch below — poisoning here as an unconditional side
+    // effect of reporting, during the O3b fixpoint's suppressed phase, can
+    // corrupt a loop-carried maybe-consumed fact before the final
+    // (unsuppressed) pass gets a chance to observe it and report for real,
+    // and this function's own fallthrough (`st->state =
+    // OwnershipState::Disposed` a few lines below, with no explicit
+    // Poisoned-state branch) would silently "revive" a poisoned record on a
+    // later pass exactly as markMovedByName's did — see that function's
+    // comment for the fully-traced mechanism. Not mechanically reproduced
+    // as a live silent-accept for THIS specific call site (every shape
+    // tried converged correctly before the final pass), but the code shape
+    // is identical to the confirmed markMovedByName defect, so the same
+    // defensive gate is applied here rather than leaving a known-fragile
+    // sibling unfixed.
     if (st->maybeConsumed) {
         report(
             Severity::Error, loc,
@@ -5356,7 +5398,7 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
             "(maybe-consumed join, §28.3) — disposing it here would "
             "double-dispose on the consuming branch; confine the disposal "
             "to a single branch or equalize the branches before the merge");
-        st->state = OwnershipState::Poisoned;
+        if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
     st->state = OwnershipState::Disposed;
@@ -5990,6 +6032,49 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
     // `move`/`owned`-transfer/`using var` adoption would transfer a stale
     // reference (a use-after-free / double-consume). The spec lists consume
     // alongside read and borrow as the uses a maybe-consumed join forbids.
+    //
+    // #2439 fix: do NOT poison the record while suppressDiag_ (the O3b
+    // fixpoint phase, see the field's doc comment in Ownership_impl.hpp) is
+    // still iterating. For a LOOP-carried maybe-consumed local — e.g. an
+    // owned local declared before the loop and unconditionally `move`d into
+    // a sink on every iteration — this same call re-executes once per
+    // fixpoint pass with the SAME Owned+maybeConsumed entry state, because
+    // the loop's back edge feeds this block's own exit state into the next
+    // pass's header entry (joinInto's union-key meet, `Ownership_Checks.cpp`
+    // ownedDischargedSplit). Poisoning here during the suppressed phase
+    // corrupts that back-edge value: on the NEXT pass, the header's meet of
+    // the pre-loop Owned edge against this block's now-Poisoned exit no
+    // longer matches ownedDischargedSplit (Poisoned is neither Disposed nor
+    // MovedFrom), so it falls through joinInto's generic "other mismatches"
+    // catch-all and the header's entry collapses to bare Poisoned — which
+    // this function (having no explicit Poisoned branch, by design: see
+    // OwnershipState::Poisoned's "suppress cascades" contract) does not
+    // recognize, so it falls through to the plain-move path below and
+    // silently "revives" the poisoned local into a fresh MovedFrom. That
+    // oscillates every pass (Owned+maybeConsumed -> Poisoned -> revived
+    // MovedFrom -> Owned+maybeConsumed -> ...) until the fixpoint's
+    // maxPasses backstop cuts it off at whatever parity it lands on, so the
+    // FINAL (unsuppressed, diagnosing) pass's own entry state for this
+    // block is corrupted noise instead of the converged Owned+maybeConsumed
+    // fact — and since the final pass's own maybeConsumed check needs that
+    // fact to fire, the diagnostic silently never prints while codegen still
+    // emits the double-free (confirmed via AddressSanitizer, issue #2439:
+    // an ordinary owned local moved into an owned-sink call inside an
+    // ordinary loop body was accepted with zero diagnostics and was a
+    // genuine heap-use-after-free at runtime).
+    //
+    // Leaving the record untouched during the suppressed phase keeps the
+    // loop fixpoint's per-pass entry/exit states IDENTICAL to what they were
+    // on the previous pass once the back-edge fact has propagated once, so
+    // the fixpoint genuinely stabilizes on the correct Owned+maybeConsumed
+    // value (matching the O3b fixpoint's own contract: "diagnostics
+    // suppressed [until] a single final pass ... over the STABILIZED entry
+    // states emits each diagnostic exactly once" — Ownership_impl.hpp). The
+    // final pass then observes that same stabilized fact fresh, unsuppressed,
+    // and both reports the error for real and poisons for real — exactly the
+    // established "poison after diagnosing" pattern this function already
+    // uses for every other branch, just deferred to the pass that actually
+    // gets to keep its diagnostic.
     if (st->maybeConsumed) {
         report(
             Severity::Error, loc,
@@ -5997,7 +6082,7 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
             "`: it may have already been consumed on another branch "
             "(maybe-consumed join, §28.3) — confine the consume to a single "
             "branch or equalize the branches before the merge");
-        st->state = OwnershipState::Poisoned;
+        if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
     // §28.3 (v0.180) consume-site freeze: this is the central consume of an owned
@@ -9905,13 +9990,18 @@ void MethodOwnership::recordAwaitOperandConsume(
     }
     // §28.3 (#1626): awaiting a maybe-consumed task local is a consume of a
     // value that may already have been consumed on another branch — reject.
+    //
+    // #2439 sweep: same shape/fix as markMovedByName's own maybeConsumed
+    // branch (see its comment for the full mechanism) — defer the Poisoned
+    // transition to the final, unsuppressed pass so a loop-carried
+    // maybe-consumed task local's fact survives the O3b fixpoint intact.
     if (st->maybeConsumed) {
         report(
             Severity::Error, loc,
             std::string("cannot await `") + std::string(id->name) +
             "`: it may have already been consumed on another branch "
             "(maybe-consumed join, §28.3)");
-        st->state = OwnershipState::Poisoned;
+        if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
     // Mark the PLAIN owned task local consumed by the await's implicit disposal
@@ -14228,6 +14318,12 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
     }
     // §28.3 (#1626): a maybe-consumed binding may not be consumed again
     // (same text as markMovedByName's arm — the K7.4 loop back-edge pin).
+    //
+    // #2439 sweep: same shape/fix as markMovedByName's own maybeConsumed
+    // branch (see its comment for the full mechanism) — defer the Poisoned
+    // transition to the final, unsuppressed pass so a loop-carried
+    // maybe-consumed fact survives the O3b fixpoint intact for this marked-
+    // arm-transfer consume too.
     if (st->maybeConsumed) {
         report(
             Severity::Error, mt.span.begin,
@@ -14235,7 +14331,7 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
             "`: it may have already been consumed on another branch "
             "(maybe-consumed join, §28.3) — confine the consume to a single "
             "branch or equalize the branches before the merge");
-        st->state = OwnershipState::Poisoned;
+        if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
     if (!ld || !classValued) {
