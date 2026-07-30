@@ -7457,44 +7457,114 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // slot) see the §7.5 result type. A unit/void result and an already-nullable
     // return are left unchanged.
     if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(ce.callee.get())) {
-        // fix #2318 / §7.5 / §22.3: reject an `out`/`out owned` argument on a
-        // null-conditional call `recv?.M(..., out x, ...)`. §7.5's
-        // short-circuit ("if any segment of a chain is null, the remainder
-        // is not evaluated") means the callee may simply never run — a THIRD
-        // outcome §22.3's `out` contract does not enumerate ("the callee
-        // must assign every `out` parameter on every normal-completion
-        // (return) path"; the alternative is only "an exception exit", where
-        // the recipient is untouched). §22.4 gives per-path definite-
-        // assignment treatment for an inline `out var` recipient whose
-        // introducing call may not run ("assigned only on control-flow paths
-        // where the introducing call was actually evaluated") — but that
-        // machinery is built for `and`/`or` short-circuiting only; nothing
-        // extends it to `?.`, and DefiniteAssignment.cpp's NullCondMemberExpr-
-        // callee CallExpr walk visits `out` arguments exactly like an
-        // ordinary `.` call's (unconditionally marking the recipient
-        // "assigned" on the straight-line path). Left unrejected, a
-        // non-nullable-reference-typed inline `out var` recipient could read
-        // as definitely-assigned on the null-receiver path where it was
-        // never written — the exact §22.4 violation that clause exists to
-        // prevent. Rather than silently admit that gap (or silently invent a
-        // narrower rule the spec does not state), decline the whole shape
-        // uniformly — `out` and the pre-declared-local sub-case alike, since
-        // splitting the two would itself be an uncited invention — with a
-        // clear diagnostic; #2345 tracks lifting this once `?.` gets the
-        // same per-path DA modeling `and`/`or` already have.
+        // fix #2345 / §7.5 / §22.3 / §22.4: #2318 rejected EVERY `out`/
+        // `out owned` argument on a null-conditional call `recv?.M(...)`
+        // uniformly, because DefiniteAssignment.cpp had no per-path
+        // treatment for `?.`'s short-circuit (a `NullCondMemberExpr`-callee
+        // CallExpr's args were walked exactly like an ordinary `.` call's,
+        // unconditionally marking an inline `out var` recipient "assigned"
+        // on the straight-line path — the exact §22.4 violation that clause
+        // exists to forbid). DefiniteAssignment.cpp now gives `?.` the same
+        // per-path `assigned_` split evalCond already gives `and`/`or`
+        // (evalNullCondCallArgs): an inline `out var` recipient is
+        // definitely-assigned only on the receiver-non-null continuation,
+        // and a later read on any other path is a DA error exactly like an
+        // `and`-conjuncted `out var` read on the false continuation. That
+        // lifts the ban for the two shapes that are ALSO codegen-safe:
+        //   - a PRE-DECLARED bare-identifier LOCAL/PARAMETER recipient
+        //     (`hh?.Set(out n)`) — buildOrderedArgs's CG50 branch takes the
+        //     EXISTING local's address via lvalueAddr; no new codegen
+        //     machinery is needed (#2318's own probe verified this exact
+        //     shape runtime-safe: `n := 10; hh?.Set(out n);` with `hh` null
+        //     left `n == 10`).
+        //   - the INLINE `out var x` declaration form (LlvmBackend_Calls2.cpp
+        //     lowerNullCondCall now calls ensureOutVarSlots, exactly as
+        //     lowerCall already does, so the fresh local's slot is
+        //     pre-created — hoisted to the function entry, unconditionally —
+        //     before the receiver-null branch is even emitted; DA's new
+        //     split, not raw uninitialized memory, is what guards a read of
+        //     it).
+        // Two shapes remain rejected — NOT yet proven safe by either pass,
+        // so admitting them would repeat #2318's original mistake in a new
+        // place:
+        //   - ANY `out owned` callee parameter, in every caller spelling
+        //     (`out owned var x` / `out using var x` inline, or the bare
+        //     `out x` pre-declared spelling §A.4/#1466 uses for a
+        //     pre-declared owned recipient) — the OWNERSHIP pass's
+        //     (src/ownership/) treatment of a conditionally-run `out owned`
+        //     assignment through `?.` has not been audited by this fix;
+        //     lifting it risks reintroducing #2318's hazard in the ownership
+        //     pass instead of DA. Filed #2385.
+        //   - an ACCESSOR-mediated pre-declared target (`out arr[i]`,
+        //     `out obj.Prop`) — #1302's copy-in/copy-out bracket composed
+        //     with `?.`'s conditional-run has only been verified for `ref`
+        //     (nullcond_ref_out_2318_test.cpp's indexer-slot tests), never
+        //     for `out`; kept rejected pending that verification. Filed
+        //     #2385.
+        MethodSymbol* outMs = dynamic_cast<MethodSymbol*>(calleeSym);
+        std::size_t outPos = 0;
         for (const auto& a : ce.args) {
-            if (a.modifier.rfind("out", 0) == 0) {
-                ctx_.diagnostics().report(
-                    Severity::Error, ce.span.begin,
-                    "an `out` argument is not admitted on a null-conditional "
-                    "call (`?.`) — the callee may never run when the "
-                    "receiver is null, so `out`'s every-normal-path "
-                    "assignment obligation cannot be discharged on that path "
-                    "(§22.3, §7.5); guard the call explicitly instead: "
-                    "`if recv <> null then recv.M(out x); end;` (#2318, "
-                    "#2345)");
-                return;
+            std::size_t pidx = outMs ? outMs->params.size() : 0;
+            if (a.name.empty()) {
+                pidx = outPos++;
+            } else if (outMs) {
+                for (std::size_t j = 0; j < outMs->params.size(); ++j) {
+                    if (outMs->params[j] && outMs->params[j]->name == a.name) {
+                        pidx = j;
+                        break;
+                    }
+                }
             }
+            if (a.modifier.rfind("out", 0) != 0) continue;
+            std::string_view paramMod;
+            if (outMs && pidx < outMs->params.size()) {
+                if (auto* ps =
+                        dynamic_cast<ParameterSymbol*>(outMs->params[pidx]))
+                    paramMod = ps->modifier;
+            }
+            bool ownedCallee = paramMod == "out owned";
+            bool inlineOwned =
+                a.modifier == "out owned var" || a.modifier == "out using var";
+            bool bareIdent =
+                a.value &&
+                dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+            bool targetsField = false;
+            if (bareIdent) {
+                auto* argSym = ctx_.exprSymbol(*a.value);
+                targetsField = dynamic_cast<FieldSymbol*>(argSym) != nullptr;
+            }
+            // Admitted: `a.modifier` is "out" (pre-declared, non-field bare
+            // identifier) or "out var" (the sole non-owned inline spelling
+            // — §22.4's grammar reserves "out owned var"/"out using var" for
+            // the owned forms), AND the callee's own parameter is not
+            // `out owned`.
+            bool admitted = !ownedCallee && !inlineOwned && bareIdent &&
+                            !targetsField &&
+                            (a.modifier == "out" || a.modifier == "out var");
+            if (admitted) continue;
+            std::string why;
+            if (ownedCallee) {
+                why = "the parameter is `out owned` — the ownership pass's "
+                      "treatment of a conditionally-run `out owned` "
+                      "assignment through `?.` is not yet verified (#2385)";
+            } else if (!bareIdent || targetsField) {
+                why = "the recipient is not a bare local/parameter "
+                      "identifier — an indexer-slot/property/field `out` "
+                      "target composed with `?.` is not yet verified "
+                      "(#2385)";
+            } else {
+                why = "the callee may never run when the receiver is null, "
+                      "so `out`'s every-normal-path assignment obligation "
+                      "cannot be discharged on that path";
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                "an `out`/`out owned` argument of this shape is not "
+                "admitted on a null-conditional call (`?.`) — " + why +
+                " (§22.3, §7.5); guard the call explicitly instead: "
+                "`if recv <> null then recv.M(out x); end;` (#2318, #2345, "
+                "#2385)");
+            return;
         }
         // §8.1/§8.3/§8.5 (#1075): an inherited Object value-semantics method
         // (`ToString`/`GetHashCode`/`Equals`) on a VALUE-type/enum/record

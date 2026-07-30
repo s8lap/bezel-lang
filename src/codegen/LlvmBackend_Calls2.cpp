@@ -7812,6 +7812,30 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
 
 llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                                const ast::NullCondMemberExpr& nm) {
+    // fix #2345 / §22.3 / §22.4: pre-create any inline `out var x` slot
+    // BEFORE the receiver-null branch below is emitted, exactly as lowerCall
+    // (the `.` form) already does as its own first statement. Without this,
+    // buildOrderedArgs' CG50 branch (below, inside the receiver-non-null
+    // block) calls lvalueAddr for the fresh identifier `x` and finds no
+    // registered local (ensureOutVarSlots is what registers it), so `v`
+    // comes back null and the "internal: lowerExpr returned null for call
+    // argument in buildOrderedArgs — #1386" ICE fires — confirmed live while
+    // developing #2318 (see that fix's commit message) and again while
+    // developing this one. `entryAlloca` (inside ensureOutVarSlots) hoists
+    // the slot to the function's entry block regardless of the CURRENT
+    // insertion point, so calling it here — before any of this function's
+    // branching exists — matches lowerCall's placement and needs no special
+    // handling for the conditional-run case: DefiniteAssignment.cpp's new
+    // per-path split (evalNullCondCallArgs, #2345) is what keeps a read of
+    // an unwritten slot out of a well-typed program, not the memory itself
+    // being initialized. The non-owned "out var" branch of ensureOutVarSlots
+    // registers no disposal (LlvmBackend_Calls2.cpp:1493-1589) — it is a pure
+    // value-slot creation — so this is safe regardless of whether the
+    // receiver ends up null; the owned inline forms ("out owned var" /
+    // "out using var") and any `out owned` callee parameter remain rejected
+    // by ExprTypecheck_Calls.cpp's NullCondMemberExpr check (#2345/#2385),
+    // so their disposal-registering branches are never reached through `?.`.
+    ensureOutVarSlots(call);
     auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
     // §28.11 / §28.2 / #889: `local?.Dispose()` — the canonical null-safe
     // discharge of a conservatively-Owned local (e.g. an `out owned` item that is
