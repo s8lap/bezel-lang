@@ -519,7 +519,56 @@ struct Loader {
                 applyBehavior(p);
                 return p;
             }
-            // Event: see #2407 (a separate fix/commit from this one).
+            case MetaMemberKind::Event: {
+                // §11.2 / §24 (issue #2407): reconstruct an EventSymbol for
+                // an imported type's `event` member. §24 (v0.235) retires the
+                // `event` member kind ("the word `event` remains reserved...
+                // an `event` declaration is a reserved-word error") in favor
+                // of the IEvent<T>/EventSource<T> stdlib §6.5 pattern — but
+                // the parser has not yet caught up to that retirement (still
+                // accepts `event` declarations, Parser_Decls.cpp), and the
+                // compiler implements the legacy member kind end-to-end for
+                // LOCAL members (parse/sema/codegen) and, since #2401, mirrors
+                // imported-INTERFACE event itable indices. Reconstructing the
+                // symbol here completes that already-committed legacy surface
+                // for cross-module parity; it does not resolve #2407's own
+                // flagged design question (complete the legacy surface vs.
+                // implement the retirement) — that remains open, per CLAUDE.md
+                // rule 4, for explicit human direction.
+                //
+                // SCOPE (see xmod_event_import_2407_test.cpp's file header for
+                // the full account, and #2421 for the filed follow-up): this
+                // symbol reconstruction alone does NOT make cross-module
+                // Subscribe/Raise work end-to-end. TWO further decl-null
+                // gates block it, both requiring a NEW metadata bit this fix
+                // does not add (a wrong guess would risk an itable/struct-
+                // layout mismatch between exporter and importer — the exact
+                // #2406-style hazard #2420 already caught elsewhere in this
+                // same session):
+                //   1. collectInstanceStorage (LlvmBackend_impl.hpp) needs
+                //      `dynamic_cast<ast::EventDecl>(es->decl)` to even ADD
+                //      the event's backing-field slot to instance storage —
+                //      unconditionally null for an imported EventSymbol, so
+                //      the reconstructed event still gets NO fieldIndex_
+                //      entry, exactly as before this fix (this fix does not
+                //      change that outcome, only whether the SYMBOL exists).
+                //   2. #2401's ifaceEventIndex_ mirror (LlvmBackend_Setup.cpp)
+                //      needs the same `ed`/`!ed->isAsync` check to reserve an
+                //      itable slot — also unconditionally null.
+                // Both need an `isStatic`/`isAsync` metadata bit
+                // (EventSymbol::modifiers is always empty even for a LOCAL
+                // event — SymbolCollection.cpp's EventDecl case never copies
+                // it — so neither is recoverable from `mm.modifiers` either).
+                auto* e = ctx.makeImportedSymbol<sema::EventSymbol>();
+                e->name = ctx.internString(mm.name);
+                e->visibility = fromMetaVisibility(mm.visibility);
+                e->modifiers = intern(mm.modifiers);
+                e->parent = &parent;
+                e->scope = parent.memberScope;
+                fieldTypes_[e] = convert(mm.type);  // §24 payload type
+                applyBehavior(e);
+                return e;
+            }
             default:
                 return nullptr;
         }
@@ -760,18 +809,18 @@ static bool metaMemberProducesSymbol(const MetaMember& mm) {
         case MetaMemberKind::EnumConstant:
         case MetaMemberKind::Constructor:
         case MetaMemberKind::Property:
-        // fix #2414: convertMember now reconstructs a symbol for Indexer too
-        // (see its Indexer case) — this predicate MUST track convertMember's
-        // real return-null/non-null behavior exactly, since every call site
-        // here sync-walks td.members against importedType.members
-        // position-by-position (see the sites' own comments) and a stale
-        // `false` here would desync that walk by one for any type with a
-        // reconstructed indexer. (Event has the identical gap — see #2407,
-        // a separate fix/commit.)
+        // fix #2414/#2407: convertMember now reconstructs a symbol for these
+        // two kinds too (see its Indexer/Event cases) — this predicate MUST
+        // track convertMember's real return-null/non-null behavior exactly,
+        // since every call site here sync-walks td.members against
+        // importedType.members position-by-position (see the sites' own
+        // comments) and a stale `false` here would desync that walk by one
+        // for any type with a reconstructed indexer or event.
         case MetaMemberKind::Indexer:
+        case MetaMemberKind::Event:
             return true;
         default:
-            return false;  // Event (until #2407) and any future kind defer
+            return false;  // any future member kind convertMember defers
     }
 }
 
