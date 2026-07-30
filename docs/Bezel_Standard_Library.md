@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.231 — July 2026**
+**Companion to the Bezel Language Specification, v0.232 — July 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -838,7 +838,7 @@ This is the type-driven serialization model: a class declares `: ISerializable`/
 <a id="sec-concrete-serialization-formats"></a>
 ### 2.15 Concrete serialization formats
 
-The standard library provides two concrete implementations of the [§2.14](#sec-serialization-vocabulary) agent interfaces: a JSON pair (`JsonSerializer`/`JsonDeserializer`) and a compact binary pair (`BinarySerializer`/`BinaryDeserializer`). Both are ordinary classes implementing `ISerializer`/`IDeserializer`; they introduce no language feature. They live in `System.Serialization` and are *not* auto-imported (unlike the vocabulary interfaces) — a program that performs serialization names the format explicitly with `import System.Serialization`.
+The standard library provides two concrete implementations of the [§2.14](#sec-serialization-vocabulary) agent interfaces: a JSON pair (`JsonSerializer`/`JsonDeserializer`) and a compact binary pair (`BinarySerializer`/`BinaryDeserializer`). Both are ordinary classes implementing `ISerializer`/`IDeserializer`; they introduce no language feature. They live in `System.Serialization` and are *not* auto-imported (unlike the vocabulary interfaces) — a program that performs serialization names the format explicitly with `import System.Serialization`. The module's one-shot facades `Json` and `Binary` (below, v0.232) are the whole-value front door over these agents.
 
 Both serializers write to, and both deserializers read from, an `OwningBuffer<byte>`-backed stream. The serializer accumulates bytes and exposes the result; the deserializer is constructed over a `ReadOnlySpan<byte>` of the encoded form.
 
@@ -891,7 +891,91 @@ end BinaryDeserializer;
 
 **Binary mapping.** The compact binary format is length-prefixed and self-describing enough to be read back without the schema, but it is *not* a stable interchange format across Bezel versions — it is intended for same-version persistence and IPC, where compactness and speed matter and the producer and consumer share a build. Integers use a variable-length encoding; `BeginObject`/`BeginArray` write the count, so `BinaryDeserializer.BeginObject()` and `BeginArray()` return the actual element count and `HasMoreElements()` is answered from it. Non-finite floats round-trip exactly (the format stores IEEE 754 bit patterns via `BitConverter`, [§2.12](#sec-bitconverter)). Programs needing a documented, version-stable wire format use JSON or an explicit hand-written format; the binary format trades interchange stability for size and speed.
 
-**Ownership and lifetime.** All four classes are `IDisposable`; the serializers own an internal growable byte buffer, the deserializers own parser state. The idiom is scope-bound:
+<a id="sec-one-shot-serialization-facades"></a>
+**The one-shot facades: `Json` and `Binary` (v0.232).** The most common serialization operation — whole value in, encoded form out, and back — needs none of the agent ceremony. Two static classes, declared in `System.Serialization` beside the agents they wrap, provide it; the agents remain the extension point (streaming and incremental writing, multi-value streams, custom `ISerializer`/`IDeserializer` formats, hand-driven [§2.14](#sec-serialization-vocabulary) conformances) — the [§7.3](#sec-file) `File`-over-`FileStream` shape.
+
+```bezel
+// One-shot facades over the agent pairs. The write members are ordinary
+// constrained generics; Parse/ParseOwned are compiler-known (see below).
+public static class Json
+  // Write: value → encoded form. `value` is borrowed for the call; the
+  // options overloads thread to the JsonSerializer constructor.
+  public static method ToText<T>(value: T): string where T: ISerializable;
+  public static method ToText<T>(value: T, options: JsonOptions): string where T: ISerializable;
+  public static method ToBytes<T>(value: T): owned OwningBuffer<byte> where T: ISerializable;
+  public static method ToBytes<T>(value: T, options: JsonOptions): owned OwningBuffer<byte> where T: ISerializable;
+
+  // Read: encoded form → value, for record/enum (value-type) targets; a
+  // class-typed T is a compile-time error directing to ParseOwned<T>. The
+  // input forms mirror the JsonDeserializer constructor set above one-for-one.
+  public static method Parse<T>(text: string): T where T: IDeserializable;
+  public static method Parse<T>(text: string, options: JsonOptions): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlySpan<byte>): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlySpan<byte>, options: JsonOptions): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlyArraySpan<byte>): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlyArraySpan<byte>, options: JsonOptions): T where T: IDeserializable;
+
+  // Read, class targets: the recognized factory's owned T transfers to the
+  // caller. Same six input forms as Parse<T>.
+  public static method ParseOwned<T>(text: string): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(text: string, options: JsonOptions): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlySpan<byte>): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlySpan<byte>, options: JsonOptions): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlyArraySpan<byte>): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlyArraySpan<byte>, options: JsonOptions): owned T where T: class, IDeserializable;
+end Json;
+
+public static class Binary
+  // The binary format is bytes-only: no text form. It has no options record;
+  // its one knob is the BinaryDeserializer constructor bool, mirrored here.
+  public static method ToBytes<T>(value: T): owned OwningBuffer<byte> where T: ISerializable;
+
+  public static method Parse<T>(input: ReadOnlySpan<byte>): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool): T where T: IDeserializable;
+  public static method Parse<T>(input: ReadOnlyArraySpan<byte>): T where T: IDeserializable;
+      // no (ReadOnlyArraySpan<byte>, ignoreUnknownFields) form: the facade
+      // mirrors the BinaryDeserializer constructor set above, which declares
+      // no such constructor
+
+  public static method ParseOwned<T>(input: ReadOnlySpan<byte>): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool): owned T where T: class, IDeserializable;
+  public static method ParseOwned<T>(input: ReadOnlyArraySpan<byte>): owned T where T: class, IDeserializable;
+end Binary;
+```
+
+Each facade member is defined — normatively, not illustratively — as the corresponding agent sequence, with the same options and the same fault surface, and **byte-identical output**: a facade write and a hand-driven agent write of the same value under the same options produce identical bytes, and a facade read accepts exactly the inputs, and raises exactly the exceptions, of the corresponding agent read driven over a whole document (the trailing-data conditions included). The scope-bound `SavePoint`/`LoadPoint` bodies under **Ownership and lifetime** below are the definitional expansions of the facade forms:
+
+```bezel
+import System.Serialization;
+import System.IO;
+
+// The SavePoint/LoadPoint pair, restated through the facade (Point: the §2.14
+// example record). The agent-driven bodies below are what these calls mean.
+public method SavePoint(p: Point): owned OwningBuffer<byte>
+  return Json.ToBytes(p);
+end SavePoint;
+
+public method LoadPoint(bytes: ReadOnlySpan<byte>): Point
+  return Json.Parse<Point>(bytes);
+end LoadPoint;
+
+// A class target arrives owned (Order: the §2.14 example class); binary bytes
+// compose with the §7.3 statics — WriteAllBytes' span overload is the
+// zero-copy serializer-output path.
+public method Reencode(text: string, path: string)
+  using var order := Json.ParseOwned<Order>(text);
+  using var blob  := Binary.ToBytes(order);
+  File.WriteAllBytes(path, blob.AsReadOnlySpan());
+end Reencode;
+```
+
+**The write family is ordinary generic code; the read family is compiler-known.** `ISerializable` has a real instance method, so `ToText`/`ToBytes` reach `value.Serialize(s)` through their constraint and are user-writable Bezel. The read family is not: `IDeserializable` is a marker interface with no members ([§2.14](#sec-serialization-vocabulary)), so no generic body can reach the recognized `T.Deserialize(d)` factory through a constraint, and `Parse<T>`/`ParseOwned<T>` (both formats) are **compiler-known generics** — the same mechanism as `Task.FromResult<T>`'s compiler-special-cased class-`T` rejection ([§6.7](#sec-task-static-helpers)). `Parse<T>` requires an `IDeserializable`-conforming record or enum target and rejects a class-typed `T` at compile time with a diagnostic directing to `ParseOwned<T>`; `ParseOwned<T>` requires an `IDeserializable`-conforming class whose recognized factory returns `owned T`. A class whose factory has the third [§2.14](#sec-serialization-vocabulary) shape — `Deserialize(d): owned Shared<C>`, the shared-node entry — has no facade form and is read through the agents; `ParseOwned<C>` over such a class is a compile-time error. Were the recognized factory promoted to a static interface member (the recorded follow-up of rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection)), all four become expressible as ordinary constrained generics with no signature change.
+
+**Ownership at the facade.** `value` is an unmarked parameter — a borrow for the duration of the call at class substitutions (language spec [§28.3](Bezel_Language_Spec.md#sec-local-variables-ownership-and-borrows)), a value at record/enum substitutions; the caller keeps ownership and the disposal obligation. The results are fresh productions under [§1](#sec-conventions)'s conventions: `ToText` returns a runtime-managed `string`, `ToBytes` returns `owned OwningBuffer<byte>` ([§4.14](#sec-owned-buffers-and-spans)), and `ParseOwned<T>` returns `owned T` (language spec [§28.8](Bezel_Language_Spec.md#sec-ownership-transfer)), discharged by `using var` or an owned field. Inside a facade read the deserializer's input-span borrow is bounded by the call itself, so the caller's obligation to keep the backing bytes alive ends when the call returns — unlike the agent path, where the span must outlive the `using var d` scope.
+
+**Facade faults.** Every facade member faults exactly as its defining agent sequence faults — malformed input, type mismatches, depth violations, trailing data, unknown fields under strict policy, and the JSON write path's non-finite floats — raising `SerializationException` with the same `Offset`/`Line`/`Column` surface, because it is the same code raising it. Under the failure-signal rule ([§1](#sec-failure-signal-rule)) these conditions classify with the agents' own, in band 4: the consumption site of a structural fault in encoded input is a boundary — logged, converted to a protocol answer, or reported — not a call-site branch, and the throwing form is the surface's one spelling (no value-shaped dual is declared, and no error-payload type). The binary format's interchange caveat (*Binary mapping* above) applies verbatim at the facade: `Binary.ToBytes`/`Parse`/`ParseOwned` produce and consume the compact same-version form — persistence and IPC between builds of one version, not a version-stable wire format.
+
+**Ownership and lifetime.** All four agent classes are `IDisposable`; the serializers own an internal growable byte buffer, the deserializers own parser state. The idiom is scope-bound:
 
 ```bezel
 import System.Serialization;
@@ -924,7 +1008,7 @@ The three properties are value-typed and copy out of a `catch` arm like any othe
 
 **Unknown-field policy.** A field present in the input that matches no declared component of the target type is, by default, a `SerializationException` — the strict default established when synthesis shipped (v0.116), because silently dropping unrecognized input masks producer/consumer schema drift and field-name typos. This behavior is a property of the deserialization *operation*, not of the target type: the same type may legitimately be read strictly when consuming a trusted internal message and leniently when consuming a third-party producer that adds fields freely, a decision that belongs to the caller performing the read, not to the type's serialization contract (rationale [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection)). It is therefore configured on the deserializer: `JsonOptions.IgnoreUnknownFields` (default `false`) for JSON, the `ignoreUnknownFields` constructor parameter for `BinaryDeserializer`. When set, the deserializer skips an unrecognized field's value (via `IDeserializer.SkipValue`, [§2.14](#sec-serialization-vocabulary), which consumes the value including any nested object/array structure) and continues rather than raising. The synthesized `Deserialize` (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) is identical regardless of policy — it always delegates an unrecognized field to the deserializer; strictness lives entirely in the deserializer's configuration. This policy governs only *unknown* fields; missing required fields, duplicates, and type mismatches remain unconditional errors regardless of the setting, and a *missing* declared field is tolerated only by the per-member `serialized optional` clause (language spec [§9.8](Bezel_Language_Spec.md#sec-serialization-synthesis)) — the two leniencies are orthogonal and compose.
 
-`JsonSerializer`, `JsonDeserializer`, `BinarySerializer`, `BinaryDeserializer`, `JsonOptions`, and `SerializationException` are declared in `System.Serialization` and require an explicit `import System.Serialization`. The vocabulary interfaces they implement (`ISerializer`/`IDeserializer`/`ISerializable`/`IDeserializable`, [§2.14](#sec-serialization-vocabulary)) remain auto-imported, so a type's `: ISerializable` conformance never requires the import — only the code that picks a concrete format does.
+`JsonSerializer`, `JsonDeserializer`, `BinarySerializer`, `BinaryDeserializer`, `JsonOptions`, and `SerializationException` are declared in `System.Serialization` and require an explicit `import System.Serialization`, and the one-shot facades `Json` and `Binary` are declared beside them under the same import. The vocabulary interfaces the agent classes implement (`ISerializer`/`IDeserializer`/`ISerializable`/`IDeserializable`, [§2.14](#sec-serialization-vocabulary)) remain auto-imported, so a type's `: ISerializable` conformance never requires the import — only the code that picks a concrete format does.
 
 <a id="sec-shared-and-weak"></a>
 ### 2.16 `Shared<T>` and `Weak<T>`

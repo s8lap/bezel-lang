@@ -432,4 +432,5 @@ end JsonValue;
 | Owned indexer-set (`obj["k"] := v`) for building | Would hide the base get-only navigation indexer; member-hiding across the sealed hierarchy is a grammar subtlety; `Set`/`Add` cover it (Q5) |
 | Depth overflow → `StackOverflowException` | Uncatchable and fatal (§31.4); a bounded parser raises the defined `JsonDepthException`, mirroring §2.15's `MaxDepth` (Q7) |
 | Add a value-kind peek token to `IDeserializer` now | Breaks the frozen vocabulary (proposal 0010) for a v1-deferrable feature (Open Q1) |
-```
+
+*Amendment (2026-07-30, riding proposal 0073's graduation, docs v0.232 — owner-ruled 2026-07-29).* The `Json.Parse` static-class decline above (Q6a) is scoped, not reversed: it declined **a whole type for one method** and continues to govern this proposal's own API shape — `JsonValue.Parse` remains the DOM's parse entry, unmoved. It does not reach the multi-method, two-direction, typed facade that 0073 landed as the `Json`/`Binary` statics in `System.Serialization` (stdlib §2.15, v0.232): that surface has no single natural value-type home, and the two homes live in different modules under distinct names (`Json` the facade static class; `JsonValue` this proposal's DOM type). Register amendment only; the decision text above is unchanged.
