@@ -4346,12 +4346,32 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
     auto* enumTs = (enumTyRef->kind == sema::TypeRef::Kind::Named)
                    ? enumTyRef->declaration : nullptr;
     if (!enumTs) {
-        // GetEnumerator() declares return type as builtin IEnumerator<T>.
-        // Scan all compiled TypeSymbols for a class with MoveNext + Current.
-        for (const auto& sym : ctx_.symbols()) {
-            auto* cand = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-            if (!cand || cand->kind != ast::TypeDeclKind::Class) continue;
-            if (cand == srcTs) continue;
+        // GetEnumerator() declares return type as builtin IEnumerator<T> (the
+        // ONLY spelling admissible for an interface implementation — §11.2/§12.1
+        // "Member matching" requires the return type to be exactly equal to the
+        // interface's under substitution, so a user's `GetEnumerator():
+        // IEnumerator<T>` can never name a concrete class directly). Find the
+        // concrete class the runtime object will actually be: a class exposing
+        // MoveNext + Current.
+        //
+        // fix #2384 / §29.1/§29.11 (v0.235): check the SOURCE class itself
+        // FIRST. A class may legally implement BOTH `IEnumerable<T>` and
+        // `IEnumerator<T>` and return `this` from `GetEnumerator()` (the
+        // single-object self-returning idiom) — precedent: #2356's
+        // GetAsyncEnumerator fix treats a hand-written implementation that
+        // returns `this` as legal ("a case the compiler cannot rule out"), and
+        // §29.11's "each GetEnumerator() call produces an independent
+        // enumerator" is satisfied at the WRAPPER level (a fresh calloc'd
+        // adapter struct every call, `wrapGetEnumFn` below re-invokes the
+        // source's own GetEnumerator() each time) — it does not forbid the
+        // wrapped class from being its own enumerator. The OLD code
+        // unconditionally excluded `cand == srcTs` from the scan below, so this
+        // shape was NEVER found: `enumTs` stayed null and
+        // `wrapUserClassAsIEnumerable` returned the raw, UNWRAPPED class
+        // instance (`if (!enumTs) return src;`) — any iterator-vtable dispatch
+        // on it then read past the object's small type-descriptor header
+        // (confirmed ASan global-buffer-overflow, issue #2384's repro).
+        auto structurallyIsEnumerator = [&](const sema::TypeSymbol* cand) {
             bool hasMN = false, hasCur = false;
             for (auto* m : cand->members) {
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
@@ -4365,7 +4385,23 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
                     if (ps && ps->name == "Current") { hasCur = true; break; }
                 }
             }
-            if (hasMN && hasCur) { enumTs = const_cast<sema::TypeSymbol*>(cand); break; }
+            return hasMN && hasCur;
+        };
+        if (structurallyIsEnumerator(srcTs)) {
+            enumTs = const_cast<sema::TypeSymbol*>(srcTs);
+        } else {
+            // Not self-implementing: scan all OTHER compiled TypeSymbols for a
+            // class with MoveNext + Current (the two-class idiom, e.g. a
+            // separate `IntRangeEnum` alongside `IntRange`).
+            for (const auto& sym : ctx_.symbols()) {
+                auto* cand = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+                if (!cand || cand->kind != ast::TypeDeclKind::Class) continue;
+                if (cand == srcTs) continue;
+                if (structurallyIsEnumerator(cand)) {
+                    enumTs = const_cast<sema::TypeSymbol*>(cand);
+                    break;
+                }
+            }
         }
     }
     if (!enumTs) return src;

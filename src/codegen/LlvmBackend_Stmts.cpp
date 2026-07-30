@@ -6221,11 +6221,18 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // If enumTs is null (builtin IEnumerator<T> interface), find the
     // concrete class structurally: any user class with both "MoveNext"
     // and ("Current" or a property) in its compiled methods.
+    //
+    // fix #2384 / §29.1/§29.11 (v0.235): check `ts` (the iterable source
+    // class) itself FIRST — same sibling defect, same fix, as
+    // `wrapUserClassAsIEnumerable` (LlvmBackend_Assign.cpp): a class may
+    // legally implement BOTH `IEnumerable<T>` and `IEnumerator<T>` and return
+    // `this` from `GetEnumerator()`. The old code unconditionally skipped
+    // `candidate == ts`, so `for var x in selfIterInstance do ... end` (a
+    // concrete-class-typed source, not routed through the interface wrapper)
+    // fell through every `for`-handler to the generic "not yet implemented:
+    // codegen for this for statement" diagnostic — confirmed via probe.
     if (!enumTs) {
-        for (const auto& sym : ctx_.symbols()) {
-            auto* candidate = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-            if (!candidate || candidate->kind != ast::TypeDeclKind::Class) continue;
-            if (candidate == ts) continue;  // skip the iterable itself
+        auto structurallyIsEnumerator = [&](const sema::TypeSymbol* candidate) {
             bool hasMoveNext = false, hasCurrent = false;
             for (auto* m : candidate->members) {
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
@@ -6240,9 +6247,19 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                     if (ps && ps->name == "Current") { hasCurrent = true; break; }
                 }
             }
-            if (hasMoveNext && hasCurrent) {
-                enumTs = const_cast<sema::TypeSymbol*>(candidate);
-                break;
+            return hasMoveNext && hasCurrent;
+        };
+        if (structurallyIsEnumerator(ts)) {
+            enumTs = const_cast<sema::TypeSymbol*>(ts);
+        } else {
+            for (const auto& sym : ctx_.symbols()) {
+                auto* candidate = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+                if (!candidate || candidate->kind != ast::TypeDeclKind::Class) continue;
+                if (candidate == ts) continue;  // skip the iterable itself
+                if (structurallyIsEnumerator(candidate)) {
+                    enumTs = const_cast<sema::TypeSymbol*>(candidate);
+                    break;
+                }
             }
         }
     }
@@ -6285,10 +6302,56 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // caused break/exception to double-dispose (the enclosing scope already ran
     // it) AND normal exhaustion to never dispose (endBB had no emitDisposals
     // call) — see issue #972.
+    //
+    // fix #2384 / §29.1/§29.11 (v0.235): who disposes what when the class is
+    // its OWN enumerator (enumTs == ts, the self-returning idiom — `enumPtr`
+    // and `srcPtr` are then the SAME object). This scope's disposal reads the
+    // object back through `enumSlot` (a dedicated alloca) and, on a non-null
+    // slot, RECLAIMS the block (`emitDisposeAndReclaim`, LlvmBackend_Disposal.cpp)
+    // — unlike the idempotent flag-guarded `Dispose()` call itself, reclaiming
+    // physically frees the heap block. A NAMED iterable source (a local,
+    // parameter, field, or auto-property) is independently owned and disposes
+    // the SAME object again at ITS OWN scope end/using-var boundary — through
+    // a DIFFERENT alloca that this scope's null-guard cannot see nulled, so
+    // both sites would reclaim the identical block: a genuine double-free
+    // (confirmed under ASan as a heap-use-after-free — the second reclaim's
+    // vtable-pointer read lands in memory the first reclaim already freed).
+    // A fresh TEMPORARY source (`for var x in new SelfIter(3) do ... end`) has
+    // no independent owner, so this scope's registration remains its ONLY
+    // disposal and must still fire.
+    //
+    // The `enumPtr == srcPtr` test is a RUNTIME compare, mirroring
+    // `lowerAwaitFor`'s `afor.enown` guard (#1268/#2356): `enumTs == ts` is
+    // only a STRUCTURAL fact (the class exposes MoveNext + Current), not a
+    // proof that this particular `GetEnumerator()` body returns `this` — a
+    // self-implementing class could instead construct and return a fresh
+    // instance of its own type, in which case the two pointers differ and the
+    // ordinary distinct-object disposal is correct and must not be skipped.
+    bool sourceIsNamedOwner = false;
+    if (sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable)) {
+        if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+            dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
+            dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
+            sourceIsNamedOwner = true;
+        } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
+            sourceIsNamedOwner = sema::isAutoPropertySymbol(ps);
+        }
+    }
+    llvm::AllocaInst* enumDisposeSlot = enumSlot;
+    if (enumTs == ts && sourceIsNamedOwner) {
+        llvm::Value* enumIsSrc =
+            builder_.CreateICmpEQ(enumPtr, srcPtr, "ien.selfen");
+        enumDisposeSlot = entryAlloca(ptrTy());
+        builder_.CreateStore(
+            builder_.CreateSelect(enumIsSrc,
+                                  llvm::ConstantPointerNull::get(ptrTy()),
+                                  enumPtr, "ien.enown"),
+            enumDisposeSlot);
+    }
     std::size_t outerDepth = disposeStack_.size();
     disposeStack_.emplace_back();
     if (disposerFns_.count(enumTs))
-        disposeStack_.back().push_back({enumSlot, enumTs});
+        disposeStack_.back().push_back({enumDisposeSlot, enumTs});
 
     // Determine the loop variable's element type.
     llvm::Type* elemTy = ptrTy();  // default: reference type
