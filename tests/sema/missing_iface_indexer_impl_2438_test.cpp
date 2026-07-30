@@ -33,24 +33,32 @@
 // non-static indexer members of any shape declared directly on `t`"
 // condition.
 //
-// "Declared directly on `t`" is deliberate and catches a THIRD, INDEPENDENT
-// crash shape found during this investigation: a class satisfying the
-// interface obligation only through an INHERITED indexer (declared on a
-// base class, never redeclared on the derived class that lists the
-// interface) — `findIndexer` never walks `baseClassOf` (unlike its
-// named-property sibling `classPropertyByName`, which does), so this
-// crashes identically even though the base class's own indexer is
-// perfectly correct. Filed as #2442 (a codegen change — teach
-// `findIndexer`/`classIndexerImplementing` to walk the base chain,
-// mirroring `classPropertyByName`); landing it would need this file's
-// `inherited_only_*` reject cases revisited (they would become false
-// rejects once the codegen side can actually wire the inherited indexer).
+// UPDATE (#2442 landed, §11.2/§23.4, v0.235): at the time this file was
+// written, the candidate search — mirroring codegen's own
+// `classIndexerImplementing`/`findIndexer` — was scoped to `t->members`
+// only ("declared directly on `t`"), so a class satisfying the interface
+// obligation ONLY through an INHERITED indexer (declared on a base class,
+// never redeclared on the derived class that lists the interface) crashed
+// identically (`findIndexer` never called `baseClassOf`, unlike its
+// named-property sibling `classPropertyByName`), even though the base
+// class's own indexer was perfectly correct — filed as #2442. #2442 taught
+// both `findIndexer` (codegen) and this file's own mirrored candidate
+// search (sema) to walk the base CLASS chain together, so a class-local
+// base's indexer now correctly satisfies the obligation and dispatches
+// through it. The `inherited_only_*` case below is flipped from a REJECT
+// to an ACCEPT (read-AND-write, mirroring #2417's own T2 read/write
+// discipline) as part of that same #2442 fix, landed in this file
+// alongside the codegen change so the two never went out of sync — see
+// #2437/#2442's shared commit for the full "why together" rationale
+// (matching codegen's actual itable-wiring capability: an indexer reached
+// only through an IMPORTED base class still cannot be wired today, so that
+// narrower shape is intentionally left rejected, not attempted here).
 //
 // The AOT run oracle is used for the same `rejects()`-is-not-enough reason
 // #2417's own test file documents: `runAot` synthesizes an Error diagnostic
 // for a runtime SIGSEGV too, so only the diagnostic-TEXT assertion actually
-// discriminates pre-fix (crash, diagnostic text absent) from post-fix
-// (genuine compile-time reject, diagnostic text present).
+// discriminates a genuine compile-time reject (diagnostic text present)
+// from a crash masquerading as one (diagnostic text absent).
 
 #include <string>
 
@@ -126,9 +134,22 @@ const char* kZeroIndexerReadonlyRejected =
     "  end Main; "
     "end C;";
 
-// ---- REJECT case 3 (satisfaction reached ONLY through inheritance — the
-//      independent third crash shape found during this fix) ----------------
-const char* kInheritedOnlyReadWriteRejected =
+// ---- ACCEPT case (§11.2/§23.4, v0.235, #2442): satisfaction reached ONLY
+//      through inheritance (Base declares the indexer; Derived lists the
+//      interface without redeclaring it) is now a VALID implementation —
+//      #2442 taught `findIndexer`/`classIndexerImplementing` (codegen) and
+//      this file's own mirrored candidate search (sema) to walk the base
+//      CLASS chain together. Was REJECT case 3 pre-#2442 (the independent
+//      third crash shape found during #2438's own fix); flipped here in the
+//      same commit that lands #2442, per that fix's own coupling
+//      discipline. Exercises BOTH write and read through the interface
+//      reference (mirrors #2417's own T2 read/write discipline, and
+//      kDirectReadWriteAccepted below) so a fix that only patches the
+//      getter path or only the setter path cannot pass by accident:
+//      `ib[5] := 42` dispatches through Derived's itable to Base's SETTER
+//      (`_v := 42 - 5 = 37`), then `ib[0]` dispatches to Base's GETTER
+//      (`_v (37) + 0 = 37`).
+const char* kInheritedOnlyReadWriteAccepted =
     "module M; "
     "public interface IBox "
     "  property [i: int]: int; "
@@ -146,7 +167,8 @@ const char* kInheritedOnlyReadWriteRejected =
     "  public static method Main(): int "
     "    using var d := new Derived(); "
     "    var ib: IBox := d; "
-    "    return ib[5]; "
+    "    ib[5] := 42; "        // _v := 37
+    "    return ib[0]; "       // 37
     "  end Main; "
     "end C;";
 
@@ -227,13 +249,6 @@ BEZEL_TEST(missing_iface_indexer_impl_2438,
 }
 
 BEZEL_TEST(missing_iface_indexer_impl_2438,
-           inherited_only_satisfaction_rejected_11_2_23_4) {
-    BEZEL_EXPECT_TRUE(rejects(kInheritedOnlyReadWriteRejected));
-    BEZEL_EXPECT_TRUE(
-        hasMissingIndexerImplError(kInheritedOnlyReadWriteRejected));
-}
-
-BEZEL_TEST(missing_iface_indexer_impl_2438,
            record_zero_indexer_rejected_11_2_23_4) {
     BEZEL_EXPECT_TRUE(rejects(kRecordZeroIndexerRejected));
     BEZEL_EXPECT_TRUE(hasMissingIndexerImplError(kRecordZeroIndexerRejected));
@@ -249,4 +264,19 @@ BEZEL_TEST(missing_iface_indexer_impl_2438,
 BEZEL_TEST(missing_iface_indexer_impl_2438,
            direct_readonly_accepted_runs_correct_value) {
     BEZEL_EXPECT_TRUE(runs(15, kDirectReadonlyAccepted));
+}
+
+// ---- ACCEPT (fix #2442, §11.2/§23.4, v0.235): satisfaction reached ONLY
+//      through inheritance now compiles AND dispatches correctly through
+//      BOTH the setter and the getter — see kInheritedOnlyReadWriteAccepted's
+//      own comment above for why the shape exercises write-then-read. This
+//      is the flip of this file's former `inherited_only_satisfaction_
+//      rejected_11_2_23_4` REJECT case, landed in the same commit as #2442
+//      itself (a codegen change to `findIndexer`/`classIndexerImplementing`,
+//      LlvmBackend_Assign.cpp) per that fix's own coupling discipline: sema
+//      and codegen must never disagree about which candidate satisfies an
+//      interface indexer obligation.
+BEZEL_TEST(missing_iface_indexer_impl_2438,
+           inherited_only_satisfaction_accepted_runs_correct_value_2442) {
+    BEZEL_EXPECT_TRUE(runs(37, kInheritedOnlyReadWriteAccepted));
 }

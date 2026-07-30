@@ -7529,7 +7529,7 @@ const ast::CallExpr* Emitter::chainCallOf(const ast::Stmt& s, bool& isThis) {
 }
 
 
-const sema::TypeSymbol* Emitter::baseClassOf(const sema::TypeSymbol* t) {
+const sema::TypeSymbol* Emitter::baseClassOf(const sema::TypeSymbol* t) const {
     for (const sema::TypeSymbol* b : t->baseTypes) {
         if (b && b->kind == ast::TypeDeclKind::Class) return b;
     }

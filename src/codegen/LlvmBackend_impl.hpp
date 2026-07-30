@@ -3311,20 +3311,27 @@ private:
                                              bool srcUnsigned = false,
                                              bool sourceIsNullableRef = false);
 
-    // §11.2 / §23.4 (#2437, v0.235): the indexer PropertySymbol declared on
-    // `ts` whose FULL parameter list (arity AND every parameter type, §23.4:
-    // "Indexers may be overloaded by parameter type list") matches interface
-    // indexer `ifaceIdx`'s. Replaces the prior first-parameter-only match
-    // (#774), which was arity-blind: it matched a `[i:int,j:int]` obligation
-    // against a narrower `[i:int]` overload whenever the two shared a first
-    // parameter type (confirmed: silently installed the wrong getter).
-    // Returns null when no member matches — never a partial/best-effort
-    // candidate: `checkAbstractImplementations` (sema,
-    // TypeResolution_Checks.cpp) mirrors this exact selection, so null here
-    // always corresponds to a compile-time reject, never a silently-wrong
-    // itable install. Scoped to `ts`'s own members only — a candidate
-    // reachable only through an inherited indexer is a separate, filed gap
-    // (#2442), not attempted here.
+    // §11.2 / §23.4 (#2437/#2442, v0.235): the indexer PropertySymbol on `ts`
+    // — or an inherited base class — whose FULL parameter list (arity AND
+    // every parameter type, §23.4: "Indexers may be overloaded by parameter
+    // type list") matches interface indexer `ifaceIdx`'s. Replaces the prior
+    // first-parameter-only match (#774), which was arity-blind: it matched a
+    // `[i:int,j:int]` obligation against a narrower `[i:int]` overload
+    // whenever the two shared a first parameter type (#2437, confirmed:
+    // silently installed the wrong getter). Also now walks `baseClassOf`
+    // (#2442), mirroring `classPropertyByName`'s identical walk for named
+    // properties — a class satisfying the obligation only through an
+    // inherited indexer is a valid candidate. A candidate is considered only
+    // if it carries a genuine LOCAL `ast::PropertyDecl`: `ensureIndexerGetterFn`/
+    // `-SetterFn` require one unconditionally, so an indexer reached only
+    // through an IMPORTED base class cannot be wired into the itable today —
+    // selecting one here would report a match this function's own callers
+    // then silently fail to install (see the .cpp definition). Returns null
+    // when no member, own or inherited, matches — never a partial/best-
+    // effort candidate (no more "fall back to the first indexer found"):
+    // `checkAbstractImplementations` (sema, TypeResolution_Checks.cpp)
+    // mirrors this exact selection, so null here always corresponds to a
+    // compile-time reject, never a silently-wrong itable install.
     const sema::PropertySymbol* findIndexer(
         const sema::TypeSymbol* ts,
         const sema::PropertySymbol* ifaceIdx) const;
@@ -3523,9 +3530,9 @@ private:
     llvm::Function* ensureIndexerSetterFn(const sema::TypeSymbol* cls,
                                           const sema::PropertySymbol* ps);
 
-    // #730/#2437: the class `cls`'s concrete indexer that implements the
-    // interface indexer `ifaceIdx`, matched by FULL parameter list via
-    // findIndexer.
+    // #730/#2437/#2442: the class `cls`'s (or an inherited base's) concrete
+    // indexer that implements the interface indexer `ifaceIdx`, matched by
+    // FULL parameter list via findIndexer.
     const sema::PropertySymbol* classIndexerImplementing(
         const sema::TypeSymbol* cls, const sema::PropertySymbol* ifaceIdx);
 
@@ -6880,7 +6887,10 @@ private:
     const ast::CallExpr* chainCallOf(const ast::Stmt& s, bool& isThis);
 
     // CG16: the base class (baseTypes[0] when it is a class), else null.
-    const sema::TypeSymbol* baseClassOf(const sema::TypeSymbol* t);
+    // #2442 (v0.235): marked `const` (pure read of `t->baseTypes`, no
+    // Emitter state touched) so the const `findIndexer` below can call it to
+    // walk a class's base chain.
+    const sema::TypeSymbol* baseClassOf(const sema::TypeSymbol* t) const;
 
     // CG16: a non-static ctor of `cls` taking `n` parameters (excluding
     // `exclude`). Overload resolution is by arity only for now.

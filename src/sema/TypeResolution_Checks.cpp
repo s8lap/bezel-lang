@@ -3707,27 +3707,47 @@ void Resolver::checkAbstractImplementations() {
         // for why an independent, "more correct" matcher was considered and
         // rejected).
         //
-        // #2437 / §11.2 / §23.4 (v0.235): matching is by the interface
-        // indexer's FULL parameter list — arity AND every parameter type —
-        // not just the first. The prior first-parameter-only match matched a
-        // `[i:int,j:int]` obligation against a class's narrower `[i:int]`
-        // overload whenever the two shared a first parameter type
-        // (confirmed: installed the wrong getter, silently returning a value
-        // from the WRONG indexer — the issue's own repro). There is also no
-        // more "fall back to the first-declared indexer when nothing matches
-        // exactly": that fallback was an UNBOUNDED version of the same
-        // arity-blind defect (it would accept ANY indexer of ANY shape as
-        // "the implementation" once no exact match existed). `candidate ==
-        // nullptr` after a full search is now the sole, correctly-scoped "no
-        // implementation" condition — see the `!candidate` branch below.
+        // #2437 / §11.2 / §23.4 (v0.235, landed in its own prior commit —
+        // codegen's `findIndexer` carried the identical defect and was fixed
+        // together with this mirror then, per the mirroring above; #2442
+        // just below is a SEPARATE, later commit that builds on top of it):
+        // matching is by the interface indexer's FULL parameter list —
+        // arity AND every parameter type — not just the first. The prior
+        // first-parameter-only match matched a `[i:int,j:int]` obligation
+        // against a class's narrower `[i:int]` overload whenever the two
+        // shared a first parameter type (confirmed: installed the wrong
+        // getter, silently returning a value from the WRONG indexer — the
+        // issue's own repro). There is also no more "fall back to the
+        // first-declared indexer when nothing matches exactly": that
+        // fallback was an UNBOUNDED version of the same arity-blind defect
+        // (it would accept ANY indexer of ANY shape as "the implementation"
+        // once no exact match existed). `candidate == nullptr` after a full
+        // search is now the sole, correctly-scoped "no implementation"
+        // condition — see the `!candidate` branch below.
         //
-        // Local-only, per #2413's confirmed scope: `ips->decl` is null for
-        // an IMPORTED interface indexer (ModuleLoader reconstructs
-        // indexerParams as ParameterSymbols but attaches no ast::
-        // PropertyDecl — #2414's own T4 accept-control test pins this
-        // shape staying accepted). `t` is always LOCAL (this function's
-        // outer loop walks `ctx_.module()->children`), so the candidate's
-        // own `->decl` needs no such fallback.
+        // #2442 / §11.2 / §23.4 (v0.235): the search also now walks `t`'s
+        // base CLASS chain (mirroring `classPropertyByName`'s identical walk
+        // for named properties, a few hundred lines above), not `t->members`
+        // alone: §11.2 says a class "implements an interface implicitly: by
+        // declaring matching public members" and imposes no restriction that
+        // the match be declared directly on the implementing type (ordinary
+        // member inheritance applies, exactly as it does for methods via
+        // `findMethodByName` and properties via `classPropertyByName`), so a
+        // class satisfying the obligation only through an INHERITED indexer
+        // (declared on a base class, never redeclared) is a valid
+        // implementation. A candidate reached this way is accepted only when
+        // it carries a genuine LOCAL `ast::PropertyDecl` (`cpd` in the loop
+        // below): codegen's `ensureIndexerGetterFn`/`-SetterFn`
+        // (LlvmBackend_Assign.cpp) require one unconditionally and return
+        // null without it, so an indexer reached only through an IMPORTED
+        // base class cannot actually be wired into the itable today —
+        // accepting one here would be a false ACCEPT of a program that still
+        // crashes, the exact anti-pattern this whole check exists to avoid.
+        // `t` itself is always LOCAL (this function's outer loop walks
+        // `ctx_.module()->children` only), so this gate only ever excludes a
+        // candidate reached through a cross-module base; left as a filed
+        // follow-up (itable wiring for an imported base's indexer), not
+        // attempted here.
         //
         // Accessor PRESENCE is a shape fact, not a typed one (see the
         // sibling property check's identical note above) — substituting a
@@ -3746,9 +3766,9 @@ void Resolver::checkAbstractImplementations() {
         // getter-only, so it already falls out of this same check with no
         // extra machinery.
         //
-        // #2438 / §11.2 / §23.4: this loop ALSO reports when `t` provides no
-        // matching indexer AT ALL (candidate stays null after the full
-        // search) — the more severe sibling #2417 itself deferred:
+        // #2438 / §11.2 / §23.4: this loop ALSO reports when `t` (own
+        // members plus its base-class chain) provides no matching indexer AT
+        // ALL — the more severe sibling #2417 itself deferred:
         // `classIndexerImplementing` returns null in that shape, so
         // `declareVtables` Pass D installs `ConstantPointerNull` in the
         // GETTER slot too, not just the setter (confirmed by probe: a plain
@@ -3769,28 +3789,13 @@ void Resolver::checkAbstractImplementations() {
         // wrong parameter list. This loop's own candidate search is already
         // shape-aware (mirrors codegen's classIndexerImplementing/
         // findIndexer, per the comment above), so `candidate == nullptr`
-        // here is the already-computed, sound condition: `t` has ZERO
-        // non-static indexer members of any shape declared directly on it.
+        // here is the already-computed, sound condition.
         //
-        // "Declared directly on it" also catches indexer satisfaction
-        // reached ONLY THROUGH INHERITANCE (a base class declares the
-        // indexer; a derived class lists the interface but does not
-        // redeclare the indexer itself) — confirmed by probe to be an
-        // INDEPENDENT instance of the identical crash (`findIndexer` never
-        // calls `baseClassOf`, so `classIndexerImplementing(derived, ip)`
-        // returns null even though the base class's indexer works
-        // perfectly on its own). Rejecting that shape too is deliberate,
-        // not collateral: since codegen cannot currently wire it either way,
-        // accepting it would still crash — this is not a case where a
-        // "more correct" check would trade a real crash for a false reject.
-        // Making inherited indexer satisfaction actually WORK is a codegen
-        // change (teaching `findIndexer`/`classIndexerImplementing` to walk
-        // `baseClassOf`, mirroring what `classPropertyByName` already does
-        // for named properties) — filed as #2442, separate from this
-        // sema-side reject and from #2437's own fix here.
-        // #2442 landing would make this reject a false one for that specific
-        // shape; the two are cross-referenced so they get revisited
-        // together.
+        // Local-only on the INTERFACE side, per #2413's confirmed scope:
+        // `ips->decl` is null for an IMPORTED interface indexer (ModuleLoader
+        // reconstructs indexerParams as ParameterSymbols but attaches no
+        // ast::PropertyDecl — #2414's own T4 accept-control test pins this
+        // shape staying accepted, uninvolved in this check).
         for (auto& obl : ifaceIndexerObligations) {
             PropertySymbol* ips = obl.ips;
             auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ips->decl);
@@ -3805,49 +3810,60 @@ void Resolver::checkAbstractImplementations() {
                            : nullptr;
             };
 
-            // #2437: full parameter-list match — see the block comment above.
+            // #2437/#2442: full parameter-list match over `t`'s own members
+            // then its base-class chain, gated on a genuine local decl — see
+            // the block comment above.
             PropertySymbol* candidate = nullptr;
-            for (Symbol* m : t->members) {
-                auto* cps = dynamic_cast<PropertySymbol*>(m);
-                if (!cps || !cps->isIndexer) continue;
-                bool isStaticIdx = false;
-                for (auto mod : cps->modifiers)
-                    if (mod == "static") { isStaticIdx = true; break; }
-                if (isStaticIdx) continue;
-                auto* cpd = dynamic_cast<const ast::PropertyDecl*>(cps->decl);
-                if (!cpd) continue;  // `t` is always LOCAL — see note above
-                if (cpd->indexerParams.size() != nparams) continue;
-                bool all = true;
-                for (std::size_t k = 0; k < nparams; ++k) {
-                    TypeRef* pty = (k < cpd->indexerParams.size() &&
-                                    cpd->indexerParams[k].type)
-                                       ? resolvedOf(
-                                             cpd->indexerParams[k].type.get())
-                                       : nullptr;
-                    TypeRef* ity = ifaceParamTy(k);
-                    if (!pty || !ity || !typeRefEqual(pty, ity)) {
-                        all = false;
+            for (TypeSymbol* cur = t; cur && !candidate;) {
+                for (Symbol* m : cur->members) {
+                    auto* cps = dynamic_cast<PropertySymbol*>(m);
+                    if (!cps || !cps->isIndexer) continue;
+                    bool isStaticIdx = false;
+                    for (auto mod : cps->modifiers)
+                        if (mod == "static") { isStaticIdx = true; break; }
+                    if (isStaticIdx) continue;
+                    auto* cpd = dynamic_cast<const ast::PropertyDecl*>(cps->decl);
+                    if (!cpd) continue;  // unwireable — see comment above
+                    if (cpd->indexerParams.size() != nparams) continue;
+                    bool all = true;
+                    for (std::size_t k = 0; k < nparams; ++k) {
+                        TypeRef* pty =
+                            (k < cpd->indexerParams.size() &&
+                             cpd->indexerParams[k].type)
+                                ? resolvedOf(cpd->indexerParams[k].type.get())
+                                : nullptr;
+                        TypeRef* ity = ifaceParamTy(k);
+                        if (!pty || !ity || !typeRefEqual(pty, ity)) {
+                            all = false;
+                            break;
+                        }
+                    }
+                    if (all) { candidate = cps; break; }
+                }
+                TypeSymbol* base = nullptr;
+                for (TypeSymbol* b : cur->baseTypes)
+                    if (b && b->kind == ast::TypeDeclKind::Class) {
+                        base = b;
                         break;
                     }
-                }
-                if (all) { candidate = cps; break; }
+                cur = base;
             }
 
             if (!candidate) {
-                // #2438: no non-static indexer of any shape declared
-                // directly on `t` — mirrors #489's "does not implement
-                // interface property" message a few hundred lines above,
-                // adapted for indexers (see the block comment above this
-                // loop for why that check itself isn't reused directly).
+                // #2438: no indexer, own or inherited, matches the
+                // obligation's full parameter list — mirrors #489's "does
+                // not implement interface property" message a few hundred
+                // lines above, adapted for indexers (see the block comment
+                // above this loop for why that check itself isn't reused
+                // directly).
                 ctx_.diagnostics().report(
                     Severity::Error, t->declLoc,
                     std::string(kindWord) + " `" + std::string(t->name) +
                     "` does not implement interface `" +
                     std::string(obl.iface->name) + "`'s indexer — declare a "
-                    "matching `public property [params]: T` directly on `" +
-                    std::string(t->name) + "` (an indexer inherited from a "
-                    "base class does not currently satisfy an interface "
-                    "indexer obligation — §11.2 / §23.4)");
+                    "matching `public property [params]: T` on `" +
+                    std::string(t->name) + "` or an ancestor class, with the "
+                    "same parameter count and types (§11.2 / §23.4)");
                 continue;
             }
 
@@ -3855,8 +3871,9 @@ void Resolver::checkAbstractImplementations() {
                 continue;  // read-only obligation, candidate found: satisfied
 
             auto* cpd = dynamic_cast<const ast::PropertyDecl*>(candidate->decl);
-            if (!cpd) continue;  // defensive: `candidate` is always a member
-                                  // of local `t`, so this should not happen
+            if (!cpd) continue;  // defensive: the search above only ever
+                                  // selects a candidate that already passed
+                                  // this same cast
 
             if (!propertyDeclHasSetter(cpd)) {
                 ctx_.diagnostics().report(
