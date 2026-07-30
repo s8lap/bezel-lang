@@ -1275,66 +1275,100 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
         case sema::PrimitiveType::Bool: {
             auto* fn = declareC("bz_binder_read_bool", i8(), {ptrTy()});
             llvm::Value* b8 = builder_.CreateCall(fn, {derPtr}, "deser.bool");
+            // fix #2378 / §9.8 / §2.15: bz_binder_read_bool can raise (JSON:
+            // "Expected JSON bool") — mirror lowerDeserializerReadMethod's
+            // ReadBool, which already pending-checks every read. Without this,
+            // a pending exception set here is left unchecked and later
+            // SUPERSEDED (without disposal) by a subsequent, unrelated throw
+            // elsewhere in this recursive field loop — leaking the exception
+            // object + its message (the #2378 pattern).
+            emitPendingCheck();
             return builder_.CreateTrunc(b8, i1(), "deser.bool1");
         }
         case sema::PrimitiveType::Char: {
             auto* fn = declareC("bz_binder_read_char", i32(), {ptrTy()});
-            return builder_.CreateCall(fn, {derPtr}, "deser.char");
+            llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.char");
+            emitPendingCheck();  // fix #2378 — see the Bool case above.
+            return v;
         }
         case sema::PrimitiveType::Byte: {
             auto* fn = declareC("bz_binder_read_uint", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.u64");
+            // fix #2378 / §9.8 / §2.15: bz_binder_read_uint raises
+            // SerializationException on truncated binary input
+            // (bz_ser_throw_at_binary) — see the Bool case above for why an
+            // unchecked pending exception here leaks.
+            emitPendingCheck();
             return builder_.CreateTrunc(v, i8(), "deser.byte");
         }
         case sema::PrimitiveType::SByte: {
             auto* fn = declareC("bz_binder_read_int", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.i64");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
             return builder_.CreateTrunc(v, i8(), "deser.sbyte");
         }
         case sema::PrimitiveType::Short: {
             auto* fn = declareC("bz_binder_read_int", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.i64");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
             return builder_.CreateTrunc(v, i16(), "deser.short");
         }
         case sema::PrimitiveType::UShort: {
             auto* fn = declareC("bz_binder_read_uint", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.u64");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
             return builder_.CreateTrunc(v, i16(), "deser.ushort");
         }
         case sema::PrimitiveType::Int: {
             auto* fn = declareC("bz_binder_read_int", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.i64");
+            // fix #2378 / §9.8 / §2.15 (the reported repro): bz_binder_read_int
+            // raises SerializationException on truncated binary input — see the
+            // Bool case above for why an unchecked pending exception here leaks
+            // the exception object bz_ser_throw allocated.
+            emitPendingCheck();
             return builder_.CreateTrunc(v, i32(), "deser.int");
         }
         case sema::PrimitiveType::UInt: {
             auto* fn = declareC("bz_binder_read_uint", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.u64");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
             return builder_.CreateTrunc(v, i32(), "deser.uint");
         }
         case sema::PrimitiveType::Long: {
             auto* fn = declareC("bz_binder_read_int", i64(), {ptrTy()});
-            return builder_.CreateCall(fn, {derPtr}, "deser.long");
+            llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.long");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
+            return v;
         }
         case sema::PrimitiveType::ULong: {
             auto* fn = declareC("bz_binder_read_uint", i64(), {ptrTy()});
-            return builder_.CreateCall(fn, {derPtr}, "deser.ulong");
+            llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.ulong");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
+            return v;
         }
         case sema::PrimitiveType::Float: {
             auto* fn = declareC("bz_binder_read_float",
                                 llvm::Type::getDoubleTy(llvm_), {ptrTy()});
             llvm::Value* d = builder_.CreateCall(fn, {derPtr}, "deser.dbl");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
             return builder_.CreateFPTrunc(d, llvm::Type::getFloatTy(llvm_), "deser.f");
         }
         case sema::PrimitiveType::Double: {
             auto* fn = declareC("bz_binder_read_float",
                                 llvm::Type::getDoubleTy(llvm_), {ptrTy()});
-            return builder_.CreateCall(fn, {derPtr}, "deser.dbl");
+            llvm::Value* d = builder_.CreateCall(fn, {derPtr}, "deser.dbl");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
+            return d;
         }
         case sema::PrimitiveType::Decimal: {
             // §2.14 / #665: ReadDecimal — bz_binder_read_decimal returns a
             // void* (ptr to alloca'd 16-byte struct), load it back to a value.
             auto* fn = declareC("bz_binder_read_decimal", ptrTy(), {ptrTy()});
             llvm::Value* decPtr = builder_.CreateCall(fn, {derPtr}, "deser.decptr");
+            // fix #2378 / §9.8 / §2.15: the JSON path (bz_jder_parse_decimal)
+            // can raise SerializationException — see the Bool case above.
+            emitPendingCheck();
             // decPtr is a ptr to a 16-byte {i32×4} struct on the runtime stack.
             // Load the decimal value via the pointer.
             llvm::AllocaInst* slot = entryAlloca(decimalStructType());
@@ -1357,7 +1391,15 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
         }
         case sema::PrimitiveType::String: {
             auto* fn = declareC("bz_binder_read_string", ptrTy(), {ptrTy()});
-            return builder_.CreateCall(fn, {derPtr}, "deser.str");
+            llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.str");
+            // fix #2378 / §9.8 / §2.15: bz_binder_read_string's JSON path can
+            // raise SerializationException — see the Bool case above. (The
+            // binary path's own truncated-payload leak is fixed separately in
+            // emitClassDeserialize/emitRecordDeserialize's per-slot disposal
+            // registration — the successfully-read string itself, not an
+            // exception object, is what leaks there; see the #2378 commit.)
+            emitPendingCheck();
+            return v;
         }
         default:
             return nullptr;
@@ -2751,6 +2793,60 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         disposeStack_.back().push_back(nd);
     }
 
+    // fix #2378 / §9.8 / §28.3/§28.9: a dedicated scope guarding already-
+    // populated owned-class/string component slots against a LATER field's
+    // read throwing. Pushed here (before any field is read); each class- or
+    // string-typed component's slot is registered into it, once, up front
+    // (self-nulled by the two manual "dispose already-filled slots" loops
+    // below on the two paths they already cover — see their own comments —
+    // so this scope's later sweep of the same slot there is a safe no-op);
+    // popped WITHOUT disposal once construction begins (below, after the
+    // missing-required-field check), since by then every slot's value is
+    // either about to be consumed into the constructed object or the
+    // function has already unwound past this point entirely.
+    //
+    // Without this: a component slot populated by an EARLIER successful
+    // field read (e.g. `First: string` read before `Second: owned Leaf`)
+    // had NO disposal registered anywhere. A LATER field's read that
+    // recurses into ANOTHER emitClassDeserialize/emitDeserializeField
+    // invocation and throws from deep inside (its own
+    // bz_binder_begin_object / field-name-null check, already correctly
+    // pending-checked per the emitDeserializeField fix above) unwinds
+    // straight past this function's own manual disposal loops (which only
+    // run on THIS class's OWN field-name-null / missing-required-field
+    // paths, not a nested recursive throw) — orphaning the already-read
+    // value (the reported #2378 follow-up string leak,
+    // `bz_binder_read_bz_string`/`bz_binder_read_string`).
+    //
+    // Scoped to tree mode (!isGraphMode): a Shared<T>/Weak<T> slot in graph
+    // mode holds a HANDLE (bz_shared_new/bz_shared_clone), not a plain class
+    // instance or string, and needs bz_shared_release/bz_weak_release, not
+    // generic vtable dispatch or bz_string_release — left to a follow-up
+    // (issue filed) rather than risking a wrong-dispatch regression by
+    // reusing this mechanism there.
+    disposeStack_.emplace_back();
+    if (!isGraphMode) {
+        for (std::size_t i = 0; i < comps.size(); ++i) {
+            if (comps[i].isSkip || !slots[i] || !comps[i].ty) continue;
+            const auto* cty = comps[i].ty;
+            if (cty->kind == sema::TypeRef::Kind::Named && cty->declaration &&
+                cty->declaration->kind == ast::TypeDeclKind::Class) {
+                // unwindOnly: skipped entirely on normal exit (belt-and-
+                // suspenders — this scope is popped without disposal on the
+                // normal path anyway), null-guarded generic vtable dispatch
+                // on unwind (LlvmBackend_Disposal.cpp's emitDisposals).
+                Disposal cd{slots[i], cty->declaration};
+                cd.unwindOnly = true;
+                disposeStack_.back().push_back(cd);
+            } else if (cty->kind == sema::TypeRef::Kind::Primitive &&
+                       cty->primitive == sema::PrimitiveType::String) {
+                Disposal sd{slots[i], nullptr};
+                sd.stringRelease = true;
+                disposeStack_.back().push_back(sd);
+            }
+        }
+    }
+
     // BeginObject → read field count.
     auto* beginFn = declareC("bz_binder_begin_object", i32(), {ptrTy()});
     llvm::Value* fieldCount = builder_.CreateCall(beginFn, {derPtr}, "cdeser.cnt");
@@ -2806,6 +2902,13 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 builder_.CreateCondBr(nonNull, dispBB, skipBB2);
                 builder_.SetInsertPoint(dispBB);
                 emitDisposeAndReclaim(p);
+                // fix #2378: null the slot after this manual dispose so the
+                // component-disposal scope's own sweep (emitThrowBuiltin below
+                // calls emitUnwindDisposals, which now also covers this slot —
+                // see the scope pushed near the top of this function) sees null
+                // and safely no-ops instead of double-disposing the same object.
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), slots[ci2]);
                 builder_.CreateBr(skipBB2);
                 builder_.SetInsertPoint(skipBB2);
                 continue;
@@ -2822,6 +2925,9 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 builder_.SetInsertPoint(relBB);
                 auto* relFn2 = declareC("bz_string_release", voidTy2, {ptrTy()});
                 builder_.CreateCall(relFn2, {sp});
+                // fix #2378 — see the class-slot null-out above.
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), slots[ci2]);
                 builder_.CreateBr(skipBB2);
                 builder_.SetInsertPoint(skipBB2);
                 continue;
@@ -3213,6 +3319,11 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
             builder_.CreateCondBr(nonNull, dispBB2, skipBB3);
             builder_.SetInsertPoint(dispBB2);
             emitDisposeAndReclaim(p);
+            // fix #2378 — see the errBB class-slot null-out above: prevent the
+            // component-disposal scope's own sweep (below, this same
+            // emitThrowBuiltin call) from double-disposing this slot.
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), slots[ci2]);
             builder_.CreateBr(skipBB3);
             builder_.SetInsertPoint(skipBB3);
         }
@@ -3221,6 +3332,23 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
             builder_.CreateUnreachable();
         builder_.SetInsertPoint(okBB);
     }
+
+    // fix #2378 / §9.8 / §28.3/§28.9: pop the component-disposal scope pushed
+    // near the top of this function (guarding already-populated owned-class/
+    // string slots against a later throw during the field loop above). Every
+    // required field is now confirmed present and construction is about to
+    // begin, consuming each slot's value into the constructed object (or
+    // handing off to the already-correct construction-phase cleanup, #2363,
+    // and emitNewPendingCheck's own partial-object disposal) — nothing in
+    // this scope should be disposed on this (normal) path, so pop it WITHOUT
+    // invoking its disposals (mirroring how a `using`/try body scope that
+    // completes normally is handled by its own, different, exit dispatch).
+    // Balances the unconditional disposeStack_.emplace_back() above (that
+    // push is unconditional so the scope exists — possibly empty, for
+    // isGraphMode — regardless; this pop must be unconditional too, or a
+    // graph-mode class would leave disposeStack_ permanently unbalanced for
+    // the rest of the enclosing function).
+    disposeStack_.pop_back();
 
     // Allocate the class instance.
     llvm::Value* sizeofSt = builder_.CreatePtrToInt(
