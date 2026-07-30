@@ -1583,9 +1583,69 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
             }
         }
         llvm::AllocaInst* slot = entryAlloca(slotTy);
+        // §7.9 "Default initialization" / §22.4 (v0.235, #2395): a plain
+        // inline `out var` recipient that DA does NOT require to be
+        // definitely-assigned before a read — every case except a
+        // non-nullable REFERENCE type — is promised §7.9's default value
+        // ("the default value or `null`") on a control-flow path where the
+        // introducing call is SKIPPED (short-circuit `and`/`or`, or a null
+        // `?.` receiver): "value-typed and nullable out variables follow
+        // §7.9's default-initialization rules" (§22.4, "Scope is not
+        // definite assignment"). `inlineOutVarNeedsDA` in
+        // DefiniteAssignment.cpp draws exactly this line via
+        // isNonNullableReferenceType (only a non-nullable reference-typed
+        // recipient is tracked/rejected on a maybe-skipped path); this
+        // mirrors that predicate so codegen's default matches what DA
+        // promises is readable. Concretely this covers not just a nullable
+        // recipient (garbage tag/pointer bits reading back as spuriously
+        // non-null, per #2395's own repro) but equally a plain NON-nullable
+        // value-typed one (`out n: int`, no `?`) — DA exempts it from
+        // tracking on the same "has a well-defined default" grounds, so an
+        // un-stored slot there reads back a garbage int instead of the
+        // promised 0 (confirmed empirically while verifying #2395: same
+        // wrong-value symptom, just less obviously "nullable"). A
+        // non-nullable REFERENCE-typed recipient is deliberately left
+        // un-stored: DA rejects any read of it on a path the call may have
+        // skipped (a compile error), so no default is required, and storing
+        // one would just be dead weight on the always-safe path.
+        // getNullValue(slotTy) is the generic §7.9 zero for every lowering
+        // slotTy takes here: 0 for an integer/float primitive, `false` (i1
+        // zero) for bool, null for a pointer (nullable reference), and the
+        // recursive all-zero aggregate for the tagged nullable-value struct
+        // {i8 hasValue, T value} or a plain record/inline-array struct —
+        // the same bit pattern nullableValueNull's ConstantAggregateZero
+        // produces for the nullable-value case, so this needs no separate
+        // isNullableValueTy branch.
+        if (!loc || !loc->declType ||
+            !sema::isNonNullableReferenceType(loc->declType)) {
+            builder_.CreateStore(llvm::Constant::getNullValue(slotTy), slot);
+        }
         locals_[id] = slot;
         if (loc && loc->decl) locals_[loc->decl] = slot;
         pos++;
+    }
+}
+
+// §22.4 / §7.9 (v0.235, #2395) — see the declaration in LlvmBackend_impl.hpp.
+// ensureOutVarSlots is idempotent (its "skip if slot already created" guard),
+// so hoisting it early here and letting the call's own normal lowering call
+// it again later (a no-op re-check) is safe — the zero-store fires exactly
+// once, at this dominating point, and the real write (if the call runs)
+// lands in the already-existing slot untouched by this function.
+void Emitter::hoistSkippableOutVarSlots(const ast::Expr& e) {
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        ensureOutVarSlots(*ce);
+        for (const auto& a : ce->args)
+            if (a.value) hoistSkippableOutVarSlots(*a.value);
+        return;
+    }
+    if (auto* be = dynamic_cast<const ast::BinaryExpr*>(&e)) {
+        if (be->left) hoistSkippableOutVarSlots(*be->left);
+        if (be->right) hoistSkippableOutVarSlots(*be->right);
+        return;
+    }
+    if (auto* ue = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+        if (ue->operand) hoistSkippableOutVarSlots(*ue->operand);
     }
 }
 

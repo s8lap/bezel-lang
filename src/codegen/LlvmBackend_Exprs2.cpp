@@ -22,6 +22,17 @@ llvm::Value* Emitter::lowerShortCircuit(const ast::BinaryExpr& bin) {
     bool isAnd = (bin.op == "and");
     llvm::Value* l = lowerExpr(*bin.left);
     if (!l) return nullptr;
+    // §22.4 / §7.9 (v0.235, #2395): pre-create/zero-init any inline
+    // `out var` slot inside the RIGHT operand — the one THIS operator may
+    // SKIP (`and` skips it when `l` is false, `or` skips it when `l` is
+    // true) — before the branch below. Without this, ensureOutVarSlots'
+    // zero-store (added by this same fix) runs from inside `rhsBB`, which
+    // does not dominate `sc.end`'s "skip" predecessor, so a read past the
+    // `if` on the skip path still observes stack garbage instead of the
+    // §7.9 default. `bin.left` needs no equivalent hoist: it is never
+    // skipped by this operator, so its own (possibly nested) lowering
+    // reaches any out-var call inside it unconditionally already.
+    if (bin.right) hoistSkippableOutVarSlots(*bin.right);
     auto* entryBB = builder_.GetInsertBlock();
     auto* rhsBB = llvm::BasicBlock::Create(llvm_, "sc.rhs", currentFn_);
     auto* endBB = llvm::BasicBlock::Create(llvm_, "sc.end", currentFn_);
