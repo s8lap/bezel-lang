@@ -1809,6 +1809,61 @@ void Emitter::ensureCtorOutVarSlots(const ast::NewExpr& ne,
             pos++;
             continue;
         }
+        // §22.4 (v0.235, #2430): `out using var x` at a CONSTRUCTOR call
+        // site — the ctor analogue of ensureOutVarSlots' `out using var`
+        // CallExpr block above, restricted to its non-`isUpgrade` path: a
+        // constructor is never `Weak<T>.TryUpgrade` (that path exists only
+        // for a MEMBER-ACCESS callee on the builtin `Weak<T>` receiver,
+        // which a `new T(...)` call is not), so this block always takes the
+        // `dynamicDispose` (owned class-element) branch, never
+        // `sharedHandle`. Sema now registers the recipient (mirrors
+        // #2409's `out owned var` NewExpr fix, ExprTypecheck_Exprs.cpp) but,
+        // exactly as the #2411 ICE for `out owned var`, codegen's
+        // `buildOrderedArgs` needs a pre-created `locals_` slot for the
+        // fresh identifier — without this block `out using var` at a
+        // constructor call site hits the same #1386 ICE guard `out owned
+        // var` did before #2411 (confirmed live: reverting this block
+        // reproduces the ICE for the issue's own repro, byte-for-byte).
+        //
+        // `x` is declared fresh here, always OBJECT-typed (§22.4's
+        // `out owned` — the only parameter kind `out using var` is accepted
+        // against — is only ever admitted on a class/interface parameter,
+        // §28.1), so a bare pointer alloca suffices — no per-parameter
+        // slotTy lookup, exactly as ensureOutVarSlots' identical block. The
+        // scope-bound disposal is unconditional `dynamicDispose` (this IS
+        // the `using` obligation — always discharged at scope end, unlike
+        // `out owned var`'s conditional unwindOnly/dynamicDispose split,
+        // which exists only because `out owned var` may instead be
+        // discharged by an explicit `.Dispose()`).
+        if (a.modifier == "out using var" && a.value) {
+            auto* iduv =
+                dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
+            if (iduv) {
+                sema::Symbol* symuv = ctx_.exprSymbol(*iduv);
+                auto* locuv = dynamic_cast<sema::LocalSymbol*>(symuv);
+                bool alreadyMapped = (locuv && locuv->decl &&
+                                      locals_.count(locuv->decl)) ||
+                                     locals_.count(iduv);
+                if (!alreadyMapped) {
+                    llvm::AllocaInst* outSlot = entryAlloca(ptrTy());
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), outSlot);
+                    locals_[iduv] = outSlot;
+                    if (locuv && locuv->decl) locals_[locuv->decl] = outSlot;
+                    const sema::TypeRef* recipTy =
+                        (locuv && locuv->declType) ? locuv->declType
+                                                   : ctx_.exprType(*iduv);
+                    if (!disposeStack_.empty() &&
+                        outOwnedRecipientDisposes(recipTy)) {
+                        Disposal disp{outSlot, nullptr};
+                        disp.dynamicDispose = true;
+                        disposeStack_.back().push_back(disp);
+                    }
+                }
+            }
+            pos++;
+            continue;
+        }
         if (a.modifier != "out var" || !a.value) { pos++; continue; }
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get());
         if (!id) { pos++; continue; }

@@ -5186,6 +5186,42 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     currentScope_->names[id->name] = lsym;
                 }
             }
+            // §22.4 (v0.235, #2430): `out using var x` at a CONSTRUCTOR call
+            // site declares x inline — the constructor analogue of the
+            // `out owned var` block just above (parallel to how that block
+            // parallels plain `out var`). §22.4 states the accepted call-site
+            // forms for an `out owned` parameter are "`out using var x` (a
+            // scope-bound owned local) and `out owned var x`" — both were
+            // already handled for a METHOD call (ExprTypecheck_Exprs.cpp
+            // ~line 4643), but this NewExpr argument-registration loop had a
+            // block for `out var` (#968) and `out owned var` (#1305/#2409)
+            // and no block at all for `out using var`, so `n` in
+            // `new Widget(s, out using var n)` was never registered as a
+            // local: every later reference to it failed the ordinary
+            // unresolved-identifier check. Mirrors the `out owned var` block
+            // immediately above (declType from the matching `out owned`
+            // ctor formal, no generic-substitution / builtin-receiver
+            // derivation — a constructor call is never a builtin Try*
+            // method, so that machinery in the CallExpr sibling does not
+            // apply here, matching this NewExpr path's existing scope for
+            // its `out owned var` sibling).
+            if (a.modifier == "out using var" && a.value && currentScope_) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                   a.value.get())) {
+                    auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                    lsym->name = id->name;
+                    lsym->decl = id;
+                    if (ctorDecl && posn < ctorDecl->params.size() &&
+                        ctorDecl->params[posn].type) {
+                        lsym->declType = ctx_.resolvedType(
+                            *ctorDecl->params[posn].type);
+                        // per §22.4 / §7.9: do NOT strip the declared
+                        // nullability — same reasoning as the `out var` /
+                        // `out owned var` blocks above.
+                    }
+                    currentScope_->names[id->name] = lsym;
+                }
+            }
             // #1051 / §5.1: target-type an unsuffixed integer literal constructor
             // argument to a `uint`/`long`/`ulong` parameter (an explicit ctor
             // parameter, or a positional-record field), so a literal > int.MaxValue
