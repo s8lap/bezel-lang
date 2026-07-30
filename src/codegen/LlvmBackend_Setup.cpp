@@ -9553,16 +9553,44 @@ const sema::TypeSymbol* Emitter::unwindOwnedLocalClass(const ast::LocalDecl* ld)
                 // is true (a borrow return must NOT be disposed).
                 bool isOwned = (md && md->returnOwned) ||
                                (!md && ctx_.importedReturnOwned(ms));
-                if (isOwned &&
-                    isClassOrInterfaceRef(ctx_.exprType(*ld->initializer))) {
+                // §11.8 / §28.7 (#1425 sub-item 3): `total := T.Zero()` /
+                // `T.Method()` through a static-interface constraint has a
+                // BARE-type-parameter static return (`declaration == nullptr`
+                // at the unsubstituted AST level — sema type-checks the
+                // generic body once, so `ctx_.exprType` never resolves T).
+                // `isClassOrInterfaceRef` alone therefore always reads false
+                // for a T-typed producer even though this specialized body
+                // (buildSpecializedMethodFn) is compiling a genuine class/
+                // interface instantiation — the sibling classifiers below
+                // ((a2) BinaryExpr operator, (a0) arm-meet, (a-1) bind-atom)
+                // already resolve the bare param through the ACTIVE
+                // substitution (resolveTypeParamRef / genericSubstSemaTy_)
+                // before testing isClassOrInterfaceRef; this CallExpr branch
+                // was the one shape missing that fallback, so a bare-T
+                // `owned T` call result (`T.Zero()`, `T.Member()`) never
+                // registered as an owned plain local — its drop-on-overwrite
+                // disposal (disposeDisplacedOwnedClassLocal, §28.7) silently
+                // no-op'd on every reassignment, leaking the displaced value
+                // (confirmed under ASan/LSan: the spec's own §11.8 `Sum<T>`
+                // accumulator leaks T.Zero()'s result plus every displaced
+                // intermediate `total + x`). Spec §11.8 "Dispatch through the
+                // type parameter" (v0.228) is explicit that at a class/
+                // interface substitution `total` "is an owned local" whose
+                // "reassignment disposes the displaced previous total by
+                // drop-on-overwrite (§28.7)" — this restores that.
+                const sema::TypeRef* initTy = ctx_.exprType(*ld->initializer);
+                if (isOwned && (isClassOrInterfaceRef(initTy) ||
+                                isClassOrInterfaceRef(
+                                    resolveTypeParamRef(initTy)))) {
                     // Use the resolved class when available (for the disposer
                     // map); dispatch is dynamic in emitDisposals regardless.
-                    if (auto* rt = ctx_.exprType(*ld->initializer))
-                        if (rt->kind == sema::TypeRef::Kind::Named &&
-                            rt->declaration &&
-                            rt->declaration->kind == ast::TypeDeclKind::Class)
-                            return rt->declaration;
-                    // Interface return: dynamic dispatch with a null cls.
+                    if (initTy && initTy->kind == sema::TypeRef::Kind::Named &&
+                        initTy->declaration &&
+                        initTy->declaration->kind == ast::TypeDeclKind::Class)
+                        return initTy->declaration;
+                    // Interface return, or a bare-T return resolved only
+                    // through the active substitution: dynamic dispatch with
+                    // a null cls.
                     return reinterpret_cast<const sema::TypeSymbol*>(1);
                 }
                 // (b2u) §28.3 "Factory methods and sourceless returns" /
