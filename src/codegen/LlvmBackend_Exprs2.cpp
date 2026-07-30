@@ -3902,6 +3902,28 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         // enclosing-scope expression — lower it under the outer
                         // substitution, then restore the new type's subst for
                         // the field-type coercion + store below.
+                        // #2367: likewise for `currentThis_` — #597 fixed the
+                        // generic-substitution half of "enclosing-scope
+                        // expression" but left `currentThis_ = obj` (set above
+                        // for the DIFFERENT purpose of resolving `t`'s OWN
+                        // implicit-field reads, e.g. a chained base-ctor arg
+                        // that names one of `t`'s own primary-ctor params) in
+                        // effect across this evaluation too. An arg expression
+                        // that is itself an implicit-field read of the ENCLOSING
+                        // scope (e.g. `new Leaf(first)` as another class's own
+                        // field initializer, where `first` is the enclosing
+                        // class's primary-ctor param) resolved that read via
+                        // implicitFieldAddr against `obj` — the new, not-yet-
+                        // initialized `t` instance — instead of the enclosing
+                        // object, reading through a pointer sized/typed for `t`
+                        // as if it had the enclosing class's layout (a wrong-
+                        // object GEP; heap-buffer-overflow when `t`'s instance
+                        // is smaller). Restore the enclosing `this`
+                        // (`savedThisForInit`) for the evaluation only, mirroring
+                        // the explicit-ctor arg path below (case (b) in its
+                        // comment) which already does this correctly.
+                        llvm::Value* savedThisForArg = currentThis_;
+                        currentThis_ = savedThisForInit;
                         auto posSubst = genericSubst_;
                         auto posSemaTy = genericSubstSemaTy_;
                         genericSubst_ = savedSubst;
@@ -3909,6 +3931,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         llvm::Value* v = lowerExpr(*ne.args[pi].value);
                         genericSubst_ = std::move(posSubst);
                         genericSubstSemaTy_ = std::move(posSemaTy);
+                        currentThis_ = savedThisForArg;
                         if (!v) break;
                         llvm::Type* fieldTy =
                             st->getElementType(idxIt->second);
