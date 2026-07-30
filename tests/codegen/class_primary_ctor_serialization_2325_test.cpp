@@ -444,3 +444,47 @@ BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
         "  return (if w2.Id = 5 then 42 else 91); "
         "end Main; end C;"), 42);
 }
+
+// Adversarial self-pass (b): a mid-deserialize failure (malformed/truncated
+// wire input) on the NEW primary-ctor path must raise SerializationException
+// cleanly, with no leak of the partially-reconstructed owned nested Customer
+// — mirrors serialization_tier2_classes_test.cpp's
+// truncated_input_asan_no_leak_spec_9_8_v0136, but for a primary-ctor Order/
+// Customer pair. The truncation is detected by the WIRE-READING loop, which
+// runs entirely BEFORE the primary-ctor construction path this fix adds (the
+// class instance is not even calloc'd yet), so this exercises the
+// pre-existing missing-field / truncated-stream cleanup with the new
+// component-collection code providing the component list — a leak here would
+// mean the fix's wider component set (now including captured primary-ctor
+// params) confused that pre-existing cleanup accounting.
+BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
+           truncated_input_no_leak_primary_ctor_nested_owned_spec_9_8) {
+    const std::string kProg =
+        std::string("module M; ") + kImport +
+        "class Customer(name: string): ISerializable, IDeserializable "
+        "  public property Name: string => name; "
+        "end Customer; "
+        "class Order(id: int, owned customer: Customer): ISerializable, IDeserializable "
+        "  public owned Customer: Customer := customer; "
+        "  public property Id: int => id; "
+        "end Order; "
+        "class C public static method Main(): int "
+        "  using var o := new Order(42, new Customer(\"Ada\")); "
+        "  using var s := new BinarySerializer(); "
+        "  o.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  var halfLen: int := bytes.Length / 2; "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan(0, halfLen)); "
+        "  var caught: bool := false; "
+        "  try "
+        "    using var back := Order.Deserialize(d); "
+        "    return 0; "
+        "  catch SerializationException => caught := true; "
+        "  end; "
+        "  return (if caught then 42 else 1); "
+        "end Main; end C;";
+    // Exit-code leg: SerializationException is caught.
+    BEZEL_EXPECT_EQ(run(kProg), 42);
+    // ASan/LSan leg: no leak of the partial Order/Customer reconstruction.
+    BEZEL_EXPECT_EQ(runChecked(kProg), 42);
+}
