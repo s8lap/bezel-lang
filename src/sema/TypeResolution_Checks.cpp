@@ -5668,13 +5668,110 @@ void Resolver::checkSerializationEligibility() {
             // are class-typed.  A non-owned (borrowing) class-typed field is a
             // back-edge; back-edges require tier-3 (serialized graph/cyclic back-
             // edge serialization) and are not yet implemented.
+            //
+            // §9.8 / #2325: a class's serialized components are its `owned`
+            // and value-typed fields/auto-properties — which, for a class with
+            // PRIMARY-CONSTRUCTOR parameters (§11.1), includes any parameter
+            // CAPTURED into a private field (referenced in a body position —
+            // a method/property/constructor/destructor body — represented as
+            // a FieldSymbol with `posParam` set and `posParamBodyRef == true`,
+            // since fs->decl for such a symbol is the owning TypeDecl, not a
+            // FieldDecl — see the FieldSymbol comment in Symbol.hpp). A
+            // parameter referenced ONLY in an initializer position generates
+            // no field of its own (§11.1) — its value flows into whichever
+            // explicit field consumes it, which is already counted there — so
+            // it is excluded here to avoid double-counting. This resolves
+            // against the stdlib §2.14 `Order` worked example, which
+            // serializes `Id` via a captured `id` (a primary-ctor param read
+            // only from `property Id: int => id;`), while `customer`/`lines`
+            // — consumed only by the explicit `Customer`/`Lines` field
+            // initializers — are not themselves separately counted.
+            auto checkComponentType = [&](std::string_view fieldName,
+                                          const TypeRef* tr,
+                                          bool isOwned) -> int {
+                // 0 = eligible; 1 = back-edge OK (not disqualifying);
+                // 2 = error (already reported; caller sets foundBackEdge).
+                bool fieldIsClass = (tr->kind == TypeRef::Kind::Named &&
+                                    tr->declaration &&
+                                    tr->declaration->kind ==
+                                        ast::TypeDeclKind::Class);
+                // Nullable T?: peel and check inner.
+                bool fieldIsNullableClass = false;
+                if (!fieldIsClass && tr->nullable) {
+                    TypeRef inner = *tr; inner.nullable = false;
+                    fieldIsNullableClass =
+                        inner.kind == TypeRef::Kind::Named &&
+                        inner.declaration &&
+                        inner.declaration->kind == ast::TypeDeclKind::Class;
+                }
+                if ((fieldIsClass || fieldIsNullableClass) && !isOwned) {
+                    // §9.8 / tier 3: back-edge fields (non-owned class-typed
+                    // fields) are serialization-eligible under `serialized graph`
+                    // and `serialized cyclic` — they are written as tag references
+                    // and resolved from the tag→object table on deserialize.
+                    // Under `serialized tree`, aliasing is forbidden (back-edges
+                    // violate the tree assertion), so they remain an error there.
+                    if (scc.shape == "tree") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` (`serialized "
+                            "tree`): field `" + std::string(fieldName) +
+                            "` is a non-owned (borrowing) class-typed field "
+                            "(a back-edge); `serialized tree` forbids aliasing — "
+                            "mark the field `owned`, declare `serialized skip`, "
+                            "or change the clause to `serialized graph`");
+                        return 2;
+                    }
+                    // Under `serialized graph` / `serialized cyclic`:
+                    // back-edge is eligible (§9.8 tier 3 implemented).
+                    // Verify the target type has a graph-shape clause.
+                    const TypeSymbol* beDecl = tr->declaration;
+                    if (!beDecl && tr->nullable) beDecl = tr->declaration;
+                    if (beDecl) {
+                        auto* beTd = dynamic_cast<const ast::TypeDecl*>(beDecl->decl);
+                        if (!beTd || !beTd->serializedClass) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, t->declLoc,
+                                "class `" + std::string(t->name) +
+                                "` (`serialized " + std::string(scc.shape) +
+                                "`): back-edge field `" + std::string(fieldName) +
+                                "` has type `" + std::string(beDecl->name) +
+                                "` which has no `serialized tree`/`graph`/`cyclic` "
+                                "clause; the back-edge target must itself be "
+                                "serialization-eligible (§9.8)");
+                            return 2;
+                        }
+                    }
+                    // Valid back-edge under graph/cyclic.
+                    return 1;
+                }
+                if (!isSerializationEligibleType(tr, visited, ctx_)) {
+                    reportIneligible(fieldName,
+                        "has a type that is not serialization-eligible");
+                    return 2;
+                }
+                return 0;
+            };
+
             bool foundBackEdge = false;
             for (const Symbol* m : t->members) {
                 // Fields (FieldDecl).
                 auto* fs = dynamic_cast<const FieldSymbol*>(m);
                 if (fs) {
                     auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-                    if (!fd) continue;
+                    if (!fd) {
+                        // §9.8 / #2325: a primary-constructor-parameter-
+                        // derived FieldSymbol (see the comment above) — only
+                        // a CAPTURED one is a real serialized component.
+                        if (!fs->posParam || !fs->posParamBodyRef) continue;
+                        if (!fs->posParam->type) continue;
+                        const TypeRef* tr = ctx_.resolvedType(*fs->posParam->type);
+                        if (!tr) continue;
+                        bool isOwned = fs->posParam->modifier == "owned";
+                        int r = checkComponentType(fs->name, tr, isOwned);
+                        if (r == 2) { foundBackEdge = true; break; }
+                        continue;
+                    }
                     // Check static: FieldDecl.modifiers contains "static".
                     bool isStat = false;
                     bool isOwned = false;
@@ -5685,70 +5782,8 @@ void Resolver::checkSerializationEligibility() {
                     if (isStat) continue;
                     const TypeRef* tr = ctx_.resolvedType(*fd->type);
                     if (!tr) continue;
-                    // §9.8 tier-boundary: a non-owned class-typed field is a
-                    // back-edge; back-edge serialization is tier 3 (not yet
-                    // implemented — issue #550 tier 3).
-                    bool fieldIsClass = (tr->kind == TypeRef::Kind::Named &&
-                                        tr->declaration &&
-                                        tr->declaration->kind ==
-                                            ast::TypeDeclKind::Class);
-                    // Nullable T?: peel and check inner.
-                    bool fieldIsNullableClass = false;
-                    if (!fieldIsClass && tr->nullable) {
-                        TypeRef inner = *tr; inner.nullable = false;
-                        fieldIsNullableClass =
-                            inner.kind == TypeRef::Kind::Named &&
-                            inner.declaration &&
-                            inner.declaration->kind == ast::TypeDeclKind::Class;
-                    }
-                    if ((fieldIsClass || fieldIsNullableClass) && !isOwned) {
-                        // §9.8 / tier 3: back-edge fields (non-owned class-typed
-                        // fields) are serialization-eligible under `serialized graph`
-                        // and `serialized cyclic` — they are written as tag references
-                        // and resolved from the tag→object table on deserialize.
-                        // Under `serialized tree`, aliasing is forbidden (back-edges
-                        // violate the tree assertion), so they remain an error there.
-                        if (scc.shape == "tree") {
-                            ctx_.diagnostics().report(
-                                Severity::Error, t->declLoc,
-                                "class `" + std::string(t->name) + "` (`serialized "
-                                "tree`): field `" + std::string(fs->name) +
-                                "` is a non-owned (borrowing) class-typed field "
-                                "(a back-edge); `serialized tree` forbids aliasing — "
-                                "mark the field `owned`, declare `serialized skip`, "
-                                "or change the clause to `serialized graph`");
-                            foundBackEdge = true;
-                            break;
-                        }
-                        // Under `serialized graph` / `serialized cyclic`:
-                        // back-edge is eligible (§9.8 tier 3 implemented).
-                        // Verify the target type has a graph-shape clause.
-                        const TypeSymbol* beDecl = tr->declaration;
-                        if (!beDecl && tr->nullable) beDecl = tr->declaration;
-                        if (beDecl) {
-                            auto* beTd = dynamic_cast<const ast::TypeDecl*>(beDecl->decl);
-                            if (!beTd || !beTd->serializedClass) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, t->declLoc,
-                                    "class `" + std::string(t->name) +
-                                    "` (`serialized " + std::string(scc.shape) +
-                                    "`): back-edge field `" + std::string(fs->name) +
-                                    "` has type `" + std::string(beDecl->name) +
-                                    "` which has no `serialized tree`/`graph`/`cyclic` "
-                                    "clause; the back-edge target must itself be "
-                                    "serialization-eligible (§9.8)");
-                                foundBackEdge = true;
-                                break;
-                            }
-                        }
-                        // Valid back-edge under graph/cyclic — continue.
-                        continue;
-                    }
-                    if (!isSerializationEligibleType(tr, visited, ctx_)) {
-                        reportIneligible(fs->name,
-                            "has a type that is not serialization-eligible");
-                        break;
-                    }
+                    int r = checkComponentType(fs->name, tr, isOwned);
+                    if (r == 2) { foundBackEdge = true; break; }
                     continue;
                 }
                 // Auto-properties (PropertySymbol with auto backing).
@@ -5851,7 +5886,16 @@ void Resolver::checkSerializationEligibility() {
                     auto* fs = dynamic_cast<const FieldSymbol*>(m);
                     if (fs) {
                         auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-                        if (!fd) continue;
+                        if (!fd) {
+                            // §9.8 / #2325: a captured primary-ctor-param
+                            // field (see the eligibility-loop comment above)
+                            // is a genuine serialized component too.
+                            if (fs->posParam && fs->posParamBodyRef) {
+                                compNamesLower.insert(toLower(fs->name));
+                                compNamesOrig.push_back(std::string(fs->name));
+                            }
+                            continue;
+                        }
                         bool isStat = false;
                         for (auto mod : fd->modifiers)
                             if (mod == "static") { isStat = true; break; }
@@ -5872,6 +5916,35 @@ void Resolver::checkSerializationEligibility() {
                 // Collect non-static constructors and check which ones match.
                 std::vector<std::string> matchingCtors;  // for error message
                 std::vector<std::string> allCtors;
+
+                // §9.8 / #2325: a class's PRIMARY constructor (§11.1) — its
+                // parameter list is `td->positionalFields` — is itself a
+                // match candidate alongside any explicit `constructor(...)`
+                // declarations. There is no separate ConstructorSymbol for
+                // it (SymbolCollection.cpp creates one only for an explicit
+                // ast::ConstructorDecl), so it is checked here directly from
+                // the AST, using the exact same bijection rule as below.
+                if (td->hasPositionalFields) {
+                    std::string ctorDesc = "constructor(";
+                    for (unsigned pi = 0; pi < td->positionalFields.size(); ++pi) {
+                        if (pi) ctorDesc += ", ";
+                        ctorDesc += std::string(td->positionalFields[pi].name);
+                    }
+                    ctorDesc += ")";
+                    allCtors.push_back(ctorDesc);
+                    if (td->positionalFields.size() == compNamesLower.size()) {
+                        bool allMatch = true;
+                        for (const auto& pf : td->positionalFields) {
+                            if (compNamesLower.find(toLower(pf.name)) ==
+                                    compNamesLower.end()) {
+                                allMatch = false;
+                                break;
+                            }
+                        }
+                        if (allMatch) matchingCtors.push_back(ctorDesc);
+                    }
+                }
+
                 for (const Symbol* m : t->members) {
                     auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
                     if (!cs || cs->isStatic) continue;

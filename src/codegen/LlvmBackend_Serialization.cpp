@@ -147,6 +147,14 @@ static void collectClassComponents(
         comp.declName = std::string(m->name);
         comp.ty       = nullptr;
 
+        // §9.8 / #2325: a primary-constructor-parameter-derived FieldSymbol
+        // (posParam != null) has `decl` set to the owning TypeDecl, not a
+        // FieldDecl/PropertyDecl — see the FieldSymbol comment in Symbol.hpp
+        // and the parallel sema check (TypeResolution_Checks.cpp,
+        // checkSerializationEligibility). Detected up front so the dispatch
+        // below can route it before falling into the "no decl" fallback.
+        const auto* fsPos = dynamic_cast<const FieldSymbol*>(m);
+
         // Determine ty, wireName, skip, optional, isOwned from the symbol's decl.
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl)) {
             // Check if owned modifier is set.
@@ -186,6 +194,47 @@ static void collectClassComponents(
                 comp.wireName = comp.declName;
             }
             if (pd->type) comp.ty = ctx.resolvedType(*pd->type);
+        } else if (fsPos && fsPos->posParam) {
+            // §9.8 / #2325: a primary-constructor-parameter-derived field.
+            // `storage` (collectInstanceStorage) reserves a physical slot for
+            // EVERY primary-ctor parameter unconditionally, whether or not it
+            // is captured — so a parameter referenced only in an initializer
+            // (§11.1: "parameters referenced only in initializers do not
+            // generate backing fields") still reaches this branch with a
+            // valid fieldIndex entry but is not a genuine field of the type.
+            // Only a CAPTURED parameter (posParamBodyRef) is a real serialized
+            // component — matches the parallel sema check exactly, so this
+            // guard and the eligibility check never disagree.
+            if (!fsPos->posParamBodyRef) continue;
+            if (!fsPos->posParam->type) continue;
+            // Primary-ctor params carry no `serialized` clause (the grammar
+            // only allows one on a record's PositionalField / a class body
+            // FieldDecl/PropertyDecl — Parser_Decls.cpp), so the wire name is
+            // always the declared identifier.
+            bool isOwned = fsPos->posParam->modifier == "owned";
+            comp.isOwned  = isOwned;
+            comp.wireName = comp.declName;
+            comp.ty = ctx.resolvedType(*fsPos->posParam->type);
+
+            // §9.8 tier 3: identify back-edges (non-owned class-typed fields),
+            // mirroring the FieldDecl branch above exactly.
+            if (!isOwned && comp.ty) {
+                bool fieldIsClass =
+                    (comp.ty->kind == sema::TypeRef::Kind::Named &&
+                     comp.ty->declaration &&
+                     comp.ty->declaration->kind == ast::TypeDeclKind::Class);
+                bool fieldIsNullableClass = false;
+                if (!fieldIsClass && comp.ty->nullable) {
+                    fieldIsNullableClass =
+                        comp.ty->kind == sema::TypeRef::Kind::Named &&
+                        comp.ty->declaration &&
+                        comp.ty->declaration->kind == ast::TypeDeclKind::Class;
+                }
+                if (fieldIsClass || fieldIsNullableClass) {
+                    if (!includeBackEdges) continue;  // skip for tree mode
+                    comp.isBackEdge = true;
+                }
+            }
         } else {
             // Fallback (no decl — e.g. imported field).
             comp.wireName = comp.declName;
@@ -3180,14 +3229,6 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         i64());
     llvm::Value* obj = builder_.CreateCall(callocFn(), {builder_.getInt64(1), sizeofSt});
 
-    // Run field initializers (emitInstanceInit).
-    {
-        llvm::Value* savedThis = currentThis_;
-        currentThis_ = obj;
-        emitInstanceInit(ts, obj, st);
-        currentThis_ = savedThis;
-    }
-
     // §9.8 v0.136: find the unique constructor whose parameter names match
     // exactly the set of serialized component declared identifiers
     // (bijection, order-insensitive).  `serialized "<name>"` renames do not
@@ -3206,26 +3247,103 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     for (std::size_t ci = 0; ci < comps.size(); ++ci)
         compByNameLower[toLowerAscii(comps[ci].declName)] = ci;
 
-    sema::ConstructorSymbol* matchedCtor = nullptr;
-    for (Symbol* m : ts->members) {
-        auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
-        if (!cs || cs->isStatic) continue;
-        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-        if (!cd) continue;
-        // Match: param count == component count AND every param name (lowered)
-        // maps to a distinct component (bijection).
-        if (cd->params.size() != comps.size()) continue;
+    // §9.8 / #2325: the class's PRIMARY constructor (§11.1) is itself a
+    // match candidate — see the parallel sema check
+    // (TypeResolution_Checks.cpp checkSerializationEligibility), which
+    // already validated that exactly one candidate (primary or explicit)
+    // matches whenever this codegen runs. There is no ConstructorSymbol / no
+    // ctorFns_ entry for the primary constructor (SymbolCollection.cpp
+    // creates a ConstructorSymbol only for an explicit ast::ConstructorDecl,
+    // and the primary constructor of a no-explicit-ctor class is not lowered
+    // as a separate callable function at all — see lowerNew's no-explicit-
+    // ctor path, LlvmBackend_Exprs2.cpp), so it cannot be "called" — instead,
+    // mirror lowerNew's own construction order for that case: store each
+    // deserialized component value directly into its primary-ctor-parameter
+    // field slot (transfer, no retain — the deserialized value is a fresh +1
+    // exactly like a literal argument to `new`, LlvmBackend_Exprs2.cpp's
+    // #1605 comment), THEN run field initializers (emitInstanceInit) so that
+    // any explicit field whose initializer reads a primary-ctor parameter
+    // (`Id: int := id;`) — as well as a parameter captured ONLY by a
+    // computed property (`property Id: int => id;`) — observes the correct
+    // value, exactly as ordinary `new ClassName(...)` construction does.
+    bool primaryCtorUsed = false;
+    if (td0g->hasPositionalFields &&
+        td0g->positionalFields.size() == comps.size()) {
         bool allMatch = true;
-        for (const auto& p : cd->params) {
-            if (compByNameLower.find(toLowerAscii(p.name)) ==
+        for (const auto& pf : td0g->positionalFields) {
+            if (compByNameLower.find(toLowerAscii(pf.name)) ==
                     compByNameLower.end()) {
                 allMatch = false;
                 break;
             }
         }
         if (allMatch) {
-            matchedCtor = cs;
-            break;
+            for (const auto& pf : td0g->positionalFields) {
+                // Find pf's own FieldSymbol (posParam == &pf) for its
+                // struct field index — the primary-ctor param's OWN slot,
+                // which may be a different symbol than the component that
+                // supplies its value (e.g. `Id: int := id;`: component
+                // "Id" supplies the value stored into param `id`'s slot).
+                const Symbol* pfs = nullptr;
+                for (const Symbol* mm : ts->members) {
+                    auto* cfs = dynamic_cast<const sema::FieldSymbol*>(mm);
+                    if (cfs && cfs->posParam == &pf) { pfs = cfs; break; }
+                }
+                if (!pfs) continue;
+                auto fit = fieldIndex_.find(pfs);
+                if (fit == fieldIndex_.end()) continue;
+                auto cit = compByNameLower.find(toLowerAscii(pf.name));
+                if (cit == compByNameLower.end()) continue;
+                std::size_t ci = cit->second;
+                if (!comps[ci].ty) continue;
+                llvm::Type* lt = lowerTypeRef(comps[ci].ty);
+                if (!lt) continue;
+                llvm::Value* fv;
+                if (comps[ci].isSkip || !slots[ci])
+                    fv = llvm::Constant::getNullValue(lt);
+                else
+                    fv = builder_.CreateLoad(lt, slots[ci], "cdeser.pcarg");
+                builder_.CreateStore(
+                    fv, builder_.CreateStructGEP(st, obj, fit->second));
+            }
+            primaryCtorUsed = true;
+        }
+    }
+
+    // Run field initializers (emitInstanceInit) — for the primary-ctor path
+    // above this reads the just-stored parameter values (mirrors lowerNew's
+    // ordering exactly); for the explicit-ctor path below this runs BEFORE
+    // the ctor call, matching ordinary construction order (field
+    // initializers execute before the constructor body).
+    {
+        llvm::Value* savedThis = currentThis_;
+        currentThis_ = obj;
+        emitInstanceInit(ts, obj, st);
+        currentThis_ = savedThis;
+    }
+
+    sema::ConstructorSymbol* matchedCtor = nullptr;
+    if (!primaryCtorUsed) {
+        for (Symbol* m : ts->members) {
+            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+            if (!cs || cs->isStatic) continue;
+            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+            if (!cd) continue;
+            // Match: param count == component count AND every param name
+            // (lowered) maps to a distinct component (bijection).
+            if (cd->params.size() != comps.size()) continue;
+            bool allMatch = true;
+            for (const auto& p : cd->params) {
+                if (compByNameLower.find(toLowerAscii(p.name)) ==
+                        compByNameLower.end()) {
+                    allMatch = false;
+                    break;
+                }
+            }
+            if (allMatch) {
+                matchedCtor = cs;
+                break;
+            }
         }
     }
 
