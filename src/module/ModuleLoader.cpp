@@ -486,7 +486,40 @@ struct Loader {
                 applyBehavior(nts);
                 return nts;
             }
-            // Indexer / Event are part of the schema but deferred.
+            case MetaMemberKind::Indexer: {
+                // §22.10 / §23.4 (issue #2414): reconstruct an indexer
+                // PropertySymbol so that cross-module `obj[i]` resolves to a
+                // real symbol instead of falling through member/type
+                // resolution and reading garbage (confirmed: 252 instead of
+                // 3). Mirrors the Property case above but additionally
+                // reconstructs `indexerParams` from `mm.params` (the
+                // exporter's `convertParams(prop->indexerParams, ctx)`
+                // counterpart, ModuleMetadataBuilder.cpp) and sets
+                // `isIndexer = true` so `PropertySymbol::isIndexer`-gated
+                // logic (sema's overload selection, codegen's
+                // findIndexer/selectIndexer/lowerIndexerGet/-Set) recognizes
+                // it as an indexer rather than a named property. As with
+                // Property, there is no ast::PropertyDecl to reconstruct — a
+                // decl-null fallback is added at each consuming site (sema
+                // candidate matching/typing; codegen non-virtual class-direct
+                // dispatch) rather than inventing a synthetic AST node.
+                auto* p = ctx.makeImportedSymbol<sema::PropertySymbol>();
+                p->name = ctx.internString(mm.name);
+                p->visibility = fromMetaVisibility(mm.visibility);
+                p->modifiers = intern(mm.modifiers);
+                p->parent = &parent;
+                p->scope = parent.memberScope;
+                p->isIndexer = true;
+                p->indexerParams = convertParams(mm.params, scope);
+                fieldTypes_[p] = convert(mm.type);
+                // fix #2400's bit, reused for indexers per its own field
+                // comment in ModuleMetadata.hpp ("Ignored for every kind but
+                // Property/Indexer").
+                propHasSetter_[p] = mm.hasSetter;
+                applyBehavior(p);
+                return p;
+            }
+            // Event: see #2407 (a separate fix/commit from this one).
             default:
                 return nullptr;
         }
@@ -727,9 +760,18 @@ static bool metaMemberProducesSymbol(const MetaMember& mm) {
         case MetaMemberKind::EnumConstant:
         case MetaMemberKind::Constructor:
         case MetaMemberKind::Property:
+        // fix #2414: convertMember now reconstructs a symbol for Indexer too
+        // (see its Indexer case) — this predicate MUST track convertMember's
+        // real return-null/non-null behavior exactly, since every call site
+        // here sync-walks td.members against importedType.members
+        // position-by-position (see the sites' own comments) and a stale
+        // `false` here would desync that walk by one for any type with a
+        // reconstructed indexer. (Event has the identical gap — see #2407,
+        // a separate fix/commit.)
+        case MetaMemberKind::Indexer:
             return true;
         default:
-            return false;  // Indexer (3), Event (5), and any future default
+            return false;  // Event (until #2407) and any future kind defer
     }
 }
 

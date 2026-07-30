@@ -2134,6 +2134,133 @@ void Emitter::emitExportedPropertySetters() {
 }
 
 
+// fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): the INDEXER
+// analog of emitExportedPropertyGetters — emit a named, ExternalLinkage getter
+// wrapper `bz$<Class>$idxget$<arity>(ptr %this, idx...) -> T` for every public
+// non-virtual, non-interface indexer on every public non-generic local class.
+// Reuses the existing ensureIndexerGetterFn (built for the itable-fill path,
+// #730) for the actual body — this just wraps it with ExternalLinkage, exactly
+// as emitExportedPropertyGetters wraps ensurePropertyAccessorFn. Keyed by
+// CLASS + ARITY (not the full index-parameter type signature): see the
+// function declaration's comment (LlvmBackend_impl.hpp) for why this is a
+// documented, deliberate simplification rather than an oversight.
+void Emitter::emitExportedIndexerGetters() {
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        if (ts->visibility != ast::Visibility::Public) continue;
+        if (!ts->genericParams.empty()) continue;
+        for (sema::Symbol* m : ts->members) {
+            auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+            if (!ps || !ps->isIndexer) continue;
+            // Skip virtual/override/abstract/interface — other dispatch paths.
+            if (isVirtualIndexer(ps)) continue;
+            bool isStatic = false;
+            for (auto mod : ps->modifiers) if (mod == "static") isStatic = true;
+            if (isStatic) continue;
+            if (ps->visibility != ast::Visibility::Public) continue;
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd) continue;
+            llvm::Type* retTy = lowerType(pd->type.get());
+            if (!retTy) retTy = i32();
+            std::vector<llvm::Type*> paramTys;
+            paramTys.push_back(ptrTy());  // `this`
+            for (const auto& p : pd->indexerParams) {
+                llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+                paramTys.push_back(pt ? pt : i32());
+            }
+            std::string clsName = mangledTypeName(ts);
+            std::string mangled = "bz$" + clsName + "$idxget$" +
+                                  std::to_string(pd->indexerParams.size());
+            if (module_->getNamedValue(mangled)) continue;
+            auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::GlobalValue::ExternalLinkage, mangled, *module_);
+            llvm::Function* innerFn = ensureIndexerGetterFn(ts, ps);
+            if (!innerFn) {
+                // No concrete getter body reachable (shouldn't normally
+                // happen for a non-abstract indexer, but guard for safety —
+                // mirrors emitExportedPropertyGetters).
+                fn->eraseFromParent();
+                continue;
+            }
+            auto* savedFn = currentFn_;
+            auto* savedInsert = builder_.GetInsertBlock();
+            currentFn_ = fn;
+            auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+            builder_.SetInsertPoint(entry);
+            std::vector<llvm::Value*> callArgs;
+            for (auto& a : fn->args()) callArgs.push_back(&a);
+            llvm::Value* result = builder_.CreateCall(
+                innerFn->getFunctionType(), innerFn, callArgs);
+            builder_.CreateRet(result);
+            currentFn_ = savedFn;
+            if (savedInsert) builder_.SetInsertPoint(savedInsert);
+        }
+    }
+}
+
+
+// fix #2414: the SETTER twin of emitExportedIndexerGetters immediately above —
+// `bz$<Class>$idxset$<arity>(ptr %this, idx..., T value) -> void`, wrapping
+// ensureIndexerSetterFn. Mirrors emitExportedPropertySetters: when the inner
+// builder finds no setter accessor (getter-only indexer), it returns nullptr
+// and the incomplete declaration is erased — this indexer is correctly
+// excluded from the cross-module setter surface.
+void Emitter::emitExportedIndexerSetters() {
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        if (ts->visibility != ast::Visibility::Public) continue;
+        if (!ts->genericParams.empty()) continue;
+        for (sema::Symbol* m : ts->members) {
+            auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+            if (!ps || !ps->isIndexer) continue;
+            if (isVirtualIndexer(ps)) continue;
+            bool isStatic = false;
+            for (auto mod : ps->modifiers) if (mod == "static") isStatic = true;
+            if (isStatic) continue;
+            if (ps->visibility != ast::Visibility::Public) continue;
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd) continue;
+            llvm::Type* valTy = lowerType(pd->type.get());
+            if (!valTy) valTy = i32();
+            std::vector<llvm::Type*> paramTys;
+            paramTys.push_back(ptrTy());  // `this`
+            for (const auto& p : pd->indexerParams) {
+                llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+                paramTys.push_back(pt ? pt : i32());
+            }
+            paramTys.push_back(valTy);  // implicit `value`
+            std::string clsName = mangledTypeName(ts);
+            std::string mangled = "bz$" + clsName + "$idxset$" +
+                                  std::to_string(pd->indexerParams.size());
+            if (module_->getNamedValue(mangled)) continue;
+            auto* fnTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), paramTys, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::GlobalValue::ExternalLinkage, mangled, *module_);
+            llvm::Function* innerFn = ensureIndexerSetterFn(ts, ps);
+            if (!innerFn) {
+                fn->eraseFromParent();
+                continue;
+            }
+            auto* savedFn = currentFn_;
+            auto* savedInsert = builder_.GetInsertBlock();
+            currentFn_ = fn;
+            auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+            builder_.SetInsertPoint(entry);
+            std::vector<llvm::Value*> callArgs;
+            for (auto& a : fn->args()) callArgs.push_back(&a);
+            builder_.CreateCall(innerFn->getFunctionType(), innerFn, callArgs);
+            builder_.CreateRetVoid();
+            currentFn_ = savedFn;
+            if (savedInsert) builder_.SetInsertPoint(savedInsert);
+        }
+    }
+}
+
+
 // §2.5 / §22.9 (issue #503): declare an external getter function for every
 // imported non-virtual PropertySymbol, so the property-access lowering can call
 // it cross-module. The signature matches what the exporter emits in
@@ -2249,6 +2376,93 @@ void Emitter::declareImportedPropertySetters() {
         auto* fn = llvm::Function::Create(
             fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
         importedPropSetterFns_[ps] = fn;
+    }
+}
+
+
+// fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): the INDEXER
+// analog of declareImportedPropertyGetters — declare an EXTERNAL
+// `bz$<Class>$idxget$<arity>` stub for every imported PropertySymbol with
+// isIndexer=true that is not virtual (not in propGetSlot_) and not an
+// interface member (those dispatch through the itable — out of scope for
+// this fix, see xmod_indexer_import_2414_test.cpp's file header "SCOPE"
+// note). The parameter/return types come from the reconstructed side tables
+// (ctx_.importedMemberType for the element type, each ParameterSymbol's
+// resolvedDeclType for an index parameter) — an imported indexer has no
+// ast::PropertyDecl to read them from (ModuleLoader.cpp's Indexer case).
+void Emitter::declareImportedIndexerGetters() {
+    for (sema::Symbol* sym : ctx_.importedSymbols()) {
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
+        if (!ps || !ps->isIndexer) continue;
+        // Skip virtual: dispatches through the vtable slot.
+        if (propGetSlot_.count(ps)) continue;
+        // Also skip interface indexers: those dispatch through the itable.
+        if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface)
+            continue;
+        if (importedIndexerGetterFns_.count(ps)) continue;
+        sema::TypeRef* retRef = ctx_.importedMemberType(ps);
+        llvm::Type* retTy = retRef ? lowerTypeRef(retRef) : i32();
+        std::vector<llvm::Type*> paramTys;
+        paramTys.push_back(ptrTy());  // `this`
+        for (sema::Symbol* p : ps->indexerParams) {
+            auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
+            sema::TypeRef* pt = pps ? pps->resolvedDeclType : nullptr;
+            paramTys.push_back(pt ? lowerTypeRef(pt) : i32());
+        }
+        std::string clsName = ps->parent ? mangledTypeName(ps->parent) : "";
+        std::string mangled = "bz$" + clsName + "$idxget$" +
+                              std::to_string(ps->indexerParams.size());
+        // Re-use an existing module declaration if present (e.g. a double-
+        // import from two transitive dependencies with the same symbol).
+        if (auto* existing = module_->getFunction(mangled)) {
+            importedIndexerGetterFns_[ps] = existing;
+            continue;
+        }
+        auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        importedIndexerGetterFns_[ps] = fn;
+    }
+}
+
+
+// fix #2414: the SETTER twin of declareImportedIndexerGetters immediately
+// above. Gates on ctx_.importedPropertyHasSetter(ps) (the reconstructed
+// MetaMember::hasSetter bit — #2400's fix, reused for indexers per its own
+// field comment in ModuleMetadata.hpp), mirroring declareImportedProperty
+// Setters's exact reasoning for why an unconditional declare would be wrong
+// (a getter-only indexer's setter symbol was never exported).
+void Emitter::declareImportedIndexerSetters() {
+    for (sema::Symbol* sym : ctx_.importedSymbols()) {
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
+        if (!ps || !ps->isIndexer) continue;
+        if (propSetSlot_.count(ps)) continue;
+        if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface)
+            continue;
+        if (!ctx_.importedPropertyHasSetter(ps)) continue;
+        if (importedIndexerSetterFns_.count(ps)) continue;
+        sema::TypeRef* retRef = ctx_.importedMemberType(ps);
+        llvm::Type* valTy = retRef ? lowerTypeRef(retRef) : i32();
+        std::vector<llvm::Type*> paramTys;
+        paramTys.push_back(ptrTy());  // `this`
+        for (sema::Symbol* p : ps->indexerParams) {
+            auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
+            sema::TypeRef* pt = pps ? pps->resolvedDeclType : nullptr;
+            paramTys.push_back(pt ? lowerTypeRef(pt) : i32());
+        }
+        paramTys.push_back(valTy);  // implicit `value`
+        std::string clsName = ps->parent ? mangledTypeName(ps->parent) : "";
+        std::string mangled = "bz$" + clsName + "$idxset$" +
+                              std::to_string(ps->indexerParams.size());
+        if (auto* existing = module_->getFunction(mangled)) {
+            importedIndexerSetterFns_[ps] = existing;
+            continue;
+        }
+        auto* fnTy = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(llvm_), paramTys, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        importedIndexerSetterFns_[ps] = fn;
     }
 }
 
@@ -2921,6 +3135,12 @@ void Emitter::declareVtables() {
     // check inside declareImportedPropertySetters is accurate. MUST run before
     // Pass D below, its first consumer.
     if (ctx_.hasImports()) declareImportedPropertySetters();
+    // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): the
+    // INDEXER analogs of the two calls immediately above — same ordering
+    // requirement (propGetSlot_/propSetSlot_ from the buildVtable loops just
+    // above must be populated first so the "skip virtual" gate is accurate).
+    if (ctx_.hasImports()) declareImportedIndexerGetters();
+    if (ctx_.hasImports()) declareImportedIndexerSetters();
     // Pass B: declare a descriptor-array global (correctly sized, no
     // initializer yet) for every class/interface, so descriptors can
     // cross-reference each other in pass C.

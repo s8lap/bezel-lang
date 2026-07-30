@@ -1712,15 +1712,52 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         argTys.push_back(idxArg.value
                                              ? ctx_.exprType(*idxArg.value)
                                              : nullptr);
+                    // fix #2414 (§23.4 / §2.8.2 clause 1, v0.235): an IMPORTED
+                    // indexer's candidate has no ast::PropertyDecl (mirrors
+                    // Property's own #503 limitation — ModuleLoader.cpp's
+                    // Indexer case reconstructs `indexerParams` as
+                    // ParameterSymbols carrying `resolvedDeclType` instead of
+                    // an AST node). Read a candidate's k-th index-parameter
+                    // type and its arity through either source uniformly, so
+                    // the overload-matching logic below works unchanged for a
+                    // local OR an imported candidate — without this, every
+                    // imported indexer candidate had `cpd == nullptr` and was
+                    // skipped outright, `anyIndexer` still true (set before
+                    // the decl check) but neither `ps` nor `arityOnly` ever
+                    // assigned, falling into the "no overload matches"
+                    // rejection below for a perfectly well-typed access
+                    // (confirmed: `no indexer overload matches the 1
+                    // argument (§23.4)` for the issue's own 1-arg repro).
+                    auto candParamCount =
+                        [](const PropertySymbol* cand) -> std::size_t {
+                        if (auto* cpd = dynamic_cast<const ast::PropertyDecl*>(
+                                cand->decl))
+                            return cpd->indexerParams.size();
+                        return cand->indexerParams.size();
+                    };
+                    auto candParamResolvedType =
+                        [this](const PropertySymbol* cand,
+                              std::size_t k) -> const TypeRef* {
+                        if (auto* cpd = dynamic_cast<const ast::PropertyDecl*>(
+                                cand->decl)) {
+                            return (k < cpd->indexerParams.size() &&
+                                    cpd->indexerParams[k].type)
+                                       ? ctx_.resolvedType(
+                                             *cpd->indexerParams[k].type)
+                                       : nullptr;
+                        }
+                        if (k < cand->indexerParams.size()) {
+                            if (auto* p = dynamic_cast<ParameterSymbol*>(
+                                    cand->indexerParams[k]))
+                                return p->resolvedDeclType;
+                        }
+                        return nullptr;
+                    };
                     auto allParamsMatch =
-                        [&](const ast::PropertyDecl* cpd) -> bool {
+                        [&](const PropertySymbol* cand) -> bool {
                         for (std::size_t k = 0; k < nargs; ++k) {
                             const TypeRef* a = argTys[k];
-                            const TypeRef* p =
-                                cpd->indexerParams[k].type
-                                    ? ctx_.resolvedType(
-                                          *cpd->indexerParams[k].type)
-                                    : nullptr;
+                            const TypeRef* p = candParamResolvedType(cand, k);
                             if (!p || !a || p->kind != a->kind) return false;
                             if (p->kind == TypeRef::Kind::Primitive) {
                                 if (p->primitive != a->primitive) return false;
@@ -1743,12 +1780,9 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             auto* cand = dynamic_cast<PropertySymbol*>(m);
                             if (!cand || !cand->isIndexer) continue;
                             anyIndexer = true;
-                            auto* cpd = dynamic_cast<const ast::PropertyDecl*>(
-                                cand->decl);
-                            if (!cpd || cpd->indexerParams.size() != nargs)
-                                continue;
+                            if (candParamCount(cand) != nargs) continue;
                             if (!arityOnly) arityOnly = cand;
-                            if (allParamsMatch(cpd)) { ps = cand; break; }
+                            if (allParamsMatch(cand)) { ps = cand; break; }
                         }
                         for (TypeSymbol* b : t->baseTypes)
                             if (b) frontier.push_back(b);
@@ -1758,24 +1792,36 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // exactly as the single-indexer path always did).
                     if (!ps) ps = arityOnly;
                     if (ps && ps->isIndexer) {
-                        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(
-                                ps->decl)) {
-                            if (pd->type) {
-                                if (auto* rt = ctx_.resolvedType(*pd->type))
-                                    ctx_.setExprType(
-                                        &e, substituteMemberType(
-                                                rt, ix->target.get(),
-                                                ps->parent));
-                            }
-                            // per §7.4 (v0.182, #1593): a user-defined indexer
-                            // access `obj[i]` invokes an "accessor" (get/set)
-                            // that can run user code — invalidate a mutably-
-                            // captured local's narrowing exactly as a named-
-                            // property access or a call does (#1566). Indexers
-                            // are never auto, so any user indexer qualifies.
-                            if (propertyAccessRunsUserCode(pd))
-                                invalidateCapturedNarrowings();
+                        auto* pd = dynamic_cast<const ast::PropertyDecl*>(
+                            ps->decl);
+                        TypeRef* rt = nullptr;
+                        // fix #2414: an imported indexer's declared element
+                        // type rides `ctx_.importedMemberType` (the same
+                        // side table Property reads, ModuleLoader.cpp
+                        // `fieldTypes_`), mirroring the param-type fallback
+                        // above — there is no `pd->type` to resolve.
+                        if (pd) {
+                            if (pd->type) rt = ctx_.resolvedType(*pd->type);
+                        } else {
+                            rt = ctx_.importedMemberType(ps);
                         }
+                        if (rt)
+                            ctx_.setExprType(
+                                &e, substituteMemberType(
+                                        rt, ix->target.get(), ps->parent));
+                        // per §7.4 (v0.182, #1593): a user-defined indexer
+                        // access `obj[i]` invokes an "accessor" (get/set)
+                        // that can run user code — invalidate a mutably-
+                        // captured local's narrowing exactly as a named-
+                        // property access or a call does (#1566). Indexers
+                        // are never auto, so any user indexer qualifies. An
+                        // imported indexer (no `pd` to ask
+                        // propertyAccessRunsUserCode about) is conservatively
+                        // treated as running user code too — the safe
+                        // default (it forgoes a narrowing optimization it
+                        // might have kept, never keeps one it shouldn't).
+                        if (pd ? propertyAccessRunsUserCode(pd) : true)
+                            invalidateCapturedNarrowings();
                     } else if (anyIndexer && nargs > 0) {
                         // §23.4: the receiver declares indexer(s) but none has
                         // the argument count — e.g. `g[i, j]` against a

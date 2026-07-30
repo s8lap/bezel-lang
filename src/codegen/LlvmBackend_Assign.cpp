@@ -16,6 +16,43 @@ bool indexerArgMatches(const sema::TypeRef* p, const sema::TypeRef* a) {
         return p->declaration == a->declaration;
     return false;
 }
+
+// fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): an
+// indexer's k-th index-parameter TYPE / total ARITY, resolved from either
+// its LOCAL ast::PropertyDecl (`ps->decl`) or, for an IMPORTED indexer (no
+// ast::PropertyDecl to read — ModuleLoader.cpp's Indexer case reconstructs
+// `indexerParams` as ParameterSymbols carrying `resolvedDeclType` instead),
+// the reconstructed ParameterSymbol directly. Every consumer below
+// (findIndexer, selectIndexer, and lowerIndexerGet/-Set's signature-building)
+// goes through these two functions instead of reading `pd` directly, so a
+// LOCAL and an IMPORTED indexer are selected/typed identically — before this
+// fix, every one of these sites unconditionally required `pd`, silently
+// excluding every imported indexer candidate from overload resolution
+// (confirmed: `selectIndexer` returned null for any imported class's
+// indexer, well before codegen even reached the getter/setter dispatch).
+// Mirrors the identically-shaped fallback added to
+// ExprTypecheck_Exprs.cpp's sema-side overload matcher.
+const sema::TypeRef* indexerParamType(sema::SemaContext& ctx,
+                                      const sema::PropertySymbol* ps,
+                                      std::size_t k) {
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+        return (k < pd->indexerParams.size() && pd->indexerParams[k].type)
+                   ? ctx.resolvedType(*pd->indexerParams[k].type)
+                   : nullptr;
+    }
+    if (k < ps->indexerParams.size()) {
+        if (auto* p =
+                dynamic_cast<sema::ParameterSymbol*>(ps->indexerParams[k]))
+            return p->resolvedDeclType;
+    }
+    return nullptr;
+}
+
+std::size_t indexerParamCount(const sema::PropertySymbol* ps) {
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+        return pd->indexerParams.size();
+    return ps->indexerParams.size();
+}
 }  // namespace
 
 const sema::PropertySymbol* Emitter::findIndexer(
@@ -26,11 +63,8 @@ const sema::PropertySymbol* Emitter::findIndexer(
         if (!ps || !ps->isIndexer) continue;
         if (!first) first = ps;
         if (!argTy) continue;  // no argument type → first indexer (legacy)
-        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-        if (!pd || pd->indexerParams.empty() || !pd->indexerParams[0].type)
-            continue;
-        if (indexerArgMatches(ctx_.resolvedType(*pd->indexerParams[0].type),
-                              argTy))
+        if (indexerParamCount(ps) == 0) continue;
+        if (indexerArgMatches(indexerParamType(ctx_, ps, 0), argTy))
             return ps;  // §23.4: the overload whose param type matches the arg
     }
     return first;  // single indexer, or an argument matching no overload
@@ -64,15 +98,11 @@ const sema::PropertySymbol* Emitter::selectIndexer(
         for (const sema::Symbol* m : t->members) {
             auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
             if (!ps || !ps->isIndexer) continue;
-            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-            if (!pd || pd->indexerParams.size() != nargs) continue;
+            if (indexerParamCount(ps) != nargs) continue;
             if (!arityOnly) arityOnly = ps;
             bool all = true;
             for (std::size_t k = 0; k < nargs; ++k) {
-                const sema::TypeRef* pty =
-                    pd->indexerParams[k].type
-                        ? ctx_.resolvedType(*pd->indexerParams[k].type)
-                        : nullptr;
+                const sema::TypeRef* pty = indexerParamType(ctx_, ps, k);
                 if (!indexerArgMatches(pty, argTys[k])) { all = false; break; }
             }
             if (all) return ps;  // exact full-parameter-list match
@@ -1229,7 +1259,45 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     auto* ps = selectIndexer(recvDecl, ix);  // per §23.4 (#1172)
     if (!ps) return nullptr;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-    if (!pd) return nullptr;
+    // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): an
+    // IMPORTED indexer has no ast::PropertyDecl (mirrors Property's own
+    // #503 limitation — ModuleLoader.cpp's Indexer case reconstructs
+    // `indexerParams` from the side tables, not an AST node). The
+    // itable/interface and vtable/virtual dispatch paths below both still
+    // read `pd->type`/`pd->indexerParams` for signature info, and the
+    // final inline-body path genuinely needs the body AST — none of those
+    // exist for an imported symbol, so they are left requiring `pd` (the
+    // itable/vtable-dispatched imported-indexer shape is explicitly out of
+    // scope for this fix; see xmod_indexer_import_2414_test.cpp's T4
+    // accept-control test and file-header "SCOPE" note). The remaining,
+    // and most common, case — a NON-VIRTUAL indexer on a CLASS-typed
+    // receiver (the issue's own confirmed repro) — dispatches through the
+    // externally-declared `bz$<Class>$idxget$<arity>` function
+    // declareImportedIndexerGetters installs, using the reconstructed
+    // side-table types (the callee's own LLVM signature) instead of `pd`.
+    if (!pd) {
+        if (recvDecl->kind != ast::TypeDeclKind::Class) return nullptr;
+        auto git = importedIndexerGetterFns_.find(ps);
+        if (git == importedIndexerGetterFns_.end()) return nullptr;
+        llvm::Function* fn = git->second;
+        llvm::Value* obj = lowerExpr(*ix.target);
+        if (!obj || !obj->getType()->isPointerTy()) return nullptr;
+        auto* fnTy = fn->getFunctionType();
+        std::vector<llvm::Value*> callArgs;
+        callArgs.push_back(obj);
+        for (std::size_t k = 0; k < ps->indexerParams.size() &&
+             k < ix.indices.size() &&
+             k + 1 < fnTy->getNumParams(); ++k) {
+            if (!ix.indices[k].value) return nullptr;
+            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            if (!argVal) return nullptr;
+            callArgs.push_back(
+                coerceNumericToType(argVal, fnTy->getParamType(k + 1), false));
+        }
+        llvm::Value* r = builder_.CreateCall(fnTy, fn, callArgs);
+        emitPendingCheck();
+        return r;
+    }
     // #730 / §13 / §23.4: an indexer accessed through an INTERFACE-typed receiver
     // (`(arr: IFoo)[i]`) dispatches dynamically through the itable — the static
     // body resolution below would find the (bodiless) interface indexer and bail
@@ -1454,7 +1522,40 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
     auto* ps = selectIndexer(recvDecl, ix);  // per §23.4 (#1172)
     if (!ps) return false;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-    if (!pd) return false;
+    // fix #2414: the SETTER twin of lowerIndexerGet's decl-null fallback
+    // immediately above — see its comment for the full rationale. Dispatches
+    // through the externally-declared `bz$<Class>$idxset$<arity>` function
+    // declareImportedIndexerSetters installs (absent for a getter-only
+    // imported indexer, in which case this correctly falls through and
+    // returns false — the same "no setter to lower" outcome a local
+    // getter-only indexer's `!setterExpr && !setterStmts` check produces
+    // further down).
+    if (!pd) {
+        if (recvDecl->kind != ast::TypeDeclKind::Class) return false;
+        auto sit = importedIndexerSetterFns_.find(ps);
+        if (sit == importedIndexerSetterFns_.end()) return false;
+        llvm::Function* fn = sit->second;
+        llvm::Value* obj = lowerExpr(*ix.target);
+        if (!obj || !obj->getType()->isPointerTy()) return false;
+        auto* fnTy = fn->getFunctionType();
+        std::vector<llvm::Value*> callArgs;
+        callArgs.push_back(obj);
+        for (std::size_t k = 0; k < ps->indexerParams.size() &&
+             k < ix.indices.size() &&
+             k + 1 < fnTy->getNumParams(); ++k) {
+            if (!ix.indices[k].value) return false;
+            llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
+            if (!argVal) return false;
+            callArgs.push_back(
+                coerceNumericToType(argVal, fnTy->getParamType(k + 1), false));
+        }
+        if (fnTy->getNumParams() == 0) return false;
+        llvm::Type* valTy = fnTy->getParamType(fnTy->getNumParams() - 1);
+        callArgs.push_back(coerceNumericToType(val, valTy, false));
+        builder_.CreateCall(fnTy, fn, callArgs);
+        emitPendingCheck();
+        return true;
+    }
     // #730 / §13 / §23.4: `(arr: IFoo)[i] := v` through an INTERFACE-typed
     // receiver dispatches the setter dynamically through the itable — load the
     // implementing class's setter from itab[set-index] and call it as
