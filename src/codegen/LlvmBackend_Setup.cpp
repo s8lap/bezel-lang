@@ -2752,11 +2752,31 @@ void Emitter::declareVtables() {
         // vtable (`vt$<Type>`) uses, letting the importer link against this exact
         // descriptor instead of fabricating its own (which would break `is`/`as`
         // identity and, for a missing imported-base entry, crash global emission).
-        // A non-public type or a generic template (per-instantiation descriptor)
-        // keeps INTERNAL linkage, so single-module codegen and private types are
+        // A non-public type or a generic CLASS template (per-instantiation
+        // descriptor, minted importer-side by instanceDescriptorFor) keeps
+        // INTERNAL linkage, so single-module codegen and private types are
         // unchanged.
+        //
+        // #2379 (§11.2/§13/§2.8.2, v0.234): a public GENERIC INTERFACE is the one
+        // generic-template exception — export its shared, type-ERASED descriptor
+        // too. Interface dispatch (CG35-itable) keys the object's itmap by the
+        // INTERFACE DECLARATION's identity, never by the type argument (the
+        // itable holds the IMPLEMENTING class's already-concrete method, so T's
+        // representation never reaches this key — unlike a generic CLASS's own
+        // placeholder-compiled body, #783/#1943, which is why that case stays
+        // excluded). Before this fix an imported generic interface's `td$<I>`
+        // never got an entry here (`!genericParams.empty()` excluded it) NOR a
+        // matching external declaration in the importer loop below, so BOTH
+        // `bz_itable_lookup`'s call-site key (LlvmBackend_Calls2.cpp) AND the
+        // [td$I, itab$C$I] pair pushed into an implementing class's own itmap
+        // (declareVtables Pass D) silently found `descArray_.find(iface) ==
+        // end()` and skipped emitting the dispatch entirely — the callee was
+        // never invoked and the call's destination local was left reading
+        // uninitialized stack memory (issue #2379's "v=-943274556" garbage,
+        // not a crash, not a wrong-callee call: NO callee was called at all).
         bool exportedDesc = ts->visibility == ast::Visibility::Public &&
-                            ts->genericParams.empty();
+                            (ts->genericParams.empty() ||
+                             ts->kind == ast::TypeDeclKind::Interface);
         descArray_[ts] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
             exportedDesc ? llvm::GlobalValue::ExternalLinkage
@@ -2774,6 +2794,12 @@ void Emitter::declareVtables() {
     // bases, null], computed from the loader-reconstructed base chain so the
     // declared type exactly matches the exporter's definition. The body lives in
     // the dependency object (exported above); here we only declare it.
+    //
+    // #2379: mirror the exporter loop's carve-out — a public IMPORTED generic
+    // INTERFACE also gets an external declaration (its type-erased identity is
+    // what CG35-itable dispatch keys on, §11.2/§13; see the exporter-side
+    // comment above). A generic CLASS stays excluded (its own placeholder-ABI
+    // body is the #783 concern, unrelated to this descriptor).
     if (ctx_.hasImports()) {
         for (sema::Symbol* sym : ctx_.importedSymbols()) {
             auto* ts = dynamic_cast<sema::TypeSymbol*>(sym);
@@ -2783,7 +2809,8 @@ void Emitter::declareVtables() {
                 continue;
             if (descArray_.count(ts)) continue;
             if (ts->visibility != ast::Visibility::Public ||
-                !ts->genericParams.empty())
+                (!ts->genericParams.empty() &&
+                 ts->kind != ast::TypeDeclKind::Interface))
                 continue;
             std::vector<const sema::TypeSymbol*> supers;
             collectTypeAndBases(ts, supers);

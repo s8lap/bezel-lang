@@ -2514,7 +2514,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
             // correctly against the imported signature.
             if (TypeRef* rt = ctx_.importedReturnType(ms)) {
                 ctx_.setExprType(&ce, rt);
-                // #783 / §14.1 (decline-with-reasons): an IMPORTED generic class's
+                // #783 / §14.1 (decline-with-reasons): an IMPORTED generic CLASS's
                 // method whose return type references a class type parameter is NOT
                 // monomorphized importer-side — its body was compiled in the
                 // defining module against the placeholder (i32) layout, so calling
@@ -2528,8 +2528,33 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // proven-miscompiling shape with a clean diagnostic (importer-side
                 // method monomorphization is the full fix — #783, #428 family) so a
                 // clean compile never returns garbage.
+                //
+                // #2379 (§11.2/§13, v0.234): restricted to `ms->parent` being a
+                // CLASS. Dispatch through an imported generic INTERFACE-typed
+                // reference (`IBox<T> b; b.Get();`) does NOT reach an imported
+                // placeholder-compiled body at all — the actual callee is the
+                // IMPLEMENTING class's method, which is compiled locally (either
+                // in this module or wherever the implementing class is declared)
+                // against the CONCRETE substituted type, with no i32-placeholder
+                // step. This diagnostic's own reasoning (a placeholder-ABI body)
+                // never applied to the interface case; it fired anyway only
+                // because the guard keyed on the INTERFACE declaration's
+                // import+generic status, not on whose body actually runs. Before
+                // the LlvmBackend_Setup.cpp #2379 companion fix, EVERY cross-
+                // module generic-interface dispatch silently emitted no call at
+                // all (descArray_ had no entry for an imported generic
+                // interface, so the itable lookup bailed before making the call
+                // — a distinct, more severe bug than the placeholder-ABI one this
+                // diagnostic describes, and one that hit `int` instantiations
+                // too, which this diagnostic's `refLike` check let through).
+                // With that companion fix, interface dispatch is correct for
+                // every instantiation (verified: value-type AND reference-type),
+                // so keeping the reject here would newly reject CORRECT programs
+                // — §2.8.2's "must not alter the instantiation's semantics" cuts
+                // the other way once the shape is actually carried correctly.
                 if (ms->parent && ctx_.isImported(ms->parent) &&
-                    !ms->parent->genericParams.empty()) {
+                    !ms->parent->genericParams.empty() &&
+                    ms->parent->kind == ast::TypeDeclKind::Class) {
                     if (auto* gma = dynamic_cast<const ast::MemberAccessExpr*>(
                             ce.callee.get())) {
                         if (gma->target) {
