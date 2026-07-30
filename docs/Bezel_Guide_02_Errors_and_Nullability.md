@@ -206,7 +206,7 @@ end;                               // c disposed at the end of the enclosing blo
 
 `out using var c` binds the out value as an owned, scope-disposed local — so a successful call that handed you a `Connection` cannot leak. Its scope is the *enclosing* block, from the call onward (not just the `if`), so the connection is disposed when that block ends. Without the `when true` clause you would still write `UseConnection(c!)` — the bool guard alone does not narrow the nullable; only the postcondition does. (`out owned` in the signature and `out using var` at the call site must match: you cannot write `out using var` for a plain `out` parameter, nor plain `out var` for an `out owned` one — the compiler rejects the mismatch, because the ownership would have nowhere to go.) This is the ownership-aware version of C#'s `TryGet`: the contract is "on `true`, you now own it," and `out using var` discharges that obligation for you.
 
-**The `choice` return** when the failure itself carries information (spec §35). Where the nullable return says only "absent" and the Try pattern carries the failure in out-parameters, a `choice` names every outcome and carries each one's data — and the `case` over it is exhaustiveness-checked, so adding an outcome breaks every consumer at compile time instead of silently falling through a null check:
+**The `choice` return** when the failure is expected, branched on at or near the call site, and its payload is a plain value shape (spec §35; the failure-signal rule's band 3, stdlib §1). Where the nullable return says only "absent" and the Try pattern carries the failure in out-parameters, a `choice` names every outcome and carries each one's data — and the `case` over it is exhaustiveness-checked, so adding an outcome breaks every consumer at compile time instead of silently falling through a null check:
 
 ```bezel
 public method ParsePort(text: string): Result<int, string>
@@ -225,7 +225,7 @@ case ParsePort(arg) of
 end;                                  // exhaustive; no _ arm needed
 ```
 
-`Result<T, E>` (stdlib §2.20) is the stdlib's ready-made shape; a domain-specific choice with named cases (`Fetched`/`NotModified`/`Failed`) is often better still. When a case's payload is an owned resource, the `case` over a fresh call is an *owning match*: bind the payload and adopt it (`using var conn := owned c;`) — see Guide 1 §9. The three idioms compose: `T?` for plain absence, the Try shape for value extraction with a boring failure, the choice return where the failure carries information.
+`Result<T, E>` (stdlib §2.20) is the stdlib's ready-made shape; a domain-specific choice with named cases (`Fetched`/`NotModified`/`Failed`) is often better still. When a case's payload is an owned resource, the `case` over a fresh call is an *owning match*: bind the payload and adopt it (`using var conn := owned c;`) — see Guide 1 §9. The three idioms compose: `T?` for plain absence, the Try shape for value extraction with a boring failure, the choice return where the failure is branched on with a value-shaped payload.
 
 ---
 

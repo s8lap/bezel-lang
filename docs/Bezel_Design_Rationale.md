@@ -1209,6 +1209,17 @@ The second is the behavior on no match. `case` in expression position raises `Ma
 
 These differences aren't gaps; they're the parts of exception handling that don't reduce to value pattern matching. The syntax unifies the parts that are the same and leaves the parts that differ to the semantics.
 
+<a id="sec-one-rule-for-failure-signals"></a>
+### 11.4 One rule for failure signals: why Bezel is not `Result`-first (v0.229)
+
+The error-model study (proposal 0076, superseded at v0.229) asked the maximal question directly: is `Result<T, E>` a better general-purpose error mechanism than exceptions, and should Bezel migrate to it? The answer landed as doctrine — the failure-signal rule (stdlib §1) — rather than migration, and the two declines behind it deserve a citable home.
+
+**Why information content is not the band test.** The intuitive line — exceptions for boring failures, `Result` where the failure carries information — was the guides' original teaching, and it was declined as the classification test. It breaks on the environmental fault: an I/O failure carries rich information (path, message, OS detail), yet its consumption site is almost always a boundary — a log, a retry loop, a protocol conversion — that reads the data once and lets it go, which is exactly what `catch`'s copy-out model (spec §31.1) serves. Classifying by information content would evacuate the environmental band into `choice` returns whose exhaustive matches every interior caller would then have to write, converting boundary handling into call-site ceremony. The test that survives is *where consumption happens* (call-site branching vs. boundary handling) *and whether the payload can be value-like* (spec §35.4) — never how much information the failure carries.
+
+**Why maximal `Result` is recorded as not currently constructible.** A `Result`-first Bezel needs four things at once, and each is missing or expensive under landed rules: ownership-polymorphic combinators (`Map`/`AndThen` over owned payloads — the retired-and-deferred territory of spec §14.4), without which owning `Result` chains are match pyramids; a propagation operator, which sits behind proposal 0061 §2's evidence gate and a four-way collision on the `?` token; failure values that cross task seams, where an owned payload makes the instantiation owning and never directly sendable (spec §35.12); and a governed payload vocabulary, without which the error-type space fragments faster than the exception taxonomy it would replace — a choice is a closed sum, so every case addition breaks every exhaustive consumer (spec §35.6). None of this is a taste judgment, which is why the study's verdict is recorded with a reopening bar (proposal 0076 §6's four conditions) rather than as a preference: it is reopenable by evidence, not by re-arguing.
+
+What Bezel adopts instead is the hybrid the rule encodes: `Result` and domain choices confined to the clusters where call-site branching on value-like payloads is the real consumption pattern (decode/deserialize, gathered validation), exceptions keeping the boundary-consumed residual, and one mechanism per fault condition — chosen per condition by the rule, not per language by fashion.
+
 <a id="sec-async"></a>
 ## 12. Async
 
