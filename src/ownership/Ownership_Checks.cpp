@@ -13108,6 +13108,632 @@ void MethodOwnership::callBoundedWalkExpr(const ast::Expr& e) {
     // Literals / identifiers / typeof / nameof / default / unit: no sinks.
 }
 
+// -- §28.14 v0.179 (#1527): call-bounded × task-abandonment -----------------
+
+bool MethodOwnership::callBoundedTaskInvocation(const ast::CallExpr& ce,
+                                                std::string_view* paramNameOut) {
+    if (!ce.callee) return false;
+    sema::ParameterSymbol* src = callBoundedSourceOf(*ce.callee);
+    if (!src) return false;
+    if (!callResultIsAsyncTask(ce)) return false;
+    if (paramNameOut) *paramNameOut = src->name;
+    return true;
+}
+
+void MethodOwnership::checkCallBoundedTaskSettlement(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    if (callBoundedParams_.empty() && callBoundedAlias_.empty()) return;
+
+    // One outstanding "must be awaited to settlement" obligation minted by
+    // invoking a call-bounded callback. `key` is the identity the item is
+    // tracked under — a bound LocalSymbol*, or the minting CallExpr* itself
+    // for an invocation never bound to a local. `collKey`, when non-null, is
+    // the LocalSymbol* of a purely-local collection this item now lives
+    // inside (added via `.Add(...)`) — discharged only by `await
+    // Task.WhenAll(<that collection>)`, not a direct `await`.
+    struct Item {
+        const void* key = nullptr;
+        const void* collKey = nullptr;
+        std::string_view paramName;
+        SourceLocation loc;
+    };
+    using Set = std::vector<Item>;
+
+    auto reportUnsettled = [&](const Item& it, std::string_view when) {
+        report(Severity::Error, it.loc,
+               std::string("the task minted by invoking call-bounded "
+                          "parameter `") +
+                   std::string(it.paramName) +
+                   "` here is not awaited to settlement " +
+                   std::string(when) +
+                   " (§28.14, v0.179) — await it directly, or accumulate it "
+                   "in a purely-local collection and `await "
+                   "Task.WhenAll(...)`");
+    };
+    auto reportSink = [&](SourceLocation loc, std::string_view paramName,
+                         std::string_view sink) {
+        report(Severity::Error, loc,
+               std::string("the task minted by invoking call-bounded "
+                          "parameter `") +
+                   std::string(paramName) + "` is " + std::string(sink) +
+                   ", not awaited to settlement — abandoning it lets the "
+                   "callback's caller-sourced captures outlive the call "
+                   "through the still-running frame (§28.14, v0.179)");
+    };
+
+    // Finds an OPEN STANDALONE entry (collKey == nullptr) whose key matches
+    // `sym`; -1 when absent.
+    auto findStandalone = [](const Set& open, const void* sym) -> long {
+        if (!sym) return -1;
+        for (std::size_t i = 0; i < open.size(); ++i)
+            if (open[i].collKey == nullptr && open[i].key == sym)
+                return static_cast<long>(i);
+        return -1;
+    };
+
+    // True when `e` is `Task.WhenAll(<ident>)`; resolves the aggregated
+    // collection's LocalSymbol* — recognized only for the named-purely-
+    // local-collection idiom, §28.14's own "purely local collection" text.
+    auto whenAllCollection =
+        [&](const ast::Expr& e) -> sema::LocalSymbol* {
+        auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
+        if (!ce || ce->args.size() != 1 || !ce->args[0].value) return nullptr;
+        auto* ma =
+            dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+        if (!ma || ma->member != "WhenAll" || !ma->target) return nullptr;
+        auto* tid =
+            dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!tid || tid->name != "Task") return nullptr;
+        auto* aid =
+            dynamic_cast<const ast::IdentifierExpr*>(ce->args[0].value.get());
+        if (!aid) return nullptr;
+        return dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*aid));
+    };
+
+    // Recognizes + records a "fresh producer" appearing at `e` (a bare
+    // invocation used inline, e.g. `pending.Add(cb())` / `return cb();`).
+    // For a SYNCHRONOUS callee this is where the §28.14 v0.179 (2)
+    // synchronous-callee rejection fires — centralized here so every call
+    // site below (LocalDecl init, assignment RHS, return/discard value,
+    // fan-out add, bare statement, await operand) gets it uniformly without
+    // separate sync-specific logic; no Item is produced in that case (the
+    // violation is already diagnosed, so nothing needs further tracking).
+    auto asProducer = [&](const ast::Expr& e, Item& out) -> bool {
+        auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
+        std::string_view pn;
+        if (!ce || !callBoundedTaskInvocation(*ce, &pn)) return false;
+        if (!isAsync_) {
+            report(Severity::Error, ce->span.begin,
+                   std::string("invoking call-bounded parameter `") +
+                       std::string(pn) +
+                       "`'s callback here mints a task, but a synchronous "
+                       "callee has no position to await it to settlement — "
+                       "declare `" +
+                       std::string(pn) +
+                       "` `scoped` or make this method/constructor `async` "
+                       "(§28.14, v0.179)");
+            return false;
+        }
+        out = Item{ce, nullptr, pn, ce->span.begin};
+        return true;
+    };
+
+    // Discharges the referent of an `await` operand: an inline invocation
+    // (never became pending), a bare identifier naming an open standalone
+    // item, or `Task.WhenAll(<purely-local collection>)` (discharges every
+    // fan-out member of that collection).
+    auto dischargeAwaitOperand = [&](const ast::Expr& operand, Set& open) {
+        Item ignored;
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&operand);
+            ce && asProducer(operand, ignored)) {
+            return;  // inline `await cb()` — settled on the spot
+        }
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&operand)) {
+            long idx = findStandalone(open, ctx_.exprSymbol(*id));
+            if (idx >= 0) open.erase(open.begin() + idx);
+            return;
+        }
+        if (sema::LocalSymbol* coll = whenAllCollection(operand)) {
+            open.erase(
+                std::remove_if(open.begin(), open.end(),
+                               [&](const Item& it) {
+                                   return it.collKey ==
+                                          static_cast<const void*>(coll);
+                               }),
+                open.end());
+        }
+    };
+
+    // A value-position expression that might create a new pending item
+    // (bound under `bindKey`), discharge one via an inline `await`, or seed
+    // a collection literal's fan-out members. Used for LocalDecl
+    // initializers and assignment RHS values.
+    auto processValueExpr = [&](const ast::Expr& e, Set& open,
+                               const void* bindKey) {
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            if (un->op == "await" && un->operand) {
+                dischargeAwaitOperand(*un->operand, open);
+                return;
+            }
+        }
+        Item it;
+        if (asProducer(e, it)) {
+            if (bindKey) it.key = bindKey;
+            open.push_back(it);
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+            for (const auto& el : cl->elements) {
+                if (!el) continue;
+                Item eit;
+                if (asProducer(*el, eit)) {
+                    eit.collKey = bindKey;
+                    open.push_back(eit);
+                }
+            }
+        }
+        // Any other shape: not a recognized producer/discharge — an existing
+        // open item referenced some other way stays open, caught later
+        // (conservative: never silently clears an obligation).
+    };
+
+    // `<purely-local collection>.Add(...)`-shaped fan-out (the §28.14
+    // "purely local collection" exemption). True when the call was
+    // recognized as such (whether or not an argument actually matched —
+    // still claims the call so the generic bare-invocation-drop check below
+    // does not ALSO fire for the receiver-qualified call form).
+    auto processFanoutAdd = [&](const ast::CallExpr& ce, Set& open) -> bool {
+        if (!builtinCollectionStoreCallee(ce.callee.get())) return false;
+        auto* ma =
+            dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+        if (!ma || !ma->target) return false;
+        if (exprReachableBeyondCall(*ma->target)) return false;
+        auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!tid) return false;
+        sema::LocalSymbol* coll =
+            dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*tid));
+        if (!coll) return false;
+        for (const auto& a : ce.args) {
+            if (!a.value) continue;
+            Item it;
+            if (asProducer(*a.value, it)) {
+                it.collKey = coll;
+                open.push_back(it);
+                continue;
+            }
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                long idx = findStandalone(open, ctx_.exprSymbol(*id));
+                if (idx >= 0) open[idx].collKey = coll;
+            }
+        }
+        return true;
+    };
+
+    std::function<void(const ast::Stmt&, Set&, bool&)> scanOne;
+    std::function<void(const std::vector<std::unique_ptr<ast::Stmt>>&, Set&,
+                       bool&)>
+        scan;
+
+    scan = [&](const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+              Set& open, bool& terminated) {
+        for (const auto& sp : stmts) {
+            if (!sp) continue;
+            if (terminated) break;
+            scanOne(*sp, open, terminated);
+        }
+    };
+
+    // Reports + discards any STANDALONE item still open at the end of an
+    // ISOLATED body scan (a loop body / try-catch arm run standalone with a
+    // copy of the entry state — see the WhileStmt/ForStmt/TryStmt handling
+    // below) that is NOT also present in `entry` — i.e. genuinely
+    // introduced within the isolated body and abandoned there, with no
+    // further chance to resolve within this same run (a standalone item's
+    // bound LOCAL is itself scoped to the body — e.g. a fresh per-iteration
+    // loop-body local — so it cannot be referenced afterward either way).
+    // Fan-out (collKey-tagged) items are deliberately excluded here: they
+    // live in a collection declared OUTSIDE the body (the loop/try
+    // construct as a whole), so a NEW one is not "abandoned" merely because
+    // this body's own scan ends — mergeNewCollItems (below) carries it
+    // forward instead.
+    auto reportNewlyAbandoned = [&](const Set& afterState, const Set& entry,
+                                   std::string_view when) {
+        for (const auto& it : afterState) {
+            if (it.collKey) continue;
+            bool preexisting = false;
+            for (const auto& e2 : entry)
+                if (e2.key == it.key && e2.collKey == it.collKey) {
+                    preexisting = true;
+                    break;
+                }
+            if (!preexisting) reportUnsettled(it, when);
+        }
+    };
+
+    // Merges every NEW (not present in `entry`) collKey-tagged item found in
+    // `afterState` into `target` (de-duplicated). A fan-out `.Add(...)` and
+    // the task it registers are atomic within one statement — no partial-
+    // completion state exists — so a member added ANYWHERE reachable from
+    // this construct (a loop body that may or may not have run, a try body
+    // or catch arm an exception may have unwound through afterward) is safe
+    // to carry forward unconditionally: either it was added (a real,
+    // still-owed member the eventual `Task.WhenAll` must still cover) or it
+    // wasn't (nothing to carry). This is the fan-out counterpart of a
+    // standalone item's conservative "revert to entry" — DISCHARGING an
+    // item is what an uncertain trip count / exception path cannot certify;
+    // ADDING one has no equivalent uncertainty.
+    auto mergeNewCollItems = [&](Set& target, const Set& entry,
+                                const Set& afterState) {
+        for (const auto& it : afterState) {
+            if (!it.collKey) continue;
+            bool preexisting = false;
+            for (const auto& e2 : entry)
+                if (e2.key == it.key && e2.collKey == it.collKey) {
+                    preexisting = true;
+                    break;
+                }
+            if (preexisting) continue;
+            bool already = false;
+            for (const auto& t : target)
+                if (t.key == it.key && t.collKey == it.collKey) {
+                    already = true;
+                    break;
+                }
+            if (!already) target.push_back(it);
+        }
+    };
+
+    scanOne = [&](const ast::Stmt& s, Set& open, bool& terminated) {
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+            if (ld->initializer) {
+                sema::LocalSymbol* ls = findLocalSymbol(*ld);
+                processValueExpr(*ld->initializer, open, ls);
+            }
+            return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+            if (as->op != ":=" || !as->target) return;
+            // A FIELD may be referenced bare (no `this.` qualifier) and so
+            // also parses as an IdentifierExpr — resolve the target's SYMBOL
+            // and require it to be a LocalSymbol specifically before taking
+            // the "reassigning a local" path below; a field (or anything
+            // else) falls through to the generic store-sink handling exactly
+            // like a MemberAccessExpr target would (mirrors the EXISTING
+            // §28.14 sink check's own fieldTarget test, which the same
+            // bare-identifier-may-be-a-field ambiguity applies to).
+            sema::LocalSymbol* targetLocal = nullptr;
+            if (auto* tid =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+                targetLocal =
+                    dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*tid));
+            if (targetLocal) {
+                long idx = findStandalone(open, targetLocal);
+                bool selfAwait = false;
+                if (as->value)
+                    if (auto* un =
+                            dynamic_cast<const ast::UnaryExpr*>(as->value.get()))
+                        selfAwait = un->op == "await";
+                if (idx >= 0 && !selfAwait) {
+                    // Reassigning a still-open local without ever awaiting
+                    // it — the spec's named "binding it and dropping it"
+                    // sink, in the reassignment spelling.
+                    reportSink(as->span.begin, open[idx].paramName,
+                              "dropped by reassignment before being awaited "
+                              "to settlement");
+                    open.erase(open.begin() + idx);
+                }
+                if (as->value) processValueExpr(*as->value, open, targetLocal);
+                return;
+            }
+            // Non-identifier target (field / indexer / out-ref write): a
+            // fresh producer or a currently-open item stored there is the
+            // "stored" sink.
+            if (!as->value) return;
+            Item it;
+            if (asProducer(*as->value, it)) {
+                reportSink(as->span.begin, it.paramName,
+                          "stored (it must be awaited to settlement before "
+                          "the callee returns)");
+                return;
+            }
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->value.get())) {
+                long idx = findStandalone(open, ctx_.exprSymbol(*id));
+                if (idx >= 0) {
+                    reportSink(as->span.begin, open[idx].paramName,
+                              "stored (it must be awaited to settlement "
+                              "before the callee returns)");
+                    open.erase(open.begin() + idx);
+                }
+            }
+            return;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+            if (rs->value) {
+                Item it;
+                if (asProducer(*rs->value, it)) {
+                    reportSink(rs->value->span.begin, it.paramName,
+                              "returned");
+                } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                               rs->value.get())) {
+                    long idx = findStandalone(open, ctx_.exprSymbol(*id));
+                    if (idx >= 0) {
+                        reportSink(rs->value->span.begin, open[idx].paramName,
+                                  "returned");
+                        open.erase(open.begin() + idx);
+                    }
+                }
+            }
+            for (const auto& it : open) reportUnsettled(it, "before this return");
+            open.clear();
+            terminated = true;
+            return;
+        }
+        if (dynamic_cast<const ast::ThrowStmt*>(&s)) {
+            // Mirrors sema::DefiniteAssignment's own out-param precedent: a
+            // throw is not a normal-`return` exit path this obligation is
+            // checked against — declined explicitly, not silently.
+            // // per CLAUDE.md rule 4
+            terminated = true;
+            return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+            if (!ds->value) return;
+            Item it;
+            if (asProducer(*ds->value, it)) {
+                reportSink(ds->value->span.begin, it.paramName,
+                          "discarded (`_ := …`) without being awaited");
+                return;
+            }
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(ds->value.get())) {
+                long idx = findStandalone(open, ctx_.exprSymbol(*id));
+                if (idx >= 0) {
+                    reportSink(ds->value->span.begin, open[idx].paramName,
+                              "discarded (`_ := …`) without being awaited");
+                    open.erase(open.begin() + idx);
+                }
+            }
+            return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+            if (!es->expr) return;
+            if (auto* un = dynamic_cast<const ast::UnaryExpr*>(es->expr.get())) {
+                if (un->op == "await" && un->operand) {
+                    dischargeAwaitOperand(*un->operand, open);
+                    return;
+                }
+            }
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(es->expr.get())) {
+                if (auto* ma =
+                        dynamic_cast<const ast::MemberAccessExpr*>(
+                            ce->callee.get())) {
+                    if (auto* ttid = dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get());
+                        ttid && ttid->name == "Task" &&
+                        ma->member == "FireAndForget" && !ce->args.empty() &&
+                        ce->args[0].value) {
+                        Item it;
+                        if (asProducer(*ce->args[0].value, it)) {
+                            reportSink(ce->span.begin, it.paramName,
+                                      "passed to `Task.FireAndForget`");
+                            return;
+                        }
+                        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                ce->args[0].value.get())) {
+                            long idx =
+                                findStandalone(open, ctx_.exprSymbol(*id));
+                            if (idx >= 0) {
+                                reportSink(ce->span.begin,
+                                          open[idx].paramName,
+                                          "passed to `Task.FireAndForget`");
+                                open.erase(open.begin() + idx);
+                                return;
+                            }
+                        }
+                    }
+                }
+                if (processFanoutAdd(*ce, open)) return;
+                Item it;
+                if (asProducer(*ce, it)) {
+                    reportSink(ce->span.begin, it.paramName,
+                              "dropped without being awaited");
+                    return;
+                }
+            }
+            return;
+        }
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+            std::vector<Set> outs;
+            std::vector<bool> term;
+            Set b0 = open;
+            bool t0 = false;
+            scan(ifs->ifBranch.body, b0, t0);
+            outs.push_back(std::move(b0));
+            term.push_back(t0);
+            for (const auto& el : ifs->elifBranches) {
+                Set be = open;
+                bool te = false;
+                scan(el.body, be, te);
+                outs.push_back(std::move(be));
+                term.push_back(te);
+            }
+            if (ifs->hasElse) {
+                Set be = open;
+                bool te = false;
+                scan(ifs->elseBody, be, te);
+                outs.push_back(std::move(be));
+                term.push_back(te);
+            } else {
+                outs.push_back(open);  // guard-false fallthrough
+                term.push_back(false);
+            }
+            // Union over the LIVE branches: an item is still owed after the
+            // join if ANY live branch left it open (the mirror-image of
+            // DefiniteAssignment's intersection — a NOT-yet-discharged fact
+            // must survive if even one live path failed to discharge it).
+            Set merged;
+            bool anyLive = false;
+            for (std::size_t i = 0; i < outs.size(); ++i) {
+                if (term[i]) continue;
+                anyLive = true;
+                for (const auto& it : outs[i]) {
+                    bool dup = false;
+                    for (const auto& m : merged)
+                        if (m.key == it.key && m.collKey == it.collKey) {
+                            dup = true;
+                            break;
+                        }
+                    if (!dup) merged.push_back(it);
+                }
+            }
+            open = anyLive ? std::move(merged) : Set{};
+            bool allTerm = !term.empty();
+            for (bool t : term) allTerm = allTerm && t;
+            terminated = allTerm;
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+            Set entry = open;
+            Set bodyState = open;
+            bool bt = false;
+            scan(ws->body, bodyState, bt);
+            // Standalone items revert to entry — the loop may run zero
+            // times, so a discharge reachable only inside the body is not
+            // reliable (mirrors DefiniteAssignment's own while/for
+            // treatment). Fan-out collection members propagate through: an
+            // `.Add` either ran (a real, still-owed member) or didn't
+            // (nothing to owe) — no "unreliable add" exists the way an
+            // unreliable discharge does.
+            reportNewlyAbandoned(bodyState, entry, "before this loop body ends");
+            // Standalone items revert to entry UNCONDITIONALLY (kept as-is,
+            // ignoring bodyState — the loop's uncertain trip count cannot
+            // certify a discharge reachable only inside the body); fan-out
+            // items carry entry's own members forward too (the SAME "might
+            // not run" concern applies to a discharge of a PRE-EXISTING
+            // collection member reachable only inside the body) plus any
+            // NEW members the body itself registered.
+            Set result = entry;
+            mergeNewCollItems(result, entry, bodyState);
+            open = std::move(result);
+            terminated = false;  // the loop may not execute
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+            Set entry = open;
+            Set bodyState = open;
+            bool bt = false;
+            scan(fs->body, bodyState, bt);
+            reportNewlyAbandoned(bodyState, entry, "before this loop body ends");
+            Set result = entry;
+            mergeNewCollItems(result, entry, bodyState);
+            open = std::move(result);
+            terminated = false;
+            return;
+        }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+            scan(db->body, open, terminated);
+            return;
+        }
+        if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+            Set entry = open;
+            Set tryState = entry;
+            bool tt = false;
+            scan(trys->body, tryState, tt);
+            reportNewlyAbandoned(tryState, entry,
+                                "before this try body ends (an exception "
+                                "may abort it at any point)");
+            std::vector<Set> armStates;
+            for (const auto& arm : trys->catches) {
+                if (!arm.body) continue;
+                Set armState = entry;
+                bool at = false;
+                scanOne(*arm.body, armState, at);
+                reportNewlyAbandoned(armState, entry,
+                                    "before this catch arm ends");
+                armStates.push_back(std::move(armState));
+            }
+            Set result;
+            if (trys->hasFinally) {
+                Set finState = entry;
+                bool ft = false;
+                scan(trys->finallyBody, finState, ft);
+                // `finally` always runs regardless of the try/catch outcome
+                // — the one place inside this construct where discharging
+                // an INHERITED obligation is reliable.
+                result = std::move(finState);
+                terminated = ft;
+            } else {
+                // try/catch alone cannot be relied on to discharge an
+                // inherited obligation (an exception may skip any given
+                // statement) — the entry state passes through unchanged.
+                result = entry;
+                terminated = false;
+            }
+            // A fan-out `.Add(...)` reachable ANYWHERE in the try body or a
+            // catch arm registers atomically (see mergeNewCollItems) — carry
+            // any NEW member forward past the whole construct regardless of
+            // which path was taken, exactly as the loop-body treatment does.
+            mergeNewCollItems(result, entry, tryState);
+            for (const auto& as2 : armStates) mergeNewCollItems(result, entry, as2);
+            open = std::move(result);
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+            std::vector<Set> outs;
+            std::vector<bool> term;
+            for (const auto& arm : cs->arms) {
+                Set as2 = open;
+                bool ta = false;
+                if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                    if (arm.exprBody) {
+                        Item it;
+                        if (asProducer(*arm.exprBody, it)) as2.push_back(it);
+                    }
+                } else {
+                    for (const auto& bs : arm.stmts)
+                        if (bs) scanOne(*bs, as2, ta);
+                }
+                outs.push_back(std::move(as2));
+                term.push_back(ta);
+            }
+            // No statically-proven exhaustiveness analysis here (mirrors
+            // DefiniteAssignment's own conservative CaseStmt posture) — the
+            // "no arm matched" fallthrough always joins as an extra live
+            // branch.
+            outs.push_back(open);
+            term.push_back(false);
+            Set merged;
+            bool anyLive = false;
+            for (std::size_t i = 0; i < outs.size(); ++i) {
+                if (term[i]) continue;
+                anyLive = true;
+                for (const auto& it : outs[i]) {
+                    bool dup = false;
+                    for (const auto& m : merged)
+                        if (m.key == it.key && m.collKey == it.collKey) {
+                            dup = true;
+                            break;
+                        }
+                    if (!dup) merged.push_back(it);
+                }
+            }
+            open = anyLive ? std::move(merged) : Set{};
+            terminated = false;
+            return;
+        }
+        // Break / Continue / IncrementStmt / LocalConstDecl: no producer,
+        // discharge, or sink shape recognized here.
+    };
+
+    Set top;
+    bool terminated = false;
+    scan(body, top, terminated);
+    for (const auto& it : top)
+        reportUnsettled(it, "before this method/constructor returns");
+}
+
 // -- stdlib §6.10: TaskScope consumption ------------------------------------
 
 void MethodOwnership::taskScopeUsageScanExpr(const ast::Expr& e,

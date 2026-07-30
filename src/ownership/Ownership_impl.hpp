@@ -3130,6 +3130,47 @@ private:
                                      const ast::NewExpr* ne,
                                      std::size_t argPos);
 
+    // -- §28.14 v0.179 (#1527): call-bounded × TASK-ABANDONMENT escape sink --
+    //
+    // A call-bounded callback's OWN signature may itself return a Task-family
+    // value (`() -> Task`, `(int) -> Task<T>`, …). INVOKING it mints a task
+    // that "inherits the call bound" (§28.14 v0.179, Appendix C.6): a
+    // synchronous callee has no consuming position for the returned task (no
+    // `await`), so the invocation itself is rejected — declare the parameter
+    // `scoped` or make the callee `async`. An async callee must await the
+    // minted task to settlement, on every normal-exit path, before it
+    // returns — directly, or by accumulating it in a purely-local collection
+    // fully discharged by an aggregation-helper await (`await
+    // Task.WhenAll(pending)`); returning it, storing it, passing it to
+    // `Task.FireAndForget`, or binding it and dropping it undisposed-to-
+    // settlement is the same escape sink the other §28.14 sinks are.
+    //
+    // Runs as its own structural pre-pass AFTER callBoundedScan (needs the
+    // completed callBoundedAlias_ map for the local-rebinding idiom `var g :=
+    // f; …`). Deliberately does NOT descend into a nested LambdaExpr's own
+    // body (mirrors checkTaskScopeConsumption's own scope): a lambda's
+    // async-ness may differ from the enclosing callable's, and #1432 already
+    // scoped the call-bounded machinery's lambda interactions narrowly —
+    // extending task-settlement tracking across that boundary is left to a
+    // follow-up issue if evidence demands it. Likewise recognizes the
+    // invocation only at a fixed set of STATEMENT-level positions (a
+    // LocalDecl initializer, an assignment RHS, a return/discard value, a
+    // fan-out `.Add(...)` argument, a bare expression-statement, an `await`
+    // operand) — a task-returning invocation reached only through some OTHER
+    // nested expression position (an argument to an unrelated call, a
+    // chained member access, …) is not specifically recognized; a deliberate,
+    // recorded "provable subset" scope, the same posture v1 admission bound
+    // #3 already states for this section. // per §28.14 v0.179, Appendix C.6
+    void checkCallBoundedTaskSettlement(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // True + resolves the invoked call-bounded parameter's name when `ce`
+    // invokes THIS callable's own call-bounded parameter (or a local alias,
+    // §28.14 v0.177's carrier machinery) — the CALLEE position, not an
+    // argument — AND `ce`'s result type is Task-family
+    // (`callResultIsAsyncTask`) — the §28.14 v0.179 (2) invocation shape.
+    bool callBoundedTaskInvocation(const ast::CallExpr& ce,
+                                   std::string_view* paramNameOut);
+
     // -- stdlib §6.10 (v0.175, #808): TaskScope consumption rules ------------
     // TaskScope may only be consumed by `await using`; a plain `using var`, an
     // undisposed drop, or an explicit .Dispose() is a compile error naming the

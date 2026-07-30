@@ -170,6 +170,11 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
         }
     }
     callBoundedScan(body);
+    // §28.14 v0.179 (#1527): call-bounded × task-abandonment. Runs right
+    // after callBoundedScan — needs the completed callBoundedAlias_ carrier
+    // map (the `var g := f;` local-rebinding idiom) but is otherwise
+    // independent of scopedPreScan's own state. // per §28.14 v0.179
+    checkCallBoundedTaskSettlement(body);
     scopedPreScan(body);
     scopedCalleeScan(body);
     checkTaskScopeConsumption(body);
