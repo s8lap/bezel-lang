@@ -439,7 +439,12 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty);  // fwd
 
 void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     w.EnterSubblock(MEMBER_BLOCK, 4);
-    llvm::SmallVector<std::uint64_t, 10> sc{
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 4, additive within v7): hasSetter is
+    // an 11th trailing scalar, same additive shape as isPure (the 10th) and
+    // #2392's PARAM_BLOCK outNullWhen — a pre-#2400 reader's `sc.size() < 8`
+    // gate never looks past index 7, so it is unaffected; see the hasSetter
+    // field comment in ModuleMetadata.hpp for the full rationale.
+    llvm::SmallVector<std::uint64_t, 11> sc{
         static_cast<std::uint64_t>(m.kind),
         static_cast<std::uint64_t>(m.visibility),
         m.isOperator ? 1u : 0u,
@@ -450,6 +455,7 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
         m.params.size(),
         m.contracts.size(),
         m.isPure ? 1u : 0u,
+        m.hasSetter ? 1u : 0u,
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, m.name);
@@ -921,6 +927,11 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     std::uint64_t nParams = sc[7];
     std::uint64_t nContracts = sc.size() >= 9 ? sc[8] : 0;
     m.isPure = sc.size() >= 10 && sc[9] != 0;
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 4, additive within v7): 11th scalar.
+    // A pre-#2400 blob has at most 10 scalars; hasSetter defaults to false —
+    // see the field's comment in ModuleMetadata.hpp for why "no setter" is
+    // the safe default for an old, not-yet-recompiled dependency.
+    m.hasSetter = sc.size() >= 11 && sc[10] != 0;
     if (!expectString(r, m.name)) return false;
     if (!readStringList(r, m.modifiers)) return false;
     if (!readType(r, m.type)) return false;

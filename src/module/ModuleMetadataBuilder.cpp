@@ -976,6 +976,25 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 out.params = convertParams(prop->indexerParams, ctx);
                 fillParamDefaults(out.params, pd->indexerParams);
             }
+            // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): mirror
+            // LlvmBackend_impl.hpp's propertyHasSetter exactly. That codegen
+            // helper only ever operates on a LOCAL decl (the same `pd`
+            // available here, in the same translation unit as the export),
+            // so its logic is duplicated at export time rather than shared
+            // across the module/codegen boundary. See hasSetter's field
+            // comment in ModuleMetadata.hpp for why an importer cannot
+            // recover this from `modifiers` alone.
+            if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
+                out.hasSetter = false;
+            } else if (pd->bodyKind == ast::PropertyBodyKind::Auto) {
+                out.hasSetter = true;
+                for (auto mod : pd->modifiers)
+                    if (mod == "readonly") { out.hasSetter = false; break; }
+            } else {
+                out.hasSetter = false;
+                for (const auto& a : pd->accessors)
+                    if (a.isSet) { out.hasSetter = true; break; }
+            }
         }
         return true;
     }

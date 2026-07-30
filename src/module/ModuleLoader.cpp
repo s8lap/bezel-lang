@@ -445,6 +445,13 @@ struct Loader {
                 //     external by declareImportedPropertyGetters in the importer.
                 // The resolved property TYPE rides fieldTypes_ (same side table
                 // used for fields/consts) so ctx.importedMemberType() can read it.
+                //   - the SETTER (fix #2400): non-virtual — a call to
+                //     bz$<Class>$<Prop>$propset, emitted as ExternalLinkage by
+                //     emitExportedPropertySetters and declared as an external
+                //     by declareImportedPropertySetters. Whether such a call
+                //     is even attempted depends on mm.hasSetter (below) — an
+                //     imported property with no setter must never resolve one,
+                //     the same way propertyHasSetter's LOCAL check does.
                 auto* p = ctx.makeImportedSymbol<sema::PropertySymbol>();
                 p->name = ctx.internString(mm.name);
                 p->visibility = fromMetaVisibility(mm.visibility);
@@ -453,6 +460,11 @@ struct Loader {
                 p->scope = parent.memberScope;
                 p->isIndexer = false;
                 fieldTypes_[p] = convert(mm.type);
+                // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): MetaMember::hasSetter,
+                // published to ctx.importedPropertyHasSetter() below. See the
+                // field's comment in ModuleMetadata.hpp for why this cannot be
+                // derived from `p->modifiers` alone.
+                propHasSetter_[p] = mm.hasSetter;
                 applyBehavior(p);
                 return p;
             }
@@ -486,6 +498,10 @@ struct Loader {
     std::unordered_map<sema::MethodSymbol*, sema::TypeRef*> returnTypes_;
     std::unordered_map<sema::MethodSymbol*, bool> returnOwned_;
     std::unordered_map<const sema::MemberSymbol*, sema::TypeRef*> fieldTypes_;
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): imported property setter presence,
+    // from MetaMember::hasSetter — published to
+    // ctx.setImportedPropertyHasSetter() below.
+    std::unordered_map<const sema::MemberSymbol*, bool> propHasSetter_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const sema::MemberSymbol*, std::string> constValues_;
 };
@@ -1896,6 +1912,11 @@ static void loadMetadataPass2(
         ctx.setImportedReturnType(m, ret, loader.returnOwned_[m]);
     for (auto& [m, ty] : loader.fieldTypes_)
         ctx.setImportedMemberType(m, ty);
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): publish imported property setter
+    // presence so declareImportedPropertySetters (LlvmBackend_Setup.cpp) can
+    // tell a genuinely settable imported property from a getter-only one.
+    for (auto& [m, hs] : loader.propHasSetter_)
+        ctx.setImportedPropertyHasSetter(m, hs);
     // §22.12 (issue #328 FINDING [3] BUG A): publish imported const values so
     // codegen can fold an imported `const` read without a storage symbol.
     for (auto& [m, val] : loader.constValues_)

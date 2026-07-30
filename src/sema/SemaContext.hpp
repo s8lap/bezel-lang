@@ -326,6 +326,21 @@ public:
         return it == importedMemberTypes_.end() ? nullptr : it->second;
     }
 
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): whether an imported Property (or
+    // Indexer) member declares a setter — MetaMember::hasSetter (see its field
+    // comment in ModuleMetadata.hpp for why this cannot be recovered from
+    // `modifiers` alone, unlike a field's "readonly"). Absent (never set) for
+    // any non-property import, and for a property imported from a pre-#2400
+    // blob (no 11th MEMBER_BLOCK scalar) — both correctly default to `false`
+    // ("no cross-module setter"), the safe direction.
+    void setImportedPropertyHasSetter(const Symbol* m, bool hasSetter) {
+        importedPropertyHasSetter_[m] = hasSetter;
+    }
+    bool importedPropertyHasSetter(const Symbol* m) const {
+        auto it = importedPropertyHasSetter_.find(m);
+        return it != importedPropertyHasSetter_.end() && it->second;
+    }
+
     // §22.12 (issue #328 FINDING [3] BUG A): an imported class-level `const` has
     // no storage symbol in the library — a const initializer is a compile-time
     // constant expression, so the library emits no global. The loader records
@@ -408,6 +423,9 @@ private:
     std::unordered_map<const Symbol*, TypeRef*> importedReturnTypes_;
     std::unordered_set<const Symbol*> importedReturnOwned_;
     std::unordered_map<const Symbol*, TypeRef*> importedMemberTypes_;
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): imported property/indexer setter
+    // presence, from MetaMember::hasSetter.
+    std::unordered_map<const Symbol*, bool> importedPropertyHasSetter_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const Symbol*, std::string> importedConstValues_;
     // §14 / #662c: imported SourceFile objects that own re-parsed ctor/dtor

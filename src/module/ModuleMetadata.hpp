@@ -425,6 +425,30 @@ struct MetaMember {
     // need not infer behavioral metadata from spelling conventions.
     bool isPure = false;
 
+    // §23 / §2.8.2/§2.8.3 rule 4 (fix #2400, additive within v7 — same rule as
+    // #2392's outNullWhen above): for a Property (or Indexer) member, whether
+    // it declares a setter. Needed because — unlike a field's "readonly"
+    // modifier — a property's
+    // setter-presence is NOT always recoverable from `modifiers`: an
+    // expression-bodied property (`P: T => e;`) or a get-only block form is
+    // getter-only by its SHAPE, not by a `readonly` modifier (writing
+    // `readonly` on either is itself a compile error per §23.2 — "read-onlyness
+    // is already expressed by the shape"), and the importer never reconstructs
+    // an ast::PropertyDecl to recover that shape from (ModuleLoader.cpp's
+    // Property case: "the getter BODY is not reconstructed here"). Without
+    // this bit, an importer cannot distinguish a genuinely settable imported
+    // property from a getter-only one, and unconditionally assuming "settable"
+    // installs a dangling reference to a setter export symbol the exporter
+    // never emitted (confirmed by probe: a getter-only base property
+    // satisfying a read-write LOCAL interface obligation produced an itable
+    // relocation to an undefined `...$propset` symbol — a link error). Ignored
+    // for every kind but Property/Indexer. A v7-or-earlier blob has no 11th
+    // scalar; the reader defaults this to `false` (degrades to "no
+    // cross-module setter for this property" — the pre-#2400 behavior — rather
+    // than risking an unresolved symbol against an old library that has not
+    // been recompiled).
+    bool hasSetter = false;
+
     // §22.16 / §2.8.2: clauses in declaration order. For a `when` form from
     // §22.4 the builder emits the equivalent static-ensures record here.
     std::vector<MetaContractRecord> contracts;

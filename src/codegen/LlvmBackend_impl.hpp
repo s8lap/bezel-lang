@@ -264,9 +264,14 @@ public:
         // non-virtual public properties (exporter side). After declareVtables so
         // propGetSlot_ is populated; virtual properties are skipped.
         emitExportedPropertyGetters();
-        // fix #2387: declareImportedPropertyGetters (importer-side external
-        // getter stubs) now runs INSIDE declareVtables() itself, between the
-        // buildVtable loops and Pass D — see the call site there for why.
+        // fix #2400: the SETTER twin — emit ExternalLinkage setter stubs for
+        // non-virtual public properties WITH a setter (exporter side). Same
+        // ordering requirement as the getter call above (propSetSlot_ populated).
+        emitExportedPropertySetters();
+        // fix #2387 / fix #2400: declareImportedPropertyGetters /
+        // declareImportedPropertySetters (importer-side external getter/setter
+        // stubs) now run INSIDE declareVtables() itself, between the buildVtable
+        // loops and Pass D — see the call site there for why.
         setupBoxDescriptors();  // §8.6: after descArray_/vtable globals exist
         declareExterns();  // CG26
         // #429 (box RETURN + FIELD-STORE category) / §8.6 / §28.9: before any
@@ -1772,6 +1777,16 @@ private:
     // (`bz$<Class>$<Prop>$propget`). Populated by declareImportedPropertyGetters.
     std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
         importedPropGetterFns_;
+    // fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): the SETTER twin of
+    // importedPropGetterFns_ — no equivalent existed before this fix, which is
+    // why a settable property inherited from an imported base class had no
+    // cross-module ABI surface at all (only a getter stub was ever declared).
+    // Keyed by the imported PropertySymbol; the value is an ExternalLinkage
+    // `void(ptr this, T value)` declaration linking against the exporter's
+    // setter function (`bz$<Class>$<Prop>$propset`). Populated by
+    // declareImportedPropertySetters.
+    std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
+        importedPropSetterFns_;
     // CG35-itable (§13 / §12): per-interface itable dispatch. For each
     // interface method `ms`, ifaceMethodIndex_[ms] is its 0-based position in
     // the interface's non-static method declaration order. This index is used
@@ -3403,6 +3418,25 @@ private:
     // `target` is not a block-setter property.
     bool lowerPropertySetValue(const ast::Expr& target, llvm::Value* v);
 
+    // fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): a DIRECT
+    // (non-itable, non-virtual) cross-module property SET — `importedObj.Prop
+    // := v` for a plain property declared or inherited on an imported class,
+    // accessed through the imported class's own type (not through an
+    // interface reference, which dispatches via lowerVirtualPropertySet
+    // instead). computedSetterOf returns nullptr for this shape (the imported
+    // PropertySymbol has no ast::PropertyDecl), so lowerPropertySet /
+    // lowerPropertyCompound bail before reaching lowerPropertySetValue; tried
+    // as a fallback AFTER lowerPropertySet fails. Calls the external setter
+    // stub (`bz$<Class>$<Prop>$propset`) declared by
+    // declareImportedPropertySetters — the direct-set twin of the imported-
+    // property getter fallback in LlvmBackend_Exprs.cpp (~4283-4300, issue
+    // #503). Returns false (so the caller's existing fallthrough is
+    // unaffected) when `target` is not an imported property with a declared
+    // setter stub.
+    bool lowerImportedPropertySet(const ast::Expr& target,
+                                  const ast::Expr& value);
+    bool lowerImportedPropertySetValue(const ast::Expr& target, llvm::Value* v);
+
     // §22.9: compound assignment `obj.P OP= rhs` on a block-form property —
     // a read-modify-write: read the current value through the getter, apply
     // OP (overflow-checked, as for any compound assignment), then run the
@@ -3763,6 +3797,48 @@ private:
     // distinguish virtual from non-virtual imported properties. The stubs are
     // stored in importedPropGetterFns_ for use by the property-access lowering.
     void declareImportedPropertyGetters();
+
+    // fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): the SETTER twin of
+    // emitExportedPropertyGetters — emit a named ExternalLinkage setter function
+    // `bz$<Class>$<Prop>$propset(ptr %this, T value) -> void` for every PUBLIC,
+    // non-virtual, non-indexer property WITH A SETTER on every PUBLIC, non-generic
+    // LOCAL class. No setter-side equivalent existed before this fix (confirmed
+    // empirically: `nm` on a compiled library object with a settable property
+    // showed `...$propget` but no `...$propset` symbol at all), so cross-module
+    // SETTING of a non-virtual imported property had no ABI surface whatsoever —
+    // independent of interfaces/itables. Mirrors emitExportedPropertyGetters
+    // exactly, including relying on ensurePropertyAccessorFn's own body-presence
+    // check (rather than a separate "hasSetter" filter here) to skip getter-only
+    // properties: it returns nullptr for those and the incomplete declaration is
+    // erased.
+    void emitExportedPropertySetters();
+
+    // fix #2400: the SETTER twin of declareImportedPropertyGetters — declare
+    // EXTERNAL setter stubs for every imported PropertySymbol that is not
+    // virtual (not in propSetSlot_), not an interface member (those dispatch
+    // through the itable), and actually HAS a setter per the imported
+    // MetaMember::hasSetter bit (ctx_.importedPropertyHasSetter — a new
+    // metadata field this fix adds; see its comment in ModuleMetadata.hpp).
+    // Unlike declareImportedPropertyGetters, this CANNOT declare unconditionally
+    // for every eligible property: Pass D's itable-building loop
+    // (LlvmBackend_Setup.cpp) calls ensurePropertyAccessorFn(ts, impl,
+    // isSet=true) for every property a LOCAL interface declares read-write,
+    // regardless of whether the concrete implementing property actually has a
+    // setter (no accessor-set matching check exists there — a separate,
+    // pre-existing gap) — a getter-only imported base property satisfying such
+    // an obligation would otherwise get a REAL relocation installed into the
+    // itable to a setter symbol the exporter never emitted, an unresolved-
+    // symbol link error at BUILD time regardless of whether the program ever
+    // writes through that slot (confirmed: this exact shape is in the
+    // pre-existing #2387/#2380 test fixtures). The stubs are stored in
+    // importedPropSetterFns_ for use by both the itable-slot fallback
+    // (ensurePropertyAccessorFn) and the direct (non-itable) property-set
+    // lowering path. MUST be called from the SAME call site as
+    // declareImportedPropertyGetters (inside declareVtables, after
+    // propSetSlot_ is populated by the buildVtable loops, before Pass D) —
+    // #2387 already discovered that calling this after declareVtables() returns
+    // leaves the map empty during Pass D, silently defeating the fallback.
+    void declareImportedPropertySetters();
 
     // CG17: assign vtable slots for a class, base-first. Slot 0 is Dispose
     // (handled at emit time); virtual methods take slots 1+. An override

@@ -2044,6 +2044,96 @@ void Emitter::emitExportedPropertyGetters() {
 }
 
 
+// fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): the SETTER twin of
+// emitExportedPropertyGetters immediately above — emit a named, ExternalLinkage
+// setter function for every public non-virtual non-indexer PropertySymbol WITH A
+// SETTER on every public non-generic local class. The function
+// `bz$<Class>$<Prop>$propset(ptr %this, T value) -> void` has the same signature
+// as the virtual-property setter accessor (ensurePropertyAccessorFn, isSet=true),
+// which is InternalLinkage. A separate ExternalLinkage wrapper is used so the
+// importer can call it without touching the (potentially inlined) local accessor
+// — mirrors the getter wrapper exactly.
+//
+// Before this fix NO setter-side equivalent existed at all: `nm` on a compiled
+// library object with a settable property showed `...$propget` but no
+// `...$propset` symbol — cross-module SETTING of a non-virtual imported property
+// had no ABI surface whatsoever, independent of interfaces/itables (the itable
+// crash and the silent no-op on a direct cross-module set are two symptoms of
+// this single missing mechanism).
+//
+// The body calls `ensurePropertyAccessorFn(ts, ps, /*isSet=*/true)` (which does
+// the real work and caches the setter) — then the wrapper just forwards to it.
+// If ensurePropertyAccessorFn returns nullptr (getter-only, or abstract with no
+// body) the wrapper is not emitted — this is how a getter-only property is
+// correctly excluded, mirroring the getter function's identical reliance on
+// ensurePropertyAccessorFn's own body-presence check rather than a separate
+// "hasSetter" filter (propertyHasSetter is deliberately NOT used here: it is
+// only safe on a LOCAL decl, which every `ps` here has since this loop iterates
+// ctx_.symbols() — see declareImportedPropertySetters below for why the IMPORT
+// side must not use it either).
+void Emitter::emitExportedPropertySetters() {
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        if (ts->visibility != ast::Visibility::Public) continue;
+        if (!ts->genericParams.empty()) continue;
+        for (sema::Symbol* m : ts->members) {
+            auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+            if (!ps || ps->isIndexer) continue;
+            // Skip virtual/override/abstract/static — they have other dispatch paths.
+            if (isVirtualProperty(ps)) continue;
+            bool isStatic = false;
+            for (auto mod : ps->modifiers) if (mod == "static") isStatic = true;
+            if (isStatic) continue;
+            // Only public properties are part of the cross-module surface.
+            if (ps->visibility != ast::Visibility::Public) continue;
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd) continue;
+            // Derive the setter's value-parameter type (same as the property's
+            // declared type — §23: get/set share one declared type).
+            llvm::Type* valTy = lowerType(pd->type.get());
+            if (!valTy) valTy = i32();
+            std::string clsName = mangledTypeName(ts);
+            std::string propName = std::string(ps->name);
+            std::string mangled = "bz$" + clsName + "$" + propName + "$propset";
+            // Avoid double-declaration if the function was already created
+            // (shouldn't happen, but guard).
+            if (module_->getNamedValue(mangled)) continue;
+            auto* fnTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), valTy}, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::GlobalValue::ExternalLinkage, mangled, *module_);
+            // Emit the body: call ensurePropertyAccessorFn to get the concrete
+            // setter (arrow-form auto-property or block), then forward to it.
+            llvm::Function* innerFn =
+                ensurePropertyAccessorFn(ts, ps, /*isSet=*/true);
+            if (!innerFn) {
+                // No concrete setter body (getter-only, or abstract with no
+                // body). Erase the incomplete declaration so the module stays
+                // valid — this property is correctly excluded from the
+                // cross-module setter surface (§23.3: no setter to export).
+                fn->eraseFromParent();
+                continue;
+            }
+            auto* savedFn = currentFn_;
+            auto* savedInsert = builder_.GetInsertBlock();
+            currentFn_ = fn;
+            auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+            builder_.SetInsertPoint(entry);
+            auto argIt = fn->args().begin();
+            llvm::Value* thisArg = &*argIt++;
+            llvm::Value* valueArg = &*argIt;
+            // Forward: call the (InternalLinkage) inner setter with (this, value).
+            builder_.CreateCall(innerFn->getFunctionType(), innerFn,
+                                {thisArg, valueArg});
+            builder_.CreateRetVoid();
+            currentFn_ = savedFn;
+            if (savedInsert) builder_.SetInsertPoint(savedInsert);
+        }
+    }
+}
+
+
 // §2.5 / §22.9 (issue #503): declare an external getter function for every
 // imported non-virtual PropertySymbol, so the property-access lowering can call
 // it cross-module. The signature matches what the exporter emits in
@@ -2078,6 +2168,87 @@ void Emitter::declareImportedPropertyGetters() {
         auto* fn = llvm::Function::Create(
             fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
         importedPropGetterFns_[ps] = fn;
+    }
+}
+
+
+// fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): the SETTER twin of
+// declareImportedPropertyGetters immediately above — declare an external setter
+// function for every imported non-virtual PropertySymbol, so the property-set
+// lowering can call it cross-module. The signature matches what the exporter
+// emits in emitExportedPropertySetters: `bz$<Class>$<Prop>$propset(ptr %this,
+// T value) -> void`. Only engages for non-virtual properties (virtual ones
+// dispatch via the vtable slot already populated by buildVtable). Must run
+// after declareVtables (which calls buildVtable for imported types), so
+// propSetSlot_ is accurate — and, like declareImportedPropertyGetters, must be
+// called from the SAME call site (inside declareVtables, before Pass D): #2387
+// discovered that a call site placed after declareVtables() returns leaves the
+// map empty when Pass D (which now falls back to importedPropSetterFns_ via
+// ensurePropertyAccessorFn) runs, silently defeating the fallback.
+//
+// Deliberately does NOT gate on propertyHasSetter(ps): that helper is gated on
+// `dynamic_cast<const ast::PropertyDecl*>(ps->decl)`, unconditionally null for
+// any imported PropertySymbol (a further confirmed #2374-pattern instance,
+// filed separately, blocking the itable-slot-RESERVATION question for imported
+// INTERFACES specifically — orthogonal to this export/import ABI question).
+//
+// DOES gate on ctx_.importedPropertyHasSetter(ps) (MetaMember::hasSetter, a new
+// metadata bit added by this fix — see its field comment in
+// ModuleMetadata.hpp). An earlier version of this fix declared a stub
+// UNCONDITIONALLY for every eligible imported property (mirroring
+// declareImportedPropertyGetters's own unconditional-declare stance), reasoning
+// that an unreferenced external declaration needs no definition at link time.
+// That reasoning covers a plain cross-module `obj.Prop := v` (sema does gate
+// that on a real setter, even though — separately — it incorrectly does NOT
+// for an imported getter-only property; see issue text) but NOT the itable
+// path: Pass D (below) calls ensurePropertyAccessorFn(ts, impl, isSet=true)
+// for EVERY property an interface declares read-write, REGARDLESS of whether
+// the implementing class's actual property has a setter (no accessor-set
+// matching check exists in that lookup — a pre-existing, separate gap). A
+// getter-only property inherited from an imported base, satisfying a
+// read-write LOCAL interface obligation, hit exactly this: the unconditional
+// stub was installed into the itable's setter slot as a REAL relocation
+// (unlike a function pointer that is merely never called, an initialized
+// global's relocation must resolve at link time even if the itable index is
+// never read at runtime) — confirmed by running the existing #2387/#2380 test
+// suites, which use exactly this shape: `undefined reference to
+// bz$BasePropLib2387T1.BaseWithProp2387T1$Name$propset`. Gating on the real
+// hasSetter bit here (skip declaring, so the itable fallback never finds an
+// entry and correctly leaves the slot null, exactly as it did before this fix)
+// is what makes those existing tests pass again.
+void Emitter::declareImportedPropertySetters() {
+    for (sema::Symbol* sym : ctx_.importedSymbols()) {
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
+        if (!ps || ps->isIndexer) continue;
+        // Skip virtual: they dispatch through the vtable slot.
+        if (propSetSlot_.count(ps)) continue;
+        // Also skip interface properties: those dispatch through the itable.
+        if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface)
+            continue;
+        // fix #2400: skip a genuinely getter-only imported property — see the
+        // long comment above this function for why this gate is load-bearing
+        // (not just an optimization).
+        if (!ctx_.importedPropertyHasSetter(ps)) continue;
+        // Skip if already declared.
+        if (importedPropSetterFns_.count(ps)) continue;
+        // Derive the value-parameter type from the side table (same source the
+        // getter twin uses — §23: get/set share one declared type).
+        sema::TypeRef* retRef = ctx_.importedMemberType(ps);
+        llvm::Type* valTy = retRef ? lowerTypeRef(retRef) : i32();
+        std::string clsName = ps->parent ? mangledTypeName(ps->parent) : "";
+        std::string mangled =
+            "bz$" + clsName + "$" + std::string(ps->name) + "$propset";
+        // Re-use an existing module declaration if present (e.g. a double-
+        // import from two transitive dependencies with the same symbol).
+        if (auto* existing = module_->getFunction(mangled)) {
+            importedPropSetterFns_[ps] = existing;
+            continue;
+        }
+        auto* fnTy = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), valTy}, false);
+        auto* fn = llvm::Function::Create(
+            fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        importedPropSetterFns_[ps] = fn;
     }
 }
 
@@ -2741,6 +2912,15 @@ void Emitter::declareVtables() {
     // empty during Pass D and the fallback never found anything (confirmed by
     // probe: the fix silently did nothing until this call moved here).
     if (ctx_.hasImports()) declareImportedPropertyGetters();
+    // fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): the SETTER twin of
+    // the #2387 fix immediately above — same ordering requirement, same reason.
+    // declareImportedPropertySetters populates importedPropSetterFns_, which
+    // ensurePropertyAccessorFn's imported-property fallback now also consults
+    // for isSet=true, and which propSetSlot_ must be fully populated (by the
+    // buildVtable loops just above) before this runs so the "skip virtual"
+    // check inside declareImportedPropertySetters is accurate. MUST run before
+    // Pass D below, its first consumer.
+    if (ctx_.hasImports()) declareImportedPropertySetters();
     // Pass B: declare a descriptor-array global (correctly sized, no
     // initializer yet) for every class/interface, so descriptors can
     // cross-reference each other in pass C.

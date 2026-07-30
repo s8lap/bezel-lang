@@ -207,6 +207,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
                 if (lowerPropertySet(*as->target, *as->value))
                     return false;
+                // fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): a
+                // DIRECT cross-module set of a plain (non-virtual,
+                // non-interface) imported property — `importedObj.Prop := v`.
+                // lowerPropertySet just failed because the imported
+                // PropertySymbol has no ast::PropertyDecl (computedSetterOf
+                // requires one); before this fix nothing else recognized this
+                // shape either, so the write fell through to the generic
+                // lvalueAddr fallback below, which cannot resolve a
+                // PropertySymbol target and silently dropped it. Checked here,
+                // after the virtual/interface and local-setter paths, so it
+                // only engages for the shape neither of those covers.
+                if (lowerImportedPropertySet(*as->target, *as->value))
+                    return false;
                 // §22.10: indexer setter for `obj[i] := v`.
                 // Evaluate RHS ONCE to avoid double side-effects if
                 // lowerIndexerSet fails and we fall through to the

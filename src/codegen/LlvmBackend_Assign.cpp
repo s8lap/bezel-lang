@@ -2363,19 +2363,20 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
         // issue #503). Its ABI (`T get(ptr this)`) is exactly the itable
         // slot's expected signature, so the itable can install it directly.
         //
-        // No setter-side stub exists yet: declareImportedPropertyGetters only
-        // ever declares a GETTER external (LlvmBackend_Setup.cpp ~2054); a
-        // settable property inherited from an imported base class still
-        // crashes identically on its SETTER slot (confirmed by probe — a
-        // write-only repro segfaults the same way). That requires a new
-        // export/import mechanism symmetric to this one and is filed
-        // separately (out of this fix's scope) rather than widened here.
-        if (!isSet) {
-            if (auto git = importedPropGetterFns_.find(ps);
-                git != importedPropGetterFns_.end()) {
-                propAccessorFns_[key] = git->second;
-                return git->second;
-            }
+        // fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): the SETTER
+        // twin of the getter fallback just above. declareImportedPropertyGetters
+        // used to be the ONLY stub of this shape — a settable property
+        // inherited from an imported base class crashed identically on its
+        // SETTER slot (confirmed by probe — a write-only repro segfaulted the
+        // same way, faulting at address 0x0). declareImportedPropertySetters
+        // (LlvmBackend_Setup.cpp) now declares the symmetric external stub
+        // (`void set(ptr this, T value)`, matching the itable slot's expected
+        // signature exactly) and populates importedPropSetterFns_; fall back
+        // to it the same way the getter branch does.
+        auto& importedFns = isSet ? importedPropSetterFns_ : importedPropGetterFns_;
+        if (auto git = importedFns.find(ps); git != importedFns.end()) {
+            propAccessorFns_[key] = git->second;
+            return git->second;
         }
         return nullptr;
     }
@@ -3048,6 +3049,92 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
     builder_.SetInsertPoint(accEndBB);
     currentThis_ = savedThis;
     return true;
+}
+
+
+// fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): a DIRECT (non-itable,
+// non-virtual) cross-module property SET — `importedObj.Prop := v` where Prop
+// is a plain, non-virtual, non-interface property declared (or inherited) on
+// an imported class, accessed through the imported class's own static type
+// rather than through an interface reference (which dispatches through
+// lowerVirtualPropertySet's itable/vtable slot lookup instead — already fixed
+// by ensurePropertyAccessorFn's importedPropSetterFns_ fallback above).
+// computedSetterOf returns nullptr for this shape (the imported PropertySymbol
+// has no ast::PropertyDecl), so lowerPropertySet/lowerPropertyCompound bail out
+// before ever reaching lowerPropertySetValue.
+//
+// Before this fix there was NO fallback at all for this shape: the assignment
+// statement fell through every check in the AssignmentStmt lowering
+// (LlvmBackend_Stmts.cpp) to the generic lvalueAddr fallback, which returns
+// null for a PropertySymbol target (it is not a FieldSymbol, so fieldAddr does
+// not resolve it) — the write was silently DROPPED, no crash. Confirmed by
+// probe: `d.Name := 55; return d.Name - 55;` (where Name's backing field
+// starts at 1) returned -54 (WEXITSTATUS-masked to 202) — the READ correctly
+// returned the untouched original value 1 via the existing
+// importedPropGetterFns_ getter fallback (LlvmBackend_Exprs.cpp ~4283-4300,
+// issue #503), proving the WRITE never happened at all rather than writing to
+// the wrong place.
+//
+// Mirrors that getter fallback's shape, calling the external setter stub
+// (`bz$<Class>$<Prop>$propset`) declared by declareImportedPropertySetters
+// (LlvmBackend_Setup.cpp) instead. The value is coerced to the stub's declared
+// parameter type first, mirroring lowerVirtualPropertySet's identical
+// coercion — both cross a fixed-ABI function-pointer boundary where an
+// implicit numeric widening admitted by sema (e.g. an `int` literal assigned
+// to a `long`-typed property) must be made explicit in the IR.
+bool Emitter::lowerImportedPropertySetValue(const ast::Expr& target,
+                                            llvm::Value* v) {
+    if (!v) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target);
+    if (!ma || !ma->target) return false;
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+    if (!ps || ps->isIndexer) return false;
+    auto sit = importedPropSetterFns_.find(ps);
+    if (sit == importedPropSetterFns_.end()) return false;
+    llvm::Value* recv = lowerExpr(*ma->target);
+    if (!recv || !recv->getType()->isPointerTy()) return false;
+    llvm::Function* fn = sit->second;
+    llvm::Type* valTy = fn->getFunctionType()->getParamType(1);
+    v = coerceNumericToType(v, valTy, isUnsignedTargetExpr(target));
+    builder_.CreateCall(fn->getFunctionType(), fn, {recv, v});
+    emitPendingCheck();
+    return true;
+}
+
+
+// #2204/§28.3 (found by this fix's own self-pass, not the original issue):
+// the shape check MUST run — and fail — BEFORE `value` is lowered. An earlier
+// version of this function lowered `value` unconditionally, exactly like
+// lowerPropertySet's own `llvm::Value* v = lowerExpr(value); return v ? ... :
+// false;` shape — but lowerPropertySet's FIRST line is `if
+// (!computedSetterOf(target)) return false;`, a pure AST/symbol shape check
+// with no side effects, so its own value-lowering is unreachable for a
+// non-matching target. This function has no such pre-check, so lowerExpr(value)
+// ran for EVERY assignment target this fallback was tried against — every
+// indexer set (`arr[i] := v`, an ast::IndexExpr, never a MemberAccessExpr) and
+// every LOCAL (non-imported) auto-property set (computedSetterOf itself
+// excludes auto-properties, so lowerPropertySet also fails for those,
+// reaching this fallback) — discarding the resulting value and evaluating the
+// SAME expression a SECOND time in the real indexer/field-store path that
+// runs afterward. For an RHS that creates a fresh owned temporary (`new T()`,
+// an owned-returning call), this DOUBLE-EVALUATED and hence DOUBLE-CREATED a
+// temporary — confirmed by this fix's own broader self-pass sweep, which a
+// narrower one would have missed: borrowing_collection_indexer_set_temp_2204,
+// collection_indexer_388, owned_array_set_dispose_919, owning_span_779,
+// interface_indexer_401, and codegen_escaping_string_429's auto-property case
+// all failed under the double-evaluation before this fix. Mirrors
+// lowerPropertySet's discipline: check the target's SHAPE (MemberAccessExpr →
+// PropertySymbol → present in importedPropSetterFns_) first, with no side
+// effects, and only call lowerExpr(value) once that succeeds.
+bool Emitter::lowerImportedPropertySet(const ast::Expr& target,
+                                       const ast::Expr& value) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target);
+    if (!ma || !ma->target) return false;
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+    if (!ps || ps->isIndexer) return false;
+    if (!importedPropSetterFns_.count(ps)) return false;
+    llvm::Value* v = lowerExpr(value);
+    return v ? lowerImportedPropertySetValue(target, v) : false;
 }
 
 
