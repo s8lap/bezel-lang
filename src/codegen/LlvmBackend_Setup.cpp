@@ -1969,10 +1969,11 @@ void Emitter::declareImportedFunctions() {
 
 // §2.5 / §22.9 (issue #503): emit a named, ExternalLinkage getter function for
 // every public non-virtual non-indexer PropertySymbol on every public non-generic
-// local class. The function `bz$<Class>$<Prop>$propget(ptr %this) -> T` has the
-// same signature as the virtual-property accessor (ensurePropertyAccessorFn),
-// which is InternalLinkage. A separate ExternalLinkage wrapper is used so the
-// importer can call it without touching the (potentially inlined) local accessor.
+// local class OR RECORD. The function `bz$<Class>$<Prop>$propget(ptr %this) -> T`
+// has the same signature as the virtual-property accessor
+// (ensurePropertyAccessorFn), which is InternalLinkage. A separate ExternalLinkage
+// wrapper is used so the importer can call it without touching the (potentially
+// inlined) local accessor.
 //
 // The body calls `ensurePropertyAccessorFn(ts, ps, /*isSet=*/false)` (which does
 // the real work and caches the getter) — then the wrapper just tail-calls it.
@@ -1984,10 +1985,30 @@ void Emitter::declareImportedFunctions() {
 // slot carries the concrete accessor). Only plain, non-virtual getters need a
 // stable cross-module symbol. Static properties have no `this` parameter and are
 // handled separately by the static-field path; they're excluded here.
+//
+// fix #2474 (§9.2/§22.9, v0.235): originally CLASS-only. A RECORD's computed
+// (arrow/block) property has no storage slot for the importer to GEP directly
+// (unlike an auto-property, whose imported read goes through the #2478
+// storage-layout path instead and never reaches this function at all) — the
+// only way to read it cross-module is a real function call, exactly as for a
+// class. This function's own body-building delegate, ensurePropertyAccessorFn,
+// was ALREADY fully general here (it declares `this` as `ptr` unconditionally,
+// see its own comment, and its `classStruct(cls)` call already routes to
+// `recordStruct` for a Record — LlvmBackend_Layout.cpp classStruct, "CG29: a
+// record has no vtable header; route to recordStruct"): only THIS gate excluded
+// records. Pre-fix, `declareImportedPropertyGetters` (the importer-side twin,
+// which does NOT filter by kind) still declared an `ExternalLinkage` reference
+// to `bz$<Record>$<Prop>$propget` for an imported record's computed property —
+// so a program that reached that call site (post this commit's OTHER fix, the
+// by-value record-receiver spill a few lines below in LlvmBackend_Exprs.cpp)
+// hit an `undefined reference` LINK error, because no module ever DEFINED that
+// symbol for a record. Confirmed by direct before/after testing during this
+// fix: the record receiver-spill fix alone was necessary but not sufficient.
 void Emitter::emitExportedPropertyGetters() {
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        if (!ts || (ts->kind != ast::TypeDeclKind::Class &&
+                    ts->kind != ast::TypeDeclKind::Record)) continue;
         if (ts->visibility != ast::Visibility::Public) continue;
         if (!ts->genericParams.empty()) continue;
         for (sema::Symbol* m : ts->members) {

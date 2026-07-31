@@ -3285,7 +3285,31 @@ llvm::Value* Emitter::implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy)
     auto* ms = storageMemberOf(ctx_.exprSymbol(e));
     if (!ms || !ms->parent || !currentThis_) return nullptr;
     auto idxIt = fieldIndex_.find(ms);
-    if (idxIt == fieldIndex_.end()) return nullptr;  // static field
+    // fix #2474 (§9.2/§22.9, v0.235): `idxIt == end()` here does NOT
+    // necessarily mean `ms` is a static field (the pre-fix assumption, which
+    // returned null unconditionally at this point) — fieldIndex_ is
+    // populated lazily, by classStruct/recordStruct's FIRST call for
+    // ms->parent. A local CLASS always has its struct built early
+    // (declareVtables calls classStruct for every class up front to lay out
+    // the vtable), but a RECORD's struct is built lazily on first real use.
+    // When a record field is read ONLY from inside that field's own
+    // computed-property getter body (`property Getter: int => _pub;`, e.g.
+    // via emitExportedPropertyGetters/ensurePropertyAccessorFn — #2474's own
+    // fix widened that path to records — with no OTHER use of the record
+    // earlier in the same module), THIS call can be the very first thing to
+    // touch the record's layout at all, so the struct genuinely has not
+    // been built yet. The sibling qualified-access path, `fieldAddr` (a few
+    // hundred lines below in this file), already retries via
+    // `classStruct(ms->parent)` before concluding a field is absent —
+    // exactly the "imported/sibling path does a step this one skips" shape
+    // (lane protocol) except the sibling here isn't cross-module, it's this
+    // function's own qualified-access twin. Do not conclude "static field"
+    // (and return null, silently collapsing the caller's whole expression to
+    // a zero constant via ensurePropertyAccessorFn's own null-value
+    // fallback) until AFTER the retry below — which needs the ancestor
+    // generic-substitution setup installed first, exactly as fieldAddr does,
+    // so it is deferred to occur once that setup below has run rather than
+    // duplicated here.
     // §12 / §14 (#989): an INHERITED field declared on a generic base (ms->parent
     // has generic params) accessed via bare identifier inside a derived-class
     // method (implicit `this.field`). classStruct(ms->parent) with no active
@@ -3331,6 +3355,16 @@ llvm::Value* Emitter::implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy)
     if (idxIt == fieldIndex_.end()) {
         classStruct(ms->parent);
         idxIt = fieldIndex_.find(ms);
+        // fix #2474: still absent after the struct is actually built ->
+        // genuinely a static field (or otherwise not instance storage), the
+        // ORIGINAL "static field" conclusion — restore state and bail, same
+        // as the pre-fix unconditional-null return did, just now correctly
+        // deferred until the lazy build has had a chance to populate it.
+        if (idxIt == fieldIndex_.end()) {
+            genericSubst_ = std::move(savedSubst);
+            genericSubstSemaTy_ = std::move(savedSemaTy);
+            return nullptr;
+        }
     }
     llvm::StructType* st = classStruct(ms->parent);
     elemTy = st->getElementType(idxIt->second);

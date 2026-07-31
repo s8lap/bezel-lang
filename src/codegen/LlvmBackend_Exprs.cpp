@@ -4290,6 +4290,31 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             auto git = importedPropGetterFns_.find(ps);
             if (git != importedPropGetterFns_.end() && ma->target) {
                 llvm::Value* obj = lowerExpr(*ma->target);
+                // fix #2474 (§9.2/§22.9, v0.235): issue #347's own rationale
+                // applies here exactly as it does to the LOCAL computed-getter
+                // path above (~L4122-4156) and the block-getter path above
+                // that (~L4257-4267) — a RECORD receiver lowers to a by-value
+                // struct, not a heap pointer, but declareImportedPropertyGetters
+                // unconditionally declares the external stub as `T get(ptr
+                // %this)` (LlvmBackend_Setup.cpp declareImportedPropertyGetters,
+                // `{ptrTy()}`). Pre-fix, a non-pointer `obj` (any record
+                // receiver) failed `isPointerTy()` and fell through this whole
+                // `if`, past CG8's field-read fallback (which does not resolve
+                // a PropertySymbol either), out of lowerExpr entirely as a bare
+                // `nullptr` — a silent, contextless failure: `return r.Getter;`
+                // alone degraded to a bare 0 with no diagnostic, `var g :=
+                // r.Getter;` hit lowerLocalDecl's #2434 zero-init backstop
+                // (loud, but still 0), and `r.x + r.Getter` returned nullptr
+                // from lowerBinary's `if (!l || !r) return nullptr;` (line
+                // ~5537) — discarding r.x's already-correctly-lowered value
+                // too, not just the failing operand. Spill the record value to
+                // a stack slot and pass that slot's address as `this`,
+                // mirroring the sibling paths exactly.
+                if (obj && !obj->getType()->isPointerTy()) {
+                    llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+                    builder_.CreateStore(obj, tmp);
+                    obj = tmp;
+                }
                 if (obj && obj->getType()->isPointerTy()) {
                     llvm::Value* res = builder_.CreateCall(
                         git->second->getFunctionType(), git->second, {obj});
