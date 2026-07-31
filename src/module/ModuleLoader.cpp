@@ -465,6 +465,14 @@ struct Loader {
                 // field's comment in ModuleMetadata.hpp for why this cannot be
                 // derived from `p->modifiers` alone.
                 propHasSetter_[p] = mm.hasSetter;
+                // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4):
+                // MetaMember::setterVisibility, published to
+                // ctx.importedPropertySetterVisibility() below — the
+                // setter's EFFECTIVE visibility (`private set` etc.), needed
+                // because an imported PropertySymbol has no ast::PropertyDecl
+                // to read `pd->accessors[i].visibility` from at the
+                // cross-module assignment site.
+                propSetterVisibility_[p] = fromMetaVisibility(mm.setterVisibility);
                 applyBehavior(p);
                 return p;
             }
@@ -516,6 +524,10 @@ struct Loader {
                 // comment in ModuleMetadata.hpp ("Ignored for every kind but
                 // Property/Indexer").
                 propHasSetter_[p] = mm.hasSetter;
+                // fix #2415's bit, reused for indexers per its own field
+                // comment in ModuleMetadata.hpp ("Ignored for every kind but
+                // Property/Indexer").
+                propSetterVisibility_[p] = fromMetaVisibility(mm.setterVisibility);
                 applyBehavior(p);
                 return p;
             }
@@ -584,6 +596,12 @@ struct Loader {
     // from MetaMember::hasSetter — published to
     // ctx.setImportedPropertyHasSetter() below.
     std::unordered_map<const sema::MemberSymbol*, bool> propHasSetter_;
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): imported
+    // property/indexer setter EFFECTIVE visibility, from
+    // MetaMember::setterVisibility — published to
+    // ctx.setImportedPropertySetterVisibility() below.
+    std::unordered_map<const sema::MemberSymbol*, ast::Visibility>
+        propSetterVisibility_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const sema::MemberSymbol*, std::string> constValues_;
 };
@@ -2008,6 +2026,12 @@ static void loadMetadataPass2(
     // tell a genuinely settable imported property from a getter-only one.
     for (auto& [m, hs] : loader.propHasSetter_)
         ctx.setImportedPropertyHasSetter(m, hs);
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): publish the
+    // imported property/indexer setter's EFFECTIVE visibility so the `:=`
+    // assignment-target check (ExprTypecheck.cpp) can enforce §13.6 across a
+    // module boundary the same way it already does locally.
+    for (auto& [m, sv] : loader.propSetterVisibility_)
+        ctx.setImportedPropertySetterVisibility(m, sv);
     // §22.12 (issue #328 FINDING [3] BUG A): publish imported const values so
     // codegen can fold an imported `const` read without a storage symbol.
     for (auto& [m, val] : loader.constValues_)

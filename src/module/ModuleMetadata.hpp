@@ -449,6 +449,34 @@ struct MetaMember {
     // been recompiled).
     bool hasSetter = false;
 
+    // §13.6 / §23.3 / §2.8.2 clause 1 / §2.8.3 rule 4 (fix #2415, additive
+    // within v7 — same shape as hasSetter above): for a Property (or
+    // Indexer) member, the setter accessor's EFFECTIVE visibility. §13.6:
+    // "A property or indexer's `get` or `set` may carry its own visibility,
+    // which must not be *less* restrictive than the property's overall
+    // visibility... An accessor without explicit visibility inherits the
+    // property's overall visibility." A settable property's `hasSetter` bit
+    // alone only recovers WHETHER a setter exists, not WHO may call it — a
+    // `private set` / `protected set` / `internal set` on an imported
+    // property was silently unenforceable at the cross-module assignment
+    // site (no ast::PropertyDecl to read `pd->accessors[i].visibility` /
+    // `pd->autoAccessorVis` from, and no side-table equivalent existed), so
+    // `d.Name := 999` on a `private set` imported property compiled clean —
+    // a visibility bypass. This field carries the ALREADY-RESOLVED effective
+    // visibility (the accessor override when present, else the property's
+    // own declared visibility — mirroring ExprTypecheck.cpp's local `sv`
+    // computation exactly, so the exporter and the local same-module check
+    // agree by construction). Ignored for every kind but Property/Indexer,
+    // and meaningless when `hasSetter` is false (no setter to restrict). A
+    // v7-or-earlier blob (predating this fix) has no 12th scalar; the reader
+    // defaults this to `MetaVisibility::Private` — the SAFE direction is to
+    // reject a cross-module write to a settable property of unknown setter
+    // visibility rather than silently permit it (§2.8.2 clause 1: an
+    // implementation that cannot carry a shape "must reject... it must not
+    // alter the instantiation's semantics"), exactly mirroring why
+    // hasSetter's own missing-scalar default is `false` rather than `true`.
+    MetaVisibility setterVisibility = MetaVisibility::Public;
+
     // §22.16 / §2.8.2: clauses in declaration order. For a `when` form from
     // §22.4 the builder emits the equivalent static-ensures record here.
     std::vector<MetaContractRecord> contracts;

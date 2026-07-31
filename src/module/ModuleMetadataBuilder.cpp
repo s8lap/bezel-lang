@@ -995,6 +995,31 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 for (const auto& a : pd->accessors)
                     if (a.isSet) { out.hasSetter = true; break; }
             }
+            // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): mirror
+            // ExprTypecheck.cpp's local `:=`-assignment-target `sv`
+            // computation exactly (and checkRefOutPropertyOperand's ref/out
+            // mirror of the same logic) — an accessor-level visibility
+            // override (`pd->accessors[i].visibility` for a block property,
+            // `pd->autoAccessorVis` for the `private set;` auto-property
+            // shorthand, §13.6) wins when present; otherwise the setter
+            // inherits the property's own declared visibility. Computed
+            // here (export time) rather than shared across the
+            // module/codegen boundary because, like hasSetter above, the
+            // importer never reconstructs an ast::PropertyDecl to read this
+            // from. Only meaningful when out.hasSetter is true; harmless
+            // (ignored on read) otherwise.
+            ast::Visibility sv = pd->visibility;
+            if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+                for (const auto& a : pd->accessors)
+                    if (a.isSet && a.visibility != ast::Visibility::None) {
+                        sv = a.visibility;
+                        break;
+                    }
+            } else if (pd->bodyKind == ast::PropertyBodyKind::Auto &&
+                       pd->hasAutoAccessorVis && pd->autoAccessorIsSet) {
+                sv = pd->autoAccessorVis;
+            }
+            out.setterVisibility = toMetaVisibility(sv, inInterface);
         }
         return true;
     }

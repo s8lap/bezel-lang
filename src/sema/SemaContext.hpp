@@ -341,6 +341,28 @@ public:
         return it != importedPropertyHasSetter_.end() && it->second;
     }
 
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): an imported
+    // Property (or Indexer) member's setter's EFFECTIVE visibility —
+    // MetaMember::setterVisibility (see its field comment in
+    // ModuleMetadata.hpp). `hasSetter` above only recovers whether a setter
+    // EXISTS; this recovers WHO may call it — without it, a `private set` /
+    // `protected set` / `internal set` on an imported property was
+    // unenforceable at the cross-module `:=` assignment site (the identical
+    // same-module shape was, correctly, already rejected). Absent (never
+    // set, e.g. any non-property import) defaults to `ast::Visibility::
+    // Private` — the reject-conservative direction, so an unrecognized
+    // shape is refused rather than silently permitted (§2.8.2 clause 1).
+    void setImportedPropertySetterVisibility(const Symbol* m,
+                                             ast::Visibility v) {
+        importedPropertySetterVisibility_[m] = v;
+    }
+    ast::Visibility importedPropertySetterVisibility(const Symbol* m) const {
+        auto it = importedPropertySetterVisibility_.find(m);
+        return it != importedPropertySetterVisibility_.end()
+            ? it->second
+            : ast::Visibility::Private;
+    }
+
     // §22.12 (issue #328 FINDING [3] BUG A): an imported class-level `const` has
     // no storage symbol in the library — a const initializer is a compile-time
     // constant expression, so the library emits no global. The loader records
@@ -426,6 +448,11 @@ private:
     // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): imported property/indexer setter
     // presence, from MetaMember::hasSetter.
     std::unordered_map<const Symbol*, bool> importedPropertyHasSetter_;
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): imported
+    // property/indexer setter EFFECTIVE visibility, from
+    // MetaMember::setterVisibility.
+    std::unordered_map<const Symbol*, ast::Visibility>
+        importedPropertySetterVisibility_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const Symbol*, std::string> importedConstValues_;
     // §14 / #662c: imported SourceFile objects that own re-parsed ctor/dtor

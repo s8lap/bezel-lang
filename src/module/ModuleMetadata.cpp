@@ -143,6 +143,12 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // into the semantic hash or a consumer's staleness check cannot see the
     // change (§2.8.3 rule 3: staleness is an error, not a negotiation).
     hashBool(h, m.hasSetter);
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): the setter's
+    // EFFECTIVE visibility is also part of the Property's signature
+    // identity — a library tightening `set` to `private set` (or
+    // loosening it) changes the cross-module contract, so it must fold
+    // into the semantic hash the same way hasSetter does above.
+    hashByte(h, static_cast<std::uint8_t>(m.setterVisibility));
     hashU64(h, m.contracts.size());
     for (const MetaContractRecord& c : m.contracts) hashContract(h, c);
     hashType(h, m.type);
@@ -281,7 +287,8 @@ MetaMember::MetaMember(const MetaMember& o)
       modifiers(o.modifiers), type(o.type), valueText(o.valueText),
       ctorBodyText(o.ctorBodyText), methodBodyText(o.methodBodyText),
       fieldInitText(o.fieldInitText),
-      isPure(o.isPure), hasSetter(o.hasSetter), contracts(o.contracts),
+      isPure(o.isPure), hasSetter(o.hasSetter),
+      setterVisibility(o.setterVisibility), contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
       hasEnumValue(o.hasEnumValue), enumValue(o.enumValue) {
@@ -295,7 +302,8 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         modifiers = o.modifiers; type = o.type; valueText = o.valueText;
         ctorBodyText = o.ctorBodyText; methodBodyText = o.methodBodyText;
         fieldInitText = o.fieldInitText;
-        isPure = o.isPure; hasSetter = o.hasSetter; contracts = o.contracts;
+        isPure = o.isPure; hasSetter = o.hasSetter;
+        setterVisibility = o.setterVisibility; contracts = o.contracts;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
         hasEnumValue = o.hasEnumValue; enumValue = o.enumValue;
@@ -318,7 +326,11 @@ bool MetaMember::operator==(const MetaMember& o) const {
            // above for why it must compare unequal when it differs (a
            // getter-only vs. read-write property are NOT the same member,
            // structurally or semantically).
-           hasSetter == o.hasSetter && contracts == o.contracts &&
+           hasSetter == o.hasSetter &&
+           // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): the
+           // setter's effective visibility is part of the Property's
+           // signature identity — see the hashMember comment above.
+           setterVisibility == o.setterVisibility && contracts == o.contracts &&
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
            hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
@@ -457,7 +469,12 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // #2392's PARAM_BLOCK outNullWhen — a pre-#2400 reader's `sc.size() < 8`
     // gate never looks past index 7, so it is unaffected; see the hasSetter
     // field comment in ModuleMetadata.hpp for the full rationale.
-    llvm::SmallVector<std::uint64_t, 11> sc{
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4, additive within
+    // v7): setterVisibility is a 12th trailing scalar, same additive shape —
+    // a pre-#2415 reader's `sc.size() < 8` gate never looks past index 7, so
+    // it too is unaffected; see the setterVisibility field comment in
+    // ModuleMetadata.hpp for the full rationale.
+    llvm::SmallVector<std::uint64_t, 12> sc{
         static_cast<std::uint64_t>(m.kind),
         static_cast<std::uint64_t>(m.visibility),
         m.isOperator ? 1u : 0u,
@@ -469,6 +486,7 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
         m.contracts.size(),
         m.isPure ? 1u : 0u,
         m.hasSetter ? 1u : 0u,
+        static_cast<std::uint64_t>(m.setterVisibility),
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, m.name);
@@ -945,6 +963,15 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     // see the field's comment in ModuleMetadata.hpp for why "no setter" is
     // the safe default for an old, not-yet-recompiled dependency.
     m.hasSetter = sc.size() >= 11 && sc[10] != 0;
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4, additive within
+    // v7): 12th scalar. A pre-#2415 blob has at most 11 scalars;
+    // setterVisibility defaults to `Private` — the reject-conservative
+    // direction (see the field's comment in ModuleMetadata.hpp) — rather
+    // than `Public`, which would silently reopen the exact bypass this fix
+    // closes for any dependency compiled before it.
+    m.setterVisibility = sc.size() >= 12
+        ? static_cast<MetaVisibility>(sc[11])
+        : MetaVisibility::Private;
     if (!expectString(r, m.name)) return false;
     if (!readStringList(r, m.modifiers)) return false;
     if (!readType(r, m.type)) return false;

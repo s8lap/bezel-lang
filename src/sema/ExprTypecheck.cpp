@@ -10466,17 +10466,85 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             // ever valid on it from outside its declaring
                             // module, so one message covers both source
                             // shapes the same way the local `!hasSetter`
-                            // branch's message already does. (A settable
-                            // imported property's setter-VISIBILITY, §13.6,
-                            // is not checked here — that is a separate,
-                            // further #2374 instance, filed as its own issue
-                            // rather than folded into this fix's scope.)
+                            // branch's message already does.
                             if (!ctx_.importedPropertyHasSetter(ps)) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, as->span.begin,
                                     "cannot assign to read-only property `" +
                                     propName +
                                     "` — it has no setter (§23.3)");
+                            } else {
+                                // fix #2415 (§13.6, §23.3, §2.8.2 clause 1 /
+                                // §2.8.3 rule 4, v0.235): the setter EXISTS
+                                // (hasSetter above), but its VISIBILITY was
+                                // never enforced across the module boundary —
+                                // a `private set` / `protected set` /
+                                // `internal set` imported property was
+                                // writable from anywhere through the import,
+                                // even though the identical same-module shape
+                                // is correctly rejected (§13.6: "A property or
+                                // indexer's `get` or `set` may carry its own
+                                // visibility, which must not be *less*
+                                // restrictive than the property's overall
+                                // visibility"). `ctx_.
+                                // importedPropertySetterVisibility(ps)`
+                                // publishes MetaMember::setterVisibility
+                                // (#2415), the ALREADY-RESOLVED effective
+                                // visibility computed at export time by
+                                // mirroring the `sv` computation just above
+                                // verbatim.
+                                //
+                                // Applying the §13.1 access levels across a
+                                // module boundary:
+                                //   - Private ("the declaring class only"):
+                                //     always inaccessible here — `declaring`
+                                //     is the imported TypeSymbol reconstructed
+                                //     by ModuleLoader, and `currentType_` is
+                                //     always a type compiled in THIS
+                                //     (importing) module, so the two can never
+                                //     be the same symbol — unconditional
+                                //     reject.
+                                //   - Protected ("the declaring class and all
+                                //     classes derived from it", §13.1 — no
+                                //     module qualifier): reuse `isSubtype`,
+                                //     which already walks `baseTypes` through
+                                //     a reconstructed imported base (proven by
+                                //     #2400's inherited-setter itable tests),
+                                //     so a LOCAL subclass of the imported
+                                //     declaring type is still accepted.
+                                //   - Internal ("code in the same module",
+                                //     §13.1): the importing module is BY
+                                //     DEFINITION a different module than the
+                                //     declaring one, so this is also an
+                                //     unconditional reject — mirroring how
+                                //     the local check's `ctx_.isImported(ps)`
+                                //     is unconditionally true for every ps
+                                //     that reaches this `else` branch at all.
+                                //   - Public / None (no restriction, or the
+                                //     property's own — already-checked —
+                                //     visibility with no accessor override):
+                                //     no further restriction.
+                                ast::Visibility sv =
+                                    ctx_.importedPropertySetterVisibility(ps);
+                                TypeSymbol* declaring = ps->parent;
+                                bool bad = false;
+                                if (sv == ast::Visibility::Private) {
+                                    bad = true;
+                                } else if (sv == ast::Visibility::Protected) {
+                                    bad = !(currentType_ &&
+                                            isSubtype(currentType_,
+                                                      declaring));
+                                } else if (sv == ast::Visibility::Internal) {
+                                    bad = true;
+                                }
+                                if (bad) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, as->span.begin,
+                                        "cannot assign to property `" +
+                                        propName +
+                                        "` — its setter is not accessible "
+                                        "here (§13.6)");
+                                }
                             }
                         }
                 }
