@@ -8,7 +8,7 @@
 // the duration of the call) but may not be assigned to an `owned` field,
 // returned as `owned`, or captured by a closure that may outlive the arm."
 // "Exception instances themselves cannot escape the arm that caught them. The
-// bare re-throw `throw;` ... is the one exception to this rule." Guide 02 §3
+// bare re-throw `throw;` ... is the one exception to this rule." Guide 02 §5
 // shows `_lastError := ex;` (storing the binding into a field) as a COMPILE
 // ERROR, and lists the three prohibited operations: assign to an owned field,
 // return as owned, capture in a closure that outlives the arm.
@@ -46,7 +46,7 @@ namespace {
 // `Use(e: Exception): int` value-returning helper (for closure bodies), and a
 // `DoWork()` whose call inside the `try` body is the protected operation. The
 // catch arms bind the built-in `Exception` type (§31.4), exactly as the spec
-// and Guide 02 §3 examples do.
+// and Guide 02 §5 examples do.
 std::string wrap(const std::string& method) {
     return std::string(
         "module M; "
@@ -63,7 +63,7 @@ std::string wrap(const std::string& method) {
 
 // =====================================================================
 // POSITIVE 1 — store the catch binding into an `owned` field (§31.1; the
-//              `_lastError := ex;` error from Guide 02 §3).
+//              `_lastError := ex;` error from Guide 02 §5).
 // =====================================================================
 
 // Direct: `this._f := ex;` stores the in-flight exception's borrow into an
@@ -277,7 +277,7 @@ BEZEL_TEST(catch_escape_closure, local_closure_capturing_binding_invoked_locally
 // =====================================================================
 // CROSS-CUTTING negative controls — the arm body that only reads / uses the
 // exception locally and lets it go is the idiomatic, legal shape (§31.1; the
-// `RecordError(ex)` pattern of Guide 02 §3).
+// `RecordError(ex)` pattern of Guide 02 §5).
 // =====================================================================
 
 // CONTROL (§31.1): using the binding purely locally — a borrow-call plus a

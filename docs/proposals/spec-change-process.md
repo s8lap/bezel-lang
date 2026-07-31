@@ -17,9 +17,9 @@ The governing principle is unchanged from `CLAUDE.md`: **the spec is the source 
 
 ---
 
-## 1. The six documents and what "changing the spec" means
+## 1. The seven documents and what "changing the spec" means
 
-The normative language is exactly the six documents in `docs/`:
+The normative language is exactly the seven documents in `docs/`:
 
 | Document | Role | Carries the revision number? |
 |---|---|---|
@@ -29,6 +29,7 @@ The normative language is exactly the six documents in `docs/`:
 | `Bezel_Changelog.md` | the per-revision narrative history; one entry per revision, pinned | **yes** — companion header |
 | `Bezel_Guide_01_Memory_and_Ownership.md` | example-first idiom guide | no (revalidation pin only) |
 | `Bezel_Guide_02_Errors_and_Nullability.md` | example-first idiom guide | no (revalidation pin only) |
+| `Bezel_Guide_03_Modeling_Data.md` | example-first idiom guide | no (revalidation pin only) |
 
 `docs/proposals/` is **not** normative. A proposal is a design under consideration; it becomes normative only by *graduating* — being amended into the normative documents through this process, at which point the proposal file's `Status` flips to `superseded` with a pointer to the landed revision.
 
@@ -38,7 +39,7 @@ A single **revision** (v0.NNN → v0.NNN+1) is the atomic unit of change: one ve
 
 ## 2. Change classes — different changes earn different gates
 
-Not every change deserves the same ceremony. Classify the change first; the class determines the required gate (§3–§4) and the artifacts (§5).
+Not every change deserves the same ceremony. Classify the change first; the class determines the required gate (§3–§4) and the artifacts (§5). One carve before classifying: a change touching **only the guides** is not a revision and takes no class — see §5 item 5's guide-only-pass rule.
 
 | Class | What it is | Examples | Required gate |
 |---|---|---|---|

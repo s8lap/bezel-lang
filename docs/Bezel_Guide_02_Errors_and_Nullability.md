@@ -2,7 +2,7 @@
 
 *A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.236.*
 
-If you know C#, Kotlin, or Swift, the syntax here is familiar: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. The *emphasis* is not. Bezel splits failure signals by one rule (the **failure-signal rule**, stdlib §1), and it is worth knowing the shape before the details: an **expected absence** returns a value — `T?` or a `Try` shape (§2); an **expected outcome the caller branches on** returns a `Result<T, E>` or a domain choice (§3); a **caller bug** is a contract (`requires`) or defect exception, and a **boundary fault** — I/O, network, anything logged or retried rather than branched on — is a typed exception (§4); a handful of fatal conditions simply terminate. So in Bezel application code the common case is a value return, and exceptions are the boundary-and-defect tool — not the default. Beyond the emphasis, two ownership rules change habits those languages taught you — a caught exception is a *borrow* (§5), and cleanup on the exception path is *automatic* (§6) — each headed **How Bezel does it**; if you skim everything else, read those and the table in §7.
+If you know C#, Kotlin, or Swift, the syntax here is familiar: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. The *emphasis* is not. Bezel splits failure signals by one rule (the **failure-signal rule**, stdlib §1), and it is worth knowing the shape before the details: an **expected absence** returns a value — `T?` or a `Try` shape (§2); an **expected outcome the caller branches on** — with a plain value payload — returns a `Result<T, E>` or a domain choice (§3); a **caller bug** is a contract (`requires`, §7) or defect exception, and a **boundary fault** — I/O, network, anything logged or retried rather than branched on — is a typed exception (§4); a handful of fatal conditions simply terminate. So in Bezel application code the common case is a value return, and exceptions are the boundary-and-defect tool — not the default. Beyond the emphasis, two ownership rules change habits those languages taught you — a caught exception is a *borrow* (§5), and cleanup on the exception path is *automatic* (§6) — each headed **How Bezel does it**; if you skim everything else, read those and the table in §7.
 
 **Contents:** §1 nullability basics · §2 expected absence: `T?`, `*OrNull`, `Try` · §3 expected outcomes: `Result<T, E>` and domain choices · §4 exceptions: the familiar shape · §5 a caught exception is a borrow · §6 cleanup without leaks · §7 choosing the right tool.
 
@@ -52,7 +52,7 @@ Locals can lose their narrowing too: a local that is **mutably captured** — as
 
 ## 2. Expected failure: absence — `T?`, the `*OrNull` tier, and the `Try` pattern
 
-Exceptions are for the unexpected. For failures that are part of normal control flow, return the outcome. The simplest expected failure is **absence** — a cache miss, a lookup with nothing under the key, a parse of input that may legitimately be malformed. Two shapes cover it.
+Expected failure is a value, not a throw — exceptions are the boundary-and-defect tool (§4). For failures that are part of normal control flow, return the outcome. The simplest expected failure is **absence** — a cache miss, a lookup with nothing under the key, a parse of input that may legitimately be malformed. Two shapes cover it; §3 adds the third.
 
 **Nullable return** for "maybe there is a value":
 
@@ -163,7 +163,7 @@ Note the `AndThen` lambda's return-type ascription: it makes the lambda's own re
 
 ## 4. Exceptions: the familiar shape
 
-For everything the value shapes don't cover — the boundary fault, the defect — the exception machinery is the familiar one. `try` / `catch` / `finally`, with `catch` arms that look like `case` arms (pattern + optional guard + body), tried top to bottom:
+For everything the value shapes don't cover — the boundary fault, and the defect a `requires` contract (§7) cannot state — the exception machinery is the familiar one. `try` / `catch` / `finally`, with `catch` arms that look like `case` arms (pattern + optional guard + body), tried top to bottom:
 
 ```bezel
 try
@@ -179,7 +179,7 @@ end;
 
 `finally` always runs — normal completion, exception, or `return`. An unmatched exception simply keeps propagating (there is no exhaustiveness warning on `catch`; letting non-matching exceptions through is normal). `return` inside `finally` is a compile error.
 
-The built-in hierarchy is what you would expect — `ArgumentException` (with `ArgumentNullException` under it), `InvalidOperationException`, `FormatException`, `OverflowException`, and so on, available without `import` (the full set is spec §31.4). Library producers declare their own exception types beside their APIs — `IOException` and `FileNotFoundException` with the file APIs, `KeyNotFoundException` with `Dictionary<K, V>` — reached by the producer's `import` and otherwise ordinary. Arm patterns match subclasses: a `catch` arm for `ArithmeticException` also catches `OverflowException` and `DivideByZeroException`. Order arms most-specific first.
+The built-in hierarchy is what you would expect — `ArgumentException` (with `ArgumentNullException` under it), `InvalidOperationException`, `FormatException`, `OverflowException`, and so on, available without `import` (the full set is spec §31.4). Library producers declare their own exception types beside their APIs — `IOException` and `FileNotFoundException` with the file APIs, `KeyNotFoundException` with `Dictionary<K, V>`, and others — reached by the producer's `import` and otherwise ordinary. Arm patterns match subclasses: a `catch` arm for `ArithmeticException` also catches `OverflowException` and `DivideByZeroException`. Order arms most-specific first.
 
 Two resource-exhaustion faults are deliberately unrecoverable — no `catch` will ever handle them, and both terminate the process. A **stack overflow** raises a `StackOverflowException`: the type exists in the hierarchy, but it **cannot be caught** — no `catch` arm ever matches it. An out-of-memory **allocation failure** is not an exception at all: there is no `OutOfMemoryException`, nothing unwinds, the process simply aborts. Neither is something a `catch` could meaningfully handle — the "handler" would itself need the stack or heap that just ran out — so Bezel does not pretend otherwise.
 
