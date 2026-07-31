@@ -7133,6 +7133,21 @@ private:
     // initFns_.
     llvm::Function* declareImportedInit(const sema::TypeSymbol* ts);
 
+    // fix #2452 (§22.8 step 1-2 / §2.5 / §2.8.2-§2.8.3, v0.235): run an
+    // IMPORTED, no-explicit-ctor base's own construction sequence (its own
+    // base chain + its own field initializers) via the already-exported
+    // `bz$<Base>$init`, instead of `emitOwnFieldInit(base, …)` — which walks
+    // `ast::FieldDecl`/`PropertyDecl` initializers off each member's `decl`,
+    // always null for an imported symbol (the #2374-class gap), so it
+    // silently no-ops for every one of `base`'s fields. Undoes `bz$<Base>
+    // $init`'s own vtable-install side effect (save/restore around the call)
+    // so it does not clobber the most-derived vtable the `new` site already
+    // installed. Returns true if it handled construction (caller should NOT
+    // also call emitOwnFieldInit); false if `base` is not an eligible
+    // imported no-ctor class (caller falls back to the local path).
+    bool emitImportedBaseFieldInit(const sema::TypeSymbol* base,
+                                   llvm::Value* obj);
+
     // CG16: if `s` is a leading constructor chain call (`base(...)` or
     // `this(...)` as an ExpressionStmt-of-CallExpr), return the call and
     // set `isThis`; else null.

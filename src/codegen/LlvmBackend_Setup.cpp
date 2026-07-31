@@ -7650,8 +7650,19 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
         // reads them. currentThis_ is the constructing object (base subobject at
         // offset 0), which emitOwnFieldInit's implicitFieldAddr resolves against.
         if (!isThis && !hasAnyConstructor(targetCls)) {
-            emitImplicitBase(targetCls, currentThis_);
-            emitOwnFieldInit(targetCls, currentThis_, classStruct(targetCls));
+            // fix #2452 (§22.8 step 1-2 / §2.5, v0.235): an explicit
+            // `base(...)`/`base()` chain reaching a no-explicit-ctor
+            // `targetCls` hits the identical gap as the implicit-base case
+            // (emitImplicitBase) when `targetCls` is IMPORTED —
+            // emitOwnFieldInit's AST-walk silently no-ops for every field of
+            // an imported class. Try the imported no-ctor path first; it
+            // returns false (no-op) for a LOCAL targetCls, falling through
+            // to the original sequence unchanged.
+            if (!emitImportedBaseFieldInit(targetCls, currentThis_)) {
+                emitImplicitBase(targetCls, currentThis_);
+                emitOwnFieldInit(targetCls, currentThis_,
+                                 classStruct(targetCls));
+            }
         } else if (!isThis && n == 0) {
             // base() into a class whose own base still needs an implicit chain.
             emitImplicitBase(targetCls, currentThis_);
@@ -7941,6 +7952,54 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
 }
 
 
+// fix #2452 (§22.8 step 1-2 / §2.5 / §2.8.2-§2.8.3, v0.235): see the header
+// comment (LlvmBackend_impl.hpp) for the full rationale. `base` is an
+// IMPORTED class reached as a construction target (an implicit `base()`, or
+// an explicit `base(...)`/`this(...)` chain with no matching
+// ConstructorSymbol — i.e. `base` has no explicit constructor at all) whose
+// own field initializers must still run. Returns false (no-op) when `base`
+// is not imported, has an explicit constructor (the existing ctor-call paths
+// already handle that correctly), or is generic (out of scope — matches
+// #662's own generic-import boundary; a generic import has no stable
+// per-instantiation `bz$<Type>$init` symbol to link against).
+bool Emitter::emitImportedBaseFieldInit(const sema::TypeSymbol* base,
+                                        llvm::Value* obj) {
+    if (!ctx_.isImported(base) || hasAnyConstructor(base) ||
+        !base->genericParams.empty())
+        return false;
+    // Route through `bz$<Base>$init` — the SAME entry point a *direct*
+    // `new ImportedBase()` already uses correctly (confirming the exported
+    // body itself is right; only the locally-derived-construction paths
+    // failed to reach it). `emitInstanceInitFunction` (emitted while
+    // compiling `base`'s OWN module) runs exactly §22.8 steps 1+2 for
+    // `base`: its own implicit base chain, then its own field initializers —
+    // via the real AST, because in THAT module `base` is local. No new
+    // metadata field or export is needed: `bz$<Type>$init` is already
+    // unconditionally emitted for every public non-generic class
+    // (the `initFns_` emission loop above), exactly mirroring the existing
+    // declareImportedInit/declareImportedCtor naming-convention pattern
+    // (LlvmBackend_Exprs2.cpp's `lowerNew`) — this is a new CALL SITE for an
+    // existing, always-present symbol, not a new ABI surface.
+    //
+    // `bz$<Base>$init` ALSO installs `base`'s OWN vtable at obj[0] as its
+    // first step (`emitInstanceInit`) — correct for a *direct*
+    // `new ImportedBase()`, where `base` IS the most-derived type, but wrong
+    // here: `obj` belongs to a more-derived class whose own (possibly
+    // overriding) vtable was already installed by the `new`-site's own
+    // `emitInstanceInit` call before this ever runs. Save/restore the slot
+    // around the call so `base`'s vtable store is undone immediately — a
+    // plain no-op restore when `base` carries no vtable at all
+    // (`specializedVtableFor` returns null and the slot is never touched).
+    llvm::StructType* bst = classStruct(base);
+    llvm::Value* vtSlot = builder_.CreateStructGEP(bst, obj, 0, "b.vt.slot");
+    llvm::Value* savedVt = builder_.CreateLoad(ptrTy(), vtSlot, "b.vt.save");
+    llvm::Function* baseInitFn = declareImportedInit(base);
+    builder_.CreateCall(baseInitFn, {obj});
+    builder_.CreateStore(savedVt, vtSlot);
+    return true;
+}
+
+
 void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
     const sema::TypeSymbol* b = baseClassOf(cls);
     if (!b) return;
@@ -8012,7 +8071,16 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
         if (it != ctorFns_.end() && it->second->arg_size() == 1) {
             builder_.CreateCall(it->second, {obj});
         }
-    } else {
+    } else if (!emitImportedBaseFieldInit(b, obj)) {
+        // fix #2452 (§22.8 step 1-2 / §2.5, v0.235): `b` may be an IMPORTED
+        // no-explicit-ctor class — emitImportedBaseFieldInit (above) handles
+        // that shape by running the base's OWN exported `bz$<Base>$init`
+        // instead of emitOwnFieldInit, whose AST-walk silently no-ops for
+        // every field of an imported `b` (the #2374-class gap: an imported
+        // symbol's `decl` is always null). Returns false for a LOCAL `b` (or
+        // an out-of-scope generic import), falling through to the original
+        // local path unchanged.
+        //
         // §22.8 (#930): `b` has no parameterless ctor. If `b` is a
         // no-explicit-ctor class, run its own base sequence then its own field
         // initializers (step 2) — there is no `b` ctor to do so. (If `b` had
