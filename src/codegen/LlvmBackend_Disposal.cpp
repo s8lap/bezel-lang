@@ -2090,7 +2090,25 @@ llvm::Function* Emitter::elementDisposerThunk() {
     // block. This thunk is the element-dispose path that does NOT route through
     // emitDynamicDispose (it is invoked per live element by bz_array_free), so
     // the free must be emitted here too. obj is non-null in this block.
-    b.CreateCall(freeFn(), {obj});
+    //
+    // §28.2 v0.134 / issue #601 / #2514: mirror emitDisposeAndReclaim's
+    // checked-disposal quarantine — in checked mode the block is NOT freed
+    // after its Dispose runs, so the per-instance disposed flag (set by the
+    // vtable Dispose call above) stays readable for a later member-entry /
+    // field-access guard. This thunk is ALSO the per-T result_disposer attached
+    // to a Pattern A `Task<T:class>` at production
+    // (asyncPatternAResultDisposer_ → patternAResultDisposerFor → this thunk),
+    // so without the gate a stale borrow of a disposed task's result — the
+    // §28.7/§30.5/§30.10 drop-on-overwrite shape — reads FREED heap before the
+    // flag guard fires (a heap-use-after-free under ASan, #2173/#2514). Gating
+    // the free keeps the quarantined block's flag valid, making the stale read
+    // deterministically raise DisposedAccessException (§31.4) instead. The
+    // owning-collection element path is made sound the same way (each element
+    // is quarantined alongside the already-quarantined header,
+    // bz_array_mark_disposed). `checkedDisposal_` is fixed for the whole
+    // module compile, so baking the branch into the cached thunk is correct.
+    if (!checkedDisposal_)
+        b.CreateCall(freeFn(), {obj});
     b.CreateBr(retBB);
     b.SetInsertPoint(retBB);
     b.CreateRetVoid();
