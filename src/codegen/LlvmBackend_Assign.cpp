@@ -1951,8 +1951,48 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     // Both the getter and setter share the resulting slots so neither expression
     // is re-evaluated. This avoids observable double side-effects on the receiver
     // and/or index sub-expressions (per §23.4's single-evaluation contract).
-    llvm::Value* obj = lowerExpr(*ix->target);
-    if (!obj) return false;
+    //
+    // fix #2507 (§9.2/§23.4, v0.236): mirrors #2502's lowerIndexerSet fix (this
+    // file) — resolve the receiver's OWN storage address via `lvalueAddr` rather
+    // than loading a COPY via `lowerExpr`. The old `obj = lowerExpr(*ix->target)`
+    // LOADS a byte-for-byte copy for a named record-typed local (records are
+    // by-value, §9.2); that raw struct value was then bound directly as
+    // `currentThis_` below with NO pointer/aggregate check at all for the
+    // expression-getter and setter calls (the block-getter branch's own local
+    // `objPtr` spill did check, but never wrote the spilled address back to
+    // `obj`, so the setter call still got the unchecked raw copy). Confirmed by
+    // probe (this issue's own repro): `r[5] += 3; return r[2];` failed IR
+    // verification — "GEP base pointer is not a vector or a vector of pointers"
+    // / "Store operand must be a pointer" — a compile-time abort on a
+    // legitimate, spec-permitted shape (§23.4 read-write indexer on a record).
+    // Falls back to `lowerExpr` + spill only when the receiver expression is
+    // NOT an addressable place (a fresh temporary, where no "original" exists
+    // to preserve, so a spilled copy is legal-but-meaningless, not unsound).
+    llvm::Value* obj = nullptr;
+    llvm::Type* objElemTy = nullptr;
+    if (llvm::Value* addr = lvalueAddr(*ix->target, objElemTy)) {
+        if (objElemTy && objElemTy->isPointerTy())
+            obj = builder_.CreateLoad(objElemTy, addr);
+        else if (objElemTy && objElemTy->isAggregateType())
+            obj = addr;  // already the address of the receiver's real storage
+    }
+    if (!obj) {
+        llvm::Value* ov = lowerExpr(*ix->target);
+        if (!ov) return false;
+        if (ov->getType()->isPointerTy()) {
+            obj = ov;
+        } else if (ov->getType()->isAggregateType()) {
+            llvm::AllocaInst* tmp = entryAlloca(ov->getType());
+            builder_.CreateStore(ov, tmp);
+            obj = tmp;
+        } else {
+            return false;
+        }
+    }
+    // `obj` is now already pointer-typed in every path above (a loaded pointer,
+    // the receiver's own aggregate storage address, or a spilled temporary's
+    // address) — the block-getter branch's own `objPtr` check just below is
+    // therefore now defense-in-depth, not a required spill.
 
     // Spill each index param into a slot; the getter and setter bodies will
     // read back from paramSlots_ which we rebuild identically for each call.

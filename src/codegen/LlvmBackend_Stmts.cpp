@@ -1302,7 +1302,55 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 if ((getterExpr || getterBlock) &&
                                     (setterExpr || setterStmts)) {
                                     // Evaluate receiver once.
-                                    llvm::Value* obj = lowerExpr(*ix->target);
+                                    // fix #2507 (§9.2/§23.4, v0.236): mirrors
+                                    // lowerIndexerCompound's own #2507 fix
+                                    // (LlvmBackend_Assign.cpp) and, upstream of
+                                    // both, #2502's lowerIndexerSet fix —
+                                    // resolve the receiver's OWN storage
+                                    // address via `lvalueAddr` rather than
+                                    // loading a COPY via `lowerExpr`. The old
+                                    // `obj = lowerExpr(*ix->target)` LOADS a
+                                    // byte-for-byte copy for a named
+                                    // record-typed local; that raw struct was
+                                    // then bound directly as `currentThis_`
+                                    // below with NO pointer/aggregate check at
+                                    // all for the expression-getter/setter
+                                    // calls, crashing the IR verifier for
+                                    // `r[i]++` / `r[i]--` on a record indexer
+                                    // (confirmed by probe, same "GEP base
+                                    // pointer is not a vector" shape as
+                                    // lowerIndexerCompound's own repro). Falls
+                                    // back to `lowerExpr` + spill only for a
+                                    // non-addressable temporary receiver.
+                                    llvm::Value* obj = nullptr;
+                                    llvm::Type* objElemTy = nullptr;
+                                    if (llvm::Value* addr = lvalueAddr(
+                                            *ix->target, objElemTy)) {
+                                        if (objElemTy &&
+                                            objElemTy->isPointerTy())
+                                            obj = builder_.CreateLoad(
+                                                objElemTy, addr);
+                                        else if (objElemTy &&
+                                                 objElemTy->isAggregateType())
+                                            obj = addr;
+                                    }
+                                    if (!obj) {
+                                        llvm::Value* ov =
+                                            lowerExpr(*ix->target);
+                                        if (ov) {
+                                            if (ov->getType()->isPointerTy()) {
+                                                obj = ov;
+                                            } else if (
+                                                ov->getType()
+                                                    ->isAggregateType()) {
+                                                llvm::AllocaInst* tmp =
+                                                    entryAlloca(
+                                                        ov->getType());
+                                                builder_.CreateStore(ov, tmp);
+                                                obj = tmp;
+                                            }
+                                        }
+                                    }
                                     if (obj) {
                                         // Spill each index param once; reused by
                                         // both getter and setter to avoid double
