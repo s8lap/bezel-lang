@@ -2038,20 +2038,19 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
     // unconditionally in its `else if` arm — safe for Equals (one arg) but
     // undefined behavior for a zero-arg ToString call.
     //
-    // #2476 follow-up: Choice gets its OWN companion branch just below,
-    // deliberately not folded into `concreteRecordOrEnum` — `emitRecordToString`
-    // sits behind `lowerValueSemMethodOn` are for records/enums specifically;
-    // a choice has no §35.7 auto-ToString codegen at all yet (it does not even
-    // reuse the "not auto-equality-bearing" type-name default the way an
-    // ineligible body record does, since §35.7's format needs the active
-    // CASE discriminant, not just the type name). `where T: value` used to
-    // REJECT every choice type argument outright (a false reject, #2476), so
-    // this call shape was UNREACHABLE until #2476's own fix; without a
-    // companion here, fixing #2476 alone would have turned that unreachable
-    // gap into a live SIGSEGV the instant a choice-substituted bare-T
-    // ToString call compiled clean — the exact "narrowing alone is unsafe"
-    // lesson #2465 already paid for on this same block of code. A clean
-    // "declared but not yet implemented" diagnostic is categorically safer.
+    // #2479 follow-up (§35.7): Choice joins Record/Enum here — `where T:
+    // value` used to REJECT every choice type argument outright (a false
+    // reject, #2476), so this call shape was UNREACHABLE until #2476's own
+    // fix landed; without a companion here, fixing #2476 alone would have
+    // turned that unreachable gap into a live SIGSEGV the instant a choice-
+    // substituted bare-T ToString call compiled clean — the exact
+    // "narrowing alone is unsafe" lesson #2465 already paid for on this
+    // same block of code. `lowerValueSemMethodOn`'s own Choice branch now
+    // implements the real §35.7 format for an auto-equality-bearing choice
+    // and keeps a clean diagnostic (rather than a crash) for the
+    // undecided non-auto-equality-bearing case — see that branch (~line
+    // 2186) for the full citation, so there is no need to special-case
+    // Choice separately here any more than Record/Enum are.
     if (isToString &&
         recvTy->kind == sema::TypeRef::Kind::Named && !recvTy->declaration &&
         !genericSubstSemaTy_.empty() && recvTy->astNode &&
@@ -2060,35 +2059,14 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
         if (sit != genericSubstSemaTy_.end() && sit->second) {
             const sema::TypeRef* concrete = sit->second;
             using K = sema::TypeRef::Kind;
-            bool concreteRecordOrEnum =
+            bool concreteRecordEnumOrChoice =
                 concrete->kind == K::Named && concrete->declaration &&
                 (concrete->declaration->kind == ast::TypeDeclKind::Record ||
-                 concrete->declaration->kind == ast::TypeDeclKind::Enum);
-            if (concreteRecordOrEnum) {
+                 concrete->declaration->kind == ast::TypeDeclKind::Enum ||
+                 concrete->declaration->kind == ast::TypeDeclKind::Choice);
+            if (concreteRecordEnumOrChoice) {
                 if (llvm::Value* recv = lowerExpr(*ma->target))
                     return lowerValueSemMethodOn(concrete, recv, call, member);
-            } else if (concrete->kind == K::Named && concrete->declaration &&
-                       concrete->declaration->kind ==
-                           ast::TypeDeclKind::Choice) {
-                // §35.7 defines the format ("TypeName.CaseName(field: value)")
-                // but only for an AUTO-EQUALITY-BEARING (value-like, admissible
-                // -payload) choice; a borrow-bearing/owning/inadmissible-payload
-                // choice has no defined ToString at all. Deciding which applies
-                // is a real implementation slice (case-discriminant dispatch +
-                // per-case payload formatting), not a one-line fallback — filed
-                // as #2479 rather than guessed at here. Mirrors the GetType()
-                // precedent just below in this same function (report + a typed
-                // poison value, never a bare `nullptr`, so IR generation for
-                // the surrounding expression stays well-typed while the Error
-                // diagnostic guarantees the program never links/runs).
-                ctx_.diagnostics().report(
-                    Severity::Error, call.span.begin,
-                    "member `ToString` on a choice-substituted generic type "
-                    "parameter is declared via the universal Object contract "
-                    "(language spec \xC2\xA7""8.1/\xC2\xA7""35.7) but is not "
-                    "yet implemented by this compiler for a choice "
-                    "substitution (tracked #2479)");
-                return llvm::PoisonValue::get(ptrTy());
             }
         }
     }
@@ -2110,12 +2088,13 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
     // §35.7 (v0.210, #2083 rework finding 2): a CHOICE receiver's direct
     // `.Equals(other)` / `.GetHashCode()` — sema-legal for value-like choices
     // (the §35.7 use-site rule rejects the rest) — dispatches the synthesized
-    // §35.7 tag+active-payload forms. ToString on a choice is NOT intercepted
-    // (stays nullptr here so the receiver is not lowered twice, #1075).
+    // §35.7 tag+active-payload forms. `.ToString()` (#2479) is ALSO routed
+    // here now — like Record/Enum's `namedValueSem` just above, the member-
+    // kind branching (including the isAutoEqualityBearingChoice gate
+    // ToString itself needs) lives inside lowerValueSemMethodOn, not here.
     bool choiceValueSem = recvTy->kind == sema::TypeRef::Kind::Named &&
         recvTy->declaration &&
-        recvTy->declaration->kind == ast::TypeDeclKind::Choice &&
-        (isEquals || isGetHashCode);
+        recvTy->declaration->kind == ast::TypeDeclKind::Choice;
     if (!primValueSem && !namedValueSem && !choiceValueSem) return nullptr;
 
     llvm::Value* recv = lowerExpr(*ma->target);
@@ -2178,13 +2157,15 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
     bool isRecord = ts->kind == ast::TypeDeclKind::Record;
     bool isEnum   = ts->kind == ast::TypeDeclKind::Enum;
     // §35.7 (v0.210, #2083 rework finding 2): a CHOICE receiver — dispatch
-    // the synthesized §35.7 equality/hash over the choice struct (tag first,
-    // then the ACTIVE case's payload only; emitChoiceEquality/HashCode).
-    // Sema admits these calls only on value-like choices (the §35.7 use-site
-    // rejection, 80e59dc). ToString is not intercepted (nullptr → the
-    // ordinary path, matching the outer gate).
+    // the synthesized §35.7 equality/hash/ToString over the choice struct
+    // (tag first, then the ACTIVE case's payload only;
+    // emitChoiceEquality/HashCode/ToString). Sema admits Equals/GetHashCode
+    // calls only on value-like choices (the §35.7 use-site rejection,
+    // 80e59dc); ToString has no such sema-side gate (§35.7 deliberately
+    // does not list it in that rejection — see the isAutoEqualityBearing
+    // check below), so it is gated HERE instead.
     if (ts->kind == ast::TypeDeclKind::Choice) {
-        if (!isEquals && !isGetHashCode) return nullptr;
+        if (!isEquals && !isGetHashCode && !isToString) return nullptr;
         // §35.7 / §14.1 (#2047): install the receiver's instantiation so the
         // specialized struct is loaded and each payload `T`/`E` resolves to its
         // concrete type (a `string` payload compares/hashes by content). A no-op
@@ -2195,6 +2176,34 @@ llvm::Value* Emitter::lowerValueSemMethodOn(const sema::TypeRef* recvTy,
         if (recv->getType()->isPointerTy())
             recv = builder_.CreateLoad(st, recv);
         if (!recv->getType()->isStructTy()) return nullptr;
+        if (isToString) {
+            // #2479 (§35.7/§8.5): a real default exists ONLY for an
+            // auto-equality-bearing choice — the same classification §35.7
+            // already gates `=`/`<>`/`Equals`/`GetHashCode` on (value-like,
+            // every payload an admissible component type). For any other
+            // classification (borrow-bearing, owning, or value-like with an
+            // inadmissible payload) neither §35.7 nor §8.5's bullet list
+            // defines a default, and §35.7's own text pointedly leaves
+            // ToString OUT of its use-site-error list (unlike the other
+            // four members) without saying what SHOULD happen instead — a
+            // genuine spec gap, not a clear "no default" the way `=` is.
+            // Per CLAUDE.md's decline-with-reasons discipline: implement
+            // the unambiguous majority case for real, keep the (pre-
+            // existing, #2476-added) crash-preventing diagnostic for the
+            // undecided one rather than invent a default, and leave #2479
+            // open for that narrower slice.
+            if (sema::isAutoEqualityBearingChoice(ts, ctx_, recvTy))
+                return emitChoiceToString(recv, ts);
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "member `ToString` on a choice that is not auto-equality-"
+                "bearing (borrow-bearing, owning, or a value-like choice "
+                "with an inadmissible payload, language spec "
+                "\xC2\xA7""35.7) has no compiler-defined default; declare "
+                "a plain `ToString(): string` member to replace it "
+                "(\xC2\xA7""10.5's choice model) (tracked #2479)");
+            return llvm::PoisonValue::get(ptrTy());
+        }
         if (isGetHashCode) return emitChoiceHashCode(recv, ts);
         if (!call.args[0].value) return nullptr;
         llvm::Value* other = lowerExpr(*call.args[0].value);
@@ -4101,7 +4110,21 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // constraint case uses). Without this the call fell through unresolved and
     // emitted the default 0/false (the silent wrong value of #903). The primitive
     // case (T = int) and the user-interface constraint case already work; this
-    // covers only the builtin-interface × user-type combination.
+    // covers the builtin-interface × user-type combination.
+    //
+    // #2480 (§35.1/§35.2/§14.2): CHOICE is included alongside Record/Class here
+    // for the same reason #1495 added Enum to the sibling `ms->parent->kind==
+    // Interface` block just below (~line 6119) — a choice is sealed (§35.1) and
+    // its methods are STATICALLY dispatched (§35.2, "Choice methods are
+    // statically dispatched"), exactly like a record's, so devirtualizing to the
+    // choice's own declared `CompareTo`/`Equals` is sound on the identical
+    // reasoning. Before this fix, a choice substitution of a `where T:
+    // IComparable<T>`-constrained bare-T fell through this gate (Choice was not
+    // Record/Class) and, via the sibling block below, attempted itable dispatch
+    // on a non-pointer choice receiver — silently yielding 0 for every pair,
+    // discovered while regression-testing #2480's own fix (confirmed: a direct,
+    // non-generic `Color.Red.CompareTo(...)` call already dispatched correctly;
+    // only the bare-T generic-constrained path was affected).
     if (!calleeSym && !genericSubstSemaTy_.empty()) {
         if (auto* cma = dynamic_cast<const ast::MemberAccessExpr*>(
                 call.callee.get())) {
@@ -4121,7 +4144,9 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         (sit->second->declaration->kind ==
                              ast::TypeDeclKind::Record ||
                          sit->second->declaration->kind ==
-                             ast::TypeDeclKind::Class)) {
+                             ast::TypeDeclKind::Class ||
+                         sit->second->declaration->kind ==
+                             ast::TypeDeclKind::Choice)) {
                         if (sema::MethodSymbol* impl = findMethodByName(
                                 sit->second->declaration, cma->member))
                             // The single-parameter CompareTo(T)/Equals(T) contract
@@ -6113,6 +6138,18 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // value (matching `point.Foo()`) or passes an enum receiver as its
         // underlying value (matching the direct `Priority.Low.CompareTo(...)`
         // path — enum methods take `this` by value, not by pointer).
+        //
+        // #2480 (§35.1/§35.2/§14.2 conformance rule 7): CHOICE joins Record/Enum
+        // here on the identical reasoning — a choice is implicitly sealed
+        // (§35.1) and its methods are STATICALLY dispatched (§35.2), so its
+        // declared interface-member implementation is likewise exactly the one
+        // declared and safe to devirtualize to directly. Confirmed live: a
+        // `where T: IComparable<T>`-constrained bare-T substituted with a choice
+        // that DOES implement `IComparable<Color>` silently returned 0 for every
+        // call before this fix (the #1495 receiver-against-itself shape, for
+        // Choice instead of Enum) — a direct, non-generic call on the same
+        // choice already dispatched correctly, so only this generic-constrained
+        // path was affected.
         if (ms->parent && ms->parent->kind == ast::TypeDeclKind::Interface &&
             !recv->getType()->isPointerTy()) {
             if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
@@ -6121,7 +6158,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         ma->target ? ctx_.exprType(*ma->target) : nullptr) {
                     // Resolve a bare type-parameter receiver (`T`, no
                     // declaration) through the active substitution to its
-                    // concrete sema type, then take its record/enum declaration.
+                    // concrete sema type, then take its record/enum/choice
+                    // declaration.
                     const sema::TypeRef* concrete = recvTy;
                     if (recvTy->kind == sema::TypeRef::Kind::Named &&
                         !recvTy->declaration && recvTy->astNode &&
@@ -6136,7 +6174,9 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         (concrete->declaration->kind ==
                              ast::TypeDeclKind::Record ||
                          concrete->declaration->kind ==
-                             ast::TypeDeclKind::Enum)) {
+                             ast::TypeDeclKind::Enum ||
+                         concrete->declaration->kind ==
+                             ast::TypeDeclKind::Choice)) {
                         if (sema::MethodSymbol* impl = findMethodByName(
                                 concrete->declaration, ms->name))
                             ms = impl;  // devirtualize to the value type's method

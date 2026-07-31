@@ -12693,23 +12693,28 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // already, via the recognizers above/below; only the bare-T RECEIVER
     // shape was unrecognized).
     //
-    // Scoped to exactly the concrete-type kinds #903/#2469 mint a fresh rc=1
-    // string for: a value primitive (mirrors the switch above verbatim) and a
-    // Record (positional or body-form — `emitRecordToString` is the same
+    // Scoped to exactly the concrete-type kinds #903/#2469/#2479 mint a fresh
+    // rc=1 string for: a value primitive (mirrors the switch above verbatim),
+    // a Record (positional or body-form — `emitRecordToString` is the same
     // function for both, and mints exactly one final rc=1 accumulator
     // regardless of field-declaration style, confirmed by tracing its field
-    // loop, LlvmBackend_String.cpp). Enum is DELIBERATELY excluded: its
-    // ToString is a compile-time string LITERAL (the type's qualified name,
-    // §8.5) — an immortal sentinel, not a heap allocation — confirmed
-    // empirically to NOT leak either way (retaining a sentinel and releasing
-    // it once is a no-op, so recognizing it here would change nothing;
-    // omitted rather than adding an untested branch). Class/Interface/Choice
-    // are excluded too: Class/Interface substitution dispatches through
-    // `lowerObjectToString`, which "may or may not allocate" (the SAME
-    // conservative exclusion the Object.ToString() comment above already
-    // documents for the non-generic case); Choice has no ToString codegen at
-    // all yet (#2479) and is rejected at compile time before this could ever
-    // matter.
+    // loop, LlvmBackend_String.cpp), and (#2479) an auto-equality-bearing
+    // Choice (`emitChoiceToString`, LlvmBackend_String.cpp — the SAME
+    // per-case-mints-a-fresh-accumulator shape, and the SAME "a sentinel-
+    // literal payload-free case is still safe to recognize as a producer"
+    // reasoning as the concrete-receiver Choice recognizer just above).
+    // Enum is DELIBERATELY excluded: its ToString is a compile-time string
+    // LITERAL (the type's qualified name, §8.5) — an immortal sentinel, not
+    // a heap allocation — confirmed empirically to NOT leak either way
+    // (retaining a sentinel and releasing it once is a no-op, so recognizing
+    // it here would change nothing; omitted rather than adding an untested
+    // branch). Class/Interface are excluded too: that substitution dispatches
+    // through `lowerObjectToString`, which "may or may not allocate" (the
+    // SAME conservative exclusion the Object.ToString() comment above
+    // already documents for the non-generic case). A non-auto-equality-
+    // bearing Choice substitution is excluded: it is rejected at compile
+    // time by lowerValueSemMethodOn's own diagnostic (#2479's undecided
+    // classification) before this could ever matter.
     if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
         if (call->args.empty() && call->callee && !genericSubstSemaTy_.empty()) {
             if (auto* ma =
@@ -12739,6 +12744,14 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                                        concrete->declaration &&
                                        concrete->declaration->kind ==
                                            ast::TypeDeclKind::Record) {
+                                return true;
+                            } else if (concrete->kind == K::Named &&
+                                       concrete->declaration &&
+                                       concrete->declaration->kind ==
+                                           ast::TypeDeclKind::Choice &&
+                                       sema::isAutoEqualityBearingChoice(
+                                           concrete->declaration, ctx_,
+                                           concrete)) {
                                 return true;
                             }
                         }
@@ -12973,6 +12986,33 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                             sema::isAutoEqualityBearingBodyRecord(ts, ctx_))
                             return true;  // emitRecordToString → rc=1 heap string
                     }
+                    // #2479 / §35.7 (mirrors the Record recognizer just above,
+                    // same shape as #2065): a CONCRETE choice receiver's
+                    // `.ToString()`, when auto-equality-bearing, dispatches
+                    // through lowerValueSemMethodOn to emitChoiceToString —
+                    // for a payload-BEARING active case this always mints a
+                    // fresh rc=1 heap string via at least one emitStringConcat
+                    // call (the "TypeName.CaseName(" open-paren concat runs
+                    // unconditionally whenever payload.size() >= 1); for a
+                    // payload-FREE case it is a pooled literal SENTINEL
+                    // instead (no concat at all) — recognizing it as a +1
+                    // producer anyway is still SOUND (retaining then releasing
+                    // a sentinel is a no-op) and keeps this check simple
+                    // rather than distinguishing per-case at the AST level
+                    // (the active case is a RUNTIME discriminant, not
+                    // statically known here). LSan-confirmed without this: a
+                    // `var s := someChoice.ToString();` local leaked the
+                    // synthesized string's header + data buffer (borrow-
+                    // retained at bind, never dropping the producer's +1) —
+                    // found while regression-testing #2479's own fix, not a
+                    // pre-existing #2065-class gap (choice ToString had no
+                    // codegen at all before this commit).
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                        tt->declaration &&
+                        tt->declaration->kind == ast::TypeDeclKind::Choice &&
+                        sema::isAutoEqualityBearingChoice(tt->declaration,
+                                                          ctx_, tt))
+                        return true;  // emitChoiceToString → rc=1 heap string
                 }
             }
         }

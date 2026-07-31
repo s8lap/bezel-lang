@@ -2851,8 +2851,46 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     const auto& mbr = ma->member;
                     bool isObjectMember =
                         mbr == "ToString"    || mbr == "GetHashCode" ||
-                        mbr == "Equals"      || mbr == "CompareTo"   ||
-                        mbr == "GetType";
+                        mbr == "Equals"      || mbr == "GetType";
+                    // #2480 / §14.2 / §8.1: `CompareTo` is NOT one of the
+                    // universal Object members admitted unconditionally above
+                    // — §8.1's Object surface is exactly GetType/Equals/
+                    // GetHashCode/ToString; `CompareTo` comes from
+                    // `IComparable<T>` conformance (stdlib §5, §14.2's
+                    // "where T: IComparable<int>" worked example). Treating it
+                    // as always-present (as this block did before this fix)
+                    // let `where T: value` — which requires nothing about
+                    // ordering (§14.2's `value` row) — silently admit
+                    // `a.CompareTo(b)` for a substitution with no ordering at
+                    // all; codegen's #903 resolver then has no real dispatch
+                    // and falls through to a constant `0` (#2480's silent-
+                    // wrong-data repro). Only admit `CompareTo` here when T's
+                    // constraints actually establish `IComparable<T>`
+                    // conformance — the identical forEachConstraintBound walk
+                    // resolveMemberAccess's #484 block performs (this file,
+                    // ~10326) to resolve the member through a real `where T:
+                    // IComparable<T>` bound (directly, or transitively via a
+                    // `where T: U` chain / an interface extending
+                    // IComparable<T>, both §14.2). When such a constraint is
+                    // present, #484 resolves the call through the ordinary
+                    // member-call path before this bare-T fallback is ever
+                    // reached (calleeSym gets set normally) — so this check is
+                    // defensive, not the primary path; when the constraint is
+                    // absent, `isObjectMember` stays false and the existing
+                    // "no member ... on unconstrained type parameter" reject
+                    // below fires, exactly as for any other unconstrained
+                    // member.
+                    if (mbr == "CompareTo") {
+                        forEachConstraintBound(
+                            paramName, [&](TypeRef* ctr) -> bool {
+                                if (lookupMember(ctr->declaration,
+                                                  "CompareTo")) {
+                                    isObjectMember = true;
+                                    return true;
+                                }
+                                return false;
+                            });
+                    }
                     // §28.2 / §14.2 (#1293): `t.Dispose()` is admissible on a
                     // type parameter constrained to a REFERENCE type — every
                     // class implicitly implements IDisposable (§28.2), so a
@@ -12414,18 +12452,57 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     else if (mbr == "Equals")
                         ctx_.setExprType(
                             &ma, ctx_.primitiveTypeRef(PrimitiveType::Bool));
-                    else if (mbr == "CompareTo")
-                        // #903 / §14.2: `a.CompareTo(b)` on a bare type-parameter
-                        // receiver — the IComparable<T> contract (a `where T:
-                        // IComparable<T>` constraint, enforced at the call site,
-                        // §14.2/#729). The builtin IComparable<T> has a null
-                        // TypeDecl, so the constraint-member resolution above skips
-                        // it; type the result int here (mirroring Equals→bool) so
-                        // the call typechecks, and codegen devirtualizes to the
-                        // monomorphized type's CompareTo (LlvmBackend_Calls.cpp).
-                        ctx_.setExprType(
-                            &ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
-                    else if (mbr == "GetType") {
+                    else if (mbr == "CompareTo") {
+                        // #2480 / §14.2 / §8.1: unlike ToString/GetHashCode/
+                        // Equals/GetType above — the actual §8.1 Object
+                        // surface, guaranteed on every type regardless of
+                        // constraint — `CompareTo` comes from `IComparable<T>`
+                        // conformance (stdlib §5, §14.2's "where T:
+                        // IComparable<int>" worked example) and is NOT implied
+                        // by `where T: value` (§14.2's `value` row: "records,
+                        // enums, choices, primitives, inline arrays ... the
+                        // unit type" — no ordering requirement). Typing this
+                        // unconditionally (the pre-fix behavior, "mirroring
+                        // Equals→bool") let a `value`-only-constrained T call
+                        // `.CompareTo` on a substitution with no ordering at
+                        // all; codegen's #903 resolver has no real dispatch
+                        // for that case and silently falls through to a
+                        // constant `0` (#2480, confirmed for both a record and
+                        // a choice substitution). The prior comment's premise
+                        // — "the builtin IComparable<T> has a null TypeDecl" —
+                        // no longer holds: #1115 gave IComparable<T> a real
+                        // synthesized Interface TypeSymbol precisely so the
+                        // #484 constraint-member walk just above (~line 10326)
+                        // CAN find its `CompareTo` member through a genuine
+                        // `where T: IComparable<T>` bound (directly, or
+                        // transitively via a `where T: U` chain / an ancestor
+                        // interface, both §14.2) — verified: with such a bound
+                        // present, #484 resolves the call through the ordinary
+                        // member-call path and this fallback is never reached.
+                        // So this block now only fires when #484 did NOT find
+                        // a conforming bound; re-running the identical walk
+                        // here (rather than assuming) keeps this in lockstep
+                        // with #484 and with the matching gate in
+                        // ExprTC::typeCall's #1078 block (~line 2852) for the
+                        // call form. When the constraint is absent, `ma` is
+                        // left untyped — the enclosing `a.CompareTo(b)` call
+                        // is rejected by that #1078 gate ("no member ... on
+                        // unconstrained type parameter").
+                        bool hasComparable = false;
+                        forEachConstraintBound(
+                            paramName, [&](TypeRef* ctr) -> bool {
+                                if (lookupMember(ctr->declaration,
+                                                  "CompareTo")) {
+                                    hasComparable = true;
+                                    return true;
+                                }
+                                return false;
+                            });
+                        if (hasComparable)
+                            ctx_.setExprType(
+                                &ma,
+                                ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    } else if (mbr == "GetType") {
                         auto* typeTy = ctx_.makeTypeRef();
                         typeTy->kind = TypeRef::Kind::Named;
                         typeTy->declaration = builtinClassSym("Type");

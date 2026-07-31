@@ -489,6 +489,44 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             // gets the synthesized `TypeName(Prop: value, ...)`
                             // form over its storage members.
                             pv = emitRecordToString(ev, ts);
+                        } else if (ts->kind == ast::TypeDeclKind::Choice &&
+                                   sema::isAutoEqualityBearingChoice(
+                                       ts, ctx_, rt)) {
+                            // #2479 / §35.7: a choice-typed interpolation hole
+                            // with no user ToString override, auto-equality-
+                            // bearing, gets the synthesized `TypeName.CaseName
+                            // (field: value, ...)` form — the same
+                            // emitChoiceToString the direct `.ToString()` call
+                            // (lowerValueSemMethodOn) and emitValueToString
+                            // (nested-field formatting) now use. Before this
+                            // fix, interpolation had its OWN hand-rolled
+                            // dispatch here with no Choice case at all, so a
+                            // choice-typed hole silently fell to the generic
+                            // "no ToString → type name" `else` branch below —
+                            // `$"{c}"` rendered just `"Color"`, dropping the
+                            // active case entirely (a distinct gap from, and
+                            // found while regression-testing, #2479's own
+                            // bare-T-receiver scope).
+                            pv = emitChoiceToString(ev, ts);
+                        } else if (ts->kind == ast::TypeDeclKind::Choice) {
+                            // §35.7's open question (see lowerValueSemMethodOn's
+                            // Choice/ToString branch for the full citation):
+                            // no compiler-defined default exists for a choice
+                            // that is not auto-equality-bearing. Diagnose
+                            // rather than silently rendering the misleading
+                            // bare type name (indistinguishable from a real
+                            // implemented default) or crashing.
+                            ctx_.diagnostics().report(
+                                Severity::Error, part.expr->span.begin,
+                                "member `ToString` on a choice that is not "
+                                "auto-equality-bearing (borrow-bearing, "
+                                "owning, or a value-like choice with an "
+                                "inadmissible payload, language spec "
+                                "\xC2\xA7""35.7) has no compiler-defined "
+                                "default; declare a plain `ToString(): "
+                                "string` member to replace it (\xC2\xA7"
+                                "10.5's choice model) (tracked #2479)");
+                            pv = llvm::PoisonValue::get(ptrTy());
                         } else {
                             // No ToString — use type name (§8.5).
                             pv = lowerStringLiteral(

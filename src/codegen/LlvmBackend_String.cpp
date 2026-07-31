@@ -2694,6 +2694,28 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
             // default (the type's qualified name) inside interpolation; `val`
             // is the enum's underlying integer.
             return emitEnumToString(val, ts);
+        // #2479 / §35.7: a choice-typed field/interpolation-hole formats by
+        // the §35.7 discriminant+payload format when the choice is auto-
+        // equality-bearing — mirrors the record recursion just above
+        // (`emitRecordToString`'s reachability precondition already
+        // guarantees any Choice-typed FIELD it recurses into is itself
+        // auto-equality-bearing, per §9.2/§35.7's recursive admissible-
+        // component rule: an ineligible body record's ToString never
+        // iterates fields at all, LlvmBackend_Calls2.cpp's `!autoBearing`
+        // early return). A bare top-level choice-typed interpolation hole
+        // (`$"{c}"`) carries no such precondition, so the check is real
+        // here, not defensive: for a non-auto-equality-bearing choice this
+        // falls through to the generic fallback below (a struct value hits
+        // neither the pointer nor the integer/float checks, landing on the
+        // final `lowerStringLiteral("\"\"", false)` — an empty string,
+        // not a crash; `lowerValueSemMethodOn`'s Choice branch (LlvmBackend
+        // _Calls2.cpp) is the primary place this classification is
+        // surfaced to the user via a real diagnostic, since a direct
+        // `.ToString()` call is by far the common spelling).
+        if (ts->kind == ast::TypeDeclKind::Choice &&
+            val->getType()->isStructTy() &&
+            sema::isAutoEqualityBearingChoice(ts, ctx_, fieldTy))
+            return emitChoiceToString(val, ts);
         if (ts->kind == ast::TypeDeclKind::Class && val->getType()->isPointerTy()) {
             // §8.5: a class field formats via its ToString override if any,
             // else the type name. Walk the class chain for a ToString method.
@@ -3050,6 +3072,126 @@ llvm::Value* Emitter::emitRecordToString(llvm::Value* recVal,
         // `acc` is the FINAL +1 result the caller binds — keep it.
     }
     return acc;
+}
+
+// §35.7 (#2479): build `"TypeName.CaseName(field1: value1, …)"` for the
+// ACTIVE case of an auto-equality-bearing choice, or `"TypeName.CaseName"`
+// for a payload-free case — the exact format §35.7 specifies. Callers are
+// responsible for confirming the choice is auto-equality-bearing first
+// (via `sema::isAutoEqualityBearingChoice`, mirroring how a caller must
+// confirm value-likeness before `emitChoiceEquality`/`emitChoiceHashCode`);
+// this function does not re-check it, matching those two siblings.
+//
+// REAL CONTROL FLOW (the emitChoiceEquality/emitChoiceHashCode shape),
+// NOT a select chain: unlike those two, EVERY case here — payload-free
+// included — needs its OWN distinct literal (`"TypeName.Red"` differs from
+// `"TypeName.Blue"`), so no case can collapse into the switch's default arm
+// the way a payload-free case does for equality/hash (which only need "is
+// the tag equal" / "the tag alone"). Each case gets its own switch arm and
+// basic block; only the active case's formatting code actually executes
+// (a straight-line emit would run every case's field formatting
+// unconditionally, reading the inactive cases' `undef` payload slots — the
+// exact hazard emitChoiceEquality's own header comment documents). The
+// switch's default (an out-of-range tag; defensive only, never reachable
+// for a validly-constructed value) yields the bare type name.
+llvm::Value* Emitter::emitChoiceToString(llvm::Value* val,
+                                         const sema::TypeSymbol* choiceTy) {
+    llvm::Value* tag = builder_.CreateExtractValue(val, {0u}, "chts.tag");
+    auto* entryBB = builder_.GetInsertBlock();
+    auto* endBB = llvm::BasicBlock::Create(llvm_, "chts.end", currentFn_);
+    auto cases = choiceCasesOf(choiceTy);
+    auto* sw = builder_.CreateSwitch(tag, endBB,
+                                     static_cast<unsigned>(cases.size()));
+    std::vector<std::pair<llvm::BasicBlock*, llvm::Value*>> incoming;
+    incoming.emplace_back(
+        entryBB,
+        lowerStringLiteral(std::string("\"") + std::string(choiceTy->name) +
+                                "\"",
+                            false));
+    for (std::size_t ci = 0; ci < cases.size(); ++ci) {
+        const sema::ChoiceCaseSymbol* cc = cases[ci];
+        if (!cc) continue;
+        auto* armBB = llvm::BasicBlock::Create(llvm_, "chts.arm", currentFn_);
+        sw->addCase(builder_.getInt32(static_cast<int>(ci)), armBB);
+        builder_.SetInsertPoint(armBB);
+        std::string prefix = std::string("\"") + std::string(choiceTy->name) +
+                             "." + std::string(cc->name);
+        if (!cc->caseDecl || cc->caseDecl->payload.empty()) {
+            // Payload-free case (§35.7): "TypeName.CaseName" — a plain
+            // literal, no field formatting, so no control-flow hazard.
+            llvm::Value* caseStr = lowerStringLiteral(prefix + "\"", false);
+            auto* armEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(endBB);
+            incoming.emplace_back(armEnd, caseStr);
+            continue;
+        }
+        // Payload-bearing case: "TypeName.CaseName(field1: value1, …)" —
+        // the same accumulator/release discipline as emitRecordToString
+        // above (each intermediate emitStringConcat result is a fresh +1
+        // that must be released once consumed by the next concat; a
+        // string-typed field's ToString is a BORROW of the payload slot,
+        // per §9.6, and must not be released).
+        llvm::Value* acc = lowerStringLiteral(prefix + "(\"", false);
+        bool accIsPlusOne = false;
+        for (std::size_t pi = 0; pi < cc->caseDecl->payload.size(); ++pi) {
+            const ast::Param& pf = cc->caseDecl->payload[pi];
+            if (pi != 0) {
+                llvm::Value* prev = acc;
+                acc = emitStringConcat(acc,
+                                       lowerStringLiteral("\", \"", false));
+                if (accIsPlusOne) emitStringRelease(prev);
+                accIsPlusOne = true;
+            }
+            {
+                llvm::Value* prev = acc;
+                acc = emitStringConcat(
+                    acc, lowerStringLiteral(
+                             std::string("\"") + std::string(pf.name) +
+                                 ": \"",
+                             false));
+                if (accIsPlusOne) emitStringRelease(prev);
+                accIsPlusOne = true;
+            }
+            llvm::Value* fieldVal = builder_.CreateExtractValue(
+                val, {static_cast<unsigned>(1 + ci),
+                      static_cast<unsigned>(pi)}, "chts.f");
+            sema::TypeRef pTy;  // resolved payload type for emitValueToString
+            if (pf.type)
+                // §14.1 (#2047 precedent): resolve a bare-param payload (`T`)
+                // through the active instantiation subst so a `string`/
+                // record/choice payload of a generic choice formats by its
+                // CONCRETE type. A no-op for a concrete payload type.
+                if (const sema::TypeRef* rt =
+                        resolveTypeParamRef(ctx_.resolvedType(*pf.type)))
+                    pTy = *rt;
+            llvm::Value* fieldStr = emitValueToString(fieldVal, &pTy);
+            {
+                llvm::Value* prev = acc;
+                acc = emitStringConcat(acc, fieldStr);
+                if (accIsPlusOne) emitStringRelease(prev);
+                accIsPlusOne = true;
+            }
+            bool fieldStrIsBorrow =
+                pTy.kind == sema::TypeRef::Kind::Primitive &&
+                pTy.primitive == sema::PrimitiveType::String;
+            if (!fieldStrIsBorrow) emitStringRelease(fieldStr);
+        }
+        {
+            llvm::Value* prev = acc;
+            acc = emitStringConcat(acc, lowerStringLiteral("\")\"", false));
+            if (accIsPlusOne) emitStringRelease(prev);
+            // `acc` is this arm's final +1 result — keep it for the PHI.
+        }
+        auto* armEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        incoming.emplace_back(armEnd, acc);
+    }
+    builder_.SetInsertPoint(endBB);
+    auto* phi = builder_.CreatePHI(ptrTy(),
+                                   static_cast<unsigned>(incoming.size()),
+                                   "chts");
+    for (auto& [bb, v] : incoming) phi->addIncoming(v, bb);
+    return phi;
 }
 
 // §8.3 / §9.1: hash a single field value of static type `fieldTy` → i32.

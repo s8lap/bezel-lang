@@ -156,15 +156,22 @@ BEZEL_TEST(generic_choice_value_constraint_2476,
     BEZEL_EXPECT_EQ(run(program), 42);
 }
 
-// ── Fallout this fix's companion diagnostic must close ──────────────────
+// ── Fallout this fix's companion diagnostic used to gate — now IMPLEMENTED ──
 
-// `.ToString()` on a bare-T choice receiver: without the companion fix
-// (added in the same commit), this SIGSEGV'd exactly like #2469's record
-// crash the instant #2476's classification fix alone landed (confirmed
-// during this fix's own development). It must now be a clean diagnostic,
-// not a crash — asserted on diagnostic TEXT per the harness note above.
+// `.ToString()` on a bare-T choice receiver: without a companion fix (added
+// in the same commit as this one), this SIGSEGV'd exactly like #2469's
+// record crash the instant #2476's classification fix alone landed
+// (confirmed during this fix's own development). #2476 closed that crash
+// with a clean "declared but not yet implemented" diagnostic (tracked
+// #2479); #2479 has since been implemented for the auto-equality-bearing
+// case `Color` is (see generic_bare_typeparam_tostring_choice_2479_test.cpp
+// for the full regression suite, including the diagnostic that remains for
+// the non-auto-equality-bearing classification #2479 left undecided) — so
+// this call now dispatches to the real §35.7 format instead of erroring.
+// Value-correct, not just clean compile: a payload-free case formats as
+// `"TypeName.CaseName"`.
 BEZEL_TEST(generic_choice_value_constraint_2476,
-           tostring_on_choice_substitution_diagnosed_not_crashed) {
+           tostring_on_choice_substitution_now_implemented_value_correct) {
     const std::string program =
         std::string("module M; ") + kColor +
         "class C "
@@ -173,13 +180,10 @@ BEZEL_TEST(generic_choice_value_constraint_2476,
         "  end F; "
         "  public static method Main(): int "
         "    var s := F(Color.Red); "
-        "    return 0; "
+        "    return (if s = \"Color.Red\" then 42 else 1); "
         "  end Main; "
         "end C;";
-    BEZEL_EXPECT_TRUE(hasError(
-        program,
-        "member `ToString` on a choice-substituted generic type parameter"));
-    BEZEL_EXPECT_TRUE(hasError(program, "#2479"));
+    BEZEL_EXPECT_EQ(run(program), 42);
 }
 
 // ── Regression guards ─────────────────────────────────────────────────

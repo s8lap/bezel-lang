@@ -253,13 +253,27 @@ BEZEL_TEST(collection_universal_member_narrowing_2465,
 // ── The positive direction: a genuine bare type-parameter receiver ──────
 
 // A genuinely-declared generic type parameter `T` (here substituted with
-// `int`, a value type) calling ToString/GetHashCode/Equals/CompareTo must
-// behave IDENTICALLY to before this fix — the narrowed #605 block still
-// types these for it (isDeclaredParam is true), and codegen's
+// `int`, a value type) calling ToString/GetHashCode/Equals must behave
+// IDENTICALLY to before this fix — the narrowed #605 block still types
+// these for it (isDeclaredParam is true), and codegen's
 // genericSubstSemaTy_-based deferred resolution (unaffected by this fix,
 // which touches only sema's own gate) still computes the real values.
 // VALUE-correct, not just clean compile — the coordinator's own explicit
 // ask, and the exact shape #2433 broke (generic_record_field_590).
+//
+// CompareTo is deliberately NOT exercised here (it originally was, as
+// `val.CompareTo(val)` — a SELF-compare, so its `cmp <> 0` check passed
+// vacuously whether CompareTo really dispatched or, per #2480, silently
+// returned a hardcoded `0` for every pair regardless of the receiver —
+// `where T: value` alone never implied `IComparable<T>`). #2480 fixed
+// this: a bare-T `.CompareTo` call is now a compile-time reject unless T's
+// constraints actually establish `IComparable<T>` conformance (§14.2),
+// exactly like any other member #1078 already gates on an unconstrained
+// type parameter. See generic_constraint_dispatch_484_test.cpp /
+// record_generic_constraint_test.cpp for the genuine
+// `where T: IComparable<T>` dispatch coverage, and
+// generic_bare_typeparam_compareto_reject_2480_test.cpp for this issue's own
+// reject-diagnostic regression test.
 BEZEL_TEST(collection_universal_member_narrowing_2465,
            genuine_type_parameter_unaffected_value_correct) {
     const std::string program =
@@ -269,10 +283,8 @@ BEZEL_TEST(collection_universal_member_narrowing_2465,
         "    var s := val.ToString(); "
         "    var h := val.GetHashCode(); "
         "    var eq := val.Equals(val); "
-        "    var cmp := val.CompareTo(val); "
         "    if s <> \"7\" then return 1; end; "
         "    if not eq then return 2; end; "
-        "    if cmp <> 0 then return 3; end; "
         "    return h; "  // int.GetHashCode() is its own value, per stdlib §9
         "  end F; "
         "  public static method Main(): int "

@@ -2811,6 +2811,13 @@ private:
                                     const sema::TypeSymbol* choiceTy);
     llvm::Value* emitChoiceHashCode(llvm::Value* val,
                                     const sema::TypeSymbol* choiceTy);
+    // §35.7 (#2479): "TypeName.CaseName(field1: value1, …)" / "TypeName.
+    // CaseName" over the choice struct's active case, mirroring
+    // emitChoiceEquality/emitChoiceHashCode's tag-switch shape. Callers must
+    // confirm auto-equality-bearing (sema::isAutoEqualityBearingChoice)
+    // first — this function does not re-check it.
+    llvm::Value* emitChoiceToString(llvm::Value* val,
+                                    const sema::TypeSymbol* choiceTy);
     // §8.5: enum ToString → the type's qualified name (the spec default for
     // enums; member-name formatting is left to user code via Type.EnumNames).
     // §8.3: enum GetHashCode → the underlying integer value.
