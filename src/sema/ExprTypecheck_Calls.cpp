@@ -4939,7 +4939,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // disagreeing" direction.
                     if ((colName == "Array" || colName == "OwningArray" ||
                          colName == "Stack" || colName == "OwningStack" ||
-                         colName == "Queue" || colName == "OwningQueue") &&
+                         colName == "Queue" || colName == "OwningQueue" ||
+                         // #2471 (stdlib §4.6/§4.10; language spec §29.1,
+                         // v0.236): Set<T>/OwningSet<T>/LinkedList<T>/
+                         // OwningLinkedList<T> join this block — the explicit
+                         // `.GetEnumerator()` call form was previously
+                         // NON-FUNCTIONAL for all four (confirmed live: the
+                         // call fell through this typing gate AND codegen's
+                         // wrap gate, landing on a zero-init fallback that
+                         // returned no elements). Each is IEnumerable<T> via
+                         // IReadOnlyCollection<T> (stdlib §4.10/§4.6/§4.12),
+                         // so GetEnumerator yields genericArgs[0] (T).
+                         colName == "Set" || colName == "OwningSet" ||
+                         colName == "LinkedList" ||
+                         colName == "OwningLinkedList") &&
                         m == "GetEnumerator" && ce.args.empty() &&
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                         static const ast::Type* kIEnumeratorNode =
@@ -4956,6 +4969,46 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         tr->declaration = nullptr;
                         tr->astNode = kIEnumeratorNode;
                         tr->genericArgs.push_back(recvTy->genericArgs[0]);
+                        ctx_.setExprType(&ce, tr);
+                    }
+                    // #2471 (stdlib §4.8/§4.12; language spec §29.1, v0.236):
+                    // Dictionary<K,V> is ICollection<DictionaryEntry<K,V>>, so
+                    // its explicit `.GetEnumerator()` call yields
+                    // DictionaryEntry<K,V> (the ICollection element type — the
+                    // SAME synthetic TypeRef the for-in sema path builds,
+                    // ExprTypecheck.cpp's §4.8 case). Type the result as the
+                    // builtin IEnumerator<DictionaryEntry<K,V>> sentinel so the
+                    // manual-protocol MoveNext()→bool/#494 Current typing fires
+                    // and codegen's wrap gate (LlvmBackend_Calls2.cpp)
+                    // dispatches it through the entry-materialization path.
+                    if (colName == "Dictionary" &&
+                        m == "GetEnumerator" && ce.args.empty() &&
+                        recvTy && recvTy->genericArgs.size() >= 2 &&
+                        recvTy->genericArgs[0] && recvTy->genericArgs[1]) {
+                        static const ast::Type* kIEnumeratorNodeDict =
+                            []() -> ast::Type* {
+                            auto* qn = new ast::QualifiedName;
+                            qn->parts.push_back("IEnumerator");
+                            auto* t = new ast::Type;
+                            t->kind = ast::TypeKind::Named;
+                            t->name.reset(qn);
+                            return t;
+                        }();
+                        static const char kDictEntryName[] = "DictionaryEntry";
+                        auto* entryTy = ctx_.makeTypeRef();
+                        entryTy->kind = TypeRef::Kind::Named;
+                        entryTy->declaration = nullptr;
+                        entryTy->astNode = nullptr;
+                        entryTy->importedName = kDictEntryName;
+                        entryTy->genericArgs.push_back(
+                            recvTy->genericArgs[0]);  // K
+                        entryTy->genericArgs.push_back(
+                            recvTy->genericArgs[1]);  // V
+                        auto* tr = ctx_.makeTypeRef();
+                        tr->kind = TypeRef::Kind::Named;
+                        tr->declaration = nullptr;
+                        tr->astNode = kIEnumeratorNodeDict;
+                        tr->genericArgs.push_back(entryTy);
                         ctx_.setExprType(&ce, tr);
                     }
                     // #1102C / §29.11: `GetEnumerator()` on a vtable-backed

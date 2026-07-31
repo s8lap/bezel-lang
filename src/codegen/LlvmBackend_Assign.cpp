@@ -5297,6 +5297,214 @@ llvm::Value* Emitter::wrapLinkedListAsIEnumerable(llvm::Value* list,
 }
 
 
+// #2471 (stdlib §4.8/§4.12; language spec §29.1, v0.236): Dictionary<K,V>'s
+// explicit `.GetEnumerator()` call. Dictionary is hash-backed (bz_dict_t*),
+// not array-backed — its entries are not a dense element array — so (unlike
+// Array/Stack/Queue) we MATERIALISE the entries into a fresh owned bz_array_t
+// of {K, V} structs (the SAME layout lowerDictEntryFor and the Calls3 LINQ
+// source use), then wrap that array via wrapOwnedArrayAsIEnumerable. The
+// wrap is OWNING — the returned IEnumerable's slot-1 Dispose frees the
+// materialised snapshot exactly once; the SOURCE dictionary is untouched
+// (no entry is retained/released/disposed here, so an owning dictionary
+// still disposes each value at its own binder's scope end). The decode loop
+// mirrors lowerDictEntryFor / the Calls3 LINQ source field-for-field,
+// including the string-key fast path (rebuilds a string object per key,
+// frees bz_dict_keys_str's raw bytes), the generic-key table (loads from
+// the malloc'd raw-bytes key copy and frees it), and every value encoding
+// (record-box load, nullable-value load, scalar inttoptr/bitcast, class
+// pointer pass-through). Iteration order is insertion order (the order
+// bz_dict_keys_*/bz_dict_values_* return), matching §4.8's contract and
+// lowerDictEntryFor's foreach behaviour.
+llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
+        llvm::Value* dict, const sema::TypeRef* iEnumTy) {
+    if (!dict || !iEnumTy) return nullptr;
+    // iEnumTy = IEnumerator<DictionaryEntry<K,V>>; drill into the entry to
+    // recover K and V.
+    if (iEnumTy->genericArgs.empty() || !iEnumTy->genericArgs[0]) return nullptr;
+    const sema::TypeRef* entryTy = iEnumTy->genericArgs[0];
+    if (entryTy->genericArgs.size() < 2 || !entryTy->genericArgs[0] ||
+        !entryTy->genericArgs[1])
+        return nullptr;
+    const sema::TypeRef* keyTy = entryTy->genericArgs[0];
+    const sema::TypeRef* valTy = entryTy->genericArgs[1];
+
+    // Record / nullable-val flags for value (mirrors lowerDictEntryFor).
+    const sema::TypeSymbol* valRec =
+        (valTy->kind == sema::TypeRef::Kind::Named && valTy->declaration &&
+         valTy->declaration->kind == ast::TypeDeclKind::Record)
+            ? valTy->declaration : nullptr;
+    bool valNullableVal = isNullableValueTy(valTy);
+
+    llvm::Type* keyLlvm = lowerTypeRef(keyTy);
+    llvm::Type* valLlvm = lowerTypeRef(valTy);
+    if (!keyLlvm || !valLlvm) return nullptr;
+    llvm::StructType* entryStTy =
+        llvm::StructType::get(llvm_, {keyLlvm, valLlvm});
+    const llvm::DataLayout& dl = module_->getDataLayout();
+    int64_t esz = (int64_t)dl.getTypeAllocSize(entryStTy);
+
+    // String-key dicts use bz_dict_keys_str (fast path); generic-key dicts
+    // (record/int/enum keys) use bz_dict_keys_gen. Mirrors lowerDictEntryFor /
+    // the Calls3 LINQ source. Determine the backing by checking the key type:
+    // a Primitive String key is the string fast path; every other valid dict
+    // key (int/record/enum) is the generic-key table. (Cannot reuse
+    // genericBackingType here without the Dictionary's own TypeRef, which the
+    // iEnumTy does not carry — its genericArgs[0] is the entry, not the dict.)
+    using K = sema::TypeRef::Kind;
+    bool isStringKey = keyTy->kind == K::Primitive &&
+                       keyTy->primitive == sema::PrimitiveType::String;
+    bool useGen = !isStringKey;
+
+    // --- snapshot keys + values ---
+    auto* keysOutSlot = entryAlloca(ptrTy());
+    auto* lensOutSlot = entryAlloca(ptrTy());
+    auto* cntSlot     = entryAlloca(i64());
+    auto* valsOutSlot = entryAlloca(ptrTy());
+
+    if (useGen) {
+        auto* kfn = declareC("bz_dict_keys_gen",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {dict, keysOutSlot, cntSlot});
+        auto* vfn = declareC("bz_dict_values_gen",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(vfn, {dict, valsOutSlot, entryAlloca(i64())});
+    } else {
+        auto* kfn = declareC("bz_dict_keys_str",
+            llvm::Type::getVoidTy(llvm_),
+            {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, cntSlot});
+        auto* vfn = declareC("bz_dict_values_str",
+            llvm::Type::getVoidTy(llvm_),
+            {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(vfn, {dict, valsOutSlot, entryAlloca(i64())});
+    }
+
+    llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
+    llvm::Value* lensArr = isStringKey
+                               ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                               : nullptr;
+    llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
+    llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
+
+    // Allocate the result bz_array_t (8-slot initial capacity, like Calls3).
+    auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+    llvm::Value* arr = builder_.CreateCall(
+        allocFn, {builder_.getInt64(esz), builder_.getInt64(8)}, "denum.arr");
+
+    auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
+                           {ptrTy(), ptrTy(), i64()});
+    auto* freeFn = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
+
+    // Decode loop — build entry structs and append to arr.
+    auto* idxSlot = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+    auto* entrySlot = entryAlloca(entryStTy);
+
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "denum.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "denum.body", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "denum.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(condBB);
+    {
+        llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
+    }
+
+    builder_.SetInsertPoint(bodyBB);
+    {
+        llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
+
+        // --- decode key (mirrors lowerDictEntryFor) ---
+        llvm::Value* keyDecoded;
+        if (isStringKey) {
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(),
+                                      {ptrTy(), ptrTy(), i64()});
+            auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            uint64_t strSz = dl.getTypeAllocSize(stringType());
+            llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
+            llvm::Value* kp    = builder_.CreateLoad(ptrTy(), kpPtr);
+            llvm::Value* lpPtr = builder_.CreateGEP(i64(), lensArr, idxB);
+            llvm::Value* kl    = builder_.CreateLoad(i64(), lpPtr);
+            llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
+            llvm::Value* dataCpy = builder_.CreateCall(mallocFn, {dataSz});
+            builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
+            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCpy, kl);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+            llvm::Value* strObj = builder_.CreateCall(
+                callocFn,
+                {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
+            builder_.CreateStore(dataCpy,
+                builder_.CreateStructGEP(stringType(), strObj, 0));
+            builder_.CreateStore(kl,
+                builder_.CreateStructGEP(stringType(), strObj, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                builder_.CreateStructGEP(stringType(), strObj, 2));
+            initStringRc(strObj);
+            // Free the raw key bytes from bz_dict_keys_str.
+            builder_.CreateCall(freeFn, {kp});
+            keyDecoded = strObj;
+        } else if (useGen) {
+            llvm::Value* kpPtr  = builder_.CreateGEP(ptrTy(), keysArr, idxB);
+            llvm::Value* keyPtr = builder_.CreateLoad(ptrTy(), kpPtr);
+            keyDecoded =
+                builder_.CreateLoad(keyLlvm, keyPtr, "denum.kgen");
+            // Free the malloc'd raw-bytes key copy.
+            builder_.CreateCall(freeFn, {keyPtr});
+        } else {
+            keyDecoded = llvm::Constant::getNullValue(keyLlvm);
+        }
+
+        // --- decode value (mirrors lowerDictEntryFor) ---
+        llvm::Value* vpPtr  = builder_.CreateGEP(ptrTy(), valsArr, idxB);
+        llvm::Value* slotV  = builder_.CreateLoad(ptrTy(), vpPtr);
+        llvm::Value* valDecoded;
+        if (valRec) {
+            valDecoded = builder_.CreateLoad(valLlvm, slotV, "denum.vrec");
+        } else if (valNullableVal && valLlvm->isStructTy()) {
+            valDecoded = builder_.CreateLoad(valLlvm, slotV, "denum.vnv");
+        } else if (!valLlvm->isPointerTy()) {
+            llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
+            if (valLlvm->isDoubleTy())
+                valDecoded = builder_.CreateBitCast(asI64, valLlvm);
+            else if (valLlvm->isFloatTy())
+                valDecoded = builder_.CreateBitCast(
+                    builder_.CreateTrunc(asI64, i32()), valLlvm);
+            else if (valLlvm->isIntegerTy(64))
+                valDecoded = asI64;
+            else
+                valDecoded = builder_.CreateTrunc(asI64, valLlvm);
+        } else {
+            valDecoded = slotV;
+        }
+
+        // Store key at field 0, value at field 1 and append.
+        builder_.CreateStore(keyDecoded,
+            builder_.CreateStructGEP(entryStTy, entrySlot, 0));
+        builder_.CreateStore(valDecoded,
+            builder_.CreateStructGEP(entryStTy, entrySlot, 1));
+        builder_.CreateCall(addFn, {arr, entrySlot, builder_.getInt64(esz)});
+        builder_.CreateStore(
+            builder_.CreateAdd(idxB, builder_.getInt64(1)), idxSlot);
+        builder_.CreateBr(condBB);
+    }
+
+    builder_.SetInsertPoint(endBB);
+    builder_.CreateCall(freeFn, {keysArr});
+    if (isStringKey) builder_.CreateCall(freeFn, {lensArr});
+    builder_.CreateCall(freeFn, {valsArr});
+
+    // Wrap the materialised entries as an OWNING vtable-backed IEnumerable
+    // (slot-1 Dispose frees the snapshot; GetEnumerator clones over it). The
+    // element type/stride come from iEnumTy's DictionaryEntry<K,V> arg, so
+    // ensureArrayEnumMachinery builds the correct {K, V} struct layout.
+    return wrapOwnedArrayAsIEnumerable(arr, iEnumTy);
+}
+
+
 // §29.2 (#552): generate (or reuse) a standalone thunk function for an
 // expression-form property getter. The thunk signature is `retTy(ptr self)`,
 // matching the block-getter protocol of ensurePropertyBlockGetter.  We save

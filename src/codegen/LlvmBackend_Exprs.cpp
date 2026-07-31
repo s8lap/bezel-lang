@@ -4448,29 +4448,47 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // {K, V} struct (laid down by lowerDictEntryFor); field 0 is Key,
         // field 1 is Value. DictionaryEntry has no user TypeSymbol, so
         // fieldAddr cannot locate its fields — intercept here first.
+        // #2471 (stdlib §4.8/§4.12; language spec §29.1, v0.236): the target
+        // need not be a loop-variable local — it may be a TEMPORARY value like
+        // `e.Current` (the result of an explicit `.GetEnumerator()` call on a
+        // Dictionary<K,V>, dispatched via IEnumerator<DictionaryEntry<K,V>>
+        // slot 3) or any other DictionaryEntry-producing expression. Spill a
+        // non-local target to a fresh alloca before GEP-ing into the field,
+        // so the same field-access path serves both `for var entry in dict`
+        // (entry is a local) and `e.Current.Value` (e.Current is a temporary).
         if (ma->target && (ma->member == "Key" || ma->member == "Value")) {
             if (auto* tt = ctx_.exprType(*ma->target)) {
                 if (tt->kind == sema::TypeRef::Kind::Named &&
                     !tt->declaration &&
                     tt->importedName == "DictionaryEntry" &&
                     tt->genericArgs.size() >= 2) {
-                    // The target must be a local whose alloca holds the
-                    // {K,V} struct written by lowerDictEntryFor.
+                    // The entry alloca type is a 2-element struct {K, V}.
+                    llvm::Type* kTy = lowerTypeRef(tt->genericArgs[0]);
+                    llvm::Type* vTy = lowerTypeRef(tt->genericArgs[1]);
+                    llvm::StructType* entryStTy =
+                        llvm::StructType::get(llvm_, {kTy, vTy});
+                    unsigned fi = ma->member == "Key" ? 0 : 1;
+                    // Prefer an existing local alloca (the loop-variable case)
+                    // — its storage already holds the {K,V} struct. Otherwise
+                    // lower the target expression to its value and spill it to
+                    // a fresh alloca so CreateStructGEP has an addressable
+                    // slot (LLVM GEP needs a pointer; a struct SSA value must
+                    // be spilled first).
                     if (llvm::AllocaInst* slot = localSlot(*ma->target)) {
-                        unsigned fi = ma->member == "Key" ? 0 : 1;
-                        sema::TypeRef* fieldTy = tt->genericArgs[fi];
-                        llvm::Type* llvmFTy = fieldTy ? lowerTypeRef(fieldTy)
-                                                       : ptrTy();
-                        // The entry alloca type is a 2-element struct {K, V}.
-                        llvm::Type* kTy = lowerTypeRef(tt->genericArgs[0]);
-                        llvm::Type* vTy = lowerTypeRef(tt->genericArgs[1]);
-                        llvm::StructType* entryStTy =
-                            llvm::StructType::get(llvm_, {kTy, vTy});
                         llvm::Value* fieldPtr = builder_.CreateStructGEP(
                             entryStTy, slot, fi, "de.fld");
-                        (void)llvmFTy;
                         return builder_.CreateLoad(
                             entryStTy->getElementType(fi), fieldPtr, "de.load");
+                    } else if (llvm::Value* v = lowerExpr(*ma->target)) {
+                        if (v->getType()->isStructTy()) {
+                            llvm::AllocaInst* tmp = entryAlloca(entryStTy);
+                            builder_.CreateStore(v, tmp);
+                            llvm::Value* fieldPtr = builder_.CreateStructGEP(
+                                entryStTy, tmp, fi, "de.fld");
+                            return builder_.CreateLoad(
+                                entryStTy->getElementType(fi), fieldPtr,
+                                "de.load");
+                        }
                     }
                 }
                 // #628 / stdlib §4.9 v0.135: `e.Key` / `e.Value` on a

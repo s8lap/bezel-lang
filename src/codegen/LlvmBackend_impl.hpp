@@ -5126,6 +5126,25 @@ private:
     llvm::Value* wrapLinkedListAsIEnumerable(llvm::Value* list,
                                              const sema::TypeRef* iEnumTy);
 
+    // #2471 (stdlib §4.8/§4.12; language spec §29.1, v0.236): wrap a
+    // Dictionary<K,V>'s entries as a vtable-backed IEnumerable<DictionaryEntry<K,V>>.
+    // Dictionary is hash-backed (bz_dict_t*) with a DictionaryEntry<K,V> Current
+    // type, so (unlike Array/Stack/Queue) its entries are not stored as a dense
+    // element array — they must be materialised. Snapshots the live keys +
+    // values via bz_dict_keys_*/bz_dict_values_*, decodes each pair into a
+    // {K, V} struct (matching lowerDictEntryFor's layout, including the
+    // record-box and nullable-value shapes), appends each to a fresh owned
+    // bz_array_t, frees the snapshot buffers, and wraps the result via
+    // wrapOwnedArrayAsIEnumerable. The returned IEnumerable is OWNING — the
+    // caller's slot-1 Dispose frees the materialised snapshot exactly once; the
+    // SOURCE dictionary is untouched (no entry retained/released/disposed), so
+    // an owning dictionary still disposes each value at its own binder's scope
+    // end. `iEnumTy` is the call's result type — `IEnumerable<DictionaryEntry<K,V>>`
+    // whose genericArgs[0] gives the entry element type/stride.
+    llvm::Value* wrapDictionaryAsIEnumerable(
+        llvm::Value* dict, const sema::TypeRef* iEnumTy);
+
+
     // §29.2 (#552): wrap a user-class instance (implementing IEnumerable<T>)
     // in a type-specific vtable-backed enumerator compatible with the iterator
     // state machine protocol ([0]=td, [1]=Dispose, [2]=MoveNext→i1,

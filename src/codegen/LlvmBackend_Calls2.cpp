@@ -4991,6 +4991,156 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         }
                     }
                 }
+                // #2471 (stdlib §4.6/§4.8/§4.10/§4.12; language spec §29.1,
+                // v0.236): Set<T>/OwningSet<T>/LinkedList<T>/
+                // OwningLinkedList<T>/Dictionary<K,V>'s explicit
+                // `.GetEnumerator()` call. Same §29.11 wrap+clone+dispose
+                // shape as Array/Stack/Queue above, but each routes through
+                // its own backing-appropriate wrap function. (Dictionary's
+                // `Current` element type is DictionaryEntry<K,V>, so sema
+                // types the call's result IEnumerator<DictionaryEntry<K,V>>;
+                // the entry element type/stride flow through iEnumTy into
+                // wrapOwnedArrayAsIEnumerable via the helper below.)
+                //
+                // The ORDER each wrap produces must agree with the separate
+                // `for x in coll do ... end` desugaring path (LlvmBackend_Stmts.cpp),
+                // per the coordinator's standing "the two paths must not end
+                // up disagreeing" direction:
+                //   * LinkedList/OwningLinkedList: head-to-tail (the order
+                //     lowerLinkedListFor walks via bz_llist_first_node /
+                //     node_next), reusing the existing node-walking wrap
+                //     (wrapLinkedListAsIEnumerable) unchanged.
+                //   * Set/OwningSet (class element): array-backed (a dense
+                //     bz_array_t*, #1070), so forward order via the SAME
+                //     wrapArrayAsIEnumerable machinery Array uses.
+                //   * Set/OwningSet (value/record/string element): generic-
+                //     key hash-backed (#1068), snapshots the key table via
+                //     bz_lazy_from_set + drainLazyPipelineToOwnedIEnumerable,
+                //     matching the implicit-coercion path's existing Set wrap.
+                //   * Dictionary<K,V>: materialises entries (bz_dict_keys_* /
+                //     bz_dict_values_*) in insertion order, matching
+                //     lowerDictEntryFor's foreach order.
+                bool isSetFam = (rbn == "Set" || rbn == "OwningSet");
+                bool isLLFam  = (rbn == "LinkedList" || rbn == "OwningLinkedList");
+                bool isDictFam = (rbn == "Dictionary");
+                if ((isSetFam || isLLFam || isDictFam) && recvTy &&
+                        !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                    llvm::Value* recv = lowerExpr(*ma->target);
+                    if (recv && recv->getType()->isPointerTy()) {
+                        llvm::Value* iter = nullptr;
+                        if (isLLFam) {
+                            iter = wrapLinkedListAsIEnumerable(recv, recvTy);
+                        } else if (isSetFam) {
+                            // Class-element set is array-backed (dense);
+                            // value-element set is hash-backed (snapshot).
+                            uint64_t ksz = 0;
+                            if (genericBackingType(
+                                    recvTy, 0, /*isSet=*/true, &ksz)) {
+                                auto* setFn = declareC(
+                                    "bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
+                                llvm::Value* lazy = builder_.CreateCall(
+                                    setFn, {recv, builder_.getInt64((int64_t)ksz)},
+                                    "setenum.lazy");
+                                iter = drainLazyPipelineToOwnedIEnumerable(
+                                    lazy, recvTy);
+                            } else {
+                                iter = wrapArrayAsIEnumerable(recv, recvTy);
+                            }
+                        } else {  // isDictFam — sema typed result as
+                                  // IEnumerator<DictionaryEntry<K,V>>; build
+                                  // that TypeRef so wrapDictionaryAsIEnumerable
+                                  // can recover K and V.
+                            static const char kDictEntryGE[] = "DictionaryEntry";
+                            auto* entryTy = ctx_.makeTypeRef();
+                            entryTy->kind = sema::TypeRef::Kind::Named;
+                            entryTy->declaration = nullptr;
+                            entryTy->astNode = nullptr;
+                            entryTy->importedName = kDictEntryGE;
+                            entryTy->genericArgs.push_back(
+                                recvTy->genericArgs[0]);  // K
+                            if (recvTy->genericArgs.size() >= 2 &&
+                                recvTy->genericArgs[1]) {
+                                entryTy->genericArgs.push_back(
+                                    recvTy->genericArgs[1]);  // V
+                            }
+                            static const ast::Type* kIEnumeratorDictNode =
+                                []() -> ast::Type* {
+                                auto* qn = new ast::QualifiedName;
+                                qn->parts.push_back("IEnumerator");
+                                auto* t = new ast::Type;
+                                t->kind = ast::TypeKind::Named;
+                                t->name.reset(qn);
+                                return t;
+                            }();
+                            auto* iEnumTy = ctx_.makeTypeRef();
+                            iEnumTy->kind = sema::TypeRef::Kind::Named;
+                            iEnumTy->declaration = nullptr;
+                            iEnumTy->astNode = kIEnumeratorDictNode;
+                            iEnumTy->genericArgs.push_back(entryTy);
+                            iter = wrapDictionaryAsIEnumerable(recv, iEnumTy);
+                        }
+                        if (iter && iter->getType()->isPointerTy()) {
+                            // slot 4: fresh independent cursor enumerator
+                            // (§29.11 #943), then reclaim the throwaway
+                            // wrapper.
+                            llvm::Value* vt =
+                                builder_.CreateLoad(ptrTy(), iter);
+                            llvm::Value* geSlot = builder_.CreateGEP(
+                                ptrTy(), vt, {builder_.getInt32(4)});
+                            llvm::Value* geFn =
+                                builder_.CreateLoad(ptrTy(), geSlot);
+                            auto* geTy = llvm::FunctionType::get(
+                                ptrTy(), {ptrTy()}, false);
+                            llvm::Value* en = builder_.CreateCall(
+                                geTy, geFn, {iter}, "coll.getenum");
+                            // #2471: LinkedList's wrapper BORROWS the list
+                            // (its Dispose is a plain free(self) — the list is
+                            // untouched, the clone re-borrows the same list),
+                            // so it is safe to free immediately, matching the
+                            // Stack/Queue/Array pattern above. Set/Dictionary's
+                            // wrapper is OWNING (it materialised a fresh array
+                            // and its Dispose frees that array; the GetEnumerator
+                            // clone re-borrows it) — disposing it immediately
+                            // would free the array out from under the live
+                            // clone (confirmed UAF under ASan: SEGV in
+                            // bz$arrenum$...$Current on the first element
+                            // read). Defer its disposal onto the caller's
+                            // disposal scope (the SAME iterEnumDispose
+                            // mechanism lowerIEnumerableBuiltinFor uses for
+                            // loop-owned sources and the wrapUserClassAsIEnumerable
+                            // path uses for unbound temporary sources): LIFO
+                            // unwind then frees the clone (registered by the
+                            // caller's `using var e := …`/scope-end auto-drop,
+                            // which runs FIRST) before the wrapper struct
+                            // (registered here, runs SECOND), so the array
+                            // stays live for the clone's full consumption. If
+                            // there is no enclosing disposeStack_ frame to
+                            // defer onto, the wrapper struct leaks — the
+                            // lesser evil versus a UAF, and the same edge
+                            // case wrapUserClassAsIEnumerable's deferred path
+                            // already tolerates.
+                            if (isLLFam) {
+                                llvm::Value* iterVt =
+                                    builder_.CreateLoad(ptrTy(), iter);
+                                llvm::Value* dSlot = builder_.CreateGEP(
+                                    ptrTy(), iterVt, {builder_.getInt32(1)});
+                                llvm::Value* dFn =
+                                    builder_.CreateLoad(ptrTy(), dSlot);
+                                auto* dTy = llvm::FunctionType::get(
+                                    llvm::Type::getVoidTy(llvm_),
+                                    {ptrTy()}, false);
+                                builder_.CreateCall(dTy, dFn, {iter});
+                            } else if (!disposeStack_.empty()) {
+                                llvm::AllocaInst* iterSlot = entryAlloca(ptrTy());
+                                builder_.CreateStore(iter, iterSlot);
+                                Disposal ds{iterSlot, nullptr};
+                                ds.iterEnumDispose = true;
+                                disposeStack_.back().push_back(ds);
+                            }
+                            return en;
+                        }
+                    }
+                }
             }
         }
         // issue #494 / §29.2 / §29.3: explicit `e.MoveNext()` call where `e` is
