@@ -3157,32 +3157,87 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     // value (the reported #2378 follow-up string leak,
     // `bz_binder_read_bz_string`/`bz_binder_read_string`).
     //
-    // Scoped to tree mode (!isGraphMode): a Shared<T>/Weak<T> slot in graph
-    // mode holds a HANDLE (bz_shared_new/bz_shared_clone), not a plain class
-    // instance or string, and needs bz_shared_release/bz_weak_release, not
-    // generic vtable dispatch or bz_string_release — left to a follow-up
-    // (issue filed) rather than risking a wrong-dispatch regression by
-    // reusing this mechanism there.
+    // fix #2397 / §9.8 / §28.3/§28.9/§28.13 (v0.235): #2378 scoped this
+    // registration to tree mode only (`!isGraphMode`), because a graph-mode
+    // component slot is not uniformly "a plain class instance or a string" —
+    // graph mode's per-field value shapes (mirrored from the ACTUAL dispatch
+    // a few hundred lines below, in the per-field loop over `comps`) each
+    // need a DIFFERENT release, dispatched in the SAME order and on the SAME
+    // predicates that loop uses, so the two decisions stay in lockstep:
+    //   1. Shared<C> identity participant (handledSharedElementClass): the
+    //      slot holds a bz_shared_t* HANDLE (bz_shared_new / bz_shared_clone)
+    //      — released via bz_shared_release (§28.13 / stdlib §2.16's `using
+    //      var` Shared<T> path, reused here via the `sharedHandle` Disposal
+    //      flag). Reusing the generic vtable dispatch would misinterpret the
+    //      handle's layout as a class instance — a wrong-dispatch regression.
+    //   2. owned Weak<C> back-reference (handledWeakElementClass, gated on
+    //      comp.isOwned exactly as the real dispatch requires): the slot
+    //      holds a bz_weak_t* HANDLE (bz_shared_downgrade) — released via
+    //      bz_weak_release (`weakHandle` Disposal flag). Same wrong-dispatch
+    //      hazard as Shared if misrouted through the generic path.
+    //   3. plain-borrow back-edge (comp.isBackEdge — a non-owned class-typed
+    //      field, e.g. `Alias: Slot?`): the slot holds a BORROWED pointer
+    //      resolved via bz_binder_graph_resolve_tag. This component owns
+    //      NOTHING (the object is owned by whichever `owned`/Shared<C>
+    //      component first constructed it), so NO disposal is registered —
+    //      registering the generic vtable dispatch here would premature-free
+    //      a value another live component/handle still references.
+    //   4. owned-class-in-graph-mode (comp.isOwned && a plain Named class,
+    //      not Shared/Weak — e.g. `owned Target: Slot`): the slot holds a
+    //      plain owned class instance from emitClassDeserialize /
+    //      emitPolyClassDeserialize, exactly like a tree-mode owned-class
+    //      component — falls through to the SAME generic-vtable-dispatch
+    //      branch tree mode already used (no graph-mode-specific handling
+    //      needed; it was excluded before only by the blanket `!isGraphMode`
+    //      gate this fix removes).
+    //   A plain string component is likewise no longer excluded in graph
+    //   mode: a graph-shaped class may carry ordinary string fields
+    //   alongside its identity-tagged ones (strings are never
+    //   identity-tagged themselves, §9.8), so it needs the SAME
+    //   `stringRelease` disposal tree mode already registers.
+    // Order matches the real per-field dispatch's own `if`/`else if` chain
+    // (Shared, then owned-Weak, then back-edge, then owned-class) so a
+    // component can never be double-classified.
     disposeStack_.emplace_back();
-    if (!isGraphMode) {
-        for (std::size_t i = 0; i < comps.size(); ++i) {
-            if (comps[i].isSkip || !slots[i] || !comps[i].ty) continue;
-            const auto* cty = comps[i].ty;
-            if (cty->kind == sema::TypeRef::Kind::Named && cty->declaration &&
-                cty->declaration->kind == ast::TypeDeclKind::Class) {
-                // unwindOnly: skipped entirely on normal exit (belt-and-
-                // suspenders — this scope is popped without disposal on the
-                // normal path anyway), null-guarded generic vtable dispatch
-                // on unwind (LlvmBackend_Disposal.cpp's emitDisposals).
-                Disposal cd{slots[i], cty->declaration};
-                cd.unwindOnly = true;
-                disposeStack_.back().push_back(cd);
-            } else if (cty->kind == sema::TypeRef::Kind::Primitive &&
-                       cty->primitive == sema::PrimitiveType::String) {
-                Disposal sd{slots[i], nullptr};
-                sd.stringRelease = true;
-                disposeStack_.back().push_back(sd);
-            }
+    for (std::size_t i = 0; i < comps.size(); ++i) {
+        if (comps[i].isSkip || !slots[i] || !comps[i].ty) continue;
+        const auto& comp = comps[i];
+        const auto* cty = comp.ty;
+        if (isGraphMode && handledSharedElementClass(cty)) {
+            // Shared<C> identity participant — bz_shared_release, null-
+            // guarded, on unwind only (LlvmBackend_Disposal.cpp's
+            // emitDisposals `it->sharedHandle` branch).
+            Disposal d{slots[i], nullptr};
+            d.unwindOnly = true;
+            d.sharedHandle = true;
+            disposeStack_.back().push_back(d);
+        } else if (isGraphMode && comp.isOwned && handledWeakElementClass(cty)) {
+            // owned Weak<C> back-reference — bz_weak_release, null-guarded,
+            // on unwind only.
+            Disposal d{slots[i], nullptr};
+            d.unwindOnly = true;
+            d.weakHandle = true;
+            disposeStack_.back().push_back(d);
+        } else if (isGraphMode && comp.isBackEdge) {
+            // Plain-borrow back-edge: owns nothing — no disposal registered.
+        } else if (cty->kind == sema::TypeRef::Kind::Named && cty->declaration &&
+                   cty->declaration->kind == ast::TypeDeclKind::Class) {
+            // Tree-mode class component, OR graph mode's owned-class-in-
+            // graph-mode component (§9.8 tier 3): a plain owned class
+            // instance, disposed via the generic vtable dispatch.
+            //
+            // unwindOnly: skipped entirely on normal exit (belt-and-
+            // suspenders — this scope is popped without disposal on the
+            // normal path anyway), null-guarded generic vtable dispatch
+            // on unwind (LlvmBackend_Disposal.cpp's emitDisposals).
+            Disposal cd{slots[i], cty->declaration};
+            cd.unwindOnly = true;
+            disposeStack_.back().push_back(cd);
+        } else if (cty->kind == sema::TypeRef::Kind::Primitive &&
+                   cty->primitive == sema::PrimitiveType::String) {
+            Disposal sd{slots[i], nullptr};
+            sd.stringRelease = true;
+            disposeStack_.back().push_back(sd);
         }
     }
 
