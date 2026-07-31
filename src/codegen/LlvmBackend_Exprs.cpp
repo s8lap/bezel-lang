@@ -449,10 +449,43 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     }
                     }  // end if (!pv) — LLVM-type integer/pointer fallback
                     // For struct (record value): spill to alloca, call ToString.
-                    if (!pv && ev->getType()->isStructTy() && rt &&
-                        rt->kind == sema::TypeRef::Kind::Named &&
-                        rt->declaration) {
-                        auto* ts = rt->declaration;
+                    // #2503 (§35.7/§9.1/§9.2): `rt->declaration` is null for a
+                    // bare, unresolved generic type-parameter operand
+                    // (`val: T`) — resolve it via the active generic
+                    // substitution first, the SAME resolution
+                    // `emitValueToString`'s bare-T redirect uses
+                    // (LlvmBackend_String.cpp, the `genericSubstSemaTy_` block
+                    // just above its final fallback) and the bare-T redirect
+                    // `lowerCall` uses for a direct `.ToString()` call
+                    // (LlvmBackend_Calls2.cpp, the `isToString &&
+                    // recvTy->kind == Named && !recvTy->declaration` block) —
+                    // so a struct-typed T instantiated to a record/choice
+                    // dispatches by ITS rule here too, instead of being
+                    // silently DROPPED from the interpolated string. Before
+                    // this fix neither this block (gated on `rt->declaration`)
+                    // nor the LLVM-type-inference fallback just above (gated
+                    // on isPointerTy/isIntegerTy/isDoubleTy/isFloatTy — none
+                    // of which match a struct) matched a struct-typed bare-T
+                    // value, so `pv` stayed null and the `if (pv)
+                    // appendPart(...)` below never fired: the hole vanished
+                    // from the interpolated string entirely (not merely
+                    // rendered as "" — confirmed by tracing `$"{val}"` for
+                    // `val: T` bound to a Choice, LlvmBackend_Exprs.cpp, #2503).
+                    const sema::TypeRef* structRt = rt;
+                    if (structRt && structRt->kind == sema::TypeRef::Kind::Named &&
+                        !structRt->declaration && structRt->astNode &&
+                        structRt->astNode->name &&
+                        structRt->astNode->name->parts.size() == 1 &&
+                        !genericSubstSemaTy_.empty()) {
+                        auto sit = genericSubstSemaTy_.find(structRt->headName());
+                        if (sit != genericSubstSemaTy_.end() && sit->second &&
+                            sit->second->declaration)
+                            structRt = sit->second;
+                    }
+                    if (!pv && ev->getType()->isStructTy() && structRt &&
+                        structRt->kind == sema::TypeRef::Kind::Named &&
+                        structRt->declaration) {
+                        auto* ts = structRt->declaration;
                         sema::MethodSymbol* toStr = nullptr;
                         for (auto* cur = ts; cur && !toStr;) {
                             for (auto* sym : cur->members) {
@@ -491,7 +524,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             pv = emitRecordToString(ev, ts);
                         } else if (ts->kind == ast::TypeDeclKind::Choice &&
                                    sema::isAutoEqualityBearingChoice(
-                                       ts, ctx_, rt)) {
+                                       ts, ctx_, structRt)) {
                             // #2479 / §35.7: a choice-typed interpolation hole
                             // with no user ToString override, auto-equality-
                             // bearing, gets the synthesized `TypeName.CaseName
