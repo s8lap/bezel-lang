@@ -13579,9 +13579,22 @@ struct StringEscapeWalker {
     // borrow loops (stringReleaseMode) IN ADDITION to the value-like-choice
     // release passes (collectStringReleaseEligible's valueLikeChoiceCandidates
     // loop and collectValueLikeChoiceCallResultReleaseEligible's candidates
-    // loop); the #1747 record-call-result and the separate ClosureEscapeWalker
-    // consumers (#2481's other two) are NOT covered by this flag and keep the
-    // pre-existing unconditional scrutinee-escape rule — each needs its own,
+    // loop).
+    //
+    // fix #2481 (consumer 2/3, #1747 record-call-result): ALSO set by
+    // collectRecordCallResultReleaseEligible's candidates loop
+    // (recordFieldReleaseMode) — re-derived separately (see that call site's
+    // own comment for the record-specific argument: a record positional
+    // destructure's field extraction is the same GEP/ExtractValue-then-raw-
+    // store, no-retain shape as a choice payload, and the record type test
+    // runs no user code, unlike a class named-slot match). This does NOT
+    // widen #2448's separate candidate-selection gate (which locals qualify
+    // as a call-result local in the first place) — only the escape verdict
+    // on an already-admitted candidate's scrutinee use.
+    //
+    // The separate ClosureEscapeWalker consumer (#2481's third) is NOT
+    // covered by this flag (a different struct entirely) and keeps the
+    // pre-existing unconditional scrutinee-escape rule — needs its own,
     // separately-argued soundness case (§2481 tracking issue).
     bool scrutineeBorrowMode = false;
     // #1871: the set of `var v: IEnumerable<T> := <target-array>` VIEW LocalDecls
@@ -15629,6 +15642,42 @@ void Emitter::collectRecordCallResultReleaseEligible(
         // stay false so the string-release / borrowing-Array / value-like-
         // choice relaxation never affects this pass.
         w.recordFieldReleaseMode = true;
+        // fix #2481 (consumer 2/3, #1747 record-call-result): OPT-IN the
+        // case-scrutinee relaxation — see the scrutineeBorrowMode flag
+        // comment (struct StringEscapeWalker, above) for the general
+        // mechanism. Re-derived for records specifically (NOT assumed to
+        // transfer from #2450's choice argument, per the lane's own
+        // discipline): §19.3's "Pattern binding and ownership" states the
+        // identical rule for a record positional destructure (`P(name, x)`)
+        // as for a choice payload — "for value-type [members], the binding
+        // is a copy … for runtime-managed [members] (`string`, function
+        // values), the binding is a shared reference" — and the lowering
+        // confirms it: patternMatches' record DestructuringPattern arm
+        // (LlvmBackend_Exprs2.cpp, the non-pointer/unboxed struct-value
+        // branch) does `CreateExtractValue(scrut, {fieldIdx})` followed by a
+        // raw `CreateStore(fieldVal, slot)` — NO retain call — for BOTH the
+        // naked-binding and `var`-binding forms, exactly mirroring the choice
+        // payload extraction #2450 already analyzed; the boxed/reference
+        // branch (a record inside `Object`/an interface) is the same
+        // extract-then-store shape one GEP deeper. `collectPatternBindings`
+        // / `armsBindingsSafe` are UNCHANGED and untyped w.r.t. what the
+        // DestructuringPattern's head type is (they only walk `ast::Pattern`
+        // shapes), so they already handle a record's positional destructure
+        // (and any nested sub-destructure) correctly — no record-specific
+        // pattern-walking gap to close. record destructuring's type test is
+        // ALSO a pure structural check (§19.3: for a record the type test is
+        // satisfied statically; only constant/range/relational SUB-PATTERN
+        // equality checks run, never a user getter — unlike a class's
+        // named-slot form, which is not reachable here since a record's own
+        // positional DestructuringPattern is the only form this candidate
+        // set's records use), so admitting `ld` itself as a scrutinee read
+        // costs nothing beyond what armsBindingsSafe already proves for its
+        // bindings. This does NOT touch #2448's candidate-selection gate
+        // (isProvablyFreshRecordFactoryMethod / isSynthesizedRecordDeserialize
+        // Call, above) — only which USES of an already-admitted candidate
+        // count as an escape, exactly as #2450 left #2115's own choice
+        // candidate gate untouched.
+        w.scrutineeBorrowMode = true;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             recordCallResultReleaseEligible_.insert(
