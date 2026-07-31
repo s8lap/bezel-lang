@@ -2814,6 +2814,129 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 }
             }
         }
+        // §8.1 / §8.7 / #2446: arity check for the universal `Object` members.
+        // The universal members (`GetType`/`Equals`/`GetHashCode`/`ToString`
+        // per §8.1, plus `Dispose` per §8.7) are present on EVERY type without
+        // a MemberSymbol — codegen synthesizes them — so an INSTANCE call with
+        // no resolved calleeSym reaches this block and otherwise bypasses
+        // `checkCallArity` / `checkArgsAgainstParams`. That left a wrong-arity
+        // call (`obj.Equals()` (0 args, should be 1), `obj.GetHashCode(1)` (1
+        // arg, should be 0), `obj.ToString(x)`, …) silently accepted by sema
+        // and degraded to a zero/garbage value at codegen (the #2434 fallback).
+        // User overrides are unaffected: a user-declared
+        // `Equals`/`ToString`/`GetHashCode` resolves to a real MethodSymbol
+        // (calleeSym), skips this block, and goes through the ordinary arity
+        // machinery above. The same applies to NullCondMemberExpr
+        // (`obj?.Equals()`), which has the same `member` field and the same
+        // no-symbol path.
+        //
+        // Excluded (false-reject guard): a STATIC call on a type-name
+        // receiver — `char.ToString(c: char)` (stdlib §9.5, 1 arg),
+        // `Convert.ToString(value: int)` (stdlib §2.3, 1 or 2 args), or any
+        // other type-named IdentifierExpr sharing the universal-member name.
+        // These share the universal name but are NOT the universal instance
+        // member (they are stdlib static methods with their own arity). They
+        // reach this block with a null calleeSym AND a target IdentifierExpr
+        // whose exprSymbol is null or a TypeSymbol — the
+        // `targetIsStaticReceiver` guard below suppresses the arity check
+        // for them, leaving their existing per-method arity validation (if
+        // any) untouched. `Object.ReferenceEquals(a, b)` (§8.1, static)
+        // also lands in that exclusion: it is the static Object surface,
+        // not the per-type instance surface this fix targets.
+        {
+            std::string_view umName;
+            const ast::Expr* umTarget = nullptr;
+            if (auto* umMA = dynamic_cast<const ast::MemberAccessExpr*>(
+                    ce.callee.get())) {
+                umName = umMA->member;
+                umTarget = umMA->target.get();
+            } else if (auto* umNCM = dynamic_cast<
+                                   const ast::NullCondMemberExpr*>(
+                                   ce.callee.get())) {
+                umName = umNCM->member;
+                umTarget = umNCM->target.get();
+            }
+            // A bare IdentifierExpr target whose resolved exprSymbol is null
+            // or a TypeSymbol (i.e. the name denotes a TYPE, not a value) is
+            // a STATIC receiver (e.g. `char`, `Convert`, `Math`, `Console`,
+            // `Object`) — `char.ToString(c: char)` (stdlib §9.5) and
+            // `Convert.ToString(value: int)` (stdlib §2.3) are stdlib static
+            // methods that share the universal-member name but carry their
+            // own arity, distinct from the universal Object instance surface.
+            // The guard suppresses the universal-arity check for them,
+            // leaving their existing per-method arity validation (if any)
+            // untouched. `Object.ReferenceEquals(a, b)` (§8.1, static) also
+            // lands here and its arity is intentionally NOT checked by this
+            // block — it is the static Object surface, not the per-type
+            // instance surface this fix targets.
+            bool targetIsStaticReceiver = false;
+            if (umTarget && dynamic_cast<const ast::IdentifierExpr*>(umTarget)) {
+                if (auto* tSym = ctx_.exprSymbol(*umTarget)) {
+                    targetIsStaticReceiver =
+                        dynamic_cast<sema::TypeSymbol*>(tSym) != nullptr;
+                } else {
+                    targetIsStaticReceiver = true;
+                }
+            }
+            // #2446 false-reject guard: primitives (string, int, …) and the
+            // stdlib value-builtin types (DateTime, TimeSpan, decimal, Guid,
+            // …) carry their OWN instance overloads of the universal-member
+            // names whose arity DIFFERS from the §8.1 universal surface —
+            // e.g. `string.Equals(other: string?, ignoreCase: bool): bool`
+            // (2 args, stdlib §9.6), `DateTime.ToString(format: string):
+            // string` (1 arg, stdlib §2.8), `decimal.ToString(radix: int)` (
+            // 1 arg, stdlib §2.18). The arity check below assumes the §8.1
+            // universal surface, so it would false-reject these legitimate
+            // type-specific overloads. Skip when the receiver's resolved
+            // type is a Primitive or a Named value-builtin. User-defined
+            // types (class/record/choice/enum/interface — declaration non-
+            // null, isValueBuiltin=false) and bare generic type parameters
+            // (declaration null, 1-part name) keep the universal surface as
+            // their ONLY Equals/GetHashCode/ToString, so the check fires
+            // for them. Value-builtins intentionally keep `declaration=null`
+            // in their resolved TypeRef (so lowerNew() fires for `new T(...)`,
+            // see TypeResolution_Names.cpp ~line 1420); they are detected
+            // here by name via isValueBuiltinByName (#1463), the single
+            // source of truth for the value-builtin name set.
+            bool receiverHasTypeSpecificOverloads = false;
+            if (umTarget) {
+                if (auto* tt = ctx_.exprType(*umTarget)) {
+                    if (tt->kind == TypeRef::Kind::Primitive) {
+                        receiverHasTypeSpecificOverloads = true;
+                    } else if (tt->kind == TypeRef::Kind::Named) {
+                        if (tt->declaration &&
+                            tt->declaration->isValueBuiltin) {
+                            receiverHasTypeSpecificOverloads = true;
+                        } else if (!tt->declaration &&
+                                   isValueBuiltinByName(
+                                       tt->headName())) {
+                            receiverHasTypeSpecificOverloads = true;
+                        }
+                    }
+                }
+            }
+            int expectedArity = -1;
+            if (umName == "Equals")               expectedArity = 1;
+            else if (umName == "ToString" ||
+                     umName == "GetHashCode" ||
+                     umName == "GetType"    ||
+                     umName == "Dispose")         expectedArity = 0;
+            else if (umName == "ReferenceEquals") expectedArity = 2;
+            if (expectedArity >= 0 && !targetIsStaticReceiver &&
+                    !receiverHasTypeSpecificOverloads) {
+                const std::size_t nargs = ce.args.size();
+                if (static_cast<int>(nargs) != expectedArity) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        std::string("the universal `Object.") +
+                            std::string(umName) +
+                            "` member takes " +
+                            std::to_string(expectedArity) +
+                            " argument(s) but the call supplies " +
+                            std::to_string(nargs) + " (§8.1)");
+                }
+            }
+        }
         if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
             if (ma->target) {
                 auto* recvTy = ctx_.exprType(*ma->target);
