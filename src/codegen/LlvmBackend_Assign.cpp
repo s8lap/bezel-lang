@@ -1917,7 +1917,138 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     auto* ps = selectIndexer(recvDecl, *ix);  // per §23.4 (#1172)
     if (!ps) return false;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-    if (!pd) return false;
+    // fix #2509 (§9.2/§23.4, v0.236): the IMPORTED-indexer compound-assign
+    // twin of #2489's `!pd` branches in lowerIndexerGet/lowerIndexerSet
+    // (this file) — and of this function's own LOCAL `pd != nullptr` path
+    // below, which #2507 had just fixed for the receiver-resolution
+    // copy-vs-address crash. An imported indexer has no ast::PropertyDecl
+    // (reconstructed from side tables only, per #2414's own comment on
+    // lowerIndexerGet); pre-fix this function bailed `if (!pd) return
+    // false;` immediately, the caller then fell through
+    // lowerCollectionIndexerCompound (false: not Array<T>/Dictionary<K,V>)
+    // and the generic lvalueAddr fallback (null: no LLVM ArrayType for a
+    // user indexer) — and the write was SILENTLY DROPPED, no crash, no
+    // diagnostic (confirmed by probe against origin/main: `r[5] += 3;
+    // return r[2];` against an imported RECORD indexer returned 2, the
+    // pristine getter value `_v+2 = 0+2`, not the expected 5; identical
+    // shape, identical exit code, against an imported CLASS indexer —
+    // #2489's own Class||Record scope).
+    //
+    // Mirror #2489's `!pd` branches: dispatch directly through the
+    // exported `bz$<Class>$idxget$<arity>` / `bz$<Class>$idxset$<arity>`
+    // ABI stubs (importedIndexerGetterFns_ / importedIndexerSetterFns_),
+    // evaluating the receiver and each index expression ONCE and sharing
+    // them between the two calls (§23.4 single-evaluation contract — this
+    // function's own header comment already documents it). Calling
+    // lowerIndexerGet/lowerIndexerSet directly would re-evaluate those
+    // sub-expressions, which the issue text explicitly rules out (a
+    // #2510-style refactor, not a fix). Receiver storage resolution
+    // mirrors both the #2507 local path below (lvalueAddr over lowerExpr:
+    // a record receiver is by-value per §9.2, so lowerExpr loads a copy
+    // and the setter would mutate a throwaway slot — #2489's own
+    // confirmed defect for plain `r[i] := v`) and #2489's lowerIndexerSet
+    // `!pd` branch.
+    if (!pd) {
+        if (recvDecl->kind != ast::TypeDeclKind::Class &&
+            recvDecl->kind != ast::TypeDeclKind::Record) return false;
+        auto git = importedIndexerGetterFns_.find(ps);
+        auto sit = importedIndexerSetterFns_.find(ps);
+        if (git == importedIndexerGetterFns_.end() ||
+            sit == importedIndexerSetterFns_.end()) return false;
+        llvm::Function* getFn = git->second;
+        llvm::Function* setFn = sit->second;
+
+        // --- Resolve receiver storage ONCE. ---
+        llvm::Value* obj = nullptr;
+        llvm::Type* objElemTy = nullptr;
+        if (llvm::Value* addr = lvalueAddr(*ix->target, objElemTy)) {
+            if (objElemTy && objElemTy->isPointerTy())
+                obj = builder_.CreateLoad(objElemTy, addr);
+            else if (objElemTy && objElemTy->isAggregateType())
+                obj = addr;  // address of the receiver's real storage
+        }
+        if (!obj) {
+            llvm::Value* ov = lowerExpr(*ix->target);
+            if (!ov) return false;
+            if (ov->getType()->isPointerTy()) {
+                obj = ov;
+            } else if (ov->getType()->isAggregateType()) {
+                llvm::AllocaInst* tmp = entryAlloca(ov->getType());
+                builder_.CreateStore(ov, tmp);
+                obj = tmp;
+            } else {
+                return false;
+            }
+        }
+
+        // --- Spill each index param ONCE; shared by getter and setter. ---
+        auto* getFnTy = getFn->getFunctionType();
+        std::vector<llvm::AllocaInst*> idxSlots;
+        idxSlots.reserve(ps->indexerParams.size());
+        for (std::size_t k = 0; k < ps->indexerParams.size() &&
+             k < ix->indices.size() &&
+             k + 1 < getFnTy->getNumParams(); ++k) {
+            if (!ix->indices[k].value) return false;
+            llvm::Value* argVal = lowerExpr(*ix->indices[k].value);
+            if (!argVal) return false;
+            llvm::AllocaInst* slot = entryAlloca(argVal->getType());
+            builder_.CreateStore(argVal, slot);
+            idxSlots.push_back(slot);
+        }
+
+        // --- Call getter with the shared receiver and indices. ---
+        std::vector<llvm::Value*> getArgs;
+        getArgs.push_back(obj);
+        for (std::size_t k = 0; k < idxSlots.size() &&
+             k + 1 < getFnTy->getNumParams(); ++k) {
+            if (!idxSlots[k]) return false;
+            llvm::Value* v = builder_.CreateLoad(
+                idxSlots[k]->getAllocatedType(), idxSlots[k]);
+            getArgs.push_back(coerceNumericToType(
+                v, getFnTy->getParamType(k + 1), false));
+        }
+        llvm::Value* cur = builder_.CreateCall(getFnTy, getFn, getArgs);
+        emitPendingCheck();
+        if (!cur) return false;
+
+        // --- Apply the compound operator. ---
+        llvm::Value* rhs = lowerExpr(*as.value);
+        if (!rhs) {
+            // #1386/#2509: ICE — lowerExpr returned null for the RHS.
+            ctx_.diagnostics().report(
+                Severity::Error, as.value->span.begin,
+                "internal: lowerExpr returned null for compound indexer "
+                "assignment RHS (imported-indexer path) — #2509");
+            return false;
+        }
+        std::string op(as.op);
+        if (!op.empty() && op.back() == '=') op.pop_back();
+        llvm::Value* newVal = emitCompoundOp(
+            op, cur, rhs, cur->getType()->isFloatingPointTy(),
+            isUnsignedTargetExpr(*as.target),
+            isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
+            isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
+        if (!newVal) return false;
+
+        // --- Call setter with the new value + shared receiver/indices. ---
+        auto* setFnTy = setFn->getFunctionType();
+        if (setFnTy->getNumParams() == 0) return false;
+        std::vector<llvm::Value*> setArgs;
+        setArgs.push_back(obj);
+        for (std::size_t k = 0; k < idxSlots.size() &&
+             k + 1 < setFnTy->getNumParams(); ++k) {
+            if (!idxSlots[k]) return false;
+            llvm::Value* v = builder_.CreateLoad(
+                idxSlots[k]->getAllocatedType(), idxSlots[k]);
+            setArgs.push_back(coerceNumericToType(
+                v, setFnTy->getParamType(k + 1), false));
+        }
+        llvm::Type* valTy = setFnTy->getParamType(setFnTy->getNumParams() - 1);
+        setArgs.push_back(coerceNumericToType(newVal, valTy, false));
+        builder_.CreateCall(setFnTy, setFn, setArgs);
+        emitPendingCheck();
+        return true;
+    }
 
     // --- Locate getter body. ---
     const ast::Expr* getterExpr = nullptr;

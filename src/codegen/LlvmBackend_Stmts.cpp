@@ -1269,6 +1269,209 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                                      *ix);  // per §23.4 (#1172)
                             auto* pd = ps ? dynamic_cast<const ast::PropertyDecl*>(
                                                ps->decl) : nullptr;
+                            // fix #2509 (§9.2/§23.4, v0.236): the
+                            // IMPORTED-indexer increment/decrement twin of
+                            // the `!pd` branch just added to
+                            // lowerIndexerCompound (LlvmBackend_Assign.cpp)
+                            // — and of this block's own LOCAL `ps && pd`
+                            // path immediately below, which #2507 had just
+                            // fixed for the receiver copy-vs-address
+                            // crash. An imported indexer has no
+                            // ast::PropertyDecl (reconstructed from side
+                            // tables only, per #2414); pre-fix this block
+                            // gated on `ps && pd` and the imported case
+                            // fell through to `return false;` below — and
+                            // the write was SILENTLY DROPPED (confirmed by
+                            // probe: `r[5]++; return r[2];` against an
+                            // imported RECORD indexer returned 2, the
+                            // pristine getter value, not the expected 3;
+                            // identical shape against an imported CLASS
+                            // indexer — #2489's Class||Record scope).
+                            // Dispatch directly through the exported
+                            // `bz$<Class>$idxget$<arity>` /
+                            // `bz$<Class>$idxset$<arity>` ABI stubs so the
+                            // receiver and each index are evaluated ONCE
+                            // (§23.4); do NOT call
+                            // lowerIndexerGet/lowerIndexerSet, which would
+                            // re-evaluate them (issue text rules that out).
+                            if (ps && !pd &&
+                                (targetTy2->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 targetTy2->declaration->kind ==
+                                     ast::TypeDeclKind::Record)) {
+                                auto git =
+                                    importedIndexerGetterFns_.find(ps);
+                                auto sit =
+                                    importedIndexerSetterFns_.find(ps);
+                                if (git != importedIndexerGetterFns_.end() &&
+                                    sit != importedIndexerSetterFns_.end()) {
+                                    llvm::Function* getFn = git->second;
+                                    llvm::Function* setFn = sit->second;
+                                    // Resolve receiver storage ONCE
+                                    // (mirrors lowerIndexerCompound's
+                                    // #2509 `!pd` branch and #2489's
+                                    // lowerIndexerSet): prefer lvalueAddr
+                                    // (own storage) over lowerExpr (a
+                                    // copy) — a record receiver is
+                                    // by-value (§9.2).
+                                    llvm::Value* obj = nullptr;
+                                    llvm::Type* objElemTy = nullptr;
+                                    if (llvm::Value* addr = lvalueAddr(
+                                            *ix->target, objElemTy)) {
+                                        if (objElemTy &&
+                                            objElemTy->isPointerTy())
+                                            obj = builder_.CreateLoad(
+                                                objElemTy, addr);
+                                        else if (objElemTy &&
+                                                 objElemTy->isAggregateType())
+                                            obj = addr;
+                                    }
+                                    if (!obj) {
+                                        llvm::Value* ov =
+                                            lowerExpr(*ix->target);
+                                        if (ov) {
+                                            if (ov->getType()->isPointerTy()) {
+                                                obj = ov;
+                                            } else if (
+                                                ov->getType()
+                                                    ->isAggregateType()) {
+                                                auto* tmp = entryAlloca(
+                                                    ov->getType());
+                                                builder_.CreateStore(ov, tmp);
+                                                obj = tmp;
+                                            }
+                                        }
+                                    }
+                                    if (obj) {
+                                        auto* getFnTy =
+                                            getFn->getFunctionType();
+                                        // Spill each index once; shared by
+                                        // both getter and setter calls
+                                        // (§23.4).
+                                        std::vector<llvm::AllocaInst*>
+                                            idxSlots;
+                                        idxSlots.reserve(
+                                            ps->indexerParams.size());
+                                        bool ok = true;
+                                        for (std::size_t k = 0;
+                                             k < ps->indexerParams.size() &&
+                                             k < ix->indices.size() &&
+                                             k + 1 < getFnTy->getNumParams();
+                                             ++k) {
+                                            if (!ix->indices[k].value) {
+                                                ok = false; break;
+                                            }
+                                            llvm::Value* av =
+                                                lowerExpr(*ix->indices[k].value);
+                                            if (!av) {
+                                                ok = false; break;
+                                            }
+                                            auto* sl = entryAlloca(av->getType());
+                                            builder_.CreateStore(av, sl);
+                                            idxSlots.push_back(sl);
+                                        }
+                                        if (ok) {
+                                            // --- Call getter ---
+                                            std::vector<llvm::Value*> getArgs;
+                                            getArgs.push_back(obj);
+                                            for (std::size_t k = 0;
+                                                 k < idxSlots.size() &&
+                                                 k + 1 < getFnTy->getNumParams();
+                                                 ++k) {
+                                                if (!idxSlots[k]) {
+                                                    ok = false; break;
+                                                }
+                                                llvm::Value* v =
+                                                    builder_.CreateLoad(
+                                                        idxSlots[k]->
+                                                            getAllocatedType(),
+                                                        idxSlots[k]);
+                                                getArgs.push_back(
+                                                    coerceNumericToType(
+                                                        v, getFnTy->getParamType(
+                                                               k + 1), false));
+                                            }
+                                            llvm::Value* cur = nullptr;
+                                            if (ok) {
+                                                cur = builder_.CreateCall(
+                                                    getFnTy, getFn, getArgs);
+                                                emitPendingCheck();
+                                            }
+                                            // --- Compute ±1 and call setter ---
+                                            if (cur) {
+                                                const std::string binOp =
+                                                    (inc->op == "++")
+                                                        ? "+" : "-";
+                                                bool fp = cur->getType()
+                                                              ->isFloatingPointTy();
+                                                llvm::Value* one =
+                                                    fp ? llvm::cast<llvm::Value>(
+                                                             llvm::ConstantFP::get(
+                                                                 cur->getType(),
+                                                                 1.0))
+                                                       : llvm::cast<llvm::Value>(
+                                                             llvm::ConstantInt::get(
+                                                                 cur->getType(),
+                                                                 1));
+                                                llvm::Value* newVal =
+                                                    emitCompoundOp(
+                                                        binOp, cur, one, fp,
+                                                        isUnsignedTargetExpr(
+                                                            *inc->target),
+                                                        isCharTargetExpr(
+                                                            *inc->target));
+                                                        // §6.6/§5.2 #1961
+                                                if (newVal) {
+                                                    auto* setFnTy =
+                                                        setFn->getFunctionType();
+                                                    if (setFnTy->getNumParams()
+                                                            == 0) {
+                                                        ok = false;
+                                                    } else {
+                                                        std::vector<
+                                                            llvm::Value*>
+                                                            setArgs;
+                                                        setArgs.push_back(obj);
+                                                        for (std::size_t k = 0;
+                                                             k < idxSlots.size() &&
+                                                             k + 1 < setFnTy->getNumParams();
+                                                             ++k) {
+                                                            if (!idxSlots[k]) {
+                                                                ok = false; break;
+                                                            }
+                                                            llvm::Value* v =
+                                                                builder_
+                                                                    .CreateLoad(
+                                                                        idxSlots[k]->
+                                                                            getAllocatedType(),
+                                                                        idxSlots[k]);
+                                                            setArgs.push_back(
+                                                                coerceNumericToType(
+                                                                    v,
+                                                                    setFnTy->getParamType(
+                                                                        k + 1),
+                                                                    false));
+                                                        }
+                                                        if (ok) {
+                                                            llvm::Type* valTy =
+                                                                setFnTy->getParamType(
+                                                                    setFnTy->getNumParams() - 1);
+                                                            setArgs.push_back(
+                                                                coerceNumericToType(
+                                                                    newVal, valTy,
+                                                                    false));
+                                                            builder_.CreateCall(
+                                                                setFnTy, setFn,
+                                                                setArgs);
+                                                            emitPendingCheck();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if (ps && pd) {
                                 // Locate getter and setter bodies.
                                 const ast::Expr* getterExpr = nullptr;
