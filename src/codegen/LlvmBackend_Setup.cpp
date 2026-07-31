@@ -13559,13 +13559,31 @@ struct StringEscapeWalker {
     // concatenated within the arm, or passed to a channel this walker already
     // treats conservatively — never captured, rebound-and-escaped, returned,
     // stored, or re-matched — so the target's own release cannot dangle it.
-    // Only the value-like-choice release passes (collectStringReleaseEligible's
-    // valueLikeChoiceCandidates loop and collectValueLikeChoiceCallResultRelease
-    // Eligible's candidates loop) set this; the plain string/dict/grouping/
-    // borrowing-Array/record walks leave it false and keep the pre-existing
-    // unconditional scrutinee-escape rule (their soundness under THIS
-    // relaxation has not been analyzed).
-    bool valueLikeChoiceMode = false;
+    //
+    // fix #2481 (consumer 1/3, plain string locals): renamed from the
+    // original valueLikeChoiceMode — the mechanism above never inspected
+    // WHAT the tracked target's own type is, only that it is a bare-
+    // identifier `case` scrutinee whose arm bindings are proven non-escaping.
+    // §19.3's general "Pattern binding and ownership" paragraph states the
+    // SAME rule for ANY scrutinee, not only a choice: "for runtime-managed
+    // scrutinees (`string`, function values), the binding is a shared
+    // reference" — and the lowering confirms it: an unconstrained/typed
+    // `var t` binding over a plain `string` scrutinee is lowered by the exact
+    // same code path as a choice payload binding (LlvmBackend_Exprs2.cpp,
+    // BindingPattern arm: `entryAlloca` + a raw `CreateStore(scrut, slot)`,
+    // no retain call), so returnedStringLocalOwnsPlusOne / lowerStringField
+    // Store's retain-unless-+1-producer / the lambda-capture no-retain gap
+    // are exactly as applicable to a plain-string `var t` binding as to a
+    // choice payload `var a` binding — nothing in their logic keys off the
+    // scrutinee's type. Set by collectStringReleaseEligible's producer/
+    // borrow loops (stringReleaseMode) IN ADDITION to the value-like-choice
+    // release passes (collectStringReleaseEligible's valueLikeChoiceCandidates
+    // loop and collectValueLikeChoiceCallResultReleaseEligible's candidates
+    // loop); the #1747 record-call-result and the separate ClosureEscapeWalker
+    // consumers (#2481's other two) are NOT covered by this flag and keep the
+    // pre-existing unconditional scrutinee-escape rule — each needs its own,
+    // separately-argued soundness case (§2481 tracking issue).
+    bool scrutineeBorrowMode = false;
     // #1871: the set of `var v: IEnumerable<T> := <target-array>` VIEW LocalDecls
     // that were independently proven never to escape. A binding of the target into
     // one of these is a borrow (the view wrapper borrows the array's backing; its
@@ -13612,7 +13630,7 @@ struct StringEscapeWalker {
 
     // fix #2450 / §19.3 / §35.5 / §28.9 / §35.4: are EVERY one of `arms`'
     // payload pattern bindings proven never to escape their own arm? Used
-    // only when valueLikeChoiceMode is set AND the CaseExpr/CaseStmt's
+    // only when scrutineeBorrowMode is set AND the CaseExpr/CaseStmt's
     // scrutinee is the tracked TARGET local itself (see the scrutinee-relax
     // call sites below) — a positive verdict here is what makes matching the
     // target non-destructive-and-non-escaping as a whole.
@@ -14128,11 +14146,11 @@ struct StringEscapeWalker {
             // is the arm-meet result), and a sub-expression arm keeps its own
             // escape rules via the recursion.
             //
-            // fix #2450 / §35.5: EXCEPT when valueLikeChoiceMode is set and the
+            // fix #2450 / §35.5: EXCEPT when scrutineeBorrowMode is set and the
             // scrutinee IS the tracked target itself — then matching it is a
             // borrowing match (§35.5), not per se an escape, PROVIDED every
             // arm's payload bindings are independently proven non-escaping
-            // (armsBindingsSafe) — see that function and the valueLikeChoiceMode
+            // (armsBindingsSafe) — see that function and the scrutineeBorrowMode
             // comment above for the full soundness argument. This ONLY changes
             // whether the scrutinee EXPRESSION read below counts as an escape;
             // `arm.guard` below is UNCHANGED (still walked at safeRead=false) —
@@ -14141,7 +14159,7 @@ struct StringEscapeWalker {
             // going through the ordinary top-level recursion exactly as
             // before, unaffected by this relaxation.
             bool armSafe = stringReleaseMode && isStringResultArmMeet(e);
-            bool scrutineeSafe = valueLikeChoiceMode &&
+            bool scrutineeSafe = scrutineeBorrowMode &&
                                  isTargetIdent(ce->scrutinee.get()) &&
                                  armsBindingsSafe(ce->arms);
             expr(ce->scrutinee.get(), /*safeRead=*/scrutineeSafe);
@@ -14346,11 +14364,11 @@ struct StringEscapeWalker {
         }
         if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
             // fix #2450 / §35.5: mirrors the CaseExpr scrutinee relaxation
-            // above — see that arm and the valueLikeChoiceMode comment for the
+            // above — see that arm and the scrutineeBorrowMode comment for the
             // full soundness argument. A statement-position case's arm result
             // (if any) is discarded, so there is no arm-meet retain to mirror
             // here; only the scrutinee-escape verdict changes.
-            bool scrutineeSafe = valueLikeChoiceMode &&
+            bool scrutineeSafe = scrutineeBorrowMode &&
                                  isTargetIdent(cs->scrutinee.get()) &&
                                  armsBindingsSafe(cs->arms);
             expr(cs->scrutinee.get(), /*safeRead=*/scrutineeSafe);
@@ -15430,6 +15448,15 @@ void Emitter::collectStringReleaseEligible(
     for (const ast::LocalDecl* ld : producerCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         w.stringReleaseMode = true;  // #1997: OPT-IN the plain-`:=` relaxation
+        // fix #2481 (consumer 1/3): OPT-IN the case-scrutinee relaxation — see
+        // the scrutineeBorrowMode flag comment (struct StringEscapeWalker,
+        // above) for the full soundness argument. A plain `string` producer
+        // local used ONLY as a `case` scrutinee (matched against string-
+        // literal/`_`/`var t` patterns — records/choice-case destructuring
+        // patterns cannot target a `string` scrutinee, sema rejects them)
+        // previously stayed an unconditional escape, so its scope-end release
+        // never armed for the shape most real `case`-on-a-string code uses.
+        w.scrutineeBorrowMode = true;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringReleaseEligible_.insert(static_cast<const void*>(ld));
@@ -15445,6 +15472,12 @@ void Emitter::collectStringReleaseEligible(
     for (const ast::LocalDecl* ld : borrowCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         w.stringReleaseMode = true;  // #1997: OPT-IN the plain-`:=` relaxation
+        // fix #2481 (consumer 1/3): mirrors the producer-candidates loop
+        // above — same scrutineeBorrowMode opt-in, same soundness argument
+        // (independent of whether the slot's +1 came from a producer or a
+        // retained borrow; either way the slot owns exactly one reference
+        // and armsBindingsSafe proves no arm binding escapes it).
+        w.scrutineeBorrowMode = true;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringBorrowRetainEligible_.insert(static_cast<const void*>(ld));
@@ -15465,17 +15498,17 @@ void Emitter::collectStringReleaseEligible(
     // escaping local is simply not armed — its payload leaks (the pre-existing,
     // safe behavior). // per §28.9, §35.4 v0.226.
     //
-    // fix #2450 / §35.5: valueLikeChoiceMode is ON (unlike stringReleaseMode,
+    // fix #2450 / §35.5: scrutineeBorrowMode is ON (unlike stringReleaseMode,
     // which stays off) — it opts INTO the case-scrutinee relaxation (matching
     // the local via `case` is not per se an escape, PROVIDED every arm's
     // payload bindings are independently proven non-escaping), closing the
     // #2428 residual where the local's ONLY use is as a case scrutinee. See
-    // the valueLikeChoiceMode flag comment (struct StringEscapeWalker, above)
+    // the scrutineeBorrowMode flag comment (struct StringEscapeWalker, above)
     // for the full soundness argument.
     for (const ast::LocalDecl* ld : valueLikeChoiceCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         // stringReleaseMode stays false — see the rationale above.
-        w.valueLikeChoiceMode = true;  // fix #2450
+        w.scrutineeBorrowMode = true;  // fix #2450
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             valueLikeChoiceStrReleaseEligible_.insert(
@@ -15857,13 +15890,13 @@ void Emitter::collectValueLikeChoiceCallResultReleaseEligible(
         // SAME leak-over-UAF discipline #2115 already established for this
         // type family.
         //
-        // fix #2450 / §35.5: valueLikeChoiceMode IS opted in, mirroring the
+        // fix #2450 / §35.5: scrutineeBorrowMode IS opted in, mirroring the
         // SAME opt-in on #2115's own walk above — closes the identical
         // scrutinee-only residual for THIS mechanism's eligibility set (the
         // issue's own "Deserialize + case-match round trip" repro). See the
-        // valueLikeChoiceMode flag comment (struct StringEscapeWalker) for the
+        // scrutineeBorrowMode flag comment (struct StringEscapeWalker) for the
         // full soundness argument.
-        w.valueLikeChoiceMode = true;  // fix #2450
+        w.scrutineeBorrowMode = true;  // fix #2450
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             valueLikeChoiceCallResultReleaseEligible_.insert(
