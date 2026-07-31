@@ -181,14 +181,14 @@ end;
 
 Or collapse it with the operators from §1: `directory.Find("alice")?.Name ?? "stranger"`.
 
-The standard library ships this idiom as the **`*OrNull` tier** (stdlib §1): every concrete `Parse` family has a `ParseOrNull` returning `T?`, the dictionaries have `GetOrNull`, and the composition is one line:
+The standard library ships this idiom as the **`*OrNull` tier** (stdlib §1): every per-type `Parse` — the stdlib §9 primitives and the `DateTime`/`DateOnly`/`TimeOnly`/`Guid` families — has a `ParseOrNull` returning `T?`, the dictionaries have `GetOrNull`, and the composition is one line:
 
 ```bezel
-var port     := int.ParseOrNull(Environment.Get("PORT") ?? "") ?? 8080;
+var port     := int.ParseOrNull(raw) ?? 8080;
 var greeting := config.GetOrNull("greeting") ?? "hello";
 ```
 
-`ParseOrNull` returns null exactly where `Parse` would throw, so the `??` supplies the default for "unset" and "malformed" alike, in one expression. When you must *distinguish* absence from a present null — a dictionary whose value type is itself nullable, say — `T?` collapses the two (stdlib §1's conflation caveat); use `ContainsKey` or the Try shape below instead.
+`ParseOrNull` returns null exactly where `Parse` would throw, so one `??` covers every failure path in a single expression. (For `int`/`bool` environment variables specifically, `Environment.GetInt`/`GetBool` are the dedicated one-call spelling.) When you must *distinguish* absence from a present null — a dictionary whose value type is itself nullable, say — `T?` collapses the two (the conflation caveat, stdlib §1/§4.8); use `ContainsKey` or the Try shape below instead.
 
 **The `Try` pattern** when the failure path and success path differ, and especially when the value is *owned*. A `bool` return plus an `out owned` parameter, with a `when true` postcondition that lets the caller skip the `!`:
 
@@ -236,7 +236,7 @@ end;                                  // exhaustive; no _ arm needed
 
 The bare `Ok(value)` / `Error(msg)` spelling is **declared-result target-typing** (spec §35.3): in a `return` statement — or an expression body, or a lambda with a return-type ascription — whose declared result type is a choice, a bare case name constructs that choice's case, with the declared type supplying the type arguments whole. The qualified `Result<int, string>.Ok(value)` remains valid everywhere; the bare form exists for exactly these positions, and if a case name shadows something in scope the compiler warns. Restating the full type at every `return` was the old cost of the choice return; it is gone.
 
-`Result<T, E>` (stdlib §2.20) is the stdlib's ready-made shape; a domain-specific choice with named cases (`Fetched`/`NotModified`/`Failed`) is often better still. When a case's payload is an owned resource, the `case` over a fresh call is an *owning match*: bind the payload and adopt it (`using var conn := owned c;`) — see Guide 1 §9. The three idioms compose: `T?` for plain absence, the Try shape for value extraction with a boring failure, the choice return where the failure is branched on with a value-shaped payload.
+`Result<T, E>` (stdlib §2.20) is the stdlib's ready-made shape; a domain-specific choice with named cases (`Fetched`/`NotModified`/`Failed`) is often better still. When a case's payload is an owned resource, the `case` over a fresh call is an *owning match*: bind the payload and adopt it (`using var conn := owned c;`) — see Guide 1 §9.
 
 **Pipelining a `Result`.** For value-payload results, four compiler-provided members fold and chain outcomes without writing a `case` (stdlib §2.20): `UnwrapOr(fallback)` folds to a plain value, `Map(f)` transforms the success, `MapError(f)` re-codes the failure at a boundary, and `AndThen(f)` sequences a second fallible step:
 
@@ -263,7 +263,7 @@ public method WellKnownPort(text: string): Result<int, string>
 end WellKnownPort;
 ```
 
-Note the `AndThen` lambda's return-type ascription: it makes the lambda's own returns declared-result positions, so the bare `Ok`/`Error` spelling works inside it too. The combinators exist only at **value-like** instantiations — payloads of values and strings, the common case. A `Result` carrying an owned resource (`Result<Connection, string>`) has none of them, deliberately: extraction there is consumption, and consumption is the owning match's job — for owning results, the exhaustive `case` *is* the pipeline.
+Note the `AndThen` lambda's return-type ascription: it makes the lambda's own returns declared-result positions, so the bare `Ok`/`Error` spelling works inside it too. The combinators exist only at **value-like** instantiations — payloads of values and strings, the common case. A `Result` carrying an owned resource (`Result<Connection, string>`) has none of them, deliberately: extraction there is consumption, and consumption is the owning match's job — for owning results, the exhaustive `case` *is* the pipeline. The three idioms compose: `T?` for plain absence, the Try shape for value extraction with a boring failure, the choice return where the failure is branched on with a value-shaped payload.
 
 ---
 
@@ -273,7 +273,7 @@ Note the `AndThen` lambda's return-type ascription: it makes the lambda's own re
 |---|---|
 | Value may legitimately be absent | nullable return `T?` (the stdlib's `*OrNull` tier: `ParseOrNull`, `GetOrNull`), handle with `?.` / `??` / narrowing |
 | Absent *and* the value would be owned | `Try` pattern: `bool` + `out owned T? when true`, caller uses `out using var` (and drops the `!`) |
-| Failure is expected, carries information the caller *branches on* at or near the call, and the error payload is a plain value shape | `choice` return (`Result<T, E>` or a domain choice, spec §35); consume with an exhaustive `case`, or pipeline with the value-payload combinators (`Map`/`AndThen`/`MapError`/`UnwrapOr`, stdlib §2.20) |
+| Failure is expected, carries information the caller *branches on* at or near the call, and the error payload is a plain value shape | `choice` return (`Result<T, E>` or a domain choice, spec §35); consume with an exhaustive `case`, or — where both payloads are value-like — pipeline with the combinators (`Map`/`MapError`/`AndThen`/`UnwrapOr`, stdlib §2.20) |
 | Failure is expected but consumed at a *boundary* — logged, retried, converted to a protocol answer, reported — or its payload is an owned resource | a typed exception, producer-local (spec §31.4); read it in the `catch` and copy out what you keep (§3) |
 | Caller violated something a correct caller guarantees (a **bug**, not an outcome) | a `requires(...)` clause (spec §22.16) — always-on, faults `ContractViolationException`; never use `requires` for input whose invalidity is a normal outcome at a trust boundary (that is the `T?`/Try/`choice` territory above) |
 | Invalid input at a boundary with no contract (interop, pre-contract code) | `throw new ArgumentException(...)` — the residual idiom `requires` replaces where a contract is possible |
@@ -284,4 +284,4 @@ Note the `AndThen` lambda's return-type ascription: it makes the lambda's own re
 
 The table is the teaching mirror of a normative rule: the **failure-signal rule** (stdlib §1) classifies every fault condition a library surface declares — five bands, first match wins, one mechanism per condition. Two of its sentences are worth restating here. The line between the `choice` row and a typed exception is *where the failure is consumed* and *whether its payload can be a plain value* — never how much information it carries: a fault whose data is read once at a boundary is a typed exception however rich the data; a fault the caller branches on near the call site, with a value-shaped payload, is a `choice` return. And `catch` is a boundary-and-supervision tool — convert, log, retry, report, re-raise; branching program logic on caught exception types at an interior call site is the signal to check the rule for a value-shaped tier.
 
-Two habits carry most of it: prefer a nullable, `Try`, or `choice` return over an exception whenever the failure is *expected and branched on* — and a `requires(...)` clause over a `throw` whenever the condition is something a correct caller already guarantees — and inside a `catch` treat the exception as something you read and let go of — copy out the strings you need, never the instance. And in choice-returning code, take the ergonomics the language gives you: bare case names in return positions, and the combinators where a `case` would only fold. The familiar C# syntax mostly transfers; the ownership rules around exceptions and `out` values are the part to internalize.
+A few habits carry most of it: prefer a nullable, `Try`, or `choice` return over an exception whenever the failure is *expected and branched on* — and a `requires(...)` clause over a `throw` whenever the condition is something a correct caller already guarantees — and inside a `catch` treat the exception as something you read and let go of — copy out the strings you need, never the instance. And in choice-returning code, take the ergonomics the language gives you: bare case names in return positions, and the combinators where a `case` would only fold. The familiar C# syntax mostly transfers; the ownership rules around exceptions and `out` values are the part to internalize.
