@@ -15106,6 +15106,37 @@ struct ClosureEscapeWalker {
     // even in an otherwise-safe-read position (a call CALLEE `cap()` or a
     // reference-equality operand). See the String walker for the full rationale.
     bool inLambda = false;
+    // fix #2481 (consumer 3/3, closures): OPT-IN gate for the SAME
+    // case-scrutinee relaxation StringEscapeWalker's `scrutineeBorrowMode`
+    // implements (see that flag's comment, above in this file, for the
+    // shared mechanism this mirrors). Re-derived independently for
+    // `ClosureEscapeWalker` — a SEPARATE struct with its own escape rules,
+    // per the issue's own caution not to assume transfer from the string/
+    // choice/record consumers. §19.3's "Pattern binding and ownership"
+    // paragraph names "function values" in the SAME sentence as `string` for
+    // the runtime-managed-scrutinee borrow rule: "for runtime-managed
+    // scrutinees (`string`, function values), the binding is a shared
+    // reference" — so a `case f of var g => ...` binding over a closure-typed
+    // scrutinee is, per the spec text itself, the identical shape. Checked
+    // against the lowering, not just the wording: the SAME generic
+    // BindingPattern arm (LlvmBackend_Exprs2.cpp) that stores a string/
+    // record/choice scrutinee value into a fresh alloca via a raw
+    // `CreateStore`, no retain, handles a closure-typed scrutinee too — there
+    // is no closure-specific branch there at all. And closures have their OWN
+    // complete, independent PARALLEL of the string retain-on-escape
+    // machinery: `returnedClosureLocalOwnsPlusOne` (false for any
+    // BindingPattern decl — same `dynamic_cast<LocalDecl*>` miss, and a
+    // BindingPattern's address is never in `closureReleaseEligible_`, which
+    // `collectClosureReleaseEligible`'s OWN candidate scan populates only
+    // from `ast::LocalDecl` nodes) so `return g;` unconditionally
+    // `emitClosureRetain`s; `lowerClosureFieldStore`'s `isProducer` gate
+    // (`isPlusOneClosureProducer` / `isUserMethodClosureReturnCall`) has no
+    // bare-local-read case, so `obj.f := g;` unconditionally retains too. The
+    // lambda-capture channel is the SAME no-retain gap (`inLambda` here,
+    // exactly mirroring FINDING [1] for strings). So the identical
+    // return/field-store-retain-but-lambda-capture-doesn't asymmetry holds,
+    // and armsBindingsSafe (below) is sound for the same reason #2450's is.
+    bool scrutineeBorrowMode = false;
 
     bool isTargetIdent(const ast::Expr* e) {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -15113,6 +15144,44 @@ struct ClosureEscapeWalker {
         auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
         return loc && loc->decl &&
                static_cast<const void*>(loc->decl) == target;
+    }
+
+    // fix #2481 (consumer 3/3, closures) / §19.3 / §28.9 / §28.3 / §27.5: are
+    // EVERY one of `arms`' payload pattern bindings proven never to escape
+    // their own arm? Independent re-implementation of StringEscapeWalker's
+    // armsBindingsSafe (LlvmBackend_Setup.cpp, above) for THIS struct — reuses
+    // the SAME free `collectPatternBindings` helper (untyped w.r.t. which
+    // walker calls it — it only inspects `ast::Pattern` shapes) but keys each
+    // per-binding sub-check on a FRESH `ClosureEscapeWalker` (not
+    // StringEscapeWalker), since a closure-typed scrutinee's bindings must be
+    // checked against closure escape rules (a call ARGUMENT escapes, a
+    // MemberAccessExpr/IndexExpr is never a safe read for a function value,
+    // etc.) — a StringEscapeWalker instance would apply the wrong rules
+    // entirely. Used only when scrutineeBorrowMode is set AND the CaseExpr/
+    // CaseStmt's scrutinee is the tracked TARGET local itself.
+    bool armsBindingsSafe(const std::vector<ast::CaseArm>& arms) {
+        for (auto& arm : arms) {
+            std::vector<const ast::BindingPattern*> bindings;
+            bool ok = true;
+            collectPatternBindings(arm.pattern.get(), bindings, ok);
+            if (!ok) return false;
+            for (const ast::BindingPattern* bp : bindings) {
+                ClosureEscapeWalker bw{ctx, static_cast<const void*>(bp)};
+                bw.expr(arm.guard.get(), /*safeRead=*/false);
+                if (!bw.escaped) {
+                    if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                        bw.expr(arm.exprBody.get(), /*safeRead=*/false);
+                    } else {
+                        for (auto& s : arm.stmts) {
+                            bw.stmt(s.get());
+                            if (bw.escaped) break;
+                        }
+                    }
+                }
+                if (bw.escaped) return false;
+            }
+        }
+        return true;
     }
 
     void expr(const ast::Expr* e, bool safeRead) {
@@ -15217,7 +15286,19 @@ struct ClosureEscapeWalker {
             return;
         }
         if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
-            expr(ce->scrutinee.get(), /*safeRead=*/false);
+            // fix #2481 (consumer 3/3): mirrors StringEscapeWalker's #2450
+            // CaseExpr relaxation — see the scrutineeBorrowMode comment
+            // (above in this struct) for the closure-specific soundness
+            // argument. When the scrutinee IS the tracked target and every
+            // arm's bindings are proven non-escaping (armsBindingsSafe),
+            // matching it is a borrowing read of the closure's own slot, not
+            // an escape. `arm.guard`/`arm.exprBody` walks below are
+            // unchanged — this only changes the scrutinee expression's own
+            // escape verdict.
+            bool scrutineeSafe = scrutineeBorrowMode &&
+                                 isTargetIdent(ce->scrutinee.get()) &&
+                                 armsBindingsSafe(ce->arms);
+            expr(ce->scrutinee.get(), /*safeRead=*/scrutineeSafe);
             for (auto& arm : ce->arms) {
                 expr(arm.guard.get(), /*safeRead=*/false);
                 expr(arm.exprBody.get(), /*safeRead=*/false);
@@ -15314,7 +15395,15 @@ struct ClosureEscapeWalker {
             return;
         }
         if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
-            expr(cs->scrutinee.get(), /*safeRead=*/false);
+            // fix #2481 (consumer 3/3): mirrors the CaseExpr relaxation above
+            // — see the scrutineeBorrowMode comment (struct ClosureEscapeWalker)
+            // for the full soundness argument. A statement-position case's
+            // arm result (if any) is discarded, so only the scrutinee-escape
+            // verdict changes.
+            bool scrutineeSafe = scrutineeBorrowMode &&
+                                 isTargetIdent(cs->scrutinee.get()) &&
+                                 armsBindingsSafe(cs->arms);
+            expr(cs->scrutinee.get(), /*safeRead=*/scrutineeSafe);
             for (auto& arm : cs->arms) {
                 expr(arm.guard.get(), /*safeRead=*/false);
                 expr(arm.exprBody.get(), /*safeRead=*/false);
@@ -15375,6 +15464,13 @@ void Emitter::collectClosureReleaseEligible(
 
     for (const ast::LocalDecl* ld : candidates) {
         ClosureEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        // fix #2481 (consumer 3/3): OPT-IN the case-scrutinee relaxation —
+        // see the scrutineeBorrowMode flag comment (struct ClosureEscapeWalker,
+        // above) for the full soundness argument. A closure-typed producer
+        // local used ONLY as a `case` scrutinee (e.g. `case f of var g =>
+        // g(), _ => ...`) previously stayed an unconditional escape, so its
+        // scope-end release never armed for this shape.
+        w.scrutineeBorrowMode = true;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             closureReleaseEligible_.insert(static_cast<const void*>(ld));
