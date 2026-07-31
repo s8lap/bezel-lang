@@ -1840,6 +1840,39 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         bool chainedReturn = asyncChainedReturn_;
         asyncChainedReturn_ = false;
         if (diverged_) return true;  // CG40: the value expression threw
+        // #2491 (return-path twin of #2434): a return statement's value
+        // expression was present but failed to lower — either lowerExpr
+        // returned null for the whole expression, or a collection-literal
+        // materializer (the #465/#538 heap-array/dict arms above) yielded
+        // nothing. Every downstream return route (sync emitReturn's
+        // `v ? v : null` fallback in LlvmBackend_Setup.cpp, the async
+        // emitAsyncComplete-with-null task completion, and the finally
+        // routing's `if (slot && v)` skip-store) silently degrade a null
+        // value to a zero/null return — the correct degrade (definite
+        // assignment / §28.3 ownership make the zero safe), but #2434 made
+        // the local-decl twin of this exact fallback LOUD and explicitly
+        // asked for the same signal on this return path. Mirror #2434's
+        // posture exactly:
+        //   * Severity::Warning, not Error — the §3 / #605 permissive
+        //     "unknown member" shape `return o.Anything();` for
+        //     `o: Object` is accepted by sema BY DESIGN and currently
+        //     reaches here (codegen has no concrete member to dispatch
+        //     to), so an Error would false-reject legal programs exactly
+        //     as #2434's empirical lit-track check found for the
+        //     local-decl twin. Driver::compileExecutableObject prints
+        //     every diagnostic regardless of severity, so a Warning is
+        //     fully visible on stderr without failing the build.
+        //   * Guarded on !hasErrors() so this does not stack on top of an
+        //     already-reported, already-fatal lowerExpr error (e.g. an
+        //     unhandled `in` form) — same message-quality guard #2434 used.
+        // The zero/null degrade still happens downstream; this only makes
+        // the failure observable instead of invisible.
+        if (rs->value && !v && !ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Warning, rs->value->span.begin,
+                "internal: return-value expression failed to lower to a "
+                "value (degraded to a zero/null return value) — #2491");
+        }
         // §30.1: inside an async method's Resume function, `return expression;`
         // completes the OUTER task with the value (and `return;` / fall-off
         // completes with no value), then returns void from Resume — it does NOT

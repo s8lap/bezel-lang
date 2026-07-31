@@ -6143,6 +6143,17 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             if (v && ci.exprBody && !fn->getReturnType()->isVoidTy())
                 v = coerceNumericToType(v, fn->getReturnType(),
                                         isUnsignedTargetExpr(*ci.exprBody));
+            // #2491 (twin of #2434): arrow-body (`=> expr`) return expression
+            // failed to lower — emitReturn's `v ? v : null` fallback would
+            // silently substitute a zero/null return. See the ReturnStmt site
+            // in LlvmBackend_Stmts.cpp for the full rationale (Warning, not
+            // Error, per §3/#605's permissive shapes; !hasErrors() guard).
+            if (ci.exprBody && !v && !ctx_.diagnostics().hasErrors()) {
+                ctx_.diagnostics().report(
+                    Severity::Warning, ci.exprBody->span.begin,
+                    "internal: return-value expression failed to lower to a "
+                    "value (degraded to a zero/null return value) — #2491");
+            }
             terminated = emitReturn(fn, v);
         }
     } else if (ci.bodyKind == ast::MethodBodyKind::Block) {

@@ -2984,6 +2984,21 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                         // Plain T value → { i8 1, T v } (has-value = true).
                         v = wrapNullableValue(retTyRef, v);
                 }
+                // #2491 (twin of #2434): the property getter body's return
+                // expression failed to lower — this site bypasses emitReturn
+                // (calls CreateRet directly), so the `v ? v : null` fallback
+                // below is the getter's OWN silent zero, named explicitly in
+                // #2491's evidence (#2474's investigation found a lazy
+                // struct-build ordering bug compiled a getter to a literal
+                // `ret 0` here with zero diagnostic). See the ReturnStmt site
+                // in LlvmBackend_Stmts.cpp for the full rationale (Warning +
+                // !hasErrors() guard). The zero/null ret still happens below.
+                if (!v && !ctx_.diagnostics().hasErrors()) {
+                    ctx_.diagnostics().report(
+                        Severity::Warning, getterExpr->span.begin,
+                        "internal: return-value expression failed to lower to a "
+                        "value (degraded to a zero/null return value) — #2491");
+                }
                 builder_.CreateRet(v ? v
                                      : llvm::Constant::getNullValue(valTy));
             }

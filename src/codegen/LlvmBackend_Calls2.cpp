@@ -8380,6 +8380,16 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
                 rv = wrapAsIEnumerableForTarget(
                     rv, ctx_.resolvedType(*ci.returnType), ci.exprBody,
                     /*ownLazyPipeline=*/true);
+            // #2491 (twin of #2434): expression-body return failed to lower —
+            // emitReturn's `v ? v : null` fallback would silently substitute a
+            // zero/null return. See the ReturnStmt site in
+            // LlvmBackend_Stmts.cpp for the full rationale.
+            if (ci.exprBody && !rv && !ctx_.diagnostics().hasErrors()) {
+                ctx_.diagnostics().report(
+                    Severity::Warning, ci.exprBody->span.begin,
+                    "internal: return-value expression failed to lower to a "
+                    "value (degraded to a zero/null return value) — #2491");
+            }
             if (!emitReturn(specFn, rv)) emitImplicitReturn(specFn);
         }
     } else {
