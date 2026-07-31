@@ -51,6 +51,46 @@
 // (issue #2457) rather than attempted here, per the project's
 // decline-with-reasons discipline; this file carries no regression test for
 // that category.
+//
+// ── #2458/#2459 follow-up (this revision) ──────────────────────────────
+// Verifying the universal Object members (ToString/Equals/GetHashCode —
+// §8.1) stayed legitimately exempt (not newly rejected by the block above)
+// surfaced two SEPARATE, pre-existing bugs, unrelated to the diagnostics
+// gap this file otherwise covers:
+//   - #2458: `ToString()` on IEnumerator<T>/DictionaryEntry<K,V> crashed
+//     (codegen misrouted the call through `lowerObjectToString`'s
+//     builtin-EXCEPTION vtable-slot-3 dispatch — a guard keyed on
+//     `declaration == nullptr` alone, which also (wrongly) matches every
+//     other declaration-less builtin type). Fixed: narrowed the guard to
+//     `isBuiltinExceptionTypeRef` (the precise, pre-existing, name-checked
+//     helper LlvmBackend_impl.hpp already defines for exactly this
+//     purpose) at both call sites.
+//   - #2459 (tracked as its own follow-up issue): tracing what SHOULD
+//     happen once the crash stopped found `Equals`/`GetHashCode` on
+//     `IEnumerator<T>`/`IAsyncEnumerator<T>` were simply never dispatched
+//     at all (silently returning 0/false) — but these receivers ARE
+//     genuine heap-allocated objects, so the §8.3 "Class" default
+//     (reference equality / identity hash) applies mechanically; IMPLEMENTED
+//     via direct pointer identity + the existing generic
+//     `bz_obj_identity_hash` runtime helper. `DrainedEntry<K,V>.ToString()`
+//     is similarly IMPLEMENTED as the fixed literal "DrainedEntry" (stdlib
+//     §4.9 documents it as a real class; §8.5's class default is a pure
+//     compile-time constant, the type's qualified name). The REMAINDER —
+//     `IEnumerator<T>`/`IAsyncEnumerator<T>.ToString()` (no nameable
+//     runtime type for the internal iterator wrapper), and
+//     `DictionaryEntry<K,V>`'s full Object-member trio plus
+//     `DrainedEntry<K,V>.Equals()`/`.GetHashCode()` (both need per-field or
+//     real-heap-identity machinery this fix's budget does not cover
+//     safely) — gets an honest sema-level "declared ... but not yet
+//     implemented (tracked #2459)" diagnostic, mirroring #2423's own
+//     SerializationException.Offset precedent, rather than an invented
+//     implementation (CLAUDE.md rule 2) or the pre-#2458 silent 0/false/
+//     crash. The two tests below originally named
+//     "legit_universal_object_members_not_regressed" for each group
+//     predate this discovery and asserted only "compiles, exit 0" for
+//     GetHashCode/Equals on EVERY one of these receivers; they are updated
+//     here to match the now-verified-correct behavior instead — a
+//     legitimate test correction, not a milestone-scope violation.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
@@ -211,28 +251,80 @@ BEZEL_TEST(iter_enumerator_unresolved_member_2444,
     BEZEL_EXPECT_EQ(run(program), 0);
 }
 
-// Universal Object members (GetHashCode/Equals — §8.1) called on the
-// sync sentinel: must not be newly rejected by this fix. (ToString on this
-// receiver has a separate, PRE-EXISTING implementation bug — confirmed
-// during this fix's investigation to return garbage/crash at runtime,
-// unrelated to member RESOLUTION — filed as issue #2458; deliberately not
-// exercised here to keep this suite about the diagnostics gap only.)
+// #2459: `GetHashCode`/`Equals` on the sync sentinel are IMPLEMENTED (direct
+// reference identity + the generic bz_obj_identity_hash runtime helper —
+// language spec §8.3 "Class" default) — VALUE-correct, not merely "doesn't
+// crash": self-equality is true, two INDEPENDENT enumerators (from separate
+// GetEnumerator() calls) compare unequal, and a single object's hash is
+// STABLE across repeated calls.
 BEZEL_TEST(iter_enumerator_unresolved_member_2444,
-           legit_universal_object_members_not_regressed) {
+           equals_and_gethashcode_identity_semantics_spec_8_3) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
-        "  var a := new Array<int>(1); "
-        "  a.Add(7); "
+        "  var a := new Array<int>(2); "
+        "  a.Add(1); a.Add(2); "
+        "  var e1 := a.GetEnumerator(); "
+        "  var e2 := a.GetEnumerator(); "
+        "  var selfEq := e1.Equals(e1); "
+        "  var crossEq := e1.Equals(e2); "
+        "  var h1a := e1.GetHashCode(); "
+        "  var h1b := e1.GetHashCode(); "
+        "  e1.Dispose(); e2.Dispose(); a.Dispose(); "
+        "  if not selfEq then return 1; end; "
+        "  if crossEq then return 2; end; "        // distinct objects, distinct identity
+        "  if h1a <> h1b then return 3; end; "      // stable across repeated calls
+        "  return 42; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(program), 42);
+}
+
+// #2458/#2459: `ToString()` on the sync sentinel — before #2458's fix this
+// crashed at runtime (codegen misrouted the call through the builtin-
+// exception ToString vtable-slot-3 dispatch onto the DIFFERENTLY-SHAPED
+// §29.11 iterator vtable's own slot 3, `Current`, called as if it were a
+// `ptr(ptr)` ToString thunk). Confirmed live on origin/main before this fix
+// (with the sema-level exemption that let the call reach codegen at all):
+// `bezelc -o` compiled at exit 0, running the binary segfaulted. Now
+// rejected at compile time instead, with a distinct "declared but not yet
+// implemented" diagnostic (#2459) rather than either the crash or an
+// invented qualified-name literal (there is none defensible for this
+// receiver's unnamed internal runtime type — see #2459's own analysis).
+BEZEL_TEST(iter_enumerator_unresolved_member_2444,
+           tostring_declared_not_implemented_ienumerator_2459) {
+    const std::string program =
+        "module M; "
+        "class C public static method F(a: Array<int>): string "
         "  var e := a.GetEnumerator(); "
-        "  var ok := e.MoveNext(); "
-        "  var h := e.GetHashCode(); "
-        "  var eq := e.Equals(e); "
+        "  var s := e.ToString(); "
         "  e.Dispose(); "
-        "  a.Dispose(); "
+        "  return s; "
+        "end F; "
+        "public static method Main(): int return 0; end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "member `ToString` on builtin `IEnumerator<T>` is declared "
+        "(language spec \xC2\xA7""8.1/\xC2\xA7""8.5) but is not yet "
+        "implemented"));
+    BEZEL_EXPECT_TRUE(hasError(program, "#2459"));
+}
+
+// Async variant of the same ToString rejection.
+BEZEL_TEST(iter_enumerator_unresolved_member_2444,
+           tostring_declared_not_implemented_iasyncenumerator_2459) {
+    const std::string program =
+        "module M; "
+        "class C public async static method Gen(): IAsyncEnumerator<int> "
+        "  yield return 1; "
+        "end Gen; "
+        "public static async method Main(): Task<int> "
+        "  await using var en := Gen(); "
+        "  var s := en.ToString(); "
         "  return 0; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 0);
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "member `ToString` on builtin `IAsyncEnumerator<T>` is declared"));
 }
 
 // ═════════════════ Group 2: DictionaryEntry<K,V>/DrainedEntry<K,V> ════════
@@ -344,22 +436,104 @@ BEZEL_TEST(dictionary_entry_unresolved_member_2444,
     BEZEL_EXPECT_EQ(run(program), 37);
 }
 
-// Universal Object members (GetHashCode/Equals — §8.1) on DictionaryEntry:
-// must not be newly rejected. (Same ToString caveat as the enumerator
-// group above — issue #2458, not exercised here.)
+// #2459: DictionaryEntry<K,V>'s full Object-member trio (ToString/Equals/
+// GetHashCode) is genuinely declared (§8.1/§8.3/§8.5) but NOT implemented —
+// it is a positional RECORD, so its documented default is FIELD-BY-FIELD
+// (needs K's/V's own recursive ToString/Equals/GetHashCode dispatch against
+// a synthetic type with no TypeSymbol to derive the field layout from
+// generically), unlike IEnumerator<T>'s simple reference-identity default.
+// Before #2458/#2459: ToString crashed (same misrouting bug as
+// IEnumerator's), Equals/GetHashCode silently returned false/0. Now all
+// three are honest compile-time rejections instead — this test replaces
+// the prior "legit_universal_object_members_not_regressed" test, which
+// asserted (incorrectly, discovered during #2458's investigation) that
+// these three silently compiled.
 BEZEL_TEST(dictionary_entry_unresolved_member_2444,
-           legit_universal_object_members_not_regressed) {
+           tostring_equals_gethashcode_declared_not_implemented_2459) {
+    // `callExpr` is the full call text (e.g. "ToString()" / "Equals(e)") so
+    // Equals can be exercised with its real one-argument signature.
+    auto rejects = [](const char* mbr, const char* callExpr) {
+        std::string program =
+            std::string("module M; ") +
+            "class C public static method F(d: Dictionary<string, int>): int "
+            "  for var e in d do "
+            "    var x := e." + callExpr + "; "
+            "  end; "
+            "  return 0; "
+            "end F; "
+            "public static method Main(): int return 0; end Main; end C;";
+        BEZEL_EXPECT_TRUE(hasError(
+            program, (std::string("member `") + mbr +
+                          "` on `DictionaryEntry<K, V>` is declared").c_str()));
+        BEZEL_EXPECT_TRUE(hasError(program, "#2459"));
+    };
+    rejects("ToString", "ToString()");
+    rejects("Equals", "Equals(e)");
+    rejects("GetHashCode", "GetHashCode()");
+}
+
+// #2459: DrainedEntry<K,V>.Equals()/.GetHashCode() are ALSO declared-not-
+// implemented, but for a DIFFERENT reason than DictionaryEntry: despite
+// being documented as a `class` (stdlib §4.9), its actual codegen
+// representation is a plain value-struct `{K key; V* value}`
+// (LlvmBackend_Stmts.cpp ~3643), not a real heap object — so, unlike
+// IEnumerator<T> (a genuine heap allocation), the §8.3 class default
+// (reference identity) cannot be soundly implemented against it.
+BEZEL_TEST(dictionary_entry_unresolved_member_2444,
+           equals_gethashcode_declared_not_implemented_drainedentry_2459) {
+    auto rejects = [](const char* mbr, const char* callExpr) {
+        std::string program =
+            std::string("module M; ") +
+            "class Res public Tag: int; "
+            "  public constructor(tag: int) Tag := tag; end constructor; "
+            "end Res; "
+            "class C public static method Main(): int "
+            "  var d := new OwningDictionary<string, Res>(); "
+            "  d.Add(\"a\", new Res(1)); "
+            "  for var entry in d.Drain() do "
+            "    using var e := owned entry; "
+            "    var x := e." + callExpr + "; "
+            "  end; "
+            "  d.Dispose(); "
+            "  return 0; "
+            "end Main; end C;";
+        BEZEL_EXPECT_TRUE(hasError(
+            program, (std::string("member `") + mbr +
+                          "` on `DrainedEntry<K, V>` is declared").c_str()));
+        BEZEL_EXPECT_TRUE(hasError(program, "#2459"));
+    };
+    rejects("Equals", "Equals(e)");
+    rejects("GetHashCode", "GetHashCode()");
+}
+
+// #2459: DrainedEntry<K,V>.ToString() IS implemented (unlike Equals/
+// GetHashCode above) — stdlib §4.9 documents it as a real `class`, and
+// §8.5's class default ("the type's qualified name") is a pure compile-time
+// constant that never reads the receiver's runtime value, so DrainedEntry's
+// value-struct representation (unlike for Equals/GetHashCode) is no
+// obstacle. VALUE-correct: asserts the literal text, not just a clean
+// compile.
+BEZEL_TEST(dictionary_entry_unresolved_member_2444,
+           tostring_implemented_drainedentry_literal_2459) {
+    // Main returns `int` (not `string`, which does not round-trip through
+    // the 8-bit process exit code — tests/README.md): compare the
+    // ToString() result to the expected literal and encode the outcome as
+    // a sentinel exit code.
     const std::string program =
         "module M; "
+        "class Res public Tag: int; "
+        "  public constructor(tag: int) Tag := tag; end constructor; "
+        "end Res; "
         "class C public static method Main(): int "
-        "  var d := new Dictionary<string, int>(); "
-        "  d[\"a\"] := 1; "
-        "  for var e in d do "
-        "    var h := e.GetHashCode(); "
-        "    var eq := e.Equals(e); "
+        "  var d := new OwningDictionary<string, Res>(); "
+        "  d.Add(\"a\", new Res(1)); "
+        "  var result := \"\"; "
+        "  for var entry in d.Drain() do "
+        "    using var e := owned entry; "
+        "    result := e.ToString(); "
         "  end; "
         "  d.Dispose(); "
-        "  return 0; "
+        "  return (if result = \"DrainedEntry\" then 42 else 1); "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 0);
+    BEZEL_EXPECT_EQ(run(program), 42);
 }

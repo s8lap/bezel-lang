@@ -11549,6 +11549,262 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // #2459 (follow-up to #2458): this block (and its DictionaryEntry/
+        // DrainedEntry sibling just below) MUST run BEFORE the #605 bare-
+        // type-parameter block a little further down. #605's guard
+        // (`kind==Named && !declaration && astNode->name->parts.size()==1`)
+        // matches these builtin sentinels too (IEnumerator/IAsyncEnumerator/
+        // DictionaryEntry/DrainedEntry all have exactly this shape -- a
+        // single-part synthetic name, no declaration) and unconditionally
+        // types ToString/GetHashCode/Equals/CompareTo/GetType for ANY such
+        // receiver with no isDeclaredParam-style narrowing at all. Before
+        // this reordering, #605 ran FIRST and set `ma`'s exprType (to a
+        // fabricated string/int/bool with no real implementation behind
+        // it) before this block's own `!ctx_.exprType(ma)` guard ever got a
+        // chance to see it unset -- so the new #2459 "declared but not
+        // implemented" ToString diagnostic below silently never fired
+        // (caught by this fix's own regression test failing until the
+        // blocks were moved). #605 itself is unaffected by types it never
+        // reaches (Current/Key/Value are typed further up, before both
+        // blocks, and returned from separately); genuinely-declared type
+        // parameters are UNCHANGED, since none of them can ever match this
+        // block's headName()=="IEnumerator" / importedName=="DictionaryEntry"
+        // detection.
+        //
+        // #2444 (sibling gap to #2423/#2433, same declaration-less-Named-type
+        // shape; stdlib §4.12; language spec §8.1/§8.7): the builtin
+        // BORROWING iterator sentinels `IEnumerator<T>` / `IAsyncEnumerator<T>`
+        // (declaration == nullptr; detected the same way the `.Current`
+        // handler ~150 lines up detects them) have a CLOSED documented
+        // surface per stdlib §4.12: `Current` (typed above), `MoveNext()` /
+        // `MoveNextAsync()` and `Dispose()`/`DisposeAsync()` (calls, resolved
+        // independently through the enclosing CallExpr machinery's
+        // colName=="IEnumerator"/"IAsyncEnumerator" dispatch a few thousand
+        // lines up in this file — none of that dispatch ever sets `ma`'s own
+        // exprType, only the CallExpr's, exactly like #2423's exempted
+        // Dispose/ReferenceEquals for exception receivers), and the universal
+        // Object members (ToString/Equals/GetHashCode/GetType/ReferenceEquals,
+        // §8.1). #2433's retraction (generic_record_field_590) does NOT apply
+        // here: that false reject came from preempting #590's deliberate
+        // CODEGEN-deferred by-name resolution for a genuinely-declared type
+        // PARAMETER (`genericSubstSemaTy_`, resolved per-instantiation).
+        // IEnumerator<T>/IAsyncEnumerator<T> are not type parameters — they
+        // are fixed builtin synthetic types with no substitution step, so
+        // there is nothing deferred to preempt; their whole member surface is
+        // enumerable right here, exactly like #2423's exception types. A
+        // member name matching none of these previously fell through to this
+        // function's tail `return;` below with no diagnostic and no exprType
+        // set — the identical uninitialized-read shape #2423 fixed for
+        // built-in exceptions (confirmed live: `e.TotallyBogusMember` on an
+        // `IEnumerator<T>` compiled at exit 0 with no diagnostic before this
+        // fix).
+        if (ma.target && !ctx_.exprType(ma)) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty()) {
+                    std::string_view en = tt->headName();
+                    bool isSyncEnum = en == "IEnumerator";
+                    bool isAsyncEnum = en == "IAsyncEnumerator";
+                    if (isSyncEnum || isAsyncEnum) {
+                        const auto& mbr = ma.member;
+                        // #2459 (follow-up to #2458): `Equals`/`GetHashCode`
+                        // ARE implemented (LlvmBackend_Calls2.cpp: direct
+                        // pointer identity / the generic
+                        // bz_obj_identity_hash runtime helper) -- this
+                        // receiver genuinely is a heap-allocated object
+                        // (confirmed: emitIteratorMethod's getEnumFn/
+                        // wrapGetEnumFn/the array-owning wrapper's
+                        // GetEnumerator all `calloc` a fresh struct per
+                        // call; the async frame is likewise heap-allocated,
+                        // LlvmBackend_Setup.cpp ~9581), so the language spec
+                        // §8.3 "Class" default (reference equality /
+                        // identity hash) applies mechanically. `ToString`
+                        // does NOT have a defensible default here: it is an
+                        // interface-typed value whose RUNTIME type (per
+                        // §8.5/§8.2, virtual dispatch resolves the runtime
+                        // type, not the static one) is the compiler's own
+                        // internal, unnamed iterator-vtable wrapper struct
+                        // -- no TypeSymbol, no stored name, and the static
+                        // interface name itself would misrepresent that
+                        // dispatch. Rejected with a distinct "declared but
+                        // not yet implemented" diagnostic (mirrors #2423's
+                        // SerializationException.Offset treatment) rather
+                        // than silently invented (CLAUDE.md rule 2) or
+                        // silently accepted (the pre-#2458 crash: this
+                        // exact member fell through to codegen's
+                        // lowerObjectToString misrouting, a wild vtable-
+                        // slot-3 dispatch onto Current's thunk).
+                        bool isDeclaredButUnimplemented = mbr == "ToString";
+                        bool isImplementedUniversalMember =
+                            mbr == "Equals" || mbr == "GetHashCode" ||
+                            mbr == "GetType" || mbr == "ReferenceEquals";
+                        bool isRecognizedCallForm =
+                            (isSyncEnum &&
+                             (mbr == "MoveNext" || mbr == "Dispose")) ||
+                            (isAsyncEnum &&
+                             (mbr == "MoveNextAsync" ||
+                              mbr == "DisposeAsync" || mbr == "Dispose"));
+                        if (isDeclaredButUnimplemented) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("member `") + std::string(mbr) +
+                                    "` on builtin `" + std::string(en) +
+                                    "<T>` is declared (language spec "
+                                    "\xC2\xA7""8.1/\xC2\xA7""8.5) but is not "
+                                    "yet implemented by this compiler for "
+                                    "this receiver (tracked #2459)");
+                            return;
+                        }
+                        if (!isImplementedUniversalMember &&
+                                !isRecognizedCallForm) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            std::string surface =
+                                isSyncEnum
+                                    ? "Current, MoveNext(), Dispose() "
+                                      "(stdlib \xC2\xA7""4.12)"
+                                    : "Current, MoveNextAsync(), "
+                                      "DisposeAsync() (stdlib \xC2\xA7""4.12)";
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("no member `") +
+                                    std::string(mbr) + "` on builtin `" +
+                                    std::string(en) +
+                                    "<T>`; documented surface: " + surface +
+                                    " and the universal `ToString`/`Equals`/"
+                                    "`GetHashCode`/`GetType` (language spec "
+                                    "\xC2\xA7""8.1)");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        // #2444 (sibling gap to #2423/#2433; stdlib §4.8/§4.9; language spec
+        // §8.1/§8.3/§8.5/§8.7): the builtin entry sentinels
+        // `DictionaryEntry<K, V>` (a RECORD) and `DrainedEntry<K, V>` (a
+        // CLASS implementing `IDisposable`) — declaration == nullptr;
+        // detected the same importedName tag the `.Key`/`.Value` handler
+        // ~250 lines up already uses — have a closed documented surface:
+        // `Key`/`Value` (typed above), the universal Object members every
+        // record/class carries (§8.1/§8.3/§8.5), and — DrainedEntry only —
+        // `Dispose()` (it is a class implementing IDisposable per stdlib
+        // §4.9; DictionaryEntry is a record, and language spec §8.7 "Dispose
+        // is not on Object" / "records ... do not implement IDisposable"
+        // means `Dispose` stays REJECTED on DictionaryEntry, not exempted).
+        // Not a #2433-shaped false-reject risk for the same reason as the
+        // IEnumerator block above: neither type is a declared generic type
+        // parameter, so there is no codegen genericSubstSemaTy_ deferred
+        // resolution step being preempted here — the member surface is fully
+        // enumerable at this declaration-less sentinel's own definition
+        // (confirmed live: `entry.TotallyBogusMember` on the `for var entry
+        // in dict do` element type compiled at exit 0 with no diagnostic
+        // before this fix).
+        if (ma.target && !ctx_.exprType(ma)) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->declaration) {
+                    bool isDictEntry = tt->importedName == "DictionaryEntry";
+                    bool isDrainedEntry = tt->importedName == "DrainedEntry";
+                    if (isDictEntry || isDrainedEntry) {
+                        const auto& mbr = ma.member;
+                        bool isGetTypeOrRefEq =
+                            mbr == "GetType" || mbr == "ReferenceEquals";
+                        // #2459 (follow-up to #2458): DrainedEntry<K,V>.
+                        // ToString() IS implemented -- stdlib §4.9 declares
+                        // it `public class DrainedEntry<K, V>`, so its §8.5
+                        // default ("the type's qualified name") is the
+                        // FIXED compile-time literal "DrainedEntry"
+                        // (LlvmBackend_Calls2.cpp), mirroring
+                        // classToStringThunk's no-override default for
+                        // every other class. DictionaryEntry's ToString (a
+                        // RECORD's §8.5 default is field-by-field, e.g.
+                        // "DictionaryEntry(Key: ..., Value: ...)") is NOT
+                        // implemented -- see below.
+                        bool isToStringImplemented =
+                            isDrainedEntry && mbr == "ToString";
+                        bool isRecognizedDispose =
+                            isDrainedEntry && mbr == "Dispose";
+                        // #2459: ToString (DictionaryEntry only --
+                        // DrainedEntry's is implemented, above), Equals,
+                        // and GetHashCode are genuinely DECLARED (§8.1/
+                        // §8.3/§8.5) but NOT implemented for either
+                        // sentinel: DictionaryEntry is a record whose
+                        // default is field-by-field (needs K's/V's own
+                        // recursive ToString/Equals/GetHashCode dispatch
+                        // against a synthetic type with no TypeSymbol to
+                        // derive the field layout from generically -- not
+                        // attempted here); DrainedEntry, despite being
+                        // DECLARED a class, is actually a plain value-
+                        // struct at runtime (LlvmBackend_Stmts.cpp ~3643:
+                        // "is a DrainedEntry<K,V> struct {K key; V*
+                        // value}, NOT a class object") with no stable heap
+                        // identity between accesses -- unlike
+                        // IEnumerator<T> (see the block above), the §8.3
+                        // class default (reference equality / identity
+                        // hash) cannot be soundly applied to a value with
+                        // no real object identity, so it is rejected here
+                        // too rather than implemented against a
+                        // representation that cannot honestly support it.
+                        // Before this fix these three fell through to
+                        // codegen's zero-init fallback (GetHashCode/Equals:
+                        // silently return 0/false -- #2458's own finding)
+                        // or the same ToString misrouting crash the
+                        // IEnumerator block above documents.
+                        bool isDeclaredButUnimplemented =
+                            (mbr == "ToString" && !isToStringImplemented) ||
+                            mbr == "Equals" || mbr == "GetHashCode";
+                        if (isDeclaredButUnimplemented) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            std::string_view tn = isDictEntry
+                                ? "DictionaryEntry" : "DrainedEntry";
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("member `") + std::string(mbr) +
+                                    "` on `" + std::string(tn) +
+                                    "<K, V>` is declared (language spec "
+                                    "\xC2\xA7""8.1/\xC2\xA7""8.3/\xC2\xA7""8.5"
+                                    ") but is not yet implemented by this "
+                                    "compiler for this receiver (tracked "
+                                    "#2459)");
+                            return;
+                        }
+                        if (!isGetTypeOrRefEq && !isToStringImplemented &&
+                                !isRecognizedDispose) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            std::string_view tn = isDictEntry
+                                ? "DictionaryEntry" : "DrainedEntry";
+                            std::string_view stdlibSec =
+                                isDictEntry ? "4.8" : "4.9";
+                            std::string surface =
+                                isDrainedEntry
+                                    ? "Key, Value, Dispose()"
+                                    : "Key, Value";
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("no member `") +
+                                    std::string(mbr) + "` on `" +
+                                    std::string(tn) +
+                                    "<K, V>`; documented surface: " +
+                                    surface + " (stdlib \xC2\xA7" +
+                                    std::string(stdlibSec) +
+                                    ") and the universal `ToString`/"
+                                    "`Equals`/`GetHashCode`/`GetType` "
+                                    "(language spec \xC2\xA7""8.1)");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         // issue #605 / §14.1 / §8.1 / §8.5: a BARE TYPE-PARAMETER receiver
         // (`val: T where T: value`) accessing a universal Object member
         // (ToString, GetHashCode, Equals, GetType). The type-param's TypeRef
@@ -11825,140 +12081,6 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                     "`GetHashCode`/`GetType` (\xC2\xA7""8.1) "
                                     "(language spec \xC2\xA7""31.4, v0.235; "
                                     "stdlib \xC2\xA7""2.17)");
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        // #2444 (sibling gap to #2423/#2433, same declaration-less-Named-type
-        // shape; stdlib §4.12; language spec §8.1/§8.7): the builtin
-        // BORROWING iterator sentinels `IEnumerator<T>` / `IAsyncEnumerator<T>`
-        // (declaration == nullptr; detected the same way the `.Current`
-        // handler ~150 lines up detects them) have a CLOSED documented
-        // surface per stdlib §4.12: `Current` (typed above), `MoveNext()` /
-        // `MoveNextAsync()` and `Dispose()`/`DisposeAsync()` (calls, resolved
-        // independently through the enclosing CallExpr machinery's
-        // colName=="IEnumerator"/"IAsyncEnumerator" dispatch a few thousand
-        // lines up in this file — none of that dispatch ever sets `ma`'s own
-        // exprType, only the CallExpr's, exactly like #2423's exempted
-        // Dispose/ReferenceEquals for exception receivers), and the universal
-        // Object members (ToString/Equals/GetHashCode/GetType/ReferenceEquals,
-        // §8.1). #2433's retraction (generic_record_field_590) does NOT apply
-        // here: that false reject came from preempting #590's deliberate
-        // CODEGEN-deferred by-name resolution for a genuinely-declared type
-        // PARAMETER (`genericSubstSemaTy_`, resolved per-instantiation).
-        // IEnumerator<T>/IAsyncEnumerator<T> are not type parameters — they
-        // are fixed builtin synthetic types with no substitution step, so
-        // there is nothing deferred to preempt; their whole member surface is
-        // enumerable right here, exactly like #2423's exception types. A
-        // member name matching none of these previously fell through to this
-        // function's tail `return;` below with no diagnostic and no exprType
-        // set — the identical uninitialized-read shape #2423 fixed for
-        // built-in exceptions (confirmed live: `e.TotallyBogusMember` on an
-        // `IEnumerator<T>` compiled at exit 0 with no diagnostic before this
-        // fix).
-        if (ma.target && !ctx_.exprType(ma)) {
-            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
-                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
-                    tt->astNode && tt->astNode->name &&
-                    !tt->astNode->name->parts.empty()) {
-                    std::string_view en = tt->headName();
-                    bool isSyncEnum = en == "IEnumerator";
-                    bool isAsyncEnum = en == "IAsyncEnumerator";
-                    if (isSyncEnum || isAsyncEnum) {
-                        const auto& mbr = ma.member;
-                        bool isUniversalObjectMember =
-                            mbr == "ToString"    || mbr == "Equals" ||
-                            mbr == "GetHashCode" || mbr == "GetType" ||
-                            mbr == "ReferenceEquals";
-                        bool isRecognizedCallForm =
-                            (isSyncEnum &&
-                             (mbr == "MoveNext" || mbr == "Dispose")) ||
-                            (isAsyncEnum &&
-                             (mbr == "MoveNextAsync" ||
-                              mbr == "DisposeAsync" || mbr == "Dispose"));
-                        if (!isUniversalObjectMember && !isRecognizedCallForm) {
-                            auto loc = ma.span.begin;
-                            if (loc.line == 0 && ma.target)
-                                loc = ma.target->span.begin;
-                            std::string surface =
-                                isSyncEnum
-                                    ? "Current, MoveNext(), Dispose() "
-                                      "(stdlib \xC2\xA7""4.12)"
-                                    : "Current, MoveNextAsync(), "
-                                      "DisposeAsync() (stdlib \xC2\xA7""4.12)";
-                            ctx_.diagnostics().report(
-                                Severity::Error, loc,
-                                std::string("no member `") +
-                                    std::string(mbr) + "` on builtin `" +
-                                    std::string(en) +
-                                    "<T>`; documented surface: " + surface +
-                                    " and the universal `ToString`/`Equals`/"
-                                    "`GetHashCode`/`GetType` (language spec "
-                                    "\xC2\xA7""8.1)");
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        // #2444 (sibling gap to #2423/#2433; stdlib §4.8/§4.9; language spec
-        // §8.1/§8.3/§8.5/§8.7): the builtin entry sentinels
-        // `DictionaryEntry<K, V>` (a RECORD) and `DrainedEntry<K, V>` (a
-        // CLASS implementing `IDisposable`) — declaration == nullptr;
-        // detected the same importedName tag the `.Key`/`.Value` handler
-        // ~250 lines up already uses — have a closed documented surface:
-        // `Key`/`Value` (typed above), the universal Object members every
-        // record/class carries (§8.1/§8.3/§8.5), and — DrainedEntry only —
-        // `Dispose()` (it is a class implementing IDisposable per stdlib
-        // §4.9; DictionaryEntry is a record, and language spec §8.7 "Dispose
-        // is not on Object" / "records ... do not implement IDisposable"
-        // means `Dispose` stays REJECTED on DictionaryEntry, not exempted).
-        // Not a #2433-shaped false-reject risk for the same reason as the
-        // IEnumerator block above: neither type is a declared generic type
-        // parameter, so there is no codegen genericSubstSemaTy_ deferred
-        // resolution step being preempted here — the member surface is fully
-        // enumerable at this declaration-less sentinel's own definition
-        // (confirmed live: `entry.TotallyBogusMember` on the `for var entry
-        // in dict do` element type compiled at exit 0 with no diagnostic
-        // before this fix).
-        if (ma.target && !ctx_.exprType(ma)) {
-            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
-                if (tt->kind == TypeRef::Kind::Named && !tt->declaration) {
-                    bool isDictEntry = tt->importedName == "DictionaryEntry";
-                    bool isDrainedEntry = tt->importedName == "DrainedEntry";
-                    if (isDictEntry || isDrainedEntry) {
-                        const auto& mbr = ma.member;
-                        bool isUniversalObjectMember =
-                            mbr == "ToString"    || mbr == "Equals" ||
-                            mbr == "GetHashCode" || mbr == "GetType" ||
-                            mbr == "ReferenceEquals";
-                        bool isRecognizedDispose =
-                            isDrainedEntry && mbr == "Dispose";
-                        if (!isUniversalObjectMember && !isRecognizedDispose) {
-                            auto loc = ma.span.begin;
-                            if (loc.line == 0 && ma.target)
-                                loc = ma.target->span.begin;
-                            std::string_view tn = isDictEntry
-                                ? "DictionaryEntry" : "DrainedEntry";
-                            std::string_view stdlibSec =
-                                isDictEntry ? "4.8" : "4.9";
-                            std::string surface =
-                                isDrainedEntry
-                                    ? "Key, Value, Dispose()"
-                                    : "Key, Value";
-                            ctx_.diagnostics().report(
-                                Severity::Error, loc,
-                                std::string("no member `") +
-                                    std::string(mbr) + "` on `" +
-                                    std::string(tn) +
-                                    "<K, V>`; documented surface: " +
-                                    surface + " (stdlib \xC2\xA7" +
-                                    std::string(stdlibSec) +
-                                    ") and the universal `ToString`/"
-                                    "`Equals`/`GetHashCode`/`GetType` "
-                                    "(language spec \xC2\xA7""8.1)");
                             return;
                         }
                     }

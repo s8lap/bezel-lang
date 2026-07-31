@@ -3917,13 +3917,31 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     cg_recvTy->declaration &&
                     cg_recvTy->declaration->kind ==
                         ast::TypeDeclKind::Class;
-                // Built-in exception types: Named with no declaration.
+                // Built-in exception types: Named with no declaration, AND
+                // the type name is actually in the builtin exception set
+                // (isBuiltinExceptionTypeRef -- see its own doc comment,
+                // LlvmBackend_impl.hpp). #2458: this used to be JUST
+                // `!declaration`, which also matches every OTHER
+                // declaration-less builtin Named type (IEnumerator<T>,
+                // DictionaryEntry<K,V>, Array<T>, Dictionary<K,V>, ...) --
+                // none of which carry the standard [td,itmap,Dispose,
+                // ToString] builtin-exception vtable layout `lowerObjectToString`
+                // (kToStringSlot=3) assumes. Confirmed live: `e.ToString()`
+                // on an IEnumerator<T> segfaulted (slot 3 of its OWN,
+                // differently-shaped §29.11 iterator vtable is `Current`,
+                // called as if it were a `ptr(ptr)` ToString thunk); on a
+                // DictionaryEntry<K,V> (not even heap-allocated) it also
+                // crashed. Only genuine builtin exceptions actually have
+                // the 4-slot layout this dispatch requires (setupBuiltin
+                // Exceptions, LlvmBackend_Setup.cpp ~3820-3860) --
+                // isBuiltinExceptionTypeRef checks the type NAME against
+                // that exact set, so it is precise where the old
+                // declaration-only check was not.
                 // Only intercept when not in a generic context (to avoid
                 // confusing a type-parameter T with a builtin exception name).
                 bool cg_isBuiltinEx =
                     genericSubstSemaTy_.empty() &&
-                    cg_recvTy->kind == CG_K::Named &&
-                    !cg_recvTy->declaration;
+                    isBuiltinExceptionTypeRef(cg_recvTy);
                 // Route through lowerObjectToString (vtable slot 3,
                 // classToStringThunk) for ALL ToString calls on user-class and
                 // builtin-exception receivers, regardless of whether sema
@@ -4198,6 +4216,31 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         }
                     }
                 }
+                // #2458/#2459 (stdlib §4.9; language spec §8.5): DrainedEntry<K,V>
+                // is documented as `public class DrainedEntry<K, V>`
+                // (stdlib §4.9), so its §8.5 default ("for classes: the
+                // type's qualified name") is the FIXED, compile-time-
+                // constant literal "DrainedEntry" -- exactly the reasoning
+                // classToStringThunk's no-override default uses (`ts->name`,
+                // no generic args) for every other class, and
+                // tryLowerInlineArrayCall's inline-array ToString default
+                // (also a compile-time constant; the receiver's runtime
+                // value is never read). DrainedEntry has no TypeSymbol
+                // (synthetic, declaration == nullptr) so classToStringThunk
+                // itself never runs for it, and unlike IEnumerator<T> it is
+                // not even heap-allocated at runtime (a plain value-struct,
+                // LlvmBackend_Stmts.cpp ~3643) -- but this literal needs no
+                // runtime state at all, so that fact does not matter here.
+                // Checked BEFORE isBuiltinExRecv below so this receiver
+                // never reaches lowerObjectToString's vtable-slot-3
+                // dispatch (DrainedEntry has no such vtable; #2458's
+                // original crash was exactly this kind of wild dispatch on
+                // a declaration-less type that wasn't a real exception).
+                if (recvTy && recvTy->kind == K::Named &&
+                        !recvTy->declaration &&
+                        recvTy->importedName == "DrainedEntry") {
+                    return lowerStringLiteral("\"DrainedEntry\"", false);
+                }
                 bool isObjectRecv =
                     recvTy && recvTy->kind == K::Primitive &&
                     recvTy->primitive == P::Object;
@@ -4221,8 +4264,14 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 // did not handle them (e.g. a bare `Exception`-typed variable in
                 // a generic body).  Dispatch through lowerObjectToString.
                 // per §8.5 (v0.134).
-                bool isBuiltinExRecv =
-                    recvTy && recvTy->kind == K::Named && !recvTy->declaration;
+                // #2458: narrowed from a bare `!declaration` check (which also
+                // matched IEnumerator<T>/DictionaryEntry<K,V>/every other
+                // builtin collection, none of which carry the builtin-exception
+                // vtable layout this dispatch assumes -- see the identical fix
+                // a few thousand lines up in this file for the full analysis
+                // and the confirmed crash repro) to the same precise
+                // isBuiltinExceptionTypeRef name-check used there.
+                bool isBuiltinExRecv = isBuiltinExceptionTypeRef(recvTy);
                 if (isObjectRecv || isIfaceRecv || isNamedClassRecv ||
                         isBuiltinExRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
@@ -4383,6 +4432,63 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
                 using K = sema::TypeRef::Kind;
                 using P = sema::PrimitiveType;
+                // #2458/#2459 (stdlib §4.12; language spec §8.3): the
+                // builtin iterator sentinels IEnumerator<T>/IAsyncEnumerator<T>
+                // are declaration-less Named types, so neither isIfaceRecv
+                // (requires a real TypeSymbol) nor isNamedClassRecv (ditto)
+                // below matches them -- before this fix, Equals/GetHashCode
+                // calls on them fell through this whole function unresolved,
+                // silently returning 0/false via the generic emitReturn/
+                // emitCall zero-init fallback (confirmed live, #2458's own
+                // finding). These receivers ARE genuine heap-allocated
+                // objects (emitIteratorMethod's getEnumFn/wrapGetEnumFn/the
+                // array-owning wrapper's GetEnumerator all `calloc` a fresh
+                // struct per call; the async frame is likewise heap-
+                // allocated, freed at `await using` scope-end,
+                // LlvmBackend_Setup.cpp ~9581), so the §8.3 "Class" default
+                // (reference equality / identity-based hash) applies
+                // mechanically -- but they carry NO standard [td,itmap,
+                // Dispose,ToString,Equals,GetHashCode] vtable; their own
+                // vtable is the much smaller §29.11 iterator format
+                // ([0]=td,[1]=Dispose,[2]=MoveNext,[3]=Current,
+                // [4]=GetEnumerator for the sync form). Dispatching through
+                // lowerObjectEquals/lowerObjectGetHashCode's
+                // kEqualsSlot(4)/kGetHashCodeSlot(5) would read PAST that
+                // shorter array -- the exact wild-dispatch shape #2458 fixed
+                // for ToString's kToStringSlot(3) (which, for this vtable,
+                // lands on the Current thunk, not a ToString-shaped one).
+                // Since no user override can exist on a builtin type,
+                // compute the §8.3 default DIRECTLY: reference identity for
+                // Equals, and the generic bz_obj_identity_hash runtime
+                // helper for GetHashCode -- the SAME helper
+                // boxDefaultHashCodeThunk/classHashCodeThunk already call
+                // for their own no-override default (§8.3 v0.204, "assigned
+                // on first request ... never derived from the object's
+                // storage address") -- bypassing the vtable entirely rather
+                // than guessing at a slot index for a vtable shape that
+                // does not have one.
+                bool isBuiltinEnumRecv =
+                    recvTy && recvTy->kind == K::Named &&
+                    !recvTy->declaration && recvTy->astNode &&
+                    recvTy->astNode->name &&
+                    !recvTy->astNode->name->parts.empty() &&
+                    (recvTy->headName() == "IEnumerator" ||
+                     recvTy->headName() == "IAsyncEnumerator");
+                if (isBuiltinEnumRecv) {
+                    llvm::Value* recv = lowerExpr(*ma->target);
+                    if (isEqualsCall) {
+                        llvm::Value* other = lowerExpr(*call.args[0].value);
+                        if (recv && other)
+                            return builder_.CreateICmpEQ(
+                                recv, other, "enum.eq.ref");
+                    } else {
+                        if (recv)
+                            return builder_.CreateCall(
+                                declareC("bz_obj_identity_hash", i32(),
+                                         {ptrTy()}),
+                                {recv}, "enum.hash");
+                    }
+                }
                 bool isObjectRecv = recvTy && recvTy->kind == K::Primitive &&
                                     recvTy->primitive == P::Object;
                 bool isIfaceRecv =
