@@ -1166,10 +1166,78 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
             !exported &&
             (member->visibility == ast::Visibility::Private ||
              member->visibility == ast::Visibility::Internal);
-        if (!exported && !includeForCtorBody && !includeForMethodBody) continue;
+        // fix #2456 (§22.8 / §2.8.2-§2.8.3, v0.235): a non-static instance
+        // field occupies a slot in the class's PHYSICAL layout regardless of
+        // its §13 visibility — declaration order, not exported-surface
+        // membership, drives §22.8's storage layout. Before this, a
+        // private/internal field on a NON-generic class was invisible to
+        // `out.members` entirely (only the generic-class case above,
+        // `includeForMethodBody`, carried private fields, and only for sema
+        // name-resolution in re-parsed bodies). `collectInstanceStorage`/
+        // `classStruct` (LlvmBackend_Layout.cpp) walk an imported base's
+        // `t->members` with NO visibility gate at all to lay out a LOCAL
+        // derived class's own fields — so a hidden private base field left
+        // every subsequent field one slot short of the exporter's own
+        // compiled layout: the derived class's own first field silently
+        // ALIASED the base's real (invisible) field's physical slot, and a
+        // *direct* `new ImportedBase()` under-allocated the instance
+        // entirely (missing the hidden field's slot) — a genuine heap-
+        // buffer-overflow the moment the exporter's real (correctly-sized)
+        // init/ctor/accessor bodies wrote to it. Confirmed via direct
+        // instrumentation: the exporter's own compilation of a class with
+        // `private _v: int := 42;` lays out `_v` at struct index 2; the
+        // importer's reconstruction — before this fix — had ZERO storage
+        // members for that same class, so a locally-declared subclass's own
+        // `_own` field landed at index 2 too, aliasing `_v`.
+        // A static field is excluded: it has no instance-layout footprint
+        // (process-global storage, §22.12) — this fix is scoped to §22.8
+        // instance layout only, not the separate static cross-module story.
+        //
+        // Scoped to CLASSES ONLY (t.kind == Class), not records: a
+        // positional record's storage order interleaves body fields BEFORE
+        // the positional fields in `t.members` (confirmed by
+        // instrumentation — a record's positional field is appended to
+        // `t.members` AFTER its body fields, regardless of source order),
+        // and `buildRecordValue`'s positional-constructor-argument-to-slot
+        // mapping (LlvmBackend_Exprs2.cpp) was not verified to consult the
+        // same `fieldIndex_` a newly-visible hidden body field would shift —
+        // widening this for records regressed a previously-CORRECT read
+        // (`r.x` went from the right value to 0 once a private record body
+        // field became visible for layout). Classes have no such
+        // interleaving risk: `collectInstanceStorage` always lays the base
+        // class's storage down FIRST, monotonically, before any derived
+        // class's own fields (§22.8), so a newly-visible base field only
+        // ever shifts LATER fields, never reorders earlier ones out from
+        // under an already-correct construction path. The record gap
+        // (#2456's own construction-time twin for records, plus this
+        // ordering hazard) is filed separately as #2464 rather than fixed
+        // here.
+        bool isStaticFieldMember = false;
+        for (auto mod : member->modifiers)
+            if (mod == "static") { isStaticFieldMember = true; break; }
+        bool includeForLayout = isField && !exported && !isStaticFieldMember &&
+            t.kind == ast::TypeDeclKind::Class;
+        if (!exported && !includeForCtorBody && !includeForMethodBody &&
+            !includeForLayout)
+            continue;
         MetaMember mm;
-        if (convertMember(*member, inInterface, ctx, mm, isGenericClass, source))
+        if (convertMember(*member, inInterface, ctx, mm, isGenericClass, source)) {
+            // A field included ONLY for layout (not otherwise exported, and
+            // not already carried for generic-body name resolution) is
+            // name-invisible outside the class — strip the initializer text
+            // convertMember unconditionally attaches for any foldable field
+            // initializer. Only the field's NAME, TYPE, and declaration-order
+            // POSITION are needed to reconstruct the physical layout; the
+            // default value is not, and dropping it keeps this genuinely a
+            // layout-only carriage (mirrors the "no initializer, no ABI
+            // change" contract the generic-class `includeForMethodBody` case
+            // above already documents for the same reason).
+            if (includeForLayout && !exported && !includeForMethodBody) {
+                mm.valueText.clear();
+                mm.fieldInitText.clear();
+            }
             out.members.push_back(std::move(mm));
+        }
     }
 
     // §10 enum constants (declared on the TypeDecl, collected as symbols but
