@@ -11549,6 +11549,162 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // #2457 slice 1 (stdlib §4.4/§4.5/§5; language spec §8.1/§8.3/§8.5/
+        // §27.6): `Array<T>`/`OwningArray<T>` are declaration-less builtin
+        // Named types (like every other category #2444/#2458/#2459 fixed)
+        // whose PROPERTY-style member surface is small and closed:
+        // `Count`/`Capacity` (typed by the dedicated handler ~1200 lines
+        // up — already returned by the time this runs) plus `.Length` (a
+        // WORKING but stdlib-undocumented alias for `.Count`, see below)
+        // plus the five universal Object members.
+        //
+        // Every OTHER real member is a METHOD — but language spec §27.6
+        // "Method references" makes a BARE reference to an instance method
+        // (`var f := a.Add;`, no call) legitimate Bezel, not merely a call
+        // form (`a.Add(x)`). An earlier draft of this fix exempted call
+        // forms only, via `calleeOfCallCtx_` (the pre-existing mechanism
+        // used identically a few thousand lines up in this file, ~9896) —
+        // that covers `a.Add(x)` but NOT `var f := a.Add;`, which reached
+        // this block with `&ma != calleeOfCallCtx_` and was wrongly
+        // rejected (caught by a live probe before landing, not the test
+        // suite — no existing test exercises a bare reference to an Array
+        // instance method). Both mechanisms are kept: `calleeOfCallCtx_`
+        // as the primary, name-independent defense for the overwhelmingly
+        // common call form, plus an explicit exempt list (below) — sourced
+        // directly from stdlib §4.4 (`Array<T>`), §4.5 (`OwningArray<T>`),
+        // and §5 (`System.Collections.Linq`'s `IEnumerable<T>` extension,
+        // read fresh for this fix rather than copied from the similarly-
+        // shaped but incomplete `isLinqOp` list elsewhere in this file,
+        // ~line 11477, which is missing `OfType` and wrongly includes the
+        // unrelated static `Parallel.ForEach`) — as the secondary defense
+        // for the bare-reference case. An incomplete secondary list is a
+        // narrower risk than an incomplete primary one: `calleeOfCallCtx_`
+        // alone already protects every ordinary call regardless of name,
+        // so a name missing from the list below only mis-rejects the rare
+        // bare-reference spelling of that one method, not its (far more
+        // common) call form.
+        //
+        // Per stdlib §4.4/§4.5, both are `public class` with NO Equals/
+        // GetHashCode/ToString override shown, and both are genuine heap
+        // objects (`bz_array_t*`) with stable identity — so, exactly like
+        // the IEnumerator<T> block below, the §8.3 "Class" default
+        // (reference equality / identity hash) applies mechanically and is
+        // IMPLEMENTED (LlvmBackend_Calls2.cpp: direct pointer identity /
+        // bz_obj_identity_hash) rather than diagnosed. `ToString`'s §8.5
+        // default ("the type's qualified name") is ALSO implementable here
+        // — unlike IEnumerator<T>'s unnamed internal wrapper, `Array<T>`/
+        // `OwningArray<T>` are real, user-visible, documented type names;
+        // implemented as the bare literal "Array"/"OwningArray" (no
+        // generic args), mirroring classToStringThunk's own no-override
+        // convention for every ordinary class.
+        //
+        // Must run BEFORE the #605 bare-type-parameter block below for the
+        // same reason #2459's blocks do (see that comment) — #605's guard
+        // matches this receiver shape too (single-part synthetic name, no
+        // declaration) and would otherwise silently pre-type these five
+        // members with no real implementation behind three of them.
+        if (ma.target && !ctx_.exprType(ma)) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty()) {
+                    std::string_view cn = tt->headName();
+                    bool isArrayFamily =
+                        cn == "Array" || cn == "OwningArray";
+                    if (isArrayFamily) {
+                        const auto& mbr = ma.member;
+                        bool isUniversalObjectMember =
+                            mbr == "ToString"    || mbr == "Equals" ||
+                            mbr == "GetHashCode" || mbr == "GetType" ||
+                            mbr == "ReferenceEquals";
+                        // `.Length` is NOT in stdlib §4.4/§4.5's documented
+                        // surface (only `Count`/`Capacity` are), but it IS
+                        // a real, WORKING, tested alias for `.Count`,
+                        // implemented purely structurally in codegen
+                        // (LlvmBackend_Exprs.cpp ~3097 "Array<T>.Length /
+                        // .Count -- runtime bz_array_len", gated on the
+                        // shared isCollectionTypeName/kArrayBackedCollections
+                        // registry, BuiltinRegistry.cpp) — independent of
+                        // whether sema ever types `ma`, exactly the #2423
+                        // TypeInitializationException.InnerException shape.
+                        // Caught by this fix's own adversarial broad-filter
+                        // sweep (array_ filter, 55 failures) before landing.
+                        bool isLengthAlias = mbr == "Length";
+                        // stdlib §4.4 Array<T>'s own declared methods
+                        // (+ IList<T>/IReadOnlyList<T>/ICollection<T>/
+                        // IEnumerable<T> ancestor GetEnumerator) and §4.5
+                        // OwningArray<T>'s own (+ IOwningEnumerable<T>
+                        // ancestor GetOwningEnumerator), unioned rather than
+                        // split per-type: a name legitimate only on the
+                        // OTHER of the two is harmless to exempt here too
+                        // (at worst a truly-bogus name matching the wrong
+                        // type's real method goes undetected — a missed
+                        // detection, never a false reject).
+                        bool isDeclaredMethod =
+                            mbr == "Add" || mbr == "AddRange" ||
+                            mbr == "Insert" || mbr == "RemoveAt" ||
+                            mbr == "Remove" || mbr == "Clear" ||
+                            mbr == "Contains" || mbr == "IndexOf" ||
+                            mbr == "LastIndexOf" || mbr == "Sort" ||
+                            mbr == "Reverse" || mbr == "Sorted" ||
+                            mbr == "Reversed" || mbr == "ToArray" ||
+                            mbr == "AsSpan" || mbr == "AsReadOnlySpan" ||
+                            mbr == "Slice" || mbr == "GetEnumerator" ||
+                            mbr == "GetOwningEnumerator" ||
+                            mbr == "PopAt" || mbr == "PopFirst" ||
+                            mbr == "PopLast" || mbr == "TryPopFirst" ||
+                            mbr == "TryPopLast" || mbr == "Drain";
+                        // stdlib §5 `System.Collections.Linq`'s
+                        // `IEnumerable<T>` extension block, transcribed
+                        // fresh from the doc for this fix (not copied from
+                        // the file's other, incomplete `isLinqOp` list).
+                        bool isLinqOperator =
+                            mbr == "Where" || mbr == "OfType" ||
+                            mbr == "Select" || mbr == "SelectMany" ||
+                            mbr == "Any" || mbr == "All" ||
+                            mbr == "First" || mbr == "FirstOrNull" ||
+                            mbr == "Last" || mbr == "LastOrNull" ||
+                            mbr == "Single" || mbr == "SingleOrNull" ||
+                            mbr == "ElementAt" || mbr == "Sum" ||
+                            mbr == "Min" || mbr == "Max" ||
+                            mbr == "Average" || mbr == "Aggregate" ||
+                            mbr == "OrderBy" || mbr == "OrderByDescending" ||
+                            mbr == "Distinct" || mbr == "Union" ||
+                            mbr == "Intersect" || mbr == "Except" ||
+                            mbr == "Take" || mbr == "TakeWhile" ||
+                            mbr == "Skip" || mbr == "SkipWhile" ||
+                            mbr == "Concat" || mbr == "Zip" ||
+                            mbr == "GroupBy" || mbr == "ToDictionary" ||
+                            mbr == "ToSet" || mbr == "ThenBy" ||
+                            mbr == "ThenByDescending";
+                        bool isCallForm = &ma == calleeOfCallCtx_;
+                        if (!isUniversalObjectMember && !isLengthAlias &&
+                                !isDeclaredMethod && !isLinqOperator &&
+                                !isCallForm) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("no member `") +
+                                    std::string(mbr) + "` on `" +
+                                    std::string(cn) +
+                                    "<T>` (stdlib \xC2\xA7""4.4/\xC2\xA7"
+                                    "4.5) -- it is not part of this "
+                                    "collection's documented property "
+                                    "surface (Count, Capacity, and the "
+                                    "`.Length` alias), a declared method/"
+                                    "LINQ operator (call or bare reference, "
+                                    "language spec \xC2\xA7""27.6), or a "
+                                    "universal `ToString`/`Equals`/"
+                                    "`GetHashCode`/`GetType` member "
+                                    "(language spec \xC2\xA7""8.1)");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         // #2459 (follow-up to #2458): this block (and its DictionaryEntry/
         // DrainedEntry sibling just below) MUST run BEFORE the #605 bare-
         // type-parameter block a little further down. #605's guard

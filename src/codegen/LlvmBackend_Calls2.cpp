@@ -4241,6 +4241,32 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         recvTy->importedName == "DrainedEntry") {
                     return lowerStringLiteral("\"DrainedEntry\"", false);
                 }
+                // #2457 slice 1 (stdlib §4.4/§4.5; language spec §8.5):
+                // `Array<T>`/`OwningArray<T>` are documented as `public
+                // class` with no ToString override, so the §8.5 default
+                // ("the type's qualified name") is the FIXED, compile-
+                // time-constant literal "Array"/"OwningArray" -- the same
+                // reasoning as DrainedEntry's literal just above, except
+                // these two ARE genuinely heap-allocated (`bz_array_t*`,
+                // unlike DrainedEntry's value-struct), so unlike
+                // DrainedEntry they could in principle dispatch through a
+                // real identity-based mechanism too -- but there is no
+                // vtable slot for them to dispatch through either (they
+                // are not object-model class instances; #2458's crash was
+                // exactly this kind of wild dispatch on a declaration-less
+                // type with no matching vtable shape), and the literal is
+                // simpler, cheaper, and equally correct per §8.5's
+                // "qualified name" default having no runtime dependency.
+                if (recvTy && recvTy->kind == K::Named &&
+                        !recvTy->declaration && recvTy->astNode &&
+                        recvTy->astNode->name &&
+                        !recvTy->astNode->name->parts.empty()) {
+                    std::string_view arn = recvTy->headName();
+                    if (arn == "Array")
+                        return lowerStringLiteral("\"Array\"", false);
+                    if (arn == "OwningArray")
+                        return lowerStringLiteral("\"OwningArray\"", false);
+                }
                 bool isObjectRecv =
                     recvTy && recvTy->kind == K::Primitive &&
                     recvTy->primitive == P::Object;
@@ -4467,26 +4493,37 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 // storage address") -- bypassing the vtable entirely rather
                 // than guessing at a slot index for a vtable shape that
                 // does not have one.
-                bool isBuiltinEnumRecv =
+                //
+                // #2457 slice 1: `Array<T>`/`OwningArray<T>` join this same
+                // block. Unlike IEnumerator<T>, they DO carry a vtable-
+                // shaped header in principle, but they are `bz_array_t*`
+                // runtime structs, not object-model class instances with
+                // the [td,itmap,Dispose,ToString,Equals,GetHashCode]
+                // layout -- there is no vtable to dispatch through here
+                // either, only a stable heap pointer, which is all §8.3's
+                // reference-identity/identity-hash default actually needs.
+                bool isBuiltinIdentityRecv =
                     recvTy && recvTy->kind == K::Named &&
                     !recvTy->declaration && recvTy->astNode &&
                     recvTy->astNode->name &&
                     !recvTy->astNode->name->parts.empty() &&
                     (recvTy->headName() == "IEnumerator" ||
-                     recvTy->headName() == "IAsyncEnumerator");
-                if (isBuiltinEnumRecv) {
+                     recvTy->headName() == "IAsyncEnumerator" ||
+                     recvTy->headName() == "Array" ||
+                     recvTy->headName() == "OwningArray");
+                if (isBuiltinIdentityRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {
                         llvm::Value* other = lowerExpr(*call.args[0].value);
                         if (recv && other)
                             return builder_.CreateICmpEQ(
-                                recv, other, "enum.eq.ref");
+                                recv, other, "bltn.eq.ref");
                     } else {
                         if (recv)
                             return builder_.CreateCall(
                                 declareC("bz_obj_identity_hash", i32(),
                                          {ptrTy()}),
-                                {recv}, "enum.hash");
+                                {recv}, "bltn.hash");
                     }
                 }
                 bool isObjectRecv = recvTy && recvTy->kind == K::Primitive &&
