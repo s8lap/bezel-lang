@@ -2551,19 +2551,59 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
         // slot shape — codegen installs a separate `$set` slot only when a
         // property has a setter (LlvmBackend_Setup.cpp), so a mismatched
         // override leaves a slot unfilled or orphaned. propertyDeclHasSetter
-        // is the same predicate codegen uses to decide slot allocation, but
-        // it reads the base's AST accessor shape directly — unavailable for
-        // an imported base (bDecl null), and NOT reconstructible from the
-        // current module-metadata schema (no accessor-presence bit is
-        // exported per §2.8.2's artifact-interface contents; PropertySymbol
-        // ::modifiers alone is insufficient — e.g. an expression-bodied
-        // get-only property carries no "readonly" modifier at all, so its
-        // absence cannot distinguish get-only from settable). Left unchecked
-        // for that case rather than guessed at (CLAUDE.md rule 4); filed as
-        // #2390 for a follow-up metadata addition. The property-TYPE check
-        // above — the confirmed false-accept shape — is unaffected.
-        if (bDecl &&
-            propertyDeclHasSetter(dDecl) != propertyDeclHasSetter(bDecl)) {
+        // is the same predicate codegen uses to decide slot allocation; it
+        // reads the base's AST accessor shape directly. For an IMPORTED base
+        // (bDecl null — ModuleLoader's Property case never reconstructs an
+        // ast::PropertyDecl, §2.8.2/§2.8.3: the artifact interface carries no
+        // AST) the bit rides the artifact interface instead: MetaMember::
+        // hasSetter, reconstructed by the loader into the #2400 side table
+        // ctx_.importedPropertyHasSetter — the accessor-presence analog of
+        // the property-TYPE fallback to ctx_.importedMemberType above
+        // (#2386). #2390: this fallback was deliberately deferred from
+        // #2386 because the hasSetter schema bit had not yet been added;
+        // #2400 added it (and codegen's propertyHasSetter already consumes
+        // it), so this sema check now consumes it too — closing the
+        // imported-base twin of the LOCAL-only gate #2386 had to leave in
+        // place.
+        //
+        // The builder bit mirrors CODEGEN's predicate, which — per
+        // propertyDeclHasSetter's own comment — SPURIOUSLY reports a setter
+        // for an abstract Auto-shorthand member (`abstract property P: T;` /
+        // `abstract property [i]: T;`, §12.5 = get-only): harmless for
+        // codegen's vtable slot allocation (an abstract class is never
+        // instantiated), but NOT for this semantic match, where it would
+        // false-reject the canonical `abstract property`/`abstract indexer`
+        // + get-only override idiom (the LOCAL twin of #1614's lit cases).
+        // Apply the same §12.5 correction sema's local predicate does. For a
+        // property, `importedPropertyIsAutoStorage` (#2478) identifies the
+        // Auto-shorthand shape precisely (a block-form abstract property
+        // with a real `set` arm keeps the builder bit — the local path
+        // accepts that shape too). For an INDEXER, the metadata cannot
+        // distinguish the Auto shorthand from a block form (isAutoProperty
+        // excludes indexers by design, #2478), so an abstract indexer is
+        // treated as the get-only shorthand — correct for the canonical
+        // idiom; the exotic abstract-block-indexer-with-set twin is a filed
+        // metadata-completeness residual. A pre-#2400 blob defaults the bit
+        // to false (see MetaMember::hasSetter's field comment); the project's
+        // recompile-the-world model means a stale dependency is recompiled
+        // rather than trusted with a stale accessor shape.
+        bool bHasSetter;
+        if (bDecl) {
+            bHasSetter = propertyDeclHasSetter(bDecl);
+        } else {
+            bHasSetter = ctx_.importedPropertyHasSetter(base);
+            if (bHasSetter) {
+                bool baseAbstract = false;
+                for (auto mod : base->modifiers)
+                    if (mod == "abstract") { baseAbstract = true; break; }
+                if (baseAbstract &&
+                    (base->isIndexer ||
+                     ctx_.importedPropertyIsAutoStorage(base))) {
+                    bHasSetter = false;  // §12.5 abstract shorthand = get-only
+                }
+            }
+        }
+        if (propertyDeclHasSetter(dDecl) != bHasSetter) {
             err("accessor set/get presence");
         }
     }
