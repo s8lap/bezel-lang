@@ -11831,6 +11831,140 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // #2444 (sibling gap to #2423/#2433, same declaration-less-Named-type
+        // shape; stdlib §4.12; language spec §8.1/§8.7): the builtin
+        // BORROWING iterator sentinels `IEnumerator<T>` / `IAsyncEnumerator<T>`
+        // (declaration == nullptr; detected the same way the `.Current`
+        // handler ~150 lines up detects them) have a CLOSED documented
+        // surface per stdlib §4.12: `Current` (typed above), `MoveNext()` /
+        // `MoveNextAsync()` and `Dispose()`/`DisposeAsync()` (calls, resolved
+        // independently through the enclosing CallExpr machinery's
+        // colName=="IEnumerator"/"IAsyncEnumerator" dispatch a few thousand
+        // lines up in this file — none of that dispatch ever sets `ma`'s own
+        // exprType, only the CallExpr's, exactly like #2423's exempted
+        // Dispose/ReferenceEquals for exception receivers), and the universal
+        // Object members (ToString/Equals/GetHashCode/GetType/ReferenceEquals,
+        // §8.1). #2433's retraction (generic_record_field_590) does NOT apply
+        // here: that false reject came from preempting #590's deliberate
+        // CODEGEN-deferred by-name resolution for a genuinely-declared type
+        // PARAMETER (`genericSubstSemaTy_`, resolved per-instantiation).
+        // IEnumerator<T>/IAsyncEnumerator<T> are not type parameters — they
+        // are fixed builtin synthetic types with no substitution step, so
+        // there is nothing deferred to preempt; their whole member surface is
+        // enumerable right here, exactly like #2423's exception types. A
+        // member name matching none of these previously fell through to this
+        // function's tail `return;` below with no diagnostic and no exprType
+        // set — the identical uninitialized-read shape #2423 fixed for
+        // built-in exceptions (confirmed live: `e.TotallyBogusMember` on an
+        // `IEnumerator<T>` compiled at exit 0 with no diagnostic before this
+        // fix).
+        if (ma.target && !ctx_.exprType(ma)) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty()) {
+                    std::string_view en = tt->headName();
+                    bool isSyncEnum = en == "IEnumerator";
+                    bool isAsyncEnum = en == "IAsyncEnumerator";
+                    if (isSyncEnum || isAsyncEnum) {
+                        const auto& mbr = ma.member;
+                        bool isUniversalObjectMember =
+                            mbr == "ToString"    || mbr == "Equals" ||
+                            mbr == "GetHashCode" || mbr == "GetType" ||
+                            mbr == "ReferenceEquals";
+                        bool isRecognizedCallForm =
+                            (isSyncEnum &&
+                             (mbr == "MoveNext" || mbr == "Dispose")) ||
+                            (isAsyncEnum &&
+                             (mbr == "MoveNextAsync" ||
+                              mbr == "DisposeAsync" || mbr == "Dispose"));
+                        if (!isUniversalObjectMember && !isRecognizedCallForm) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            std::string surface =
+                                isSyncEnum
+                                    ? "Current, MoveNext(), Dispose() "
+                                      "(stdlib \xC2\xA7""4.12)"
+                                    : "Current, MoveNextAsync(), "
+                                      "DisposeAsync() (stdlib \xC2\xA7""4.12)";
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("no member `") +
+                                    std::string(mbr) + "` on builtin `" +
+                                    std::string(en) +
+                                    "<T>`; documented surface: " + surface +
+                                    " and the universal `ToString`/`Equals`/"
+                                    "`GetHashCode`/`GetType` (language spec "
+                                    "\xC2\xA7""8.1)");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        // #2444 (sibling gap to #2423/#2433; stdlib §4.8/§4.9; language spec
+        // §8.1/§8.3/§8.5/§8.7): the builtin entry sentinels
+        // `DictionaryEntry<K, V>` (a RECORD) and `DrainedEntry<K, V>` (a
+        // CLASS implementing `IDisposable`) — declaration == nullptr;
+        // detected the same importedName tag the `.Key`/`.Value` handler
+        // ~250 lines up already uses — have a closed documented surface:
+        // `Key`/`Value` (typed above), the universal Object members every
+        // record/class carries (§8.1/§8.3/§8.5), and — DrainedEntry only —
+        // `Dispose()` (it is a class implementing IDisposable per stdlib
+        // §4.9; DictionaryEntry is a record, and language spec §8.7 "Dispose
+        // is not on Object" / "records ... do not implement IDisposable"
+        // means `Dispose` stays REJECTED on DictionaryEntry, not exempted).
+        // Not a #2433-shaped false-reject risk for the same reason as the
+        // IEnumerator block above: neither type is a declared generic type
+        // parameter, so there is no codegen genericSubstSemaTy_ deferred
+        // resolution step being preempted here — the member surface is fully
+        // enumerable at this declaration-less sentinel's own definition
+        // (confirmed live: `entry.TotallyBogusMember` on the `for var entry
+        // in dict do` element type compiled at exit 0 with no diagnostic
+        // before this fix).
+        if (ma.target && !ctx_.exprType(ma)) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->declaration) {
+                    bool isDictEntry = tt->importedName == "DictionaryEntry";
+                    bool isDrainedEntry = tt->importedName == "DrainedEntry";
+                    if (isDictEntry || isDrainedEntry) {
+                        const auto& mbr = ma.member;
+                        bool isUniversalObjectMember =
+                            mbr == "ToString"    || mbr == "Equals" ||
+                            mbr == "GetHashCode" || mbr == "GetType" ||
+                            mbr == "ReferenceEquals";
+                        bool isRecognizedDispose =
+                            isDrainedEntry && mbr == "Dispose";
+                        if (!isUniversalObjectMember && !isRecognizedDispose) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            std::string_view tn = isDictEntry
+                                ? "DictionaryEntry" : "DrainedEntry";
+                            std::string_view stdlibSec =
+                                isDictEntry ? "4.8" : "4.9";
+                            std::string surface =
+                                isDrainedEntry
+                                    ? "Key, Value, Dispose()"
+                                    : "Key, Value";
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("no member `") +
+                                    std::string(mbr) + "` on `" +
+                                    std::string(tn) +
+                                    "<K, V>`; documented surface: " +
+                                    surface + " (stdlib \xC2\xA7" +
+                                    std::string(stdlibSec) +
+                                    ") and the universal `ToString`/"
+                                    "`Equals`/`GetHashCode`/`GetType` "
+                                    "(language spec \xC2\xA7""8.1)");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         return;
     }
     // Lookup member by name. Slice S5: walks own members first,
