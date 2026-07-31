@@ -201,7 +201,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         (propSetSlot_.count(tps) ||
                          ifacePropertySetIndex_.count(tps))) {
                         llvm::Value* rhsV = lowerExpr(*as->value);
-                        if (lowerVirtualPropertySet(*as->target, rhsV))
+                        // fix #2490: thread the RHS expr through so a
+                        // directly-passed +1 producer gets its ARGUMENT-PASS
+                        // release (see lowerVirtualPropertySet's comment).
+                        if (lowerVirtualPropertySet(*as->target, rhsV,
+                                                    as->value.get()))
                             return false;
                     }
                 }

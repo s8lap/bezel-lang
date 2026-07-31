@@ -4849,7 +4849,8 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
 // #481: dynamic dispatch of a virtual/interface property SETTER for
 // `obj.P := v`, with the already-lowered value `v`. Mirrors the getter dispatch
 // above; the call is `void set(ptr this, T value)`.
-bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v) {
+bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
+                                      const ast::Expr* valueExpr) {
     if (!v) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target);
     if (!ma || !ma->target) return false;
@@ -4915,6 +4916,41 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v) {
     }
     builder_.CreateCall(fnTy, fnPtr, {recv, v});
     emitPendingCheck();
+    // fix #2490 (§23.3/§4.6/§27.5/§28.9, v0.236): the virtual/interface-
+    // dispatch twin of lowerImportedPropertySetValue's ARGUMENT-PASS release
+    // — see that function's comment for the full rationale (the callee
+    // ensurePropertyAccessorFn built now retains a plain setter parameter,
+    // but ONLY for a CLASS-owned property, §9/§9.7; a RECORD's stays a plain
+    // store, so releasing a producer the callee never retained would UAF).
+    //
+    // Restricted to the NON-interface (`!isIfaceProp`) branch — a class's own
+    // vtable-slot virtual/override property. There `ps->parent` IS reliably
+    // the declaring CLASS (records cannot enter a vtable hierarchy at all:
+    // "A record cannot derive from another record or from a class", §9), so
+    // the callee is guaranteed to be the CLASS-gated retaining setter.
+    //
+    // The `isIfaceProp` (itable) branch is DELIBERATELY left WITHOUT this
+    // release: `ps` there is the INTERFACE's own declared PropertySymbol, so
+    // `ps->parent->kind` is always Interface — it carries no information
+    // about the CONCRETE runtime receiver, which per §11 may be a class
+    // instance OR a boxed record ("a record may implement any number of
+    // interfaces" / "an interface-typed variable holds a reference: to a
+    // class instance directly, [or] to a record value boxed at assignment").
+    // Distinguishing which concrete setter an itable call will actually
+    // invoke is a runtime fact this call site cannot see statically, and a
+    // wrong guess here risks exactly the live UAF this fix's own adversarial
+    // pass just found for the direct-set record case — so this leaks a
+    // direct-producer argument passed through an INTERFACE-dispatched setter
+    // (leak-over-UAF, the safe direction) until that distinction can be made
+    // soundly. Filed as a follow-up alongside the other known gaps this fix
+    // records rather than guesses at.
+    if (!isIfaceProp) {
+        if (valueExpr && isPlusOneStringProducer(valueExpr))
+            emitStringRelease(v);
+        else if (valueExpr && (isPlusOneClosureProducer(valueExpr) ||
+                               isUserMethodClosureReturnCall(valueExpr)))
+            emitClosureRelease(v);
+    }
     return true;
 }
 

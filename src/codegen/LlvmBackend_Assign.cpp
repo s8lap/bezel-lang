@@ -2801,7 +2801,94 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
             if (idxIt != fieldIndex_.end()) {
                 llvm::Value* slot = builder_.CreateStructGEP(
                     st, currentThis_, idxIt->second);
-                builder_.CreateStore(&valArg, slot);
+                // fix #2490 (§23.3 "Block-form properties" / §28.9 "Runtime-
+                // managed types", v0.236): pre-fix this was a bare,
+                // unguarded pointer store — NO retain of the incoming value
+                // and NO release of the value being displaced. §23.3 is
+                // explicit that "the setter's implicit `value` parameter has
+                // no modifier by default and takes a BORROW of the
+                // property's declared type" (auto-properties have no syntax
+                // slot for `set(owned)` — that spelling is admitted only on
+                // block-form properties/indexers, §23.3 — so an auto-
+                // property setter's `value` is ALWAYS a borrow, never an
+                // announced transfer). A borrow means the CALLER keeps its
+                // own reference and is not discharging it into this call;
+                // if the callee (this setter) wants to keep the value alive
+                // past the call — which storing it into a field that
+                // outlives the call obviously does — it must mint its OWN
+                // independent +1, exactly like an ordinary in-class field
+                // store of a plain (non-modifier) parameter already does
+                // (lowerStringFieldStore / lowerClosureFieldStore, #429 /
+                // §4.6 / §27.5 / §28.9 — "field store of a `string` param
+                // routes through lowerStringFieldStore's emitStringRetain").
+                // Confirmed live consequence of the bare store: the field
+                // and the caller's local silently aliased the SAME single
+                // reference, so the owning object's disposal (which
+                // correctly releases the field once, per
+                // emitOwnedFieldDisposals) freed the string out from under
+                // the caller's still-live local — SEGV in
+                // bz_string_to_utf8z (xmod_auto_property_setter_arc_2490_
+                // test.cpp T1, fail-red/pass-green demonstrated).
+                //
+                // Order mirrors lowerStringFieldStore/lowerClosureFieldStore
+                // exactly: load-old -> retain-new -> store-new -> release-
+                // old. Retaining before releasing keeps a self-assignment
+                // (`h.Name := h.Name;`, which calls this SAME generated
+                // function) transiently safe — the count dips +1 then back,
+                // never 0 — instead of releasing first and risking a
+                // display of the same object at rc 0.
+                //
+                // There is no source ast::Expr for the incoming value here
+                // (it is an opaque function parameter, not a spelled-out
+                // assignment RHS), so unlike lowerStringFieldStore's
+                // isPlusOneStringProducer check, there is no way to prove
+                // the value is a fresh, uniquely-owned +1 the callee could
+                // transfer instead of retain — and §23.3 says it never is,
+                // for a plain setter. Always retain; never transfer.
+                //
+                // CLASS ONLY, matching isStringFieldLvalue/
+                // isClosureFieldLvalue's own gate: a RECORD's auto-property
+                // backing field is a borrow with no independent +1 and no
+                // disposer (records are legal with mutable auto-properties
+                // per §9.2, but "the record does not own what \[reference
+                // fields\] point to", §9; §9.7 — no disposer to balance a
+                // retain against). Falls through to the pre-fix plain store
+                // for a record (or any non-class `cls`), unaffected.
+                //
+                // Object/interface (box)-typed auto-properties are
+                // deliberately NOT covered here — isBoxStorageMember's
+                // classification prepass (collectBoxStorageFields,
+                // LlvmBackend_Setup.cpp:18116) runs AFTER declareVtables()/
+                // emitExportedPropertySetters() (LlvmBackend_impl.hpp
+                // ~262-327), both of which can be the FIRST caller of this
+                // memoized function, so boxStorageFields_ would read empty
+                // at the point this body needs to consult it — consulting it
+                // anyway would either no-op (useless) or require inventing an
+                // ordering-independent replacement policy not backed by the
+                // established discipline. Filed as #2500 (full ordering
+                // analysis + two sound remediation options) rather than
+                // guessing at it (CLAUDE.md rule 4).
+                bool classField = cls && cls->kind == ast::TypeDeclKind::Class;
+                bool strField = classField && isStringStorageMember(ps) &&
+                                valArg.getType()->isPointerTy();
+                bool closureField = classField && !strField &&
+                                    isClosureStorageMember(ps) &&
+                                    valArg.getType()->isPointerTy();
+                if (strField) {
+                    llvm::Value* oldVal = builder_.CreateLoad(
+                        ptrTy(), slot, "propset.str.old");
+                    emitStringRetain(&valArg);
+                    builder_.CreateStore(&valArg, slot);
+                    emitStringRelease(oldVal);
+                } else if (closureField) {
+                    llvm::Value* oldVal = builder_.CreateLoad(
+                        ptrTy(), slot, "propset.clo.old");
+                    emitClosureRetain(&valArg);
+                    builder_.CreateStore(&valArg, slot);
+                    emitClosureRelease(oldVal);
+                } else {
+                    builder_.CreateStore(&valArg, slot);
+                }
             }
         } else if (setAcc) {
             if (setAcc->bodyKind == ast::PropertyAccessorBodyKind::Expression &&
@@ -3393,7 +3480,8 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
 // exists to preserve) does this fall back to `lowerExpr` + spill, exactly
 // as before.
 bool Emitter::lowerImportedPropertySetValue(const ast::Expr& target,
-                                            llvm::Value* v) {
+                                            llvm::Value* v,
+                                            const ast::Expr* valueExpr) {
     if (!v) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target);
     if (!ma || !ma->target) return false;
@@ -3430,6 +3518,36 @@ bool Emitter::lowerImportedPropertySetValue(const ast::Expr& target,
     v = coerceNumericToType(v, valTy, isUnsignedTargetExpr(target));
     builder_.CreateCall(fn->getFunctionType(), fn, {recv, v});
     emitPendingCheck();
+    // fix #2490 (§23.3/§4.6/§28.9, v0.236): the ARGUMENT-PASS release, the
+    // property-setter-call twin of the ordinary method-call release in
+    // LlvmBackend_Calls2.cpp (~7035, the "#429 ARGUMENT-PASS category"
+    // comment there has the full rationale). The generated setter this call
+    // just invoked RETAINS its incoming `value` (ensurePropertyAccessorFn's
+    // #2490 fix — §23.3 makes every plain setter parameter a borrow, so the
+    // callee never transfers, always mints its own +1) — but ONLY for a
+    // CLASS-owned property (ensurePropertyAccessorFn's ARC is deliberately
+    // gated to `cls->kind == Class`; a RECORD's auto-property backing field
+    // is a borrow with no independent +1, §9/§9.7, and keeps the pre-fix
+    // plain store). Gating this release the SAME way is required, not
+    // optional: releasing a producer the record-owning callee never retained
+    // would drop the field's ONLY reference immediately — a confirmed live
+    // UAF found by this fix's own adversarial pass (`r.Name := "a" + "b";`
+    // on a record-typed imported property crashed in bz_string_to_utf8z when
+    // this release fired unconditionally). A +1 producer passed DIRECTLY as
+    // a CLASS setter's value — `h.Name := "a" + "b";`, no local binding of
+    // its own — holds an independent, now-doubled reference nothing else
+    // will ever release: this call's own `v` and the callee's fresh retain.
+    // A bare `v` (an identifier / field / any non-producer borrow) is
+    // unaffected either way, since it is that binding's own responsibility
+    // to release at its own scope end, same as every other #429
+    // ARGUMENT-PASS site.
+    bool classOwned = ps->parent && ps->parent->kind == ast::TypeDeclKind::Class;
+    if (classOwned && valueExpr && isPlusOneStringProducer(valueExpr))
+        emitStringRelease(v);
+    else if (classOwned && valueExpr &&
+             (isPlusOneClosureProducer(valueExpr) ||
+              isUserMethodClosureReturnCall(valueExpr)))
+        emitClosureRelease(v);
     return true;
 }
 
@@ -3466,7 +3584,10 @@ bool Emitter::lowerImportedPropertySet(const ast::Expr& target,
     if (!ps || ps->isIndexer) return false;
     if (!importedPropSetterFns_.count(ps)) return false;
     llvm::Value* v = lowerExpr(value);
-    return v ? lowerImportedPropertySetValue(target, v) : false;
+    // fix #2490: thread `value` through as valueExpr so
+    // lowerImportedPropertySetValue can release a +1 producer passed
+    // directly (see its own comment for the full rationale).
+    return v ? lowerImportedPropertySetValue(target, v, &value) : false;
 }
 
 

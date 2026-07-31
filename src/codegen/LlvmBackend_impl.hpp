@@ -3609,7 +3609,19 @@ private:
     // SETTER through the vtable/itable with the already-lowered value `v`.
     // Returns true when it handled the assignment; false to fall through to the
     // static setter path.
-    bool lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v);
+    //
+    // fix #2490 (§23.3/§4.6/§27.5/§28.9, v0.236): `valueExpr` is the SOURCE
+    // ast::Expr `v` was lowered from, when the caller has one (nullptr at the
+    // `ref`/`out` accessor write-back call site, whose `v` is a reload of an
+    // existing slot, never a fresh producer). See the .cpp definition for why
+    // this is needed — the callee (the generated setter body) now always
+    // retains its incoming borrow (§23.3), so a caller-side +1 producer
+    // passed DIRECTLY as the argument (no local binding of its own) needs the
+    // SAME post-call release the #429 ARGUMENT-PASS call-argument release
+    // already gives an ordinary method call (LlvmBackend_Calls2.cpp), or it
+    // leaks.
+    bool lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
+                                 const ast::Expr* valueExpr = nullptr);
 
     // §23.4: emit (or retrieve cached) a standalone LLVM function for a
     // BLOCK-form indexer getter body (`property [i: …]: T get => do…end;`).
@@ -3685,7 +3697,13 @@ private:
     // setter stub.
     bool lowerImportedPropertySet(const ast::Expr& target,
                                   const ast::Expr& value);
-    bool lowerImportedPropertySetValue(const ast::Expr& target, llvm::Value* v);
+    // fix #2490 (§23.3/§4.6/§27.5/§28.9, v0.236): `valueExpr` (default
+    // nullptr for the `ref`/`out` write-back call site) is the source
+    // ast::Expr `v` was lowered from — see lowerVirtualPropertySet's comment
+    // just above for why a caller-side post-call release is needed now that
+    // the callee always retains.
+    bool lowerImportedPropertySetValue(const ast::Expr& target, llvm::Value* v,
+                                       const ast::Expr* valueExpr = nullptr);
 
     // §22.9: compound assignment `obj.P OP= rhs` on a block-form property —
     // a read-modify-write: read the current value through the getter, apply
