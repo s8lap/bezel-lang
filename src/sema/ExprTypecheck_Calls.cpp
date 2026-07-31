@@ -13366,7 +13366,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             (targetType->decl != nullptr || importedKnownCompleteUserType) &&
             (targetType->kind == ast::TypeDeclKind::Class ||
              targetType->kind == ast::TypeDeclKind::Record ||
-             targetType->kind == ast::TypeDeclKind::Enum);
+             targetType->kind == ast::TypeDeclKind::Enum ||
+             targetType->kind == ast::TypeDeclKind::Choice);
         // §8.1 / §8.7: universal members present on every type without a
         // MemberSymbol — never diagnose these as missing.
         const auto& mm = ma.member;
@@ -13383,7 +13384,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if ((mm == "Serialize" || mm == "Deserialize") && knownCompleteUserType &&
                 (targetType->kind == ast::TypeDeclKind::Record ||
                  targetType->kind == ast::TypeDeclKind::Enum ||
-                 targetType->kind == ast::TypeDeclKind::Class)) {
+                 targetType->kind == ast::TypeDeclKind::Class ||
+                 targetType->kind == ast::TypeDeclKind::Choice)) {
             auto* tdSer = dynamic_cast<const ast::TypeDecl*>(targetType->decl);
             if (tdSer) {
                 // For classes: only synthesized when a serialized-class clause
@@ -13480,8 +13482,15 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         if (knownCompleteUserType && !isUniversalObjectMember &&
                 !isBuiltinExInheritedMember &&
                 !isSerializationSynthesizedMember) {
+            // #1307 / #2496: a degenerate-callee MemberAccessExpr can carry a
+            // zero span (the parser synthesizes `Type<args>.Member` without a
+            // usable span on the access itself); fall back to the target's span
+            // so the diagnostic points at real source, not `0:0`.
+            auto nmLoc = ma.span.begin;
+            if (nmLoc.line == 0 && ma.target)
+                nmLoc = ma.target->span.begin;
             ctx_.diagnostics().report(
-                Severity::Error, ma.span.begin,
+                Severity::Error, nmLoc,
                 std::string("no member `") + std::string(ma.member) +
                     "` on type `" + std::string(targetType->name) +
                     "` (§11.3, §12.1)");
