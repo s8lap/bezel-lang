@@ -1018,6 +1018,19 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     llvm::Value* savedCaught = currentCaughtExc_;
     std::size_t savedUnwindDepth = unwindScopeDepth_;
     bool savedDiverged = diverged_;
+    // #2515 / §27.3 / §28.9: save the enclosing method's return-type node and
+    // reset it for the lambda body (see the nullptr assignment at body-entry
+    // below).  Without this, a block-bodied lambda compiled inside a method
+    // whose declared return type is a FUNCTION type (e.g. `() -> Animal`) leaks
+    // that node into the body's ReturnStmt lowering: emitReturn's
+    // closure-return-retain branch (LlvmBackend_Stmts.cpp ~line 1828) sees a
+    // Function declRet and fires emitClosureRetain on a NON-closure return
+    // value (a captured class instance), writing 8 bytes at offset 16 of a
+    // 16-byte object — a heap-buffer-overflow that surfaces as a double-free
+    // under ASan.  The expr-body path is unaffected (it keys off retSemaTy, the
+    // lambda's OWN return type); only the block-body path goes through
+    // emitReturn, which reads currentReturnTypeNode_.
+    const ast::Type* savedCurrentReturnTypeNode = currentReturnTypeNode_;
 
     // §27.5: the set of outer locals/params the body references.
     std::unordered_set<const sema::Symbol*> capturedSyms;
@@ -1476,6 +1489,16 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     lastLambdaCapturedCells_.clear();
     currentFn_ = fn;
     currentThis_ = nullptr;
+    // #2515 / §27.3: a lambda body is NOT a method body — its `return` is an
+    // internal transfer to the trampoline, not a method-contract return that
+    // mints +1 / boxes against a declared return-type node.  Null it so
+    // emitReturn's retain/box branches (keyed on currentReturnTypeNode_) do not
+    // fire on the LEAKED enclosing-method return node.  The expr-body path
+    // already uses retSemaTy (the lambda's own return type) for its retain
+    // decisions; the block-body path now matches by carrying no declared node.
+    // A lambda's external RC/boxing contract is settled at the CALL SITE from
+    // the lambda's function type, not in the body.
+    currentReturnTypeNode_ = nullptr;
     locals_.clear();
     paramSlots_.clear();
     refParams_.clear();
@@ -1839,6 +1862,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
 
     // --- Restore emitter state ---
     expectedFunctionType_ = savedExpectedFT;  // #731
+    currentReturnTypeNode_ = savedCurrentReturnTypeNode;  // #2515
     lambdaParamTypeHint_ = std::move(savedLambdaParamHints);
     currentFn_ = savedFn;
     currentThis_ = savedThis;
