@@ -6064,6 +6064,16 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     // (an auto-property backed by a compiler-generated field is the OWNED
     // NAMED case; every other property — expression-body, block-body,
     // expression-bodied `=>` — is the COMPUTED, fresh-value case).
+    // fix #2485 (§9.2/§22.8/§29.2, v0.235): sema::isAutoPropertySymbol is
+    // DECL-DEPENDENT and always false for an IMPORTED PropertySymbol, so an
+    // imported auto-property source was misclassified as COMPUTED — the loop
+    // then disposed a source it does not own. CONFIRMED live heap-use-after-
+    // free (a second `for x in h.Prop` read the source through the same,
+    // now-freed, pointer the first loop's erroneous disposal reclaimed).
+    // isAutoPropertyStorage (Emitter, LlvmBackend_impl.hpp) is the SAME
+    // predicate #2478 already built for the storage-layout family: local
+    // decl-based check first (byte-for-byte unchanged), wire-carried fallback
+    // for a decl-null imported Property.
     bool sourceIsNamedLocal = false;
     if (sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable)) {
         if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
@@ -6071,7 +6081,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
             sourceIsNamedLocal = true;
         } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
-            sourceIsNamedLocal = sema::isAutoPropertySymbol(ps);
+            sourceIsNamedLocal = isAutoPropertyStorage(ps);
         }
     }
     if (!sourceIsNamedLocal) {
@@ -6391,6 +6401,10 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // self-implementing class could instead construct and return a fresh
     // instance of its own type, in which case the two pointers differ and the
     // ordinary distinct-object disposal is correct and must not be skipped.
+    // fix #2485 (§9.2/§22.8/§29.1, v0.235): isAutoPropertyStorage, not the
+    // bare decl-dependent sema::isAutoPropertySymbol — see the sibling fix a
+    // few lines up in lowerIEnumerableBuiltinFor's plain sync path for the
+    // confirmed heap-use-after-free this same misclassification produces.
     bool sourceIsNamedOwner = false;
     if (sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable)) {
         if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
@@ -6398,7 +6412,7 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
             dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
             sourceIsNamedOwner = true;
         } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
-            sourceIsNamedOwner = sema::isAutoPropertySymbol(ps);
+            sourceIsNamedOwner = isAutoPropertyStorage(ps);
         }
     }
     llvm::AllocaInst* enumDisposeSlot = enumSlot;
@@ -6657,6 +6671,10 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     //     at its own lifetime end (registerIterableSourceDisposal, §29.11).
     // The `en == src` test is a runtime compare because the two producers differ
     // and the static type (`IAsyncEnumerable<T>`) cannot tell them apart.
+    // fix #2485 (§9.2/§22.8/§29.8, v0.235): isAutoPropertyStorage — the async
+    // `for await` twin of the sync for-in fix above (same misclassification,
+    // same confirmed heap-use-after-free direction: an imported auto-property
+    // source disposed early by a loop that does not own it).
     bool sourceIsNamedLocal = false;
     if (sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable)) {
         if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
@@ -6664,7 +6682,7 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
             dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
             sourceIsNamedLocal = true;
         } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
-            sourceIsNamedLocal = sema::isAutoPropertySymbol(ps);
+            sourceIsNamedLocal = isAutoPropertyStorage(ps);
         }
     }
     llvm::Value* enumIsSrc = builder_.CreateICmpEQ(enumPtr, srcPtr, "afor.selfen");

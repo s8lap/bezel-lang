@@ -8677,6 +8677,11 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 // double-free. Mirrors lowerIEnumerableFor's
                 // `sourceIsNamedOwner` test (LlvmBackend_Stmts.cpp), the
                 // sibling fix for the analogous for-in desugaring gap.
+                // fix #2485 (§9.2/§22.8/§29.11, v0.235): isAutoPropertyStorage
+                // — see LlvmBackend_Stmts.cpp's `sourceIsNamedOwner`
+                // (lowerIEnumerableBuiltinFor) for the confirmed
+                // heap-use-after-free this same misclassification produces
+                // when the source is an imported auto-property.
                 bool srcIsNamedOwner = false;
                 if (sema::Symbol* sym = ctx_.exprSymbol(*init)) {
                     if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
@@ -8685,7 +8690,7 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         srcIsNamedOwner = true;
                     } else if (auto* ps =
                                    dynamic_cast<sema::PropertySymbol*>(sym)) {
-                        srcIsNamedOwner = sema::isAutoPropertySymbol(ps);
+                        srcIsNamedOwner = isAutoPropertyStorage(ps);
                     }
                 }
                 v = wrapUserClassAsIEnumerable(v, initTR->declaration, declTR,
@@ -9807,6 +9812,15 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                                 ce->callee.get())) {
                             if (gma->member == "GetAsyncEnumerator" &&
                                     gma->target) {
+                                // fix #2485 (§9.2/§22.8/§29.8, v0.235):
+                                // isAutoPropertyStorage — the manual-protocol
+                                // `.GetAsyncEnumerator()` twin of the sibling
+                                // fixes above; an imported auto-property
+                                // receiver was misclassified as unnamed, so
+                                // the self-alias guard never armed and the
+                                // enumerator's own scope-end disposal
+                                // collided with the source's separate
+                                // disposal (double free / use-after-free).
                                 bool srcIsNamed = false;
                                 if (sema::Symbol* sym =
                                         ctx_.exprSymbol(*gma->target)) {
@@ -9817,8 +9831,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                                         srcIsNamed = true;
                                     } else if (auto* ps = dynamic_cast<
                                                    sema::PropertySymbol*>(sym)) {
-                                        srcIsNamed =
-                                            sema::isAutoPropertySymbol(ps);
+                                        srcIsNamed = isAutoPropertyStorage(ps);
                                     }
                                 }
                                 if (srcIsNamed) {
