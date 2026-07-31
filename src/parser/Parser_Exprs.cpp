@@ -1065,6 +1065,24 @@ ast::Param Parser::parseLambdaParam() {
     } else if (consumeKeyword("owned")) {
         mod = "owned";
         hasMod = true;
+    } else if (current_.kind == TokenKind::Identifier &&
+               current_.text == "scoped" &&
+               peekAt(1).kind == TokenKind::Identifier) {
+        // per §27 / A.7 (v0.228): `scoped` is a CONTEXTUAL modifier (lexed
+        // as Identifier, not a reserved keyword) listed in FuncParamMods and
+        // therefore admissible on a LambdaParam, exactly mirroring the
+        // method-param path (§22.3 ParamModifiers, A.4; Parser_Decls.cpp).
+        // It is the modifier exactly when the next token is the parameter's
+        // name (an Identifier); a parameter NAMED `scoped` is followed by
+        // `:` and is not matched here, and a destructure head `scoped(` is
+        // followed by `(` (a Punctuator) and likewise falls through to the
+        // LambdaDestructure alternative below. Function-typed-ness and the
+        // §28.14 storage-bounded-capture semantics for a lambda's own
+        // parameter are checked in sema — the parser only admits the token
+        // the grammar admits (#2344).
+        mod = "scoped";
+        hasMod = true;
+        advance();
     }
     // per §27.4 (v0.183)/A.7: the LambdaDestructure alternative is
     // `QualifiedName "(" ...`, discriminated from the Identifier alternative
