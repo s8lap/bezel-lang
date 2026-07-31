@@ -4953,6 +4953,26 @@ private:
     };
     ArrEnumMachinery ensureArrayEnumMachinery(llvm::Type* elemTy);
 
+    // #2471 (stdlib §4.11; language spec §29.1, agreeing with #2472's
+    // for-loop fix): the REVERSE-order twin of ensureArrayEnumMachinery /
+    // wrapArrayAsIEnumerable, for Stack<T>/OwningStack<T>'s explicit
+    // `.GetEnumerator()` call. Same 4-field struct layout { vtable, arr,
+    // idx, esz } and the same Dispose/Current bodies, but MoveNext COUNTS
+    // DOWN (`idx--; return idx >= 0`) instead of up, and the "before-first"
+    // sentinel is `bz_array_len(arr)` (a RUNTIME value fetched fresh on
+    // every wrap/clone) instead of the forward machinery's fixed `-1` —
+    // reverse iteration's starting point depends on the collection's
+    // current length, which the constant sentinel has no way to express.
+    // A distinct name prefix ("stackenum."/"bz$stackenum$..." vs
+    // "arrenum."/"bz$arrenum$...") keeps this cache fully separate from the
+    // forward machinery even though the struct shape is identical — the two
+    // must never be interchanged (a forward-cursor MoveNext on a
+    // reverse-initialized struct, or vice versa, would silently read
+    // out-of-bounds or terminate immediately).
+    ArrEnumMachinery ensureStackEnumMachinery(llvm::Type* elemTy);
+    llvm::Value* wrapStackAsIEnumerator(llvm::Value* arr,
+                                        const sema::TypeRef* iEnumTy);
+
     // §29 / §12.9 (#1850): wrap an array-backed collection whose ELEMENTS are
     // themselves array-backed collections viewed covariantly as IEnumerable<T>
     // (`Array<Array<Dog>>` → `IEnumerable<IEnumerable<Dog>>`). The plain

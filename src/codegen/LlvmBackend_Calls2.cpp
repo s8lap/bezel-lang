@@ -4867,7 +4867,15 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     }
                     return src;
                 }
-                if ((rbn == "Array" || rbn == "OwningArray") && recvTy &&
+                // #2471 (stdlib §4.11): Queue<T>/OwningQueue<T> join Array/
+                // OwningArray here — Queue's required front-to-back (dequeue)
+                // order coincides with physical/forward order (front = index
+                // 0, the same index Dequeue() itself reads,
+                // LlvmBackend_Calls.cpp ~4566-4588), so the SAME forward
+                // machinery already correct for Array applies unchanged; no
+                // new machinery needed (unlike Stack, just below).
+                if ((rbn == "Array" || rbn == "OwningArray" ||
+                     rbn == "Queue" || rbn == "OwningQueue") && recvTy &&
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                     llvm::Value* arr = lowerExpr(*ma->target);
                     if (arr && arr->getType()->isPointerTy()) {
@@ -4890,6 +4898,45 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             // free the wrapper struct (its Dispose is a plain
                             // free() of the borrow-holding struct; the array is
                             // untouched). Keeps the heap clean with no leak.
+                            llvm::Value* iterVt =
+                                builder_.CreateLoad(ptrTy(), iter);
+                            llvm::Value* dSlot = builder_.CreateGEP(
+                                ptrTy(), iterVt, {builder_.getInt32(1)});
+                            llvm::Value* dFn =
+                                builder_.CreateLoad(ptrTy(), dSlot);
+                            auto* dTy = llvm::FunctionType::get(
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false);
+                            builder_.CreateCall(dTy, dFn, {iter});
+                            return en;
+                        }
+                    }
+                }
+                // #2471 (stdlib §4.11 "Iteration order" v0.195; language spec
+                // §29.1, agreeing with #2472's for-loop fix): Stack<T>/
+                // OwningStack<T>'s explicit `.GetEnumerator()` call — the
+                // SAME wrap+clone+dispose shape as the block above, but
+                // through wrapStackAsIEnumerator's REVERSE-order machinery
+                // (ensureStackEnumMachinery) instead of the forward one, so
+                // `s.GetEnumerator()`'s element order matches `for x in s
+                // do ... end`'s top-to-bottom (pop) order — the coordinator's
+                // explicit "the two paths must not end up disagreeing"
+                // direction.
+                if ((rbn == "Stack" || rbn == "OwningStack") && recvTy &&
+                        !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+                    llvm::Value* arr = lowerExpr(*ma->target);
+                    if (arr && arr->getType()->isPointerTy()) {
+                        llvm::Value* iter = wrapStackAsIEnumerator(arr, recvTy);
+                        if (iter && iter->getType()->isPointerTy()) {
+                            llvm::Value* vt =
+                                builder_.CreateLoad(ptrTy(), iter);
+                            llvm::Value* geSlot = builder_.CreateGEP(
+                                ptrTy(), vt, {builder_.getInt32(4)});
+                            llvm::Value* geFn =
+                                builder_.CreateLoad(ptrTy(), geSlot);
+                            auto* geTy = llvm::FunctionType::get(
+                                ptrTy(), {ptrTy()}, false);
+                            llvm::Value* en = builder_.CreateCall(
+                                geTy, geFn, {iter}, "stk.getenum");
                             llvm::Value* iterVt =
                                 builder_.CreateLoad(ptrTy(), iter);
                             llvm::Value* dSlot = builder_.CreateGEP(

@@ -4881,7 +4881,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // OwningArray<T> through IEnumerable<T> is borrowing (§4.3:
                     // shared read-only interfaces yield borrows), so Current is
                     // non-destructive here.
-                    if ((colName == "Array" || colName == "OwningArray") &&
+                    //
+                    // #2471 (stdlib §4.11; language spec §29.1): Stack<T>/
+                    // OwningStack<T>/Queue<T>/OwningQueue<T> join this block —
+                    // the explicit `.GetEnumerator()` call form was previously
+                    // NON-FUNCTIONAL for all four (confirmed live: MoveNext()
+                    // immediately false, no diagnostic either way), unlike the
+                    // `for x in coll do` desugaring (a completely separate
+                    // codegen path, LlvmBackend_Stmts.cpp's isCollectionTypeName
+                    // dispatch, unaffected by this typing gap). Codegen
+                    // (LlvmBackend_Calls2.cpp) dispatches Queue/OwningQueue
+                    // through the SAME forward-order machinery Array/OwningArray
+                    // already use (front-to-back dequeue order coincides with
+                    // physical/forward order, #2472's own finding) and
+                    // Stack/OwningStack through a NEW reverse-order machinery
+                    // (`ensureStackEnumMachinery`) so its element order agrees
+                    // with #2472's now-fixed for-loop pop order, per the
+                    // coordinator's explicit "the two paths must not end up
+                    // disagreeing" direction.
+                    if ((colName == "Array" || colName == "OwningArray" ||
+                         colName == "Stack" || colName == "OwningStack" ||
+                         colName == "Queue" || colName == "OwningQueue") &&
                         m == "GetEnumerator" && ce.args.empty() &&
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                         static const ast::Type* kIEnumeratorNode =

@@ -4112,6 +4112,191 @@ Emitter::ArrEnumMachinery Emitter::ensureArrayEnumMachinery(llvm::Type* elemTy) 
     return {stTy, vtGV, esz};
 }
 
+// #2471 (stdlib §4.11 "Iteration order" v0.195; language spec §29.1,
+// agreeing with #2472's for-loop fix, LlvmBackend_Stmts.cpp): the
+// REVERSE-order twin of ensureArrayEnumMachinery, for Stack<T>/
+// OwningStack<T>'s explicit `.GetEnumerator()` call. Mirrors that
+// function's structure field-for-field (see its own comments for the
+// Dispose/Current rationale, unchanged here) with three differences, all
+// driven by the direction reversal:
+//   1. A distinct struct/function name prefix ("stackenum."/
+//      "bz$stackenum$..." vs "arrenum."/"bz$arrenum$...") so this cache
+//      never collides with or is mistaken for the forward machinery.
+//   2. MoveNext counts DOWN (`idx--; return idx >= 0`) instead of up —
+//      §4.11's "a stack top-to-bottom (pop order)" contract, matching the
+//      SAME physical index Pop() itself reads (LlvmBackend_Calls.cpp
+//      ~4566-4588, `m == "Pop"`: `len - 1`).
+//   3. The "before-first" (top) sentinel is `bz_array_len(arr)` — a RUNTIME
+//      value that must be (re-)fetched, not the forward machinery's fixed
+//      `-1` constant — computed once here at wrap time and again inside the
+//      GetEnumerator (clone) function below, so a clone always starts from
+//      the collection's CURRENT length rather than one captured earlier.
+Emitter::ArrEnumMachinery Emitter::ensureStackEnumMachinery(llvm::Type* elemTy) {
+    int64_t esz = 8;
+    if (elemTy->isIntegerTy(32) || elemTy->isFloatTy()) esz = 4;
+    else if (elemTy->isIntegerTy(1) || elemTy->isIntegerTy(8)) esz = 1;
+    else if (elemTy->isIntegerTy(16)) esz = 2;
+    else if (elemTy->isStructTy())
+        esz = (int64_t)module_->getDataLayout().getTypeAllocSize(elemTy);
+    else esz = 8;
+
+    std::string elemName = elemTy->isIntegerTy() ?
+        ("i" + std::to_string(elemTy->getIntegerBitWidth())) :
+        (elemTy->isPointerTy() ? "ptr" : "f");
+    std::string stName = "stackenum." + elemName;
+    auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
+    if (!stTy) {
+        stTy = llvm::StructType::create(llvm_,
+            {ptrTy(), ptrTy(), i64(), i64()}, stName);
+    }
+
+    std::string prefix = "bz$stackenum$" + elemName + "$";
+    auto getOrCreate = [&](const std::string& name, llvm::FunctionType* ft,
+                           std::function<void(llvm::Function*)> fill)
+        -> llvm::Function* {
+        if (auto* f = module_->getFunction(name)) return f;
+        auto* f = llvm::Function::Create(ft, llvm::Function::InternalLinkage,
+                                         name, module_.get());
+        fill(f);
+        return f;
+    };
+
+    // Dispose: free(self) — identical to the forward machinery's.
+    auto* dispFn = getOrCreate(prefix + "Dispose",
+        llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            auto* freeFn2 = module_->getOrInsertFunction(
+                "free", llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
+            b.CreateCall(llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+                freeFn2, {f->arg_begin()});
+            b.CreateRetVoid();
+        });
+
+    // MoveNext: e->idx--; return idx >= 0.
+    auto* mnFn = getOrCreate(prefix + "MoveNext",
+        llvm::FunctionType::get(i1(), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* idxF = b.CreateStructGEP(stTy, self, 2);
+            llvm::Value* idx = b.CreateLoad(i64(), idxF);
+            llvm::Value* next =
+                b.CreateSub(idx, llvm::ConstantInt::get(i64(), 1));
+            b.CreateStore(next, idxF);
+            b.CreateRet(
+                b.CreateICmpSGE(next, llvm::ConstantInt::get(i64(), 0)));
+        });
+
+    // Current: load element at idx and return by value — identical to the
+    // forward machinery's (direction affects only which idx MoveNext leaves
+    // behind; Current always just reads whatever idx currently holds).
+    auto* curFn = getOrCreate(prefix + "Current",
+        llvm::FunctionType::get(elemTy, {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            llvm::Value* arrF = b.CreateStructGEP(stTy, self, 1);
+            llvm::Value* arrPtr = b.CreateLoad(ptrTy(), arrF);
+            llvm::Value* idxF = b.CreateStructGEP(stTy, self, 2);
+            llvm::Value* idx = b.CreateLoad(i64(), idxF);
+            auto* ptrAtFT = llvm::FunctionType::get(
+                ptrTy(), {ptrTy(), i64(), i64()}, false);
+            auto* ptrAtFn =
+                module_->getOrInsertFunction("bz_array_ptr_at", ptrAtFT)
+                    .getCallee();
+            llvm::Value* ep = b.CreateCall(ptrAtFT, ptrAtFn,
+                {arrPtr, idx, llvm::ConstantInt::get(i64(), esz)});
+            b.CreateRet(b.CreateLoad(elemTy, ep));
+        });
+
+    // GetEnumerator(self) → a FRESH independent enumerator over the same
+    // array, positioned before the first (top) element — idx =
+    // bz_array_len(arr), re-fetched fresh in THIS clone (not copied from
+    // `self`'s idx field, which may already be partway through its own
+    // walk) so a second `for`/manual walk over the same source replays the
+    // CURRENT top-to-bottom order from the top, per §29.11.
+    auto* geFn = getOrCreate(prefix + "GetEnumerator",
+        llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+        [&](llvm::Function* f) {
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", f);
+            llvm::IRBuilder<> b(bb);
+            llvm::Value* self = f->arg_begin();
+            uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
+            auto* callocFT =
+                llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+            auto* callocC =
+                module_->getOrInsertFunction("calloc", callocFT).getCallee();
+            llvm::Value* clone = b.CreateCall(callocFT, callocC,
+                {llvm::ConstantInt::get(i64(), 1),
+                 llvm::ConstantInt::get(i64(), (int64_t)cloneSz)});
+            llvm::Value* vt =
+                b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 0));
+            b.CreateStore(vt, b.CreateStructGEP(stTy, clone, 0));
+            llvm::Value* arrCp =
+                b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
+            b.CreateStore(arrCp, b.CreateStructGEP(stTy, clone, 1));
+            llvm::Value* eszCp =
+                b.CreateLoad(i64(), b.CreateStructGEP(stTy, self, 3));
+            b.CreateStore(eszCp, b.CreateStructGEP(stTy, clone, 3));
+            auto* lenFT = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+            auto* lenFn2 =
+                module_->getOrInsertFunction("bz_array_len", lenFT)
+                    .getCallee();
+            llvm::Value* len = b.CreateCall(lenFT, lenFn2, {arrCp});
+            b.CreateStore(len, b.CreateStructGEP(stTy, clone, 2));
+            b.CreateRet(clone);
+        });
+
+    // Build the vtable (same 5-slot §29.11 layout as the forward machinery).
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getGlobalVariable(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()),
+            dispFn, mnFn, curFn, geFn
+        };
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
+    return {stTy, vtGV, esz};
+}
+
+// #2471: build the initial (before-first / top) reverse enumerator struct
+// over `arr`, mirroring wrapArrayAsIEnumerable's shape exactly (see its own
+// comment) except the idx field is `bz_array_len(arr)` — a runtime value —
+// rather than a fixed `-1`.
+llvm::Value* Emitter::wrapStackAsIEnumerator(llvm::Value* arr,
+                                             const sema::TypeRef* iEnumTy) {
+    llvm::Type* elemTy = i32();
+    if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
+        elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
+    ArrEnumMachinery m = ensureStackEnumMachinery(elemTy);
+    llvm::StructType* stTy = m.stTy;
+    uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
+    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+    llvm::Value* en = builder_.CreateCall(callocFn2,
+        {builder_.getInt64(1), builder_.getInt64(stSz)}, "stkenum");
+    builder_.CreateStore(m.vtGV, builder_.CreateStructGEP(stTy, en, 0));
+    builder_.CreateStore(arr, builder_.CreateStructGEP(stTy, en, 1));
+    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+    llvm::Value* len = builder_.CreateCall(lenFn, {arr});
+    builder_.CreateStore(len, builder_.CreateStructGEP(stTy, en, 2));
+    builder_.CreateStore(builder_.getInt64(m.esz),
+        builder_.CreateStructGEP(stTy, en, 3));
+    return en;
+}
+
 // §29 / §12.9 (#1850): a factory `ptr F(ptr backing)` wrapping a bz_array_t*
 // `backing` (whose static type is `storedTy`) as the covariant view `viewTy`.
 //
