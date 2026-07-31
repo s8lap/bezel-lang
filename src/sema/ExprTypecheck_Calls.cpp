@@ -2,6 +2,7 @@
 
 #include <algorithm>  // std::find (isCaptureFreeEntry's static-modifier check)
 
+#include "common/BuiltinRegistry.hpp"  // isArrayBackedCollectionName/isDictionaryName/isLinkedListName (#2465)
 #include "common/OwnershipFacts.hpp"  // isBorrowBearingRecordOrSpan (§30.1, #1595)
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation (shared with Resolver)
 #include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
@@ -11983,6 +11984,45 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     !recvTy->declaration && recvTy->astNode &&
                     recvTy->astNode->name &&
                     recvTy->astNode->name->parts.size() == 1) {
+                    // #2465 (§14.1/§14.2, mirrors #1078's identical scan,
+                    // ExprTypecheck_Calls.cpp ~2889): confirm the receiver
+                    // is a GENUINELY-DECLARED generic type parameter of the
+                    // enclosing method/class, not merely shaped like one.
+                    // Before this fix, this block matched ANY declaration-
+                    // less Named type with a single-part synthetic name --
+                    // every builtin collection sentinel (Stack<T>,
+                    // Dictionary<K,V>, Set<T>, ...) has exactly that shape
+                    // too, and this block silently pre-typed
+                    // ToString/GetHashCode/Equals/CompareTo/GetType for all
+                    // of them with no real implementation behind most of
+                    // them (confirmed live: `Stack<int>.ToString()` compiled
+                    // clean and segfaulted on use; `.Equals(itself)`
+                    // silently returned false) -- the same false-match
+                    // shape #2433 was retracted for. Narrowing to a
+                    // genuine type parameter here does NOT touch #590's
+                    // deliberate codegen-deferred (genericSubstSemaTy_)
+                    // per-instantiation resolution: this scan only decides
+                    // whether THIS block fires; a genuine type parameter
+                    // still reaches it and is typed exactly as before.
+                    std::string_view paramName = recvTy->headName();
+                    bool isDeclaredParam = false;
+                    if (currentMethodDecl_) {
+                        for (const auto& gp : currentMethodDecl_->genericParams)
+                            if (gp.name == paramName) {
+                                isDeclaredParam = true; break;
+                            }
+                    }
+                    if (!isDeclaredParam && currentType_ &&
+                            currentType_->decl) {
+                        if (auto* td = dynamic_cast<const ast::TypeDecl*>(
+                                currentType_->decl)) {
+                            for (const auto& gp : td->genericParams)
+                                if (gp.name == paramName) {
+                                    isDeclaredParam = true; break;
+                                }
+                        }
+                    }
+                if (isDeclaredParam) {
                     // Bare type-parameter receiver (T, TKey, TValue, …).
                     const auto& mbr = ma.member;
                     if (mbr == "ToString")
@@ -12012,6 +12052,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ctx_.setExprType(&ma, typeTy);
                     }
                 }
+            }
             }
         }
         // §26.5: a user extension on a PRIMITIVE/builtin receiver (e.g.
@@ -12237,6 +12278,109 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                     "`GetHashCode`/`GetType` (\xC2\xA7""8.1) "
                                     "(language spec \xC2\xA7""31.4, v0.235; "
                                     "stdlib \xC2\xA7""2.17)");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        // #2465 (§8.1, follow-up to narrowing the #605 block above to
+        // genuine type parameters): the universal Object members
+        // (ToString/Equals/GetHashCode/CompareTo/GetType) on the OTHER
+        // bz_array_t*/bz_dict_t*/bz_llist_t*-backed builtin collections --
+        // Stack<T>, Queue<T>, Set<T>, LinkedList<T>, Dictionary<K,V>
+        // itself, SortedSet/SortedDictionary, OwningBuffer<T>, ... -- none
+        // of which has its own audited block yet (#2457's remaining
+        // slices). Before #605 was narrowed, its over-broad guard silently
+        // (and WRONGLY) typed these five names for ANY such receiver,
+        // which mostly hid two symptoms: a silently wrong VALUE (confirmed
+        // live: `Stack<int>.Equals(itself)` returned `false`) and, for
+        // `IEnumerator<T>`/`DictionaryEntry<K,V>` specifically, a codegen
+        // misrouting CRASH (#2458). Narrowing #605 alone (this fix's
+        // primary change) removes that fabricated typing but does NOT
+        // replace it with anything -- and empirically (not just in theory)
+        // that is UNSAFE on its own for this receiver family: `var eq :=
+        // stack.Equals(stack); if eq then ... end;` now IR-verification-
+        // crashes the compiler itself ("Branch condition is not 'i1'
+        // type!"), because `eq`'s inferred local slot silently falls back
+        // to the untyped default (`i32`) while codegen's OWN, separate
+        // Equals/GetHashCode dispatch (unrelated to sema typing) still
+        // computes and stores a real `i1`/`i32` result through a different
+        // path -- the exact "IR verification failure" #605's own original
+        // comment describes, just reintroduced for a wider receiver set
+        // than the one #605 was written for.
+        //
+        // SCOPE, precisely: `isArrayBackedCollectionName`/`isDictionaryName`/
+        // `isLinkedListName` (common/BuiltinRegistry.hpp) -- the SAME
+        // canonical, already-vetted registries codegen itself uses for
+        // `isCollectionTypeName`/`isDictTypeName`/`isLinkedListTypeName` --
+        // minus `Array`/`OwningArray` (already implemented, #2457 slice 1).
+        // A first draft of this block used a general `kind==Named &&
+        // !declaration` structural test (mirroring #2444/#2457/#2459's own
+        // shape) instead of this precise registry membership check, and it
+        // was WRONG: it also matched `ReadOnlyStringSpan` (a real,
+        // genuinely-implemented, tested `ToString()` -- `"hello
+        // world".AsSpan(6,5).ToString()` returns `"world"`,
+        // string_span_883_test.cpp) and `IEnumerator<T>`/`Array<T>`
+        // themselves (whose Equals/GetHashCode/ToString this session
+        // already implemented directly in codegen -- LlvmBackend_Calls2.cpp
+        // -- WITHOUT ever setting `ma`'s sema exprType, the same
+        // deliberate "resolved structurally, independent of sema typing"
+        // shape as #2423's TypeInitializationException.InnerException
+        // exemption). `!ctx_.exprType(ma)` is NOT a reliable signal for
+        // "nothing implements this" -- it is also the signature of "codegen
+        // implements this by receiver-name matching and never needed sema
+        // to type it," which this fix's OWN earlier work in this same
+        // session did for four separate categories. Caught by running the
+        // broad `span`/`array_`/`iter_` filters (not just `stack`/`queue`)
+        // before landing -- exactly the class of false reject this
+        // session's own #2457-slice-1 report flagged as the standing risk.
+        // A true bogus member name (not one of these five) was already
+        // safe either way (nothing computes or stores a value for it, so
+        // an untouched i32 alloca never trips the verifier) -- confirmed
+        // live before writing this block, so the reject below stays scoped
+        // to just these five names, not a general "no member" catch-all
+        // (that is #2457's per-type-audited job, one slice at a time).
+        //
+        // A COMPILE ERROR is categorically safer than an IR verification
+        // crash (a compiler-internal failure mode, not a diagnosed user-
+        // facing error) or a silently wrong value, so this rejects with the
+        // same "declared via Object but not yet implemented for this
+        // receiver" wording #2459 already established, tracked under
+        // #2457 (the open per-type-slice issue for the rest of this
+        // family) rather than claiming these members do not exist at all.
+        // A genuine type parameter is UNAFFECTED: it is typed by the
+        // narrowed #605 block above and returns before reaching here.
+        if (ma.target && !ctx_.exprType(ma)) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty()) {
+                    std::string_view cn = tt->headName();
+                    bool isAuditedElsewhere =
+                        cn == "Array" || cn == "OwningArray";
+                    bool isRegisteredCollection =
+                        !isAuditedElsewhere &&
+                        (common::isArrayBackedCollectionName(cn) ||
+                         common::isDictionaryName(cn) ||
+                         common::isLinkedListName(cn));
+                    if (isRegisteredCollection) {
+                        const auto& mbr = ma.member;
+                        bool isAffectedMember =
+                            mbr == "ToString" || mbr == "GetHashCode" ||
+                            mbr == "Equals"   || mbr == "CompareTo";
+                        if (isAffectedMember) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("member `") + std::string(mbr) +
+                                    "` on `" + std::string(cn) +
+                                    "` is declared via the universal Object "
+                                    "contract (language spec \xC2\xA7""8.1) but "
+                                    "is not yet implemented by this compiler "
+                                    "for this receiver (tracked #2457)");
                             return;
                         }
                     }
