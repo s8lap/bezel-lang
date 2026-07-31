@@ -3135,14 +3135,26 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     // fix #2378 / §9.8 / §28.3/§28.9: a dedicated scope guarding already-
     // populated owned-class/string component slots against a LATER field's
     // read throwing. Pushed here (before any field is read); each class- or
-    // string-typed component's slot is registered into it, once, up front
-    // (self-nulled by the two manual "dispose already-filled slots" loops
-    // below on the two paths they already cover — see their own comments —
-    // so this scope's later sweep of the same slot there is a safe no-op);
-    // popped WITHOUT disposal once construction begins (below, after the
+    // string-typed component's slot is registered into it, once, up front.
+    // Popped WITHOUT disposal once construction begins (below, after the
     // missing-required-field check), since by then every slot's value is
     // either about to be consumed into the constructed object or the
     // function has already unwound past this point entirely.
+    //
+    // fix #2460 (v0.235): this scope is now the SOLE disposal mechanism for
+    // every throw site inside this function (the truncated-field-name errBB
+    // block and the missing-required-field block, both below, used to walk
+    // `comps`/`slots` a second and third time with their OWN manual dispose
+    // loops immediately before their throw — removed; see their own comments
+    // for why duplicating this scope's classification there, slightly
+    // differently each time, produced a real heap-use-after-free on a
+    // graph-mode back-edge slot). Every throw in this function goes through
+    // `emitThrowBuiltin`, which unconditionally calls `emitUnwindDisposals()`
+    // and sweeps this scope (it is armed unconditionally, before any field is
+    // read, regardless of which specific throw site fires later) — so one
+    // correctly-classified registration, not three independently-maintained
+    // copies of the same classification, is what disposes every
+    // already-populated slot on every path out of this loop.
     //
     // Without this: a component slot populated by an EARLIER successful
     // field read (e.g. `First: string` read before `Second: owned Leaf`)
@@ -3284,7 +3296,43 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     // WITHOUT a pending exception (reached only for the OOM allocation-failure
     // paths inside bz_binder_read_bz_string, which still return null silently
     // — a truncation-caused null is now caught by emitPendingCheck() above).
-    // Dispose any already-allocated owned-class slots, raise SerializationException.
+    // Raise SerializationException; already-filled slots are disposed by
+    // emitThrowBuiltin's own emitUnwindDisposals() call, which sweeps the
+    // component-disposal scope pushed near the top of this function.
+    //
+    // fix #2460 / §9.8 / §28.3/§28.9/§28.13 (v0.235): this block used to walk
+    // `comps`/`slots` itself and manually dispose+null every non-null class/
+    // string slot BEFORE the throw, so the (#2378-introduced) disposal-scope
+    // sweep inside emitThrowBuiltin would see null and safely no-op. That
+    // manual walk classified a slot as disposable by `ty->kind == Named &&
+    // ty->declaration && Class` alone — true for a genuinely owned class
+    // component AND for a graph-mode plain-borrow BACK-EDGE component (e.g.
+    // `Alias: Slot?`), whose resolved type is a real class TypeSymbol just
+    // like an owned field's. Unlike `Shared<T>`/`Weak<T>` (no `declaration`,
+    // correctly skipped by this same check, if left un-disposed — a leak, not
+    // a crash), a back-edge slot holds a BORROWED pointer to an object an
+    // EARLIER owned/Shared component already registered as ITS OWN slot. This
+    // walk did not exclude it, so disposing both `Target` (owned) and `Alias`
+    // (its back-edge alias, the SAME pointer) double-freed the object —
+    // empirically confirmed as a heap-use-after-free (#2460).
+    //
+    // The fix is not a third exclusion check bolted onto this walk: #2397
+    // (a few dozen lines above, the disposeStack_ scope pushed near the top
+    // of this function) already built the CORRECT per-component dispatch —
+    // Shared<C> -> bz_shared_release, owned Weak<C> -> bz_weak_release,
+    // back-edge -> no disposal (owns nothing), owned-class/string -> the
+    // same mechanisms this walk used — and registers it UNCONDITIONALLY,
+    // before ANY field is read, so it is already armed here regardless of
+    // which slots happen to be populated when this specific throw fires.
+    // Since `emitThrowBuiltin` unconditionally calls `emitUnwindDisposals()`,
+    // that scope's sweep is FULLY SUFFICIENT for this throw site — a second,
+    // manual walk duplicating the same classification (and getting it wrong
+    // for back-edges) added risk without adding coverage. Deleted rather than
+    // patched: three near-identical dispose loops in one function (this one,
+    // the missing-required-field one below, and #2397's own registration) is
+    // the shape that let the back-edge exclusion drift out of sync in the
+    // first place; collapsing to the ONE already-fixed, already-tested
+    // mechanism is the fix, not a fourth parallel patch.
     {
         llvm::Value* isNull = builder_.CreateICmpEQ(
             namePtr, llvm::ConstantPointerNull::get(ptrTy()), "cdeser.nfname");
@@ -3293,58 +3341,10 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         builder_.CreateCondBr(isNull, errBB, contBB);
 
         builder_.SetInsertPoint(errBB);
-        // Dispose already-filled slots (prevent leaks on truncated-input path).
-        // §28.3/§28.5: owned class ptrs must be disposed; §4.6 string ptrs must
-        // be released (bz_string_release); other value types need no cleanup.
-        auto* voidTy2 = llvm::Type::getVoidTy(llvm_);
-        for (std::size_t ci2 = 0; ci2 < comps.size(); ++ci2) {
-            if (comps[ci2].isSkip || !slots[ci2]) continue;
-            if (!comps[ci2].ty) continue;
-            const auto* ty2 = comps[ci2].ty;
-            // Owned class: Dispose + free.
-            if (ty2->kind == sema::TypeRef::Kind::Named) {
-                const TypeSymbol* cTs = ty2->declaration;
-                if (!cTs || cTs->kind != ast::TypeDeclKind::Class) continue;
-                llvm::Value* p = builder_.CreateLoad(ptrTy(), slots[ci2], "cdeser.pslot");
-                llvm::Value* nonNull = builder_.CreateICmpNE(
-                    p, llvm::ConstantPointerNull::get(ptrTy()), "cdeser.pnn");
-                auto* dispBB    = llvm::BasicBlock::Create(llvm_, "cdeser.disp",  currentFn_);
-                auto* skipBB2   = llvm::BasicBlock::Create(llvm_, "cdeser.skipt", currentFn_);
-                builder_.CreateCondBr(nonNull, dispBB, skipBB2);
-                builder_.SetInsertPoint(dispBB);
-                emitDisposeAndReclaim(p);
-                // fix #2378: null the slot after this manual dispose so the
-                // component-disposal scope's own sweep (emitThrowBuiltin below
-                // calls emitUnwindDisposals, which now also covers this slot —
-                // see the scope pushed near the top of this function) sees null
-                // and safely no-ops instead of double-disposing the same object.
-                builder_.CreateStore(
-                    llvm::ConstantPointerNull::get(ptrTy()), slots[ci2]);
-                builder_.CreateBr(skipBB2);
-                builder_.SetInsertPoint(skipBB2);
-                continue;
-            }
-            // String: bz_string_release (null-safe per runtime implementation).
-            if (ty2->kind == sema::TypeRef::Kind::Primitive &&
-                ty2->primitive == sema::PrimitiveType::String) {
-                llvm::Value* sp = builder_.CreateLoad(ptrTy(), slots[ci2], "cdeser.sslot");
-                llvm::Value* nonNull = builder_.CreateICmpNE(
-                    sp, llvm::ConstantPointerNull::get(ptrTy()), "cdeser.snn");
-                auto* relBB  = llvm::BasicBlock::Create(llvm_, "cdeser.srel",  currentFn_);
-                auto* skipBB2 = llvm::BasicBlock::Create(llvm_, "cdeser.sskip", currentFn_);
-                builder_.CreateCondBr(nonNull, relBB, skipBB2);
-                builder_.SetInsertPoint(relBB);
-                auto* relFn2 = declareC("bz_string_release", voidTy2, {ptrTy()});
-                builder_.CreateCall(relFn2, {sp});
-                // fix #2378 — see the class-slot null-out above.
-                builder_.CreateStore(
-                    llvm::ConstantPointerNull::get(ptrTy()), slots[ci2]);
-                builder_.CreateBr(skipBB2);
-                builder_.SetInsertPoint(skipBB2);
-                continue;
-            }
-        }
-        // Raise SerializationException (sets bz_exc, unwinds, branches to unwindBB).
+        // Raise SerializationException (sets bz_exc, unwinds, branches to
+        // unwindBB — emitUnwindDisposals() along the way disposes every
+        // already-filled component slot correctly, per the #2397/#2460
+        // scope above).
         emitThrowBuiltin("SerializationException");
         // emitThrowBuiltin branches to unwindBB; add unreachable as fallback.
         if (!builder_.GetInsertBlock()->getTerminator())
@@ -3781,31 +3781,20 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         auto* okBB   = llvm::BasicBlock::Create(llvm_, "cdeser.ok",   currentFn_);
         builder_.CreateCondBr(notSeen, missBB, okBB);
         builder_.SetInsertPoint(missBB);
-        // Dispose already-read owned-class slots to avoid leaks (§28.3/§28.5).
-        for (std::size_t ci2 = 0; ci2 < comps.size(); ++ci2) {
-            if (comps[ci2].isSkip || !slots[ci2]) continue;
-            if (!comps[ci2].ty) continue;
-            bool isClassSlot =
-                comps[ci2].ty->kind == sema::TypeRef::Kind::Named &&
-                comps[ci2].ty->declaration &&
-                comps[ci2].ty->declaration->kind == ast::TypeDeclKind::Class;
-            if (!isClassSlot) continue;
-            llvm::Value* p = builder_.CreateLoad(ptrTy(), slots[ci2], "cdeser.mslot");
-            llvm::Value* nonNull = builder_.CreateICmpNE(
-                p, llvm::ConstantPointerNull::get(ptrTy()), "cdeser.mnn");
-            auto* dispBB2 = llvm::BasicBlock::Create(llvm_, "cdeser.mdisp", currentFn_);
-            auto* skipBB3 = llvm::BasicBlock::Create(llvm_, "cdeser.mskip", currentFn_);
-            builder_.CreateCondBr(nonNull, dispBB2, skipBB3);
-            builder_.SetInsertPoint(dispBB2);
-            emitDisposeAndReclaim(p);
-            // fix #2378 — see the errBB class-slot null-out above: prevent the
-            // component-disposal scope's own sweep (below, this same
-            // emitThrowBuiltin call) from double-disposing this slot.
-            builder_.CreateStore(
-                llvm::ConstantPointerNull::get(ptrTy()), slots[ci2]);
-            builder_.CreateBr(skipBB3);
-            builder_.SetInsertPoint(skipBB3);
-        }
+        // fix #2460 / §9.8 / §28.3/§28.9/§28.13 (v0.235): this block used to
+        // walk `comps`/`slots` itself and manually dispose+null every
+        // non-null class-typed slot before the throw — see the errBB block
+        // above (a few dozen lines up in this same function) for the full
+        // account of why that classification (`ty->kind == Named &&
+        // ty->declaration && Class`, with no `comp.isBackEdge` exclusion)
+        // double-freed a graph-mode back-edge slot alongside the owned
+        // object it borrows (confirmed heap-use-after-free, #2460). Deleted
+        // for the same reason: emitThrowBuiltin's own emitUnwindDisposals()
+        // call already sweeps the #2397 component-disposal scope pushed near
+        // the top of this function, which classifies every component shape
+        // correctly (including excluding back-edges) and is armed
+        // unconditionally before this check ever runs — a second, separately
+        // maintained walk here added risk without adding coverage.
         emitThrowBuiltin("SerializationException");
         if (!builder_.GetInsertBlock()->getTerminator())
             builder_.CreateUnreachable();
