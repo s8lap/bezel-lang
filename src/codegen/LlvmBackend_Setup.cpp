@@ -12609,6 +12609,80 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // #2475 / §4.6 / §14.1 / §28.9: `val.ToString()` where `val`'s SEMA type is
+    // a bare, unconstrained generic type parameter `T` (Named, no declaration —
+    // the numeric-ToString block above never matches it, since `tt->kind` is
+    // `Named`, not `Primitive`, regardless of what T is concretely bound to).
+    // At codegen, the active monomorphization (`genericSubstSemaTy_`) resolves
+    // T to a concrete type whose ToString call (LlvmBackend_Calls2.cpp: #903's
+    // `emitPrimitiveToString` redirect for a value-primitive T, or #2469's
+    // `emitRecordToString` redirect for a Record T) mints a fresh rc=1 heap
+    // string — the SAME shape as the numeric-ToString block above, just
+    // reached through one extra layer of indirection this recognizer could not
+    // see through. Without this, `return val.ToString();` (or `var s :=
+    // val.ToString();`) treated the result as a BORROW and retained it, never
+    // dropping the producer's original +1 — a bounded per-call leak (LSan-
+    // confirmed: 34 bytes for T=int, 47 bytes for T=a positional record,
+    // isolated by elimination to exactly this shape — a string LITERAL return,
+    // a `+`-concatenation return, and ToString on a concrete-typed LOCAL
+    // inside the same generic body all correctly avoided the extra retain
+    // already, via the recognizers above/below; only the bare-T RECEIVER
+    // shape was unrecognized).
+    //
+    // Scoped to exactly the concrete-type kinds #903/#2469 mint a fresh rc=1
+    // string for: a value primitive (mirrors the switch above verbatim) and a
+    // Record (positional or body-form — `emitRecordToString` is the same
+    // function for both, and mints exactly one final rc=1 accumulator
+    // regardless of field-declaration style, confirmed by tracing its field
+    // loop, LlvmBackend_String.cpp). Enum is DELIBERATELY excluded: its
+    // ToString is a compile-time string LITERAL (the type's qualified name,
+    // §8.5) — an immortal sentinel, not a heap allocation — confirmed
+    // empirically to NOT leak either way (retaining a sentinel and releasing
+    // it once is a no-op, so recognizing it here would change nothing;
+    // omitted rather than adding an untested branch). Class/Interface/Choice
+    // are excluded too: Class/Interface substitution dispatches through
+    // `lowerObjectToString`, which "may or may not allocate" (the SAME
+    // conservative exclusion the Object.ToString() comment above already
+    // documents for the non-generic case); Choice has no ToString codegen at
+    // all yet (#2479) and is rejected at compile time before this could ever
+    // matter.
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->args.empty() && call->callee && !genericSubstSemaTy_.empty()) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->member == "ToString" && ma->target) {
+                    auto* tt = ctx_.exprType(*ma->target);
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                        !tt->declaration && tt->astNode && tt->astNode->name &&
+                        tt->astNode->name->parts.size() == 1) {
+                        auto sit = genericSubstSemaTy_.find(tt->headName());
+                        if (sit != genericSubstSemaTy_.end() && sit->second) {
+                            const sema::TypeRef* concrete = sit->second;
+                            using K = sema::TypeRef::Kind;
+                            using P = sema::PrimitiveType;
+                            if (concrete->kind == K::Primitive) {
+                                switch (concrete->primitive) {
+                                    case P::Int: case P::Long: case P::Short:
+                                    case P::Byte: case P::SByte: case P::UInt:
+                                    case P::ULong: case P::UShort:
+                                    case P::Float: case P::Double:
+                                    case P::Decimal: case P::Char:
+                                        return true;
+                                    default:
+                                        break;
+                                }
+                            } else if (concrete->kind == K::Named &&
+                                       concrete->declaration &&
+                                       concrete->declaration->kind ==
+                                           ast::TypeDeclKind::Record) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     // #1982 / stdlib §2.6 / §4.6 / §28.9: the no-arg `guid.ToString()` is a BUILTIN
     // lowered in lowerCall's Guid block (LlvmBackend_Calls.cpp) to bz_guid_to_string,
     // which mints a fresh heap `bz.string` at rc := 1 (BZ_GUID_STRING_RC_INIT) —
