@@ -533,7 +533,26 @@ void Resolver::checkEnumRestrictions() {
                 continue;
             }
             if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
-                if (ps->isIndexer) bad("an indexer");
+                if (ps->isIndexer) { bad("an indexer"); continue; }
+                // fix #2499 (§10.5): "Block-form properties or properties
+                // with backing storage" are forbidden on an enum. §10.4
+                // permits only the expression-bodied READ-ONLY form
+                // (`public property Name: string => …;` — grammar A.4's
+                // `ExpressionPropertyDecl`; the "=>" production is
+                // inherently read-only, no setter form exists for it, so
+                // PropertyBodyKind::Expression is always the legal §10.4
+                // shape and never needs a settability check here). Any
+                // other body kind is rejected regardless of whether it
+                // declares a setter: a GETTER-ONLY block-form property
+                // (`get => 7; end P;`) is still "block-form" and equally
+                // forbidden by §10.5's unqualified wording, not just a
+                // settable one.
+                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                    if (pd->bodyKind == ast::PropertyBodyKind::Block)
+                        bad("a block-form property");
+                    else if (pd->bodyKind == ast::PropertyBodyKind::Auto)
+                        bad("a property with backing storage");
+                }
                 continue;
             }
             // per §24.1 (v0.180): an event's compiler-generated `owned
