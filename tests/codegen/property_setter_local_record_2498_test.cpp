@@ -168,16 +168,33 @@ BEZEL_TEST(property_setter_local_record_2498, property_chain_class_receiver_fall
         "end C2498T4;"), 88);
 }
 
-// T5 — REGRESSION GUARD (mirrors #2489's own T12): a pre-existing, separate
-// sema gap (#2499, NOT fixed here) currently accepts a block-form settable
-// property on an ENUM in violation of §10.5. Confirmed by probe: this exact
-// shape compiles clean on origin/main with no diagnostic. Pins that this
-// fix's `isEnumReceiver` guard keeps the (already out-of-scope, already
-// silently-inert) enum setter path link-safe — the program still compiles,
-// links, and runs (the real assertion here); the getter (a fixed `get => 7`,
-// unrelated to any field) is unaffected by the SET's pre-existing no-op.
-BEZEL_TEST(property_setter_local_record_2498, enum_illegal_setter_still_links_control_10_5_2499) {
-    int r = run(
+// T5 — §10.5 (v0.236): a block-form property on an ENUM is now REJECTED.
+//
+// HISTORY, because this test's meaning inverted mid-batch and that is worth
+// recording: as originally written it was a link-safety guard. #2499 was then
+// an open sema gap that wrongly ACCEPTED this shape (§10.5 forbids "Block-form
+// properties or properties with backing storage" on an enum), so the program
+// compiled, and the guard pinned that this fix's `isEnumReceiver` check kept
+// the resulting inert setter path link-safe rather than crashing.
+//
+// #2499 landed three commits later in the same batch, from a different lane,
+// and closed that gap — so the premise this test rested on ("the sema gap
+// stays open") became false while the test still asserted `r >= 0`, and it
+// began failing. Caught by independent review of the two commits together,
+// before the gate ran.
+//
+// Repurposed rather than deleted: the shape is still worth pinning, just with
+// the opposite expectation. It now asserts the §10.5 REJECTION, which also
+// keeps a guard on #2499's own behaviour from this file's side. The
+// `isEnumReceiver` guard in this fix remains correct and still matters for any
+// enum receiver that reaches codegen by another route; it is simply no longer
+// observable through this particular program.
+BEZEL_TEST(property_setter_local_record_2498, enum_block_form_property_rejected_10_5_2499) {
+    // Assert on diagnostic TEXT, not the coarse "did not run": runAot's
+    // WIFSIGNALED path synthesizes an Error for a runtime SIGSEGV too, so a
+    // bare `!r.ran` check cannot tell a genuine rejection from a crash.
+    // Same idiom as enum_property_restrictions_2499_test.cpp's own hasError().
+    auto r = bezel::test::runAot(
         "module M; "
         "public enum EnumSetLocal2498T5 "
         "  Red, Green, Blue; "
@@ -193,7 +210,15 @@ BEZEL_TEST(property_setter_local_record_2498, enum_illegal_setter_still_links_co
         "    return e.P; "
         "  end Main; "
         "end C2498T5;");
-    BEZEL_EXPECT_TRUE(r >= 0);  // the real assertion: compiled AND linked, no crash
+    bool sawEnumBlockFormDiag = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity == bezel::Severity::Error &&
+                d.message.find("block-form property") != std::string::npos) {
+            sawEnumBlockFormDiag = true;
+            break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(sawEnumBlockFormDiag);
 }
 
 // T6 — BONUS coverage: `lowerPropertyCompound` (§22.9, `r.Name += v`) reads
