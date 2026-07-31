@@ -428,6 +428,17 @@ bool Emitter::isNullableRecordTy(const sema::TypeRef* rt) {
 }
 
 
+// fix #2447 / §35.9 / §7.2: a NULLABLE CHOICE (a nullable Named TypeRef
+// whose declaration is a choice) is a value type that lacked a null
+// representation — see the declaration comment in LlvmBackend_impl.hpp for
+// the full rationale. The choice analogue of isNullableRecordTy just above.
+bool Emitter::isNullableChoiceTy(const sema::TypeRef* rt) {
+    return rt && rt->nullable &&
+           rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+           rt->declaration->kind == ast::TypeDeclKind::Choice;
+}
+
+
 // per §2.5–§2.6 / issue #1954: is rt a NULLABLE VALUE-BUILTIN (DateTime/TimeSpan/
 // DateOnly/TimeOnly/Guid)? See the declaration comment in LlvmBackend_impl.hpp for
 // why these need the tagged-struct nullable lowering (esp. the multi-field Guid
@@ -833,9 +844,21 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 return enumLlvmType(rt->declaration);
             // §35 (v0.200, #2045): a choice lowers to a value-type struct
             // `{ i32 tag, case0_payload, case1_payload, ... }` — see
-            // choiceStruct for the layout rationale. NB: this is the
+            // choiceStruct for the layout rationale. This is the
             // non-nullable form; the nullable `C?` wraps this struct in
-            // nullableValueStructTy's `{ i8 hasValue, <choice struct> }`.
+            // nullableValueStructTy's `{ i8 hasValue, <choice struct> }` —
+            // fix #2447 / §35.9: this branch is reached ONLY for a
+            // non-nullable choice, because isNullableValueTy (consulted at
+            // the top of this function) now recognizes a nullable choice
+            // via isNullableChoiceTy and routes it through
+            // nullableValueStructTy before control ever reaches here. Before
+            // #2447, isNullableValueTy did NOT recognize choices, so a
+            // nullable choice fell through to THIS branch regardless of
+            // `rt->nullable` — returning the bare struct with no null
+            // representation, contradicting this very comment (a
+            // long-standing aspirational note that was never actually
+            // wired up) and crashing the first time downstream code tested
+            // a (non-existent) hasValue tag.
             if (rt->declaration &&
                 rt->declaration->kind == ast::TypeDeclKind::Choice) {
                 // #2047: a CONCRETE generic-choice annotation (`Result<C,
@@ -1539,6 +1562,17 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
         RecordSubstGuard guard(this, rt);
         return llvm::StructType::get(
             llvm_, {nullablePrimHasValTy(), recordStruct(rt->declaration)});
+    }
+    // fix #2447 / §35.9 / §7.2: a nullable choice's payload is the bare
+    // choice struct ({i32 tag, case0_payload, ...} — choiceStruct), so the
+    // leading hasValue tag distinguishes null from any choice value
+    // (mirroring isNullableRecordTy just above; RecordSubstGuard is reused
+    // here exactly as it is for a nullable GENERIC record — a generic
+    // choice's payload struct is likewise per-instantiation, #2047).
+    if (isNullableChoiceTy(rt)) {
+        RecordSubstGuard guard(this, rt);
+        return llvm::StructType::get(
+            llvm_, {nullablePrimHasValTy(), choiceStruct(rt->declaration)});
     }
     // per §2.5–§2.6 / issue #1954: a nullable value-builtin's payload is the
     // NON-nullable builtin's lowering (DateTime/TimeSpan → i64, DateOnly/TimeOnly →

@@ -3093,6 +3093,27 @@ private:
     // unified by isNullableValueTy below. Defined in LlvmBackend_Layout.cpp
     // (needs the record-declaration kind check, like isNullableEnumTy).
     bool isNullableRecordTy(const sema::TypeRef* rt);
+    // fix #2447 / §35.9 / §7.2: is rt a NULLABLE CHOICE (a nullable Named
+    // TypeRef whose declaration is a choice)? "`C?` is the ordinary
+    // nullable value type (§7.2)" (§35.9, "Nullable `C?`") — a choice's
+    // classification (value-like/borrow-bearing/owning, §35.4) does not
+    // change this: the WRAPPER `C?` is always the tagged {i8 hasValue; T}
+    // struct, exactly like a nullable record. Before this fix, no
+    // predicate recognized a nullable choice as a nullable value type at
+    // all — lowerTypeRef's `isNullableValueTy` gate returned false, so a
+    // `Wrap?` field fell through to the LATER Named/Choice branch, which
+    // returns the BARE (non-nullable) choiceStruct regardless of
+    // `rt->nullable`, contradicting its own comment ("the nullable `C?`
+    // wraps this struct in nullableValueStructTy's `{ i8 hasValue,
+    // <choice struct> }`") — no such wrap ever happened. This produced a
+    // choice-typed value with no null representation, which crashed
+    // (an ICmp i32-vs-i8 type-mismatch assertion) the first time code
+    // tried to test its (non-existent) hasValue tag — confirmed via
+    // serializing a record with a `Wrap?` component. This predicate is
+    // the choice analogue of isNullableRecordTy; the two are unified by
+    // isNullableValueTy below. Defined in LlvmBackend_Layout.cpp (needs
+    // the choice-declaration kind check, like isNullableRecordTy).
+    bool isNullableChoiceTy(const sema::TypeRef* rt);
     // per §2.5–§2.6 / issue #1954: is rt a NULLABLE VALUE-BUILTIN (a nullable
     // Named TypeRef naming DateTime/TimeSpan/DateOnly/TimeOnly/Guid)? These are
     // scalar/struct value types whose decl kind is Class (or declaration-less), so
@@ -3106,15 +3127,18 @@ private:
     // valueBuiltinName); the four unify under isNullableValueTy below.
     bool isNullableValueBuiltinTy(const sema::TypeRef* rt);
     // A nullable VALUE type — a value primitive (isNullablePrimTy), an enum
-    // (isNullableEnumTy), a record (isNullableRecordTy), or a value-builtin
+    // (isNullableEnumTy), a record (isNullableRecordTy), a CHOICE
+    // (isNullableChoiceTy, fix #2447), or a value-builtin
     // (isNullableValueBuiltinTy, #1954). All lower to the tagged {i8 hasValue; T
     // value} struct; the only difference is T (the primitive's LLVM type, i32 for
-    // an enum, the bare record struct, or the value-builtin's lowering — i64 for
-    // DateTime/TimeSpan, i32 for DateOnly/TimeOnly, {i64,i64} for Guid). All
-    // null/wrap/value-semantics sites key off this combined predicate.
+    // an enum, the bare record struct, the bare choice struct, or the
+    // value-builtin's lowering — i64 for DateTime/TimeSpan, i32 for
+    // DateOnly/TimeOnly, {i64,i64} for Guid). All null/wrap/value-semantics
+    // sites key off this combined predicate.
     bool isNullableValueTy(const sema::TypeRef* rt) {
         return isNullablePrimTy(rt) || isNullableEnumTy(rt) ||
-               isNullableRecordTy(rt) || isNullableValueBuiltinTy(rt);
+               isNullableRecordTy(rt) || isNullableChoiceTy(rt) ||
+               isNullableValueBuiltinTy(rt);
     }
     // The tagged struct for a nullable value type (prim, enum, or record). For
     // an enum the value slot is the underlying integer (i32 — CG44); for a record
