@@ -40,16 +40,44 @@ BEZEL_TEST(builtin_registry_snapshot, owning_collection_head_set) {
 
 // --- isOwningTypeHead (§28.3/§5.11) : owning collections + owning wrappers ---
 BEZEL_TEST(builtin_registry_snapshot, owning_type_head_set) {
-    static constexpr std::array<std::string_view, 12> kSnapshot = {
+    static constexpr std::array<std::string_view, 15> kSnapshot = {
         "OwningArray", "OwningDictionary", "OwningSet",
         "OwningStack", "OwningQueue",      "OwningLinkedList",
         "Shared",      "Weak",             "ChannelSender",
         "OwningTask",  "IOwningEnumerable", "CancellationTokenSource",
+        // INTENTIONAL addition (#2369, §28.6/§28.3 v0.221 #1787 ruling): the
+        // three remaining owning iterable-interface heads — `checkBorrowReturned
+        // ThroughOwningType` never inspected them, so a borrow returned through
+        // `IOwningEnumerator<T>`/`IOwningAsyncEnumerable<T>`/
+        // `IOwningAsyncEnumerator<T>` sailed past the §28.6 return-shape check.
+        "IOwningEnumerator", "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
     };
     for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isOwningTypeHead(n));
     for (std::string_view n : {"Array", "Dictionary", "OwningBuffer",
-                               "OwningTaskCompletionSource", "Task", ""})
+                               "OwningTaskCompletionSource", "Task",
+                               "IEnumerable", "IEnumerator",
+                               "IAsyncEnumerable", "IAsyncEnumerator", ""})
         BEZEL_EXPECT_FALSE(isOwningTypeHead(n));
+}
+
+// --- isOwningIterableInterfaceHead (§28.6/§28.3 v0.221, #1787 ruling; #2369):
+// the four consumer-disposed owning iterable-interface heads whose receiver-
+// owned-field bare-read carve-out §28.6 bullet 1 explicitly excludes. A new
+// name-set fact introduced with #2369 (no pre-refactor hand-list), pinned here
+// so an accidental add/drop is caught. ---
+BEZEL_TEST(builtin_registry_snapshot, owning_iterable_interface_head_set) {
+    static constexpr std::array<std::string_view, 4> kSnapshot = {
+        "IOwningEnumerable", "IOwningEnumerator",
+        "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isOwningIterableInterfaceHead(n));
+    // The non-owning iterable heads, the task family, and the owning
+    // collections/wrappers must stay OUT (different carve-out surfaces).
+    for (std::string_view n : {"IEnumerable", "IEnumerator",
+                               "IAsyncEnumerable", "IAsyncEnumerator",
+                               "Task", "OwningTask", "OwningArray",
+                               "Shared", "ChannelSender", ""})
+        BEZEL_EXPECT_FALSE(isOwningIterableInterfaceHead(n));
 }
 
 // --- isOwningPrefixedName : the 16 rfind("Owning",0) sites, as a prefix test ---

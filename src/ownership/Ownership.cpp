@@ -6143,7 +6143,12 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
         //
         // §28.3 (#1660 review — reachable double-free): the #1493 receiver-
         // owned-field carve-out is UNSOUND for the owning DEFERRED-ACTIVATION
-        // heads — `OwningTask<T>` and `IOwningEnumerable<T>`. These are
+        // heads — `OwningTask<T>` and the four owning iterable-interface heads
+        // (`IOwningEnumerable<T>`, `IOwningEnumerator<T>`,
+        // `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`; #2369
+        // extended the set from `IOwningEnumerable<T>` alone per the #1787
+        // ruling — §28.6 "the same method-return exclusion applies to a field
+        // typed at an owning iterable-interface head"). These are
         // consumer-disposed (producerState's name-head fallback classifies a
         // call result of these types Owned) and their disposal is NOT
         // idempotent-protected (unlike Shared/Weak/ChannelSender/
@@ -6180,7 +6185,8 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
         // for a plain-`Task` return; excluding `Task` here routes it to the borrow
         // rejection below. // per §28.3, §28.6 (v0.190)
         const bool deferredActivationOwningHead =
-            common::isTaskFamilyHead(head) || head == "IOwningEnumerable";
+            common::isTaskFamilyHead(head) ||
+            common::isOwningIterableInterfaceHead(head);
         if (!deferredActivationOwningHead && exprIsReceiverOwnedFieldBorrow(e))
             return;
         bool isBorrow = ownedArgSourceIsBorrow(e);

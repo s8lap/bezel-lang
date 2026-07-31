@@ -28,11 +28,34 @@ constexpr std::array<std::string_view, 6> kOwningCollectionHeads = {
 };
 
 // §28.3 / §5.11: the owning collections plus the owning wrappers.
-constexpr std::array<std::string_view, 12> kOwningTypeHeads = {
+// §28.6 / §28.3 (v0.221, #1787 ruling; #2369): all FOUR owning iterable-
+// interface heads (`IOwningEnumerable`, `IOwningEnumerator`,
+// `IOwningAsyncEnumerable`, `IOwningAsyncEnumerator`) are members — "the
+// owning heads take no unmarked instance/extension spelling at all", so
+// `checkBorrowReturnedThroughOwningType` must inspect a borrow returned
+// through any of the four (previously only `IOwningEnumerable` was listed,
+// letting the three sibling heads sail past the §28.6 return-shape check).
+constexpr std::array<std::string_view, 15> kOwningTypeHeads = {
     "OwningArray", "OwningDictionary", "OwningSet",
     "OwningStack", "OwningQueue",      "OwningLinkedList",
     "Shared",      "Weak",             "ChannelSender",
     "OwningTask",  "IOwningEnumerable", "CancellationTokenSource",
+    // #2369: the three remaining owning iterable-interface heads.
+    "IOwningEnumerator", "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
+};
+
+// §28.6 / §28.3 (v0.221, #1787 ruling; #2369): the OWNING iterable-interface
+// heads — the four consumer-disposed, non-idempotent deferred-activation
+// interfaces whose receiver-owned-field bare-read carve-out §28.6 bullet 1
+// EXPLICITLY excludes ("The same method-return exclusion applies to a field
+// typed at an owning iterable-interface head"). `checkBorrowReturnedThrough
+// OwningType`'s `deferredActivationOwningHead` gate (the #1660 carve-out
+// removal) consults this set; it overlaps `kIterableInterfaceHeads` (the
+// full 8-member iterator-convention family) and `kOwningTypeHeads` (these
+// four are the owning iterable subset of that owning-head set).
+constexpr std::array<std::string_view, 4> kOwningIterableInterfaceHeads = {
+    "IOwningEnumerable", "IOwningEnumerator",
+    "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
 };
 
 // §28.3 / §29.3 / §30.7 (v0.201, #2048 / proposal 0048): the iterable and
@@ -203,6 +226,16 @@ bool isTaskFamilyHead(std::string_view head) {
 // declaration-site error. // per §28.3 v0.201
 bool isIterableInterfaceHead(std::string_view head) {
     return contains(kIterableInterfaceHeads, head);
+}
+
+// §28.6 / §28.3 (v0.221, #1787 ruling; #2369): the OWNING iterable-interface
+// heads — the four consumer-disposed, non-idempotent deferred-activation
+// interfaces whose receiver-owned-field bare-read carve-out §28.6 bullet 1
+// explicitly excludes. Consulted by `checkBorrowReturnedThroughOwningType`'s
+// `deferredActivationOwningHead` gate (the #1660 carve-out removal, extended
+// to all four owning iterable heads). // per §28.6, §28.3
+bool isOwningIterableInterfaceHead(std::string_view head) {
+    return contains(kOwningIterableInterfaceHeads, head);
 }
 
 bool isArrayBackedCollectionName(std::string_view n) {

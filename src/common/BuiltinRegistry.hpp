@@ -60,6 +60,19 @@ bool isTaskFamilyHead(std::string_view head);
 // needs no `owned` marker. // per §28.3 v0.201
 bool isIterableInterfaceHead(std::string_view head);
 
+// §28.6 / §28.3 (v0.221, #1787 ruling; #2369): the OWNING iterable-interface
+// heads (`IOwningEnumerable<T>`, `IOwningEnumerator<T>`,
+// `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`) — the four
+// consumer-disposed, non-idempotent deferred-activation interfaces. §28.6
+// bullet 1 excludes these from the receiver-owned-field bare-read borrow
+// carve-out ("The same method-return exclusion applies to a field typed at an
+// owning iterable-interface head"), so `checkBorrowReturnedThroughOwningType`'s
+// `deferredActivationOwningHead` gate consults this set to reject `return
+// this._field;` typed at any of the four (the #1660 carve-out removal,
+// extended from `IOwningEnumerable` alone to all four owning iterable heads).
+// per §28.6, §28.3
+bool isOwningIterableInterfaceHead(std::string_view head);
+
 // Array-backed collections (bz_array_t*): the receiver names whose indexer /
 // .Count lower through the bz_array_* runtime.  Backs isCollectionTypeName.
 // per §4.4–§4.7 / §4.14
