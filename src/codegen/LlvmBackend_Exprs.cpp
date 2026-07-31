@@ -5703,6 +5703,55 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     llvm::Value* r = lowerExpr(*bin.right);
     if (!l || !r) return nullptr;
     const auto& op = bin.op;
+    // fix #2497 / §8.3 / §9.2 / §35.2: `this` (or `base`) inside a record/
+    // choice instance method is lowered as a POINTER to the receiver storage
+    // (CG9 — "this is the receiver ptr"; §35.2 — "this in a choice instance
+    // method is a borrow of the receiver value"; the record analog is the
+    // same receiver-ptr convention, #575/§9.5's lowerWith documents it too).
+    // When such a bare-`this` operand is compared against a same-typed
+    // by-value operand with `=`/`<>`, the `this` operand is a pointer while
+    // the other side is a struct value — the struct-equality dispatch below
+    // keys on isStructTy() and would skip it, falling through to a raw
+    // ICmpEQ over mismatched operand types (ptr vs struct) and aborting in
+    // the IR verifier (LLVM ICmpInst::AssertOK operand-type-mismatch). Load
+    // the receiver struct through the pointer so both operands are
+    // struct-typed and the record/choice auto-equality dispatch proceeds —
+    // the same load `this with {…}` already does (#575, §9.5). This block
+    // runs only for the AUTO-equality path: a user-declared `operator =`/
+    // `<>` is intercepted earlier (the `opm` block above) and never reaches
+    // here. The other operand must be a bare (non-nullable) record/choice:
+    // its lowered struct matches the receiver storage shape exactly, and a
+    // nullable value-typed operand lowers to a different {i8, T} wrapper
+    // shape than the bare receiver (sema rejects or lifts that mix before
+    // codegen, so this guard must not fire for it).
+    if (op == "=" || op == "<>") {
+        auto isThisIdent = [](const ast::Expr* e) -> bool {
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e))
+                return id->name == "this" || id->name == "base";
+            return false;
+        };
+        auto bareRecordOrChoiceStructTy = [&](const ast::Expr* other,
+                                              llvm::Value* thisVal,
+                                              llvm::Value* otherVal) -> llvm::Type* {
+            if (!other || !thisVal || !otherVal) return nullptr;
+            if (!thisVal->getType()->isPointerTy()) return nullptr;
+            llvm::Type* ot = otherVal->getType();
+            if (!ot->isStructTy()) return nullptr;
+            const sema::TypeRef* t = ctx_.exprType(*other);
+            if (!t || t->nullable) return nullptr;
+            if (t->kind != sema::TypeRef::Kind::Named || !t->declaration) return nullptr;
+            if (t->declaration->kind != ast::TypeDeclKind::Record &&
+                t->declaration->kind != ast::TypeDeclKind::Choice) return nullptr;
+            return ot;
+        };
+        if (isThisIdent(bin.left.get())) {
+            if (llvm::Type* st = bareRecordOrChoiceStructTy(bin.right.get(), l, r))
+                l = builder_.CreateLoad(st, l, "this.val");
+        } else if (isThisIdent(bin.right.get())) {
+            if (llvm::Type* st = bareRecordOrChoiceStructTy(bin.left.get(), r, l))
+                r = builder_.CreateLoad(st, r, "this.val");
+        }
+    }
     // §7.11 Lifted operators — nullable value types (int?, long?, double?,
     // bool?, …). When either operand is a nullable value type:
     //   - Arithmetic / bitwise / shift: result is T? (null when EITHER operand
