@@ -4274,6 +4274,39 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
                 elemTy = lowerTypeRef(iterTy->genericArgs[0]);
                 esz = collectionElemSize(iterTy);
             }
+            // #2472 (stdlib §4.11 "Iteration order" v0.195; language spec
+            // §29.1's protocol / §29.2's desugaring). Every array-backed
+            // collection shares this one direct-indexed-loop lowering, an
+            // elision of the GetEnumerator()/MoveNext()/Current desugaring
+            // sanctioned by language spec §29.2's "Compiler optimization"
+            // clause ONLY when "the observable behavior is identical to the
+            // desugared form" — normatively true for a forward scan (index 0
+            // upward) EXCEPT for `Stack<T>`/`OwningStack<T>`, whose stdlib
+            // §4.11 contract is "a stack top-to-bottom (pop order)", the
+            // REVERSE of physical storage order. Physical index 0 is the
+            // BOTTOM of the stack (first pushed) and index Count-1 is the TOP
+            // (most recently pushed, the same index `Pop()` itself reads —
+            // LlvmBackend_Calls.cpp ~4566-4588's `m == "Pop"` case) — a
+            // forward scan would silently visit bottom-to-top, the exact
+            // reverse of what §4.11 requires, with no diagnostic (confirmed
+            // live before this fix: `Push(1);Push(2);Push(3); for x in s ...`
+            // visited 1,2,3, not the required 3,2,1). `Queue<T>`/
+            // `OwningQueue<T>`'s required order (front-to-back / dequeue
+            // order) coincides with physical/insertion order (front = index
+            // 0, the same index `Dequeue()` reads) so it needs no special
+            // case; neither does any other member of this shared dispatch
+            // (`Array`, `Set`, `SortedSet`, `OwningBuffer`), whose stdlib
+            // sections state no take-order contract distinct from storage
+            // order. `OwningStack<T>`'s default (borrowing)
+            // `IReadOnlyCollection<T>` conformance "iterate[s] identically"
+            // per §4.11, so it shares the reversal; `Drain()`'s SEPARATE
+            // `IOwningEnumerable<T>` path (an interface-typed source, so this
+            // `isCollectionTypeName` dispatch never matches it) is untouched
+            // by this fix.
+            bool isStackFamily = iterTy && iterTy->astNode &&
+                iterTy->astNode->name && !iterTy->astNode->name->parts.empty() &&
+                (iterTy->headName() == "Stack" ||
+                 iterTy->headName() == "OwningStack");
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
             // §29.12 / #1232: capture mod epoch before the loop starts.
@@ -4283,7 +4316,16 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             builder_.CreateStore(epochVal, epochSlot);
             llvm::Value* len = builder_.CreateCall(lenFn, {arrObj});
             auto* idxSlotR = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlotR);
+            // Forward scan starts at 0 (unchanged); the Stack reversal starts
+            // at `len - 1` (top) — for an empty stack this is -1, which the
+            // `>= 0` loop condition below immediately fails, correctly
+            // running zero iterations, the same as the forward `0 < len`
+            // check does for an empty forward-scanned collection.
+            builder_.CreateStore(
+                isStackFamily
+                    ? builder_.CreateSub(len, builder_.getInt64(1))
+                    : builder_.getInt64(0),
+                idxSlotR);
             auto* varSlotR = entryAlloca(elemTy);
             locals_[&fs] = varSlotR;
             // #747 R42: spill the index + loop-var + epoch into the async frame
@@ -4308,7 +4350,10 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
                 // After emitGuardThrow the insert point is the continuation block.
             }
             llvm::Value* idxR = builder_.CreateLoad(i64(), idxSlotR);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(idxR, len), bodyBBR, endBBR);
+            llvm::Value* loopCond = isStackFamily
+                ? builder_.CreateICmpSGE(idxR, builder_.getInt64(0))
+                : builder_.CreateICmpSLT(idxR, len);
+            builder_.CreateCondBr(loopCond, bodyBBR, endBBR);
             builder_.SetInsertPoint(bodyBBR);
             llvm::Value* idxR2 = builder_.CreateLoad(i64(), idxSlotR);
             llvm::Value* ep = builder_.CreateCall(ptrAtFn,
@@ -4327,7 +4372,13 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             if (!termR) builder_.CreateBr(incBBR);
             builder_.SetInsertPoint(incBBR);
             llvm::Value* idxR3 = builder_.CreateLoad(i64(), idxSlotR);
-            builder_.CreateStore(builder_.CreateAdd(idxR3, builder_.getInt64(1)), idxSlotR);
+            // #2472: the Stack family steps the cursor DOWN (top-to-bottom);
+            // every other array-backed collection steps it up, unchanged.
+            builder_.CreateStore(
+                isStackFamily
+                    ? builder_.CreateSub(idxR3, builder_.getInt64(1))
+                    : builder_.CreateAdd(idxR3, builder_.getInt64(1)),
+                idxSlotR);
             builder_.CreateBr(condBBR);
             builder_.SetInsertPoint(endBBR);
             // #1055: a fresh `owned` Array materializer iterated directly as the
