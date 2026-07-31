@@ -8,8 +8,9 @@
 // CALLEE's own body: it was reasoning (per its own, now-corrected, comment)
 // that the callee always "mints the +1" the caller's release balances. No
 // such mint ever existed in codegen (`emitRecordStringFieldRetains` /
-// `currentReturnIsRecord_` are declared but never invoked/set anywhere —
-// grep-verified, dead code from an intended-but-unbuilt design). A record's
+// `currentReturnIsRecord_` were declared but never invoked/set anywhere —
+// grep-verified, dead code from an intended-but-unbuilt design; #2453
+// removed both, so they no longer appear in src/ at all). A record's
 // string field in fact carries whatever +1/borrow state it had AT
 // CONSTRUCTION, unchanged by a by-value return (a struct copy touches no
 // refcount). That is sound only when the callee's returned value is a

@@ -9208,10 +9208,16 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // bound from a record-returning CALL (`var p := Mk()`) and proven
     // NON-escaping by the conservative escape walk
     // (recordCallResultReleaseEligible_), register a scope-end release of
-    // each string field (the recordStringFields Disposal). The callee mints
-    // the +1 each field owns (the narrow NewExpr-return path's
-    // emitRecordStringFieldRetains), so this single release balances it
-    // (no double-free, no UAF). Gated on currentFn_ matching the analyzed
+    // each string field (the recordStringFields Disposal). fix #2448 / §9.7
+    // (v0.235): no callee-side retain mints this +1 (#2453 removed the
+    // never-wired `emitRecordStringFieldRetains` this comment used to
+    // credit) — `recordCallResultReleaseEligible_` itself only admits a
+    // local whose initializer is PROVABLY a fresh, alias-free construction
+    // (isFreshRecordConstructionOfExactType / isProvablyFreshRecordFactoryMethod
+    // below), so each string field's value already carries whatever +1 it
+    // had at construction and this local is provably its sole owner: this
+    // single release balances that construction-time +1 (no double-free, no
+    // UAF). Gated on currentFn_ matching the analyzed
     // function (a lambda/thunk body lowered mid-function is not analyzed
     // → its record locals just leak, never double-freed). disposeStack_ is
     // non-empty inside any lowered block body.

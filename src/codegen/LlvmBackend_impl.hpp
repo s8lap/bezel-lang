@@ -2642,39 +2642,6 @@ private:
         }
     }
 
-    // fix #1747 / §28.9: GEP every string storage member of record VALUE
-    // `recVal` (a struct SSA value), load the field's current string
-    // pointer, and bz_string_retain (null-/sentinel-safe). Used on the
-    // callee side immediately after `return new P(...)` builds the value
-    // — the retain mints the +1 the returned record carries to the
-    // caller, balancing the caller's scope-end recordStringFields
-    // disposal. A literal field is a sentinel and its retain is a no-op
-    // (bz_string_retain is null-/sentinel-safe). `recVal` is a struct
-    // VALUE; we spill it to a temp because CreateStructGEP wants a
-    // pointer and we don't have one for an SSA value.
-    void emitRecordStringFieldRetains_impl(llvm::Value* recVal,
-                                           const sema::TypeSymbol* ts) {
-        if (!recVal || !ts || ts->kind != ast::TypeDeclKind::Record) return;
-        llvm::StructType* st = recordStruct(ts);
-        if (!st) return;
-        // Spill the SSA value to a temp slot so each GEP can address it.
-        llvm::AllocaInst* tmp = entryAlloca(st);
-        builder_.CreateStore(recVal, tmp);
-        std::vector<const sema::Symbol*> storage;
-        collectRecordStorage(ts, storage);
-        for (const sema::Symbol* m : storage) {
-            if (!isStringStorageMember(m)) continue;
-            auto idxIt = fieldIndex_.find(m);
-            if (idxIt == fieldIndex_.end()) continue;
-            llvm::Value* addr =
-                builder_.CreateStructGEP(st, tmp, idxIt->second,
-                                          "recstrr.addr");
-            llvm::Value* val =
-                builder_.CreateLoad(ptrTy(), addr, "recstrr.val");
-            emitStringRetain(val);
-        }
-    }
-
     // Load the data pointer (field 0) from a bz_string pointer.
     llvm::Value* loadStringData(llvm::Value* strPtr) {
         llvm::Value* p = builder_.CreateStructGEP(stringType(), strPtr, 0);
@@ -6222,38 +6189,25 @@ private:
     // of record `ts` at the struct ADDRESS `recAddr`. For each string
     // field: GEP the slot, load the string pointer, bz_string_release (null-
     // safe / sentinel-no-op), null the slot. Used by the recordStringFields
-    // scope-end Disposal to balance the callee-minted +1.
+    // scope-end Disposal.
+    //
+    // fix #2448 / §9.7 / §28.9 (v0.235): this release is balanced NOT by a
+    // callee-side retain (no such retain runs — see #2453, which removed
+    // the never-wired `emitRecordStringFieldRetains`/`_impl` and the
+    // never-set `currentReturnIsRecord_` flag that #1747-era comments here
+    // used to credit with minting that +1) but by
+    // `recordCallResultReleaseEligible_` only admitting a local whose
+    // initializer is PROVABLY a fresh, alias-free construction
+    // (`isFreshRecordConstructionOfExactType` / `isProvablyFreshRecordFactoryMethod`,
+    // LlvmBackend_Setup.cpp): each string field's value already carries
+    // whatever +1/borrow state it had AT CONSTRUCTION (a by-value return is
+    // a bit-copy that touches no refcount), and the eligibility walk proves
+    // that state is exclusively this local's to release — no separate mint
+    // step is needed or exists.
     void emitRecordStringFieldReleases(llvm::Value* recAddr,
                                        const sema::TypeSymbol* ts) {
         emitRecordStringFieldReleases_impl(recAddr, ts);
     }
-
-    // fix #1747 / §28.9: retain each string storage member of record VALUE
-    // `recVal` (a struct SSA value — spilled to a temp, GEP + load +
-    // bz_string_retain).
-    //
-    // fix #2448 (discovery note): audited during #2448's investigation and
-    // found UNCALLED — this function, emitRecordStringFieldRetains_impl,
-    // and currentReturnIsRecord_ just below are never invoked/set anywhere
-    // in codegen (grep-verified). The #1747-era comments that used to
-    // describe them as the live soundness mechanism for
-    // recordCallResultReleaseEligible_ (below) were describing an intended
-    // design that was never wired up — #2448's own investigation is what
-    // surfaced this: the caller-side gate was in fact relying on NO
-    // retain at all, which is what made it unsound for a borrowed-return
-    // callee (a genuine, empirically-confirmed use-after-free, fixed by
-    // isProvablyFreshRecordFactoryMethod below, which reasons about the
-    // callee's actual body instead). Left in place, unused, rather than
-    // deleted — removing dead code is a separate decision from fixing the
-    // UAF this comment update accompanies.
-    void emitRecordStringFieldRetains(llvm::Value* recVal,
-                                      const sema::TypeSymbol* ts) {
-        emitRecordStringFieldRetains_impl(recVal, ts);
-    }
-
-    // See the #2448 discovery note on emitRecordStringFieldRetains just
-    // above — this flag is never set anywhere; dead code, left in place.
-    bool currentReturnIsRecord_ = false;
 
     // fix #1747 / §28.9 / §9.7 / §28.3: the set of plain `var` RECORD
     // LocalDecl nodes whose declared type owns at least one `string` field,
