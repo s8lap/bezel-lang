@@ -6206,34 +6206,53 @@ private:
 
     // fix #1747 / §28.9: retain each string storage member of record VALUE
     // `recVal` (a struct SSA value — spilled to a temp, GEP + load +
-    // bz_string_retain). Used on the callee side after `return new P(...)`
-    // to mint the +1 the returned record carries out to the caller. The
-    // retained +1 is what the caller's scope-end recordStringFields
-    // Disposal balances. A literal field is a sentinel — its retain is a
-    // no-op (bz_string_retain is null-/sentinel-safe).
+    // bz_string_retain).
+    //
+    // fix #2448 (discovery note): audited during #2448's investigation and
+    // found UNCALLED — this function, emitRecordStringFieldRetains_impl,
+    // and currentReturnIsRecord_ just below are never invoked/set anywhere
+    // in codegen (grep-verified). The #1747-era comments that used to
+    // describe them as the live soundness mechanism for
+    // recordCallResultReleaseEligible_ (below) were describing an intended
+    // design that was never wired up — #2448's own investigation is what
+    // surfaced this: the caller-side gate was in fact relying on NO
+    // retain at all, which is what made it unsound for a borrowed-return
+    // callee (a genuine, empirically-confirmed use-after-free, fixed by
+    // isProvablyFreshRecordFactoryMethod below, which reasons about the
+    // callee's actual body instead). Left in place, unused, rather than
+    // deleted — removing dead code is a separate decision from fixing the
+    // UAF this comment update accompanies.
     void emitRecordStringFieldRetains(llvm::Value* recVal,
                                       const sema::TypeSymbol* ts) {
         emitRecordStringFieldRetains_impl(recVal, ts);
     }
 
-    // fix #1747 / §28.9 / §9.7 / §28.3: set while lowering the operand of
-    // a ReturnStmt whose declared return type is a record with string
-    // fields. Detected as a NewExpr of the matching record — read here to
-    // retain each string field after construction, transferring one +1 out
-    // of the callee to the caller.
+    // See the #2448 discovery note on emitRecordStringFieldRetains just
+    // above — this flag is never set anywhere; dead code, left in place.
     bool currentReturnIsRecord_ = false;
 
     // fix #1747 / §28.9 / §9.7 / §28.3: the set of plain `var` RECORD
     // LocalDecl nodes whose declared type owns at least one `string` field,
     // whose initializer is a CALL returning that record (`var p := Mk()`),
-    // and which the conservative escape walk proved never to escape. The
-    // callee mints the +1 each string field owns (the narrow NewExpr
-    // return path's emitRecordStringFieldRetains), so the caller's scope-
-    // end recordStringFields Disposal balances it (no double-free, no
-    // UAF). A NewExpr-init local, a copy (`var q := p`), a with-copy, a
-    // by-value-argument, a collection/field store, or a nullable result
-    // keeps the prior safe-leak behaviour — the walker over-approximates
-    // and the eligibility is intentionally narrow.
+    // and which the conservative escape walk proved never to escape.
+    //
+    // fix #2448 / §9.7 / §28.9 (v0.235): ALSO now requires the CALLEE be
+    // isProvablyFreshRecordFactoryMethod-eligible (see that function). The
+    // ORIGINAL #1747 gate admitted ANY CallExpr returning a record-with-
+    // string-fields type, reasoning (per its own comment, since corrected)
+    // that the callee always "mints the +1" on return — but no such mint
+    // ever existed (see the #2448 discovery note above): a record's string
+    // field carries whatever +1/borrow state it had AT CONSTRUCTION,
+    // unchanged by a by-value return (a bit-copy touches no refcount). That
+    // is sound ONLY when the callee's return value is a fresh, alias-free
+    // construction (isFreshRecordConstructionOfExactType) — NOT when it is
+    // a BORROWED value already reachable from a longer-lived binding (a
+    // plain field read, `return this.f;`, empirically confirmed as a
+    // heap-use-after-free: the caller's scope-end release frees a string
+    // the field's owner still references). A NewExpr-init local, a copy
+    // (`var q := p`), a with-copy, a by-value-argument, a collection/field
+    // store, or a nullable result keeps the prior safe-leak behaviour — the
+    // walker over-approximates and the eligibility is intentionally narrow.
     std::unordered_set<const void*> recordCallResultReleaseEligible_;
     llvm::Function* recordCallResultReleaseEligibleFn_ = nullptr;
 
@@ -6241,6 +6260,44 @@ private:
     // record-call-result LocalDecl by escape verdict.
     void collectRecordCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
+    // fix #2448 / §9.7 / §28.9 (v0.235): is `expr` a provably fresh, alias-
+    // free construction of EXACTLY record type `recTs`? See the definition
+    // (LlvmBackend_Setup.cpp) for the full rationale.
+    bool isFreshRecordConstructionOfExactType(
+        const ast::Expr* expr, const sema::TypeSymbol* recTs) const;
+
+    // fix #2448 / §9.7 / §28.9 (v0.235): is MethodSymbol `ms` provably a
+    // "fresh record factory" for record `recTs`? Consulted by
+    // collectRecordCallResultReleaseEligible to close the #2448 use-after-
+    // free (a caller-side gate blind to the callee's own body). See the
+    // definition (LlvmBackend_Setup.cpp) for the full rationale and its
+    // deliberately narrow scope.
+    bool isProvablyFreshRecordFactoryMethod(
+        const sema::MethodSymbol* ms, const sema::TypeSymbol* recTs) const;
+
+    // fix #2428 / §9.8 / §28.9 / §35.4, generalized by fix #2448 / §9.7: is
+    // `call` a call to SOME type's own SYNTHESIZED `Deserialize` factory?
+    // Returns the resolved TypeSymbol (Record or Choice) when recognized,
+    // null otherwise. Shared recognition logic behind both
+    // isSynthesizedValueLikeChoiceDeserializeCall (choice-kind check) and
+    // isSynthesizedRecordDeserializeCall (record-kind check) below. See the
+    // definition (LlvmBackend_Setup.cpp) for the full rationale.
+    const sema::TypeSymbol* resolveSynthesizedDeserializeCallTarget(
+        const ast::CallExpr* call) const;
+
+    // fix #2448 / §9.7 / §28.9 (v0.235): is `call` a call to record
+    // `recTs`'s own synthesized `Deserialize` factory? An UNCONDITIONALLY
+    // sound alternative to isProvablyFreshRecordFactoryMethod — a
+    // synthesized Deserialize's body is codegen-emitted directly
+    // (emitRecordDeserialize), never a user ast::MethodDecl, so
+    // isProvablyFreshRecordFactoryMethod's AST-body walk can never admit
+    // it; without this alternative, `var back := Root.Deserialize(d);`
+    // would silently lose the release coverage the PRIOR (unsound) #1747
+    // gate happened to also provide for this exact shape. See the
+    // definition (LlvmBackend_Setup.cpp) for the full rationale.
+    bool isSynthesizedRecordDeserializeCall(
+        const ast::CallExpr* call, const sema::TypeSymbol* recTs) const;
 
     // fix #2428 / §9.8 / §28.9 / §35.4: is `call` a call to a value-like
     // choice type's own SYNTHESIZED `Deserialize(d: IDeserializer)` factory

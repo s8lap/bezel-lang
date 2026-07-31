@@ -15049,15 +15049,51 @@ void Emitter::collectRecordCallResultReleaseEligible(
                 // (IdentifierExpr naming another record local) and a
                 // with-copy (WithExpr) likewise carry no callee-minted +1
                 // by themselves. Restrict to CallExpr only.
-                if (dynamic_cast<const ast::CallExpr*>(ld->initializer.get())) {
+                if (auto* call = dynamic_cast<const ast::CallExpr*>(
+                        ld->initializer.get())) {
                     // Recover the record-with-string-fields type from the
                     // declared annotation, or — for an inferred
                     // `var p := Mk()` — from the initializer's exprType.
                     const sema::TypeRef* tr = nullptr;
                     if (ld->type) tr = ctx_.resolvedType(*ld->type);
                     if (!tr) tr = ctx_.exprType(*ld->initializer);
-                    if (isRecordWithStringFieldsTypeRef(tr))
-                        candidates.push_back(ld);
+                    // fix #2448 / §9.7 / §28.9: the gate below used to admit
+                    // ANY CallExpr returning a record-with-string-fields
+                    // type, regardless of the callee's own body — blind to
+                    // whether the callee actually mints a fresh, alias-free
+                    // value or merely hands back a BORROWED one (e.g.
+                    // `return this.f;`). Both shapes are the SAME static
+                    // type, so the type check alone cannot tell them apart;
+                    // a borrowed return caused an empirically-confirmed
+                    // heap-use-after-free (the caller's scope-end release
+                    // frees a string a still-live object's field also
+                    // references) — see isProvablyFreshRecordFactoryMethod's
+                    // own comment for the callee-side proof this now
+                    // requires before admitting the local.
+                    if (tr && isRecordWithStringFieldsTypeRef(tr) &&
+                        call->callee) {
+                        // fix #2448: a call to the record's OWN synthesized
+                        // Deserialize (`var back := Root.Deserialize(d);`)
+                        // is an UNCONDITIONALLY sound alternative admission
+                        // — compiler-generated, so it cannot return a
+                        // borrow — and is NOT reachable via
+                        // isProvablyFreshRecordFactoryMethod below (that
+                        // check walks a user ast::MethodDecl body; a
+                        // synthesized Deserialize's body is codegen-emitted
+                        // directly, with no such AST node to walk). Without
+                        // this alternative, #2448's callee-body-aware gate
+                        // would silently DROP coverage the prior (unsound)
+                        // gate happened to also provide for this shape —
+                        // caught by re-running #2425's own nested-choice-
+                        // in-record round-trip test against this fix (it
+                        // regressed to a 60-byte leak without this branch).
+                        const auto* ms = dynamic_cast<const sema::MethodSymbol*>(
+                            ctx_.exprSymbol(*call->callee));
+                        if ((ms &&
+                             isProvablyFreshRecordFactoryMethod(ms, tr->declaration)) ||
+                            isSynthesizedRecordDeserializeCall(call, tr->declaration))
+                            candidates.push_back(ld);
+                    }
                 }
             }
         }
@@ -15097,29 +15133,141 @@ void Emitter::collectRecordCallResultReleaseEligible(
 }
 
 
-// fix #2428 / §9.8 / §28.9 / §35.4: see the declaration in
-// LlvmBackend_impl.hpp for the full rationale (why this call shape, and why
-// it is narrower than #1747's own gate). Structurally mirrors the EXACT
-// recognition LlvmBackend_Serialization.cpp's own call-site dispatch uses
-// for `Type.Deserialize(d)` (methodName=="Deserialize", one arg, callee
-// target is an IdentifierExpr naming a TypeSymbol, the type declares
-// IDeserializable, no hand-written "Deserialize" method) — duplicated here
-// (rather than exposed cross-TU) since the two `declaresConformance`/
+// fix #2448 / §9.7 / §28.9 (v0.235): is `expr` a PROVABLY fresh, alias-free
+// construction of EXACTLY record type `recTs`? A `new P(args...)` where:
+//   * `recTs` is a POSITIONAL record (§9.1) with NO user-declared
+//     (explicit) constructor — the compiler's own primary construction
+//     stores each positional argument directly into its field, with no
+//     interposed logic (validating/normalizing constructors are legal
+//     Bezel, §9.2, but their body is opaque to this static check — an
+//     explicit constructor could route an argument anywhere, or ignore it
+//     and store a pre-existing shared/static string instead, so its
+//     presence disqualifies the type from this check entirely, regardless
+//     of what any individual constructor does).
+//   * every argument is POSITIONAL (no name/ref/out/owned modifier, no
+//     discard) — named/reordered args are conservatively out of scope.
+//   * a NESTED record- or choice-typed positional field disqualifies the
+//     WHOLE type (this check reasons about DIRECT string fields only; a
+//     record with any nested value-type component falls back to the
+//     pre-existing safe-leak behaviour for every call to it, matching
+//     #2425's own choice of a separate walker for the nested-depth case
+//     rather than proving a nested construction is ALSO alias-free here).
+//   * each STRING-typed field's corresponding argument is a string literal
+//     (an immortal sentinel) or a +1-producer expression
+//     (isPlusOneStringProducer) — never a borrow (a field/param/identifier
+//     read), which would alias a string another live binding still owns.
+// See isProvablyFreshRecordFactoryMethod below for how this is applied
+// across a whole callee body.
+bool Emitter::isFreshRecordConstructionOfExactType(
+        const ast::Expr* expr, const sema::TypeSymbol* recTs) const {
+    if (!expr || !recTs || recTs->kind != ast::TypeDeclKind::Record)
+        return false;
+    auto* ne = dynamic_cast<const ast::NewExpr*>(expr);
+    if (!ne || !ne->type) return false;
+    const sema::TypeRef* nty = ctx_.resolvedType(*ne->type);
+    if (!nty || nty->kind != sema::TypeRef::Kind::Named ||
+        nty->declaration != recTs)
+        return false;  // not EXACTLY recTs (a subtype/other type is out of scope)
+    const auto* td = dynamic_cast<const ast::TypeDecl*>(recTs->decl);
+    if (!td || !td->hasPositionalFields) return false;
+    for (const sema::Symbol* m : recTs->members)
+        if (dynamic_cast<const sema::ConstructorSymbol*>(m))
+            return false;  // explicit constructor — opaque, disqualifies
+    if (ne->args.size() != td->positionalFields.size()) return false;
+    for (std::size_t i = 0; i < ne->args.size(); ++i) {
+        const ast::CallArgument& arg = ne->args[i];
+        if (!arg.name.empty() || !arg.modifier.empty() || arg.isDiscard ||
+            !arg.value)
+            return false;
+        const ast::Param& pf = td->positionalFields[i];
+        if (!pf.type) return false;
+        const sema::TypeRef* fty = ctx_.resolvedType(*pf.type);
+        if (!fty) return false;
+        if (!fty->nullable && fty->kind == sema::TypeRef::Kind::Named &&
+            fty->declaration &&
+            (fty->declaration->kind == ast::TypeDeclKind::Record ||
+             fty->declaration->kind == ast::TypeDeclKind::Choice)) {
+            return false;  // nested value-type component — out of scope here
+        }
+        if (!fty->nullable && fty->kind == sema::TypeRef::Kind::Primitive &&
+            fty->primitive == sema::PrimitiveType::String) {
+            const ast::Expr* a = arg.value.get();
+            bool isLiteral = dynamic_cast<const ast::StringLiteralExpr*>(a) ||
+                             dynamic_cast<const ast::VerbatimStringExpr*>(a);
+            if (!isLiteral && !isPlusOneStringProducer(a)) return false;
+        }
+    }
+    return true;
+}
+
+
+// fix #2448 / §9.7 / §28.9 (v0.235): is MethodSymbol `ms` PROVABLY a "fresh
+// record factory" for record `recTs` — i.e. is EVERY value it can return
+// isFreshRecordConstructionOfExactType? Deliberately narrow: supports ONLY
+// (a) an expression-bodied method (`=> new P(...)`), or (b) a block-bodied
+// method whose ENTIRE top-level statement list is EXACTLY ONE statement, a
+// `return new P(...);`. This sidesteps a general control-flow walk over the
+// callee's body — which would risk silently missing a return hidden in an
+// unrecognized statement/expression kind and admitting an UNSAFE callee —
+// by requiring the body have NO other statement in which one could hide.
+// The EXISTING #1747 test's shape
+// (`Mk(): P return new P($"hello", 8); end Mk;`) is exactly case (b): one
+// statement, so it stays admitted. A multi-statement or branching factory
+// body (e.g. a local computed first, or an if/else choosing between two
+// constructions) is conservatively REJECTED — a bounded leak for that
+// shape, strictly preferable to silently re-admitting the #2448
+// use-after-free class through a construct this check does not reason
+// about. (A fuller whole-body escape analysis remains a follow-up, out of
+// this fix's scope — see the commit message.)
+bool Emitter::isProvablyFreshRecordFactoryMethod(
+        const sema::MethodSymbol* ms, const sema::TypeSymbol* recTs) const {
+    if (!ms || !recTs) return false;
+    const auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl);
+    if (!md) return false;
+    if (md->bodyKind == ast::MethodBodyKind::Expression) {
+        return isFreshRecordConstructionOfExactType(md->exprBody.get(), recTs);
+    }
+    if (md->bodyKind == ast::MethodBodyKind::Block) {
+        if (md->stmts.size() != 1) return false;
+        auto* rs = dynamic_cast<const ast::ReturnStmt*>(md->stmts[0].get());
+        if (!rs) return false;
+        return isFreshRecordConstructionOfExactType(rs->value.get(), recTs);
+    }
+    return false;
+}
+
+
+// fix #2428 / §9.8 / §28.9 / §35.4, generalized by fix #2448: is `call` a
+// call to SOME type's own SYNTHESIZED `Deserialize(d: IDeserializer)`
+// factory — recognized structurally, the same way
+// LlvmBackend_Serialization.cpp's own call-site dispatch recognizes
+// `Type.Deserialize(d)` (methodName=="Deserialize", one arg, callee target
+// is an IdentifierExpr naming a TypeSymbol, the type declares
+// IDeserializable, no hand-written "Deserialize" method — duplicated here,
+// rather than exposed cross-TU, since the two `declaresConformance`/
 // `hasHandWrittenMethod` helpers in LlvmBackend_Serialization.cpp are file-
-// static and small.
-bool Emitter::isSynthesizedValueLikeChoiceDeserializeCall(
+// static and small). Returns the resolved TypeSymbol when recognized
+// (either a Record or a Choice — the caller checks which), null otherwise.
+// A synthesized factory is compiler-generated: there is no user body that
+// could return a borrowed field/param, so admitting it needs none of
+// isProvablyFreshRecordFactoryMethod's callee-body analysis — it is
+// unconditionally fresh by construction. GENERIC types are excluded
+// (#2425's own documented decline, extended here to records: neither this
+// recognition nor the release walkers it feeds were audited against a
+// chained generic-type-Deserialize call result).
+const sema::TypeSymbol* Emitter::resolveSynthesizedDeserializeCallTarget(
         const ast::CallExpr* call) const {
-    if (!call || !call->callee || call->args.size() != 1) return false;
+    if (!call || !call->callee || call->args.size() != 1) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
-    if (!ma || ma->member != "Deserialize" || !ma->target) return false;
+    if (!ma || ma->member != "Deserialize" || !ma->target) return nullptr;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
-    if (!id) return false;
+    if (!id) return nullptr;
     const auto* ts =
         dynamic_cast<const sema::TypeSymbol*>(ctx_.exprSymbol(*ma->target));
-    if (!ts || ts->kind != ast::TypeDeclKind::Choice) return false;
-    if (!ts->genericParams.empty()) return false;  // #2425's own generic decline
+    if (!ts) return nullptr;
+    if (!ts->genericParams.empty()) return nullptr;
     const auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl);
-    if (!td) return false;
+    if (!td) return nullptr;
     bool declaresIDeserializable = false;
     for (const auto& bt : td->baseTypes) {
         if (bt && bt->name && !bt->name->parts.empty() &&
@@ -15128,16 +15276,40 @@ bool Emitter::isSynthesizedValueLikeChoiceDeserializeCall(
             break;
         }
     }
-    if (!declaresIDeserializable) return false;
+    if (!declaresIDeserializable) return nullptr;
     for (const sema::Symbol* m : ts->members) {
         // A hand-written "Deserialize" method suppresses synthesis (§9.8) —
         // its body is not provably a fresh construction, so it must NOT be
         // admitted here.
         if (m->name == "Deserialize" &&
             dynamic_cast<const sema::MethodSymbol*>(m))
-            return false;
+            return nullptr;
     }
-    return true;
+    return ts;
+}
+
+
+bool Emitter::isSynthesizedValueLikeChoiceDeserializeCall(
+        const ast::CallExpr* call) const {
+    const sema::TypeSymbol* ts = resolveSynthesizedDeserializeCallTarget(call);
+    return ts && ts->kind == ast::TypeDeclKind::Choice;
+}
+
+
+// fix #2448 / §9.7 / §28.9 (v0.235): is `call` a call to record `recTs`'s
+// own SYNTHESIZED `Deserialize` factory? See
+// resolveSynthesizedDeserializeCallTarget just above for the recognition
+// rationale. Restores coverage isProvablyFreshRecordFactoryMethod cannot
+// reach on its own: a synthesized Deserialize's body is codegen-emitted
+// directly (emitRecordDeserialize), not a user ast::MethodDecl, so
+// isProvablyFreshRecordFactoryMethod's AST-body walk always rejects it —
+// this is the record-side counterpart of
+// isSynthesizedValueLikeChoiceDeserializeCall, admitted as an ALTERNATIVE,
+// unconditionally-sound path in collectRecordCallResultReleaseEligible.
+bool Emitter::isSynthesizedRecordDeserializeCall(
+        const ast::CallExpr* call, const sema::TypeSymbol* recTs) const {
+    const sema::TypeSymbol* ts = resolveSynthesizedDeserializeCallTarget(call);
+    return ts && ts == recTs && ts->kind == ast::TypeDeclKind::Record;
 }
 
 
