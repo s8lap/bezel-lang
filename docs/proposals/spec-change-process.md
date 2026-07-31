@@ -95,6 +95,8 @@ A revision is not done when the text changes; it is done when the record is comp
 4. **Comments closing the loop on prior issues** the revision resolves (close with the citation; or comment "landed in <sha>, tracking the impl delta").
 5. **Guide revalidation** when a revision changes idiom. The guides carry a revalidation pin, not a version number; bump it and re-trace every example. A guide that teaches a retired idiom is a defect (Guide 02 was 26 revisions stale when the 2026-07-11 run found it).
 
+   **Guide-only passes are unversioned (owner-ruled 2026-07-30).** A change touching only the guides — a restructure, an expansion, an idiom refresh at a fixed normative revision — takes **no version bump and no changelog entry**: the revision number pins the *normative* definition, and it must not churn for prose. The record is the commit message and PR, plus the adversarial meaning gate for substantive passes. The pin keeps its exact meaning — "re-validated against v0.NNN" names the normative revision the guide was last checked against — so it stays put when only guide prose moves, and moves only when the normative documents move and the guide is re-checked. When a guide change rides a normative train, that revision's entry mentions the pin move as before. (The one guide-only train that predates this ruling, v0.236, stands as pinned history.)
+
 ---
 
 ## 6. Proposals — the design-change lifecycle
