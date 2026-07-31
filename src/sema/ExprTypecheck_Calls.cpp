@@ -11750,6 +11750,87 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             mbr == "ToSet" || mbr == "ThenBy" ||
                             mbr == "ThenByDescending";
                         bool isCallForm = &ma == calleeOfCallCtx_;
+                        // #2470 (stdlib §4.4/§4.5; language spec §27.6): a
+                        // BARE reference to a name in `isDeclaredMethod` has
+                        // no backing MethodSymbol -- Array<T>/OwningArray<T>'s
+                        // native methods are dispatched STRUCTURALLY (by name,
+                        // in codegen's tryLowerCollectionInstanceCall et al.),
+                        // never through a real declared-method symbol. Unlike
+                        // a user-class method reference (codegen's CG60,
+                        // gated on `dynamic_cast<MethodSymbol*>(exprSymbol)`),
+                        // there is nothing for that path to find, so sema
+                        // left `ma`'s exprType UNSET here -- confirmed live:
+                        // `var f := a.Add;` gave the LocalDecl no inferred
+                        // type at all (ExprTypecheck.cpp's `lsym->declType =
+                        // ctx_.exprType(*ld->initializer)` -> null), so
+                        // codegen's lowerLocalDecl fallback
+                        // (LlvmBackend_Setup.cpp, `slotTy = v ? ... :
+                        // (declaredTy ? declaredTy : i32())`) silently
+                        // degraded `f` to a zero-initialized `i32`, and every
+                        // later call through it (`f(5)`) lowered to NO CODE
+                        // AT ALL (not even a null-pointer crash) -- a clean
+                        // compile that silently drops the call. Language spec
+                        // §27.6 states plainly that "Method references work
+                        // for ... instance methods" with no carve-out for a
+                        // structurally-dispatched builtin, so accepting the
+                        // syntax and then silently doing nothing is the one
+                        // forbidden outcome (worse than either a working
+                        // reference or an honest rejection). The machinery to
+                        // make it actually WORK -- synthesizing a per-method
+                        // thunk that calls back into the same structural
+                        // dispatch the CALL form already uses -- does not
+                        // exist yet (a substantial, family-wide feature, not
+                        // a fix-lane-sized change); reject at the reference
+                        // site instead of leaving the no-op. The CALL form
+                        // (`a.Add(x)`, `isCallForm` above) is completely
+                        // unaffected: it already works today via
+                        // `calleeOfCallCtx_` and the CALL-site dispatch in
+                        // LlvmBackend_Calls*.cpp, neither of which this
+                        // condition touches.
+                        //
+                        // `isUniversalObjectMember` shares the identical
+                        // root cause (ToString/Equals/GetHashCode/GetType/
+                        // ReferenceEquals are ALSO dispatched structurally
+                        // for this receiver -- the CALL form's own §8.3/§8.5
+                        // "IMPLEMENTED... rather than diagnosed" comment
+                        // above says so directly) and is folded into the
+                        // SAME reject rather than left exempted: a bare
+                        // reference to these is not merely a no-op but a
+                        // hard COMPILER CRASH (confirmed live: `var f :=
+                        // a.ToString; var s := f(); return (if s = "Array"
+                        // then ... )` aborts inside LLVM's ICmpInst::AssertOK
+                        // -- comparing the untyped/zero-degraded `s` against
+                        // a string constant emits an ICmp between mismatched
+                        // LLVM types; `var f := a.Equals; f(a)` separately
+                        // fails IR verification, "Branch condition is not
+                        // i1 type"), strictly worse than the silent no-op
+                        // #2470 itself reports. No existing test exercises a
+                        // bare reference to any of these five names on these
+                        // receivers (only their CALL forms, unaffected here),
+                        // so folding them into this reject regresses nothing.
+                        if ((isDeclaredMethod || isUniversalObjectMember) &&
+                                !isCallForm) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("a bare reference to `") +
+                                    std::string(mbr) + "` (language spec "
+                                    "\xC2\xA7""27.6) is not yet supported on "
+                                    "`" + std::string(cn) + "<T>` (stdlib "
+                                    "\xC2\xA7""4.4/\xC2\xA7""4.5, #2470): `" +
+                                    std::string(mbr) + "` is a real member "
+                                    "(declared, or a universal Object member "
+                                    "-- language spec \xC2\xA7""8.1), but this "
+                                    "builtin collection dispatches it "
+                                    "structurally rather than through a real "
+                                    "method symbol, so no function value can "
+                                    "be formed for it yet -- call it directly "
+                                    "instead (`." + std::string(mbr) +
+                                    "(...)`)");
+                            return;
+                        }
                         if (!isUniversalObjectMember && !isLengthAlias &&
                                 !isDeclaredMethod && !isLinqOperator &&
                                 !isCallForm) {
@@ -11924,6 +12005,60 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             mbr == "ToSet" || mbr == "ThenBy" ||
                             mbr == "ThenByDescending";
                         bool isCallForm = &ma == calleeOfCallCtx_;
+                        // #2470 (stdlib §4.11; language spec §27.6): the same
+                        // no-MethodSymbol-behind-a-bare-reference gap slice
+                        // 1's identical block fixes for Array/OwningArray
+                        // (see that block's comment for the full mechanism)
+                        // — confirmed live for `s.Push`/`s.GetEnumerator` on
+                        // Stack<int>: `var f := s.Push;` compiled clean, then
+                        // `f(5)` silently emitted NO CODE (codegen's #2434
+                        // zero-init fallback degrades the untyped local to
+                        // `i32`, and every later call through it is dropped
+                        // outright, not even a null-pointer crash). Reject at
+                        // the reference site rather than leave the no-op —
+                        // §27.6 promises a working reference for "instance
+                        // methods" generally, so an honest "not yet
+                        // supported" is the sound interim answer, not silent
+                        // wrong behavior. The CALL form (`s.Push(5)`,
+                        // `isCallForm` above) is unaffected: it already works
+                        // via `calleeOfCallCtx_` and the existing CALL-site
+                        // structural dispatch.
+                        //
+                        // `isUniversalObjectMember` folds into this SAME
+                        // reject for the identical reason as the Array block
+                        // above: ToString/Equals/GetHashCode/GetType/
+                        // ReferenceEquals are dispatched structurally here
+                        // too (this block's own §8.3/§8.5 "IMPLEMENTED... not
+                        // diagnosed" comment above), so a bare reference to
+                        // them shares the same no-MethodSymbol root cause —
+                        // confirmed to crash/mis-verify on Array via the
+                        // identical mechanism (see that block's comment); no
+                        // existing test exercises the bare form of any of
+                        // these five names on Stack/Queue (only their CALL
+                        // forms, unaffected here).
+                        if ((isDeclaredMethod || isUniversalObjectMember) &&
+                                !isCallForm) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("a bare reference to `") +
+                                    std::string(mbr) + "` (language spec "
+                                    "\xC2\xA7""27.6) is not yet supported on "
+                                    "`" + std::string(cn) + "<T>` (stdlib "
+                                    "\xC2\xA7""4.11, #2470): `" +
+                                    std::string(mbr) + "` is a real member "
+                                    "(declared, or a universal Object member "
+                                    "-- language spec \xC2\xA7""8.1), but this "
+                                    "builtin collection dispatches it "
+                                    "structurally rather than through a real "
+                                    "method symbol, so no function value can "
+                                    "be formed for it yet -- call it directly "
+                                    "instead (`." + std::string(mbr) +
+                                    "(...)`)");
+                            return;
+                        }
                         if (!isUniversalObjectMember &&
                                 !isUndocumentedWorkingAlias &&
                                 !isDeclaredMethod && !isLinqOperator &&

@@ -124,7 +124,20 @@ BEZEL_TEST(array_unresolved_member_2457, legit_length_alias_value_correct) {
 // compile after this fix's reject; the earlier draft of this fix (caught
 // before landing) rejected it because it exempted only the CALL form via
 // calleeOfCallCtx_, not the reference form language spec §27.6 sanctions.
-BEZEL_TEST(array_unresolved_member_2457, legit_bare_method_reference_not_regressed) {
+//
+// #2470 CORRECTION (this test previously asserted `run(program) == 0` —
+// "compiles and doesn't crash" — which was itself the vacuous-test failure
+// mode the standing protocol warns about: #2470 proved the accepted
+// reference was a silent NO-OP at runtime, `f(5)` lowering to no code at
+// all, not even a null-pointer crash, because `Array<T>.Add` has no real
+// MethodSymbol behind it for codegen's method-reference thunk to bind. A
+// bare reference silently accepted and then doing nothing is worse than an
+// honest rejection (the standing protocol's own framing) — so #2470's fix
+// now REJECTS this bare-reference form at the sema level, with a distinct
+// diagnostic from "no member" (the member IS real; only its reference form
+// isn't implemented yet). The CALL form (`a.Add(5)`, exercised by
+// `legit_call_form_methods_value_correct` above) is completely unaffected.
+BEZEL_TEST(array_unresolved_member_2457, legit_bare_method_reference_now_rejected_2470) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
@@ -134,7 +147,93 @@ BEZEL_TEST(array_unresolved_member_2457, legit_bare_method_reference_not_regress
         "  a.Dispose(); "
         "  return 0; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 0);
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `Add` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Array<T>`"));
+}
+
+// #2470: the reject applies uniformly to OwningArray<T> too (same
+// `isDeclaredMethod` union; the class/owning axis is otherwise untouched by
+// this fix).
+BEZEL_TEST(array_unresolved_member_2457, legit_bare_method_reference_owningarray_now_rejected_2470) {
+    const std::string program =
+        "module M; "
+        "class Res public Tag: int; "
+        "  public constructor(t: int) Tag := t; end constructor; "
+        "end Res; "
+        "class C public static method Main(): int "
+        "  var a := new OwningArray<Res>(); "
+        "  var f := a.Add; "
+        "  a.Dispose(); "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `Add` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `OwningArray<T>`"));
+}
+
+// #2470: `GetEnumerator` is in the same `isDeclaredMethod` union (the
+// IEnumerable<T> ancestor method, stdlib §4.4/§4.12) and shares the
+// identical no-MethodSymbol shape — confirmed live before this fix:
+// `var f := a.GetEnumerator; var it := f();` compiled clean and `it`'s
+// MoveNext() was unreachable dead code, not merely unimplemented.
+BEZEL_TEST(array_unresolved_member_2457, legit_bare_getenumerator_reference_now_rejected_2470) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "  var a := new Array<int>(3); "
+        "  var f := a.GetEnumerator; "
+        "  a.Dispose(); "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `GetEnumerator` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Array<T>`"));
+}
+
+// #2470: folded the `isUniversalObjectMember` names into the SAME reject —
+// a bare reference to `.ToString`/`.Equals` shares the identical
+// no-MethodSymbol root cause as `.Add`, but manifests WORSE: before this
+// fix, `var f := a.ToString; var s := f(); return (if s = "Array" ...)`
+// aborted the compiler inside LLVM's `ICmpInst::AssertOK` (comparing the
+// #2434-degraded, mistyped `s` against a string constant), and `var f :=
+// a.Equals; f(a)` separately failed IR verification ("Branch condition is
+// not i1 type"). Both are now clean, honest rejections instead of a crash.
+BEZEL_TEST(array_unresolved_member_2457, legit_bare_tostring_reference_now_rejected_2470_no_crash) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "  var a := new Array<int>(0); "
+        "  a.Add(1); "
+        "  var f := a.ToString; "
+        "  var s := f(); "
+        "  a.Dispose(); "
+        "  return (if s = \"Array\" then 42 else 1); "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `ToString` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Array<T>`"));
+}
+
+BEZEL_TEST(array_unresolved_member_2457, legit_bare_equals_reference_now_rejected_2470_no_crash) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "  var a := new Array<int>(0); "
+        "  a.Add(1); "
+        "  var f := a.Equals; "
+        "  var b := f(a); "
+        "  a.Dispose(); "
+        "  return (if b then 42 else 1); "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `Equals` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Array<T>`"));
 }
 
 // A LINQ bare method reference (requires the §5 import) — the largest,

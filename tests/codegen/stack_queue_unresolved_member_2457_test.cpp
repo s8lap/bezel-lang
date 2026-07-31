@@ -244,15 +244,20 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_reverse_alias_stack_value_c
     BEZEL_EXPECT_EQ(run(program), 1);
 }
 
-// A bare (uncalled) method reference — language spec §27.6 — must still
-// compile after this fix's reject (matches slice 1's identical guard for
-// Array.Add). NOTE: per #2470 (filed, not fixed here — a distinct,
-// pre-existing bug independent of this slice, reproducing on Array<T> too)
-// the invoked reference is currently a silent no-op at runtime, so this
-// asserts only what slice 1's own analogous test asserted: the reference
-// form compiles and the program runs to completion without being wrongly
-// REJECTED, not that the invocation is value-correct (#2470 tracks that).
-BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_method_reference_not_regressed) {
+// A bare (uncalled) method reference — language spec §27.6.
+//
+// #2470 CORRECTION: this test originally asserted `run(program) == 0`
+// ("compiles and doesn't crash") for the accepted reference, with a NOTE
+// that the invocation was a known silent no-op tracked by #2470. #2470's
+// own fix (sema/ExprTypecheck_Calls.cpp's Stack/Queue block) now REJECTS
+// this bare-reference form outright instead of leaving that no-op: a
+// clean-compile-then-silently-do-nothing is worse than an honest
+// diagnostic (the standing protocol's framing), and `Push`/`Enqueue` on
+// Stack<T>/Queue<T> have no real MethodSymbol for codegen's method-
+// reference thunk to bind (they are dispatched structurally, exactly like
+// Array<T>.Add). The CALL form (`s.Push(5)`, exercised by
+// `legit_reverse_alias_value_correct` and others above) is unaffected.
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_method_reference_now_rejected_2470) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
@@ -261,10 +266,13 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_method_reference_not_r
         "  f(5); "
         "  return 0; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 0);
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `Push` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Stack<T>`"));
 }
 
-BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_method_reference_queue_not_regressed) {
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_method_reference_queue_now_rejected_2470) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
@@ -273,7 +281,32 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_method_reference_queue
         "  f(5); "
         "  return 0; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 0);
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `Enqueue` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Queue<T>`"));
+}
+
+// #2470: folded `isUniversalObjectMember` into the same reject on the
+// Stack/Queue block too — shares the identical no-MethodSymbol root cause
+// as `.Push`/`.Enqueue` (see the Array block's analogous test and sema
+// comment for the confirmed-crashing repro shape on Array; the mechanism is
+// receiver-shape-independent, so the same class of malformed-IR/ICE
+// failure is expected here too, not separately re-confirmed per receiver).
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_tostring_reference_stack_now_rejected_2470) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "  var s := new Stack<int>(); "
+        "  s.Push(1); "
+        "  var f := s.ToString; "
+        "  var str := f(); "
+        "  return (if str = \"Stack\" then 42 else 1); "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `ToString` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Stack<T>`"));
 }
 
 // A LINQ bare method reference (requires the §5 import) — the largest,
