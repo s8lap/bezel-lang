@@ -5095,28 +5095,122 @@ llvm::Value* Emitter::buildRecordValue(
     std::vector<const sema::Symbol*> fields;
     collectRecordStorage(t, fields);
 
+    // fix #2464 (§9.1, v0.235): `collectRecordStorage`/`t->members` order a
+    // record's BODY members ahead of its POSITIONAL fields regardless of
+    // source declaration order — SymbolCollection.cpp's collectTypeDecl
+    // always walks td.members (the body) before appending td.positionalFields
+    // — a storage detail §32.13 clause 2 leaves implementation-defined for an
+    // ordinary (non-C-compatible) record: "Field reordering and packing
+    // optimizations are forbidden for classified records; all other records
+    // keep unspecified layout." The §9.1 auto-generated PRIMARY constructor's
+    // parameters are "the positional fields, in declaration order" — never
+    // the body storage — so `args[i]` must map to the i-th POSITIONAL field
+    // specifically, never to `fields[i]` by raw storage index.
+    //
+    // The positional subset is computed inside the fast-path gate below, as
+    // the TRAILING `args.size()` entries of `fields` — NOT via
+    // FieldSymbol::posParam. posParam is a real `ast::Param*`, populated by
+    // SymbolCollection.cpp only for a LOCALLY-declared record; ModuleLoader.cpp
+    // never sets it for an IMPORTED field (there is no wire-level "is this
+    // field positional" tag on MetaMember — only the whole-type
+    // MetaTypeDecl::hasPositionalFields boolean). Filtering on posParam alone
+    // would leave every imported record's positional set EMPTY, breaking
+    // cross-module positional-record construction entirely. Instead this
+    // relies on a structural invariant that holds on BOTH sides: every
+    // positional field is always exported (an auto-generated PUBLIC
+    // read-only property, §9.1) and — because both
+    // ModuleMetadataBuilder.cpp's export loop and ModuleLoader.cpp's
+    // reconstruction loop are single linear passes over `t.members` that only
+    // ever SKIP non-exported entries, never reorder — the positional fields
+    // stay a single CONTIGUOUS block at the tail of `fields`/`t->members`,
+    // in their own declared order, on the importer's reconstruction exactly
+    // as on the exporter's own compilation. The §9.1 auto-generated primary
+    // constructor's arity always equals the record's TRUE positional-field
+    // count (sema rejects a mismatched call before codegen ever runs), so
+    // whenever this gate is reached (an implicit-primary-ctor call, so
+    // `args.size()` IS that arity), the trailing `args.size()`-length slice
+    // of `fields` is exactly the positional fields, in their declared order.
+    // The `args.size() <= fields.size()` bound below is a defensive guard
+    // against iterator underflow on a malformed call sema should already
+    // have rejected before codegen — not a claim that inequality is a
+    // legitimate case.
+    //
+    // §9.2 body record (or a combined-form record's non-positional storage):
+    // zero the whole struct, then run every body-declared field/auto-property
+    // initializer. Hoisted ahead of the positional fast path below (fix
+    // #2464, was previously only reached when falling through to the
+    // explicit-constructor path) — a combined-form record's positional fast
+    // path fills only the POSITIONAL slots, so any body storage must already
+    // be zeroed/defaulted first. A positional field's `m->decl` is the owning
+    // TypeDecl (never a FieldDecl/PropertyDecl), so this loop naturally skips
+    // positional fields — they have no separate initializer to run.
+    builder_.CreateStore(llvm::ConstantAggregateZero::get(st), slot);
+    for (const sema::Symbol* m : fields) {
+        const ast::Expr* init = nullptr;
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+            init = fd->initializer.get();
+        else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+            init = pd->autoInitializer.get();  // §9.2: `property X := v;`
+        if (!init) continue;
+        auto idxIt = fieldIndex_.find(m);
+        if (idxIt == fieldIndex_.end()) continue;
+        llvm::Value* v = lowerExpr(*init);
+        if (!v) {
+            // #1386: ICE — lowerExpr returned null for a record field/property
+            // default initializer; the expression kind is not yet handled.
+            ctx_.diagnostics().report(
+                Severity::Error, init->span.begin,
+                "internal: lowerExpr returned null for record field/property "
+                "default initializer — #1386");
+            continue;
+        }
+        // CG-nullable: a NULLABLE VALUE field initialized with a plain value
+        // (`property N: int? := 9;`, or `property C: Color? := Color.Green;` —
+        // issue #364) must wrap the bare value into the {i8 hasValue; T value}
+        // struct, like the positional path below. per §9.2
+        const sema::TypeRef* initFty = recordMemberType(m);
+        if (isNullableValueTy(initFty)) {
+            auto* expectedSt = nullableValueStructTy(initFty);
+            if (v->getType() != expectedSt) {
+                if (v->getType()->isPointerTy() &&
+                    llvm::isa<llvm::ConstantPointerNull>(v))
+                    v = nullableValueNull(initFty);
+                else if (v->getType() == expectedSt->getElementType(1))
+                    v = wrapNullableValue(initFty, v);
+            }
+        }
+        builder_.CreateStore(
+            v, builder_.CreateStructGEP(st, slot, idxIt->second));
+    }
+
     // §9.1 positional record: a bare positional argument list whose count
-    // matches the storage members maps each argument to its field by
-    // position. This is the original positional-record construction path,
-    // taken only when the record has no explicit constructor.
+    // matches the POSITIONAL storage members (fix #2464: never total storage
+    // — a combined form's body fields/auto-properties are not primary-
+    // constructor parameters, §9.1) maps each argument to its positional
+    // field by position. This is the original positional-record construction
+    // path, taken only when the record has no explicit constructor.
     //
     // §22.5 / #540: named arguments on a positional record are also handled
     // here by reordering the supplied args to field-declaration order before
     // the field stores, mirroring buildOrderedArgs for class constructors.
-    if (!hasAnyConstructor(t) && !args.empty() &&
-        args.size() == fields.size()) {
+    if (!hasAnyConstructor(t) && !args.empty() && args.size() <= fields.size()) {
+        // fix #2464: the positional fields are the TRAILING args.size()
+        // entries of `fields` (see the comment above) — never fields[0..N).
+        std::vector<const sema::Symbol*> posFields(
+            fields.end() - static_cast<std::ptrdiff_t>(args.size()),
+            fields.end());
         bool allPositional = true;
         for (const auto& a : args)
             if (!a.name.empty()) { allPositional = false; break; }
 
         // Build a field-index-ordered pointer to each call argument.
         // For positional args: fieldArg[i] = &args[i].
-        // For named args: fieldArg[i] = the arg whose .name == fields[i]->name.
+        // For named args: fieldArg[i] = the arg whose .name == posFields[i]->name.
         // Fall through to the body-record path if any name is unrecognised.
-        std::vector<const ast::CallArgument*> fieldArg(fields.size(), nullptr);
+        std::vector<const ast::CallArgument*> fieldArg(posFields.size(), nullptr);
         bool mappingOk = true;
         if (allPositional) {
-            for (std::size_t i = 0; i < fields.size(); ++i)
+            for (std::size_t i = 0; i < posFields.size(); ++i)
                 fieldArg[i] = &args[i];
         } else {
             // §22.5 / #540: map each named argument to the field with that name.
@@ -5131,8 +5225,8 @@ llvm::Value* Emitter::buildRecordValue(
                     mappingOk = false; break;
                 }
                 bool found = false;
-                for (std::size_t fi = 0; fi < fields.size(); ++fi) {
-                    if (fields[fi]->name == a.name) {
+                for (std::size_t fi = 0; fi < posFields.size(); ++fi) {
+                    if (posFields[fi]->name == a.name) {
                         fieldArg[fi] = &a;
                         found = true;
                         break;
@@ -5142,13 +5236,13 @@ llvm::Value* Emitter::buildRecordValue(
             }
             // Verify every field got an argument.
             if (mappingOk) {
-                for (std::size_t fi = 0; fi < fields.size(); ++fi)
+                for (std::size_t fi = 0; fi < posFields.size(); ++fi)
                     if (!fieldArg[fi]) { mappingOk = false; break; }
             }
         }
 
         if (mappingOk) {
-            for (std::size_t i = 0; i < fields.size(); ++i) {
+            for (std::size_t i = 0; i < posFields.size(); ++i) {
                 if (!fieldArg[i] || !fieldArg[i]->value) return nullptr;
                 // §9.1 / §15.4 (#1129): an INLINE-ARRAY field whose positional
                 // argument is a collection literal `[e1, e2, …]` must be built IN
@@ -5160,7 +5254,7 @@ llvm::Value* Emitter::buildRecordValue(
                 // (Binding the literal to a named local first already worked
                 // because the local-decl path materializes the array.)
                 {
-                    auto fit = fieldIndex_.find(fields[i]);
+                    auto fit = fieldIndex_.find(posFields[i]);
                     if (fit != fieldIndex_.end()) {
                         llvm::Type* fty0 = st->getElementType(fit->second);
                         auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
@@ -5244,7 +5338,7 @@ llvm::Value* Emitter::buildRecordValue(
                 // nullable-value wrap below fires and the value is stored as the
                 // tagged `{i8 hasValue; int value}` struct (the unresolved `T?`
                 // was mis-judged, leaving the field wrong).
-                const sema::TypeRef* fty = recordMemberTypeResolved(fields[i]);
+                const sema::TypeRef* fty = recordMemberTypeResolved(posFields[i]);
                 if (isNullableValueTy(fty)) {
                     auto* expectedSt = nullableValueStructTy(fty);
                     llvm::Type* valTy = expectedSt->getElementType(1);
@@ -5267,7 +5361,7 @@ llvm::Value* Emitter::buildRecordValue(
                                 fty, builder_.CreateSExtOrTrunc(v, valTy));
                     }
                 }
-                auto idxIt = fieldIndex_.find(fields[i]);
+                auto idxIt = fieldIndex_.find(posFields[i]);
                 if (idxIt == fieldIndex_.end()) return nullptr;
                 // §5/§6/§9.1: widen/narrow a numeric positional argument to the
                 // field's storage type before the store — e.g. an `int` literal
@@ -5288,50 +5382,12 @@ llvm::Value* Emitter::buildRecordValue(
         }
     }
 
-    // §9.2 body record (or a record constructed through an explicit
-    // constructor): zero the storage, run auto-property / field
-    // initializers, then run the matching constructor with `this` bound to
-    // the struct slot. Mirrors the class construction path in lowerNew but
-    // for a by-value struct.
-    builder_.CreateStore(llvm::ConstantAggregateZero::get(st), slot);
-    for (const sema::Symbol* m : fields) {
-        const ast::Expr* init = nullptr;
-        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
-            init = fd->initializer.get();
-        else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
-            init = pd->autoInitializer.get();  // §9.2: `property X := v;`
-        if (!init) continue;
-        auto idxIt = fieldIndex_.find(m);
-        if (idxIt == fieldIndex_.end()) continue;
-        llvm::Value* v = lowerExpr(*init);
-        if (!v) {
-            // #1386: ICE — lowerExpr returned null for a record field/property
-            // default initializer; the expression kind is not yet handled.
-            ctx_.diagnostics().report(
-                Severity::Error, init->span.begin,
-                "internal: lowerExpr returned null for record field/property "
-                "default initializer — #1386");
-            continue;
-        }
-        // CG-nullable: a NULLABLE VALUE field initialized with a plain value
-        // (`property N: int? := 9;`, or `property C: Color? := Color.Green;` —
-        // issue #364) must wrap the bare value into the {i8 hasValue; T value}
-        // struct, like the positional path above. per §9.2
-        const sema::TypeRef* fty = recordMemberType(m);
-        if (isNullableValueTy(fty)) {
-            auto* expectedSt = nullableValueStructTy(fty);
-            if (v->getType() != expectedSt) {
-                if (v->getType()->isPointerTy() &&
-                    llvm::isa<llvm::ConstantPointerNull>(v))
-                    v = nullableValueNull(fty);
-                else if (v->getType() == expectedSt->getElementType(1))
-                    v = wrapNullableValue(fty, v);
-            }
-        }
-        builder_.CreateStore(
-            v, builder_.CreateStructGEP(st, slot, idxIt->second));
-    }
-
+    // §9.2 body record, or a combined-form/positional record constructed
+    // through an EXPLICIT constructor: storage is already zeroed and
+    // body-declared initializers have already run (hoisted above, fix
+    // #2464); here, run the matching constructor with `this` bound to the
+    // struct slot. Mirrors the class construction path in lowerNew but for a
+    // by-value struct.
     if (sema::ConstructorSymbol* cs = ctorForArgs(t, args)) {
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
         if (!cd) return nullptr;
