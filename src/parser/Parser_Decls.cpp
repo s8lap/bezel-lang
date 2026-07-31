@@ -389,7 +389,7 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                 }
             }
         } else {
-            decl->baseTypes = parseInheritance();
+            decl->baseTypes = parseInheritance(decl.get());
         }
         decl->genericConstraints = parseGenericConstraints();
     }
@@ -2753,18 +2753,104 @@ std::vector<ast::GenericParam> Parser::parseGenericParams() {
     return params;
 }
 
-std::vector<std::unique_ptr<ast::Type>> Parser::parseInheritance() {
+std::vector<std::unique_ptr<ast::Type>> Parser::parseInheritance(
+    const ast::TypeDecl* decl) {
     // A.3: `Inheritance ::= ":" InheritItem ("," InheritItem)*`.
-    // `InheritItem ::= Type ("(" ArgList? ")")?` — the optional argument
-    // list is tokenized away here; ArgList contains expressions which
-    // arrive in the expression slice.
+    // `InheritItem ::= Type ("(" ArgList? ")")?`.
+    //
+    // fix #2455 (§11.1 / §22.10 / §12.8, v0.235): this function is reached
+    // for interface decls, record decls, and — via the caller's
+    // `!(kind==Class && hasPositionalFields)` branch — for CLASS decls that
+    // have NO primary-constructor parameter list of its own. Previously an
+    // argument list here was silently tokenized away with no AST record and
+    // no diagnostic: `class D: Base(99)` compiled and ran `Base()` with no
+    // arguments, silently dropping the 99 (issue #2455's confirmed repro,
+    // LOCAL bases included — not cross-module-specific).
+    //
+    // The spec ties the header argument-list shorthand exclusively to a
+    // primary constructor: §11.1 "If the class has a base class that
+    // requires constructor arguments, the base's arguments appear in
+    // parentheses after the base class name in the inheritance list" is
+    // stated within the "Primary constructors" subsection, and §22.10 says
+    // the sugar "replaces an explicit base(...) call" that a primary
+    // constructor would otherwise need. For a class with NO primary
+    // constructor and no explicit constructor, §12.8 gives the general,
+    // unconditional rule instead: "If neither base(...) nor this(...) is
+    // written, the compiler inserts an implicit base() call" — a
+    // NO-ARGUMENT call, with no provision anywhere for a header argument
+    // list to feed it. Confirmed against the existing (correct, tested)
+    // implementation too: `class D(): Base(99)` — an explicit EMPTY primary-
+    // ctor parameter list — already threads 99 through
+    // `decl->primaryBaseCtorArgs` (the `hasPositionalFields` branch above)
+    // and runs correctly; only the bare `class D: Base(99)` spelling (no
+    // primary ctor at all) was silently accepting and discarding. So a
+    // class-header argument list without an owning primary constructor has
+    // no defined destination — reject it rather than silently drop it
+    // (CLAUDE.md rule 4: silently picking a semantics for an unspecified
+    // shape is the forbidden option; here the simplest SOUND reading is
+    // rejection, since inventing "which constructor does this bind to" for
+    // a class that may declare several independently-chaining explicit
+    // constructors has no textual answer).
+    //
+    // Interface and record decls reaching this same function are UNCHANGED
+    // by this fix — they keep the original tokenize-away behaviour. Every
+    // item in their inheritance list is an interface (records cannot
+    // inherit a class at all, other than the implicit `Object` root, per
+    // §9.6; interfaces only extend other interfaces), so an argument list
+    // there is inert nonsense rather than silently-dropped DATA (nothing
+    // was ever going to consume it) — a real but lower-severity, distinct
+    // gap, filed separately (#2466) rather than folded into this fix.
+    const bool rejectArgList = decl != nullptr &&
+        decl->kind == ast::TypeDeclKind::Class;
     std::vector<std::unique_ptr<ast::Type>> items;
     if (!isPunctuator(":")) return items;
     advance(); // past ':'
 
+    // `itemIndex` distinguishes the base-class position (0) from an
+    // interface position (>0) for the diagnostic wording — per the grammar
+    // note on `InheritItem` (Appendix A.3), an argument list is syntactically
+    // admitted on every item but semantically meaningful only on the first.
+    std::size_t itemIndex = 0;
     auto parseOne = [&]() -> std::unique_ptr<ast::Type> {
+        const std::size_t thisIndex = itemIndex++;
         auto t = parseType();
         if (isPunctuator("(")) {
+            const SourceLocation argListLoc = current_.location;
+            // An EMPTY arg list (`Base()`) drops no data — it supplies zero
+            // arguments, exactly what §12.8's implicit `base()` call already
+            // does for a class with neither a primary nor an explicit
+            // constructor. Only a NON-empty list silently discards a real
+            // value (the issue's actual bug), so only that is rejected;
+            // `Base()` keeps parsing as a harmless no-op (regression guard:
+            // parser_generics_inheritance.inheritance_with_unparsed_arg_list_
+            // does_not_error already asserts this stays accepted).
+            const bool argListNonEmpty = peekNext().kind != TokenKind::Punctuator ||
+                                          peekNext().text != ")";
+            if (rejectArgList && argListNonEmpty) {
+                if (thisIndex == 0) {
+                    diagnostics_.report(
+                        Severity::Error, argListLoc,
+                        "class `" + std::string(decl->name) + "` supplies a "
+                        "base-constructor argument list here, but `" +
+                        std::string(decl->name) + "` declares no primary-"
+                        "constructor parameter list of its own — the header "
+                        "argument-list shorthand feeds a primary "
+                        "constructor's `base(...)` chain (§11.1, §22.10, "
+                        "v0.235), and a class without one gets an implicit "
+                        "no-argument `base()` call instead (§12.8, v0.235) "
+                        "that cannot receive these arguments; add an empty "
+                        "primary-constructor parameter list (`" +
+                        std::string(decl->name) + "()`) or declare an "
+                        "explicit constructor that chains via `base(...)`");
+                } else {
+                    diagnostics_.report(
+                        Severity::Error, argListLoc,
+                        "an argument list is not permitted here — per "
+                        "Appendix A's `InheritItem` grammar (v0.235), it is "
+                        "permitted only on the base class (the first item "
+                        "in the inheritance list), not on an interface");
+                }
+            }
             // Skip a balanced parenthesised group without parsing its contents.
             int depth = 1;
             advance();
