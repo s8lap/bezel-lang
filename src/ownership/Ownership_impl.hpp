@@ -55,6 +55,14 @@ namespace bezel::ownership {
 //     try/finally, so it is not reported as leaked on that edge.
 using BlockState = std::unordered_map<sema::Symbol*, LocalOwnership>;
 
+// §28.8.1 (#1125) / §28.6 bullet 2 (#2518): if `e` is a leading force-unwrap
+// `x!` (PostfixBangExpr), return its operand `x`; otherwise return `e`
+// unchanged. Lets the §28.6 / §28.8.1 field-read recognizers see through the
+// null-forgiving `!` so the force-unwrap spellings (`return _f!`, `move _f!`)
+// are classified identically to their bare forms. Defined in
+// Ownership_Checks.cpp; shared by both Ownership.cpp and Ownership_Checks.cpp.
+const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e);
+
 // §28.8.1 (#867): the per-block dataflow lattice for the field-restoration
 // check. A `move` of an owned field leaves the field moved-from; the field
 // must be RESTORED (reassigned a value, incl. `null` for a nullable owned

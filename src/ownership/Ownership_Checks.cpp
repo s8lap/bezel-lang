@@ -17,7 +17,6 @@ namespace bezel::ownership {
 // The statement/flow-walking definitions live in Ownership.cpp alongside
 // the public checkOwnership entry point.
 
-namespace {
 // §28.8.1 (#1125): the operand of a `move` may be a force-unwrap of a nullable
 // owned field/local — `move _slot!` / `move this._slot!`. The null-forgiving
 // `!` is a postfix PostfixBangExpr wrapping the field/local reference. The spec
@@ -28,6 +27,14 @@ namespace {
 // so the move-recognition below sees the field/local identifier. (Undiagnosed,
 // the field stays moved-from with no restoration check, and the owner's
 // auto-disposer re-disposes the moved-out object → double-free / SIGSEGV.)
+//
+// #2518: hoisted out of the anonymous namespace so the `checkOwnedFieldReturn`
+// arms in Ownership.cpp (a separately-compiled TU) can thread it through the
+// §28.6 bullet 2 / §28.8.1 field-read test — `return _f!` through an `owned`
+// return and `return move _f!` through a non-`owned` return are the force-
+// unwrap twins of #2368 / #1005 and must be classified identically to their
+// bare forms (the `!` does not make `_f` a `move`, and `move _f!` is still a
+// `move` of the underlying owned field). Declared in Ownership_impl.hpp.
 const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e) {
     // The null-forgiving `!` is a postfix operator → PostfixBangExpr (§A.7),
     // not a prefix UnaryExpr.
@@ -35,6 +42,8 @@ const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e) {
         if (b->operand) return b->operand.get();
     return e;
 }
+
+namespace {
 
 // §22.10 (#1627): resolve the parameter list that a `new T(args)` call binds to,
 // for the owned-argument / call-site-marker checks in the NewExpr handlers.

@@ -7657,7 +7657,17 @@ void MethodOwnership::checkOwnedFieldReturn(const ast::Expr& e) {
         // FieldSymbol, so `return ownedParam;` / `return ownedLocal;` does NOT
         // match (those are the legal owned-passthrough shapes). A fresh `new`
         // or owned-returning call result is not a field read either — admitted.
-        if (exprIsOwnedFieldRead(e)) {
+        //
+        // #2518 (§28.6 bullet 2 / §17.8 / §28.8.1): look through a leading
+        // force-unwrap `!` so the nullable spelling `=> _f!` is classified
+        // identically to its bare form `=> _f`. §17.8 line 3271: "The null-
+        // forgiving operator preserves ownership ... it does not move, copy,
+        // or borrow beyond what reading `x` already does" — so `_f!` is the
+        // SAME bare read as `_f` (the `!` only strips the §7 nullable-vs-non-
+        // nullable mismatch that would otherwise fire first on the bare
+        // nullable form, exposing the very §28.6 bullet 2 hole #2368 closed;
+        // it does NOT make the read a `move`).
+        if (exprIsOwnedFieldRead(*lookThroughForceUnwrap(&e))) {
             report(
                 Severity::Error, e.span.begin,
                 "a bare read of an owned field may not be returned through an "
@@ -7685,7 +7695,19 @@ void MethodOwnership::checkOwnedFieldReturn(const ast::Expr& e) {
     // identifier `f` (implicit `this.f`) to its FieldSymbol and checks the
     // `owned` modifier; a method-scope local/parameter is not a FieldSymbol, so
     // `move localOwned` (the #1006a concern) does not match. // per §28.6
-    if (!exprIsOwnedFieldRead(*un->operand)) return;
+    //
+    // #2518 (§28.6 / §17.8 / §28.8.1): look through a leading force-unwrap
+    // `!` so the nullable spelling `move _f!` is classified identically to its
+    // bare form `move _f`. §17.8 line 3271 ("the null-forgiving operator ...
+    // does not move, copy, or borrow beyond what reading `x` already does")
+    // makes `move _f!` a `move` of the SAME underlying owned field as
+    // `move _f`; on the non-`owned`-return path that leaks the moved value
+    // out with no owner exactly like `move _f` (#1005). (`move _f!` followed
+    // by `_f := null` is §28.8.1's canonical nullable-field detach — line
+    // 4605 — but only through an `owned` return; the non-`owned`-return arm
+    // remains a leak.)
+    if (!exprIsOwnedFieldRead(*lookThroughForceUnwrap(un->operand.get())))
+        return;
     report(
         Severity::Error, e.span.begin,
         "cannot return an owned field's `move`d value through a non-`owned` "
