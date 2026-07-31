@@ -2,7 +2,9 @@
 
 *A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.236.*
 
-If you know C#, Kotlin, or Swift, most of this chapter is familiar: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. Skim those parts. The three places where the ownership model changes how you write this code — and where a habit from those languages produces a *compile error* — are headed **How Bezel does it**. Read those.
+If you know C#, Kotlin, or Swift, the syntax here is familiar: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. The *emphasis* is not. Bezel splits failure signals by one rule (the **failure-signal rule**, stdlib §1), and it is worth knowing the shape before the details: an **expected absence** returns a value — `T?` or a `Try` shape (§2); an **expected outcome the caller branches on** — with a plain value payload — returns a `Result<T, E>` or a domain choice (§3); a **caller bug** is a contract (`requires`, §7) or defect exception, and a **boundary fault** — I/O, network, anything logged or retried rather than branched on — is a typed exception (§4); a handful of fatal conditions simply terminate. So in Bezel application code the common case is a value return, and exceptions are the boundary-and-defect tool — not the default. Beyond the emphasis, two ownership rules change habits those languages taught you — a caught exception is a *borrow* (§5), and cleanup on the exception path is *automatic* (§6) — each headed **How Bezel does it**; if you skim everything else, read those and the table in §7.
+
+**Contents:** §1 nullability basics · §2 expected absence: `T?`, `*OrNull`, `Try` · §3 expected outcomes: `Result<T, E>` and domain choices · §4 exceptions: the familiar shape · §5 a caught exception is a borrow · §6 cleanup without leaks · §7 choosing the right tool.
 
 ---
 
@@ -48,121 +50,9 @@ Locals can lose their narrowing too: a local that is **mutably captured** — as
 
 ---
 
-## 2. Exceptions: the familiar shape
+## 2. Expected failure: absence — `T?`, the `*OrNull` tier, and the `Try` pattern
 
-`try` / `catch` / `finally`, with `catch` arms that look like `case` arms (pattern + optional guard + body), tried top to bottom:
-
-```bezel
-try
-  var data := Parse(input);
-  Process(data);
-catch
-  var e: FormatException => Log($"bad input: {e.Message}"),
-  var e: InvalidOperationException => Log($"bad state: {e.Message}")
-finally
-  Log("done");
-end;
-```
-
-`finally` always runs — normal completion, exception, or `return`. An unmatched exception simply keeps propagating (there is no exhaustiveness warning on `catch`; letting non-matching exceptions through is normal). `return` inside `finally` is a compile error.
-
-The built-in exception hierarchy is what you would expect — `ArgumentException` (with `ArgumentNullException` under it), `InvalidOperationException`, `OverflowException`, `IndexOutOfRangeException`, `FormatException`, and so on. These are available without `import`. Arm patterns match subclasses: a `catch` arm for `ArithmeticException` also catches `OverflowException` and `DivideByZeroException`. Order arms most-specific first.
-
-A handful of common exception types live in the standard library rather than the built-in set and need an explicit `import` — `IOException` and `FileNotFoundException` (with the file APIs), `KeyNotFoundException` (with `Dictionary<K, V>`), and others. They are otherwise ordinary exceptions, caught the same way.
-
-Two resource-exhaustion faults are deliberately unrecoverable — no `catch` will ever handle them, and both terminate the process. A **stack overflow** raises a `StackOverflowException`: the type exists in the hierarchy, but it **cannot be caught** — no `catch` arm ever matches it. An out-of-memory **allocation failure** is not an exception at all: there is no `OutOfMemoryException`, nothing unwinds, the process simply aborts. Neither is something a `catch` could meaningfully handle — the "handler" would itself need the stack or heap that just ran out — so Bezel does not pretend otherwise.
-
-Throwing:
-
-```bezel
-throw new ArgumentException("Amount must be positive.", nameof(amount));
-```
-
-`throw;` with no operand re-raises the current exception (in a catch arm only), preserving the original stack trace.
-
----
-
-## 3. How Bezel does it: a caught exception is a *borrow*, not yours to keep
-
-This is the most important rule to internalize. In C# you can stash a caught exception — `_lastError = ex;`, capture it in a closure, return it. In Bezel a caught exception is a **borrow** whose lifetime is the catch arm body. The runtime owns the exception and disposes it when the arm completes. You may use `ex` and pass it to methods (they borrow it for the call), but you may **not**:
-
-- assign it to an `owned` field,
-- return it as `owned`,
-- capture it in a closure that outlives the arm.
-
-```bezel
-private owned _lastError: Exception?;
-
-method Handle()
-  try
-    Risky();
-  catch
-    var ex: Exception => _lastError := ex;   // ERROR: ex is a borrow;
-  end;                                        //  cannot assign to an owned field
-end Handle;
-```
-
-(A note on the shape: arm bodies in `catch` can be an expression, a single statement, or a `do … end` block. The assignment `_lastError := ex;` is a single statement, so it works directly as the arm body — its terminating `;` ends the body and the next arm follows. For multi-statement work the `do … end` form is used; for very compact arms a method call is common. All three forms are equivalent in semantics; pick the one that reads cleanest at the point of use.)
-
-To preserve information about the failure, copy the data you need into owned values *inside the arm*. When the work is more than a line or two, extracting a named helper is usually clearer — the helper gives the action a name a reader can recognize at a glance and localizes any side effects it performs:
-
-```bezel
-private _lastErrorText: string?;
-
-method Handle()
-  try
-    Risky();
-  catch
-    var ex: Exception => RecordError(ex)
-  end;
-end Handle;
-
-private method RecordError(ex: Exception)
-  _lastErrorText := ex.Message;            // string is fine to keep
-  Log($"{ex.Message}\n{ex.StackTrace}");
-end RecordError;
-```
-
-`ex.Message` is a `string` (runtime-managed, no ownership obligation), so copying it out is fine. The exception *instance* cannot escape. The single exception to the rule is the bare re-throw `throw;`, which hands the in-flight exception back to the runtime rather than capturing it.
-
-The reasoning: an exception often carries no disposable resources, but the rule is uniform so the language never has to ask "does this exception own something?" at a `catch` boundary. Copy what you need; let the instance go.
-
-The same borrow discipline reaches *inside* an exception you throw: don't stash a borrow of a local in an exception's field. The unwind disposes that local before the handler runs — in checked mode the handler's access to it faults deterministically as `DisposedAccessException`. Give exception classes owned or copied state instead; that is exactly why the built-in cause-chaining constructor (`new Exception(msg, cause)`) *snapshots* the cause rather than pointing at it.
-
----
-
-## 4. How Bezel does it: exceptions and cleanup — there is no leak, automatically
-
-In C# you reach for `try`/`finally` (or `using`) to avoid leaking on the exception path. In Bezel you usually write neither *for leak prevention*: an owned value live when an exception propagates is disposed automatically during unwinding (every owned local and `owned` parameter behaves as if wrapped in an implicit `try`/`finally`). `using var` stays the default — it declares *intent*, not exception-safety — and what you stop writing is the `try`/`finally` *cleanup plumbing*.
-
-```bezel
-method Import(path: string)
-  using var fs := new FileStream(path, FileMode.Open);
-  using var parser := new Parser(fs);
-  parser.ReadAll();                // if this throws, parser then fs are
-end Import;                        // disposed automatically, innermost first
-```
-
-No `try`/`finally` is needed for resource safety — that is what `using var` and the ownership model already guarantee, on the exception path as well as the normal one. Use `finally` only for cleanup that is *not* a disposal: flushing a log, releasing a non-owned external lock, restoring global state.
-
-```bezel
-try
-  BeginBatch();
-  DoWork();                        // may throw
-finally
-  EndBatch();                      // must run even on failure; not a disposal
-end;
-```
-
-Even a half-constructed object is safe: if a constructor throws after some `owned` fields are set, those fields are disposed before the exception propagates. The same holds for a half-built *expression*: if one argument throws while an earlier argument has already produced an owned temporary, that temporary is disposed during the unwind (v0.184) — an exception never leaks a half-built argument list. You do not write code for any of this.
-
-One diagnostic worth recognizing in this area: disposing a value and then using it. A *straight-line* dispose-then-use is a warning (and a deterministic fault in checked mode); a use after a *conditional* dispose — disposed on one branch, still live on another — is a compile error at the merge (the value is "maybe-disposed"). Both are the compiler catching a use-after-free before it can happen.
-
----
-
-## 5. Expected failure: return a value, don't throw
-
-Exceptions are for the unexpected. For failures that are part of normal control flow — a cache miss, a parse that may legitimately fail, a lookup that may be absent — return the outcome instead. Three idioms.
+Expected failure is a value, not a throw — exceptions are the boundary-and-defect tool (§4). For failures that are part of normal control flow, return the outcome. The simplest expected failure is **absence** — a cache miss, a lookup with nothing under the key, a parse of input that may legitimately be malformed. Two shapes cover it; §3 adds the third.
 
 **Nullable return** for "maybe there is a value":
 
@@ -215,7 +105,11 @@ end;                               // c disposed at the end of the enclosing blo
 
 `out using var c` binds the out value as an owned, scope-disposed local — so a successful call that handed you a `Connection` cannot leak. Its scope is the *enclosing* block, from the call onward (not just the `if`), so the connection is disposed when that block ends. Without the `when true` clause you would still write `UseConnection(c!)` — the bool guard alone does not narrow the nullable; only the postcondition does. (`out owned` in the signature and `out using var` at the call site must match: you cannot write `out using var` for a plain `out` parameter, nor plain `out var` for an `out owned` one — the compiler rejects the mismatch, because the ownership would have nowhere to go.) This is the ownership-aware version of C#'s `TryGet`: the contract is "on `true`, you now own it," and `out using var` discharges that obligation for you.
 
-**The `choice` return** when the failure is expected, branched on at or near the call site, and its payload is a plain value shape (spec §35; the failure-signal rule's band 3, stdlib §1). Where the nullable return says only "absent" and the Try pattern carries the failure in out-parameters, a `choice` names every outcome and carries each one's data — and the `case` over it is exhaustiveness-checked, so adding an outcome breaks every consumer at compile time instead of silently falling through a null check:
+---
+
+## 3. Expected failure: outcomes with information — `Result<T, E>` and domain choices
+
+When the failure itself has something to say — *which* error, at *which* position, of *which* kind — absence is not enough. **The `choice` return** is the tool when the failure is expected, branched on at or near the call site, and its payload is a plain value shape (spec §35; the failure-signal rule's band 3, stdlib §1). Where the nullable return says only "absent" and the Try pattern carries the failure in out-parameters, a `choice` names every outcome and carries each one's data — and the `case` over it is exhaustiveness-checked, so adding an outcome breaks every consumer at compile time instead of silently falling through a null check:
 
 ```bezel
 public method ParsePort(text: string): Result<int, string>
@@ -267,14 +161,124 @@ Note the `AndThen` lambda's return-type ascription: it makes the lambda's own re
 
 ---
 
-## 6. Choosing the right tool
+## 4. Exceptions: the familiar shape
+
+For everything the value shapes don't cover — the boundary fault, and the defect a `requires` contract (§7) cannot state — the exception machinery is the familiar one. `try` / `catch` / `finally`, with `catch` arms that look like `case` arms (pattern + optional guard + body), tried top to bottom:
+
+```bezel
+try
+  var data := Parse(input);
+  Process(data);
+catch
+  var e: FormatException => Log($"bad input: {e.Message}"),
+  var e: InvalidOperationException => Log($"bad state: {e.Message}")
+finally
+  Log("done");
+end;
+```
+
+`finally` always runs — normal completion, exception, or `return`. An unmatched exception simply keeps propagating (there is no exhaustiveness warning on `catch`; letting non-matching exceptions through is normal). `return` inside `finally` is a compile error.
+
+The built-in hierarchy is what you would expect — `ArgumentException` (with `ArgumentNullException` under it), `InvalidOperationException`, `FormatException`, `OverflowException`, and so on, available without `import` (the full set is spec §31.4). Library producers declare their own exception types beside their APIs — `IOException` and `FileNotFoundException` with the file APIs, `KeyNotFoundException` with `Dictionary<K, V>`, and others — reached by the producer's `import` and otherwise ordinary. Arm patterns match subclasses: a `catch` arm for `ArithmeticException` also catches `OverflowException` and `DivideByZeroException`. Order arms most-specific first.
+
+Two resource-exhaustion faults are deliberately unrecoverable — no `catch` will ever handle them, and both terminate the process. A **stack overflow** raises a `StackOverflowException`: the type exists in the hierarchy, but it **cannot be caught** — no `catch` arm ever matches it. An out-of-memory **allocation failure** is not an exception at all: there is no `OutOfMemoryException`, nothing unwinds, the process simply aborts. Neither is something a `catch` could meaningfully handle — the "handler" would itself need the stack or heap that just ran out — so Bezel does not pretend otherwise.
+
+Throwing:
+
+```bezel
+throw new ArgumentException("Amount must be positive.", nameof(amount));
+```
+
+`throw;` with no operand re-raises the current exception (in a catch arm only), preserving the original stack trace.
+
+---
+
+## 5. How Bezel does it: a caught exception is a *borrow*, not yours to keep
+
+This is the most important rule to internalize. In C# you can stash a caught exception — `_lastError = ex;`, capture it in a closure, return it. In Bezel a caught exception is a **borrow** whose lifetime is the catch arm body. The runtime owns the exception and disposes it when the arm completes. You may use `ex` and pass it to methods (they borrow it for the call), but you may **not**:
+
+- assign it to an `owned` field,
+- return it as `owned`,
+- capture it in a closure that outlives the arm.
+
+```bezel
+private owned _lastError: Exception?;
+
+method Handle()
+  try
+    Risky();
+  catch
+    var ex: Exception => _lastError := ex;   // ERROR: ex is a borrow;
+  end;                                        //  cannot assign to an owned field
+end Handle;
+```
+
+(A note on the shape: arm bodies in `catch` can be an expression, a single statement, or a `do … end` block. The assignment `_lastError := ex;` is a single statement, so it works directly as the arm body — its terminating `;` ends the body and the next arm follows. For multi-statement work the `do … end` form is used; for very compact arms a method call is common. All three forms are equivalent in semantics; pick the one that reads cleanest at the point of use.)
+
+To preserve information about the failure, copy the data you need into owned values *inside the arm*. When the work is more than a line or two, extracting a named helper is usually clearer — the helper gives the action a name a reader can recognize at a glance and localizes any side effects it performs:
+
+```bezel
+private _lastErrorText: string?;
+
+method Handle()
+  try
+    Risky();
+  catch
+    var ex: Exception => RecordError(ex)
+  end;
+end Handle;
+
+private method RecordError(ex: Exception)
+  _lastErrorText := ex.Message;            // string is fine to keep
+  Log($"{ex.Message}\n{ex.StackTrace}");
+end RecordError;
+```
+
+`ex.Message` is a `string` (runtime-managed, no ownership obligation), so copying it out is fine. The exception *instance* cannot escape. The single exception to the rule is the bare re-throw `throw;`, which hands the in-flight exception back to the runtime rather than capturing it.
+
+The reasoning: an exception often carries no disposable resources, but the rule is uniform so the language never has to ask "does this exception own something?" at a `catch` boundary. Copy what you need; let the instance go.
+
+The same borrow discipline reaches *inside* an exception you throw: don't stash a borrow of a local in an exception's field. The unwind disposes that local before the handler runs — in checked mode the handler's access to it faults deterministically as `DisposedAccessException`. Give exception classes owned or copied state instead; that is exactly why the built-in cause-chaining constructor (`new Exception(msg, cause)`) *snapshots* the cause rather than pointing at it.
+
+---
+
+## 6. How Bezel does it: exceptions and cleanup — there is no leak, automatically
+
+In C# you reach for `try`/`finally` (or `using`) to avoid leaking on the exception path. In Bezel you usually write neither *for leak prevention*: an owned value live when an exception propagates is disposed automatically during unwinding (every owned local and `owned` parameter behaves as if wrapped in an implicit `try`/`finally`). `using var` stays the default — it declares *intent*, not exception-safety — and what you stop writing is the `try`/`finally` *cleanup plumbing*.
+
+```bezel
+method Import(path: string)
+  using var fs := new FileStream(path, FileMode.Open);
+  using var parser := new Parser(fs);
+  parser.ReadAll();                // if this throws, parser then fs are
+end Import;                        // disposed automatically, innermost first
+```
+
+No `try`/`finally` is needed for resource safety — that is what `using var` and the ownership model already guarantee, on the exception path as well as the normal one. Use `finally` only for cleanup that is *not* a disposal: flushing a log, releasing a non-owned external lock, restoring global state.
+
+```bezel
+try
+  BeginBatch();
+  DoWork();                        // may throw
+finally
+  EndBatch();                      // must run even on failure; not a disposal
+end;
+```
+
+Even a half-constructed object is safe: if a constructor throws after some `owned` fields are set, those fields are disposed before the exception propagates. The same holds for a half-built *expression*: if one argument throws while an earlier argument has already produced an owned temporary, that temporary is disposed during the unwind (v0.184) — an exception never leaks a half-built argument list. You do not write code for any of this.
+
+One diagnostic worth recognizing in this area: disposing a value and then using it. A *straight-line* dispose-then-use is a warning (and a deterministic fault in checked mode); a use after a *conditional* dispose — disposed on one branch, still live on another — is a compile error at the merge (the value is "maybe-disposed"). Both are the compiler catching a use-after-free before it can happen.
+
+---
+
+## 7. Choosing the right tool
 
 | Situation | Use |
 |---|---|
 | Value may legitimately be absent | nullable return `T?` (the stdlib's `*OrNull` tier: `ParseOrNull`, `GetOrNull`), handle with `?.` / `??` / narrowing |
 | Absent *and* the value would be owned | `Try` pattern: `bool` + `out owned T? when true`, caller uses `out using var` (and drops the `!`) |
 | Failure is expected, carries information the caller *branches on* at or near the call, and the error payload is a plain value shape | `choice` return (`Result<T, E>` or a domain choice, spec §35); consume with an exhaustive `case`, or — where both payloads are value-like — pipeline with the combinators (`Map`/`MapError`/`AndThen`/`UnwrapOr`, stdlib §2.20) |
-| Failure is expected but consumed at a *boundary* — logged, retried, converted to a protocol answer, reported — or its payload is an owned resource | a typed exception, producer-local (spec §31.4); read it in the `catch` and copy out what you keep (§3) |
+| Failure is expected but consumed at a *boundary* — logged, retried, converted to a protocol answer, reported — or its payload is an owned resource | a typed exception, producer-local (spec §31.4); read it in the `catch` and copy out what you keep (§5) |
 | Caller violated something a correct caller guarantees (a **bug**, not an outcome) | a `requires(...)` clause (spec §22.16) — always-on, faults `ContractViolationException`; never use `requires` for input whose invalidity is a normal outcome at a trust boundary (that is the `T?`/Try/`choice` territory above) |
 | Invalid input at a boundary with no contract (interop, pre-contract code) | `throw new ArgumentException(...)` — the residual idiom `requires` replaces where a contract is possible |
 | Operation invalid in current state | `throw new InvalidOperationException(...)` (or an `invariant(...)`/`requires(...)` where the condition is a class or caller contract) |

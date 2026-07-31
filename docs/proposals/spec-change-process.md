@@ -17,9 +17,9 @@ The governing principle is unchanged from `CLAUDE.md`: **the spec is the source 
 
 ---
 
-## 1. The six documents and what "changing the spec" means
+## 1. The seven documents and what "changing the spec" means
 
-The normative language is exactly the six documents in `docs/`:
+The normative language is exactly the seven documents in `docs/`:
 
 | Document | Role | Carries the revision number? |
 |---|---|---|
@@ -29,6 +29,7 @@ The normative language is exactly the six documents in `docs/`:
 | `Bezel_Changelog.md` | the per-revision narrative history; one entry per revision, pinned | **yes** — companion header |
 | `Bezel_Guide_01_Memory_and_Ownership.md` | example-first idiom guide | no (revalidation pin only) |
 | `Bezel_Guide_02_Errors_and_Nullability.md` | example-first idiom guide | no (revalidation pin only) |
+| `Bezel_Guide_03_Modeling_Data.md` | example-first idiom guide | no (revalidation pin only) |
 
 `docs/proposals/` is **not** normative. A proposal is a design under consideration; it becomes normative only by *graduating* — being amended into the normative documents through this process, at which point the proposal file's `Status` flips to `superseded` with a pointer to the landed revision.
 
@@ -38,7 +39,7 @@ A single **revision** (v0.NNN → v0.NNN+1) is the atomic unit of change: one ve
 
 ## 2. Change classes — different changes earn different gates
 
-Not every change deserves the same ceremony. Classify the change first; the class determines the required gate (§3–§4) and the artifacts (§5).
+Not every change deserves the same ceremony. Classify the change first; the class determines the required gate (§3–§4) and the artifacts (§5). One carve before classifying: a change touching **only the guides** is not a revision and takes no class — see §5 item 5's guide-only-pass rule.
 
 | Class | What it is | Examples | Required gate |
 |---|---|---|---|
@@ -94,6 +95,8 @@ A revision is not done when the text changes; it is done when the record is comp
 3. **A tracking issue for every spec-ahead-of-impl delta.** The spec routinely leads the compiler. Each semantic change that the compiler does not yet implement gets a GitHub issue filed *in the same landing*, citing the section and the revision (`§28.3, v0.184`) and stating what the spec now requires vs. what the compiler does. This is how "the spec is normative and the compiler is behind on exactly these items" stays legible. (`CLAUDE.md`'s spec-citation discipline applies: cite section *and* revision so the reference stays pinned.)
 4. **Comments closing the loop on prior issues** the revision resolves (close with the citation; or comment "landed in <sha>, tracking the impl delta").
 5. **Guide revalidation** when a revision changes idiom. The guides carry a revalidation pin, not a version number; bump it and re-trace every example. A guide that teaches a retired idiom is a defect (Guide 02 was 26 revisions stale when the 2026-07-11 run found it).
+
+   **Guide-only passes are unversioned (owner-ruled 2026-07-30).** A change touching only the guides — a restructure, an expansion, an idiom refresh at a fixed normative revision — takes **no version bump and no changelog entry**: the revision number pins the *normative* definition, and it must not churn for prose. The record is the commit message and PR, plus the adversarial meaning gate for substantive passes. The pin keeps its exact meaning — "re-validated against v0.NNN" names the normative revision the guide was last checked against — so it stays put when only guide prose moves, and moves only when the normative documents move and the guide is re-checked. When a guide change rides a normative train, that revision's entry mentions the pin move as before. (The one guide-only train that predates this ruling, v0.236, stands as pinned history.)
 
 ---
 
