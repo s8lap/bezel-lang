@@ -4501,7 +4501,24 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // not borrowable"; without this exclusion the inert-RHS check
         // would over-fire on every disposable-typed `using var` binding
         // (#2073 rework 2). // per §28.10, #2073 (rework 2)
-        const sema::TypeRef* rhsTy = ctx_.exprType(*ld.initializer);
+        //
+        // #2451 (rework 4): prefer the EXPLICIT declared type (`ld.type`) over
+        // the bare initializer expression's own type when both are present —
+        // mirrors codegen's own precedence for the identical decision
+        // (registerUsingDisposal, LlvmBackend_Setup.cpp: "const sema::TypeRef*
+        // lt = ld->type ? ctx_.resolvedType(*ld->type) :
+        // ctx_.exprType(*ld->initializer);"). This matters for a coercing
+        // binding — `using var seq: IEnumerable<int> := a;` where `a: Array<int>`
+        // — whose initializer's OWN type (Array<int>, trivial-dispose per
+        // §28.11) differs from the declared target type (IEnumerable<int>,
+        // one of the eight iteration-protocol sentinel names above): codegen
+        // wraps `a` into a fresh vtable-backed IEnumerable frame and registers
+        // a real disposal for it (the `wrappedHere`/`isSyncIterEnum` path), so
+        // keying this lint on the initializer's un-coerced type alone left the
+        // coercing shape misclassified as inert even after the head-name fix.
+        // Without a declared type this is exactly the prior behavior.
+        const sema::TypeRef* rhsTy = ld.type ? ctx_.resolvedType(*ld.type)
+                                              : ctx_.exprType(*ld.initializer);
         // §35.4 (#2047): an OWNING choice (`Result<Connection, string>`) is a
         // value type that DOES carry a disposal obligation — its active case's
         // owned payloads are disposed at scope end (§35.4). It is neither
@@ -4626,11 +4643,35 @@ bool MethodOwnership::rhsIsVacuousBorrowPin(const ast::Expr& e) const {
 // `Dictionary<K,V>`) are deliberately EXCLUDED: per §28.11 their `Dispose()`
 // is a no-op (trivial-dispose), so a `using var` over `new Array<int>()` is
 // the vacuous pattern the lint exists to steer away from — the §21.1 const
-// alias is the correct spelling. Interfaces with user TypeDecls (IEvent<T>,
-// IAsyncEvent<T>, the IOwningEnumerable<T> family, IEnumerable<T>,
-// IAsyncEnumerable<T>, …) are already covered by isBorrowableType's
-// interface branch (returns true) and never reach this exclusion.
-// // per §28.10, §28.11, #2073 (rework 3c)
+// alias is the correct spelling.
+//
+// #2385/#2451 (rework 4): the iteration-protocol sentinel family —
+// IEnumerable<T>/IEnumerator<T>/IOwningEnumerable<T>/IOwningEnumerator<T>
+// and their async counterparts IAsyncEnumerable<T>/IAsyncEnumerator<T>/
+// IOwningAsyncEnumerable<T>/IOwningAsyncEnumerator<T> — are NOT "interfaces
+// with user TypeDecls"; TypeResolution_Names.cpp registers all eight as
+// declaration-less builtins ("declaration stays null (no user TypeDecl)"),
+// the SAME representation as Channel<T>/EventSource<T> above, so a
+// previous version of this comment's claim that they are "already covered
+// by isBorrowableType's interface branch" was simply wrong — isBorrowableType
+// falls through the null-declaration branch and reports false for every one
+// of them, exactly like the builtins this function exists to rescue. Yet a
+// `using var`/`await using var` bound to one of them DOES carry a real
+// disposal obligation: `GetEnumerator()`/`GetOwningEnumerator()`/
+// `GetAsyncEnumerator()`/`GetOwningAsyncEnumerator()` return an `owned`
+// enumerator/enumerable per stdlib §4.12/§4.13 and language spec §29.1
+// ("the caller takes ownership of the enumerator and must dispose it" —
+// unconditional, not gated on the callee's implementation shape), and
+// codegen's registerUsingDisposal (LlvmBackend_Setup.cpp) genuinely
+// registers a disposal call for exactly this eight-name set — the sync
+// `isSyncIterEnum` list (IEnumerable/IOwningEnumerable/IEnumerator/
+// IOwningEnumerator/IAsyncEnumerable/IOwningAsyncEnumerable) plus the
+// `isAwaitUsing` branch's `isAsyncIterEnum` list (IAsyncEnumerator/
+// IOwningAsyncEnumerator) — never a no-op. Without this exclusion the
+// inert-RHS check wrongly steered users away from the canonical `using var
+// e := src.GetEnumerator();` spelling toward a `const` that would silently
+// drop the disposal and leak the enumerator/wrapper frame.
+// // per §28.10, §28.11, §29.1, #2073 (rework 3c), #2385, #2451
 bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     if (!rt) return false;
     if (rt->kind != sema::TypeRef::Kind::Named) return false;
@@ -4688,6 +4729,26 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     // guarantees this on every exit edge, including exceptions"). Without this
     // arm the §28.10 lint would call that idiom vacuous.
     if (head == "FileStream") return true;
+    // #2385/#2451 / §29.1, §29.2, stdlib §4.12/§4.13: the iteration-protocol
+    // sentinel family. `GetEnumerator()`/`GetOwningEnumerator()`/
+    // `GetAsyncEnumerator()`/`GetOwningAsyncEnumerator()` return an `owned`
+    // enumerator/enumerable — §29.1: "the caller takes ownership of the
+    // enumerator and must dispose it", unconditionally, independent of the
+    // callee's implementation shape (compiler-generated iterator, hand-
+    // written user class, or an Array<T>/user-class value wrapped into the
+    // interface by codegen's wrapUserClassAsIEnumerable). A `using var`/
+    // `await using var` bound to one of these eight names is exactly the
+    // canonical §28.10 pattern, mirrored by registerUsingDisposal's own
+    // isSyncIterEnum / isAsyncIterEnum head-name sets (LlvmBackend_Setup.cpp)
+    // — never a no-op. Without this arm, isBorrowableType's null-declaration
+    // fallthrough (these are declaration-less builtins, TypeResolution_
+    // Names.cpp) left every one of them in the "no disposal obligation"
+    // bucket, misfiring the vacuous-pin warning on a real disposal.
+    if (head == "IEnumerable" || head == "IEnumerator" ||
+        head == "IOwningEnumerable" || head == "IOwningEnumerator" ||
+        head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
+        head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator")
+        return true;
     return head == "Channel" || head == "ChannelSender" ||
            head == "EventSource" || head == "AsyncEventSource" ||
            head == "Subscription" || head == "TaskScope" ||
