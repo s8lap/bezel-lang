@@ -79,9 +79,24 @@ bool hasError(const std::string& program, const char* keyword) {
 // #2465 core repro: `Stack<int>.Equals(itself)` used in a branch condition
 // used to IR-verification-crash the compiler after a naive #605 narrowing
 // (confirmed mechanically during this fix's own development, before the
-// second block was added). Now a clean, honest diagnostic.
+// second block was added). At the time #2465 landed, Stack/Queue had no
+// audited implementation yet, so this asserted the PLACEHOLDER "declared
+// via Object... not yet implemented (tracked #2457)" reject as the
+// categorically-safer-than-a-crash interim behavior.
+//
+// #2457 slice 2 is exactly the "tracked #2457" follow-up #2465's own commit
+// message named: it audits Stack/OwningStack/Queue/OwningQueue (stdlib
+// §4.11) and IMPLEMENTS Equals/GetHashCode/ToString directly (§8.3/§8.5
+// mechanical defaults — real heap objects, no override shown), so
+// `isAuditedElsewhere` in the #2465 block now excludes these four names and
+// this placeholder reject no longer fires for them. Updated here (rather
+// than left red) per that slice's own explicit anticipation of this exact
+// change — not a scope violation of #2465's original PR, but its own
+// stated follow-up landing. The crash-safety property this test was
+// written to prove is now demonstrated the STRONGER way: not just "doesn't
+// crash" but "computes the spec-correct value."
 BEZEL_TEST(collection_universal_member_narrowing_2465,
-           stack_equals_used_in_branch_rejected_not_crashed) {
+           stack_equals_used_in_branch_now_implemented_value_correct) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
@@ -91,67 +106,68 @@ BEZEL_TEST(collection_universal_member_narrowing_2465,
         "  s.Dispose(); "
         "  if eq then return 42; else return 1; end; "
         "end Main; end C;";
-    BEZEL_EXPECT_TRUE(hasError(
-        program,
-        "member `Equals` on `Stack` is declared via the universal Object "
-        "contract"));
-    BEZEL_EXPECT_TRUE(hasError(program, "#2457"));
+    BEZEL_EXPECT_EQ(run(program), 42);
 }
 
 // Stack<T>.ToString() — was: compiled clean, segfaulted on use (the
-// original #2465 filing's own repro).
+// original #2465 filing's own repro), then (after #2465 landed) a clean
+// placeholder reject. Now implemented (#2457 slice 2, see above): the §8.5
+// default for a `public class` with no ToString override is the type's
+// qualified name — the fixed literal "Stack".
 BEZEL_TEST(collection_universal_member_narrowing_2465,
-           stack_tostring_rejected_not_crashed) {
+           stack_tostring_now_implemented_value_correct) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
         "  var s := new Stack<int>(); "
         "  s.Push(1); "
         "  var x := s.ToString(); "
-        "  Console.WriteLine($\"len={x.Length}\"); "
         "  s.Dispose(); "
-        "  return 0; "
+        "  return (if x = \"Stack\" then 42 else 1); "
         "end Main; end C;";
-    BEZEL_EXPECT_TRUE(hasError(
-        program,
-        "member `ToString` on `Stack` is declared via the universal "
-        "Object contract"));
+    BEZEL_EXPECT_EQ(run(program), 42);
 }
 
-// Stack<T>.GetHashCode() — was: silently returned 0.
+// Stack<T>.GetHashCode() — was: silently returned 0, then (after #2465) a
+// clean placeholder reject. Now implemented (#2457 slice 2): the §8.3
+// identity-hash default via bz_obj_identity_hash — stable across repeated
+// calls on the same object.
 BEZEL_TEST(collection_universal_member_narrowing_2465,
-           stack_gethashcode_rejected) {
+           stack_gethashcode_now_implemented_value_correct) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
         "  var s := new Stack<int>(); "
         "  s.Push(1); "
-        "  var h := s.GetHashCode(); "
+        "  var h1 := s.GetHashCode(); "
+        "  var h2 := s.GetHashCode(); "
         "  s.Dispose(); "
-        "  return h; "
+        "  return (if h1 = h2 then 42 else 1); "
         "end Main; end C;";
-    BEZEL_EXPECT_TRUE(hasError(
-        program,
-        "member `GetHashCode` on `Stack` is declared via the universal "
-        "Object contract"));
+    BEZEL_EXPECT_EQ(run(program), 42);
 }
 
-// The reject generalizes across the registry, not just Stack — Queue
-// (array-backed), Set (also array-backed, hash-table-on-top), and
-// Dictionary<K,V> itself (dict-backed) each confirmed independently.
+// The reject generalizes across the registry, not just Stack — Set
+// (array-backed, hash-table-on-top) and Dictionary<K,V> itself
+// (dict-backed) each confirmed independently, and REMAIN rejected: neither
+// is part of #2457 slice 2's scope (Stack/OwningStack/Queue/OwningQueue
+// only). Queue<T> — array-backed, and IS in slice 2's scope — moves to the
+// positive/implemented assertion alongside Stack above, mirroring exactly.
 BEZEL_TEST(collection_universal_member_narrowing_2465,
            reject_generalizes_across_the_registry) {
-    BEZEL_EXPECT_TRUE(hasError(
-        "module M; "
-        "class C public static method Main(): int "
-        "  var q := new Queue<int>(); "
-        "  q.Enqueue(1); "
-        "  var x := q.ToString(); "
-        "  q.Dispose(); "
-        "  return 0; "
-        "end Main; end C;",
-        "member `ToString` on `Queue` is declared via the universal "
-        "Object contract"));
+    // Queue<T> (#2457 slice 2): now implemented, not rejected.
+    {
+        const std::string program =
+            "module M; "
+            "class C public static method Main(): int "
+            "  var q := new Queue<int>(); "
+            "  q.Enqueue(1); "
+            "  var x := q.ToString(); "
+            "  q.Dispose(); "
+            "  return (if x = \"Queue\" then 42 else 1); "
+            "end Main; end C;";
+        BEZEL_EXPECT_EQ(run(program), 42);
+    }
     BEZEL_EXPECT_TRUE(hasError(
         "module M; "
         "class C public static method Main(): int "
@@ -176,14 +192,15 @@ BEZEL_TEST(collection_universal_member_narrowing_2465,
         "Object contract"));
 }
 
-// A truly bogus (non-universal) member on Stack is UNAFFECTED by this fix
-// either way — it was already silently accepted before (no crash, since
-// nothing computes or stores a value for it) and stays that way; closing
-// this residual gap is #2457 slice 2's job, not this fix's. This guards
-// the scope boundary: the new reject fires ONLY for the five affected
-// names, not as a general "no member" catch-all.
+// A truly bogus (non-universal) member on Stack was UNAFFECTED by #2465
+// (silently accepted, no crash, since nothing computes or stores a value
+// for it) — #2465's own comment explicitly named closing this residual gap
+// as "#2457 slice 2's job, not this fix's". Slice 2 closes it: Stack's full
+// stdlib §4.11 surface is now audited, so a genuinely nonexistent member is
+// rejected with a "no member" diagnostic (ExprTypecheck_Calls.cpp, the new
+// #2457-slice-2 block) instead of silently falling through.
 BEZEL_TEST(collection_universal_member_narrowing_2465,
-           bogus_non_universal_member_unaffected_out_of_scope) {
+           bogus_non_universal_member_now_rejected_by_2457_slice_2) {
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
@@ -193,7 +210,8 @@ BEZEL_TEST(collection_universal_member_narrowing_2465,
         "  s.Dispose(); "
         "  return 0; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 0);
+    BEZEL_EXPECT_TRUE(
+        hasError(program, "no member `TotallyBogusStackMember` on `Stack<T>`"));
 }
 
 // GetType() is deliberately EXCLUDED from this fix's reject list: it is

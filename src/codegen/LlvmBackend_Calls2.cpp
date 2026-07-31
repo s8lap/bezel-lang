@@ -4346,6 +4346,15 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 // type with no matching vtable shape), and the literal is
                 // simpler, cheaper, and equally correct per §8.5's
                 // "qualified name" default having no runtime dependency.
+                // #2457 slice 2 (stdlib §4.11; language spec §8.5): the same
+                // reasoning as the Array/OwningArray literals just above,
+                // extended to `Stack<T>`/`OwningStack<T>`/`Queue<T>`/
+                // `OwningQueue<T>` — all four are documented `public class`
+                // types (stdlib §4.11) with no ToString override shown, and
+                // are `bz_array_t*`-backed (common/BuiltinRegistry.cpp's
+                // kArrayBackedCollections, the same registry Array/
+                // OwningArray are in), so the §8.5 default is equally a
+                // fixed, compile-time-constant literal here.
                 if (recvTy && recvTy->kind == K::Named &&
                         !recvTy->declaration && recvTy->astNode &&
                         recvTy->astNode->name &&
@@ -4355,6 +4364,14 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         return lowerStringLiteral("\"Array\"", false);
                     if (arn == "OwningArray")
                         return lowerStringLiteral("\"OwningArray\"", false);
+                    if (arn == "Stack")
+                        return lowerStringLiteral("\"Stack\"", false);
+                    if (arn == "OwningStack")
+                        return lowerStringLiteral("\"OwningStack\"", false);
+                    if (arn == "Queue")
+                        return lowerStringLiteral("\"Queue\"", false);
+                    if (arn == "OwningQueue")
+                        return lowerStringLiteral("\"OwningQueue\"", false);
                 }
                 bool isObjectRecv =
                     recvTy && recvTy->kind == K::Primitive &&
@@ -4591,6 +4608,12 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 // layout -- there is no vtable to dispatch through here
                 // either, only a stable heap pointer, which is all §8.3's
                 // reference-identity/identity-hash default actually needs.
+                // #2457 slice 2: `Stack<T>`/`OwningStack<T>`/`Queue<T>`/
+                // `OwningQueue<T>` join this block for the same reason
+                // Array<T>/OwningArray<T> did — `bz_array_t*`-backed
+                // (kArrayBackedCollections), no matching vtable shape, so
+                // the §8.3 default is direct pointer identity /
+                // bz_obj_identity_hash, not a vtable dispatch.
                 bool isBuiltinIdentityRecv =
                     recvTy && recvTy->kind == K::Named &&
                     !recvTy->declaration && recvTy->astNode &&
@@ -4599,7 +4622,11 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     (recvTy->headName() == "IEnumerator" ||
                      recvTy->headName() == "IAsyncEnumerator" ||
                      recvTy->headName() == "Array" ||
-                     recvTy->headName() == "OwningArray");
+                     recvTy->headName() == "OwningArray" ||
+                     recvTy->headName() == "Stack" ||
+                     recvTy->headName() == "OwningStack" ||
+                     recvTy->headName() == "Queue" ||
+                     recvTy->headName() == "OwningQueue");
                 if (isBuiltinIdentityRecv) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (isEqualsCall) {

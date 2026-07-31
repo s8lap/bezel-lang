@@ -11731,6 +11731,180 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // #2457 slice 2 (stdlib §4.11/§4.12/§5; language spec §8.1/§8.3/§8.5/
+        // §27.6): `Stack<T>`/`OwningStack<T>`/`Queue<T>`/`OwningQueue<T>` are
+        // declaration-less builtin Named types with the same shape Array<T>/
+        // OwningArray<T> had (#2457 slice 1, immediately above) and the same
+        // silent-fallthrough gap #2457 as a whole targets: `s.TotallyBogus
+        // StackMember` on a live `Stack<int>` was confirmed to compile at
+        // exit 0 with zero diagnostics before this fix. All four types
+        // conform ONLY to `IReadOnlyCollection<T>` (stdlib §4.11 "Surface
+        // coherence", v0.222/#1811) -- not `ICollection<T>`/`IOwningCollection
+        // <T>` -- so their PROPERTY surface is just `Count` (typed by the
+        // dedicated handler ~1000 lines up) plus the five universal Object
+        // members; every other real member is a METHOD.
+        //
+        // Two undocumented-but-real structural aliases, found by this slice's
+        // own adversarial probing (the exact risk class #2457 slice 1's own
+        // report flagged as standing) and confirmed VALUE-correct before
+        // exempting either, not just "doesn't crash":
+        //   - `.Length` -- not in stdlib §4.11 (only `Count`, via
+        //     IReadOnlyCollection<T>, is documented) but a real, WORKING
+        //     alias, same as Array's -- LlvmBackend_Exprs.cpp ~3101/3186
+        //     dispatches on the shared isCollectionTypeName/
+        //     kArrayBackedCollections registry, which Stack/OwningStack/
+        //     Queue/OwningQueue are all members of, with no per-type
+        //     conditional excluding them.
+        //   - `.Reverse()` -- NOT declared for Stack/Queue in stdlib §4.11
+        //     (only Array<T>'s own §4.4 declares an in-place `Reverse()`),
+        //     but genuinely implemented as a real in-place reverse for ANY
+        //     `isCollectionTypeName` receiver (tryLowerCollectionInstanceCall,
+        //     LlvmBackend_Calls.cpp ~3160, gated the same way `.Length` is) --
+        //     confirmed empirically: `Push(1);Push(2);Push(3); Reverse();
+        //     Pop()` returns `1` (the physically-first-pushed element),
+        //     proving the backing `bz_array_t*` storage is genuinely mutated
+        //     in place, not a silent no-op. Rejecting a real, working,
+        //     value-correct mutator would be the exact false-reject failure
+        //     mode the standing protocol weights most heavily against.
+        //     (Whether exposing an UNDOCUMENTED Reverse on Stack/Queue is
+        //     itself a stdlib-doc gap worth flagging is a docs-workflow
+        //     question, out of scope for autonomous implementation work --
+        //     not raised as a new issue since it is not a defect: the
+        //     behavior is sound and deterministic, the same disposition
+        //     slice 1 gave `.Length`.)
+        //
+        // `GetEnumerator` (IEnumerable<T> ancestor, stdlib §4.12) is
+        // exempted the same way slice 1 exempted it for Array -- but here
+        // that exemption is BAND-AID, not confirmation: `s.GetEnumerator()`
+        // as an explicit CALL (as opposed to the `for x in s do` desugaring,
+        // which bypasses GetEnumerator entirely via a direct indexed loop,
+        // LlvmBackend_Stmts.cpp ~4267) currently returns a non-functional
+        // enumerator whose `MoveNext()` is immediately false -- confirmed by
+        // a live probe, no diagnostic either way. This is NOT specific to
+        // Stack/Queue: the explicit-call wrapping machinery
+        // (LlvmBackend_Calls2.cpp ~4618) is gated to exactly `rbn == "Array"
+        // || rbn == "OwningArray"`, so the same gap reproduces on `Set<T>`
+        // (confirmed) and is inferred (not confirmed) to reproduce on
+        // `LinkedList<T>`/`Dictionary<K,V>` and their Owning variants too --
+        // a family-wide codegen gap, not a Stack/Queue-specific one, and
+        // much larger than this slice's own scope (extending the
+        // wrapArrayAsIEnumerable machinery to five more receiver shapes).
+        // Filed as #2470 rather than fixed here or silently left unexempted
+        // (unexempting would newly REJECT `s.GetEnumerator()`, which is a
+        // genuinely-declared member per stdlib §4.12 -- correct rejection
+        // wording would have to describe a "declared but its call form is
+        // broken" case distinct from "no such member", which is its own
+        // follow-up, not a fit for this reject's wording).
+        //
+        // Must run BEFORE the #605 bare-type-parameter block below, same
+        // reason as slice 1's block and #2459's blocks (see their comments):
+        // #605's guard matches this receiver shape too.
+        if (ma.target && !ctx_.exprType(ma)) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty()) {
+                    std::string_view cn = tt->headName();
+                    bool isStackQueueFamily =
+                        cn == "Stack" || cn == "OwningStack" ||
+                        cn == "Queue" || cn == "OwningQueue";
+                    if (isStackQueueFamily) {
+                        const auto& mbr = ma.member;
+                        bool isUniversalObjectMember =
+                            mbr == "ToString"    || mbr == "Equals" ||
+                            mbr == "GetHashCode" || mbr == "GetType" ||
+                            mbr == "ReferenceEquals";
+                        // `.Length` / `.Reverse` — undocumented-but-real
+                        // structural aliases, see the block comment above.
+                        bool isUndocumentedWorkingAlias =
+                            mbr == "Length" || mbr == "Reverse";
+                        // stdlib §4.11's own declared methods, unioned across
+                        // Stack/OwningStack/Queue/OwningQueue rather than
+                        // split per-type (harmless to exempt a name legit
+                        // only on a sibling type — see slice 1's identical
+                        // reasoning) + IReadOnlyCollection<T>/IEnumerable<T>
+                        // ancestor GetEnumerator (stdlib §4.1/§4.12).
+                        bool isDeclaredMethod =
+                            mbr == "Push"     || mbr == "Enqueue" ||
+                            mbr == "Contains" || mbr == "Pop" ||
+                            mbr == "Dequeue"  || mbr == "Peek" ||
+                            mbr == "TryPop"   || mbr == "TryDequeue" ||
+                            mbr == "TryPeek"  || mbr == "Clear" ||
+                            mbr == "Drain"    || mbr == "GetEnumerator";
+                        // stdlib §5 IEnumerable<T> LINQ extension, RE-DERIVED
+                        // independently against the doc for this fix (not
+                        // diffed against slice 1's Array/OwningArray list —
+                        // that transcription blind spot is exactly how a
+                        // post-commit review found this list missing
+                        // `ToArray`: slice 1 got away with the identical
+                        // omission only because `Array<T>`/`OwningArray<T>`
+                        // separately declare their OWN native `ToArray()`
+                        // (stdlib §4.4/§4.5), covered by slice 1's own
+                        // isDeclaredMethod, which masked the gap there;
+                        // Stack/Queue declare no such method (§4.11), so
+                        // nothing masks it here). Applies identically since
+                        // all four types are IEnumerable<T> via
+                        // IReadOnlyCollection<T>. Re-deriving from stdlib §5
+                        // and §5.1 fresh (rather than re-diffing against
+                        // slice 1) also caught a SECOND, independent gap in
+                        // both this list and slice 1's own: `MinOrNull`/
+                        // `MaxOrNull` (§5.1's `IEnumerable<T> where T:
+                        // IComparable<T>` extension) — filed as a follow-up
+                        // for slice 1's already-merged Array/OwningArray
+                        // block (bare-reference form only; the call form is
+                        // separately broken by a PRE-EXISTING, unrelated gap
+                        // in the older #920/#1112 allowedNonOwningMethod/
+                        // allowedOwningMethod call-site lists, ~line 3789/
+                        // 3912, out of scope for this fix).
+                        bool isLinqOperator =
+                            mbr == "Where" || mbr == "OfType" ||
+                            mbr == "Select" || mbr == "SelectMany" ||
+                            mbr == "Any" || mbr == "All" ||
+                            mbr == "First" || mbr == "FirstOrNull" ||
+                            mbr == "Last" || mbr == "LastOrNull" ||
+                            mbr == "Single" || mbr == "SingleOrNull" ||
+                            mbr == "ElementAt" || mbr == "Sum" ||
+                            mbr == "Min" || mbr == "Max" ||
+                            mbr == "MinOrNull" || mbr == "MaxOrNull" ||
+                            mbr == "Average" || mbr == "Aggregate" ||
+                            mbr == "OrderBy" || mbr == "OrderByDescending" ||
+                            mbr == "Distinct" || mbr == "Union" ||
+                            mbr == "Intersect" || mbr == "Except" ||
+                            mbr == "Take" || mbr == "TakeWhile" ||
+                            mbr == "Skip" || mbr == "SkipWhile" ||
+                            mbr == "Concat" || mbr == "Zip" ||
+                            mbr == "GroupBy" || mbr == "ToArray" ||
+                            mbr == "ToDictionary" ||
+                            mbr == "ToSet" || mbr == "ThenBy" ||
+                            mbr == "ThenByDescending";
+                        bool isCallForm = &ma == calleeOfCallCtx_;
+                        if (!isUniversalObjectMember &&
+                                !isUndocumentedWorkingAlias &&
+                                !isDeclaredMethod && !isLinqOperator &&
+                                !isCallForm) {
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("no member `") +
+                                    std::string(mbr) + "` on `" +
+                                    std::string(cn) +
+                                    "<T>` (stdlib \xC2\xA7""4.11) -- it is "
+                                    "not part of this collection's "
+                                    "documented property surface (Count and "
+                                    "the `.Length` alias), a declared "
+                                    "method/LINQ operator (call or bare "
+                                    "reference, language spec \xC2\xA7"
+                                    "27.6), or a universal `ToString`/"
+                                    "`Equals`/`GetHashCode`/`GetType` "
+                                    "member (language spec \xC2\xA7""8.1)");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         // #2459 (follow-up to #2458): this block (and its DictionaryEntry/
         // DrainedEntry sibling just below) MUST run BEFORE the #605 bare-
         // type-parameter block a little further down. #605's guard
@@ -12339,7 +12513,10 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // `isLinkedListName` (common/BuiltinRegistry.hpp) -- the SAME
         // canonical, already-vetted registries codegen itself uses for
         // `isCollectionTypeName`/`isDictTypeName`/`isLinkedListTypeName` --
-        // minus `Array`/`OwningArray` (already implemented, #2457 slice 1).
+        // minus `Array`/`OwningArray` (already implemented, #2457 slice 1)
+        // and minus `Stack`/`OwningStack`/`Queue`/`OwningQueue` (already
+        // implemented, #2457 slice 2 -- see that block, just above #605
+        // near the top of this same `!targetType` branch).
         // A first draft of this block used a general `kind==Named &&
         // !declaration` structural test (mirroring #2444/#2457/#2459's own
         // shape) instead of this precise registry membership check, and it
@@ -12383,7 +12560,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     !tt->astNode->name->parts.empty()) {
                     std::string_view cn = tt->headName();
                     bool isAuditedElsewhere =
-                        cn == "Array" || cn == "OwningArray";
+                        cn == "Array" || cn == "OwningArray" ||
+                        cn == "Stack" || cn == "OwningStack" ||
+                        cn == "Queue" || cn == "OwningQueue";
                     bool isRegisteredCollection =
                         !isAuditedElsewhere &&
                         (common::isArrayBackedCollectionName(cn) ||
