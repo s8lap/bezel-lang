@@ -381,13 +381,29 @@ BEZEL_TEST(xmod_record_property_setter_indexer_import_2489,
 // ===========================================================================
 // T8 — SCOPE BOUNDARY (not a regression, not "fixed" by this commit): the
 // identical shape over a RECORD receiver. `buildPropertyClosureCell`
-// (LlvmBackend_Layout.cpp) never captures a by-value receiver into the
-// closure's env at all — a pre-existing, general bug (crashes for a plain
-// LOCAL record today, filed separately as #2501) unrelated to import/export.
-// This commit's new makePropertyThunk branch is deliberately restricted to a
+// (LlvmBackend_Layout.cpp) never captured a by-value receiver into the
+// closure's env at all — a pre-existing, general bug (crashed for a plain
+// LOCAL record, filed separately as #2501) unrelated to import/export. This
+// commit's new makePropertyThunk branch was deliberately restricted to a
 // CLASS receiver specifically BECAUSE of that bug — widening it to Record
-// would convert this silent 0 into a SIGSEGV. Pins the still-degraded (but
-// still link-safe, still non-crashing) pre-existing outcome.
+// would have converted this silent 0 into a SIGSEGV.
+//
+// UPDATE (fix #2501, §27.6 v0.236): the general/local-receiver capture bug
+// this comment describes is now fixed — buildPropertyClosureCell captures a
+// record's struct value by copy (sized by getTypeStoreSize) exactly like
+// buildMethodClosureCell already did for method references, and
+// makePropertyThunk's own `this`-reconstruction now branches on the
+// captured shape instead of assuming a pointer, so a LOCAL record's
+// arrow-getter referenced as a function value no longer SIGSEGVs (see
+// property_ref_function_value_756_test.cpp's `record_*_2501` tests). This
+// T8 case is still pinned at 0, unchanged: it is the CROSS-MODULE path
+// through the `importedPropGetterFns_` branch above, which stays gated to
+// `ps->parent->kind == Class` deliberately — #2501 did not widen it (that
+// gate's own record-across-module correctness was never exercised or
+// proven end-to-end, per #2489's own reasoning above) — so an imported
+// record's computed property still falls through every branch to the
+// `getNullValue` default, same as before. Widening this gate to Record is a
+// #2489-shaped follow-up, not folded into #2501.
 // ===========================================================================
 BEZEL_TEST(xmod_record_property_setter_indexer_import_2489,
            property_thunk_record_scope_boundary_control_2501) {

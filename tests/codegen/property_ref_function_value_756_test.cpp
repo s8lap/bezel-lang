@@ -219,3 +219,125 @@ BEZEL_TEST(property_ref_function_value_756, instance_property_value_in_call_argu
         "  end Main; "
         "end Program;"), 9);
 }
+
+// fix #2501 (§27.6, v0.236): "the instance is captured at formation — by
+// reference for class-typed receivers, by copy for value-shaped (record)
+// receivers". Emitter::buildPropertyClosureCell captured the receiver into
+// the closure env ONLY when it was already a POINTER (`receiverVal->
+// getType()->isPointerTy()`); for a RECORD receiver (a by-value struct,
+// §9.2/#347) that condition is false, so the env stayed the null-pointer
+// default. makePropertyThunk's generated thunk body then unconditionally did
+// `CreateLoad(ptrTy(), thunk->getArg(0))` to reconstruct `this` — a load
+// through that null pointer — and the getter's implicit field read (`_pub`)
+// GEPs off it, SIGSEGVing. This is the issue's own exact repro: a plain
+// LOCAL record's arrow-getter property referenced as a function value.
+// Before the fix: SIGSEGV (this whole gtest binary would have crashed,
+// exactly as #756's own original bug did before its fix — see this file's
+// header note). After the fix: `fn()` correctly returns 41.
+BEZEL_TEST(property_ref_function_value_756, record_computed_getter_2501) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "public record RecThunkLocal(x: int) "
+        "  public _pub: int := 41; "
+        "  public property Getter: int => _pub; "
+        "end RecThunkLocal; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var r := new RecThunkLocal(9); "
+        "    var fn: () -> int := r.Getter; "
+        "    return fn(); "  // 41
+        "  end Main; "
+        "end C;"), 41);
+}
+
+// fix #2501 (§27.6, v0.236): the SAME shape as above, but for a record's
+// AUTO-property (isAutoPropertyStorage's makePropertyThunk branch — a
+// DIFFERENT dispatch arm than the computed-getter branch the test above
+// exercises: it GEPs the field directly off `thisVal` rather than lowering
+// an expression body against `currentThis_`).
+BEZEL_TEST(property_ref_function_value_756, record_auto_property_2501) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "public record RecAuto "
+        "  public property Count: int; "
+        "  public constructor(seed: int) Count := seed * 10; end constructor; "
+        "end RecAuto; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var r := new RecAuto(4); "
+        "    var fn: () -> int := r.Count; "
+        "    return fn(); "  // 40
+        "  end Main; "
+        "end Program;"), 40);
+}
+
+// fix #2501 (§27.6, v0.236): a record's BLOCK-form getter (`get => do …
+// end;`) thunked. Exercises a THIRD makePropertyThunk dispatch arm
+// (blockGetterOf / ensurePropertyBlockGetter), whose generated function
+// always takes `this` as a POINTER — the record receiver captured by copy
+// must be re-spilled to a pointer for this call specifically (see the
+// `blockThis` spill in makePropertyThunk).
+BEZEL_TEST(property_ref_function_value_756, record_block_getter_2501) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "public record RecBlock(x: int) "
+        "  public property Doubled: int get => do return x * 2; end; end; "
+        "end RecBlock; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var r := new RecBlock(11); "
+        "    var fn: () -> int := r.Doubled; "
+        "    return fn(); "  // 22
+        "  end Main; "
+        "end Program;"), 22);
+}
+
+// fix #2501 (§27.6, v0.236): proves the spec's exact "by copy" wording, not
+// merely "doesn't crash" — a record property reference must capture an
+// INDEPENDENT COPY of the receiver at FORMATION time, not an alias of the
+// local. `b` is REASSIGNED to a brand-new `Box` (a different `N`) AFTER
+// `fn` is formed but BEFORE it is invoked; `fn()` must still observe the
+// ORIGINAL `N` (21, doubled 42) — an aliasing (by-reference) implementation
+// would observe the reassigned value (999, doubled 1998) instead.
+BEZEL_TEST(property_ref_function_value_756, record_captured_by_copy_not_reference_2501) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "public record Box(N: int) "
+        "  public property Doubled: int => N * 2; "
+        "end Box; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var b := new Box(21); "
+        "    var fn: () -> int := b.Doubled; "
+        "    b := new Box(999); "
+        "    return fn(); "  // 42, NOT 1998
+        "  end Main; "
+        "end Program;"), 42);
+}
+
+// fix #2501 (§27.6, v0.236; #574 / §10.4 / §19.2 precedent): an ENUM
+// receiver's env is likewise captured now (the raw scalar value, not a
+// pointer). Separately, makePropertyThunk never set `currentEnumMethod_`
+// around the computed-getter body it lowers, so an enum property whose
+// getter dispatches with `case this ...` (the common enum-property idiom)
+// was REJECTED at codegen — "the `case`/`when` pattern … did not resolve to
+// a type, enum constant, or named constant" — even once the receiver-capture
+// half of this fix landed; this test pins both halves together. Before
+// either fix: a compile-time reject (not the record's SIGSEGV — the issue's
+// own text notes the two receiver kinds fail differently pre-fix). After:
+// `fn()` correctly dispatches on the captured Green constant, returning 2.
+BEZEL_TEST(property_ref_function_value_756, enum_case_this_computed_getter_2501) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; "
+        "enum Color Red, Green, Blue; "
+        "  public property Code: int => "
+        "    (case this of Red => 1, Green => 2, _ => 3); "
+        "end Color; "
+        "class App "
+        "  public static method Main(): int "
+        "    var c := Color.Green; "
+        "    var fn: () -> int := c.Code; "
+        "    return fn(); "  // 2
+        "  end Main; "
+        "end App;"), 2);
+}

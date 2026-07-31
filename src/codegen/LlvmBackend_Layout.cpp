@@ -3093,8 +3093,49 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", thunk));
 
-    // Load the captured receiver from env; bind as `this`.
-    llvm::Value* thisVal = builder_.CreateLoad(ptrTy(), thunk->getArg(0));
+    // fix #2501 (§27.6, v0.236): "the instance is captured at formation — by
+    // reference for class-typed receivers, by copy for value-shaped (record)
+    // receivers". buildPropertyClosureCell (below) now copies ANY receiver
+    // shape into env, sized by getTypeStoreSize (mirroring
+    // buildMethodClosureCell) — so the reload here must match that shape, not
+    // assume a pointer. The shape is read off `receiverVal`'s OWN LLVM type
+    // (produced by the caller's `lowerExpr` on the receiver expression, so it
+    // is already correctly specialized for a generic receiver — no dependency
+    // on the §14.1 genericSubst_ block below) rather than re-derived from
+    // `ps->parent`, so this also covers an EXTENSION property (whose
+    // PropertySymbol carries no `parent` — SymbolCollection.cpp "patched by
+    // slice 2" never patches it for properties, only `MethodSymbol::
+    // extensionDecl` gets the analogous method-side wiring). The thunk body
+    // is built ONCE and cached per `ps` (propertyThunks_), so this shape is
+    // fixed at first emission — the same per-symbol-not-per-instantiation
+    // caching methodThunks_ already accepts.
+    //   - CLASS/INTERFACE receiver (or no receiver at all — a static
+    //     property; `thisVal` then has no real use since a static getter
+    //     body never reads `this`): unchanged pointer load.
+    //   - RECORD receiver: env holds the struct VALUE (an aggregate,
+    //     non-pointer type). Reload it, then re-spill to a fresh alloca so
+    //     the getter body's `this.field` GEPs still see a pointer — mirrors
+    //     the ordinary (non-thunk) record-getter read path
+    //     (LlvmBackend_Exprs.cpp, "issue #347 / §9.2").
+    //   - ENUM (or primitive-extension) receiver: env holds the raw SCALAR
+    //     value (e.g. i32 — enumLlvmType). Reload it as-is and use it
+    //     directly as `this` — never spill to a pointer, mirroring CG30 /
+    //     the §10.4 `isEnumReceiver` carve-out in that same read path (a
+    //     `case this` arm needs the bare scalar to icmp against an enum
+    //     constant; comparing a spilled pointer against one is malformed IR).
+    llvm::Value* envArg = thunk->getArg(0);
+    llvm::Type* recvLlvmTy = receiverVal ? receiverVal->getType() : nullptr;
+    llvm::Value* thisVal;
+    if (!recvLlvmTy || recvLlvmTy->isPointerTy()) {
+        thisVal = builder_.CreateLoad(ptrTy(), envArg);
+    } else if (recvLlvmTy->isAggregateType()) {
+        llvm::Value* loadedRecv = builder_.CreateLoad(recvLlvmTy, envArg);
+        llvm::AllocaInst* recvTmp = entryAlloca(recvLlvmTy);
+        builder_.CreateStore(loadedRecv, recvTmp);
+        thisVal = recvTmp;
+    } else {
+        thisVal = builder_.CreateLoad(recvLlvmTy, envArg);
+    }
     currentThis_ = thisVal;
 
     // §14.1: for a generic class receiver, set up the generic substitution so a
@@ -3164,10 +3205,46 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     }
     if (!result) {
         if (const ast::Expr* getter = computedGetterOf(ps)) {
+            // fix #2501 (#574 / §10.4 / §19.2 precedent): an enum computed
+            // property's getter body commonly dispatches with `case this ...`
+            // — patternMatches needs enumTypeOf("this") to resolve the
+            // declaring enum type, and enumTypeOf falls back to
+            // currentEnumMethod_ for a bare `this` identifier because sema
+            // attaches no exprType to it. The ordinary (non-thunk) getter
+            // read path sets this (LlvmBackend_Exprs.cpp, the #574 fix);
+            // makePropertyThunk never did, so an enum property referenced as
+            // a function value with a `case this` body was rejected at
+            // codegen ("pattern … did not resolve to a type, enum constant,
+            // or named constant") even after the receiver-capture fix above.
+            const sema::TypeSymbol* savedEnumMethod = currentEnumMethod_;
+            if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Enum)
+                currentEnumMethod_ = ps->parent;
             result = lowerExpr(*getter);
+            currentEnumMethod_ = savedEnumMethod;
         } else if (const ast::PropertyAccessor* acc = blockGetterOf(ps)) {
             if (llvm::Function* fn = ensurePropertyBlockGetter(pd, acc)) {
-                result = builder_.CreateCall(fn->getFunctionType(), fn, {thisVal});
+                // fix #2501 (§9.2/§27.6, v0.236): ensurePropertyBlockGetter's
+                // generated function always takes `this` as a POINTER
+                // (`fnTy = (ptr) -> retTy`, its own `currentThis_ = &*fn->
+                // args().begin()`), mirroring the ordinary (non-thunk)
+                // block-getter read path's unconditional spill
+                // (LlvmBackend_Exprs.cpp, "issue #347 / §9.2" — spills even
+                // an enum/primitive `this`, unlike the expression-getter
+                // path's isEnumReceiver carve-out just above). `thisVal` here
+                // is the raw scalar for an enum/primitive receiver (by
+                // design, so `case this` above can icmp it directly) — spill
+                // it to a fresh pointer for this call site specifically,
+                // rather than passing the scalar where a pointer is expected
+                // (a thunk->fn signature mismatch / malformed-IR call).
+                llvm::Value* blockThis = thisVal;
+                if (!blockThis->getType()->isPointerTy()) {
+                    llvm::AllocaInst* blockTmp =
+                        entryAlloca(blockThis->getType());
+                    builder_.CreateStore(blockThis, blockTmp);
+                    blockThis = blockTmp;
+                }
+                result = builder_.CreateCall(fn->getFunctionType(), fn,
+                                             {blockThis});
                 emitPendingCheck();
             }
         } else if (isAutoPropertyStorage(ps)) {
@@ -3200,27 +3277,28 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
             // (LlvmBackend_Exprs.cpp's "imported non-virtual property
             // getter" site, issue #503/#2474): call the exported
             // `$propget` stub declareImportedPropertyGetters declared.
-            // `thisVal` here is ALWAYS `ptr` (loaded via
-            // `CreateLoad(ptrTy(), thunk->getArg(0))` a few lines above) —
-            // no by-value spill is needed the way the ordinary read path
-            // needs one, but ONLY because this branch is deliberately
-            // restricted to a CLASS receiver: `buildPropertyClosureCell`
-            // (this file, `Emitter::buildPropertyClosureCell`) only
-            // copies the receiver into the closure's env block when it is
-            // already a pointer — for a RECORD or ENUM receiver
-            // (value-shaped, §9.2/§10.4) the env is left null, so
-            // `thisVal` would be a null pointer here, not a usable
-            // receiver. Confirmed mechanically: the identical shape over
-            // a LOCAL (non-imported) record's arrow-getter SIGSEGVs today
-            // (a pre-existing, general bug unrelated to import/export —
-            // filed separately as #2501, out of #2489's cross-module-ABI
-            // scope). Restricting this branch to Class keeps #2489's own
-            // fix from making that latent crash newly reachable for the
-            // cross-module case: pre-fix, a Record/Enum receiver here hit
-            // the same `getNullValue` default every OTHER case did
-            // (silently wrong, not a crash); this branch preserves that
-            // exact pre-existing outcome for Record/Enum, changing
-            // behavior only for Class, where `thisVal` is genuinely valid.
+            // `thisVal` here is ALWAYS `ptr` because this branch's own guard
+            // (`ps->parent->kind == Class`, just above) excludes Record/Enum
+            // — no by-value spill is needed the way the ordinary read path
+            // needs one.
+            //
+            // UPDATE (fix #2501, §27.6 v0.236): the general bug this
+            // comment originally described — buildPropertyClosureCell left
+            // the env null for any non-pointer (Record/Enum) receiver, so
+            // `thisVal` would have been a null pointer here had this branch
+            // admitted one — is now fixed at its source: buildPropertyClosureCell
+            // captures ANY receiver shape (sized by getTypeStoreSize,
+            // mirroring buildMethodClosureCell), and the `this`-reconstruction
+            // a few lines above this function's start now branches on that
+            // shape (pointer / spilled-record-pointer / raw-enum-scalar), so
+            // a LOCAL record or enum arrow-getter referenced as a function
+            // value no longer SIGSEGVs (see makePropertyThunk's `this`-
+            // reconstruction comment). This branch's restriction to Class is
+            // kept AS-IS regardless: it exists for the CROSS-MODULE ABI
+            // surface (the imported `$propget` stub call below), which
+            // #2501 did not exercise or test end-to-end (no `importedPropGetterFns_`
+            // entry was involved in its repro) — widening it to Record/Enum
+            // is a #2489-shaped follow-up, not folded in here.
             auto git = importedPropGetterFns_.find(ps);
             if (git != importedPropGetterFns_.end()) {
                 llvm::Function* fn = git->second;
@@ -3283,15 +3361,40 @@ llvm::Value* Emitter::buildPropertyClosureCell(llvm::Function* thunk,
     // each reference still has its own rc/lifetime; equality is by the cell's
     // { fn, receiver-in-env, kind } value (bz_closure_value_equals), mirroring
     // buildMethodClosureCell.
+    //
+    // fix #2501 (§27.6, v0.236): "the instance is captured at formation — by
+    // reference for class-typed receivers, by copy for value-shaped (record)
+    // receivers". Before this fix the env was populated ONLY when
+    // `receiverVal->getType()->isPointerTy()` — true for a class/interface
+    // receiver, but false for a RECORD (a by-value struct, §9.2/#347) or an
+    // ENUM/primitive-extension receiver (a scalar, e.g. i32). For those the
+    // env silently stayed the null-pointer default, and makePropertyThunk's
+    // body unconditionally loaded `this` through it — a null-pointer read
+    // that SIGSEGVs the moment the getter body actually uses the receiver
+    // (confirmed: issue #2501's local-record repro). Capture ANY receiver
+    // shape (not just pointers), sized by getTypeStoreSize, mirroring
+    // buildMethodClosureCell's instMethod branch exactly. This is a raw
+    // value copy, never a retain: a record cannot declare `owned` fields or a
+    // destructor (§9.7 — "Records cannot have destructors, owned fields...
+    // the record does not own what they point to"), so there is nothing for
+    // the record itself to own or release, and envdtor stays null below
+    // (foundation: "a closure cell holds only borrows; freeing it frees ONLY
+    // the cell and its env block", bezel_runtime_refcounting.cpp) — exactly
+    // the same no-retain, no-envdtor contract buildMethodClosureCell already
+    // relies on for a record method-reference receiver.
     uint64_t cellSz =
         module_->getDataLayout().getTypeAllocSize(closureCellType());
     llvm::Value* closureObj = builder_.CreateCall(
         callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)cellSz)});
     builder_.CreateStore(thunk, closureObj);
     llvm::Value* envObj = llvm::ConstantPointerNull::get(ptrTy());
-    if (receiverVal && receiverVal->getType()->isPointerTy()) {
+    if (receiverVal) {
+        uint64_t envSz = module_->getDataLayout()
+                             .getTypeStoreSize(receiverVal->getType())
+                             .getFixedValue();
+        if (envSz < 8) envSz = 8;  // minimum 8 for alignment
         envObj = builder_.CreateCall(
-            callocFn(), {builder_.getInt64(1), builder_.getInt64(8)});
+            callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)envSz)});
         builder_.CreateStore(receiverVal, envObj);
     }
     builder_.CreateStore(
