@@ -1336,13 +1336,37 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // externally-declared `bz$<Class>$idxget$<arity>` function
     // declareImportedIndexerGetters installs, using the reconstructed
     // side-table types (the callee's own LLVM signature) instead of `pd`.
+    //
+    // fix #2489 (§9.2/§23.4, v0.236): widened from `Class`-only to
+    // `Class || Record` — §23.4 permits a read-write indexer on a body-form
+    // record with mutable properties, and emitExportedIndexerGetters (this
+    // fix's own companion in LlvmBackend_Setup.cpp) now exports a stub for
+    // one. Confirmed by probe: pre-fix, `r[3]` against an imported record
+    // indexer returned 0 (this `recvDecl->kind != Class` check rejected the
+    // record receiver and returned nullptr BEFORE the call was ever
+    // considered — no crash, no link error, just the caller's zero-init
+    // backstop). A record receiver also needs the by-value spill
+    // (`obj->getType()->isPointerTy()` alone rejects it, issue #347/§9.2,
+    // same as every other by-value-record-receiver site this fix touches)
+    // — added below, guarded by `isAggregateType()` (redundant with the
+    // `Class || Record` kind check above, since an Enum can never reach
+    // here per §23.5's "Enums may not declare indexers", confirmed still
+    // enforced by probe — but kept for defense-in-depth, matching every
+    // sibling spill site's own belt-and-suspenders posture).
     if (!pd) {
-        if (recvDecl->kind != ast::TypeDeclKind::Class) return nullptr;
+        if (recvDecl->kind != ast::TypeDeclKind::Class &&
+            recvDecl->kind != ast::TypeDeclKind::Record) return nullptr;
         auto git = importedIndexerGetterFns_.find(ps);
         if (git == importedIndexerGetterFns_.end()) return nullptr;
         llvm::Function* fn = git->second;
         llvm::Value* obj = lowerExpr(*ix.target);
-        if (!obj || !obj->getType()->isPointerTy()) return nullptr;
+        if (!obj) return nullptr;
+        if (!obj->getType()->isPointerTy()) {
+            if (!obj->getType()->isAggregateType()) return nullptr;
+            llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+            builder_.CreateStore(obj, tmp);
+            obj = tmp;
+        }
         auto* fnTy = fn->getFunctionType();
         std::vector<llvm::Value*> callArgs;
         callArgs.push_back(obj);
@@ -1591,13 +1615,58 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
     // returns false — the same "no setter to lower" outcome a local
     // getter-only indexer's `!setterExpr && !setterStmts` check produces
     // further down).
+    //
+    // fix #2489 (§9.2/§23.4, v0.236): the SETTER twin of the widening in
+    // lowerIndexerGet immediately above — same `Class`-only kind gate, same
+    // missing by-value-record spill, same fix, same §23.4 authority. See
+    // that function's comment for the full rationale (probe confirmed:
+    // `r[5] := 9; return r[2];` against an imported record's read-write
+    // indexer returned 0 pre-fix, both the SET and the independent GET
+    // rejected by this same shape of gate).
+    //
+    // A SETTER additionally needs the receiver's OWN storage address, not a
+    // copy — mirroring lowerImportedPropertySetValue's identical fix (this
+    // file): `lowerExpr(*ix.target)` on a named record-typed local LOADS a
+    // byte-for-byte copy, so spilling that copy into a fresh alloca (as a
+    // GET-only path may safely do) mutates a throwaway slot, never the
+    // caller's own variable — confirmed by probe (`r[5] := 9; return
+    // r[2];` returned 2, not 6, i.e. the write silently failed to persist
+    // even once the gate/spill above were in place). The pre-existing,
+    // same-shaped LOCAL (`pd != nullptr`) inline-body branch a few dozen
+    // lines below this one has this exact defect too — filed separately as
+    // #2502, out of #2489's cross-module-ABI scope; this `!pd` branch is
+    // new code written for #2489 and does not inherit it. Prefer
+    // `lvalueAddr` (resolves a local/field to its own storage via
+    // `localSlot`/`fieldAddr`) over `lowerExpr`; fall back to `lowerExpr` +
+    // spill only for a non-addressable (temporary) receiver, where no
+    // "original" exists to preserve.
     if (!pd) {
-        if (recvDecl->kind != ast::TypeDeclKind::Class) return false;
+        if (recvDecl->kind != ast::TypeDeclKind::Class &&
+            recvDecl->kind != ast::TypeDeclKind::Record) return false;
         auto sit = importedIndexerSetterFns_.find(ps);
         if (sit == importedIndexerSetterFns_.end()) return false;
         llvm::Function* fn = sit->second;
-        llvm::Value* obj = lowerExpr(*ix.target);
-        if (!obj || !obj->getType()->isPointerTy()) return false;
+        llvm::Value* obj = nullptr;
+        llvm::Type* objElemTy = nullptr;
+        if (llvm::Value* addr = lvalueAddr(*ix.target, objElemTy)) {
+            if (objElemTy && objElemTy->isPointerTy())
+                obj = builder_.CreateLoad(objElemTy, addr);
+            else if (objElemTy && objElemTy->isAggregateType())
+                obj = addr;  // already the address of the receiver's real storage
+        }
+        if (!obj) {
+            llvm::Value* ov = lowerExpr(*ix.target);
+            if (!ov) return false;
+            if (ov->getType()->isPointerTy()) {
+                obj = ov;
+            } else if (ov->getType()->isAggregateType()) {
+                llvm::AllocaInst* tmp = entryAlloca(ov->getType());
+                builder_.CreateStore(ov, tmp);
+                obj = tmp;
+            } else {
+                return false;
+            }
+        }
         auto* fnTy = fn->getFunctionType();
         std::vector<llvm::Value*> callArgs;
         callArgs.push_back(obj);
@@ -3270,6 +3339,59 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
 // coercion — both cross a fixed-ABI function-pointer boundary where an
 // implicit numeric widening admitted by sema (e.g. an `int` literal assigned
 // to a `long`-typed property) must be made explicit in the IR.
+//
+// fix #2489 (§9.2/§9.4/§23, v0.236): this function had NO by-value-receiver
+// handling at all — `!recv->getType()->isPointerTy()` unconditionally
+// rejected the call, exactly #2474's pre-fix property-GETTER shape
+// (LlvmBackend_Exprs.cpp's "imported non-virtual property getter" site).
+// A RECORD receiver lowers to a by-value struct (issue #347/§9.2), so a
+// settable computed property on an imported record always fell through this
+// guard — confirmed by probe: `r.Name := 55; return r.x + r.Name;` against
+// an imported record returned 9 (the untouched original `_n = 1`, i.e.
+// 9 + 1), not 64, proving the write silently dropped rather than crashing
+// or link-failing (this guard, not emitExportedPropertySetters' own
+// pre-#2489 Class-only gate, is what kept it link-safe pre-fix: the call
+// was never even emitted). Spill the receiver exactly as #2474's layer 2
+// does for the getter, guarded to `isAggregateType() && !isEnumReceiver` —
+// NOT a bare `!isPointerTy()`. #2474's own review caught that the bare
+// form is unsound here: declareImportedPropertySetters (no kind filter
+// beyond virtual/interface + ctx_.importedPropertyHasSetter) can — because
+// of a separate, pre-existing sema gap (#2499: an enum block-form settable
+// property is wrongly accepted, in violation of §10.5) — declare a
+// `$propset` reference for an ENUM property today; emitExportedPropertySetters
+// deliberately stays `Class || Record`, never `Enum`, so an unconditional
+// spill of an enum's scalar `i32` receiver into a pointer would fire a call
+// against a symbol nothing defines, turning a (silently-wrong-but-legal)
+// compiling-and-linking program into a hard `undefined reference` link
+// error. Confirmed mechanically: #2499's own repro shape, promoted to a
+// direct cross-module SET, links successfully with this guard in place.
+//
+// A second, independent defect surfaced while testing the spill above: a
+// naive `lowerExpr(*ma->target)` + spill-to-a-fresh-alloca (the pattern
+// every SIBLING by-value-receiver site in this codebase uses for READS,
+// #2474/#2489's own indexer-getter fix included) is WRONG for a SETTER
+// specifically. `lowerExpr` on a plain identifier referencing a
+// record-typed local LOADS the record's current value — a byte-for-byte
+// COPY, not the variable's own storage. Spilling that copy into a NEW
+// alloca and writing through it (via the exported setter stub) mutates
+// only the throwaway copy; the caller's own variable is never touched, so
+// `r.Name := 55; return r.x + r.Name;` (T1's own repro) evaluated as `9 +
+// 1` (the untouched original), not `9 + 55` — confirmed mechanically
+// before this second fix landed. (The identical defect shape exists in the
+// pre-existing, same-module `lowerIndexerSet` inline path — filed
+// separately as #2502, out of #2489's cross-module-ABI scope; this
+// function's OWN fix, being new code written for #2489, does not inherit
+// it.) The fix: prefer `lvalueAddr` (which resolves a plain local/field to
+// its OWN storage address via `localSlot`/`fieldAddr`) over `lowerExpr`
+// for the receiver — for a pointer-shaped (class) slot, load the pointer
+// value from that address (identical to what `lowerExpr` would have
+// yielded, since a class reference is a value that may be freely copied);
+// for an aggregate-shaped (record) slot, the address itself IS the correct
+// `this` — no spill needed, because it already addresses the real
+// storage. Only when the receiver expression is NOT an addressable place
+// (e.g. a fresh temporary — `MakeRecord().Name := 55`, where no "original"
+// exists to preserve) does this fall back to `lowerExpr` + spill, exactly
+// as before.
 bool Emitter::lowerImportedPropertySetValue(const ast::Expr& target,
                                             llvm::Value* v) {
     if (!v) return false;
@@ -3279,8 +3401,30 @@ bool Emitter::lowerImportedPropertySetValue(const ast::Expr& target,
     if (!ps || ps->isIndexer) return false;
     auto sit = importedPropSetterFns_.find(ps);
     if (sit == importedPropSetterFns_.end()) return false;
-    llvm::Value* recv = lowerExpr(*ma->target);
-    if (!recv || !recv->getType()->isPointerTy()) return false;
+    bool isEnumReceiver = ps->parent &&
+                          ps->parent->kind == ast::TypeDeclKind::Enum;
+    llvm::Value* recv = nullptr;
+    llvm::Type* recvElemTy = nullptr;
+    if (llvm::Value* addr = lvalueAddr(*ma->target, recvElemTy)) {
+        if (recvElemTy && recvElemTy->isPointerTy())
+            recv = builder_.CreateLoad(recvElemTy, addr);
+        else if (recvElemTy && recvElemTy->isAggregateType() &&
+                 !isEnumReceiver)
+            recv = addr;  // already the address of the receiver's real storage
+    }
+    if (!recv) {
+        llvm::Value* rv = lowerExpr(*ma->target);
+        if (!rv) return false;
+        if (rv->getType()->isPointerTy()) {
+            recv = rv;
+        } else if (rv->getType()->isAggregateType() && !isEnumReceiver) {
+            llvm::AllocaInst* tmp = entryAlloca(rv->getType());
+            builder_.CreateStore(rv, tmp);
+            recv = tmp;
+        } else {
+            return false;
+        }
+    }
     llvm::Function* fn = sit->second;
     llvm::Type* valTy = fn->getFunctionType()->getParamType(1);
     v = coerceNumericToType(v, valTy, isUnsignedTargetExpr(target));

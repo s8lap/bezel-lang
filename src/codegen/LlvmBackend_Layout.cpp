@@ -3183,6 +3183,51 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
                 result = builder_.CreateLoad(
                     fty, builder_.CreateStructGEP(st, thisVal, idxIt->second));
             }
+        } else if (ps->parent &&
+                   ps->parent->kind == ast::TypeDeclKind::Class) {
+            // fix #2489 (§9.2/§27.6, v0.236): an imported, non-virtual,
+            // non-auto COMPUTED property (an arrow-getter or block-form
+            // getter with no ast::PropertyDecl to drive computedGetterOf/
+            // blockGetterOf above, and no storage slot for
+            // isAutoPropertyStorage's branch either) referenced as a
+            // FUNCTION VALUE fell through every branch above straight to
+            // the `getNullValue` default below — silently yielding a
+            // thunk that always returns 0, never calling anything.
+            // Confirmed by probe: `var fn: () -> int := obj.Getter;
+            // return fn();` against an imported CLASS's arrow-getter
+            // property returned 0 instead of the field's real value.
+            // Mirror the ordinary (non-thunk) imported-getter fallback
+            // (LlvmBackend_Exprs.cpp's "imported non-virtual property
+            // getter" site, issue #503/#2474): call the exported
+            // `$propget` stub declareImportedPropertyGetters declared.
+            // `thisVal` here is ALWAYS `ptr` (loaded via
+            // `CreateLoad(ptrTy(), thunk->getArg(0))` a few lines above) —
+            // no by-value spill is needed the way the ordinary read path
+            // needs one, but ONLY because this branch is deliberately
+            // restricted to a CLASS receiver: `buildPropertyClosureCell`
+            // (this file, `Emitter::buildPropertyClosureCell`) only
+            // copies the receiver into the closure's env block when it is
+            // already a pointer — for a RECORD or ENUM receiver
+            // (value-shaped, §9.2/§10.4) the env is left null, so
+            // `thisVal` would be a null pointer here, not a usable
+            // receiver. Confirmed mechanically: the identical shape over
+            // a LOCAL (non-imported) record's arrow-getter SIGSEGVs today
+            // (a pre-existing, general bug unrelated to import/export —
+            // filed separately as #2501, out of #2489's cross-module-ABI
+            // scope). Restricting this branch to Class keeps #2489's own
+            // fix from making that latent crash newly reachable for the
+            // cross-module case: pre-fix, a Record/Enum receiver here hit
+            // the same `getNullValue` default every OTHER case did
+            // (silently wrong, not a crash); this branch preserves that
+            // exact pre-existing outcome for Record/Enum, changing
+            // behavior only for Class, where `thisVal` is genuinely valid.
+            auto git = importedPropGetterFns_.find(ps);
+            if (git != importedPropGetterFns_.end()) {
+                llvm::Function* fn = git->second;
+                result = builder_.CreateCall(fn->getFunctionType(), fn,
+                                             {thisVal});
+                emitPendingCheck();
+            }
         }
     }
     if (!result) result = llvm::Constant::getNullValue(retTy);

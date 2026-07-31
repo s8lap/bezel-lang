@@ -2103,10 +2103,41 @@ void Emitter::emitExportedPropertyGetters() {
 // only safe on a LOCAL decl, which every `ps` here has since this loop iterates
 // ctx_.symbols() — see declareImportedPropertySetters below for why the IMPORT
 // side must not use it either).
+//
+// fix #2489 (§9.2/§9.4/§23, v0.236): originally CLASS-only, the exact same
+// gate emitExportedPropertyGetters carried before #2474 widened it. A
+// RECORD's settable computed property (§9.4: "In the body form, properties
+// may be declared with any mutability") had no exported `$propset` stub —
+// declareImportedPropertySetters (the importer-side twin, no kind filter,
+// gated only on ctx_.importedPropertyHasSetter) still declared a reference
+// to it, so the reference existed with nothing to define it. Confirmed by
+// direct before/after probe (not just inferred from the getter's shape):
+// `r.Name := 55; return r.x + r.Name;` against an imported record with a
+// public settable computed property returned 9 (the untouched original,
+// i.e. `_n` still 1) instead of 64 — the write silently dropped, exactly
+// the #2400 "DIRECT shape" symptom §2400's own header documents, not a link
+// error (lowerImportedPropertySetValue's pre-#2489 `isPointerTy()` guard,
+// see LlvmBackend_Assign.cpp, rejects the by-value record receiver before
+// ever emitting the call, so the undefined symbol this gate leaves dangling
+// is never actually referenced pre-#2489 either way). Widened to Class ||
+// Record — safe for the identical reason #2474 gave: ensurePropertyAccessorFn
+// (the body-building delegate this function forwards to) already declares
+// `this` as `ptr` unconditionally and its classStruct(cls) call already
+// forwards to recordStruct for a Record. Deliberately still NOT `Enum`:
+// §10.4/§10.5 restrict enum members to expression-bodied READ-ONLY
+// properties, so a well-formed enum property can never reach
+// declareImportedPropertySetters' `ctx_.importedPropertyHasSetter(ps)` gate
+// in the first place — but see the companion fix in
+// LlvmBackend_Assign.cpp's lowerImportedPropertySetValue for why the
+// IMPORTER call site still needs its own explicit enum exclusion (a
+// separate, pre-existing sema gap — filed as #2499 — currently lets an
+// enum declare a BLOCK-form settable property, which §10.5 forbids; that
+// gap is orthogonal to this ABI fix and not corrected here).
 void Emitter::emitExportedPropertySetters() {
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        if (!ts || (ts->kind != ast::TypeDeclKind::Class &&
+                    ts->kind != ast::TypeDeclKind::Record)) continue;
         if (ts->visibility != ast::Visibility::Public) continue;
         if (!ts->genericParams.empty()) continue;
         for (sema::Symbol* m : ts->members) {
@@ -2176,10 +2207,31 @@ void Emitter::emitExportedPropertySetters() {
 // CLASS + ARITY (not the full index-parameter type signature): see the
 // function declaration's comment (LlvmBackend_impl.hpp) for why this is a
 // documented, deliberate simplification rather than an oversight.
+//
+// fix #2489 (§9.2/§23.4, v0.236): originally CLASS-only, the same
+// Class-only gate #2474 found and fixed on emitExportedPropertyGetters.
+// §23.4: "Records may declare read-only indexers. Body-form records with
+// mutable properties may declare read-write indexers" — a RECORD indexer
+// had no exported `bz$<Type>$idxget$<arity>` stub, while
+// declareImportedIndexerGetters (the importer twin, no kind filter beyond
+// virtual/interface) still declares a reference. Confirmed by probe before
+// fixing: `r[3]` against an imported record indexer (getter `_v + i`)
+// returned 0 instead of 3 — not a link error, because the importer CALL
+// SITE (lowerIndexerGet, LlvmBackend_Assign.cpp) has its OWN separate
+// `recvDecl->kind != Class` gate that rejected the record receiver before
+// ever emitting the call (see that fix's own comment for why it also
+// needed widening). ensureIndexerGetterFn already declares `this` as `ptr`
+// unconditionally (paramTys.push_back(ptrTy())), so — exactly as for
+// emitExportedPropertyGetters — only this gate needed widening, not the
+// body builder. Deliberately still not `Enum`: §23.5 forbids indexers on
+// enums outright ("Enums may not declare indexers"), confirmed still
+// enforced (probed: rejected with "enum `E` may not declare an indexer
+// (§10.5)"), so no enum indexer PropertySymbol can ever reach this loop.
 void Emitter::emitExportedIndexerGetters() {
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        if (!ts || (ts->kind != ast::TypeDeclKind::Class &&
+                    ts->kind != ast::TypeDeclKind::Record)) continue;
         if (ts->visibility != ast::Visibility::Public) continue;
         if (!ts->genericParams.empty()) continue;
         for (sema::Symbol* m : ts->members) {
@@ -2239,10 +2291,22 @@ void Emitter::emitExportedIndexerGetters() {
 // builder finds no setter accessor (getter-only indexer), it returns nullptr
 // and the incomplete declaration is erased — this indexer is correctly
 // excluded from the cross-module setter surface.
+//
+// fix #2489 (§9.2/§23.4, v0.236): the SETTER twin of the widening just above
+// on emitExportedIndexerGetters — same Class-only gate, same fix, same
+// §23.4 authority ("Body-form records with mutable properties may declare
+// read-write indexers"). Confirmed by probe: `r[5] := 9; return r[2];`
+// against an imported record's read-write indexer returned 0 (both the SET
+// and the subsequent GET independently broken pre-fix — see the companion
+// importer-call-site fix in LlvmBackend_Assign.cpp) instead of the correct
+// 6. ensureIndexerSetterFn is already general (`this` as `ptr`
+// unconditionally, mirrors ensureIndexerGetterFn); not widened to `Enum`
+// for the same §23.5 reason (no enum indexer can exist).
 void Emitter::emitExportedIndexerSetters() {
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-        if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+        if (!ts || (ts->kind != ast::TypeDeclKind::Class &&
+                    ts->kind != ast::TypeDeclKind::Record)) continue;
         if (ts->visibility != ast::Visibility::Public) continue;
         if (!ts->genericParams.empty()) continue;
         for (sema::Symbol* m : ts->members) {
