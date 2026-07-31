@@ -5106,7 +5106,7 @@ llvm::Value* Emitter::wrapUserClassAsIEnumerable(llvm::Value* src,
 // Returns the slot address, or null when `target` is not an accessor-mediated
 // location this bracket can drive (caller falls through to #1386).
 llvm::Value* Emitter::emitAccessorRefArgCopyIn(
-    const ast::Expr& target, const ast::Param& param, bool isOut,
+    const ast::Expr& target, llvm::Type* paramTy, bool isOut,
     std::vector<AccessorRefArg>& sink) {
     AccessorRefArg rec;
     rec.target = &target;
@@ -5167,10 +5167,6 @@ llvm::Value* Emitter::emitAccessorRefArgCopyIn(
     //     shape). // per §22.3
     llvm::Type* valueTy = nullptr;
     if (const sema::TypeRef* et = ctx_.exprType(target)) valueTy = lowerTypeRef(et);
-    llvm::Type* paramTy = nullptr;
-    if (param.type)
-        if (const sema::TypeRef* pt = ctx_.resolvedType(*param.type))
-            paramTy = lowerTypeRef(pt);
     if (!valueTy) valueTy = paramTy;
     if (!valueTy) { unpinAll(); return nullptr; }
     llvm::Type* slotTy = valueTy;
@@ -5543,10 +5539,16 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // compile-time rejection through the #1386 fallback below; the
             // missing dedicated §22.3 diagnostic is filed separately.
             if (!v && accessorRefArgs &&
-                (params[idx].modifier == "ref" || params[idx].modifier == "out"))
+                (params[idx].modifier == "ref" || params[idx].modifier == "out")) {
+                llvm::Type* paramTy = nullptr;
+                if (params[idx].type)
+                    if (const sema::TypeRef* pt =
+                            ctx_.resolvedType(*params[idx].type))
+                        paramTy = lowerTypeRef(pt);
                 v = emitAccessorRefArgCopyIn(
-                    *a.value, params[idx],
+                    *a.value, paramTy,
                     /*isOut=*/params[idx].modifier == "out", *accessorRefArgs);
+            }
         } else if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
                        a.value.get())) {
             // #999 / §15.4: a collection literal passed inline as a call argument.

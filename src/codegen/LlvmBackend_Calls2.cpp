@@ -6207,6 +6207,11 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         genericSubst_ = std::move(preSavedSubst);
                         genericSubstSemaTy_ = std::move(preSavedSema);
                     }
+                    // fix #2462: release any earlier arg's accessor-bracket
+                    // pins before abandoning the call (mirrors the `!v`
+                    // cleanup just below).
+                    emitAccessorRefArgWriteBacks(accessorRefArgs,
+                                                 /*emit=*/false);
                     return nullptr;
                 }
                 // Determine the formal parameter's ref/out modifier from the
@@ -6222,6 +6227,32 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 if (byRef) {
                     llvm::Type* et = nullptr;
                     v = lvalueAddr(*a.value, et);
+                    // fix #2462 (§22.3/§2.8.2 clause 1/§2.8.3 rule 4,
+                    // v0.235): `lvalueAddr` only resolves a true-alias
+                    // location (local/field/static/inline-array element);
+                    // an indexer slot or property needs the accessor
+                    // copy-in/copy-out bracket instead (§22.3), which this
+                    // branch never fell back to for an IMPORTED callee —
+                    // confirmed by probe: `ref`/`out` on a property target
+                    // to an imported method compiled clean and silently
+                    // dropped the write (no diagnostic anywhere; `v` being
+                    // null here just abandoned the WHOLE call below with no
+                    // error). Mirrors buildOrderedArgs's identical fallback
+                    // (LlvmBackend_Assign.cpp) exactly, restricted to plain
+                    // `ref`/`out` the same way (`out owned` etc. are NOT
+                    // admitted into the bracket, §22.3), populating the
+                    // SAME `accessorRefArgs` sink this function already
+                    // flushes unconditionally after the call
+                    // (emitAccessorRefArgWriteBacks below) — no new
+                    // machinery. `paramTy` is passed null: an imported
+                    // method's own AST param is never reconstructed
+                    // (#1221's limitation), and §22.3's "exact referent
+                    // type" rule means the target's own exprType already
+                    // gives the correct slot type in the ordinary case.
+                    if (!v && (formalMod == "ref" || formalMod == "out"))
+                        v = emitAccessorRefArgCopyIn(
+                            *a.value, /*paramTy=*/nullptr,
+                            /*isOut=*/formalMod == "out", accessorRefArgs);
                 } else {
                     v = lowerExpr(*a.value);
                 }
@@ -6230,6 +6261,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         genericSubst_ = std::move(preSavedSubst);
                         genericSubstSemaTy_ = std::move(preSavedSema);
                     }
+                    emitAccessorRefArgWriteBacks(accessorRefArgs,
+                                                 /*emit=*/false);
                     return nullptr;
                 }
                 args.push_back(v);
@@ -8587,11 +8620,21 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
         // §22.3 / #1221: an imported method has no ast::MethodDecl — mirror
         // lowerCall's cross-module fallback: consult the imported
         // ParameterSymbol's modifier and pass the argument's ADDRESS for a
-        // ref/out parameter. No accessor bracket on this path (matching the
-        // `.` form's identical limitation there).
+        // ref/out parameter.
+        // fix #2462 (§22.3/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): this path
+        // now DOES fall back to the accessor bracket for a property/indexer
+        // target — the "No accessor bracket on this path" limitation this
+        // comment used to describe silently dropped the write with no
+        // diagnostic (confirmed by probe, same shape as the `.` form's
+        // identical gap, fixed the same way just above). See that fix's
+        // comment for the full rationale; `paramTy` is null for the same
+        // reason (no ast::Param for an imported callee).
         std::size_t pi = 0;
         for (const auto& a : call.args) {
-            if (!a.value) return nullptr;
+            if (!a.value) {
+                emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
+                return nullptr;
+            }
             std::string_view formalMod;
             if (pi < ms->params.size())
                 if (auto* ps =
@@ -8602,10 +8645,17 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
             if (byRef) {
                 llvm::Type* et = nullptr;
                 v = lvalueAddr(*a.value, et);
+                if (!v && (formalMod == "ref" || formalMod == "out"))
+                    v = emitAccessorRefArgCopyIn(
+                        *a.value, /*paramTy=*/nullptr,
+                        /*isOut=*/formalMod == "out", accessorRefArgs);
             } else {
                 v = lowerExpr(*a.value);
             }
-            if (!v) return nullptr;
+            if (!v) {
+                emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
+                return nullptr;
+            }
             args.push_back(v);
             argExprs.push_back(a.value.get());
             ++pi;

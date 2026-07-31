@@ -8905,8 +8905,22 @@ private:
     // callee's slot, or null when `target` is not an accessor-mediated
     // location this bracket can drive (the caller then falls through to its
     // existing #1386 diagnostic).
+    //
+    // fix #2462 (§22.3/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): `paramTy` is
+    // the callee's declared parameter type, ALREADY LOWERED — was formerly
+    // `const ast::Param&`, but the two IMPORTED-callee call sites this fix
+    // adds (LlvmBackend_Calls2.cpp) have no `ast::Param` at all (an imported
+    // method's own AST is never reconstructed — #1221's same limitation
+    // #2400/#2412/#2415 hit elsewhere). `paramTy` is used only to WIDEN the
+    // slot when the callee's declared width exceeds the target's own type
+    // (the #2266 slot-clobber shape); §22.3's "exact referent type" rule
+    // means the common case has `paramTy == valueTy` anyway, so a caller
+    // that cannot cheaply recover the callee's declared type may pass
+    // `nullptr` — `valueTy` (from the target's own exprType) alone still
+    // drives the slot's primary type, so this degrades the #2266 widening
+    // refinement only, not ordinary correctness.
     llvm::Value* emitAccessorRefArgCopyIn(const ast::Expr& target,
-                                          const ast::Param& param, bool isOut,
+                                          llvm::Type* paramTy, bool isOut,
                                           std::vector<AccessorRefArg>& sink);
 
     // #1302 / §22.3: emit the copy-OUT half — "on **normal return** the setter
