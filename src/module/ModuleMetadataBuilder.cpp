@@ -976,6 +976,47 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 out.params = convertParams(prop->indexerParams, ctx);
                 fillParamDefaults(out.params, pd->indexerParams);
             }
+            // fix #2467 (§9.2/§2.5, v0.235): carry an instance AUTO-PROPERTY's
+            // constant-foldable initializer (`property X: T := v;`) textually,
+            // mirroring the FieldDecl branch above exactly (same renderConstExpr
+            // / §22.8 FINDING [7] wire precedent — `valueText` already "rides
+            // every member", ModuleMetadata.hpp v2/v3 notes, so this populates
+            // an existing always-serialized-but-previously-always-empty field
+            // for Property, no schema bump). The FieldDecl branch above only
+            // ever matches `m.decl` as an `ast::FieldDecl` — an auto-property's
+            // `PropertyDecl` never takes that branch — so an auto-property's
+            // own default value was NOT carried at all before this fix, a
+            // strictly separate gap from the Field case (which already
+            // worked). This is the root cause of #2467's confirmed repro (a
+            // fully public `record BodOnly { public property W: int := 42; }`
+            // reading `0` after import): §9.2's record construction
+            // (`buildRecordValue`, LlvmBackend_Exprs2.cpp) reads a body
+            // member's initializer off `m->decl`, which is null for every
+            // imported symbol (no AST crosses the boundary) — with no wire
+            // carriage at all, the importer had nothing to fall back to. See
+            // buildRecordValue's decl-null fallback (this issue) for the
+            // consuming side.
+            //
+            // Scoped identically to the Field case: only a NON-STATIC
+            // auto-property's foldable initializer crosses (a static
+            // auto-property is admitted by §22.12 rule 2 but follows the
+            // external-storage-global story like a static field — no
+            // textual carriage needed here). Applies to BOTH classes and
+            // records — for classes this rides alongside the FieldDecl
+            // carriage as inert, unconsumed data (classes replay field/auto-
+            // property initializers via the exported `bz$<Type>$init`
+            // function, #2452, which needs no textual carriage at all,
+            // exactly as the Field branch's own comment already notes for
+            // the class case) — only `buildRecordValue`'s new fallback
+            // (this issue) reads it.
+            if (pd->bodyKind == ast::PropertyBodyKind::Auto &&
+                pd->autoInitializer) {
+                bool isStaticProp = false;
+                for (auto mod : m.modifiers)
+                    if (mod == "static") { isStaticProp = true; break; }
+                if (!isStaticProp)
+                    out.valueText = renderConstExpr(pd->autoInitializer.get());
+            }
             // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): mirror
             // LlvmBackend_impl.hpp's propertyHasSetter exactly. That codegen
             // helper only ever operates on a LOCAL decl (the same `pd`

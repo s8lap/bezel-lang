@@ -473,6 +473,19 @@ struct Loader {
                 // to read `pd->accessors[i].visibility` from at the
                 // cross-module assignment site.
                 propSetterVisibility_[p] = fromMetaVisibility(mm.setterVisibility);
+                // fix #2467 (§9.2/§2.5, v0.235): mirror the Field case's
+                // constValues_ carriage above — an auto-property's
+                // constant-foldable initializer (ModuleMetadataBuilder.cpp's
+                // new Property-branch `out.valueText`) is folded at RECORD
+                // construction by buildRecordValue's decl-null fallback
+                // (LlvmBackend_Exprs2.cpp), the same `ctx_.importedConstValue`
+                // / `foldImportedConstText` path §22.12/§22.8 FINDING [3]/[7]
+                // already provide. No consumer exists on the CLASS side (a
+                // class replays field/auto-property initializers via the
+                // exported `bz$<Type>$init` function, #2452) — this entry
+                // simply rides unread for a class's PropertySymbol, exactly
+                // as the pre-existing Field-side carriage already does.
+                if (!mm.valueText.empty()) constValues_[p] = mm.valueText;
                 applyBehavior(p);
                 return p;
             }

@@ -5151,32 +5151,89 @@ llvm::Value* Emitter::buildRecordValue(
             init = fd->initializer.get();
         else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
             init = pd->autoInitializer.get();  // §9.2: `property X := v;`
-        if (!init) continue;
         auto idxIt = fieldIndex_.find(m);
         if (idxIt == fieldIndex_.end()) continue;
-        llvm::Value* v = lowerExpr(*init);
-        if (!v) {
-            // #1386: ICE — lowerExpr returned null for a record field/property
-            // default initializer; the expression kind is not yet handled.
-            ctx_.diagnostics().report(
-                Severity::Error, init->span.begin,
-                "internal: lowerExpr returned null for record field/property "
-                "default initializer — #1386");
+        if (init) {
+            llvm::Value* v = lowerExpr(*init);
+            if (!v) {
+                // #1386: ICE — lowerExpr returned null for a record field/
+                // property default initializer; the expression kind is not
+                // yet handled.
+                ctx_.diagnostics().report(
+                    Severity::Error, init->span.begin,
+                    "internal: lowerExpr returned null for record "
+                    "field/property default initializer — #1386");
+                continue;
+            }
+            // CG-nullable: a NULLABLE VALUE field initialized with a plain
+            // value (`property N: int? := 9;`, or `property C: Color? :=
+            // Color.Green;` — issue #364) must wrap the bare value into the
+            // {i8 hasValue; T value} struct, like the positional path below.
+            // per §9.2
+            const sema::TypeRef* initFty = recordMemberType(m);
+            if (isNullableValueTy(initFty)) {
+                auto* expectedSt = nullableValueStructTy(initFty);
+                if (v->getType() != expectedSt) {
+                    if (v->getType()->isPointerTy() &&
+                        llvm::isa<llvm::ConstantPointerNull>(v))
+                        v = nullableValueNull(initFty);
+                    else if (v->getType() == expectedSt->getElementType(1))
+                        v = wrapNullableValue(initFty, v);
+                }
+            }
+            builder_.CreateStore(
+                v, builder_.CreateStructGEP(st, slot, idxIt->second));
             continue;
         }
-        // CG-nullable: a NULLABLE VALUE field initialized with a plain value
-        // (`property N: int? := 9;`, or `property C: Color? := Color.Green;` —
-        // issue #364) must wrap the bare value into the {i8 hasValue; T value}
-        // struct, like the positional path below. per §9.2
-        const sema::TypeRef* initFty = recordMemberType(m);
-        if (isNullableValueTy(initFty)) {
-            auto* expectedSt = nullableValueStructTy(initFty);
+        // fix #2467 (§9.2/§2.5, v0.235): `m->decl` is null for an IMPORTED
+        // body storage member — no `ast::FieldDecl`/`PropertyDecl` crosses
+        // the module boundary, so `init` above always misses and this
+        // initializer was silently skipped entirely, leaving the storage at
+        // its `ConstantAggregateZero` default regardless of the exporter's
+        // declared value (#2467's own confirmed repro: a fully public
+        // `record BodOnly { public property W: int := 42; }` reads `0`
+        // after import). A record's construction is fully inline and
+        // by-value, with NO cross-module CALL of any kind to hook a
+        // class-style `bz$<Type>$init` replay into (unlike #2452's class
+        // mechanism, which needs no textual carriage because the exporter's
+        // own compiled function runs the real initializer) — so this falls
+        // back to the SAME constant-foldable-text wire mechanism §22.12's
+        // const values and the Field-side §22.8 class layout carriage
+        // already use (ModuleMetadataBuilder.cpp's renderConstExpr /
+        // ctx_.importedConstValue / foldImportedConstText, issue #328
+        // FINDING [3]/[7] — extended to auto-properties by this same fix).
+        // No new metadata surface invented (CLAUDE.md rule 4): `valueText`
+        // already "rides every member" on the wire; this just consumes an
+        // existing field that had no reader for a record body member before.
+        // Only a CONSTANT-FOLDABLE initializer crosses this way
+        // (renderConstExpr returns "" for `new Array()`, `DateTime.Now`,
+        // etc., and a PRIVATE/internal member's valueText is deliberately
+        // stripped by the layout-only carriage, #2468) — a non-foldable or
+        // private body-member initializer remains a documented, pre-existing
+        // limitation, not newly regressed by this fix.
+        //
+        // A LOCAL positional field also reaches here (its `m->decl` is the
+        // owning TypeDecl, never a FieldDecl/PropertyDecl, so `init` misses
+        // above too) — gate on `m->decl == nullptr` (true only for an
+        // IMPORTED symbol; every LOCAL symbol, positional or otherwise, has
+        // a non-null decl) so a local positional field takes the same
+        // no-initializer-to-run `continue` it always did, without a wasted
+        // (harmless, since the map lookup would find nothing, but
+        // misleading) importedConstValue probe.
+        if (m->decl != nullptr) continue;
+        const std::string* text = ctx_.importedConstValue(m);
+        if (!text || text->empty()) continue;
+        const sema::TypeRef* fty = recordMemberTypeResolved(m);
+        llvm::Value* v = foldImportedConstText(*text, fty);
+        if (!v) continue;
+        if (isNullableValueTy(fty)) {
+            auto* expectedSt = nullableValueStructTy(fty);
             if (v->getType() != expectedSt) {
                 if (v->getType()->isPointerTy() &&
                     llvm::isa<llvm::ConstantPointerNull>(v))
-                    v = nullableValueNull(initFty);
+                    v = nullableValueNull(fty);
                 else if (v->getType() == expectedSt->getElementType(1))
-                    v = wrapNullableValue(initFty, v);
+                    v = wrapNullableValue(fty, v);
             }
         }
         builder_.CreateStore(
