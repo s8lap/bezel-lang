@@ -11704,6 +11704,31 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // `IEnumerable<T>` extension block, transcribed
                         // fresh from the doc for this fix (not copied from
                         // the file's other, incomplete `isLinqOp` list).
+                        //
+                        // #2484: `MinOrNull`/`MaxOrNull` (stdlib §5.1's
+                        // `public extension IEnumerable<T> where T:
+                        // IComparable<T>` block) were missing from this
+                        // original transcription -- the identical shape to
+                        // the `ToArray` gap slice 2's own review found in
+                        // its Stack/Queue counterpart of this list (commit
+                        // bd41a69): a bare reference (`var f :=
+                        // a.MinOrNull;`, language spec §27.6) was wrongly
+                        // rejected even though the type is genuine,
+                        // documented, real. Re-derived the whole §5/§5.1
+                        // surface fresh against ALL FIVE of this block's
+                        // exemption paths (isUniversalObjectMember,
+                        // isLengthAlias, isDeclaredMethod, isLinqOperator,
+                        // isCallForm) for this fix rather than re-trusting
+                        // either list -- confirms MinOrNull/MaxOrNull are
+                        // the only gap (`Count` is not: it's typed by the
+                        // dedicated property handler ~950 lines up, ~line
+                        // 10733, and returns before this block ever runs).
+                        // The CALL form (`a.MinOrNull()`) is separately
+                        // broken by the pre-existing, unrelated #920/#1112
+                        // allowedNonOwningMethod/allowedOwningMethod
+                        // call-site validator (~line 3814/3937) -- out of
+                        // scope here, which is the bare-reference form
+                        // only.
                         bool isLinqOperator =
                             mbr == "Where" || mbr == "OfType" ||
                             mbr == "Select" || mbr == "SelectMany" ||
@@ -11713,6 +11738,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             mbr == "Single" || mbr == "SingleOrNull" ||
                             mbr == "ElementAt" || mbr == "Sum" ||
                             mbr == "Min" || mbr == "Max" ||
+                            mbr == "MinOrNull" || mbr == "MaxOrNull" ||
                             mbr == "Average" || mbr == "Aggregate" ||
                             mbr == "OrderBy" || mbr == "OrderByDescending" ||
                             mbr == "Distinct" || mbr == "Union" ||

@@ -152,6 +152,29 @@ BEZEL_TEST(array_unresolved_member_2457, legit_linq_bare_method_reference_not_re
     BEZEL_EXPECT_EQ(run(program), 0);
 }
 
+// #2484: `.MinOrNull`/`.MaxOrNull` bare reference — both are genuine members
+// of stdlib §5.1's `IEnumerable<T> where T: IComparable<T>` extension with
+// no per-type override on Array/OwningArray, but were missing from this
+// slice's own `isLinqOperator` list (found by independently re-deriving the
+// whole §5/§5.1 surface against the doc, not by diffing against slice 2's
+// already-corrected Stack/Queue list — the same "MinOrNull` bare reference
+// falsely rejected" shape slice 2's own review caught in its own list,
+// commit bd41a69). Confirmed on origin/main before this fix: `var f :=
+// a.MinOrNull;` was rejected with "no member `MinOrNull` on `Array<T>`".
+BEZEL_TEST(array_unresolved_member_2457, legit_minornull_maxornull_bare_method_reference_not_regressed) {
+    const std::string program =
+        "module M; import System.Collections.Linq; "
+        "class C public static method Main(): int "
+        "  var a := new Array<int>(3); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var f := a.MinOrNull; "
+        "  var g := a.MaxOrNull; "
+        "  a.Dispose(); "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(program), 0);
+}
+
 // Call-form methods across the declared surface still work — sampled, not
 // exhaustive (the broad `array_`/`linq`/`collection` suites, ~1600 tests,
 // already exercise the full call surface; this is a direct guard on THIS
