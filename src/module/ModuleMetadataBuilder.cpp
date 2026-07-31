@@ -1193,30 +1193,55 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         // (process-global storage, §22.12) — this fix is scoped to §22.8
         // instance layout only, not the separate static cross-module story.
         //
-        // Scoped to CLASSES ONLY (t.kind == Class), not records: a
-        // positional record's storage order interleaves body fields BEFORE
-        // the positional fields in `t.members` (confirmed by
-        // instrumentation — a record's positional field is appended to
-        // `t.members` AFTER its body fields, regardless of source order),
-        // and `buildRecordValue`'s positional-constructor-argument-to-slot
-        // mapping (LlvmBackend_Exprs2.cpp) was not verified to consult the
-        // same `fieldIndex_` a newly-visible hidden body field would shift —
+        // fix #2468 (§9.1/§22.8, v0.235): extended to RECORDS. This was
+        // originally scoped to CLASSES ONLY because a positional record's
+        // storage order interleaves body fields BEFORE the positional fields
+        // in `t.members` (confirmed by instrumentation — a record's
+        // positional field is appended to `t.members` AFTER its body fields,
+        // regardless of source order), and `buildRecordValue`'s positional-
+        // constructor-argument-to-slot mapping (LlvmBackend_Exprs2.cpp) used
+        // to assume `args[i]` maps to `fields[i]` by raw storage index —
         // widening this for records regressed a previously-CORRECT read
         // (`r.x` went from the right value to 0 once a private record body
-        // field became visible for layout). Classes have no such
-        // interleaving risk: `collectInstanceStorage` always lays the base
-        // class's storage down FIRST, monotonically, before any derived
-        // class's own fields (§22.8), so a newly-visible base field only
-        // ever shifts LATER fields, never reorders earlier ones out from
-        // under an already-correct construction path. The record gap
-        // (#2456's own construction-time twin for records, plus this
-        // ordering hazard) is filed separately as #2464 rather than fixed
-        // here.
+        // field became visible for layout). That ordering defect is now
+        // root-caused and fixed by #2464: `buildRecordValue` maps each
+        // positional argument to the correct POSITIONAL field (the trailing
+        // `args.size()` entries of `fields`/`t->members`, which stay a
+        // contiguous block regardless of body-field count) rather than by
+        // raw index, so a newly-visible hidden body field only shifts WHERE
+        // the positional block starts, never which entries are in it.
+        // Re-verified directly (this issue): the exact repro that motivated
+        // the classes-only scoping —
+        //   public record Rec(x: int)
+        //     private _hidden: int := 77;
+        //     public property Hidden: int => _hidden;
+        //   end Rec;
+        // — now round-trips `r.x` correctly cross-module with this gate
+        // widened (see xmod_record_private_field_layout_import_2468_test.cpp
+        // T1). Classes have an analogous non-interleaving guarantee:
+        // `collectInstanceStorage` always lays the base class's storage down
+        // FIRST, monotonically, before any derived class's own fields
+        // (§22.8), so a newly-visible base field only ever shifts LATER
+        // fields.
+        //
+        // NOTE: this makes a private/internal record body field's STORAGE
+        // SLOT visible (fixing the identical aliasing/under-allocation
+        // hazard #2456 fixes for classes — §9.1's storage layout is a
+        // property of declaration order, not of the §13 exported surface,
+        // exactly as §22.8 is for classes) but does NOT make its declared
+        // DEFAULT VALUE correct cross-module for a PRIVATE member — that
+        // value replay gap is #2467, fixed in this same issue pair only for
+        // the already-exported (public) case; see buildRecordValue
+        // (LlvmBackend_Exprs2.cpp) and this loop's
+        // `mm.valueText.clear()` below, which deliberately keeps a
+        // layout-only member's carriage genuinely layout-only (no
+        // initializer, no ABI change — mirrors the class precedent).
         bool isStaticFieldMember = false;
         for (auto mod : member->modifiers)
             if (mod == "static") { isStaticFieldMember = true; break; }
         bool includeForLayout = isField && !exported && !isStaticFieldMember &&
-            t.kind == ast::TypeDeclKind::Class;
+            (t.kind == ast::TypeDeclKind::Class ||
+             t.kind == ast::TypeDeclKind::Record);
         if (!exported && !includeForCtorBody && !includeForMethodBody &&
             !includeForLayout)
             continue;
