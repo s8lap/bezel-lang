@@ -4280,7 +4280,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             emitPendingCheck();
             return res;
         }
-        // §2.5 / §22.9 (issue #503): imported non-virtual property getter.
+        // §2.5 / §23 (issue #503): imported non-virtual property getter.
         // computedGetterOf and blockGetterOf both returned null because the
         // imported PropertySymbol has no ast::PropertyDecl. Call the external
         // getter function `bz$<Class>$<Prop>$propget` declared by
@@ -4290,7 +4290,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             auto git = importedPropGetterFns_.find(ps);
             if (git != importedPropGetterFns_.end() && ma->target) {
                 llvm::Value* obj = lowerExpr(*ma->target);
-                // fix #2474 (§9.2/§22.9, v0.235): issue #347's own rationale
+                // fix #2474 (§9.2/§23.1/§23.2, v0.235): issue #347's own rationale
                 // applies here exactly as it does to the LOCAL computed-getter
                 // path above (~L4122-4156) and the block-getter path above
                 // that (~L4257-4267) — a RECORD receiver lowers to a by-value
@@ -4310,7 +4310,42 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 // too, not just the failing operand. Spill the record value to
                 // a stack slot and pass that slot's address as `this`,
                 // mirroring the sibling paths exactly.
-                if (obj && !obj->getType()->isPointerTy()) {
+                //
+                // Guard the spill to AGGREGATE receivers only (mirroring the
+                // LOCAL computed-getter path's own `isAggregateType() &&
+                // !isEnumReceiver` condition exactly, not just its
+                // `isPointerTy()` half) — an ENUM receiver lowers to a bare
+                // scalar `i32`, never a struct, so it is not this fix's
+                // concern. Review caught an over-broad first draft here that
+                // guarded on `!isPointerTy()` alone: `declareImportedProperty
+                // Getters` (LlvmBackend_Setup.cpp) declares the external
+                // stub for EVERY imported PropertySymbol with no kind filter,
+                // including an enum's expression-bodied property (§10.4
+                // permits one), so an unconditional spill made THAT call fire
+                // too — but this fix's exporter-side half (
+                // emitExportedPropertyGetters) only widened its gate to
+                // `Class || Record`, not `Enum`, so the stub the call now
+                // reached had no definition anywhere. Confirmed mechanically:
+                // the over-broad draft turned a program that compiles and
+                // links TODAY (silently reading the documented `0` degrade,
+                // exactly like the record case pre-fix) into a hard
+                // `undefined reference` LINK ERROR — strictly worse than the
+                // preexisting silent-wrong-value gap it did not intend to
+                // touch. Restricting the spill to aggregates restores the
+                // exact preexisting (still-silently-wrong, still out of this
+                // record-scoped issue's scope) enum behavior. Filed as its
+                // own issue rather than fixed here or by widening layer 1 to
+                // `Enum` — that would additionally require confirming
+                // ensurePropertyAccessorFn's enum `this` handling is correct
+                // when reached through this NEW external-stub calling
+                // convention (today only exercised, if at all, through
+                // itable dispatch, a different call shape), which is exactly
+                // the kind of "one more layer" scope creep #2474 (a
+                // RECORD-scoped issue) should not silently absorb.
+                bool isEnumReceiver = ps->parent &&
+                                      ps->parent->kind == ast::TypeDeclKind::Enum;
+                if (obj && !obj->getType()->isPointerTy() &&
+                    obj->getType()->isAggregateType() && !isEnumReceiver) {
                     llvm::AllocaInst* tmp = entryAlloca(obj->getType());
                     builder_.CreateStore(obj, tmp);
                     obj = tmp;

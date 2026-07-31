@@ -3285,7 +3285,7 @@ llvm::Value* Emitter::implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy)
     auto* ms = storageMemberOf(ctx_.exprSymbol(e));
     if (!ms || !ms->parent || !currentThis_) return nullptr;
     auto idxIt = fieldIndex_.find(ms);
-    // fix #2474 (§9.2/§22.9, v0.235): `idxIt == end()` here does NOT
+    // fix #2474 (§9.2/§23.1/§23.2, v0.235): `idxIt == end()` here does NOT
     // necessarily mean `ms` is a static field (the pre-fix assumption, which
     // returned null unconditionally at this point) — fieldIndex_ is
     // populated lazily, by classStruct/recordStruct's FIRST call for

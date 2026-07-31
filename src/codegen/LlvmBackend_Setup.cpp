@@ -1986,7 +1986,7 @@ void Emitter::declareImportedFunctions() {
 // stable cross-module symbol. Static properties have no `this` parameter and are
 // handled separately by the static-field path; they're excluded here.
 //
-// fix #2474 (§9.2/§22.9, v0.235): originally CLASS-only. A RECORD's computed
+// fix #2474 (§9.2/§23.1/§23.2, v0.235): originally CLASS-only. A RECORD's computed
 // (arrow/block) property has no storage slot for the importer to GEP directly
 // (unlike an auto-property, whose imported read goes through the #2478
 // storage-layout path instead and never reaches this function at all) — the
@@ -2004,6 +2004,17 @@ void Emitter::declareImportedFunctions() {
 // hit an `undefined reference` LINK error, because no module ever DEFINED that
 // symbol for a record. Confirmed by direct before/after testing during this
 // fix: the record receiver-spill fix alone was necessary but not sufficient.
+//
+// Deliberately still `Class || Record`, NOT `Enum`: `declareImportedProperty
+// Getters` (the importer-side declaration, below) has no kind filter either,
+// so an enum's expression-bodied property (§10.4) is already declared here
+// too — but the importer-side spill fix (LlvmBackend_Exprs.cpp) intentionally
+// does NOT route an enum's scalar `i32` receiver into this call (see that
+// fix's own comment) because widening this gate to `Enum` needs its own
+// verification that ensurePropertyAccessorFn's enum `this` handling is
+// correct through this NEW external-stub calling convention, which is out
+// of #2474's record-scoped remit — filed separately rather than guessed at
+// here (CLAUDE.md rule 4).
 void Emitter::emitExportedPropertyGetters() {
     for (const auto& sym : ctx_.symbols()) {
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());

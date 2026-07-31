@@ -1,12 +1,27 @@
-// fix #2474 (§9.2/§22.9, v0.235): an imported RECORD property read used
-// INLINE as a binary-expression operand silently evaluated wrong.
+// fix #2474 (§9.2/§23.1/§23.2, v0.235): an imported RECORD property read
+// used INLINE as a binary-expression operand silently evaluated wrong.
 //
 // #2474's own confirmed repro used an AUTO-PROPERTY (`property W: int :=
-// 42;`); that shape is now fixed as a SIDE EFFECT of #2478's storage-layout
-// fix (an imported record's auto-property is now correctly recognized as
-// instance storage, so `b.W` reads the real value cross-module and combines
-// correctly no matter the context) — T1 below pins this as a control, not a
-// new fix in this commit.
+// 42;`); that shape's VALUE is already correct on `origin/main` before this
+// commit, as a side effect of #2478's storage-layout fix (an imported
+// record's auto-property is recognized as instance storage). T1 below pins
+// that outcome, but it is NOT an untouched control: layer 2 below (see the
+// LAYER 2 note) is keyed only on whether an entry exists in
+// `importedPropGetterFns_`, which `declareImportedPropertyGetters` populates
+// for EVERY imported non-virtual property — auto-backed or computed alike,
+// with no distinction between them. So layer 2's fix reroutes T1's `b.W`
+// read too: pre-commit it fell through the (pointer-check-failing) getter
+// call to CG8's `fieldAddr` direct-storage-GEP path; post-commit it instead
+// calls the exported `$propget` wrapper, which independently reaches the
+// correct value because `ensurePropertyAccessorFn`'s own `isAuto` branch
+// builds its own `classStruct`/`fieldIndex_` and does not depend on the
+// caller's path. Confirmed by `nm -u` on the compiled importer object:
+// pre-commit it has no `propget` reference for `W` at all; post-commit it
+// does. So this commit's real blast radius is EVERY public non-virtual
+// property read on an imported record — auto-property and computed alike —
+// not only the arrow-getter shape #2474's issue text singled out; T1 pins
+// the (correct, unchanged) auto-property VALUE outcome across that
+// path-level change, it does not validate an untouched path.
 //
 // #2474's issue text ALSO confirmed the identical symptom for an
 // ARROW-GETTER (computed, non-auto) property (`property Hidden: int =>
@@ -35,7 +50,22 @@
 //   not a pointer (issue #347 / §9.2, the same rule the LOCAL computed-
 //   getter path and the block-getter path a few dozen lines above already
 //   apply). Fixed by spilling a non-pointer receiver to a stack slot first,
-//   mirroring those two sibling paths exactly.
+//   mirroring those two sibling paths — but ONLY for an aggregate (struct)
+//   receiver, exactly matching the LOCAL computed-getter path's own
+//   `isAggregateType() && !isEnumReceiver` guard (not just its
+//   `isPointerTy()` half). Review of an earlier draft here (which spilled
+//   ANY non-pointer receiver unconditionally) caught that
+//   `declareImportedPropertyGetters` has NO kind filter — it already
+//   declares a `$propget` reference for an imported ENUM's expression-
+//   bodied property (§10.4 permits one) — while layer 1 above deliberately
+//   stayed `Class || Record` (not `Enum`, see that fix's own comment for
+//   why). An unconditional spill made an enum's scalar `i32` receiver into
+//   a pointer, so the call fired against a symbol layer 1 never defined:
+//   confirmed mechanically, this turned a program that compiles AND LINKS
+//   today (silently reading the pre-existing documented `0` degrade) into a
+//   hard `undefined reference` LINK ERROR — strictly worse than the
+//   preexisting gap. T9 below pins the corrected (link-safe, still
+//   silently-wrong, out-of-scope-for-this-record-issue) enum outcome.
 //
 //   LAYER 3 (discovered by LAYER 1+2's own testing): once the call actually
 //   reaches the exported getter's BODY, `Emitter::implicitFieldAddr`
@@ -135,11 +165,16 @@ int compileImportAndRun2474(const std::string& libSrc,
 }  // namespace
 
 // ===========================================================================
-// T1 — CONTROL: #2474's OWN confirmed repro shape (auto-property, no
-// positional field). Fixed as a side effect of #2478's storage-layout fix
-// (landed before this commit); pinned here so a future regression on either
-// side of that boundary is caught by name. Both operand orders + the
-// bound-local control (which already worked even before #2478) must agree.
+// T1 — #2474's OWN confirmed repro shape (auto-property, no positional
+// field). The VALUE is already correct on origin/main before this commit
+// (a side effect of #2478's storage-layout fix) — but this is NOT an
+// untouched control: per the file header's LAYER 2 note, this commit's
+// importer-side spill fix reroutes `b.W` from CG8's direct-storage read
+// onto the SAME exported-getter call the arrow-getter shape uses (both
+// share one `importedPropGetterFns_` entry, with no auto-vs-computed
+// distinction). Pinned here so a future regression in EITHER the old path's
+// replacement or the new path's own correctness is caught by name. Both
+// operand orders + the bound-local control must agree.
 // ===========================================================================
 BEZEL_TEST(xmod_record_property_binary_operand_2474,
            auto_property_inline_binary_operand_control_9_2) {
@@ -197,7 +232,7 @@ BEZEL_TEST(xmod_record_property_binary_operand_2474,
 // operand.
 // ===========================================================================
 BEZEL_TEST(xmod_record_property_binary_operand_2474,
-           arrow_getter_public_backing_inline_binary_operand_9_2_22_9) {
+           arrow_getter_public_backing_inline_binary_operand_9_2_23_2) {
     const char* lib =
         "module RecLib2474T2; "
         "public record RecGetter2474T2(x: int) "
@@ -456,6 +491,49 @@ BEZEL_TEST(xmod_record_property_binary_operand_2474,
         "end C2474T8;");
     if (r == -2) return;
     BEZEL_EXPECT_EQ(r, 22);  // 9 + 13
+}
+
+// ===========================================================================
+// T9 — REGRESSION GUARD (review-caught, not originally in this file): an
+// imported ENUM's expression-bodied property (§10.4 permits one), combined
+// inline. `declareImportedPropertyGetters` has NO kind filter, so it already
+// declares a `$propget` reference for an enum's computed property today —
+// but layer 1 (the exporter gate) stays `Class || Record` in this commit,
+// deliberately NOT `Enum` (see LlvmBackend_Setup.cpp's own comment on
+// emitExportedPropertyGetters for why: widening it needs its own
+// verification of ensurePropertyAccessorFn's enum `this` handling through
+// this NEW external-stub calling convention, out of THIS record-scoped
+// issue's remit). The POINT of this test is layer 2's spill guard: an
+// earlier draft spilled ANY non-pointer receiver unconditionally, which
+// turned THIS exact program from "compiles, links, and runs (silently
+// reading the pre-existing documented `0` degrade)" into a hard `undefined
+// reference` LINK ERROR — confirmed mechanically before the guard was
+// narrowed to aggregates-only (matching the local computed-getter path's
+// own `isAggregateType() && !isEnumReceiver` condition). This test asserts
+// compile+link SUCCESS (the actual regression this guards) and pins the
+// still-silently-wrong `0` value only for transparency — that value is a
+// separate, PRE-EXISTING, out-of-scope gap (unrelated to records, not
+// fixed or worsened by this commit; not #2474's concern) rather than
+// something this commit endorses as correct.
+// ===========================================================================
+BEZEL_TEST(xmod_record_property_binary_operand_2474,
+           imported_enum_property_inline_still_links_control_10_4) {
+    int r = compileImportAndRun2474(
+        "module EnumLib2474T9; "
+        "public enum EnumX2474T9 "
+        "  Red, Green, Blue; "
+        "  public property P: int => 7; "
+        "end EnumX2474T9;",
+        "module App2474T9; import EnumLib2474T9; "
+        "public class C2474T9 "
+        "  public static method Main(): int "
+        "    var e := EnumX2474T9.Red; "
+        "    return 1 + e.P; "
+        "  end Main; "
+        "end C2474T9;");
+    if (r == -2) return;
+    BEZEL_EXPECT_TRUE(r >= 0);  // the real assertion: compiled AND linked
+    BEZEL_EXPECT_EQ(r, 0);      // pre-existing, out-of-scope gap — see above
 }
 
 }  // namespace bezel::module
