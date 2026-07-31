@@ -138,8 +138,14 @@ private:
         ast::Visibility visibility, std::vector<std::string_view> modifiers,
         SourceLocation memberStart = {});
     // Caller has already consumed `method operator`.
+    // fix #2418: `memberStart` (default {} for call sites with none to give,
+    // e.g. none today) anchors OperatorDecl::span.begin, mirroring
+    // parseMethodDeclBody's #783 convention, so SymbolCollection's
+    // MethodSymbol::declLoc (operators reuse MethodSymbol) has a real
+    // location to read instead of the default {0,0}.
     std::unique_ptr<ast::Member> parseOperatorDeclBody(
-        ast::Visibility visibility, std::vector<std::string_view> modifiers);
+        ast::Visibility visibility, std::vector<std::string_view> modifiers,
+        SourceLocation memberStart = {});
     std::vector<ast::Param> parseParamList();
     // Slice 41: A.3 PositionalField list — `Identifier ":" Type
     // SerializedClause?`. Distinct from ParamList: no modifiers, no default

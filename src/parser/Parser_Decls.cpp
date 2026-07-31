@@ -398,6 +398,14 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
     if (decl->kind == ast::TypeDeclKind::Record &&
         consumePunctuator(";")) {
         decl->isRecordShorthand = true;
+        // fix #2418: this early return bypassed the #1761 span-stamp below
+        // (which only the non-shorthand `... end ...;` path reached), so
+        // EVERY shorthand record's TypeSymbol::declLoc silently stayed 0:0
+        // even before this fix — the "TypeSymbol is the one already-working
+        // precedent" premise held only for the non-shorthand forms. Stamp
+        // it here too, identically to the #1761 logic.
+        decl->span.begin = start;
+        decl->span.end = current_.location;
         return decl;
     }
 
@@ -652,6 +660,11 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
     // A.3 `ExternBlock ::= "extern" StringLiteral
     //                        ("convention" StringLiteral)?
     //                        ExternDecl+ "end" ";"`.
+    // fix #2418: ExternBlock's span was never stamped — SymbolCollection's
+    // ExternBlockSymbol::declLoc (and, via fallback, each ExternDeclSymbol)
+    // had nothing to read. Mirrors the #1761 TypeSymbol / #662c ctor-dtor
+    // span convention.
+    const SourceLocation start = current_.location;
     auto blk = std::make_unique<ast::ExternBlock>();
     advance(); // past `extern`
     if (current_.kind != TokenKind::StringLiteral) {
@@ -748,6 +761,8 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after 'end' of extern block");
     }
+    blk->span.begin = start;
+    blk->span.end = current_.location;
     return std::unique_ptr<ast::TopDecl>(blk.release());
 }
 
@@ -756,6 +771,10 @@ std::unique_ptr<ast::TypeAlias> Parser::parseTypeAlias() {
     //                          GenericConstraints* ";"`. (v0.160: ":=" replaces
     // the old "=" — all bindings in Bezel use ":="; §27.8.) Slice 27 completes
     // the optional GenericParams and trailing GenericConstraints.
+    // fix #2418: TypeAlias's span was never stamped — SymbolCollection's
+    // TypeAliasSymbol::declLoc had nothing to read. Mirrors the #1761
+    // TypeSymbol / #662c ctor-dtor span convention.
+    const SourceLocation start = current_.location;
     auto alias = std::make_unique<ast::TypeAlias>();
     advance(); // past `type`
 
@@ -788,6 +807,8 @@ std::unique_ptr<ast::TypeAlias> Parser::parseTypeAlias() {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after type alias");
     }
+    alias->span.begin = start;
+    alias->span.end = current_.location;
     return alias;
 }
 
@@ -952,9 +973,15 @@ std::unique_ptr<ast::Type> Parser::parseType() {
 std::unique_ptr<ast::Member> Parser::parseMember() {
     // #662c: record the start offset of the member's first token (visibility
     // keyword or modifier or `constructor`/`destructor`) so that the builder
-    // can extract source text for cross-module ctor/dtor body export.  The
-    // offset is stamped onto ConstructorDecl/DestructorDecl nodes before
-    // returning; all other member kinds leave their span at 0 (existing behaviour).
+    // can extract source text for cross-module ctor/dtor body export. Stamped
+    // onto ConstructorDecl/DestructorDecl nodes for that purpose.
+    // fix #2418: the SAME `memberStart` also anchors `span.begin` on every
+    // other member kind returned from here (FieldDecl/ConstDecl/EventDecl/
+    // PropertyDecl/NestedTypeMember; MethodDecl gets it via the memberStart
+    // parameter threaded into parseMethodDeclBody, #783) — this is what
+    // lets SymbolCollection.cpp's collectMember populate each member
+    // symbol's declLoc from a real source location instead of leaving it at
+    // the default {0,0}.
     const SourceLocation memberStart = current_.location;
 
     // §13: most members declare their visibility explicitly. Destructors
@@ -1042,6 +1069,15 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         auto td = parseTypeOrInterfaceDecl(visibility, std::move(modifiers));
         auto ntm = std::make_unique<ast::NestedTypeMember>();
         ntm->decl = std::move(td);
+        // fix #2418: NestedTypeMember's own span was never stamped (only its
+        // wrapped TypeDecl's span is, via parseTypeOrInterfaceDecl's #1761
+        // fix) — SymbolCollection's NestedTypeSymbol wrapper had nothing to
+        // read its declLoc from. `current_.location` here is just past the
+        // nested type's closing `end ... ;`, mirroring the ctor/dtor
+        // #662c span convention (begin = first member token, end = just
+        // past the terminator).
+        ntm->span.begin = memberStart;
+        ntm->span.end = current_.location;
         return std::unique_ptr<ast::Member>(ntm.release());
     }
 
@@ -1078,6 +1114,11 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after const declaration");
         }
+        // fix #2418: ConstDecl's span was never stamped — SymbolCollection's
+        // ConstMemberSymbol::declLoc had nothing to read. Mirrors the ctor/
+        // dtor #662c span convention.
+        cd->span.begin = memberStart;
+        cd->span.end = current_.location;
         return std::unique_ptr<ast::Member>(cd.release());
     }
     if (isKeyword("event")) {
@@ -1123,6 +1164,11 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after event declaration");
         }
+        // fix #2418: EventDecl's span was never stamped — SymbolCollection's
+        // EventSymbol::declLoc had nothing to read. Mirrors the ctor/dtor
+        // #662c span convention.
+        ed->span.begin = memberStart;
+        ed->span.end = current_.location;
         return std::unique_ptr<ast::Member>(ed.release());
     }
     if (isKeyword("property")) {
@@ -1250,6 +1296,12 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                 }
             }
         }
+        // fix #2418: PropertyDecl's span was never stamped — SymbolCollection's
+        // PropertySymbol::declLoc had nothing to read. Mirrors the ctor/dtor
+        // #662c span convention. (All three body-kind branches above
+        // converge here, after their own terminating `;` is consumed.)
+        pd->span.begin = memberStart;
+        pd->span.end = current_.location;
         return std::unique_ptr<ast::Member>(pd.release());
     }
     // `method` (slice 10), `method operator` (slice 27),
@@ -1260,7 +1312,8 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         if (current_.kind == TokenKind::Identifier &&
             current_.text == "operator") {
             advance();
-            return parseOperatorDeclBody(visibility, std::move(modifiers));
+            return parseOperatorDeclBody(visibility, std::move(modifiers),
+                                         memberStart);
         }
         return std::unique_ptr<ast::Member>(
             parseMethodDeclBody(visibility, std::move(modifiers),
@@ -1458,6 +1511,11 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after field declaration");
     }
+    // fix #2418: FieldDecl's span was never stamped — SymbolCollection's
+    // FieldSymbol::declLoc had nothing to read. Mirrors the ctor/dtor #662c
+    // span convention.
+    field->span.begin = memberStart;
+    field->span.end = current_.location;
 
     // Reseat the raw pointer explicitly (Node's deleted move blocks the
     // implicit unique_ptr<Derived> -> unique_ptr<Base> conversion).
@@ -1473,6 +1531,12 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
     // §11.8 (v0.176, #807) — `static` for the abstract-only static method /
     // static operator forms. All are scanned tentatively then dispatched on
     // the kind keyword.
+    // fix #2418: record the member's first token so every branch below can
+    // stamp `span.begin` — mirrors parseMember's `memberStart` (#662c/#783);
+    // interface members never had ANY span before (SymbolCollection's
+    // PropertySymbol/EventSymbol/MethodSymbol/ConstMemberSymbol::declLoc had
+    // nothing to read for an interface-declared member).
+    const SourceLocation memberStart = current_.location;
     bool readonlyMod = false;
     bool asyncMod = false;
     bool staticMod = false;
@@ -1570,6 +1634,9 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
                     "expected ';' after interface property declaration");
             }
         }
+        // fix #2418: see memberStart comment at the top of this function.
+        pd->span.begin = memberStart;
+        pd->span.end = current_.location;
         return std::unique_ptr<ast::Member>(pd.release());
     }
 
@@ -1607,6 +1674,9 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
                 Severity::Error, current_.location,
                 "expected ';' after interface event declaration");
         }
+        // fix #2418: see memberStart comment at the top of this function.
+        ed->span.begin = memberStart;
+        ed->span.end = current_.location;
         return std::unique_ptr<ast::Member>(ed.release());
     }
 
@@ -1666,6 +1736,9 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
                 "expected ';' after interface method signature");
         }
         m->bodyKind = ast::MethodBodyKind::Abstract;
+        // fix #2418: see memberStart comment at the top of this function.
+        m->span.begin = memberStart;
+        m->span.end = current_.location;
         return std::unique_ptr<ast::Member>(m.release());
     }
 
@@ -1720,6 +1793,9 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
                 "expected ';' after static interface operator signature");
         }
         op->bodyKind = ast::MethodBodyKind::Abstract;
+        // fix #2418: see memberStart comment at the top of this function.
+        op->span.begin = memberStart;
+        op->span.end = current_.location;
         return std::unique_ptr<ast::Member>(op.release());
     }
 
@@ -2157,7 +2233,8 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
 }
 
 std::unique_ptr<ast::Member> Parser::parseOperatorDeclBody(
-    ast::Visibility visibility, std::vector<std::string_view> modifiers) {
+    ast::Visibility visibility, std::vector<std::string_view> modifiers,
+    SourceLocation memberStart) {
     // A.4 `OperatorDecl ::= "public" "static" "pure"? "method" "operator"
     //                        OpToken "(" ParamList ")" ":" "owned"? Type
     //                        OperatorBody` (v0.202, #2052). Caller has consumed
@@ -2236,6 +2313,13 @@ std::unique_ptr<ast::Member> Parser::parseOperatorDeclBody(
                                 "expected ';' after 'end' of operator");
         }
     }
+    // fix #2418: OperatorDecl's span was never stamped — SymbolCollection's
+    // MethodSymbol::declLoc (operators reuse MethodSymbol) had nothing to
+    // read for the class-body operator form. `memberStart` defaults to {}
+    // when a caller has none to give (matching parseMethodDeclBody's
+    // convention); the class-body call site (parseMember) does supply it.
+    op->span.begin = memberStart;
+    op->span.end = current_.location;
     return std::unique_ptr<ast::Member>(op.release());
 }
 

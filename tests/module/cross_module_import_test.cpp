@@ -175,6 +175,54 @@ BEZEL_TEST(cross_module_import, wrong_arg_type_rejected_spec_5_1) {
     BEZEL_EXPECT_TRUE(r->hadErrors);
 }
 
+// fix #2418 (⚠ imported-symbol decision): an imported member is reconstructed
+// from the dependency's `.bezel.meta` (ModuleLoader.cpp's
+// `ctx.makeImportedSymbol<...>()` call sites), NOT from an
+// ast::Member-derived decl node — there is no local AST to read a `span`
+// from (the #2374 defect class: "imported symbols have no astNode"), and
+// SourceLocation carries no filename, so stamping one from a *re-parsed*
+// dependency-source-text location (as ModuleLoader lazily does for a body it
+// re-parses for cross-module inlining) would silently mislabel the position
+// against the IMPORTING file — worse than 0:0, not better. #2418's
+// SymbolCollection.cpp / Parser_Decls.cpp fix deliberately does not touch
+// ModuleLoader.cpp: an imported member's declLoc stays the SourceLocation
+// default (unset / 0:0), exactly as before the fix. Pinned here so that
+// invariant doesn't silently drift.
+BEZEL_TEST(cross_module_import, imported_member_decl_loc_stays_unset_2418) {
+    ModuleMetadata dep = buildMetaFor(
+        "module MathLib; "
+        "public class Calc "
+        "  public _cached: int; "
+        "  public static method Square(n: int): int => n * n; "
+        "end Calc;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import MathLib; "
+        "public class Program "
+        "  public static method Main(): int => Calc.Square(6); "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+    sema::TypeSymbol* calc = r->ctx->lookupImportedTypeByName("Calc");
+    BEZEL_EXPECT_TRUE(calc != nullptr);
+    if (!calc) return;
+    // The imported TYPE itself: also unset (no local ast::TypeDecl either).
+    BEZEL_EXPECT_EQ(calc->declLoc.line, std::uint32_t(0));
+    BEZEL_EXPECT_EQ(calc->declLoc.column, std::uint32_t(0));
+    bool sawField = false, sawMethod = false;
+    for (sema::Symbol* m : calc->members) {
+        if (dynamic_cast<sema::FieldSymbol*>(m)) {
+            sawField = true;
+            BEZEL_EXPECT_EQ(m->declLoc.line, std::uint32_t(0));
+        } else if (dynamic_cast<sema::MethodSymbol*>(m)) {
+            sawMethod = true;
+            BEZEL_EXPECT_EQ(m->declLoc.line, std::uint32_t(0));
+        }
+    }
+    BEZEL_EXPECT_TRUE(sawField);
+    BEZEL_EXPECT_TRUE(sawMethod);
+}
+
 // fix #795 / §2.5 / §11.3 / §12.1: a call to a member that does NOT exist on an
 // imported type is rejected with a "no member" diagnostic. Before the fix the
 // importer silently accepted it (the imported type has a null local `decl`, so

@@ -121,6 +121,12 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->modifiers = fd->modifiers;
         sym->parent = &parent;
         sym->decl = fd;
+        // fix #2418: mirror the TypeSymbol precedent (SymbolCollection.cpp,
+        // collectTypeDecl) — every ast::Member subtype inherits `span` from
+        // ast::Node, so its own decl node's span is a real, available
+        // location. Without this, every diagnostic keyed on
+        // FieldSymbol::declLoc reported 0:0.
+        sym->declLoc = fd->span.begin;
         sym->scope = parent.memberScope;  // field lives in type's member scope
         return sym;
     }
@@ -131,6 +137,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->modifiers = md->modifiers;
         sym->parent = &parent;
         sym->decl = md;
+        sym->declLoc = md->span.begin;  // fix #2418
         sym->scope = scope;
         sym->genericParams =
             collectGenericParams(md->genericParams, ctx, scope);
@@ -143,6 +150,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->visibility = od->visibility;
         sym->parent = &parent;
         sym->decl = od;
+        sym->declLoc = od->span.begin;  // fix #2418
         sym->scope = scope;
         sym->params = collectParams(od->params, ctx, scope);
         sym->isOperator = true;
@@ -158,6 +166,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->visibility = cd->visibility;
         sym->parent = &parent;
         sym->decl = cd;
+        sym->declLoc = cd->span.begin;  // fix #2418
         sym->scope = scope;
         sym->isStatic = cd->isStatic;
         sym->params = collectParams(cd->params, ctx, scope);
@@ -168,6 +177,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->name = ".dtor";
         sym->parent = &parent;
         sym->decl = dd;
+        sym->declLoc = dd->span.begin;  // fix #2418
         sym->scope = scope;
         return sym;
     }
@@ -178,6 +188,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->modifiers = pd->modifiers;
         sym->parent = &parent;
         sym->decl = pd;
+        sym->declLoc = pd->span.begin;  // fix #2418
         sym->scope = scope;
         sym->isIndexer = pd->isIndexer;
         if (pd->isIndexer) {
@@ -192,6 +203,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->visibility = ed->visibility;
         sym->parent = &parent;
         sym->decl = ed;
+        sym->declLoc = ed->span.begin;  // fix #2418
         sym->scope = parent.memberScope;
         return sym;
     }
@@ -201,6 +213,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->visibility = cd->visibility;
         sym->parent = &parent;
         sym->decl = cd;
+        sym->declLoc = cd->span.begin;  // fix #2418
         sym->scope = parent.memberScope;
         sym->isStatic = cd->isStatic;
         return sym;
@@ -210,6 +223,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         wrapper->name = nt->decl ? nt->decl->name : std::string_view();
         wrapper->parent = &parent;
         wrapper->decl = nt;
+        wrapper->declLoc = nt->span.begin;  // fix #2418
         wrapper->scope = parent.memberScope;
         if (nt->decl) {
             wrapper->visibility = nt->decl->visibility;
@@ -285,6 +299,14 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
             fs->visibility = ast::Visibility::Public;
             fs->parent = sym;
             fs->decl = &td;
+            // fix #2418: ast::Param (a record's positional-field shape)
+            // carries no span of its own — unlike ast::Member, it isn't an
+            // ast::Node — so there is no per-field location to read. Fall
+            // back to the declaring TypeDecl's already-populated location
+            // (same fallback TypeResolution_Checks.cpp already uses
+            // explicitly at a handful of call sites, e.g. the enum-constant
+            // initializer check) rather than leaving 0:0.
+            fs->declLoc = sym->declLoc;
             fs->posParam = &pf;
             fs->scope = sym->memberScope;
             sym->members.push_back(fs);
@@ -295,6 +317,11 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
         auto* esym = ctx.makeSymbol<EnumConstantSymbol>();
         esym->name = ec.name;
         esym->parent = sym;
+        // fix #2418: ast::EnumConstant carries no span of its own (only its
+        // optional `:= ConstExpr` initializer does) — fall back to the
+        // enclosing TypeDecl's location, same reasoning as the positional
+        // field above.
+        esym->declLoc = sym->declLoc;
         esym->scope = sym->memberScope;
         sym->members.push_back(esym);
     }
@@ -307,6 +334,9 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
         csym->name = cc.name;
         csym->parent = sym;
         csym->caseDecl = &cc;
+        // fix #2418: ast::ChoiceCase carries no span of its own — same
+        // fallback as EnumConstant above.
+        csym->declLoc = sym->declLoc;
         csym->scope = sym->memberScope;
         sym->members.push_back(csym);
     }
@@ -322,6 +352,7 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
         auto* sym = ctx.makeSymbol<TypeAliasSymbol>();
         sym->name = alias->name;
         sym->decl = alias;
+        sym->declLoc = alias->span.begin;  // fix #2418: TypeAlias : TopDecl : Node
         sym->scope = parentScope;
         const ScopeId aliasScope = ctx.newScope();
         sym->genericParams =
@@ -334,6 +365,7 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
         // the symbol key (lookups never find an extension by name —
         // extensions resolve via target type during typecheck).
         sym->decl = ext;
+        sym->declLoc = ext->span.begin;  // fix #2418: ExtensionDecl : TopDecl : Node
         sym->scope = parentScope;
         const ScopeId extScope = ctx.newScope();
         // We need a dummy TypeSymbol-shape parent for member collection;
@@ -365,6 +397,7 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
         sym->library = xb->library;
         sym->convention = xb->convention;
         sym->decl = xb;
+        sym->declLoc = xb->span.begin;  // fix #2418: ExternBlock : TopDecl : Node
         sym->scope = parentScope;
         const ScopeId xbScope = ctx.newScope();
         for (const auto& d : xb->methods) {
@@ -374,6 +407,11 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
             dsym->scope = xbScope;
             dsym->params = collectParams(d.params, ctx, xbScope);
             dsym->externDecl = &d;
+            // fix #2418: ast::ExternDecl (a single FFI method inside the
+            // block) carries no span of its own — fall back to the
+            // enclosing ExternBlock's location, same reasoning as the
+            // positional-field/enum-constant/choice-case fallbacks above.
+            dsym->declLoc = sym->declLoc;
             sym->decls.push_back(dsym);
         }
         return sym;
