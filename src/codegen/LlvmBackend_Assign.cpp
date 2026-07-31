@@ -3400,9 +3400,64 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
         builder_.SetInsertPoint(accEndBB);
         return true;
     }
+    // fix #2498 (§9.2/§9.4/§23, v0.236): mirrors lowerImportedPropertySetValue's
+    // #2489 fix a few dozen lines above — this LOCAL (non-imported) sibling had
+    // the identical missing-spill defect for a RECORD receiver, plus the same
+    // "spilled copy, not original storage" trap once a naive spill is added.
+    // Before this fix, `recv = lowerExpr(*ma->target)` on a record-typed
+    // receiver yielded a by-value struct; binding that struct value directly
+    // as `currentThis_` made the inlined setter body's implicit field write
+    // (`_n := value;`, resolved via lvalueAddr/implicitFieldAddr, which always
+    // expects a pointer `this`) emit a StructGEP against a non-pointer base —
+    // malformed IR, confirmed by probe against this exact repro (#2498's own):
+    // `r.Name := 55; return r.x + r.Name;` failed IR verification with "GEP
+    // base pointer is not a vector or a vector of pointers" / "Store operand
+    // must be a pointer", not a clean compile. A bare `!isPointerTy()` spill
+    // (the naive fix) would also be unsound here for the same reason #2489's
+    // comment documents: #2499's pre-existing sema gap can let an ENUM
+    // property reach a computed setter, and an enum receiver's scalar `i32`
+    // must NOT be spilled/treated as `this` (it is used as a plain integer,
+    // not a struct pointer) — guard on `isAggregateType() && !isEnumReceiver`,
+    // never a bare `!isPointerTy()`. And spilling a LOADED COPY (rather than
+    // resolving the receiver's own storage address via `lvalueAddr`) would
+    // reproduce #2502's silent-no-op defect: the write would land in a
+    // throwaway alloca instead of the caller's actual variable. Only the
+    // `ma->target` (explicit-receiver, e.g. `r.Name := 55`) branch needs this
+    // — the implicit-`this` default below is already a pointer (methods bind
+    // `currentThis_` to a pointer argument regardless of record/class kind,
+    // LlvmBackend_Setup.cpp ~L7576), so no spill/address resolution applies
+    // there.
     llvm::Value* recv = currentThis_;
-    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target))
-        recv = ma->target ? lowerExpr(*ma->target) : currentThis_;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
+        if (!ma->target) {
+            recv = currentThis_;
+        } else {
+            bool isEnumReceiver = ps->parent &&
+                                  ps->parent->kind == ast::TypeDeclKind::Enum;
+            recv = nullptr;
+            llvm::Type* recvElemTy = nullptr;
+            if (llvm::Value* addr = lvalueAddr(*ma->target, recvElemTy)) {
+                if (recvElemTy && recvElemTy->isPointerTy())
+                    recv = builder_.CreateLoad(recvElemTy, addr);
+                else if (recvElemTy && recvElemTy->isAggregateType() &&
+                         !isEnumReceiver)
+                    recv = addr;  // already the receiver's own storage address
+            }
+            if (!recv) {
+                llvm::Value* rv = lowerExpr(*ma->target);
+                if (!rv) return false;
+                if (rv->getType()->isPointerTy()) {
+                    recv = rv;
+                } else if (rv->getType()->isAggregateType() && !isEnumReceiver) {
+                    llvm::AllocaInst* tmp = entryAlloca(rv->getType());
+                    builder_.CreateStore(rv, tmp);
+                    recv = tmp;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
     if (!recv) return false;
     // Bind `value` — sema anchored its symbol's decl on the PropertyDecl.
     llvm::AllocaInst* slot = entryAlloca(v->getType());
