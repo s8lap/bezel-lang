@@ -2036,12 +2036,22 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
     // against, #1075). A Class/Interface substitution has the same hazard,
     // plus the #1091 block's `concreteRefSem` branch indexes `call.args[0]`
     // unconditionally in its `else if` arm — safe for Equals (one arg) but
-    // undefined behavior for a zero-arg ToString call. Choice is excluded
-    // too: `lowerValueSemMethodOn` deliberately does not intercept ToString
-    // for a choice receiver either (the concrete-typed case just below,
-    // `choiceValueSem`, is Equals/GetHashCode-only, #1075) — a choice
-    // substitution's ToString remains the pre-existing, separately-tracked
-    // gap this fix does not touch.
+    // undefined behavior for a zero-arg ToString call.
+    //
+    // #2476 follow-up: Choice gets its OWN companion branch just below,
+    // deliberately not folded into `concreteRecordOrEnum` — `emitRecordToString`
+    // sits behind `lowerValueSemMethodOn` are for records/enums specifically;
+    // a choice has no §35.7 auto-ToString codegen at all yet (it does not even
+    // reuse the "not auto-equality-bearing" type-name default the way an
+    // ineligible body record does, since §35.7's format needs the active
+    // CASE discriminant, not just the type name). `where T: value` used to
+    // REJECT every choice type argument outright (a false reject, #2476), so
+    // this call shape was UNREACHABLE until #2476's own fix; without a
+    // companion here, fixing #2476 alone would have turned that unreachable
+    // gap into a live SIGSEGV the instant a choice-substituted bare-T
+    // ToString call compiled clean — the exact "narrowing alone is unsafe"
+    // lesson #2465 already paid for on this same block of code. A clean
+    // "declared but not yet implemented" diagnostic is categorically safer.
     if (isToString &&
         recvTy->kind == sema::TypeRef::Kind::Named && !recvTy->declaration &&
         !genericSubstSemaTy_.empty() && recvTy->astNode &&
@@ -2057,6 +2067,28 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
             if (concreteRecordOrEnum) {
                 if (llvm::Value* recv = lowerExpr(*ma->target))
                     return lowerValueSemMethodOn(concrete, recv, call, member);
+            } else if (concrete->kind == K::Named && concrete->declaration &&
+                       concrete->declaration->kind ==
+                           ast::TypeDeclKind::Choice) {
+                // §35.7 defines the format ("TypeName.CaseName(field: value)")
+                // but only for an AUTO-EQUALITY-BEARING (value-like, admissible
+                // -payload) choice; a borrow-bearing/owning/inadmissible-payload
+                // choice has no defined ToString at all. Deciding which applies
+                // is a real implementation slice (case-discriminant dispatch +
+                // per-case payload formatting), not a one-line fallback — filed
+                // as #2479 rather than guessed at here. Mirrors the GetType()
+                // precedent just below in this same function (report + a typed
+                // poison value, never a bare `nullptr`, so IR generation for
+                // the surrounding expression stays well-typed while the Error
+                // diagnostic guarantees the program never links/runs).
+                ctx_.diagnostics().report(
+                    Severity::Error, call.span.begin,
+                    "member `ToString` on a choice-substituted generic type "
+                    "parameter is declared via the universal Object contract "
+                    "(language spec \xC2\xA7""8.1/\xC2\xA7""35.7) but is not "
+                    "yet implemented by this compiler for a choice "
+                    "substitution (tracked #2479)");
+                return llvm::PoisonValue::get(ptrTy());
             }
         }
     }

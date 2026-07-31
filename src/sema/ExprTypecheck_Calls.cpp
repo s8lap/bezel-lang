@@ -1891,8 +1891,33 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 auto k = a->declaration->kind;
                                 if (k == ast::TypeDeclKind::Class ||
                                     k == ast::TypeDeclKind::Interface) return 1;
+                                // #2476 / §14.2: choices are value types, same
+                                // as records/enums — "records, enums, choices
+                                // ([§35](#sec-choices)), primitives, inline
+                                // arrays (all forms, including owning forms),
+                                // and the unit type." Before this fix, Choice
+                                // fell through this if-chain to the `return 1`
+                                // built-in-named fallback below, so a CALL-SITE
+                                // generic method (`F(Color.Red)` / `F<Color>(…)`,
+                                // inferred or explicit — both route through this
+                                // lambda via checkMethodGenericConstraints) with
+                                // a `where T: value`/`where T: class` constraint
+                                // misclassified every choice type argument as a
+                                // REFERENCE type: `where T: value` wrongly
+                                // rejected it and `where T: class` would have
+                                // wrongly ACCEPTED it (untested — no reachable
+                                // choice-as-class-arg repro, since a choice
+                                // never satisfies §14.2's class bound on any
+                                // other check). This lambda's own comment above
+                                // claims to mirror `Resolver::categorize` (the
+                                // declaration-site / explicit-type-argument-list
+                                // check, TypeResolution_Checks.cpp), which
+                                // already classifies Choice as Value — so this
+                                // was a drift between the two duplicate
+                                // classifiers, not a deliberate omission.
                                 if (k == ast::TypeDeclKind::Record ||
-                                    k == ast::TypeDeclKind::Enum) return 0;
+                                    k == ast::TypeDeclKind::Enum ||
+                                    k == ast::TypeDeclKind::Choice) return 0;
                             }
                             return 1;  // built-in named (Array/IEnumerable/…) → ref
                         default: return -1;  // Error/unresolved → defer
