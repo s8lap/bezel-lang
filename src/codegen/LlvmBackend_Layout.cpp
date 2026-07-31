@@ -3170,7 +3170,12 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
                 result = builder_.CreateCall(fn->getFunctionType(), fn, {thisVal});
                 emitPendingCheck();
             }
-        } else if (isAutoProperty(ps)) {
+        } else if (isAutoPropertyStorage(ps)) {
+            // fix #2478 (§9.2/§22.8): isAutoPropertyStorage, not the bare
+            // decl-dependent isAutoProperty — an imported auto-property
+            // referenced as a FUNCTION VALUE (`var f := obj.Prop;`, §27.6)
+            // fell through to the `llvm::Constant::getNullValue` default
+            // below without this, silently yielding a permanently-0 thunk.
             auto idxIt = fieldIndex_.find(ps);
             if (idxIt != fieldIndex_.end()) {
                 llvm::StructType* st = classStruct(ps->parent);
@@ -3256,7 +3261,20 @@ llvm::Value* Emitter::buildPropertyClosureCell(llvm::Function* thunk,
 
 sema::MemberSymbol* Emitter::storageMemberOf(sema::Symbol* sym) {
     if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym)) return fs;
-    if (isAutoProperty(sym))
+    // fix #2478 (§9.2/§22.8): isAutoPropertyStorage, not the bare
+    // decl-dependent isAutoProperty — this is the central GEP-address
+    // resolution function for a plain member-access read/write
+    // (fieldAddr/implicitFieldAddr and their callers below), so leaving it
+    // on the decl-dependent predicate meant an imported auto-property's
+    // STORAGE SLOT could be correctly counted by collectInstanceStorage/
+    // collectRecordStorage (this same issue's layout fix) while every
+    // ordinary READ/WRITE of that member still fell through to a different,
+    // wrong path (confirmed: `b.W` on an imported record with `public
+    // property W: int := 42;` still read `0` post-layout-fix until this
+    // line was widened too — the layout fix alone was necessary but not
+    // sufficient). See isAutoPropertyStorage's own comment
+    // (LlvmBackend_impl.hpp) for the full rationale and scope boundary.
+    if (isAutoPropertyStorage(sym))
         return dynamic_cast<sema::PropertySymbol*>(sym);
     return nullptr;
 }

@@ -363,6 +363,28 @@ public:
             : ast::Visibility::Private;
     }
 
+    // fix #2478 (§9.2/§22.8): whether an imported Property member is declared
+    // in AUTO form (a real instance-storage member, §9.2) — MetaMember::
+    // isAutoProperty (see its field comment in ModuleMetadata.hpp for the
+    // full rationale and the confirmed live memory-safety hazard this
+    // closes). `sema::isAutoPropertySymbol`/`Emitter::isAutoProperty` are
+    // decl-dependent and always return `false` for an imported PropertySymbol
+    // (no ast::PropertyDecl crosses the module boundary); THIS side table is
+    // the wire-carried fallback `collectInstanceStorage`/
+    // `collectRecordStorage`'s `isAutoPropertyStorage` helper
+    // (LlvmBackend_impl.hpp) consults for a decl-null Property. Absent
+    // (never set — any non-property import, or a property imported from a
+    // pre-#2478 blob with no 13th MEMBER_BLOCK scalar) defaults to `false`
+    // — the SAME "not storage" behavior already exhibited today, not a new
+    // regression for a stale dependency.
+    void setImportedPropertyIsAutoStorage(const Symbol* m, bool isAuto) {
+        importedPropertyIsAutoStorage_[m] = isAuto;
+    }
+    bool importedPropertyIsAutoStorage(const Symbol* m) const {
+        auto it = importedPropertyIsAutoStorage_.find(m);
+        return it != importedPropertyIsAutoStorage_.end() && it->second;
+    }
+
     // §22.12 (issue #328 FINDING [3] BUG A): an imported class-level `const` has
     // no storage symbol in the library — a const initializer is a compile-time
     // constant expression, so the library emits no global. The loader records
@@ -453,6 +475,9 @@ private:
     // MetaMember::setterVisibility.
     std::unordered_map<const Symbol*, ast::Visibility>
         importedPropertySetterVisibility_;
+    // fix #2478 (§9.2/§22.8): imported property AUTO-storage classification,
+    // from MetaMember::isAutoProperty.
+    std::unordered_map<const Symbol*, bool> importedPropertyIsAutoStorage_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const Symbol*, std::string> importedConstValues_;
     // §14 / #662c: imported SourceFile objects that own re-parsed ctor/dtor

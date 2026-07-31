@@ -473,6 +473,17 @@ struct Loader {
                 // to read `pd->accessors[i].visibility` from at the
                 // cross-module assignment site.
                 propSetterVisibility_[p] = fromMetaVisibility(mm.setterVisibility);
+                // fix #2478 (§9.2/§22.8): MetaMember::isAutoProperty,
+                // published to ctx.importedPropertyIsAutoStorage() below —
+                // whether this Property is a real instance-storage member
+                // (backed by compiler-generated storage, §9.2) rather than a
+                // computed (expression/block-bodied) property. Needed
+                // because `collectInstanceStorage`/`collectRecordStorage`
+                // (LlvmBackend_impl.hpp) must know this to lay out an
+                // imported type's storage correctly — the decl-dependent
+                // `sema::isAutoPropertySymbol` always returns false here
+                // (no ast::PropertyDecl crosses the boundary).
+                propIsAutoStorage_[p] = mm.isAutoProperty;
                 // fix #2467 (§9.2/§2.5, v0.235): mirror the Field case's
                 // constValues_ carriage above — an auto-property's
                 // constant-foldable initializer (ModuleMetadataBuilder.cpp's
@@ -541,6 +552,13 @@ struct Loader {
                 // comment in ModuleMetadata.hpp ("Ignored for every kind but
                 // Property/Indexer").
                 propSetterVisibility_[p] = fromMetaVisibility(mm.setterVisibility);
+                // fix #2478's bit: an indexer is never "auto" (the exporter's
+                // own `out.isAutoProperty` computation excludes
+                // `prop->isIndexer` unconditionally), so this is always
+                // false here — set for consistency with hasSetter/
+                // setterVisibility above, not because an indexer can occupy
+                // a storage slot.
+                propIsAutoStorage_[p] = mm.isAutoProperty;
                 applyBehavior(p);
                 return p;
             }
@@ -615,6 +633,10 @@ struct Loader {
     // ctx.setImportedPropertySetterVisibility() below.
     std::unordered_map<const sema::MemberSymbol*, ast::Visibility>
         propSetterVisibility_;
+    // fix #2478 (§9.2/§22.8): imported property AUTO-storage classification,
+    // from MetaMember::isAutoProperty — published to
+    // ctx.setImportedPropertyIsAutoStorage() below.
+    std::unordered_map<const sema::MemberSymbol*, bool> propIsAutoStorage_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const sema::MemberSymbol*, std::string> constValues_;
 };
@@ -2045,6 +2067,12 @@ static void loadMetadataPass2(
     // module boundary the same way it already does locally.
     for (auto& [m, sv] : loader.propSetterVisibility_)
         ctx.setImportedPropertySetterVisibility(m, sv);
+    // fix #2478 (§9.2/§22.8): publish imported property AUTO-storage
+    // classification so collectInstanceStorage/collectRecordStorage's
+    // isAutoPropertyStorage fallback (LlvmBackend_impl.hpp) can lay out an
+    // imported type's storage correctly.
+    for (auto& [m, isAuto] : loader.propIsAutoStorage_)
+        ctx.setImportedPropertyIsAutoStorage(m, isAuto);
     // §22.12 (issue #328 FINDING [3] BUG A): publish imported const values so
     // codegen can fold an imported `const` read without a storage symbol.
     for (auto& [m, val] : loader.constValues_)

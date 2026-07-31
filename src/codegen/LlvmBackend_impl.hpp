@@ -3518,6 +3518,46 @@ private:
         return false;
     }
 
+    // fix #2478 (§9.2/§22.8): isAutoProperty above is DECL-DEPENDENT
+    // (`dynamic_cast<const ast::PropertyDecl*>(ps->decl)`) — it always
+    // returns `false` for an IMPORTED PropertySymbol (`ps->decl` is null for
+    // every imported symbol, ModuleLoader.cpp never reconstructs an
+    // ast::PropertyDecl). This was a confirmed live memory-safety hazard:
+    // `collectInstanceStorage`/`collectRecordStorage` below call
+    // `isAutoProperty` to decide whether a member occupies a struct slot, so
+    // an imported class/record with a PUBLIC (or now-#2456/#2468-visible
+    // private) auto-property was silently under-counted — a locally-declared
+    // derived class's own field then collided with the physical offset the
+    // exporter's own compiled functions use for a LATER member (confirmed:
+    // a derived class's own private field read back the BASE auto-property's
+    // sibling field's value instead of its own, 122 instead of the correct
+    // 66 in the discovering repro). This helper is the STORAGE-LAYOUT-ONLY
+    // fallback: try the local (decl-based) predicate first (unchanged
+    // behavior for every LOCAL declaration); when that is false AND the
+    // symbol is an imported (decl-null) Property, consult the wire-carried
+    // classification (`ctx_.importedPropertyIsAutoStorage`, set from
+    // MetaMember::isAutoProperty by ModuleLoader.cpp) instead of silently
+    // treating it as "not storage".
+    //
+    // SCOPE (CLAUDE.md rule 4 — deliberately narrow, not a blanket fix):
+    // `sema::isAutoPropertySymbol`/`isAutoProperty`/`isStaticAutoProperty`
+    // have roughly thirty OTHER call sites (definite assignment, ownership/
+    // disposal ARC, sendability, serialization eligibility, pattern
+    // destructuring, the for-in "named vs. computed source" disposal test)
+    // audited during #2478's investigation — each has its own failure
+    // direction (some silent-wrong-data, some spurious-reject, at least one
+    // disposal-miscount/double-free-adjacent) and its own regression-test
+    // burden. Only the two STORAGE-LAYOUT call sites that directly cause the
+    // confirmed struct-offset collision (`collectInstanceStorage`,
+    // `collectRecordStorage`, immediately below) are widened here; the rest
+    // remain open, filed as a follow-up (see #2478's tracking comment).
+    bool isAutoPropertyStorage(const sema::Symbol* m) {
+        if (isAutoProperty(m)) return true;
+        auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
+        if (!ps || ps->isIndexer || ps->decl != nullptr) return false;
+        return ctx_.importedPropertyIsAutoStorage(ps);
+    }
+
     // CG33b: the arrow-getter expression of a computed property, or null
     // (auto-properties, indexers, and block/explicit-accessor getters
     // are not arrow getters).
@@ -3668,7 +3708,11 @@ private:
         for (const sema::Symbol* m : t->members) {
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
             if (fs && !isStaticField(fs)) { out.push_back(m); continue; }
-            if (isAutoProperty(m)) out.push_back(m);
+            // fix #2478 (§9.2/§22.8): isAutoPropertyStorage (not the bare
+            // decl-dependent isAutoProperty) so an IMPORTED auto-property
+            // occupies its correct storage slot — see that helper's comment
+            // for the confirmed memory-safety hazard this closes.
+            if (isAutoPropertyStorage(m)) out.push_back(m);
             // per §24.1 / §24.5 (#1176): each INSTANCE event declaration (sync
             // or async) gets a compiler-generated owned backing field of type
             // EventSource<T> / AsyncEventSource<T>, laid out as a plain `ptr`
@@ -3769,7 +3813,12 @@ private:
         for (const sema::Symbol* m : t->members) {
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
             if (fs && !isStaticField(fs)) { out.push_back(m); continue; }
-            if (sema::isAutoPropertySymbol(m)) out.push_back(m);
+            // fix #2478 (§9.2/§22.8): isAutoPropertyStorage (not the bare
+            // decl-dependent sema::isAutoPropertySymbol) so an IMPORTED
+            // record's auto-property occupies its correct storage slot —
+            // see that helper's comment (near isAutoProperty above) for the
+            // confirmed memory-safety hazard this closes.
+            if (isAutoPropertyStorage(m)) out.push_back(m);
         }
     }
 

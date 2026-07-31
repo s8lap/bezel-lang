@@ -477,6 +477,53 @@ struct MetaMember {
     // hasSetter's own missing-scalar default is `false` rather than `true`.
     MetaVisibility setterVisibility = MetaVisibility::Public;
 
+    // §9.2 / §22.8 (fix #2478, additive within v7 — same shape as hasSetter/
+    // setterVisibility above): for a Property member, whether it is declared
+    // in AUTO form (`property X: T := v;` / `property X: T;` — backing
+    // storage, no user getter/setter body) as opposed to an expression-
+    // bodied or block-accessor (computed) property. An auto-property is a
+    // real INSTANCE STORAGE member — it occupies a struct slot exactly like
+    // a field (§9.2's "auto-property PropertySymbol, backed by compiler-
+    // generated storage like a field") — but the importer has no
+    // ast::PropertyDecl to derive this from (ModuleLoader.cpp's Property
+    // case never reconstructs one), and `sema::isAutoPropertySymbol`/
+    // `Emitter::isAutoProperty` are DECL-DEPENDENT (`dynamic_cast<const
+    // ast::PropertyDecl*>(ps->decl)`), so they always return `false` for an
+    // imported PropertySymbol regardless of the exporter's real shape.
+    // Confirmed as a live memory-safety hazard (not merely inferred):
+    // `collectInstanceStorage`/`collectRecordStorage`
+    // (LlvmBackend_impl.hpp) call the decl-dependent predicate to decide
+    // whether a member occupies a layout slot, so an imported class/record
+    // with a PUBLIC auto-property was under-counted — a locally-declared
+    // derived class's own field then collided with the physical offset the
+    // exporter's own compiled getter/setter/init functions use for a LATER
+    // member, aliasing two logically-independent fields onto the same slot
+    // (the same failure class #2456 fixed for a PRIVATE plain field, here
+    // triggered by ANY-visibility auto-property instead). This bit closes
+    // ONLY that storage-layout gap (`collectInstanceStorage`/
+    // `collectRecordStorage`'s new `isAutoPropertyStorage` fallback,
+    // LlvmBackend_impl.hpp) — the many OTHER call sites of
+    // `isAutoPropertySymbol`/`isAutoProperty` (definite assignment,
+    // ownership/disposal, sendability, serialization eligibility, pattern
+    // destructuring — audited during #2478's investigation, ~30 sites) are
+    // NOT touched by this fix and remain separately filed follow-up work;
+    // widening every consumer at once risked mixing at least three
+    // different failure directions (silent wrong data, spurious rejects,
+    // and a double-free-adjacent disposal miscount) into one unreviewed
+    // change. Computed once by the exporter mirroring
+    // `sema::isAutoPropertySymbol`'s own predicate exactly (Auto bodyKind,
+    // non-indexer, non-static) so the importer-side fallback and the
+    // local-decl path classify identically. Ignored for every kind but
+    // Property (an Indexer is never "auto" — `isAutoPropertySymbol`
+    // excludes `ps->isIndexer` unconditionally, so this is left `false`
+    // for Indexer members). A pre-#2478 blob has no 13th scalar; the
+    // reader defaults this to `false` — the SAME (already-broken, not
+    // newly-regressed) "not storage" behavior an old dependency exhibits
+    // today, exactly mirroring hasSetter's own missing-scalar default
+    // reasoning: a stale (not-yet-recompiled) dependency keeps its
+    // pre-fix behavior until recompiled, rather than the reader guessing.
+    bool isAutoProperty = false;
+
     // §22.16 / §2.8.2: clauses in declaration order. For a `when` form from
     // §22.4 the builder emits the equivalent static-ensures record here.
     std::vector<MetaContractRecord> contracts;

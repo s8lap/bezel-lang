@@ -149,6 +149,12 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // loosening it) changes the cross-module contract, so it must fold
     // into the semantic hash the same way hasSetter does above.
     hashByte(h, static_cast<std::uint8_t>(m.setterVisibility));
+    // fix #2478 (§9.2/§22.8): isAutoProperty is part of a Property's
+    // signature identity for LAYOUT purposes — a library changing a
+    // property from auto-storage form to computed form (or vice versa)
+    // changes the cross-module storage contract, so it must fold into the
+    // semantic hash the same way hasSetter/setterVisibility do above.
+    hashBool(h, m.isAutoProperty);
     hashU64(h, m.contracts.size());
     for (const MetaContractRecord& c : m.contracts) hashContract(h, c);
     hashType(h, m.type);
@@ -288,7 +294,8 @@ MetaMember::MetaMember(const MetaMember& o)
       ctorBodyText(o.ctorBodyText), methodBodyText(o.methodBodyText),
       fieldInitText(o.fieldInitText),
       isPure(o.isPure), hasSetter(o.hasSetter),
-      setterVisibility(o.setterVisibility), contracts(o.contracts),
+      setterVisibility(o.setterVisibility), isAutoProperty(o.isAutoProperty),
+      contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
       hasEnumValue(o.hasEnumValue), enumValue(o.enumValue) {
@@ -303,7 +310,8 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         ctorBodyText = o.ctorBodyText; methodBodyText = o.methodBodyText;
         fieldInitText = o.fieldInitText;
         isPure = o.isPure; hasSetter = o.hasSetter;
-        setterVisibility = o.setterVisibility; contracts = o.contracts;
+        setterVisibility = o.setterVisibility;
+        isAutoProperty = o.isAutoProperty; contracts = o.contracts;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
         hasEnumValue = o.hasEnumValue; enumValue = o.enumValue;
@@ -330,7 +338,11 @@ bool MetaMember::operator==(const MetaMember& o) const {
            // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): the
            // setter's effective visibility is part of the Property's
            // signature identity — see the hashMember comment above.
-           setterVisibility == o.setterVisibility && contracts == o.contracts &&
+           setterVisibility == o.setterVisibility &&
+           // fix #2478 (§9.2/§22.8): auto vs. computed form is part of the
+           // Property's signature identity for layout purposes — see the
+           // hashMember comment above.
+           isAutoProperty == o.isAutoProperty && contracts == o.contracts &&
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
            hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
@@ -474,7 +486,12 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // a pre-#2415 reader's `sc.size() < 8` gate never looks past index 7, so
     // it too is unaffected; see the setterVisibility field comment in
     // ModuleMetadata.hpp for the full rationale.
-    llvm::SmallVector<std::uint64_t, 12> sc{
+    // fix #2478 (§9.2/§22.8, additive within v7): isAutoProperty is a 13th
+    // trailing scalar, same additive shape — a pre-#2478 reader's
+    // `sc.size() < 8` gate never looks past index 7, so it too is
+    // unaffected; see the isAutoProperty field comment in ModuleMetadata.hpp
+    // for the full rationale.
+    llvm::SmallVector<std::uint64_t, 13> sc{
         static_cast<std::uint64_t>(m.kind),
         static_cast<std::uint64_t>(m.visibility),
         m.isOperator ? 1u : 0u,
@@ -487,6 +504,7 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
         m.isPure ? 1u : 0u,
         m.hasSetter ? 1u : 0u,
         static_cast<std::uint64_t>(m.setterVisibility),
+        m.isAutoProperty ? 1u : 0u,
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, m.name);
@@ -972,6 +990,11 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     m.setterVisibility = sc.size() >= 12
         ? static_cast<MetaVisibility>(sc[11])
         : MetaVisibility::Private;
+    // fix #2478 (§9.2/§22.8, additive within v7): 13th scalar. A pre-#2478
+    // blob has at most 12 scalars; isAutoProperty defaults to `false` — the
+    // SAME "not storage" behavior a stale dependency already exhibits today
+    // (see the field's comment in ModuleMetadata.hpp).
+    m.isAutoProperty = sc.size() >= 13 && sc[12] != 0;
     if (!expectString(r, m.name)) return false;
     if (!readStringList(r, m.modifiers)) return false;
     if (!readType(r, m.type)) return false;

@@ -1017,6 +1017,20 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 if (!isStaticProp)
                     out.valueText = renderConstExpr(pd->autoInitializer.get());
             }
+            // fix #2478 (§9.2/§22.8, v0.235): carry whether this Property is
+            // declared in AUTO form (a real instance-storage member, §9.2) so
+            // the importer's `collectInstanceStorage`/`collectRecordValue`
+            // storage-layout walk can classify it correctly — mirroring
+            // `sema::isAutoPropertySymbol`'s own predicate EXACTLY (Auto
+            // bodyKind, non-indexer, non-static) so the wire-carried
+            // classification and the local-decl classification agree by
+            // construction. See `out.isAutoProperty`'s field comment in
+            // ModuleMetadata.hpp for the full rationale and the confirmed
+            // live memory-safety hazard this closes.
+            out.isAutoProperty = pd->bodyKind == ast::PropertyBodyKind::Auto &&
+                !prop->isIndexer;
+            for (auto mod : m.modifiers)
+                if (mod == "static") { out.isAutoProperty = false; break; }
             // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): mirror
             // LlvmBackend_impl.hpp's propertyHasSetter exactly. That codegen
             // helper only ever operates on a LOCAL decl (the same `pd`
