@@ -8601,9 +8601,28 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 // IEnumerable<T> (Array<Array<Dog>> → IEnumerable<IEnumerable<Dog>>)
                 // needs the per-element re-wrapping nested enumerator — the plain
                 // wrapper hands out raw bz_array_t* elements the inner for-in then
-                // vtable-dispatches on → SIGSEGV.
+                // vtable-dispatches on → SIGSEGV. #2486: this nested factory is
+                // NOT yet Stack-aware (filed as #2487); left untouched here.
                 if (nestedIEnumViewNeeded(initTR, declTR))
                     v = wrapNestedArrayAsIEnumerable(v, initTR, declTR);
+                else if (initTR->headName() == "Stack" ||
+                         initTR->headName() == "OwningStack")
+                    // #2486 (stdlib §4.11 "Iteration order" v0.195; language
+                    // spec §29.1): a Stack<T>/OwningStack<T> bound to an
+                    // explicit `IEnumerable<T>` local is a SEPARATE dispatch
+                    // point from wrapAsIEnumerableForTarget's argument/return
+                    // coercion (this local-decl init path duplicates the same
+                    // actualIsArray logic independently, LlvmBackend_Setup.cpp
+                    // — confirmed by direct probe: fixing only
+                    // wrapAsIEnumerableForTarget left this site still forward-
+                    // order). Reuse #2471's wrapStackAsIEnumerator (the SAME
+                    // reverse machinery as the argument/return sites and the
+                    // explicit .GetEnumerator()/for-loop paths) instead of the
+                    // forward wrapArrayAsIEnumerable, so all coercion
+                    // positions agree on top-to-bottom (pop) order. Still a
+                    // plain BORROW — same contract as the unchanged
+                    // wrapArrayAsIEnumerable call below.
+                    v = wrapStackAsIEnumerator(v, declTR);
                 else
                     v = wrapArrayAsIEnumerable(v, declTR);
             } else if (initIsDictSet) {

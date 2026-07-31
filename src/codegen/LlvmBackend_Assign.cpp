@@ -3482,9 +3482,35 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     if (actualIsArray || actualIsClassSet) {
         // §29 / §12.9 (#1850): a nested covariant view whose elements are
         // themselves array-backed collections viewed as pure IEnumerable<T>
-        // needs the per-element re-wrapping nested enumerator, not the plain one.
+        // needs the per-element re-wrapping nested enumerator, not the plain
+        // one. #2486: the nested factory (ensureIEnumViewFactory /
+        // wrapNestedArrayAsIEnumerable) is NOT yet Stack-aware in either
+        // direction — a Stack<T> OUTER container's traversal and a Stack<T>
+        // ELEMENT's per-item leaf wrap both stay forward-only there — so it
+        // is deliberately left untouched here (filed as #2487, a distinct,
+        // larger surface per the same "land clean, file the rest" reasoning
+        // #2486 itself was scoped out of #2471 with).
         if (nestedIEnumViewNeeded(actualTy, targetTy))
             return wrapNestedArrayAsIEnumerable(v, actualTy, targetTy);
+        // #2486 (stdlib §4.11 "Iteration order" v0.195; language spec §29.1,
+        // agreeing with #2472's for-loop fix and #2471's explicit
+        // .GetEnumerator() fix): a Stack<T>/OwningStack<T> widened to a pure
+        // IEnumerable<T> at an argument, local-decl-init, or method-RETURN
+        // coercion — all three positions share this one dispatch point —
+        // must iterate top-to-bottom (pop order), not physical/forward
+        // order. Reuse #2471's own reverse machinery (wrapStackAsIEnumerator
+        // / ensureStackEnumMachinery, LlvmBackend_Assign.cpp) verbatim
+        // rather than minting a third implementation, so this path's element
+        // order is structurally the SAME code as the explicit-GetEnumerator
+        // and for-loop paths, not just independently re-derived to agree.
+        // The wrap stays a plain BORROW (mirrors wrapArrayAsIEnumerable's
+        // existing contract for this branch, unchanged by this fix): the
+        // source Stack remains the sole owner, so `outOwningWrap` is
+        // correctly left false for both Array/Queue and Stack here — no
+        // ownership question is introduced that wasn't already present for
+        // Array's identical borrowing wrap at this same call site.
+        if (an == "Stack" || an == "OwningStack")
+            return wrapStackAsIEnumerator(v, targetTy);
         return wrapArrayAsIEnumerable(v, targetTy);
     }
     // fix #1069 / stdlib §4.10 / §5: DICT-backed `Set<T>` — snapshot its element
