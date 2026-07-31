@@ -12646,6 +12646,50 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // fix #2435 / stdlib §2.15 "Concrete serialization formats" / §4.6 / §28.9
+    // "Runtime-managed types" (v0.235): `JsonSerializer.ToString()` is a
+    // BUILTIN lowered in tryLowerSerializationCall (LlvmBackend_Serialization.cpp,
+    // the `rcn == "JsonSerializer"` branch) to bz_jser_to_string, which decodes
+    // the accumulated JSON bytes into a freshly-allocated heap `bz.string` whose
+    // rc := 1 (bz_string_init_rc) — exactly the +1 single-reference shape of
+    // `+`/interpolation/primitive-ToString/StringBuilder.ToString above. Before
+    // this recognition the result was treated as a BORROW: `var json :=
+    // s.ToString()` retained it at bind (rc 1→2) and released at scope end
+    // (rc 2→1), never dropping the producer's original +1 — leaking the 32-byte
+    // header plus its data buffer (#2435: LSan-confirmed 87 bytes / 2
+    // allocations, both rooted at bz_jser_to_string; the sibling `ToBytes()` +
+    // `using var`-disposed `OwningBuffer<byte>` path is unaffected and stayed
+    // LSan-clean, isolating the gap to this recognizer).
+    //
+    // Recognized structurally — a CallExpr with an empty arg list, member ==
+    // "ToString", and a receiver whose type is the SAME synthetic-Named shape
+    // (`Kind::Named`, no user `declaration` — JsonSerializer is a compiler-
+    // recognized opaque handle type, stdlib §2.15, never a real TypeSymbol) that
+    // tryLowerSerializationCall's `rcn` dispatch requires before it ever reaches
+    // the "JsonSerializer" branch — so the recognizer and the lowering stay in
+    // lockstep and a same-named user class (which WOULD carry a real
+    // `declaration`) cannot be misclassified as this producer. A bound local
+    // TRANSFERS the single reference (no extra retain) and the scope-end
+    // release — when the escape walk proves the local non-escaping — drops it
+    // exactly once. No double-free: an escaping local is excluded from the
+    // scope-end release by the escape walk (its +1 then leaks — the safe
+    // direction, unchanged from before this fix).
+    if (auto* call = dynamic_cast<const ast::CallExpr*>(init)) {
+        if (call->args.empty() && call->callee) {
+            if (auto* ma =
+                    dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get())) {
+                if (ma->member == "ToString" && ma->target) {
+                    auto* tt = ctx_.exprType(*ma->target);
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                        !tt->declaration &&
+                        tt->astNode && tt->astNode->name &&
+                        !tt->astNode->name->parts.empty() &&
+                        tt->headName() == "JsonSerializer")
+                        return true;  // bz_jser_to_string → rc=1 heap string
+                }
+            }
+        }
+    }
     // #2065 / §8.5 / §9.1 / §9.2 / §4.6 / §28.9 (v0.204): the SYNTHESIZED
     // `ToString()` on a positional or auto-equality-bearing body record is a
     // +1 string PRODUCER. It lowers in lowerValueSemMethodOn to emitRecordToString
