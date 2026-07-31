@@ -8866,28 +8866,108 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // #2423: a last-resort safety net for any OTHER slot shape (a scalar,
         // a struct — e.g. the `{i1, i64}` layout of a nullable value-type
         // local — or any future case this function does not special-case)
-        // when the initializer failed to lower (`v == nullptr`) for a reason
-        // none of the branches above cover. Before this, such a slot's
+        // when there is no value to store. Before this, such a slot's
         // `alloca` was left completely unwritten: declared once and later
         // loaded with whatever bytes happened to occupy that stack address —
         // a silent, non-deterministic uninitialized-stack read (confirmed via
         // `BEZEL_DUMP_IR=1` for the #2423 repro: the destination local's
         // alloca was declared and loaded but never stored to anywhere in the
-        // function). The known trigger for `v == nullptr` here — an
-        // unresolved member access on a declaration-less built-in exception
-        // type — is now rejected at compile time by
-        // `ExprTC::resolveMemberAccess` (src/sema/ExprTypecheck_Calls.cpp),
-        // so this branch should be unreachable in a correctly functioning
-        // compiler; it exists as defense in depth for any OTHER lowering
-        // failure this function does not yet know about, mirroring the two
-        // zero-initializing branches immediately above (a null pointer /
-        // zero-filled array is already this function's established answer to
-        // "no initializer value" — this extends the same policy uniformly).
-        // `getNullValue` covers every LLVM type shape generically: pointers
-        // (null), scalars (zero), and aggregates (zero-filled), so a
+        // function). `getNullValue` covers every LLVM type shape generically:
+        // pointers (null), scalars (zero), and aggregates (zero-filled), so a
         // zero-initialized owned-pointer-bearing struct slot disposes nothing
         // (a moved-from/absent owned value), consistent with the existing
         // string-slot branch's reasoning above.
+        //
+        // `v == nullptr` here has TWO distinct causes that this branch must
+        // tell apart (#2434):
+        //   (a) `init == nullptr` — a declaration-only local (`var x: int;`,
+        //       no initializer expression). This is common and legitimate
+        //       under definite assignment (Appendix C.1): the slot's zero is
+        //       never observed before a later assignment, and DA rejects any
+        //       program that would read it first. Silent zero-init is the
+        //       correct, unremarkable answer, exactly as the string/array
+        //       branches above are silent for the same reason.
+        //   (b) `init != nullptr` — an initializer EXPRESSION was present but
+        //       `lowerExpr` (or a post-processing step such as
+        //       `boxForTarget`/the IEnumerable-wrapping arms above) yielded
+        //       no value. Codegen only runs once the front end is clean
+        //       (`Driver.cpp` gates `emitModule`/`emitObjectFile` on
+        //       `!diagnostics.hasErrors()`), so a program with an initializer
+        //       that reaches here already passed sema.
+        //
+        // #2434 asked for a SIGNAL on case (b) instead of pure silence, and
+        // suggested (but did not mandate) an internal-diagnostic idiom
+        // matching this file's other "lowerExpr returned null" ICE guards
+        // (e.g. the inline-array-literal-element and base-constructor-
+        // argument arms above) — EXPLICITLY conditioned on first checking
+        // EMPIRICALLY whether any current program legitimately reaches here,
+        // since an unconditional Error would then turn a working compile
+        // into a hard failure. That check was run (`scripts/agent_check.sh`'s
+        // lit track, which covers the whole tests/lit corpus — the targeted
+        // gtest filters alone would have missed this): reaching here is NOT
+        // always a compiler defect. At least two DISTINCT, currently-
+        // legitimate shapes hit case (b) today, both governed by this
+        // language's PERMISSIVE typing story rather than any lowering bug:
+        //   * §3 / #605's permissive "unknown member" acceptance on a
+        //     receiver whose static type cannot carry a complete member set
+        //     (`Object`, a primitive, or an unconstrained/under-constrained
+        //     generic type parameter) — e.g. `var s := o.Anything();` for
+        //     `o: Object`, or `x.ToString()`/`x.GetHashCode()` inside a
+        //     method generic over an unconstrained `T` — which sema accepts
+        //     BY DESIGN (tests/lit/sema/sema_unknown_member__object_typed_
+        //     receiver_permissive.bzl,
+        //     .../method_constraint_callsite_746__object_members_on_
+        //     unconstrained_t_accepted_1078.bzl,
+        //     .../sema_unknown_primitive_method_spec3_4__string_empty_
+        //     still_accepted_1034.bzl) but for which codegen has no concrete
+        //     member to dispatch to.
+        //   * §14.1/§14.2's `where T: new()` generic constraint — `new T()`
+        //     for an UNCONSTRAINED-CONCRETELY type parameter (observed in a
+        //     method-level generic's body form that is not the call-site
+        //     monomorphization) has no concrete type to construct
+        //     (.../generic_default_new_constraint_864__part2_*_accepted.bzl,
+        //     .../new_type_param_constraint_992__accept_method_level_with_
+        //     new_constraint.bzl).
+        // All 6 are pre-existing (predate this fix and #2423 both — this
+        // fallback merely made them OBSERVABLE for the first time) "clean
+        // compile, zero diagnostics" ACCEPT controls in the lit corpus, so an
+        // unconditional Error here is exactly the false-reject the issue
+        // warned against: it would turn 6 currently-green corpus programs
+        // (and, by the same shape, presumably real user code using the same
+        // permissive constructs) into hard compile failures for behavior
+        // this language's type system already promises to tolerate. So the
+        // signal is Severity::Warning, not Error: `DiagnosticEngine::report`
+        // (support/Diagnostic.cpp) only increments `errorCount_` — hence
+        // `hasErrors()` — for Severity::Error, and `Driver::
+        // compileExecutableObject` prints EVERY diagnostic (any severity)
+        // unconditionally before returning (src/driver/Driver.cpp, the loop
+        // just after the codegen block), so a Warning here is fully visible
+        // on stderr without failing the build — "degrade to zero, but say
+        // so" without the false-reject an Error would cause. (A regression
+        // lit test pins this: it recompiles the §3/#605 Object-permissive
+        // shape above and asserts the compile still exits 0 WHILE this
+        // warning's text is now present on stderr, where before this fix it
+        // was silent.)
+        //
+        // Guarded on `!ctx_.diagnostics().hasErrors()` for MESSAGE QUALITY
+        // (not safety, now that this is a Warning): `lowerExpr` also has
+        // "not yet implemented" sites that return nullptr AFTER already
+        // reporting their OWN specific Error — e.g. the unhandled-`in`-
+        // expression-form fallback (LlvmBackend_Exprs.cpp, "not yet
+        // implemented: codegen for this `in` expression form"), reachable
+        // from `var x := a in b;` for an operand shape none of that
+        // dispatch's branches cover. Stacking this generic warning on top of
+        // an already-specific, already-fatal Error would be redundant noise
+        // that also mislabels an explained "not yet implemented" limitation
+        // as "internal: …". The guard only suppresses THIS diagnostic, never
+        // the zero-init store below.
+        if (init && !ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Warning, init->span.begin,
+                "internal: lowerLocalDecl's initializer expression failed "
+                "to lower to a value for this local's slot (degraded to a "
+                "zero-initialized value) — #2434");
+        }
         builder_.CreateStore(llvm::Constant::getNullValue(slotTy), slot);
     }
     // §28.3 / §28.10 (v0.180, #1978): a `var y := owned x;` / `using var y :=
