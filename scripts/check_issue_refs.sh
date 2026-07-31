@@ -41,6 +41,15 @@ git rev-parse "$RANGE" >/dev/null 2>&1 || { echo "check_issue_refs: bad range '$
 # Scan the FULL message (subject + body): a "Filed #NNNN" line in the body is
 # exactly where the dangling-reference bug lived.
 #
+# NB the dedup is `sort -u` on the WHOLE line, then a stable numeric re-sort.
+# An earlier version used `sort -u -k1,1n`, which dedupes on the SORT KEY only
+# (the issue number) and therefore collapsed an issue referenced by two commits
+# to ONE arbitrary row -- in practice keeping the body-`mention` row and
+# discarding the subject-`FIX` row, so the issue silently vanished from the
+# close-list. That is precisely the failure this script exists to prevent: it
+# dropped 3 of 7 issues from a real batch. An issue referenced by several
+# commits now gets one row per commit, which is also more informative.
+#
 # Done with a per-commit loop rather than one clever awk pass: a commit body is
 # multi-line and may contain tabs, so record/field splitting over a single
 # `git log` stream misaligns the columns (it produced rows keyed by SHA instead
@@ -58,22 +67,28 @@ rows="$(
         case "$subj" in *"#$n"*) kind=FIX ;; *) kind=mention ;; esac
         printf '%s\t%s\t%s\t%s\n' "$n" "$sha" "$kind" "$subj"
       done
-  done | sort -u -k1,1n
+  done | sort -u | sort -k1,1n -s
 )"
 
 [ -n "$rows" ] || { echo "check_issue_refs: no issue references in $RANGE"; exit 0; }
 
-dangling=0; open_n=0; closed_n=0; to_close=""
+dangling=0; open_n=0; closed_n=0; to_close=""; seen_open=""; seen_closed=""; seen_dangling=""
 printf '%-8s %-8s %-8s %-10s %s\n' "ISSUE" "STATE" "ROLE" "COMMIT" "SUBJECT"
 printf '%-8s %-8s %-8s %-10s %s\n' "-----" "-----" "----" "------" "-------"
 while IFS=$'\t' read -r num sha kind subj; do
   [ -n "$num" ] || continue
   if ! state="$(gh issue view "$num" --json state -q .state 2>/dev/null)"; then
-    state="DANGLING"; dangling=$(( dangling + 1 ))
-  elif [ "$state" = OPEN ]; then open_n=$(( open_n + 1 ))
-  else closed_n=$(( closed_n + 1 ))
+    state="DANGLING"
+    case " $seen_dangling " in *" $num "*) ;; *) dangling=$(( dangling + 1 )); seen_dangling="$seen_dangling $num" ;; esac
+  elif [ "$state" = OPEN ]; then
+    case " $seen_open " in *" $num "*) ;; *) open_n=$(( open_n + 1 )); seen_open="$seen_open $num" ;; esac
+  else
+    case " $seen_closed " in *" $num "*) ;; *) closed_n=$(( closed_n + 1 )); seen_closed="$seen_closed $num" ;; esac
   fi
-  [ "$kind" = FIX ] && [ "$state" = OPEN ] && to_close="$to_close $num"
+  # to_close is per-ISSUE: one FIX row anywhere in the range is enough.
+  if [ "$kind" = FIX ] && [ "$state" = OPEN ]; then
+    case " $to_close " in *" $num "*) ;; *) to_close="$to_close $num" ;; esac
+  fi
   printf '#%-7s %-8s %-8s %-10s %.52s\n' "$num" "$state" "$kind" "$sha" "$subj"
 done <<< "$rows"
 
