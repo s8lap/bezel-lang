@@ -4129,7 +4129,69 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
                                         const ast::Expr& target,
                                         const char* kind) {
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps.decl);
-    if (!pd) return;
+    if (!pd) {
+        // fix #2454 (§22.3/§13.6/§23.3, §2.8.2 clause 1/§2.8.3 rule 4,
+        // v0.235): an IMPORTED PropertySymbol has no ast::PropertyDecl
+        // (`ps.decl` is unconditionally null — ModuleLoader never
+        // reconstructs a body-less imported property's decl), so this
+        // function previously returned immediately for ANY imported
+        // property, skipping BOTH the "no setter" check and the §13.6
+        // setter-visibility check — the ref/out sibling of #2412 (hasSetter)
+        // and #2415 (setter visibility), which fixed the identical gap for
+        // the plain `:=` assignment-target check in the same file. Falls
+        // back to the SAME two side tables #2412/#2415 already publish (no
+        // new metadata needed — #2415 already proved the metadata exists
+        // and round-trips): `ctx_.importedPropertyHasSetter(ps)` and
+        // `ctx_.importedPropertySetterVisibility(ps)`.
+        //
+        // NOT covered here (deliberately, decline-with-reasons): a
+        // WRITE-ONLY property (no getter) is invalid as a `ref` argument
+        // (§22.3: "for `ref`, the getter is called once to produce the
+        // callee's slot value") but valid as `out` (§22.3: "for `out` no
+        // getter call occurs"). The LOCAL `pd`-present branch below does
+        // NOT enforce this distinction either — a write-only LOCAL
+        // property's illegal use as `ref` is instead caught by a SEPARATE,
+        // EARLIER general "reading a write-only property" check
+        // (ExprTypecheck_Calls.cpp's propertyDeclIsSetOnly gate), which is
+        // ALSO `pd`-gated and so ALSO does not cover an imported property.
+        // Recovering "has a getter" for an imported property would need a
+        // THIRD new metadata bit (no `hasGetter`/`isSetOnly` scalar exists
+        // today) — filed as #2461 rather than guessed at here; today a
+        // write-only imported property used as `ref` is still soundly
+        // rejected, just via a confusing codegen-level "internal: no
+        // setter" diagnostic (#1302) instead of a clean §23 message, since
+        // codegen's copy-in getter call has nothing to call.
+        if (!ctx_.importedPropertyHasSetter(&ps)) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument must be a property "
+                "with an accessible setter — this property has no setter "
+                "(§22.3 / §23.3)");
+            return;
+        }
+        ast::Visibility sv = ctx_.importedPropertySetterVisibility(&ps);
+        TypeSymbol* declaring = ps.parent;
+        bool bad = false;
+        if (sv == ast::Visibility::Private) {
+            bad = true;  // declaring is an imported TypeSymbol; currentType_
+                         // is always a type compiled in THIS module — the
+                         // two can never be the same symbol (mirrors #2415).
+        } else if (sv == ast::Visibility::Protected) {
+            bad = !(currentType_ && isSubtype(currentType_, declaring));
+        } else if (sv == ast::Visibility::Internal) {
+            bad = true;  // the importing module is by definition a
+                         // different module than the declaring one
+                         // (mirrors #2415).
+        }
+        if (bad) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument must be a property "
+                "with an accessible setter — its setter is not accessible "
+                "here (§22.3 / §13.6)");
+        }
+        return;
+    }
     bool hasSetter = true;
     if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
         hasSetter = false;

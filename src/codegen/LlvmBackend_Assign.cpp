@@ -5237,8 +5237,26 @@ void Emitter::emitAccessorRefArgWriteBacks(std::vector<AccessorRefArg>& recs,
                 // Mirrors lowerStmt's `obj.P := v` order: a virtual/interface
                 // property setter dispatches dynamically (§12.1/§12.5/§23);
                 // otherwise the statically-known accessor body is inlined.
+                // fix #2454 (§22.3/§2.8.2 clause 1/§2.8.3 rule 4, v0.235):
+                // a THIRD fallback, lowerImportedPropertySetValue (#2400) —
+                // for a PLAIN (non-virtual, non-interface) property
+                // inherited or declared on an IMPORTED class, both of the
+                // above fail (lowerVirtualPropertySet needs a vtable/itable
+                // slot this shape has none of; lowerPropertySetValue needs
+                // `pd`, an ast::PropertyDecl, which an imported
+                // PropertySymbol never has), so a `ref`/`out` write-back to
+                // such a property had no path at all — confirmed by probe:
+                // a LOCAL method taking `ref v: int` called as
+                // `Bump(ref imported.Prop)` hit this function's own
+                // "internal: no setter" diagnostic even for a fully public,
+                // unrestricted imported property (a §22.3-conformant
+                // program the sema checks above correctly accept). Mirrors
+                // #2400's own DIRECT (non-bracket) `:=` fix exactly, reusing
+                // the SAME importedPropSetterFns_-backed function — no new
+                // machinery.
                 done = lowerVirtualPropertySet(*r.target, v) ||
-                       lowerPropertySetValue(*r.target, v);
+                       lowerPropertySetValue(*r.target, v) ||
+                       lowerImportedPropertySetValue(*r.target, v);
             }
             if (!done)
                 ctx_.diagnostics().report(
