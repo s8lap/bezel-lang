@@ -1791,8 +1791,41 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
     }
     if (!setterExpr && !setterStmts) return false;
     // Bind `this`, indexer params, and implicit `value` param.
-    llvm::Value* obj = lowerExpr(*ix.target);
-    if (!obj) return false;
+    // fix #2502 (§9.2/§23.4, v0.236): resolve the receiver's OWN storage
+    // address via `lvalueAddr` rather than loading a COPY via `lowerExpr` —
+    // mirrors lowerImportedPropertySetValue's #2489 fix and this same
+    // function's own `!pd` (imported) branch above. `lowerExpr(*ix.target)`
+    // on a named record-typed local LOADS a byte-for-byte copy; the OLD code
+    // then spilled that copy into a FRESH alloca (see the removed "§9.2 /
+    // #794" spill a few lines below, which is now folded into this
+    // resolution), so `this` inside the setter body pointed at a THROWAWAY
+    // slot and the write never reached the caller's own variable. Confirmed
+    // by probe (#2502's own repro): `r[5] := 9; return r[2];` returned 2 (the
+    // untouched initial value), not 6 — no crash, no diagnostic, a silently
+    // dropped write. Falls back to `lowerExpr` + spill only when the receiver
+    // expression is NOT an addressable place (e.g. a fresh temporary —
+    // `MakeRecord()[5] := 9`, where no "original" exists to preserve).
+    llvm::Value* obj = nullptr;
+    llvm::Type* objElemTy = nullptr;
+    if (llvm::Value* addr = lvalueAddr(*ix.target, objElemTy)) {
+        if (objElemTy && objElemTy->isPointerTy())
+            obj = builder_.CreateLoad(objElemTy, addr);
+        else if (objElemTy && objElemTy->isAggregateType())
+            obj = addr;  // already the address of the receiver's real storage
+    }
+    if (!obj) {
+        llvm::Value* ov = lowerExpr(*ix.target);
+        if (!ov) return false;
+        if (ov->getType()->isPointerTy()) {
+            obj = ov;
+        } else if (ov->getType()->isAggregateType()) {
+            llvm::AllocaInst* tmp = entryAlloca(ov->getType());
+            builder_.CreateStore(ov, tmp);
+            obj = tmp;
+        } else {
+            return false;
+        }
+    }
     // #794: lower index ARGUMENTS in the CALLER's scope, BEFORE clearing
     // locals_/paramSlots_ (they may reference the enclosing method's
     // locals/params — the same hazard fixed in lowerIndexerGet).
@@ -1811,12 +1844,12 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
     // getter path) so a `T`-typed field read/write inside the setter body uses
     // the concrete layout, not the i32 erasure.
     auto savedSubst = setupReceiverGenericSubst(ix.target.get(), ps->parent);
-    // §9.2 / #794: spill a by-value RECORD receiver to a pointer for `this`.
-    if (!obj->getType()->isPointerTy()) {
-        llvm::AllocaInst* tmp = entryAlloca(obj->getType());
-        builder_.CreateStore(obj, tmp);
-        obj = tmp;
-    }
+    // fix #2502: `obj` is already pointer-typed at this point — resolved
+    // above via `lvalueAddr` (the receiver's own storage) or, for a
+    // non-addressable temporary, via `lowerExpr` + spill. The old bare
+    // `!isPointerTy()` spill that used to live here is folded into that
+    // resolution now (spilling here, post-resolution, would have re-copied
+    // an already-correct address and defeated the fix).
     currentThis_ = obj;
     locals_.clear();
     paramSlots_.clear();
