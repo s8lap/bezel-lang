@@ -35,6 +35,6 @@ public class C
 end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: class `LocalDerived` supplies a base-constructor argument list here, but `LocalDerived` declares no primary-constructor parameter list of its own
-// CHECK-SAME: (§11.1, §22.10, v0.235)
-// CHECK-SAME: (§12.8, v0.235)
+// CHECK-SAME: (§11.1, §22.10, v0.236)
+// CHECK-SAME: (§12.8, v0.236)
 // CHECK-NOT: internal:

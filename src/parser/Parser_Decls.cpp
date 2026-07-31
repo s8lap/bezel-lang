@@ -373,17 +373,40 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                 // Remaining base types (interfaces) — only one class base is
                 // valid for a primary-ctor class (sema enforces); parse further
                 // items for completeness, discarding their '(...)' groups.
+                // fix #2466 (Appendix A.3 InheritItem grammar note, v0.236):
+                // a NON-empty argument list on any of these interface-position
+                // items was previously silently discarded here with no
+                // diagnostic, the same gap #2466 closes in `parseInheritance`
+                // for record/interface decls. Per Appendix A.3's note, the
+                // argument list is "permitted only on the base class (the
+                // first item), not on interfaces"; an EMPTY list (`IFoo()`)
+                // drops no data and stays accepted, matching #2455's carve-out.
                 while (isPunctuator(",")) {
                     advance();
                     auto t = parseType();
                     decl->baseTypes.push_back(std::move(t));
                     if (isPunctuator("(")) {
+                        const SourceLocation argListLoc = current_.location;
+                        // EMPTY `()` drops no data — only a non-empty list is
+                        // rejected (consistent with #2455 / #2466 elsewhere).
+                        const bool argListNonEmpty =
+                            peekNext().kind != TokenKind::Punctuator ||
+                            peekNext().text != ")";
                         int depth = 1;
                         advance();
                         while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
                             if (isPunctuator("("))      ++depth;
                             else if (isPunctuator(")")) --depth;
                             advance();
+                        }
+                        if (argListNonEmpty) {
+                            diagnostics_.report(
+                                Severity::Error, argListLoc,
+                                "an argument list is not permitted here — per "
+                                "Appendix A's `InheritItem` grammar (v0.236), "
+                                "it is permitted only on the base class (the "
+                                "first item in the inheritance list), not on "
+                                "an interface");
                         }
                     }
                 }
@@ -2876,16 +2899,26 @@ std::vector<std::unique_ptr<ast::Type>> Parser::parseInheritance(
     // a class that may declare several independently-chaining explicit
     // constructors has no textual answer).
     //
-    // Interface and record decls reaching this same function are UNCHANGED
-    // by this fix — they keep the original tokenize-away behaviour. Every
-    // item in their inheritance list is an interface (records cannot
-    // inherit a class at all, other than the implicit `Object` root, per
-    // §9.6; interfaces only extend other interfaces), so an argument list
-    // there is inert nonsense rather than silently-dropped DATA (nothing
-    // was ever going to consume it) — a real but lower-severity, distinct
-    // gap, filed separately (#2466) rather than folded into this fix.
-    const bool rejectArgList = decl != nullptr &&
+    // fix #2466 (Appendix A.3 InheritItem grammar note, §9.6, §11.2,
+    // v0.236): record and interface decls reach this same function and
+    // previously kept the original tokenize-away behaviour. Every item in
+    // their inheritance list is an interface (records cannot inherit a
+    // class at all, other than the implicit `Object` root, per §9.6;
+    // interfaces only extend other interfaces, per §11.2), so an argument
+    // list there is inert nonsense rather than silently-dropped DATA
+    // (nothing was ever going to consume it) — but Appendix A.3's own note
+    // on `InheritItem` documents the restriction ("permitted only on the
+    // base class ... not on interfaces"), so the silent tokenize-away is
+    // now upgraded to a diagnostic for these kinds too. Only an EMPTY arg
+    // list (`IFoo()`) stays accepted, matching #2455's "no data lost"
+    // carve-out and the pre-existing
+    // parser_generics_inheritance.inheritance_with_unparsed_arg_list_
+    // does_not_error regression test's expectation for that shape.
+    const bool classNoPrimaryCtor = decl != nullptr &&
         decl->kind == ast::TypeDeclKind::Class;
+    const bool recordOrInterface = decl != nullptr &&
+        (decl->kind == ast::TypeDeclKind::Record ||
+         decl->kind == ast::TypeDeclKind::Interface);
     std::vector<std::unique_ptr<ast::Type>> items;
     if (!isPunctuator(":")) return items;
     advance(); // past ':'
@@ -2910,8 +2943,10 @@ std::vector<std::unique_ptr<ast::Type>> Parser::parseInheritance(
             // does_not_error already asserts this stays accepted).
             const bool argListNonEmpty = peekNext().kind != TokenKind::Punctuator ||
                                           peekNext().text != ")";
-            if (rejectArgList && argListNonEmpty) {
-                if (thisIndex == 0) {
+            if (argListNonEmpty) {
+                if (classNoPrimaryCtor && thisIndex == 0) {
+                    // #2455: class without a primary constructor, base-class
+                    // position — the arg list has no defined destination.
                     diagnostics_.report(
                         Severity::Error, argListLoc,
                         "class `" + std::string(decl->name) + "` supplies a "
@@ -2920,17 +2955,22 @@ std::vector<std::unique_ptr<ast::Type>> Parser::parseInheritance(
                         "constructor parameter list of its own — the header "
                         "argument-list shorthand feeds a primary "
                         "constructor's `base(...)` chain (§11.1, §22.10, "
-                        "v0.235), and a class without one gets an implicit "
-                        "no-argument `base()` call instead (§12.8, v0.235) "
+                        "v0.236), and a class without one gets an implicit "
+                        "no-argument `base()` call instead (§12.8, v0.236) "
                         "that cannot receive these arguments; add an empty "
                         "primary-constructor parameter list (`" +
                         std::string(decl->name) + "()`) or declare an "
                         "explicit constructor that chains via `base(...)`");
-                } else {
+                } else if (classNoPrimaryCtor || recordOrInterface) {
+                    // #2455 (class interface positions, item 1+) and #2466
+                    // (every record/interface item, all interface positions
+                    // per §9.6 / §11.2): Appendix A.3's `InheritItem` note
+                    // admits the arg list only on the base class, not on
+                    // interfaces.
                     diagnostics_.report(
                         Severity::Error, argListLoc,
                         "an argument list is not permitted here — per "
-                        "Appendix A's `InheritItem` grammar (v0.235), it is "
+                        "Appendix A's `InheritItem` grammar (v0.236), it is "
                         "permitted only on the base class (the first item "
                         "in the inheritance list), not on an interface");
                 }
