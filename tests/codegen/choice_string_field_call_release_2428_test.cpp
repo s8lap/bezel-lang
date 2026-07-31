@@ -45,17 +45,19 @@
 // rather than a third ad hoc mechanism, per #2425's own filed
 // recommendation.
 //
-// RESIDUAL (documented, NOT fixed here, filed as #2450): the shared
-// StringEscapeWalker treats a `case` MATCH SCRUTINEE as an unconditional
-// escape (by design, shared across every consumer of the walker -- string
-// locals, #1747 records, this mechanism). Both of #2428's own reported
-// repros use the local SOLELY as a case scrutinee
-// (`case v of Text(var a, var b) => ...`), so neither is closed by this
-// fix -- they stay the prior safe-leak behaviour, pinned as "no UAF" below
-// rather than claimed fixed. This fix DOES close the shape #1747's own
-// precedent targets: a call-result local that is not subsequently
-// re-matched/re-passed (declared and simply not read again, or read only
-// in a position the walker already recognizes as safe).
+// RESIDUAL (documented as NOT fixed here, filed as #2450 -- NOW CLOSED, see
+// case_scrutinee_pattern_binding_release_2450_test.cpp): the shared
+// StringEscapeWalker used to treat a `case` MATCH SCRUTINEE as an
+// unconditional escape (by design, shared across every consumer of the
+// walker -- string locals, #1747 records, this mechanism). Both of #2428's
+// own reported repros use the local SOLELY as a case scrutinee
+// (`case v of Text(var a, var b) => ...`), so neither was closed by THIS
+// fix -- #2450 lifted the scrutinee-escape rule for exactly this mechanism
+// (valueLikeChoiceMode's armsBindingsSafe, LlvmBackend_Setup.cpp), proving
+// each arm's payload bindings independently non-escaping before admitting
+// the scrutinee as a borrow rather than an escape. The two repro tests
+// below were updated from "no crash / no UAF" (runAotCheckedLenient) to
+// leak-free (runAotChecked) once #2450 landed.
 //
 // Adversarial grid covered (full detail in the lane report):
 //   * the fix's actual reach: an unused (declared, never re-read)
@@ -63,8 +65,8 @@
 //     PASSES.
 //   * the issue's own two repros (direct construction + case-match, and
 //     the Deserialize + case-match round trip) -- pinned as "no crash / no
-//     UAF", NOT as "leak-free" (the scrutinee-escape residual, #2450,
-//     keeps them leaking by design of the shared conservative walker).
+//     UAF" when this file was written; #2450 (below) proved them leak-free
+//     too, and the two tests now assert that directly.
 //   * `_ := v;` (explicit discard) -- ALSO stays a conservative escape
 //     under the shared walker (an unconditional escape read, matching
 //     every other DiscardStmt use across the whole walker, not specific
@@ -119,32 +121,37 @@ BEZEL_TEST(choice_string_field_call_release_2428,
 
 // ===========================================================================
 // The issue's own non-serialization repro: direct construction (already
-// #2115-eligible, unrelated to THIS fix) matched via `case`. Pinned as
-// "no crash / no UAF" -- the scrutinee-escape residual (#2450) keeps this
-// leaking BOTH before and after this fix; runAotCheckedLenient disables
-// leak detection so the pin is specifically about crash/UAF safety, not a
-// (false) leak-free claim.
+// #2115-eligible, unrelated to THIS fix) matched via `case`. Originally
+// pinned as "no crash / no UAF" only (runAotCheckedLenient) -- #2450 lifted
+// the scrutinee-escape rule for the value-like-choice release mechanism
+// (armsBindingsSafe proves the arms' `var a`/`var b` bindings never escape:
+// arm 1 discards both into the literal `42`, arm `_` is binding-free), so
+// this now asserts leak-free with strict runAotChecked.
 // ===========================================================================
 BEZEL_TEST(choice_string_field_call_release_2428,
            direct_construction_case_match_no_uaf_residual_leak_spec_35_5) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module M; choice Msg Text(first: string, second: string), Empty; end Msg; "
         "class C public static method Main(): int "
         "  var m := Msg.Text($\"hello-world-{1}\", $\"second-{2}\"); "
         "  return (case m of Text(var a, var b) => 42, _ => 1); "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);   // no crash / no UAF (generated-code ASan still active)
+    BEZEL_EXPECT_TRUE(r.ran);   // fix #2450: now leak-free (was leaking pre-#2450)
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
 
 // ===========================================================================
 // The issue's own serialization repro: `Msg.Deserialize(d)` matched via
-// `case ... when ...`. Same residual as above (scrutinee escape) -- pinned
-// as "no crash / no UAF", not leak-free.
+// `case ... when ...`. Same residual as above (scrutinee escape) --
+// originally pinned as "no crash / no UAF"; #2450 closes it because the
+// `when` guard's equality comparisons (`a = "...", b = "..."`) are safe
+// reads (BinaryExpr comparison operands) under armsBindingsSafe's
+// maximally-conservative sub-walker, and the arm result (`42`) does not
+// read the bindings at all.
 // ===========================================================================
 BEZEL_TEST(choice_string_field_call_release_2428,
            deserialize_case_match_no_uaf_residual_leak_spec_9_8_35_5) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         std::string("module M; ") + kImport +
         "choice Msg: ISerializable, IDeserializable "
         "  Text(first: string, second: string), Empty; end Msg; "
@@ -159,7 +166,7 @@ BEZEL_TEST(choice_string_field_call_release_2428,
         "            when a = \"a-fairly-long-tag-value-string\" and b = \"second-value-str\" => 42, "
         "          _ => 1); "
         "end Main; end C;");
-    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_TRUE(r.ran);   // fix #2450: now leak-free (was leaking pre-#2450)
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
 

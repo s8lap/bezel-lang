@@ -13329,6 +13329,52 @@ namespace {
 //
 // `safeRead`: true when a bare identifier in the current expression position is
 // a non-consuming read; false when it would escape.
+//
+// fix #2450 / §19.3 / §35.5: collect every BindingPattern reachable from a
+// case-arm `Pattern` (a naked binding, a typed `var x: T` binding, or either
+// nested inside a positional destructure or an alternative list). The
+// grammar's binding-free pattern kinds (Discard/Null/Constant/Named/Range/
+// RelOp/Type — §19.3's own binding-free enumeration for alternative-list
+// members) contribute no bindings and are walked only for their own nested
+// destructuring (AltPattern members are binding-free per grammar so their
+// recursion is a no-op in practice, kept for completeness/defensiveness). Any
+// Pattern subtype NOT in this enumeration clears `ok` so the caller fails
+// CLOSED — treats the arm as if it could hide an unanalyzed binding, the same
+// "unrecognized construct ⇒ conservative" posture the rest of this walk uses.
+void collectPatternBindings(const ast::Pattern* pat,
+                            std::vector<const ast::BindingPattern*>& out,
+                            bool& ok) {
+    if (!pat) return;
+    if (auto* bp = dynamic_cast<const ast::BindingPattern*>(pat)) {
+        out.push_back(bp);
+        return;
+    }
+    if (dynamic_cast<const ast::DiscardPattern*>(pat)) return;
+    if (dynamic_cast<const ast::NullPattern*>(pat)) return;
+    if (dynamic_cast<const ast::ConstantPattern*>(pat)) return;
+    if (dynamic_cast<const ast::NamedPattern*>(pat)) return;
+    if (dynamic_cast<const ast::RangePattern*>(pat)) return;
+    if (dynamic_cast<const ast::RelOpPattern*>(pat)) return;
+    if (dynamic_cast<const ast::TypePattern*>(pat)) return;
+    if (auto* alt = dynamic_cast<const ast::AltPattern*>(pat)) {
+        for (auto& m : alt->members) collectPatternBindings(m.get(), out, ok);
+        return;
+    }
+    if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(pat)) {
+        for (auto& sp : dp->subPatterns) {
+            // A.7 PositionalPattern: either a naked binding (its dedicated
+            // BindingPattern anchor, #1271) or a full sub-Pattern.
+            if (sp.nakedAnchor) {
+                out.push_back(sp.nakedAnchor.get());
+            } else {
+                collectPatternBindings(sp.pattern.get(), out, ok);
+            }
+        }
+        return;
+    }
+    ok = false;  // an unrecognized Pattern kind — fail closed
+}
+
 struct StringEscapeWalker {
     const sema::SemaContext& ctx;
     const void* target;   // the LocalDecl node we are testing
@@ -13378,6 +13424,42 @@ struct StringEscapeWalker {
     // record-call-result eligibility pass sets it; the
     // string/dict/grouping/borrowing-Array walks leave it false.
     bool recordFieldReleaseMode = false;
+    // fix #2450 / §35.5 / §28.9 / §35.4: OPT-IN gate for the case-scrutinee
+    // relaxation below. §35.5's "borrowing match" makes every payload binding
+    // a BORROW of the scrutinee's source — for a value-like choice, a
+    // `string`/runtime-managed payload binding is "a shared reference with no
+    // extra retain" (verbatim). So when the tracked TARGET local is itself the
+    // bare-identifier scrutinee of a `case`, matching it is not per se an
+    // escape: the match only READS the tag and payload fields already in the
+    // target's own slot. The only way a scope-end release of that slot could
+    // dangle is if some arm lets a PAYLOAD BINDING (`var a`, not the scrutinee
+    // itself) escape past the release — a binding is never itself retained at
+    // bind, so an escaping use of it would alias the target's single +1
+    // without an independent one, UNLESS the escaping USE mints its own retain
+    // (a `return`/field-store of a plain string always does, #429/#1747) — but
+    // a lambda CAPTURE of a binding does NOT retain (§27.5's "no extra retain
+    // at capture-store time" relies on the captured local's OWN would-be
+    // scope-end release being suppressed, a mechanism that does not exist for
+    // an untracked pattern binding), so a captured/rebound-then-escaping
+    // binding is a genuine UAF risk this analysis must catch.
+    //
+    // armsBindingsSafe (below) proves EVERY arm's payload bindings never
+    // escape by running a FRESH, maximally-conservative StringEscapeWalker
+    // (every opt-in mode left off) keyed on each binding's own BindingPattern
+    // node — reusing exactly the same "any use not explicitly recognized as a
+    // safe, call-bounded read is an escape" discipline the rest of this walker
+    // already relies on, just retargeted at the binding instead of a LocalDecl.
+    // A binding proven non-escaping this way can only be read/compared/
+    // concatenated within the arm, or passed to a channel this walker already
+    // treats conservatively — never captured, rebound-and-escaped, returned,
+    // stored, or re-matched — so the target's own release cannot dangle it.
+    // Only the value-like-choice release passes (collectStringReleaseEligible's
+    // valueLikeChoiceCandidates loop and collectValueLikeChoiceCallResultRelease
+    // Eligible's candidates loop) set this; the plain string/dict/grouping/
+    // borrowing-Array/record walks leave it false and keep the pre-existing
+    // unconditional scrutinee-escape rule (their soundness under THIS
+    // relaxation has not been analyzed).
+    bool valueLikeChoiceMode = false;
     // #1871: the set of `var v: IEnumerable<T> := <target-array>` VIEW LocalDecls
     // that were independently proven never to escape. A binding of the target into
     // one of these is a borrow (the view wrapper borrows the array's backing; its
@@ -13420,6 +13502,58 @@ struct StringEscapeWalker {
         return rt &&
                rt->kind == sema::TypeRef::Kind::Primitive &&
                rt->primitive == sema::PrimitiveType::String;
+    }
+
+    // fix #2450 / §19.3 / §35.5 / §28.9 / §35.4: are EVERY one of `arms`'
+    // payload pattern bindings proven never to escape their own arm? Used
+    // only when valueLikeChoiceMode is set AND the CaseExpr/CaseStmt's
+    // scrutinee is the tracked TARGET local itself (see the scrutinee-relax
+    // call sites below) — a positive verdict here is what makes matching the
+    // target non-destructive-and-non-escaping as a whole.
+    //
+    // Each binding is checked with its OWN fresh StringEscapeWalker (every
+    // opt-in mode OFF — the most conservative configuration this walker
+    // offers), keyed on the binding's BindingPattern node exactly the way the
+    // outer walk is keyed on a LocalDecl (isTargetIdent matches either kind
+    // via Symbol::decl, per #1271's naked-binding anchor). Reusing the
+    // existing walk gives this check the SAME proven safe-read/escape
+    // boundary — no new "this is safe" rule is introduced; a binding is
+    // deemed safe only for the exact positions (concat/comparison operand,
+    // method-call receiver, interpolation part, a plain-param call arg NOT
+    // opted in here, etc.) the rest of this file already relies on. In
+    // particular a lambda capture of a binding is caught (inLambda forces an
+    // escape on any read, safe or not) — §27.5's "no extra retain at
+    // capture-store time" would otherwise leave the closure's env cell as an
+    // UNRETAINED alias into the target's slot, which the target's scope-end
+    // release would then dangle.
+    //
+    // A Pattern shape this file's pattern grammar does not recognize (should
+    // not occur — Appendix A.7 is closed) fails collectPatternBindings' `ok`
+    // and this returns false — conservative, matching that helper's own
+    // documented fail-closed posture.
+    bool armsBindingsSafe(const std::vector<ast::CaseArm>& arms) {
+        for (auto& arm : arms) {
+            std::vector<const ast::BindingPattern*> bindings;
+            bool ok = true;
+            collectPatternBindings(arm.pattern.get(), bindings, ok);
+            if (!ok) return false;
+            for (const ast::BindingPattern* bp : bindings) {
+                StringEscapeWalker bw{ctx, static_cast<const void*>(bp)};
+                bw.expr(arm.guard.get(), /*safeRead=*/false);
+                if (!bw.escaped) {
+                    if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                        bw.expr(arm.exprBody.get(), /*safeRead=*/false);
+                    } else {
+                        for (auto& s : arm.stmts) {
+                            bw.stmt(s.get());
+                            if (bw.escaped) break;
+                        }
+                    }
+                }
+                if (bw.escaped) return false;
+            }
+        }
+        return true;
     }
 
     // #1185 / stdlib §3.1: StringBuilder.Append/AppendLine(string) is a RETAINING
@@ -13887,8 +14021,24 @@ struct StringEscapeWalker {
             // arm-meet). The scrutinee and guards stay escape positions (neither
             // is the arm-meet result), and a sub-expression arm keeps its own
             // escape rules via the recursion.
+            //
+            // fix #2450 / §35.5: EXCEPT when valueLikeChoiceMode is set and the
+            // scrutinee IS the tracked target itself — then matching it is a
+            // borrowing match (§35.5), not per se an escape, PROVIDED every
+            // arm's payload bindings are independently proven non-escaping
+            // (armsBindingsSafe) — see that function and the valueLikeChoiceMode
+            // comment above for the full soundness argument. This ONLY changes
+            // whether the scrutinee EXPRESSION read below counts as an escape;
+            // `arm.guard` below is UNCHANGED (still walked at safeRead=false) —
+            // a guard may itself reference the target's identifier directly
+            // (not only through a pattern binding), and that occurrence keeps
+            // going through the ordinary top-level recursion exactly as
+            // before, unaffected by this relaxation.
             bool armSafe = stringReleaseMode && isStringResultArmMeet(e);
-            expr(ce->scrutinee.get(), /*safeRead=*/false);
+            bool scrutineeSafe = valueLikeChoiceMode &&
+                                 isTargetIdent(ce->scrutinee.get()) &&
+                                 armsBindingsSafe(ce->arms);
+            expr(ce->scrutinee.get(), /*safeRead=*/scrutineeSafe);
             for (auto& arm : ce->arms) {
                 expr(arm.guard.get(), /*safeRead=*/false);
                 expr(arm.exprBody.get(), /*safeRead=*/armSafe);
@@ -14089,7 +14239,15 @@ struct StringEscapeWalker {
             return;
         }
         if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
-            expr(cs->scrutinee.get(), /*safeRead=*/false);
+            // fix #2450 / §35.5: mirrors the CaseExpr scrutinee relaxation
+            // above — see that arm and the valueLikeChoiceMode comment for the
+            // full soundness argument. A statement-position case's arm result
+            // (if any) is discarded, so there is no arm-meet retain to mirror
+            // here; only the scrutinee-escape verdict changes.
+            bool scrutineeSafe = valueLikeChoiceMode &&
+                                 isTargetIdent(cs->scrutinee.get()) &&
+                                 armsBindingsSafe(cs->arms);
+            expr(cs->scrutinee.get(), /*safeRead=*/scrutineeSafe);
             for (auto& arm : cs->arms) {
                 expr(arm.guard.get(), /*safeRead=*/false);
                 expr(arm.exprBody.get(), /*safeRead=*/false);
@@ -15200,9 +15358,18 @@ void Emitter::collectStringReleaseEligible(
     // payload would leak through the very release armed here — exclude it. An
     // escaping local is simply not armed — its payload leaks (the pre-existing,
     // safe behavior). // per §28.9, §35.4 v0.226.
+    //
+    // fix #2450 / §35.5: valueLikeChoiceMode is ON (unlike stringReleaseMode,
+    // which stays off) — it opts INTO the case-scrutinee relaxation (matching
+    // the local via `case` is not per se an escape, PROVIDED every arm's
+    // payload bindings are independently proven non-escaping), closing the
+    // #2428 residual where the local's ONLY use is as a case scrutinee. See
+    // the valueLikeChoiceMode flag comment (struct StringEscapeWalker, above)
+    // for the full soundness argument.
     for (const ast::LocalDecl* ld : valueLikeChoiceCandidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
         // stringReleaseMode stays false — see the rationale above.
+        w.valueLikeChoiceMode = true;  // fix #2450
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             valueLikeChoiceStrReleaseEligible_.insert(
@@ -15576,13 +15743,21 @@ void Emitter::collectValueLikeChoiceCallResultReleaseEligible(
 
     for (const ast::LocalDecl* ld : candidates) {
         StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
-        // Every mode stays false, mirroring #2115's OWN value-like-choice
+        // Every OTHER mode stays false, mirroring #2115's OWN value-like-choice
         // release walk (collectStringReleaseEligible's valueLikeChoiceCandidates
         // loop): a choice-typed store/arg-pass is a raw aggregate memcpy with
-        // no per-field retain, so every non-trivial use (case-match scrutinee,
-        // arg-pass, field/collection store, reassignment) stays a
-        // conservative escape — the SAME leak-over-UAF discipline #2115
-        // already established for this type family.
+        // no per-field retain, so every non-trivial use (arg-pass, field/
+        // collection store, reassignment) stays a conservative escape — the
+        // SAME leak-over-UAF discipline #2115 already established for this
+        // type family.
+        //
+        // fix #2450 / §35.5: valueLikeChoiceMode IS opted in, mirroring the
+        // SAME opt-in on #2115's own walk above — closes the identical
+        // scrutinee-only residual for THIS mechanism's eligibility set (the
+        // issue's own "Deserialize + case-match round trip" repro). See the
+        // valueLikeChoiceMode flag comment (struct StringEscapeWalker) for the
+        // full soundness argument.
+        w.valueLikeChoiceMode = true;  // fix #2450
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             valueLikeChoiceCallResultReleaseEligible_.insert(
