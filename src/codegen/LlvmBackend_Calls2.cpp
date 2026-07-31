@@ -2003,6 +2003,63 @@ llvm::Value* Emitter::tryLowerValueSemanticsCall(const ast::CallExpr& call) {
             }
         }
     }
+    // #2469 (§8.5/§14.1/§14.2): ToString on a bare unconstrained generic type
+    // parameter `T` substituted with a RECORD or ENUM at this instantiation.
+    // #1091 above deliberately left ToString out of the genericSubstSemaTy_
+    // redirect ("ToString already works via the genericSubst path in the
+    // ms==null fallback") — but that fallback (LlvmBackend_Calls2.cpp,
+    // lowerCall's `if (!ms)` block, the `ma->member == "ToString"` case) only
+    // has branches for a PRIMITIVE substitution (emitPrimitiveToString) and a
+    // CLASS/INTERFACE substitution (lowerObjectToString via the uniform
+    // vtable slot) — no RECORD or ENUM branch. `val.ToString()` at T = a
+    // positional record (e.g. `record Pt(X: int, Y: int)`) therefore fell all
+    // the way through to lowerCall's own unconditional `return nullptr;`,
+    // producing `ret ptr null` for the string return; the caller's use of the
+    // result (e.g. `s.Length`) then dereferenced a near-null pointer —
+    // confirmed via ASan (SEGV, read at offset 0x8 from address 0x0).
+    // Fix: resolve T's concrete bound type exactly as #1091 does, and for a
+    // Record/Enum concrete type reuse `lowerValueSemMethodOn` — the SAME
+    // dispatcher a *concrete*-typed record/enum receiver's `.ToString()`
+    // already uses unconditionally (`namedValueSem` below, no member filter)
+    // — so a generic-substituted record gets the identical §8.5 default
+    // (`emitRecordToString`) a directly-typed record does.
+    //
+    // Scoped to Record/Enum ONLY, deliberately not folded into the #1091
+    // condition above: a Primitive substitution's ToString is handled by its
+    // own dedicated path below and `lowerValueSemMethodOn` does not support
+    // ToString for a primitive receiver (it returns nullptr, since that
+    // branch is gated on `isEquals || isGetHashCode`); widening the #1091
+    // gate to include ToString would cause the receiver to be lowered here,
+    // find no handler, and fall through to the fallback's *own* `lowerExpr`
+    // call — a double-lowering hazard for receivers with side effects (the
+    // exact thing the "receiver lowered exactly once" comment below guards
+    // against, #1075). A Class/Interface substitution has the same hazard,
+    // plus the #1091 block's `concreteRefSem` branch indexes `call.args[0]`
+    // unconditionally in its `else if` arm — safe for Equals (one arg) but
+    // undefined behavior for a zero-arg ToString call. Choice is excluded
+    // too: `lowerValueSemMethodOn` deliberately does not intercept ToString
+    // for a choice receiver either (the concrete-typed case just below,
+    // `choiceValueSem`, is Equals/GetHashCode-only, #1075) — a choice
+    // substitution's ToString remains the pre-existing, separately-tracked
+    // gap this fix does not touch.
+    if (isToString &&
+        recvTy->kind == sema::TypeRef::Kind::Named && !recvTy->declaration &&
+        !genericSubstSemaTy_.empty() && recvTy->astNode &&
+        recvTy->astNode->name && recvTy->astNode->name->parts.size() == 1) {
+        auto sit = genericSubstSemaTy_.find(recvTy->headName());
+        if (sit != genericSubstSemaTy_.end() && sit->second) {
+            const sema::TypeRef* concrete = sit->second;
+            using K = sema::TypeRef::Kind;
+            bool concreteRecordOrEnum =
+                concrete->kind == K::Named && concrete->declaration &&
+                (concrete->declaration->kind == ast::TypeDeclKind::Record ||
+                 concrete->declaration->kind == ast::TypeDeclKind::Enum);
+            if (concreteRecordOrEnum) {
+                if (llvm::Value* recv = lowerExpr(*ma->target))
+                    return lowerValueSemMethodOn(concrete, recv, call, member);
+            }
+        }
+    }
     // Lower the receiver ONLY for the value-semantics receiver kinds the core
     // handles (a primitive Equals/GetHashCode, or any record/enum member); a
     // primitive ToString (left to the dedicated string path) or a non-value
