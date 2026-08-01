@@ -3942,23 +3942,64 @@ void Resolver::checkAbstractImplementations() {
         // findIndexer, per the comment above), so `candidate == nullptr`
         // here is the already-computed, sound condition.
         //
-        // Local-only on the INTERFACE side, per #2413's confirmed scope:
-        // `ips->decl` is null for an IMPORTED interface indexer (ModuleLoader
-        // reconstructs indexerParams as ParameterSymbols but attaches no
-        // ast::PropertyDecl — #2414's own T4 accept-control test pins this
-        // shape staying accepted, uninvolved in this check).
+        // #2529 (§11.2 / §23.4 / §2.8.2 clause 1 / §2.8.3 rule 4, v0.236):
+        // for an IMPORTED interface indexer — `ips->decl` is null, because
+        // ModuleLoader's Indexer case (#2414) reconstructs `indexerParams`
+        // as ParameterSymbols but attaches no `ast::PropertyDecl` (there is
+        // no syntactic AST to attach — "the getter BODY is not reconstructed
+        // here") — the obligation was silently SKIPPED via `if (!ipd)
+        // continue;` below. A getter-only impl of an imported read-write
+        // interface indexer therefore compiled clean (verified: `b[1]` on a
+        // `property [i: int]: int` interface with a getter-only local impl
+        // returned `_v + i`, no diagnostic); the LOCAL twin — same source,
+        // no import — was, and remains, correctly REJECTED with the
+        // §11.2/§23.4 diagnostic (#2417). This is the indexer sibling of
+        // the property-side #2406-shaped gap; the ifaceProps loop below
+        // already has the analogous property-type fallback to
+        // `ctx_.importedMemberType` for its imported side (#2380), so this
+        // loop is extended the same way: `ifaceParamCount`/`ifaceParamTy`
+        // and `ifaceHasSetter` read from the LOCAL `ast::PropertyDecl`
+        // when present (the original shape) and fall back to the
+        // RECONSTRUCTED `PropertySymbol::indexerParams` (ParameterSymbols
+        // with `resolvedDeclType`) and to `ctx_.importedPropertyHasSetter`
+        // (#2400's `propHasSetter_` side table, populated by ModuleLoader's
+        // Indexer case from `MetaMember::hasSetter`) otherwise. No new
+        // metadata bit is needed — every imported indexer obligation is
+        // fully reconstructable from what #2414 + #2400 already publish.
         for (auto& obl : ifaceIndexerObligations) {
             PropertySymbol* ips = obl.ips;
             auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ips->decl);
-            if (!ipd) continue;  // imported interface indexer — left to a
-                                  // future #2406-shaped fix, same as ifaceProps
 
-            const std::size_t nparams = ipd->indexerParams.size();
+            // #2529: count/type of the interface indexer's parameter list,
+            // local or imported — mirrors the candidate-side `candParamCount`
+            // /`candParamTy` fallbacks already present in this loop (#2449).
+            auto ifaceParamCount = [&]() -> std::size_t {
+                if (ipd) return ipd->indexerParams.size();
+                return ips->indexerParams.size();
+            };
+            const std::size_t nparams = ifaceParamCount();
             auto ifaceParamTy = [&](std::size_t k) -> TypeRef* {
-                return (k < ipd->indexerParams.size() &&
-                        ipd->indexerParams[k].type)
-                           ? resolvedOf(ipd->indexerParams[k].type.get())
-                           : nullptr;
+                if (ipd) {
+                    return (k < ipd->indexerParams.size() &&
+                            ipd->indexerParams[k].type)
+                               ? resolvedOf(ipd->indexerParams[k].type.get())
+                               : nullptr;
+                }
+                if (k < ips->indexerParams.size())
+                    if (auto* p = dynamic_cast<ParameterSymbol*>(
+                            ips->indexerParams[k]))
+                        return p->resolvedDeclType;
+                return nullptr;
+            };
+            // #2529: whether the interface's own indexer declares a setter.
+            // Mirrors the candidate-side `cpd ? propertyDeclHasSetter(cpd)
+            // : ctx_.importedPropertyHasSetter(candidate)` fallback a few
+            // lines below (#2449) — same MetaMember::hasSetter bit
+            // (#2400), the same one codegen's `declareImportedIndexerSetters`
+            // gate uses to reserve a setter itable slot.
+            auto ifaceHasSetter = [&]() -> bool {
+                if (ipd) return propertyDeclHasSetter(ipd);
+                return ctx_.importedPropertyHasSetter(ips);
             };
 
             // #2449: a candidate's arity/k-th param type, read from its
@@ -4055,7 +4096,7 @@ void Resolver::checkAbstractImplementations() {
                 continue;
             }
 
-            if (!propertyDeclHasSetter(ipd))
+            if (!ifaceHasSetter())
                 continue;  // read-only obligation, candidate found: satisfied
 
             // #2449: an IMPORTED candidate has no ast::PropertyDecl to read

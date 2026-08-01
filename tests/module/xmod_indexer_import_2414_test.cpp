@@ -249,6 +249,23 @@ BEZEL_TEST(xmod_indexer_import_2414, local_class_indexer_control_unaffected) {
 // independently, so a future regression in the itable-slot-count machinery
 // (the #2406-style layout-shift hazard) is at least caught as a compile
 // failure here even before value-level coverage runs.
+//
+// Updated after #2529 (§11.2 / §23.4): the original test used a getter-only
+// impl of an imported read-write interface indexer — a shape #2414 needed to
+// accept at the time because the iface-indexer obligations walker
+// (`checkAbstractImplementations` in src/sema/TypeResolution_Checks.cpp)
+// silently SKIPPED the §11.2/§23.4 accessor-presence check for imported
+// interface indexers (it gated on `ips->decl`, which is null for any
+// imported PropertySymbol — ModuleLoader's Indexer case reconstructs
+// `indexerParams` but attaches no `ast::PropertyDecl`). #2529's fix closes
+// that gap (mirroring #2380's `ifaceProps` type-compare fallback and the
+// candidate-side #2449 fallback the same loop already uses); the original
+// test would now (correctly) reject. To preserve T4's accept-control role
+// — pin that the itable-dispatched indexer-overload resolution path
+// (`#2414`'s actual subject) still compiles cross-module — the test now
+// uses a getter+setter impl, the legitimate read-write indexer shape, and
+// the getter-only-vs-readwrite reject for an imported interface indexer is
+// pinned by the new #2529 tests (`xmod_iface_indexer_setter_2529`).
 // ===========================================================================
 BEZEL_TEST(xmod_indexer_import_2414,
            indexer_through_imported_interface_still_compiles_accept_control) {
@@ -260,7 +277,10 @@ BEZEL_TEST(xmod_indexer_import_2414,
         "module App2414T4; import IdxIfaceLib2414T4; "
         "public class Impl2414T4: IIdx2414T4 "
         "  private _v: int := 7; "
-        "  public property [i: int]: int => _v + i; "
+        "  public property [i: int]: int "
+        "    get => _v + i; "
+        "    set => _v := value - i; "
+        "  end; "
         "end Impl2414T4; "
         "public class C "
         "  public static method Main(): int "
