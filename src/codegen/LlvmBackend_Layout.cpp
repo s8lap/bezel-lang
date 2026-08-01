@@ -979,6 +979,35 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
 
 
 llvm::Type* Emitter::storageType(const sema::Symbol* m) {
+    // fix #2533 (§24.1/§22.8/§2.8.2 clause 1, v0.236): an event's backing
+    // storage is a runtime `EventSource<T>` (`AsyncEventSource<T>` for async)
+    // referenced by an OPAQUE POINTER (§24.1), NOT the event's payload type.
+    // The wire-carried MetaMember::type for an IMPORTED event is its `: T`
+    // PAYLOAD type (e.g. `EvB2421` in the issue's repro), not the EventSource
+    // storage type — so the imported-member-type fallback below would happily
+    // pick that payload type up and LAY the struct out with the payload record
+    // in the event slot, mis-aligning the importer's struct relative to the
+    // exporter's. Concretely: the exporter's BaseWithEvt2421 struct is `{ ptr,
+    // i8, ptr }` (vtable, disposed flag, EventSource ptr) at offset 16; the
+    // importer's Derived2421 struct, with the event laid out as the payload
+    // record `EvB2421`, became `{ ptr, i8, %EvB2421 }` (where %EvB2421 is a
+    // `{ i32 }` payload record, alignment 4) — the EventSource landed at
+    // offset 12 inside that struct. The exporter's `bz$<Base>$init` (called
+    // via `emitImportedBaseFieldInit`) writes the EventSource at offset 16
+    // per the exporter's struct, but the importer's itable accessor
+    // (`bz$Derived2421$Ready$evtget`) reads at offset 12 per the importer's
+    // struct — the byte read is not the EventSource, so `bz_event_add`
+    // dereferences a junk pointer and SEGVs (#2533). This check has to come
+    // BEFORE the imported-member-type fallback (and the fd/pd branches, which
+    // are also decl-dependent) so EVERY event — local or imported, sync or
+    // async, payload or unit — gets the same opaque pointer storage the
+    // exporter uses. The `isEventStatic`/`isEventAsync` wire bits
+    // (added by #2421) carry the sync/async classification that determines
+    // whether the slot is initialized at all (`collectInstanceStorage` /
+    // `emitOwnFieldInit` gate on `eventIsStatic`); the storage TYPE itself is
+    // always `ptr` regardless of either bit.
+    if (dynamic_cast<const sema::EventSymbol*>(m))
+        return ptrTy();
     // §9.1: a record's positional field carries its type on the
     // originating Param, not a FieldDecl (its `decl` is the TypeDecl).
     if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m))
@@ -1000,10 +1029,6 @@ llvm::Type* Emitter::storageType(const sema::Symbol* m) {
         return lowerType(fd->type.get());
     if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
         return lowerType(pd->type.get());
-    // per §24.1: an event's backing EventSource<T> field is a runtime object
-    // referenced by an opaque pointer.
-    if (dynamic_cast<const sema::EventSymbol*>(m))
-        return ptrTy();
     return i32();
 }
 
