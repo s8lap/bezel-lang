@@ -4941,6 +4941,13 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
     llvm::Value* recv = lowerExpr(*ma->target);
     if (!recv || !recv->getType()->isPointerTy()) return false;
     v = coerceNumericToType(v, valTy, isUnsignedTargetExpr(target));
+    // fix #2500 (§8.6/§23.3/§28.9, v0.236): virtual/interface-dispatch twin of
+    // lowerImportedPropertySetValue's boxing — an Object/interface property's
+    // setter slot expects a `ptr` (box) value parameter, but a value-typed RHS
+    // arrived bare; box it first. boxForTarget no-ops for a reference source
+    // and for a null valueExpr. Without this the itable/vtable setter call
+    // passed i32 where ptr is required and IR verification rejected the module.
+    v = boxForTarget(v, ctx_.exprType(target), valueExpr);
 
     llvm::Value* fnPtr = nullptr;
     if (isIfaceProp) {
@@ -5001,6 +5008,22 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
         else if (valueExpr && (isPlusOneClosureProducer(valueExpr) ||
                                isUserMethodClosureReturnCall(valueExpr)))
             emitClosureRelease(v);
+        else if (valueExpr && v->getType()->isPointerTy()) {
+            // fix #2500 (§23.3/§28.9, v0.236): the box twin of the string/
+            // closure release above — same isProducer predicate as
+            // lowerBoxFieldStore / lowerImportedPropertySetValue. See those
+            // functions' comments for the full rationale. Gated on the TARGET
+            // being Object/interface (and v a ptr): a value-typed property's
+            // source may be boxable in isolation but is not boxed here.
+            const sema::TypeRef* tgtTy = ctx_.exprType(target);
+            if (tgtTy && isObjectOrInterfaceTarget(tgtTy)) {
+                const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+                if ((srcTy && (isBoxableValueType(srcTy) ||
+                               isNullableValueTy(srcTy))) ||
+                    isUserMethodBoxReturnCall(valueExpr))
+                    emitBoxRelease(v);
+            }
+        }
     }
     return true;
 }

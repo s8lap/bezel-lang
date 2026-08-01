@@ -259,6 +259,34 @@ public:
         // is safe; it has no dependency on methodFns_, vtables_, or any other
         // codegen state that declareVtables or declareFunctions populates.
         computeEnumValues();  // CG30 — moved before declareVtables (fix #510)
+        // #429 (box RETURN + FIELD-STORE category) / §8.6 / §28.9, reordered
+        // here by fix #2500 (§23.3/§28.9): determine, BEFORE any caller of
+        // ensurePropertyAccessorFn runs —
+        //   (a) which locally-compiled methods always return boxable value
+        //       sources (boxReturnMethods_) — callers of these treat the result
+        //       as a +1 box producer and may release it at scope end;
+        //   (b) which Object/interface-typed CLASS fields ONLY receive boxable
+        //       value stores across the entire class (boxStorageFields_) —
+        //       emitDisposerCore releases these fields via bz_box_release.
+        // Both analyses depend only on ctx_ (sema, resolved before codegen),
+        // fieldIndex_ (declareStructs above), and methodFns_/ctorFns_
+        // (declareFunctions above) — none on vtables or late codegen state — so
+        // moving them here (before declareVtables/emitExportedPropertySetters,
+        // the two earliest ensurePropertyAccessorFn callers) is sound. This is
+        // required so that ensurePropertyAccessorFn's auto-SETTER body can
+        // consult isBoxStorageMember to decide whether to retain/release a
+        // box-typed backing field (the box twin of #2490's string/closure ARC):
+        // the body is built ONCE on first request and memoized, and before this
+        // reorder both first-call sites ran ahead of collectBoxStorageFields,
+        // leaving boxStorageFields_ empty at the point the setter body needed
+        // it (the ordering hazard #2500 documents). The analyses STILL satisfy
+        // their original "before the method body loop" obligation (that loop is
+        // well below), so collectBoxReleaseEligible's isPlusOneBoxProducer ->
+        // isUserMethodBoxReturnCall continues to see a populated
+        // boxReturnMethods_, and the disposer (emitted after all method bodies)
+        // sees a fully-populated boxStorageFields_.
+        collectBoxReturnMethods();
+        collectBoxStorageFields();
         declareVtables();  // CG17: after functions exist (needs fn ptrs)
         // §2.5 / §22.9 (issue #503): emit ExternalLinkage getter stubs for
         // non-virtual public properties (exporter side). After declareVtables so
@@ -310,21 +338,11 @@ public:
         // loops and Pass D — see the call site there for why.
         setupBoxDescriptors();  // §8.6: after descArray_/vtable globals exist
         declareExterns();  // CG26
-        // #429 (box RETURN + FIELD-STORE category) / §8.6 / §28.9: before any
-        // method bodies are lowered, determine:
-        //   (a) which locally-compiled methods always return boxable value
-        //       sources (boxReturnMethods_) — callers of these treat the result
-        //       as a +1 box producer and may release it at scope end;
-        //   (b) which Object/interface-typed CLASS fields ONLY receive boxable
-        //       value stores across the entire class (boxStorageFields_) —
-        //       emitDisposerCore releases these fields via bz_box_release.
-        // Both analyses must run BEFORE the method body loop so that per-body
-        // collectBoxReleaseEligible (which calls isPlusOneBoxProducer, which
-        // calls isUserMethodBoxReturnCall) sees a populated boxReturnMethods_,
-        // and the disposer (emitted after all method bodies) sees a fully-
-        // populated boxStorageFields_.
-        collectBoxReturnMethods();
-        collectBoxStorageFields();
+        // collectBoxReturnMethods()/collectBoxStorageFields() now run BEFORE
+        // declareVtables() (see the call site just above computeEnumValues) so
+        // that ensurePropertyAccessorFn — invoked from declareVtables (Pass D)
+        // and emitExportedPropertySetters — sees a populated boxStorageFields_
+        // for the auto-setter body's box-ARC branch (fix #2500).
         for (auto& [sym, fn] : methodFns_) {
             emitFunctionBody(sym, fn);
         }

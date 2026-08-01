@@ -3074,25 +3074,42 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 // retain against). Falls through to the pre-fix plain store
                 // for a record (or any non-class `cls`), unaffected.
                 //
-                // Object/interface (box)-typed auto-properties are
-                // deliberately NOT covered here — isBoxStorageMember's
+                // Object/interface (box)-typed auto-properties ARE covered
+                // here as of fix #2500 (§23.3/§28.9, v0.236): the box twin of
+                // the string/closure retain/release just below. This was the
+                // hazard #2500 was filed on — isBoxStorageMember's
                 // classification prepass (collectBoxStorageFields,
-                // LlvmBackend_Setup.cpp:18116) runs AFTER declareVtables()/
-                // emitExportedPropertySetters() (LlvmBackend_impl.hpp
-                // ~262-327), both of which can be the FIRST caller of this
-                // memoized function, so boxStorageFields_ would read empty
-                // at the point this body needs to consult it — consulting it
-                // anyway would either no-op (useless) or require inventing an
-                // ordering-independent replacement policy not backed by the
-                // established discipline. Filed as #2500 (full ordering
-                // analysis + two sound remediation options) rather than
-                // guessing at it (CLAUDE.md rule 4).
+                // LlvmBackend_Setup.cpp:18116) used to run AFTER declareVtables
+                // ()/emitExportedPropertySetters() (this function's two
+                // earliest, memoizing callers), so boxStorageFields_ read empty
+                // at the point this body needed it. Fix #2500 REORDERED
+                // collectBoxReturnMethods()/collectBoxStorageFields() to run
+                // BEFORE declareVtables() (LlvmBackend_impl.hpp, after
+                // computeEnumValues), so isBoxStorageMember now returns the
+                // correct classification here. The retain is unconditional
+                // (never a transfer) for the same §23.3 borrow reason as
+                // string/closure; bz_box_retain/release are null-safe, so a
+                // first-time set into a calloc-zeroed (null) backing field
+                // releases null harmlessly. CLASS ONLY — a RECORD's
+                // auto-property backing field is a borrow with no independent
+                // +1 and no disposer (§9/§9.7); isBoxStorageMember is itself
+                // class-gated, so boxField is false for a record regardless.
                 bool classField = cls && cls->kind == ast::TypeDeclKind::Class;
                 bool strField = classField && isStringStorageMember(ps) &&
                                 valArg.getType()->isPointerTy();
                 bool closureField = classField && !strField &&
                                     isClosureStorageMember(ps) &&
                                     valArg.getType()->isPointerTy();
+                // fix #2500 (§23.3/§28.9): box-typed (Object/interface) CLASS
+                // auto-property backing field — the box twin of strField/
+                // closureField above. isBoxStorageMember (class-gated, now
+                // populated before this body is built — see the comment above)
+                // confirms the field ONLY ever holds boxes, so bz_box_retain/
+                // release are type-correct here (never called on a class-ref
+                // pointer, which lacks a box header).
+                bool boxField = classField && !strField && !closureField &&
+                                isBoxStorageMember(ps) &&
+                                valArg.getType()->isPointerTy();
                 if (strField) {
                     llvm::Value* oldVal = builder_.CreateLoad(
                         ptrTy(), slot, "propset.str.old");
@@ -3105,6 +3122,16 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                     emitClosureRetain(&valArg);
                     builder_.CreateStore(&valArg, slot);
                     emitClosureRelease(oldVal);
+                } else if (boxField) {
+                    // §23.3/§28.9: load-old -> retain-new -> store-new ->
+                    // release-old, mirroring the string/closure order (retain
+                    // before release keeps a self-assignment `h.V := h.V;`,
+                    // which calls this same function, transiently safe).
+                    llvm::Value* oldVal = builder_.CreateLoad(
+                        ptrTy(), slot, "propset.box.old");
+                    emitBoxRetain(&valArg);
+                    builder_.CreateStore(&valArg, slot);
+                    emitBoxRelease(oldVal);
                 } else {
                     builder_.CreateStore(&valArg, slot);
                 }
@@ -3790,6 +3817,17 @@ bool Emitter::lowerImportedPropertySetValue(const ast::Expr& target,
     llvm::Function* fn = sit->second;
     llvm::Type* valTy = fn->getFunctionType()->getParamType(1);
     v = coerceNumericToType(v, valTy, isUnsignedTargetExpr(target));
+    // fix #2500 (§8.6/§23.3/§28.9, v0.236): for an Object/interface property
+    // the setter's `value` parameter is `ptr` (a box pointer), but the RHS
+    // arrived here as the bare lowered value (e.g. an i32 literal) — without
+    // boxing, the call passes i32 where ptr is required and IR verification
+    // rejects the module. This is the cross-module-setter twin of the §8.6
+    // boxing the direct-assignment path does (LlvmBackend_Stmts.cpp, just
+    // before the field-store helpers); boxForTarget is a no-op for a reference
+    // source (a class instance assigned to Object stays a bare ptr) and for a
+    // null valueExpr (the ref/out write-back caller passes no RHS expr), so
+    // only a boxable VALUE source is wrapped.
+    v = boxForTarget(v, ctx_.exprType(target), valueExpr);
     builder_.CreateCall(fn->getFunctionType(), fn, {recv, v});
     emitPendingCheck();
     // fix #2490 (§23.3/§4.6/§28.9, v0.236): the ARGUMENT-PASS release, the
@@ -3822,6 +3860,35 @@ bool Emitter::lowerImportedPropertySetValue(const ast::Expr& target,
              (isPlusOneClosureProducer(valueExpr) ||
               isUserMethodClosureReturnCall(valueExpr)))
         emitClosureRelease(v);
+    else if (classOwned && valueExpr && v->getType()->isPointerTy()) {
+        // fix #2500 (§23.3/§28.9, v0.236): the box twin of the string/closure
+        // ARGUMENT-PASS release above. The class-owning setter this call just
+        // invoked RETAINS its incoming `value` (ensurePropertyAccessorFn's
+        // #2500 box branch), so a +1 box PRODUCER passed directly as the
+        // setter argument now holds an independent, doubled reference nothing
+        // else will release: this call's own `v` (a fresh box boxForTarget
+        // just minted for a boxable VALUE source) or a box-return method
+        // call's callee-produced box. Release it here, mirroring
+        // lowerBoxFieldStore's producer-transfer counterpart exactly (same
+        // isProducer predicate). The TARGET must be Object/interface (and v a
+        // ptr) — a VALUE-typed property's source may be "boxable" in isolation
+        // (an int literal) but is NOT boxed at this call site, so there is no
+        // box to release and bz_box_release must not be called on the raw i32.
+        // A borrow (a named local / field holding a box whose +1 belongs to
+        // its own slot) is unaffected — its own scope-end release still
+        // applies. Gated classOwned for the same reason as the string/closure
+        // branches: a RECORD's auto-property setter keeps the pre-fix plain
+        // store (#9/§9.7), so it never retained, and releasing here would
+        // drop the field's only reference.
+        const sema::TypeRef* tgtTy = ctx_.exprType(target);
+        if (tgtTy && isObjectOrInterfaceTarget(tgtTy)) {
+            const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+            if ((srcTy && (isBoxableValueType(srcTy) ||
+                           isNullableValueTy(srcTy))) ||
+                isUserMethodBoxReturnCall(valueExpr))
+                emitBoxRelease(v);
+        }
+    }
     return true;
 }
 

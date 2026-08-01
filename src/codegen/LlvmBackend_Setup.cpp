@@ -7484,6 +7484,33 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                 v = coerceReturnToNullableValue(v, fieldRt,
                                                 isUnsignedTargetExpr(*init));
         }
+        // fix #2500 (§8.6 / §28.9, v0.236): a CLASS Object/interface field or
+        // auto-property with a value-typed initializer (`f: Object := 1`,
+        // `property V: Object := Pt(...)`) must BOX the initializer before
+        // storing — the field's slot is `ptr` (a box pointer once the disposer's
+        // bz_box_release touches it via isBoxStorageMember), but lowerExpr
+        // returns the bare scalar/struct. Pre-fix the raw value was stored
+        // verbatim (e.g. the integer 1 as bits), so emitDisposerCore's later
+        // bz_box_release on that raw non-pointer crashed (SEGV calling
+        // bz_box_release(0x1)), and any later field read saw garbage. This is
+        // the field-initializer twin of the §8.6 boxing the direct-assignment
+        // path already does (LlvmBackend_Stmts.cpp `boxForTarget` at the `:=`
+        // store site) and the constructor-body field-store path
+        // (lowerBoxFieldStore). boxForTarget is a no-op for a reference-typed
+        // initializer (a class instance assigned to Object stays a bare ptr) and
+        // for an already-pointer source, so only boxable VALUE initializers are
+        // wrapped. Gated to CLASS — a RECORD's Object field is a borrow the
+        // record does not own (§9: "the record does not own what [reference
+        // fields] point to"; §9.7 — no disposer), matching the class-only gate
+        // on every retain/release helper below.
+        if (t->kind == ast::TypeDeclKind::Class) {
+            const sema::TypeRef* fieldRt = nullptr;
+            if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+                if (fd->type) fieldRt = ctx_.resolvedType(*fd->type);
+            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+                if (pd->type) fieldRt = ctx_.resolvedType(*pd->type);
+            v = boxForTarget(v, fieldRt, init);
+        }
         // #429 / §4.6 / §28.9: a CLASS string field / auto-property initializer
         // gives the field its own reference, like a later assignment. The field
         // is calloc-zeroed (null) before this, so there is no old value to
