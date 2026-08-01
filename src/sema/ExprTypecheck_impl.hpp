@@ -434,6 +434,20 @@ private:
     // RHS) is a read and must be rejected.
     const ast::Expr* plainSetAssignTargetNode_ = nullptr;
 
+    // fix #2543 (§23, v0.236): mirror of `plainSetAssignTargetNode_` for
+    // `ref`/`out` call/constructor argument operands. The bare-read-of-
+    // write-only-indexer gate (ExprTypecheck_Exprs.cpp user-defined-indexer
+    // visit) must NOT fire when the IndexExpr is the operand of a `ref`/`out`
+    // argument: that operand position has its OWN specialized check in
+    // `checkRefOutPropertyOperand` (#2530), which correctly rejects `ref`
+    // and admits `out`. Without this exemption, an `out d[i]` against a
+    // write-only indexer would be incorrectly rejected here BEFORE the
+    // (correct) ref/out operand pass even runs. Saved/restored around each
+    // CallArgument/NewExpr-arg visit. A `nullptr` (default) means the
+    // current IndexExpr is NOT a ref/out operand and the gate fires
+    // normally for write-only indexers.
+    const ast::Expr* refOutArgTargetNode_ = nullptr;
+
     // fix #829 / §A.7: when a lambda's expected type is a known function type
     // `(T1, …, Tn) -> R` (a typed-local initializer, an assignment RHS, or a
     // call argument bound to a function-typed parameter), this holds those

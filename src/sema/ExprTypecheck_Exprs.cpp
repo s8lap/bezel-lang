@@ -1875,6 +1875,87 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // no PropertySymbol here, and the inline-array path is
                         // a GEP-load with no slot semantics to gate).
                         ctx_.setExprSymbol(&e, ps);
+                        // fix #2543 (§23, v0.236): reject a BARE READ of a
+                        // write-only (set-only block) INDEXER. Symmetric to
+                        // `propertyDeclIsSetOnly`'s read-of-write-only gate
+                        // for the named-property case (ExprTypecheck_Calls.cpp
+                        // ~line 14327), which deliberately excludes
+                        // `pd->isIndexer` because IndexExpr reaches this site,
+                        // not a MemberAccessExpr. The local branch mirrors
+                        // #2530's ref/out operand check shape:
+                        //   - Expression / Auto bodyKinds always have a getter.
+                        //   - Block bodyKind has a getter iff any accessor is
+                        //     a `get` arm (loop on `!acc.isSet`, mirroring the
+                        //     hasSetter loop in checkRefOutPropertyOperand).
+                        // The IMPORTED case (no `pd`) consults
+                        // `ctx_.importedPropertyHasGetter` — published by
+                        // #2461 for indexers too — so an imported set-only
+                        // indexer is rejected with the same diagnostic. The
+                        // plain `:=` assignment target is exempted (a write
+                        // dispatches to the setter and is the LEGAL escape
+                        // hatch, exactly like `c.Val := 7` for #1192); a
+                        // `ref`/`out` argument operand is exempted (the
+                        // ref/out operand pass `checkRefOutPropertyOperand`
+                        // #2530 is the specialized gate and correctly
+                        // rejects `ref` and admits `out` per §22.3); a
+                        // compound `+=` is NOT exempted because it reads
+                        // first. Without this gate, a bare READ of a
+                        // write-only indexer silently degraded to a zero-
+                        // initialized value via the #2434 fallback at codegen.
+                        if (&e != plainSetAssignTargetNode_ &&
+                            &e != refOutArgTargetNode_) {
+                            bool idxHasGetter = false;
+                            if (pd) {
+                                if (pd->bodyKind == ast::PropertyBodyKind::
+                                        Expression ||
+                                    pd->bodyKind == ast::PropertyBodyKind::
+                                        Auto) {
+                                    idxHasGetter = true;
+                                } else if (pd->bodyKind ==
+                                           ast::PropertyBodyKind::Block) {
+                                    for (const auto& acc : pd->accessors)
+                                        if (!acc.isSet) {
+                                            idxHasGetter = true;
+                                            break;
+                                        }
+                                }
+                            } else {
+                                // imported: rely on the published
+                                // importedPropertyHasGetter bit (default
+                                // `true` for stale-dep compatibility — see
+                                // #2461's rationale in SemaContext.hpp).
+                                idxHasGetter =
+                                    ctx_.importedPropertyHasGetter(ps);
+                            }
+                            if (!idxHasGetter) {
+                                // Mirror the propertyDeclIsSetOnly NAMED-
+                                // property message shape ("property `W` is
+                                // write-only ...") so a user greps for the
+                                // same substring. An INDEXER has no usable
+                                // `pd->name` (the parser leaves it empty for
+                                // the `property this[i: T]: U` form, and
+                                // `ps->name` is the metadata handle ".this"
+                                // for the IMPORTED case — neither makes a
+                                // useful human label), so use "the
+                                // `<DeclaringType>` indexer" mirroring
+                                // #2530's indexer label in
+                                // checkRefOutPropertyOperand.
+                                std::string typeName = ps->parent
+                                    ? std::string(ps->parent->name)
+                                    : std::string();
+                                std::string label = typeName.empty()
+                                    ? std::string("the indexer")
+                                    : ("the `" + typeName + "` indexer");
+                                ctx_.diagnostics().report(
+                                    Severity::Error, e.span.begin,
+                                    std::string("a read of a write-only "
+                                                "indexer is not allowed — ")
+                                    + label +
+                                    " is write-only (it declares only a "
+                                    "`set` accessor) and cannot be read "
+                                    "(§23)");
+                            }
+                        }
                         // per §7.4 (v0.182, #1593): a user-defined indexer
                         // access `obj[i]` invokes an "accessor" (get/set)
                         // that can run user code — invalidate a mutably-
@@ -5037,7 +5118,23 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             currentLiteralWideningHint_ = prt->primitive;
                     }
                 }
+                // fix #2543 (§23, v0.236): exempt a `ref`/`out` argument
+                // operand from the bare-read-of-write-only-indexer gate
+                // (IndexExpr visit). The ref/out operand pass
+                // `checkRefOutPropertyOperand` (#2530) is the specialized
+                // gate and correctly rejects `ref` and admits `out`;
+                // without this exemption an `out d[i]` against a
+                // write-only indexer would be wrongly rejected here.
+                const ast::Expr* savedRefOut = refOutArgTargetNode_;
+                refOutArgTargetNode_ =
+                    (a.modifier == "ref" || a.modifier == "out" ||
+                     a.modifier == "out var" ||
+                     a.modifier == "out using var" ||
+                     a.modifier == "out owned var")
+                        ? a.value.get()
+                        : nullptr;
                 visitExpr(*a.value);
+                refOutArgTargetNode_ = savedRefOut;
                 // per §22.12 rule 5 (v0.180, #1542): the handler argument
                 // (arg 0) of a `<static event>.Subscribe(...)` / `.Add(...)`
                 // call must be capture-free — a non-capturing lambda or a
@@ -5347,7 +5444,22 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     hintPrim == PrimitiveType::UInt)
                     currentLiteralWideningHint_ = hintPrim;
             }
+            // fix #2543 (§23, v0.236): exempt a `ref`/`out` constructor
+            // argument operand from the bare-read-of-write-only-indexer
+            // gate (IndexExpr visit). Same exemption as the CallExpr arg
+            // visit above — the ref/out operand pass
+            // `checkRefOutPropertyOperand` (#2530) is the specialized gate
+            // for that position.
+            const ast::Expr* savedRefOutNew = refOutArgTargetNode_;
+            refOutArgTargetNode_ =
+                (a.modifier == "ref" || a.modifier == "out" ||
+                 a.modifier == "out var" ||
+                 a.modifier == "out using var" ||
+                 a.modifier == "out owned var")
+                    ? a.value.get()
+                    : nullptr;
             if (a.value) visitExpr(*a.value);
+            refOutArgTargetNode_ = savedRefOutNew;
             currentLiteralWideningHint_ = savedNewHint;
             // §22.3 (v0.184, #1682): validate a bare `ref`/`out` constructor
             // argument's operand category (a no-op for every other
