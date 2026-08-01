@@ -12584,6 +12584,241 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // #2536 (stdlib §4.7/§4.8/§4.9/§4.10/§4.17/§4.18; language spec
+        // §8.1/§27.6): bare-reference catch-all "no member" reject for the
+        // collection families NOT covered by the #2457 per-family blocks
+        // above (Array/OwningArray at ~11866, Stack/OwningStack/Queue/
+        // OwningQueue at ~12176) — OwningDictionary, Dictionary,
+        // SortedDictionary, Set, OwningSet, SortedSet, LinkedList,
+        // OwningLinkedList. The CALL form `d.Bogus()` already rejects via
+        // the allowedOwningMethod/allowedNonOwningMethod lists above
+        // (~3975/~4067), but the BARE form `var f := d.Bogus;` previously
+        // fell through to codegen's #2434 zero-init fallback, silently
+        // degrading the local to `i32` and emitting an "internal:
+        // lowerLocalDecl's initializer ... degraded to a zero-initialized
+        // value" ICE — the same shape #2521 fixed for `GetEnumerator` on
+        // OwningDictionary specifically. This block extends that fix to
+        // the general "no member" case for all eight families. The CALL
+        // form is exempted (`!isCallForm`) — it routes through
+        // calleeOfCallCtx_ above and is dispatched by the per-call-site
+        // lists. Property names (`Count`/`Keys`/`Values`/etc.) are typed
+        // by the dedicated handlers ~1000 lines up and return before this
+        // block ever runs, so they need no special-casing here. The
+        // OwningDictionary GetEnumerator/GetAsyncEnumerator case is caught
+        // by the #2521 block immediately above with a distinct message
+        // (per stdlib §4.9: OwningDictionary implements `IDisposable`
+        // only, so those are genuinely "not a member" rather than "real
+        // member but no function value yet").
+        //
+        // This is the "no member" catch-all ONLY — for a name that is
+        // not part of the family's stdlib-documented surface. Names
+        // that ARE documented members are deliberately LEFT TO FALL
+        // THROUGH here: the "real member but no function value" case
+        // (per #2470 pattern) for `var f := d.Add;` on Dictionary, or
+        // `var f := s.GetEnumerator;` on Set, is a separate, larger fix
+        // (it requires per-family MethodSymbol synthesis so the bare
+        // reference can actually produce a function value, not just a
+        // zero-init) — filed as a follow-up rather than silently extended
+        // here. Skipping the documented members (rather than widening
+        // this reject to cover them) avoids two bad outcomes: (a) a
+        // false "no member" diagnostic for a name that IS documented
+        // (the exact false-reject failure mode the standing protocol
+        // weights most heavily against), and (b) silently breaking any
+        // existing test that bare-references a documented member.
+        if (ma.target && !ctx_.exprType(ma)) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty()) {
+                    std::string_view cn = tt->headName();
+                    bool isOwningDictionary = cn == "OwningDictionary";
+                    bool isDictionaryFamily =
+                        cn == "Dictionary" || cn == "SortedDictionary";
+                    bool isSetFamily =
+                        cn == "Set" || cn == "OwningSet" ||
+                        cn == "SortedSet";
+                    bool isLinkedListFamily =
+                        cn == "LinkedList" || cn == "OwningLinkedList";
+                    if (isOwningDictionary || isDictionaryFamily ||
+                        isSetFamily || isLinkedListFamily) {
+                        const auto& mbr = ma.member;
+                        bool isCallForm = &ma == calleeOfCallCtx_;
+                        if (!isCallForm) {
+                            // Universal Object members every reference
+                            // type carries (language spec §8.1) — not
+                            // enumerated in each family's stdlib section
+                            // but still real members.
+                            bool isUniversalObjectMember =
+                                mbr == "ToString" || mbr == "Equals" ||
+                                mbr == "GetHashCode" || mbr == "GetType" ||
+                                mbr == "ReferenceEquals";
+                            // stdlib §5 IEnumerable<T> LINQ extension
+                            // operators — applicable to every family here
+                            // (all conform to IEnumerable<T> via ICollection
+                            // <T>/IReadOnlyCollection<T> EXCEPT
+                            // OwningDictionary, which implements
+                            // IDisposable only; the LINQ extension still
+                            // applies to OwningDictionary because the
+                            // extension machinery (language spec §26.5)
+                            // dispatches structurally, exactly like the
+                            // Stack/Queue block above).
+                            bool isLinqOperator =
+                                mbr == "Where" || mbr == "OfType" ||
+                                mbr == "Select" || mbr == "SelectMany" ||
+                                mbr == "Any" || mbr == "All" ||
+                                mbr == "First" || mbr == "FirstOrNull" ||
+                                mbr == "Last" || mbr == "LastOrNull" ||
+                                mbr == "Single" || mbr == "SingleOrNull" ||
+                                mbr == "ElementAt" || mbr == "Sum" ||
+                                mbr == "Min" || mbr == "Max" ||
+                                mbr == "MinOrNull" || mbr == "MaxOrNull" ||
+                                mbr == "Average" || mbr == "Aggregate" ||
+                                mbr == "OrderBy" ||
+                                mbr == "OrderByDescending" ||
+                                mbr == "Distinct" || mbr == "Union" ||
+                                mbr == "Intersect" || mbr == "Except" ||
+                                mbr == "Take" || mbr == "TakeWhile" ||
+                                mbr == "Skip" || mbr == "SkipWhile" ||
+                                mbr == "Concat" || mbr == "Zip" ||
+                                mbr == "GroupBy" || mbr == "ToArray" ||
+                                mbr == "ToDictionary" ||
+                                mbr == "ToSet" || mbr == "ThenBy" ||
+                                mbr == "ThenByDescending";
+                            // Known property names — handled by dedicated
+                            // property handlers above (~10908 Keys/Values,
+                            // ~10947 Count) for the families in their
+                            // explicit list, but a FEW families are missing
+                            // from those handlers and would otherwise be
+                            // false-rejected here as "no member" on a bare
+                            // reference:
+                            //   - SortedSet/SortedDictionary: `Count` is
+                            //     typed by the call-form handler at ~5382
+                            //     (sets exprType on the CallExpr, not the
+                            //     MemberAccessExpr), so the bare-reference
+                            //     form `var f := s.Count;` falls through
+                            //     here untyped. The property handler at
+                            //     ~10947 explicitly excludes SortedSet/
+                            //     SortedDictionary from its `hasCount` list
+                            //     — a pre-existing gap this block would
+                            //     otherwise expose.
+                            //   - SortedDictionary: `Keys`/`Values` are
+                            //     typed by the handler at ~10908 for
+                            //     Dictionary/OwningDictionary only, so
+                            //     `var f := sd.Keys;` falls through here
+                            //     untyped — same pre-existing gap, same
+                            //     false-reject risk.
+                            // Including these property names here (rather
+                            // than widening the property handlers, which
+                            // is a separate change) avoids a false
+                            // "no member" reject on a bare reference to
+                            // a real, documented property — the exact
+                            // false-reject failure mode the standing
+                            // protocol weights most heavily against.
+                            bool isKnownProperty =
+                                mbr == "Count" || mbr == "Keys" ||
+                                mbr == "Values";
+                            // Per-family documented methods (stdlib
+                            // §4.7-§4.10, §4.17, §4.18). Enumerated as a
+                            // catch-all UNION across the family's own
+                            // declared methods (owning vs. borrowing
+                            // variants share most names; the ones that
+                            // differ — PopValue/TryPopValue/Drain on
+                            // OwningDictionary only, GetOrAdd on
+                            // Dictionary only — are included
+                            // unconditionally so a name legitimate on
+                            // EITHER variant is allowed on both, matching
+                            // the #2457 blocks' identical over-inclusion
+                            // reasoning).
+                            bool isDeclaredMethod =
+                                // Dictionary/OwningDictionary/
+                                // SortedDictionary shared surface
+                                mbr == "Add" || mbr == "Contains" ||
+                                mbr == "ContainsKey" ||
+                                mbr == "Remove" || mbr == "TryGetValue" ||
+                                mbr == "GetOrNull" || mbr == "GetOrAdd" ||
+                                mbr == "Clear" ||
+                                // OwningDictionary-only (stdlib §4.9)
+                                mbr == "PopValue" || mbr == "TryPopValue" ||
+                                mbr == "Drain" ||
+                                // Set/OwningSet/SortedSet surface
+                                mbr == "UnionWith" ||
+                                mbr == "IntersectWith" ||
+                                mbr == "ExceptWith" ||
+                                mbr == "IsSubsetOf" ||
+                                mbr == "IsSupersetOf" ||
+                                // LinkedList/OwningLinkedList surface
+                                mbr == "AddFirst" || mbr == "AddLast" ||
+                                mbr == "AddBefore" || mbr == "AddAfter" ||
+                                mbr == "RemoveFirst" ||
+                                mbr == "RemoveLast" ||
+                                mbr == "RemoveNode" || mbr == "Find" ||
+                                // IDisposable (every owning family)
+                                mbr == "Dispose";
+                            if (!isUniversalObjectMember &&
+                                !isLinqOperator &&
+                                !isDeclaredMethod &&
+                                !isKnownProperty) {
+                                // Build a family-specific surface citation
+                                // so the diagnostic names the real
+                                // documented members (§4.7-§4.10, §4.17,
+                                // §4.18), not a generic "no member" that
+                                // leaves the user guessing what IS a
+                                // member.
+                                std::string surface;
+                                const char* section = "\xC2\xA7""4.x";
+                                if (isOwningDictionary) {
+                                    section = "\xC2\xA7""4.9";
+                                    surface = "Add/ContainsKey/Contains/"
+                                              "Remove/TryGetValue/"
+                                              "GetOrNull/GetOrAdd/PopValue/"
+                                              "TryPopValue/Drain/Clear";
+                                } else if (isDictionaryFamily) {
+                                    section = cn == "Dictionary"
+                                        ? "\xC2\xA7""4.8"
+                                        : "\xC2\xA7""4.17";
+                                    surface = "Add/ContainsKey/Contains/"
+                                              "Remove/TryGetValue/"
+                                              "GetOrNull/GetOrAdd/Clear";
+                                } else if (isSetFamily) {
+                                    section = cn == "SortedSet"
+                                        ? "\xC2\xA7""4.18"
+                                        : "\xC2\xA7""4.10";
+                                    surface = "Add/Remove/Contains/Clear/"
+                                              "UnionWith/IntersectWith/"
+                                              "ExceptWith/IsSubsetOf/"
+                                              "IsSupersetOf";
+                                } else {
+                                    // isLinkedListFamily
+                                    section = "\xC2\xA7""4.7";
+                                    surface = "AddFirst/AddLast/AddBefore/"
+                                              "AddAfter/RemoveFirst/"
+                                              "RemoveLast/RemoveNode/Find/"
+                                              "Contains/Clear";
+                                }
+                                auto loc = ma.span.begin;
+                                if (loc.line == 0 && ma.target)
+                                    loc = ma.target->span.begin;
+                                ctx_.diagnostics().report(
+                                    Severity::Error, loc,
+                                    std::string("no member `") +
+                                        std::string(mbr) + "` on `" +
+                                        std::string(cn) +
+                                        "` (stdlib " + section +
+                                        ") -- it is not part of this "
+                                        "collection's documented surface (" +
+                                        surface + "), a universal "
+                                        "`ToString`/`Equals`/`GetHashCode`/"
+                                        "`GetType` member (language spec "
+                                        "\xC2\xA7""8.1), or a stdlib "
+                                        "\xC2\xA7""5 LINQ extension "
+                                        "operator");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // #2444 (sibling gap to #2423/#2433; stdlib §4.8/§4.9; language spec
         // §8.1/§8.3/§8.5/§8.7): the builtin entry sentinels
         // `DictionaryEntry<K, V>` (a RECORD) and `DrainedEntry<K, V>` (a
