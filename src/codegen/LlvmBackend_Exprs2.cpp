@@ -2577,6 +2577,31 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 tnode = rt->astNode;
         }
     }
+    // fix #2477: `new T()` in the dead abstract template body — the
+    // genericSubstSemaTy_ lookup just above is empty there (no monomorphization
+    // binding) so the bare type-param TypeRef falls through every construction
+    // branch below and lowerNew returns nullptr. The pre-existing #2434 generic
+    // warning (lowerLocalDecl's zero-init fallback) still fires as a backstop;
+    // this is the SPECIFIC, named complement that flags the abstract-template
+    // shape by name so the silence→zero-init case is observable in source. The
+    // abstract body is dead code (real calls route through the monomorphized
+    // clone, per #2477's analysis), so this is purely a diagnostics-clarity
+    // fix — no operational change. Gated on !hasErrors() to match the #2434
+    // message-quality guard.
+    if (!rt->declaration && rt->astNode && rt->astNode->name &&
+        rt->astNode->name->parts.size() == 1 &&
+        genericSubstSemaTy_.empty() &&
+        templateGenericParamNames_.count(rt->astNode->name->parts.back()) &&
+        !ctx_.diagnostics().hasErrors()) {
+        ctx_.diagnostics().report(
+            Severity::Warning, ne.span.begin,
+            "internal: codegen cannot construct 'new " +
+            std::string(rt->astNode->name->parts.back()) +
+            "()' in the dead abstract template body: no monomorphization "
+            "binding exists for this type parameter (spec #14.1 / #14.2 "
+            "permits the form but the abstract body is never invoked — "
+            "real calls route through the monomorphized clone — #2477)");
+    }
     // §22.4 (#968): pre-create the `out var x` slot(s) for `new T(out var x)` so
     // the arg lowering below passes the slot's address and a later read sees the
     // value the constructor wrote (the call-site analogue of ensureOutVarSlots).

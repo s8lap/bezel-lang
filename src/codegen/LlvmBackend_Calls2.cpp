@@ -6164,6 +6164,87 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 }
             }
         }
+        // fix #2477: structural cleanup for the #605 / generic-new(T) silent-zero
+        // family. Before returning nullptr, identify the two distinct shapes the
+        // issue catalogs (spec §3 / #605 permissive "unknown member" on a
+        // concrete-type receiver, and a bare type parameter in the dead template
+        // body where the genericSubstSemaTy_ lookup is empty) and emit a
+        // diagnostic that names the member and the receiver type — so the
+        // currently-silent-zero case is observable in source. The pre-existing
+        // #2434 generic warning (lowerLocalDecl's zero-init fallback) still
+        // fires as a backstop; this is the SPECIFIC, named complement that
+        // tells the user *which* member and *which* type fell through. The
+        // existing #2434 control test (`tests/lit/local_decl_zero_init_fallback
+        // _warns_2434.bzl`) continues to pass because the generic #2434 text
+        // is unchanged. Gated on !hasErrors() to avoid stacking this on top of
+        // an already-diagnosed shape (same message-quality guard the #2434
+        // fallback uses).
+        if (!ctx_.diagnostics().hasErrors()) {
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call.callee.get())) {
+                if (ma->target) {
+                    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+                    using K = sema::TypeRef::Kind;
+                    using P = sema::PrimitiveType;
+                    // Shape 1: receiver is a concrete type whose declared
+                    // member set is known to the type system (Named +
+                    // declaration, or a primitive) — the silent-zero
+                    // degradation is observable here. Object is included
+                    // because Object has no documented members; an unknown
+                    // member on Object is exactly the §3 / #605 case the
+                    // lit-control test pins.
+                    bool isConcreteType = recvTy && (
+                        (recvTy->kind == K::Named && recvTy->declaration) ||
+                        (recvTy->kind == K::Primitive &&
+                         recvTy->primitive != P::None));
+                    // The universal Object surface (ToString/GetHashCode/
+                    // Equals/GetType/Dispose) is always present on a value
+                    // even when the static type is opaque — codegen handles
+                    // those via the special branches above. Anything else on
+                    // a concrete type is genuinely undefined.
+                    bool isUniversalObjMember =
+                        ma->member == "ToString" ||
+                        ma->member == "GetHashCode" ||
+                        ma->member == "Equals" ||
+                        ma->member == "GetType" ||
+                        ma->member == "Dispose";
+                    // Shape 2: bare type parameter in the dead template body
+                    // (no monomorphization binding for this type parameter) —
+                    // the abstract-generic-body form per #2477's analysis.
+                    bool isBareTypeParamInDeadTemplate =
+                        emittingGenericTemplateBody_ &&
+                        recvTy && recvTy->kind == K::Named &&
+                        !recvTy->declaration && recvTy->astNode &&
+                        recvTy->astNode->name &&
+                        !recvTy->astNode->name->parts.empty() &&
+                        templateGenericParamNames_.count(
+                            recvTy->astNode->name->parts.back());
+                    if (isConcreteType ? !isUniversalObjMember
+                                        : isBareTypeParamInDeadTemplate) {
+                        std::string recvName;
+                        if (recvTy->kind == K::Primitive &&
+                            recvTy->astNode && recvTy->astNode->name &&
+                            !recvTy->astNode->name->parts.empty()) {
+                            recvName = std::string(
+                                recvTy->astNode->name->parts.back());
+                        } else if (recvTy->declaration) {
+                            recvName = recvTy->declaration->name;
+                        } else {
+                            recvName = std::string(recvTy->headName());
+                        }
+                        ctx_.diagnostics().report(
+                            Severity::Warning, call.span.begin,
+                            "internal: codegen cannot dispatch member '" +
+                            std::string(ma->member) + "' on receiver of type '" +
+                            recvName + "': permissive acceptance (spec #3 / "
+                            "issue #605) admits this site but no concrete "
+                            "member dispatch exists (lowerLocalDecl's "
+                            "zero-init fallback will degrade the slot — "
+                            "#2477)");
+                    }
+                }
+            }
+        }
         return nullptr;
     }
 
