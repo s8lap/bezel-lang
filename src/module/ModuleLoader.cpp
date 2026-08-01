@@ -1568,8 +1568,23 @@ static bool parseAndAttachMethodBody(
 // extra since the text is already on hand) — the `:=` initializer text is
 // appended too. Every method is a signature-only stub (self-call
 // resolution, e.g. `Hits: int := ComputeInitial();`).
-static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td) {
+static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td,
+                                                 const std::string& moduleName) {
     std::string src = "module _2351_reparsed_field_;\n";
+    // §2.8.2 / #2375: `import` the exporting module so its PUBLIC sibling
+    // types — already loaded into the importer's mainCtx — are visible to
+    // resolveTypes/typecheckExpressions here. parseAndAttachFieldInit
+    // registers those siblings into this fresh context under `moduleName`;
+    // the `import` is what engages Resolver's imports path (§2.2) to expose
+    // them by bare name. This closes #2351's sibling-type coverage gap: a
+    // static field whose declared type OR initializer references a public
+    // co-declared type (e.g. `public static readonly Res: Box := new
+    // Box(42);`) now reconstructs instead of being rejected. Internal
+    // siblings are not in the exported metadata (§13.2: only `public`
+    // top-level types are exported), so they remain unresolvable here and
+    // the import still correctly rejects — the #2351 self-pass (a)
+    // guarantee is preserved.
+    if (!moduleName.empty()) src += "import " + moduleName + ";\n";
     src += metaVisibilityToKeyword(td.visibility);
     src += " class ";
     src += td.name;
@@ -1640,19 +1655,20 @@ static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td) {
 // silent zero-inits, an already-recorded limitation this fix does not
 // widen or narrow.
 //
-// Known coverage gap (tracked, not silently dropped — issue #2375): the
-// synthetic source (buildSyntheticFieldInitSource) declares only the type
-// being reconstructed, so an initializer referencing a SIBLING type — even
-// as simple as `new SomeOtherClass()` for the field's own type — fails
-// resolveTypes and is rejected via the `reject` path above, not silently
-// wrong (the strict gate this function applies makes that the CORRECT
-// outcome per §2.8.2), but it IS a real capability gap shared with #710 /
-// #2290 bug 2's identical "synthetic source omits sibling/base types"
-// limitation on the ctor-body path. Every #2351 regression test uses
-// AtomicInteger<T> (stdlib §6.4) specifically because it is compiler-known
-// and needs no `import` inside the synthetic reconstruction; a static field
-// of a plain user-defined class type is unsupported today and rejects
-// cleanly rather than reconstructing.
+// Coverage note (#2375, §2.8.2): the synthetic source declares only the
+// type being reconstructed, BUT buildSyntheticFieldInitSource also emits
+// `import <moduleName>;` and parseAndAttachFieldInit registers the
+// exporting module's already-imported PUBLIC sibling types into the fresh
+// context — so a PUBLIC sibling-type reference (in the field's declared
+// type or in its initializer) now resolves to the real imported
+// TypeSymbol and reconstructs. An INTERNAL sibling-type reference still
+// fails resolveTypes and rejects via the path below — the CORRECT outcome
+// per §2.8.2 (internal types are not in the exported metadata, §13.2, so
+// they genuinely do not exist across the module boundary) and the
+// #2351 self-pass (a) pin. The ctor-body path's identical "synthetic
+// source omits sibling/base types" limitation (#710 / #2290 bug 2) is a
+// separate, harder shape (a ctor body can reach arbitrary members, not
+// just type names) and remains tracked there.
 static bool parseAndAttachFieldInit(
     const MetaTypeDecl& td,
     const std::string& moduleName,
@@ -1660,7 +1676,7 @@ static bool parseAndAttachFieldInit(
     sema::FieldSymbol* importedFs,
     const sema::TypeSymbol& importedType,
     sema::SemaContext& mainCtx) {
-    std::string source = buildSyntheticFieldInitSource(td);
+    std::string source = buildSyntheticFieldInitSource(td, moduleName);
 
     auto reject = [&](const char* reason) {
         mainCtx.diagnostics().report(
@@ -1691,6 +1707,26 @@ static bool parseAndAttachFieldInit(
     if (semaDiag->hasErrors()) {
         reject("symbol collection failed on the reconstructed declaration");
         return false;
+    }
+    // §2.8.2 / #2375: register the exporting module's PUBLIC sibling types
+    // (already imported into mainCtx under `moduleName`) into this fresh
+    // context so the `import <moduleName>;` line emitted above resolves a
+    // sibling-type reference in the reconstructed initializer / field type
+    // to the REAL imported TypeSymbol — no stub declaration and no remap:
+    // the reconstructed TypeRefs/exprTypes point directly at the imported
+    // symbols, which is exactly what codegen consumes. The reconstructed
+    // type itself (td.name) is skipped so its synthetic declaration stays
+    // authoritative for any self-reference (preserving pre-#2375 behavior).
+    // Internal siblings are absent from mainCtx's imported registry (only
+    // publics are exported, §13.2), so they still correctly fail
+    // resolveTypes and reject — matching the #2351 self-pass (a) pin.
+    if (const std::vector<sema::TypeSymbol*>* siblings =
+            mainCtx.importedTypesOf(moduleName)) {
+        for (sema::TypeSymbol* sib : *siblings) {
+            if (!sib || sib->name.empty()) continue;
+            if (sib->name == td.name) continue;
+            freshCtx.registerImportedType(moduleName, sib);
+        }
     }
     sema::resolveTypes(*sf, freshCtx);
     if (semaDiag->hasErrors()) {
@@ -1765,16 +1801,38 @@ static bool parseAndAttachFieldInit(
         if (!expr || !freshSym) continue;
         if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
             auto it = importedFields.find(freshSym->name);
-            if (it != importedFields.end())
-                mainCtx.setExprSymbol(expr, it->second);
+            if (it != importedFields.end()) {
+                mainCtx.setExprSymbol(expr, it->second);  // self-field → imported
+                continue;
+            }
+            // #2375: not a self-field — a SIBLING type's field (e.g.
+            // `Box.DefaultSize` in the reconstructed initializer). The
+            // sibling was registered as the REAL imported TypeSymbol, so
+            // freshSym already IS the imported FieldSymbol — copy it as-is.
+            // Skipping it (the pre-#2375 behavior for any non-self symbol)
+            // left codegen with no symbol for the reference and it silently
+            // read zero.
+            mainCtx.setExprSymbol(expr, freshSym);
         } else if (auto* fms = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
             auto it = importedMethods.find(freshMethodSigKey(fms));
-            if (it != importedMethods.end())
-                mainCtx.setExprSymbol(expr, it->second);
+            if (it != importedMethods.end()) {
+                mainCtx.setExprSymbol(expr, it->second);  // self-method → imported
+                continue;
+            }
+            // #2375: a sibling type's method — already the imported symbol.
+            // (A self-operator is unreachable here: buildSyntheticFieldInitSource
+            // emits no operator stubs, so an operator reference never resolves
+            // in freshCtx.)
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else {
+            // No ParameterSymbol/LocalSymbol case: a field initializer is not a
+            // body — it has no parameters, and per §22.8/§22.13 a field
+            // initializer expression admits no local declarations either.
+            // Any other symbol here is a sibling reference (a TypeSymbol or
+            // ConstructorSymbol) that already resolves to the real imported
+            // symbol — copy it as-is (#2375).
+            mainCtx.setExprSymbol(expr, freshSym);
         }
-        // No ParameterSymbol/LocalSymbol case: a field initializer is not a
-        // body — it has no parameters, and per §22.8/§22.13 a field
-        // initializer expression admits no local declarations either.
     }
 
     // Copy resolved-type / expr-type entries so codegen's lowerExpr finds a

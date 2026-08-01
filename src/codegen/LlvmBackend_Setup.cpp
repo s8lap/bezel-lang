@@ -1284,7 +1284,27 @@ llvm::Function* Emitter::genericInstSfinitFn(const sema::TypeSymbol* ts,
         if (dynamic_cast<const ast::CollectionLiteralExpr*>(initExpr)) continue;
 
         llvm::Value* val = lowerExpr(*initExpr);
-        if (!val) continue;
+        if (!val) {
+            // #2375 / #1386: this path used to SILENTLY `continue` when
+            // lowerExpr could not lower an initializer kind, leaving the
+            // per-instantiation global at its zero-init default — a silent
+            // miscompile. The sibling per-type path (emitStaticConstructorBody's
+            // own #1386 handling) reports an internal-error diagnostic for the
+            // same shape; mirror it here so an unsupported initializer is a
+            // clean compile error rather than a wrong value. This is the safety
+            // net for #2375's sibling-type coverage extension: a class-typed
+            // sibling (`new Box(42)`) lowers fine, but a sibling RECORD type's
+            // reconstructed construction is not yet lowerable in this path
+            // (sema reconstructs it cleanly; codegen cannot) — that shape now
+            // errors here instead of silently zeroing the field, and is tracked
+            // separately for proper support.
+            ctx_.diagnostics().report(
+                Severity::Error, initExpr->span.begin,
+                "internal: lowerExpr returned null for an imported generic "
+                "static field initializer — the initializer kind is not yet "
+                "supported on the cross-module per-instantiation path (#1386)");
+            continue;
+        }
         // #1116 guard, mirrors the #709 loop's getValueType() check: a
         // T-DEPENDENT initializer whose value type doesn't match this
         // instantiation's field type is skipped rather than mis-stored.

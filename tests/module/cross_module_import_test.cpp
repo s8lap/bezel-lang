@@ -4982,6 +4982,166 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_TRUE(foundDiag);
 }
 
+// #2375 / §2.8.2 (follow-up to #2351): a static field initializer of an
+// imported generic class that references a PUBLIC SIBLING TYPE — another
+// type declared in the same exporting module — must RECONSTRUCT (and run)
+// on the importing side, not be rejected. Before #2375,
+// buildSyntheticFieldInitSource declared only the type being reconstructed,
+// so the sibling-type reference failed resolveTypes and the import was
+// rejected with "a referenced type did not resolve inside the module
+// boundary" even for the simplest `new Box(42)` shape (the field's own
+// type being the sibling). #2375 makes parseAndAttachFieldInit register
+// the exporting module's already-imported PUBLIC sibling TypeSymbols into
+// the fresh reconstruction context (and emit `import <moduleName>;` in the
+// synthetic source), so the reference resolves to the REAL imported symbol
+// and the initializer runs.
+//
+// This test is the spec-cited regression test for #2375: a two-module
+// setup (Base2375 declares `public class Box` + `public class Reg<T>` with
+// `public static readonly Res: Box := new Box(42);`; App2375 imports Base
+// and reads `Reg<int>.Res.Tag`). Pre-fix: rejected ("cannot import static
+// field 'Reg.Res'..."). Post-fix: compiles + runs + returns 42 (the
+// sibling-type initializer `new Box(42)` ran on the importing side and
+// stored a Box whose Tag is 42).
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_field_init_sibling_type_reconstructs_spec_2375_2_8_2) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2375_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+
+    // Module Base2375: a PUBLIC sibling class `Box` (the type referenced by
+    // the static field) + a generic `Reg<T>` whose static readonly field's
+    // TYPE and INITIALIZER both reference that sibling. T-independent
+    // (the #803 T-dependent scope is separately tracked) and the sibling
+    // is a plain user-defined class — exactly the shape #2351's tests
+    // deliberately avoided (they used compiler-intrinsic AtomicInteger<int>
+    // which needs no import in the synthetic reconstruction).
+    writeSource(baseSrc.path,
+        "module Base2375; "
+        "public class Box "
+        "  public Tag: int; "
+        "  public constructor(tag: int) "
+        "    Tag := tag; "
+        "  end constructor; "
+        "end Box; "
+        "public class Reg<T> "
+        "  public static readonly Res: Box := new Box(42); "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    // App2375: imports Base2375 and reads the sibling-typed static field.
+    writeSource(appSrc.path,
+        "module App2375; "
+        "import Base2375; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var b := Reg<int>.Res; "
+        "    return b.Tag; "
+        "  end Main; "
+        "end Program;");
+    std::vector<bezel::Dependency> depsApp;
+    {
+        bezel::Dependency d;
+        d.metadataPath = baseObj.path;
+        d.objectPath   = baseObj.path;
+        depsApp.push_back(d);
+    }
+    bezel::CompileResult rApp =
+        driver.compileFile(appSrc.path, appExe.path, depsApp);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+
+    int status = std::system(appExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    // 42: the sibling-type initializer `new Box(42)` ran on the importing
+    // side (the field's declared type `Box` AND the constructor argument
+    // both crossed the module boundary via the now-resolved sibling).
+    // Pre-fix: the import was rejected outright (BEZEL_EXPECT_TRUE(rApp.success)
+    // above would fail with "cannot import static field 'Reg.Res'...").
+    BEZEL_EXPECT_EQ(code, 42);
+}
+
+// #2375 (sibling-MEMBER reference): the second half of the fix — once the
+// sibling TYPE resolves, an initializer sub-expression that reads a STATIC
+// MEMBER of that sibling (`new Box(Box.DefaultSize)`) must resolve the
+// member reference to the REAL imported FieldSymbol and read its value,
+// not silently read zero. The expr-symbol remap loop in
+// parseAndAttachFieldInit previously copied ONLY self-fields/self-methods
+// into mainCtx; a sibling-member reference resolved in the fresh context to
+// the real imported symbol but was never copied to mainCtx, so codegen had
+// no symbol for the read and the arg evaluated to zero (silent miscompile:
+// Box.DefaultSize, declared `:= 77`, read as 0 → Box.Tag came out 0). The
+// fix copies such non-self symbols as-is (the fresh symbol already IS the
+// imported one). This test pins that: `Reg<int>.Seed.Tag` must be 77, the
+// sibling's own static readonly value, same as the same-module baseline.
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_field_init_sibling_member_ref_resolves_spec_2375_2_8_2) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2375m_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+
+    // Module Base2375M: sibling `Box` carries its OWN public static
+    // readonly `DefaultSize := 77`, and `Reg<T>.Seed`'s initializer reads
+    // that sibling static as the constructor argument — a sibling-MEMBER
+    // reference, not just a sibling-TYPE reference.
+    writeSource(baseSrc.path,
+        "module Base2375M; "
+        "public class Box "
+        "  public static readonly DefaultSize: int := 77; "
+        "  public Tag: int; "
+        "  public constructor(tag: int) "
+        "    Tag := tag; "
+        "  end constructor; "
+        "end Box; "
+        "public class Reg<T> "
+        "  public static readonly Seed: Box := new Box(Box.DefaultSize); "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    writeSource(appSrc.path,
+        "module App2375M; "
+        "import Base2375M; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var b := Reg<int>.Seed; "
+        "    return b.Tag; "
+        "  end Main; "
+        "end Program;");
+    std::vector<bezel::Dependency> depsApp;
+    {
+        bezel::Dependency d;
+        d.metadataPath = baseObj.path;
+        d.objectPath   = baseObj.path;
+        depsApp.push_back(d);
+    }
+    bezel::CompileResult rApp =
+        driver.compileFile(appSrc.path, appExe.path, depsApp);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+
+    int status = std::system(appExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    // 77: the sibling static `Box.DefaultSize` was read correctly inside the
+    // reconstructed initializer (the expr-symbol copy fix), so the Box was
+    // constructed with Tag=77. Pre-fix this returned 0 (silent miscompile:
+    // the sibling-member reference had no symbol in mainCtx). With only the
+    // sibling-TYPE half of #2375 and not the expr-symbol copy, this same
+    // binary returns 0 — pinning the second half of the fix.
+    BEZEL_EXPECT_EQ(code, 77);
+}
+
 // #2351 self-pass (c) / §22.13 "Disposal of static owned fields": an `owned`
 // static field's exit disposal must run EXACTLY ONCE process-wide even when
 // TWO SEPARATE importers each independently reconstruct the field's
