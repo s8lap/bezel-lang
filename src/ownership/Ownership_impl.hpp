@@ -105,6 +105,16 @@ struct GenericReturnContext {
     const std::vector<ast::GenericParam>* enclosingParams = nullptr;
     const std::vector<ast::GenericConstraint>* methodConstraints = nullptr;
     const std::vector<ast::GenericConstraint>* enclosingConstraints = nullptr;
+    // §28.3 v0.235 (#1666, #2381): for a method declared inside an EXTENSION
+    // block, the block-level type parameters ride the target type's generic
+    // argument list (an `ExtensionDecl` carries no `genericParams` vector), so
+    // they are collected here as synthetic `GenericParam`s and `enclosingParams`
+    // is pointed at this vector — letting `computeBareReturnContext` recognize a
+    // bare-`T` return that names the extension-block-level parameter (the v0.235
+    // iteration-variable ruling's must-reject shape is an extension method on
+    // `IEnumerable<T>`). Empty for type-member and static methods. Owns the
+    // `string_view` names (they point into the AST, which outlive the pass).
+    std::vector<ast::GenericParam> extensionEnclosingParams;
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S10; #1885): true when
     // this method IMPLEMENTS or OVERRIDES a generic declaration whose declared
     // return type is a bare type parameter (`class VChooser: IChooser<C> ...
@@ -990,6 +1000,18 @@ private:
     // parameter return of a value the caller cannot own (a fresh owned value or a
     // borrow of an owned local / `using var` / `owned` parameter). // per §28.3
     void reportBareTypeParamOwnedReturn(const ast::Expr& e);
+    // §28.3 v0.235 (#1666, #2381): returns the ForStmt whose iteration variable
+    // `e` is, when that loop's source is statically an INTERFACE-TYPED
+    // enumeration (`IEnumerable<T>` / `IAsyncEnumerable<T>`) — the v0.235 ruling's
+    // must-reject shape (the element's backing is unprovable, so the variable's
+    // source is conservatively the loop's implicit enumerator, a scope-bound
+    // local). Returns null for a non-iteration-variable expression, an iteration
+    // variable over a CONCRETE collection (Array<T> …, collection-backed, the
+    // chain element slot → collection → receiver, admitted), a range/span/
+    // inline-array/string source, or the owning heads (IOwningEnumerable/…, which
+    // seed the iteration variable OWNED and are rejected by the owned-local arm).
+    // // per §28.3, §29.1, §29.2 v0.235
+    const ast::ForStmt* borrowedIterVarFromInterfaceSource(const ast::Expr& e);
 
     // §28.3 / §28.6 (v0.180 #1547; role changed v0.196 #1815): true when `e` is
     // a bare identifier or member access resolving to a STATIC field or property

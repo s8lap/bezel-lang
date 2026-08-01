@@ -7483,6 +7483,33 @@ void MethodOwnership::checkBareTypeParamReturn(const ast::Expr& e) {
                 return;
             }
     }
+    // §28.3 v0.235 (#1666, #2381): REJECT an iteration-variable borrow whose
+    // loop source is INTERFACE-TYPED (IEnumerable<T>/IAsyncEnumerable<T>). At an
+    // interface-typed enumeration source the element's backing is unprovable, so
+    // the variable's source is conservatively the loop's implicit enumerator — a
+    // scope-bound local — and returning it hands back a borrow that dies with the
+    // callee frame while the caller re-establishes only a borrow. A CONCRETE
+    // collection-backed source (Array<T>, …) re-borrows through element slot →
+    // collection → receiver and is ADMITTED (the ruling's accept half); the
+    // index spelling `this[i]` is not an iteration variable and is admitted by
+    // the fall-through. The owning heads (IOwningEnumerable<T>/…) seed the
+    // iteration variable OWNED and were already rejected by the owned-local arm
+    // above. // per §28.3, §29.1, §29.2 v0.235
+    if (borrowedIterVarFromInterfaceSource(e)) {
+        report(
+            Severity::Error, e.span.begin,
+            "a bare-type-parameter return may not return an iteration variable "
+            "borrowed from an interface-typed enumeration source "
+            "(IEnumerable<T>/IAsyncEnumerable<T>) — the element's backing is "
+            "unprovable, so the variable's source is the loop's implicit "
+            "enumerator, a scope-bound local that dies with the callee while the "
+            "caller re-establishes only a borrow (§28.3 *Bare-type-parameter "
+            "returns* / §29.2, v0.235, #1666); use the index spelling "
+            "`this[i]` (receiver-sourced), constrain the parameter "
+            "`where T: value` so the return copies, or declare the return type "
+            "`owned T`");
+        return;
+    }
     // Admit: a plain-parameter- / receiver- / static-storage-sourced borrow.
 }
 
@@ -7499,6 +7526,40 @@ void MethodOwnership::reportBareTypeParamOwnedReturn(const ast::Expr& e) {
         "(§28.3 *Bare-type-parameter returns*, v0.194); return `null`, a "
         "receiver- or plain-parameter-sourced borrow, or declare the return type "
         "`owned T` to transfer ownership");
+}
+
+// §28.3 v0.235 (#1666, #2381): the v0.235 iteration-variable ruling's must-
+// reject recognizer. A returned bare identifier `e` resolves to its LocalSymbol;
+// when that symbol is a for-loop's iteration variable (`decl` is a ForStmt) whose
+// loop source has the static type of a BORROWING enumeration interface —
+// `IEnumerable<T>` / `IAsyncEnumerable<T>` — the element's backing is unprovable,
+// so the variable's source is conservatively the loop's implicit enumerator (a
+// scope-bound local), and the borrow may not escape the loop body. The check is
+// keyed on the iterable's STATIC type head, mirroring iterableIsOwningEnumerable:
+// a Named TypeRef carries its name on the AST node (`astNode->name->parts`) or,
+// for an imported type, in `importedName`; check both. A CONCRETE collection
+// source (Array<T>, …) is collection-backed (the chain element slot → collection
+// → receiver) and returns null — admitted; the owning heads seed the iteration
+// variable OWNED and are rejected by the owned-local arm; range/span/inline-array/
+// string sources carry no enumeration interface and return null. // per §28.3,
+// §29.1, §29.2 v0.235
+const ast::ForStmt* MethodOwnership::borrowedIterVarFromInterfaceSource(
+    const ast::Expr& e) {
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return nullptr;
+    auto* lsym = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!lsym) return nullptr;
+    auto* fs = dynamic_cast<const ast::ForStmt*>(lsym->decl);
+    if (!fs || !fs->iterable) return nullptr;
+    const sema::TypeRef* tt = ctx_.exprType(*fs->iterable);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named) return nullptr;
+    std::string_view head;
+    if (tt->astNode && tt->astNode->name && !tt->astNode->name->parts.empty())
+        head = tt->headName();
+    else if (!tt->importedName.empty())
+        head = tt->importedName;
+    if (head == "IEnumerable" || head == "IAsyncEnumerable") return fs;
+    return nullptr;
 }
 
 // §28.3 / §28.6 (v0.180 #1547; role changed v0.196 #1815): see the header
@@ -8110,8 +8171,35 @@ void checkOperatorReturnDeclaration(const ast::OperatorDecl& od,
                             /*isOperator=*/true, ctx);
 }
 
+// §28.3 v0.235 (#1666, #2381): collect an extension block's type parameters as
+// synthetic `GenericParam`s. An `ExtensionDecl` carries no `genericParams`
+// vector — the block-level type parameters ride the target type's generic
+// argument list (the `T` in `extension IEnumerable<T>`). A generic argument
+// introduces a block-level type parameter when it is a bare single-segment
+// non-nullable Named type with no generic args of its own (mirroring
+// bindExtensionTargetTypeParams's recognition rule); a concrete-instantiation
+// head (`Array` in `Array<T>`) is not a parameter. The returned `string_view`s
+// point into the AST, which outlives the ownership pass. // per §26.4, §28.3 v0.235
+static std::vector<ast::GenericParam> extensionTypeParams(
+    const ast::ExtensionDecl& ext) {
+    std::vector<ast::GenericParam> out;
+    if (!ext.targetType) return out;
+    for (const auto& ga : ext.targetType->genericArgs) {
+        if (!ga) continue;
+        if (ga->kind == ast::TypeKind::Named && ga->name &&
+            ga->name->parts.size() == 1 && !ga->nullable &&
+            ga->genericArgs.empty()) {
+            ast::GenericParam gp;
+            gp.name = ga->name->parts.front();
+            out.push_back(gp);
+        }
+    }
+    return out;
+}
+
 void checkMember(const ast::Member& m, sema::SemaContext& ctx,
-                 const ast::TypeDecl* enclosingType = nullptr) {
+                 const ast::TypeDecl* enclosingType = nullptr,
+                 const ast::ExtensionDecl* enclosingExtension = nullptr) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
         // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): assemble the
         // generic context the callee-side check keys on — this method's generic
@@ -8125,6 +8213,22 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         if (enclosingType) {
             genericCtx.enclosingParams = &enclosingType->genericParams;
             genericCtx.enclosingConstraints = &enclosingType->genericConstraints;
+        } else if (enclosingExtension) {
+            // §28.3 v0.235 (#1666, #2381): an ExtensionDecl carries no
+            // `genericParams` vector (the block-level type parameters ride the
+            // target type's generic argument list, e.g. the `T` in
+            // `extension IEnumerable<T>`), so collect them here as synthetic
+            // `GenericParam`s and point `enclosingParams` at the owned vector.
+            // This lets `computeBareReturnContext` recognize a bare-`T` return
+            // naming the extension-block-level parameter — the v0.235 ruling's
+            // must-reject shape (an extension method on `IEnumerable<T>` whose
+            // body returns the iteration variable). The block-level `where`
+            // constraints live on the ExtensionDecl directly. // per §28.3 v0.235
+            genericCtx.extensionEnclosingParams =
+                extensionTypeParams(*enclosingExtension);
+            genericCtx.enclosingParams = &genericCtx.extensionEnclosingParams;
+            genericCtx.enclosingConstraints =
+                &enclosingExtension->genericConstraints;
         }
         // §28.3 (v0.194 S10; #1885): does this INSTANCE method implement/override
         // a bare-T-returning generic declaration? If so, its return classification
@@ -8445,11 +8549,15 @@ void checkTopDecl(const ast::TopDecl& d, sema::SemaContext& ctx) {
             if (m) checkMember(*m, ctx, td);
         }
     } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
-        // §28.3 (#1801 S6): an ExtensionDecl carries no `genericParams` vector
-        // (extension type parameters ride the target type), so only a method-
-        // LEVEL bare-T return is recognized here — extensionType stays null.
+        // §28.3 v0.235 (#1666, #2381): an ExtensionDecl carries no `genericParams`
+        // vector (the block-level type parameters ride the target type's generic
+        // argument list), so pass the ExtensionDecl to checkMember, which collects
+        // those parameters as synthetic GenericParams — letting the callee-side
+        // bare-T check recognize a bare-`T` return naming an extension-block-level
+        // parameter (the v0.235 iteration-variable ruling's must-reject shape).
+        // // per §28.3 v0.235
         for (const auto& m : ext->members) {
-            if (m) checkMember(*m, ctx);
+            if (m) checkMember(*m, ctx, /*enclosingType=*/nullptr, ext);
         }
     }
 }
