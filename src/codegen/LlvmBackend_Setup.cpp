@@ -13491,7 +13491,16 @@ bool Emitter::isStringFieldLvalue(const ast::Expr& target) {
     if (!sym) return false;
     if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym))
         return fs->parent && fs->parent->kind == ast::TypeDeclKind::Class;
-    if (isAutoProperty(sym)) {
+    // fix #2504 (§23/§2.8.2): isAutoProperty is DECL-DEPENDENT (always false
+    // for an imported PropertySymbol whose decl is null); use the
+    // storage-layout fallback isAutoPropertyStorage (#2478's pattern) so a
+    // bare-identifier assignment target resolving to an IMPORTED base
+    // auto-property is recognized as field storage and lowerStringFieldStore
+    // runs its retain-new/release-old. The issue's own drafted widening had
+    // "zero effect" ONLY because the upstream sema type resolution (now fixed
+    // in ExprTypecheck_Exprs.cpp) bailed first at isStringExprType — both
+    // halves are required.
+    if (isAutoPropertyStorage(sym)) {
         auto* ms = dynamic_cast<sema::MemberSymbol*>(sym);
         return ms && ms->parent && ms->parent->kind == ast::TypeDeclKind::Class;
     }
@@ -14767,7 +14776,7 @@ bool Emitter::isClosureFieldLvalue(const ast::Expr& target) {
     if (!sym) return false;
     if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym))
         return fs->parent && fs->parent->kind == ast::TypeDeclKind::Class;
-    if (isAutoProperty(sym)) {
+    if (isAutoPropertyStorage(sym)) {  // fix #2504: imported auto-property (decl-dependent isAutoProperty)
         auto* ms = dynamic_cast<sema::MemberSymbol*>(sym);
         return ms && ms->parent && ms->parent->kind == ast::TypeDeclKind::Class;
     }
@@ -14874,7 +14883,7 @@ bool Emitter::isBoxFieldLvalue(const ast::Expr& target,
     if (!sym) return false;
     if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym))
         return fs->parent && fs->parent->kind == ast::TypeDeclKind::Class;
-    if (isAutoProperty(sym)) {
+    if (isAutoPropertyStorage(sym)) {  // fix #2504: imported auto-property (decl-dependent isAutoProperty)
         auto* ms = dynamic_cast<sema::MemberSymbol*>(sym);
         return ms && ms->parent && ms->parent->kind == ast::TypeDeclKind::Class;
     }

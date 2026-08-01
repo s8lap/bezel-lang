@@ -858,6 +858,22 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         ctx_.setExprType(
                             &e, substituteMemberType(rt, nullptr, fs->parent));
                     }
+                } else if (ctx_.isImported(fs)) {
+                    // fix #2532 (§2.7/§2.8.2): an IMPORTED field inherited
+                    // from an imported base and reached via a BARE identifier
+                    // (`field := v;`, implicit this) has no ast::FieldDecl
+                    // (the loader's makeImportedSymbol carries no AST), so its
+                    // type rides the importedMemberType side table — the
+                    // FieldSymbol sibling of the #2504 property fix in the
+                    // adjacent branch, with the IDENTICAL heap-corruption
+                    // repro under ASan (confirmed live: SEGV in
+                    // bz_string_release, double-free-shaped). The
+                    // resolveMemberAccess path (explicit `this.field` /
+                    // `h.field`) already publishes the type this way; the
+                    // bare-identifier path simply missed it.
+                    if (TypeRef* rt = ctx_.importedMemberType(fs))
+                        ctx_.setExprType(&e,
+                            substituteMemberType(rt, nullptr, fs->parent));
                 }
             } else if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {
                 // §12.1 / §23: implicit `this.<auto-property>` form: a bare
@@ -879,6 +895,25 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 ctx_.setExprType(&e, rt);
                             }
                         }
+                    } else if (ctx_.isImported(ps)) {
+                        // fix #2504 (§23/§2.8.2): an IMPORTED auto-property
+                        // inherited from an imported base and reached via a
+                        // BARE identifier (`Name := v;`, implicit this) has no
+                        // ast::PropertyDecl (the module loader's
+                        // makeImportedSymbol carries no AST), so its type rides
+                        // the importedMemberType side table — mirroring the
+                        // MemberAccess path (resolveMemberAccess's imported-
+                        // Property branch, i.e. the `this.Name` form that
+                        // already works). Without this the bare-identifier
+                        // assignment target carries no exprType, so codegen's
+                        // isStringExprType/isStringFieldLvalue bail at their
+                        // first check and lowerStringFieldStore is skipped →
+                        // the setter stores the string pointer without
+                        // retain/release → heap corruption (double-free in
+                        // bz_string_release, confirmed under ASan).
+                        if (TypeRef* rt = ctx_.importedMemberType(ps))
+                            ctx_.setExprType(&e,
+                                substituteMemberType(rt, nullptr, ps->parent));
                     }
                 }
             }
