@@ -170,6 +170,14 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // isAutoProperty do above (§2.8.3 rule 3 staleness detection).
     hashBool(h, m.isEventStatic);
     hashBool(h, m.isEventAsync);
+    // fix #2516 (§9.2/§2.8.3 rule 3): isPositional is part of a Field's
+    // signature identity — a library changing a field from positional to
+    // body (or vice versa) changes the cross-module contract (positional
+    // fields are §9.2 record-equality-bearing; body fields are not), so it
+    // must fold into the semantic hash the same way hasSetter/
+    // isAutoProperty/hasGetter/isEventStatic/isEventAsync do above, or a
+    // consumer's staleness check cannot see the change (§2.8.3 rule 3).
+    hashBool(h, m.isPositional);
     hashU64(h, m.contracts.size());
     for (const MetaContractRecord& c : m.contracts) hashContract(h, c);
     hashType(h, m.type);
@@ -311,7 +319,8 @@ MetaMember::MetaMember(const MetaMember& o)
       isPure(o.isPure), hasSetter(o.hasSetter),
       setterVisibility(o.setterVisibility), isAutoProperty(o.isAutoProperty),
       hasGetter(o.hasGetter), isEventStatic(o.isEventStatic),
-      isEventAsync(o.isEventAsync), contracts(o.contracts),
+      isEventAsync(o.isEventAsync), isPositional(o.isPositional),
+      contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
       hasEnumValue(o.hasEnumValue), enumValue(o.enumValue) {
@@ -329,6 +338,7 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         setterVisibility = o.setterVisibility;
         isAutoProperty = o.isAutoProperty; hasGetter = o.hasGetter;
         isEventStatic = o.isEventStatic; isEventAsync = o.isEventAsync;
+        isPositional = o.isPositional;
         contracts = o.contracts;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
@@ -370,7 +380,11 @@ bool MetaMember::operator==(const MetaMember& o) const {
            // and itable layouts, so two events that differ on either bit are
            // NOT the same member (see the hashMember comment above).
            isEventStatic == o.isEventStatic &&
-           isEventAsync == o.isEventAsync && contracts == o.contracts &&
+           isEventAsync == o.isEventAsync &&
+           // fix #2516 (§9.2/§2.8.3 rule 3): isPositional is part of a
+           // Field's signature identity — see the hashMember comment above.
+           isPositional == o.isPositional &&
+           contracts == o.contracts &&
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
            hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
