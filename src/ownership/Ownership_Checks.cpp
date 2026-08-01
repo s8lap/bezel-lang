@@ -8912,6 +8912,26 @@ bool MethodOwnership::isDeferredActivationCallResult(
            head == "Task" || head == "OwningTask";
 }
 
+// §28.14 *Call-bounded × deferred activation* (v0.196): shared single-part-
+// head navigation over an AST type node — true when `t` is a Named type whose
+// head is an iterator/async-iterator interface or a Task-family type (the
+// deferred-activation shapes that can appear as a WRITTEN return type). Used by
+// returnTypeIsDeferredActivation (the enclosing method's declared return) and
+// lambdaReturnTypeIsDeferredActivation (a lambda's own ascribed `: Type`).
+// Null `t` (no ascription) returns false — the inferred case is handled by the
+// caller via isDeferredActivationCallResult on the body. // per §28.14, §28.3 v0.196
+static bool isDeferredActivationTypeNode(const ast::Type* t) {
+    if (!t || t->kind != ast::TypeKind::Named || !t->name ||
+        t->name->parts.size() != 1)
+        return false;
+    std::string_view head = t->name->parts.front();
+    return head == "IEnumerable" || head == "IEnumerator" ||
+           head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
+           head == "IOwningEnumerable" || head == "IOwningEnumerator" ||
+           head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator" ||
+           head == "Task" || head == "OwningTask";
+}
+
 // §28.14 *Call-bounded × deferred activation* (v0.196): the declared-return-type
 // sibling of isDeferredActivationCallResult, used by the call-bounded frame-
 // residence check. Read directly from the AST return-type node's single-part
@@ -8919,15 +8939,21 @@ bool MethodOwnership::isDeferredActivationCallResult(
 // a frame RETURNED under one of these types is the announced frame residence,
 // not an escape of the callback it carries. // per §28.14, §28.3 v0.196
 bool MethodOwnership::returnTypeIsDeferredActivation() const {
-    if (!returnType_ || returnType_->kind != ast::TypeKind::Named ||
-        !returnType_->name || returnType_->name->parts.size() != 1)
-        return false;
-    std::string_view head = returnType_->name->parts.front();
-    return head == "IEnumerable" || head == "IEnumerator" ||
-           head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
-           head == "IOwningEnumerable" || head == "IOwningEnumerator" ||
-           head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator" ||
-           head == "Task" || head == "OwningTask";
+    return isDeferredActivationTypeNode(returnType_);
+}
+
+// #2343 (§28.14 v0.196): the per-lambda sibling of the above. A lambda's
+// expr-body `=> E` is an implicit return of `E`; the frame-residence carve-out
+// at that sink needs the LAMBDA's return type, not the enclosing method's. An
+// ascribed `: Type` reads that AST node (same navigation); an INFERRED return
+// type equals the exprBody's resolved type, so the announcement composes
+// exactly when the body is a frame (isDeferredActivationCallResult). The latter
+// is the spec's "expressible neighbor" idiom — `lambda(f) => xs.Where(f)` —
+// which must stay admitted. // per §28.14, v0.196, #2343
+bool MethodOwnership::lambdaReturnTypeIsDeferredActivation(
+    const ast::LambdaExpr& lam, const ast::Expr& exprBody) const {
+    if (lam.retType) return isDeferredActivationTypeNode(lam.retType.get());
+    return isDeferredActivationCallResult(exprBody);
 }
 
 // #1526 (§28.3): true when `arg` is a plain-argument "unbound owned
@@ -13353,11 +13379,35 @@ void MethodOwnership::callBoundedWalkExpr(const ast::Expr& e) {
         // entry resident cannot make an unrelated identifier in a different
         // lambda (or the enclosing method) resolve to it. // per §28.14, #1432
         seedLambdaCallBoundedParams(*lam);
-        // Walk the lambda BODY: a store that executes when the closure runs
-        // (`() => do _f := f; end`) is still a store of the call-bounded
+        // #2343 (§28.14 v0.177, twin of #1432's ReturnStmt handler): a lambda's
+        // EXPRESSION body `=> E` is an implicit RETURN of `E` (§27.3), so the
+        // exprBody is a return sink exactly as `do return E; end` is — and a
+        // call-bounded parameter (or a closure capturing one) returned through
+        // `=> g` escapes the callback exactly as `return g;` does. The prior
+        // `callBoundedWalkExpr(*lam->exprBody)` walked the body only
+        // STRUCTURALLY (a top-level identifier `g` hit no sink), so the
+        // expr-body twin of the block-body return was silently admitted.
+        // Mirror the callBoundedWalkStmt `ReturnStmt` case: if the exprBody
+        // resolves via callBoundedSourceOf to a call-bounded source, apply the
+        // §28.14 *Call-bounded × deferred activation* (v0.196) frame-residence
+        // carve-out — using lambdaReturnTypeIsDeferredActivation (the LAMBDA's
+        // own return type, not the enclosing method's returnType_) — else
+        // report; otherwise descend structurally as before.
+        if (lam->exprBody) {
+            if (sema::ParameterSymbol* src =
+                    callBoundedSourceOf(*lam->exprBody)) {
+                if (!(isDeferredActivationCallResult(*lam->exprBody) &&
+                      lambdaReturnTypeIsDeferredActivation(*lam, *lam->exprBody)))
+                    reportCallBounded(lam->exprBody->span.begin, src->name,
+                                      "returned");
+            } else {
+                callBoundedWalkExpr(*lam->exprBody);
+            }
+        }
+        // Walk the lambda BLOCK body: a store that executes when the closure
+        // runs (`() => do _f := f; end`) is still a store of the call-bounded
         // value. The lambda VALUE's own escape is judged at its use sites
         // via callBoundedSourceOf.
-        if (lam->exprBody) callBoundedWalkExpr(*lam->exprBody);
         for (const auto& bs : lam->stmts)
             if (bs) callBoundedWalkStmt(*bs);
         return;

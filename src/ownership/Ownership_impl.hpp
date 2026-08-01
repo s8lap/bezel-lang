@@ -2661,6 +2661,20 @@ private:
     // // per §28.14, §28.3 v0.196
     bool returnTypeIsDeferredActivation() const;
 
+    // #2343 (§28.14 *Call-bounded × deferred activation*, v0.196): per-lambda
+    // sibling of returnTypeIsDeferredActivation, for the lambda's OWN `=>`
+    // expression body. The frame-residence carve-out at an expr-body implicit
+    // return needs the LAMBDA's return type (what ITS caller sees and
+    // re-establishes against), not the enclosing method's returnType_. A lambda
+    // with an explicit return-type ascription (lam->retType) reads that AST
+    // node with the same head-name navigation as returnTypeIsDeferredActivation;
+    // a lambda with an INFERRED return type has it equal to the exprBody's
+    // resolved type, so isDeferredActivationCallResult(exprBody) alone is the
+    // equivalent announcement (the inferred return type composes iff the body
+    // is a frame). // per §28.14, v0.196, #2343
+    bool lambdaReturnTypeIsDeferredActivation(
+        const ast::LambdaExpr& lam, const ast::Expr& exprBody) const;
+
     // True when `arg` is a plain-argument "unbound owned temporary" per the
     // §28.3 Producers table: a bare `new T(...)` or call already classified
     // Owned by producerState, OR a call to a STATIC method (no receiver)

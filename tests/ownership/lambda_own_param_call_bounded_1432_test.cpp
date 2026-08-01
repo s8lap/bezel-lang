@@ -26,12 +26,13 @@
 // classification.
 //
 // NOTE on scope: a lambda's own EXPRESSION-body (`lambda(g) => g`) treating
-// its bare value as an implicit RETURN sink is a separate, pre-existing gap
+// its bare value as an implicit RETURN sink was a separate, pre-existing gap
 // in the callee-side walk (it is not specific to a lambda's own parameters —
 // the same gap exists for the enclosing method's captured parameter forwarded
-// through a nested lambda's `=>` body) and is intentionally left to a
-// follow-up issue; the BLOCK-bodied `do return g; end` form (the shape this
-// file exercises, matching the issue's own repro style) IS covered.
+// through a nested lambda's `=>` body); it is closed by #2343, whose cells
+// live in the "EXPRESSION body" sections below. The BLOCK-bodied
+// `do return g; end` form (the shape the #1432 cells below exercise, matching
+// the issue's own repro style) was already covered.
 
 #include <string>
 
@@ -182,6 +183,106 @@ BEZEL_TEST(lambda_own_param_call_bounded_1432, return_block_body_rejected) {
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(diagContains(r, "call-bounded"));
+}
+
+// ===========================================================================
+// Forbidden sink: implicit return, from the lambda's own EXPRESSION body (#2343)
+//
+// #2343 (§28.14 v0.177/v0.196, twin of #1432's block-body `return` cell above):
+// a lambda's EXPRESSION body `=> E` is an implicit RETURN of `E` (§27.3), so a
+// call-bounded parameter (or a closure capturing one) returned through `=> g`
+// escapes the callback exactly as `return g;` does. `callBoundedWalkExpr`'s
+// LambdaExpr case previously walked the exprBody only STRUCTURALLY (a top-level
+// identifier `g` hit no sink), so the expr-body twin of the block-body return
+// was silently admitted. The fix treats the exprBody as an implicit return sink
+// — mirroring callBoundedWalkStmt's ReturnStmt case, with the SAME §28.14
+// *Call-bounded × deferred activation* (v0.196) frame-residence carve-out
+// (computed against the LAMBDA's own return type, not the enclosing method's).
+// ===========================================================================
+
+// #2343 / §28.14 v0.177: the issue's canonical shape — a lambda whose OWN plain
+// function-typed parameter is the whole expression body (`=> g`), an implicit
+// return of the call-bounded value. Without the fix the structural walk found
+// no sink (a top-level identifier) and this was silently ADMITTED; with the fix
+// the implicit return is the "returned" sink. The block-body twin
+// (`return_block_body_rejected` above) was already rejected by #1432.
+BEZEL_TEST(lambda_own_param_call_bounded_1432,
+          return_expr_body_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public method Set(f: () -> int): () -> int "
+        "    var pass := lambda(g: () -> int): () -> int => g; "
+        "    return pass(f); "
+        "  end Set; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagContains(r, "call-bounded"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "may not be returned"));
+}
+
+// #2343 / §28.14 v0.177: the broader aspect — the ENCLOSING METHOD's call-
+// bounded parameter captured and returned through a LOCAL lambda's `=>` body
+// (`lambda() => f`, where `f` is the method's formal). The implicit return of
+// the captured callback escapes it exactly as `return f;` does; before the fix
+// the structural walk missed the top-level capture. (The block-body twin
+// `do return f; end` was already caught via the ReturnStmt handler.)
+BEZEL_TEST(lambda_own_param_call_bounded_1432,
+          enclosing_param_implicit_return_via_expr_body_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public method Run(f: () -> int): () -> int "
+        "    var cap := lambda() => f; "
+        "    return cap(); "
+        "  end Run; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagContains(r, "call-bounded"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "may not be returned"));
+}
+
+// ===========================================================================
+// Accept controls for the #2343 carve-out: §28.14 *Call-bounded × deferred
+// activation* (v0.196) frame residence through a lambda's `=>` body — the
+// spec's "expressible neighbor" idiom (`xs.Where(f)`), which must stay ADMITTED.
+// A bare "treat the exprBody as a return sink" would wrongly reject these; the
+// fix's per-lambda frame-residence carve-out (lambdaReturnTypeIsDeferredActivation)
+// admits them. Guards against an over-broad fix.
+// ===========================================================================
+
+// #2343 / §28.14 v0.196 ACCEPT: forwarding the lambda's own call-bounded
+// parameter into a deferred-activation call (`xs.Where(g)`) and returning the
+// resulting frame UNDER the lambda's DECLARED deferred-activation return type
+// is announced frame residence — admitted. The lambda twin of
+// call_bounded_2814.forward_into_lazy_returned_under_deferred_type_clean.
+BEZEL_TEST(lambda_own_param_call_bounded_1432,
+          expr_body_frame_residence_declared_return_type_accepted) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Apply(xs: Array<int>, "
+        "                             f: (int) -> bool): IEnumerable<int> "
+        "    var mk := lambda(g: (int) -> bool): IEnumerable<int> "
+        "             => xs.Where(g); "
+        "    return mk(f); "
+        "  end Apply; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// #2343 / §28.14 v0.196 ACCEPT: the same frame-residence forward with an
+// INFERRED lambda return type (no `: IEnumerable<int>` ascription). The
+// inferred return type equals the exprBody's resolved type, so the
+// announcement composes exactly when the body is a frame — admitted.
+BEZEL_TEST(lambda_own_param_call_bounded_1432,
+          expr_body_frame_residence_inferred_return_type_accepted) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Apply(xs: Array<int>, "
+        "                             f: (int) -> bool): IEnumerable<int> "
+        "    var mk := lambda(g: (int) -> bool) => xs.Where(g); "
+        "    return mk(f); "
+        "  end Apply; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
 // ===========================================================================
