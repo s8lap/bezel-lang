@@ -1197,6 +1197,25 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         bool isMethod = dynamic_cast<const sema::MethodSymbol*>(ms) != nullptr;
         bool isField  = !isMethod &&
             dynamic_cast<const sema::FieldSymbol*>(ms) != nullptr;
+        // fix #2473 (§9.2/§23.1/§22.8/§13, v0.236): an instance auto-property
+        // (`private property W: int := 41;` — backed by compiler-generated
+        // storage, §23.1 "the compiler generates the backing field") is a real
+        // instance-storage member exactly like a plain field, but is a
+        // PropertySymbol, not a FieldSymbol — so the existing `isField` test
+        // never matched it, and a private/internal auto-property was dropped
+        // from `out.members` entirely (the identical layout-aliasing/
+        // under-allocation hazard #2456 fixed for plain FIELDS, just for the
+        // auto-property subtype of storage member; #2478 closed the
+        // IMPORTER-SIDE classification but presupposed the PropertySymbol
+        // exists in `t->members` at all, which for a private/internal
+        // auto-property it did not). `sema::isAutoPropertySymbol` excludes
+        // indexers and static auto-properties, so this matches ONLY instance-
+        // storage auto-properties — the storage members
+        // `collectInstanceStorage`/`collectRecordStorage`
+        // (LlvmBackend_impl.hpp) count via `isAutoPropertyStorage` (#2478's
+        // importer-side wire-bit fallback). On the EXPORTER side (here) the
+        // decl is always present, so the decl-based predicate is exact.
+        bool isAutoPropStorage = !isMethod && sema::isAutoPropertySymbol(ms);
         bool exported = isExportedMember(member->visibility, inInterface);
         // For generic classes, also include private/internal METHODS so the
         // importer's ctor/dtor body re-parsing can resolve self-calls (#695).
@@ -1217,7 +1236,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         // exported — no initializer, no ABI change. Mirrors the private-method
         // rationale (#695): the field is not accessible outside the class;
         // the stub is used solely for sema name-resolution in re-parsed bodies.
-        bool includeForMethodBody = isGenericClass && isField &&
+        bool includeForMethodBody = isGenericClass && (isField || isAutoPropStorage) &&
             !exported &&
             (member->visibility == ast::Visibility::Private ||
              member->visibility == ast::Visibility::Internal);
@@ -1294,7 +1313,17 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         bool isStaticFieldMember = false;
         for (auto mod : member->modifiers)
             if (mod == "static") { isStaticFieldMember = true; break; }
-        bool includeForLayout = isField && !exported && !isStaticFieldMember &&
+        // fix #2473 (§9.2/§23.1/§22.8): widen `includeForLayout` to also
+        // match an instance auto-property (`isAutoPropStorage`, recognized
+        // above) — the same storage-layout hazard #2456 (classes) / #2468
+        // (records) fixed for plain fields applies verbatim to an
+        // auto-property's compiler-generated backing slot. `isAutoPropStorage`
+        // already excludes static auto-properties, so `!isStaticFieldMember`
+        // is redundant for that arm but kept for the plain-field path; an
+        // indexer (PropertySymbol with `isIndexer`) is excluded by
+        // `isAutoPropertySymbol` and never reaches this gate.
+        bool includeForLayout = (isField || isAutoPropStorage) &&
+            !exported && !isStaticFieldMember &&
             (t.kind == ast::TypeDeclKind::Class ||
              t.kind == ast::TypeDeclKind::Record);
         if (!exported && !includeForCtorBody && !includeForMethodBody &&
