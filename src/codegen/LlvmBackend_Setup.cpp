@@ -14560,25 +14560,27 @@ struct StringEscapeWalker {
                 escaped = true;
                 return;
             }
-            // fix #2505 (§23.3/§28.9, v0.236): a bare-identifier (or safe-
-            // sub-positioned) RHS of a property-SET on a CLASS — `h.Name := s;`
-            // — is a CALL-BOUNDED BORROW, the AssignmentStmt twin of #1430's
-            // method-argument relaxation in walkCallArgs. A class's auto-
-            // property setter RETAINS its incoming value into the backing field
+            // fix #2505 / fix #2535 (§23.3/§28.9/§11, v0.236): a bare-
+            // identifier (or safe-sub-positioned) RHS of a property-SET on a
+            // CLASS or INTERFACE — `h.Name := s;` / `iref.Name := s;` — is a
+            // CALL-BOUNDED BORROW, the AssignmentStmt twin of #1430's method-
+            // argument relaxation in walkCallArgs. A class's auto-property
+            // setter RETAINS its incoming value into the backing field
             // (ensurePropertyAccessorFn's class-gated retain, §23.3; a direct
             // class field store retains via lowerStringFieldStore), minting the
-            // slot's OWN independent +1 and leaving the local's own +1 UNTOUCHED
-            // — so the local still owns exactly one reference it MUST release at
-            // scope end. Walking the RHS as a safe read keeps the local scope-end-
-            // release eligible; without this the conservative escape below
-            // suppressed that release and the local's +1 leaked (a per-call,
-            // loop-compounding leak — `h.Name := s;` in a loop leaked one object
-            // per iteration; the safe direction, leak-not-UAF). #2490's setter-
-            // ARC fix is what made the leak RELEVANT: pre-#2490 the setter did a
-            // bare, unretained store, so the field ALIASED the local's single
-            // reference and suppressing the local's release was load-bearing
-            // (arming it would double-free at the owner's disposal); now that
-            // the field takes its own +1, the local's release must fire.
+            // slot's OWN independent +1 and leaving the local's own +1
+            // UNTOUCHED — so the local still owns exactly one reference it MUST
+            // release at scope end. Walking the RHS as a safe read keeps the
+            // local scope-end-release eligible; without this the conservative
+            // escape below suppressed that release and the local's +1 leaked
+            // (a per-call, loop-compounding leak — `h.Name := s;` in a loop
+            // leaked one object per iteration; the safe direction, leak-not-
+            // UAF). #2490's setter-ARC fix is what made the leak RELEVANT:
+            // pre-#2490 the setter did a bare, unretained store, so the field
+            // ALIASED the local's single reference and suppressing the local's
+            // release was load-bearing (arming it would double-free at the
+            // owner's disposal); now that the field takes its own +1, the
+            // local's release must fire.
             //
             // SOUNDNESS — the discriminant mirrors lowerImportedPropertySetValue's
             // `classOwned` gate (== ps->parent->kind == Class) and
@@ -14594,25 +14596,40 @@ struct StringEscapeWalker {
             //     for `r.Name := s;` on a record SEGV'd under ASan when the field
             //     was read after the local's scope ended.)
             //   * an INTERFACE parent ⇒ the concrete runtime receiver may be a
-            //     class (retains) OR a boxed record (plain store), a runtime fact
-            //     this static walk cannot see, so it too falls through (leak-over-
-            //     UAF, the safe direction — the named-local-borrow twin of #2506's
-            //     pre-fix itable-producer gap; filed as a follow-up). Gated on
-            //     stringReleaseMode, matching the `+=`/reassignment relaxations
-            //     above (sound only for the string-release analysis, whose setter
-            //     call / field store mints an independent +1).
+            //     class (retains) OR a boxed record (plain store), a runtime
+            //     fact this static walk cannot see on its own, so the safe-read
+            //     relaxation is EXTENDED to interface-parent property-SETs
+            //     (#2535) — the corresponding call-site fix in
+            //     lowerVirtualPropertySet (the `if (ifaceNamedLocalEligible)
+            //     emitStringRetain(v)` on the record-backed path) mints the
+            //     independent +1 the scope-end release then drops, sound on
+            //     both runtime paths (class-backed: setter retained + scope-end
+            //     release, no extra retain; record-backed: setter plain-stored
+            //     + call-site retain + scope-end release — the retain
+            //     pre-balances the release so the field's plain-stored alias
+            //     stays alive past the local's scope). Without that paired
+            //     call-site fix, arming the release here alone would UAF on
+            //     the record-backed path; without arming it here, the
+            //     interface-parent class-backed path keeps leaking per call —
+            //     the very leak this fix closes. Gated on stringReleaseMode,
+            //     matching the `+=`/reassignment relaxations above (sound only
+            //     for the string-release analysis, whose setter call / field
+            //     store mints an independent +1).
             if (stringReleaseMode) {
-                bool classPropSet = false;
+                bool classOrIfacePropSet = false;
                 if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
                         as->target.get())) {
                     if (auto* ps = dynamic_cast<sema::PropertySymbol*>(
                             ctx.exprSymbol(*ma))) {
-                        classPropSet =
+                        auto k = ps->parent ? ps->parent->kind
+                                            : ast::TypeDeclKind::Class;
+                        classOrIfacePropSet =
                             !ps->isIndexer && ps->parent &&
-                            ps->parent->kind == ast::TypeDeclKind::Class;
+                            (k == ast::TypeDeclKind::Class ||
+                             k == ast::TypeDeclKind::Interface);
                     }
                 }
-                if (classPropSet) {
+                if (classOrIfacePropSet) {
                     expr(as->target.get(), /*safeRead=*/false);
                     expr(as->value.get(), /*safeRead=*/true);
                     return;

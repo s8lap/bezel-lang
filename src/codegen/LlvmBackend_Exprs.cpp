@@ -5033,6 +5033,53 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
             }
         }
     };
+    // fix #2535 (§23.3/§28.9/§11, v0.236): the NAMED-LOCAL twin of
+    // emitProducerRelease, pairing with the StringEscapeWalker's #2535
+    // AssignmentStmt relaxation (LlvmBackend_Setup.cpp ~14604 — the
+    // class-or-interface property-SET safe-read gate, closed in this
+    // commit). The walker now treats `iref.Name := s;` as a CALL-BOUNDED
+    // BORROW when `s` is the tracked local, arming its scope-end release.
+    // That release needs a paired +1 on the heap it can drop without
+    // danging any other reference — the setter provides it on the CLASS-
+    // backed path (setter retains → field has +1, local keeps its +1,
+    // scope-end release drops the local's, sound); on the RECORD-backed
+    // path the setter keeps the PLAIN STORE (§9/§9.7 — a boxed record's
+    // reference fields are borrows with no disposer), so the field ALIASES
+    // the local's only reference and the scope-end release would free the
+    // field's only ref → UAF. Mint that extra +1 here, on the record path
+    // ONLY, so the scope-end release has a balanced +1 to drop. Restricted
+    // to the NAMED LOCAL case (an IdentifierExpr whose LocalSymbol's decl
+    // is in stringReleaseEligible_ / stringBorrowRetainEligible_ — the
+    // SAME sets that the walker uses to decide whether to arm the scope-
+    // end release) so a producer-temporary RHS (whose only release is
+    // emitProducerRelease above on the class path) doesn't get a phantom
+    // retain — that would leave a stranded +1 on the heap (heap rc+1,
+    // field rc-1 at disposal, heap rc=1, leak; emitStringRetain/release
+    // are null-safe but the +1 still has no owner). Mirrors #2506's
+    // producer-release gating: a runtime owner-kind flag read from the
+    // itable's trailing word (ifaceItabSlotCount_[iface]) selects class-
+    // backed (release the producer, no extra retain) vs record-backed
+    // (skip the producer release, mint the named-local retain). On the
+    // class-vtable path (`!isIfaceProp`) no such retain is needed: the
+    // setter's own retain is unconditional for the class-gated branch
+    // (lowerImportedPropertySetValue's `classOwned` gate, mirrored by
+    // ensurePropertyAccessorFn's class-gated retain — a vtable slot is
+    // always a class's own slot, never a record's, so the class-retain
+    // invariant holds soundly and the scope-end release is balanced
+    // without help).
+    auto isTrackedStringLocalForRelease = [&](const ast::Expr* e) -> bool {
+        if (!e || currentFn_ != stringReleaseEligibleFn_) return false;
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return false;
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+        if (!loc || !loc->decl) return false;
+        const void* declNode = static_cast<const void*>(loc->decl);
+        return stringReleaseEligible_.count(declNode) ||
+               stringBorrowRetainEligible_.count(declNode);
+    };
+    bool ifaceNamedLocalEligible =
+        isIfaceProp && valueExpr && v && v->getType()->isPointerTy() &&
+        isTrackedStringLocalForRelease(valueExpr);
     if (!isIfaceProp) {
         emitProducerRelease();
     } else if (itabForFlag) {
@@ -5048,13 +5095,27 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
                 "pset.isclass");
             llvm::BasicBlock* curBB = builder_.GetInsertBlock();
             llvm::Function* fn = curBB->getParent();
-            llvm::BasicBlock* relBB =
-                llvm::BasicBlock::Create(llvm_, "pset.rel", fn);
+            llvm::BasicBlock* classBB =
+                llvm::BasicBlock::Create(llvm_, "pset.class", fn);
+            llvm::BasicBlock* recordBB =
+                llvm::BasicBlock::Create(llvm_, "pset.record", fn);
             llvm::BasicBlock* doneBB =
                 llvm::BasicBlock::Create(llvm_, "pset.done", fn);
-            builder_.CreateCondBr(isClassBacked, relBB, doneBB);
-            builder_.SetInsertPoint(relBB);
+            builder_.CreateCondBr(isClassBacked, classBB, recordBB);
+            // CLASS-backed branch: setter retained → producer release (if RHS
+            // is a producer) balances it; no extra retain needed (the class
+            // setter's retain is the field's +1; scope-end release on the
+            // local drops the local's +1; both +1's are accounted for).
+            builder_.SetInsertPoint(classBB);
             emitProducerRelease();
+            builder_.CreateBr(doneBB);
+            // RECORD-backed branch: setter plain-stored → skip producer
+            // release (would UAF the field's only ref). For a tracked-string
+            // NAMED LOCAL RHS, mint the extra +1 here so the walker's
+            // scope-end release on the local has a balanced +1 to drop.
+            builder_.SetInsertPoint(recordBB);
+            if (ifaceNamedLocalEligible)
+                emitStringRetain(v);
             builder_.CreateBr(doneBB);
             builder_.SetInsertPoint(doneBB);
         }
