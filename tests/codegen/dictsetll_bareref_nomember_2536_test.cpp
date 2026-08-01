@@ -711,3 +711,311 @@ BEZEL_TEST(dictsetll_bareref_nomember_2536,
     BEZEL_EXPECT_TRUE(
         hasError(program, "\xC2\xA7""4.18"));
 }
+
+// ── Issue #2537 (sibling of #2536; mirror of #2470/#2492; language spec
+//    §27.6): a BARE reference to a REAL, documented METHOD on the same
+//    eight families the #2536 catch-all covers — OwningDictionary,
+//    Dictionary, SortedDictionary, Set, OwningSet, SortedSet, LinkedList,
+//    OwningLinkedList — used to ICE (the #2434 silent zero-init
+//    degradation: codegen's `lowerLocalDecl` fallback emitted an "internal:
+//    lowerLocalDecl's initializer expression failed to lower" message
+//    because `ma`'s exprType was left UNSET and the LocalDecl's inferred
+//    type was lost). The #2536 block's allow-list for documented members
+//    (`isDeclaredMethod || isLinqOperator || isUniversalObjectMember`)
+//    deliberately EXCLUDED them from the generic "no member" reject, so
+//    the bare reference fell through. The fix adds a SECOND reject path
+//    immediately before the #2536 catch-all that fires the same §27.6
+//    "real member but no function value" diagnostic #2470/#2492 used for
+//    Array/Stack/Queue, citing the family's stdlib section and #2537.
+//    The CALL form (exempted by `!isCallForm`) is completely unaffected.
+//
+//    Each axis below asserts BOTH the §27.6 reject fires AND the pre-fix
+//    #2434 internal ICE does NOT (so the test FAILS without the fix: the
+//    program compiled and silently ICE'd, no real reject fires; and
+//    PASSES with the fix: the reject fires and the ICE is gone). Per
+//    tests/README.md, asserting on the diagnostic TEXT is load-bearing —
+//    runAot's WIFSIGNALED path synthesizes an Error diagnostic for a
+//    runtime crash too, so a genuine rejection must be distinguished by
+//    its message, not by exit code or `!r.ran` alone.
+
+// ── Per-family documented-METHOD bare references (#2537) ────────────────
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           dictionary_add_bare_ref_realmember_rejected_2537) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var d := new Dictionary<string, int>(); "
+        "d[\"a\"] := 1; "
+        "var f := d.Add; "
+        "f(\"b\", 2); "
+        "return 0; "
+        "end Main; end C;";
+    // The §27.6 "real member but no function value" diagnostic must fire...
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "a bare reference to `Add`"));
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "is not yet supported on `Dictionary`"));
+    BEZEL_EXPECT_TRUE(hasError(program, "\xC2\xA7""4.8"));
+    BEZEL_EXPECT_TRUE(hasError(program, "#2537"));
+    // ...and the pre-fix #2434 internal ICE must NOT.
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+    // ...and the generic "no member" wording from the #2536 catch-all
+    // must NOT — the message must be the §27.6 one, not the "no member"
+    // one (the member IS real).
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "no member `Add` on `Dictionary`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           owningdictionary_popvalue_bare_ref_realmember_rejected_2537) {
+    // Per stdlib §4.9: PopValue is OwningDictionary-specific (no
+    // borrowing counterpart). Test the owning-only method to confirm the
+    // #2537 reject covers it.
+    const std::string program =
+        "module M; "
+        "class V public N: int := 0; "
+        "public constructor(n: int) this.N := n; end constructor; end V; "
+        "class C public static method Main(): int "
+        "using var d := new OwningDictionary<string, V>(); "
+        "d.Add(\"a\", new V(1)); "
+        "var f := d.PopValue; "
+        "d.Dispose(); "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "a bare reference to `PopValue`"));
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "is not yet supported on `OwningDictionary`"));
+    BEZEL_EXPECT_TRUE(hasError(program, "\xC2\xA7""4.9"));
+    BEZEL_EXPECT_TRUE(hasError(program, "#2537"));
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "no member `PopValue` on `OwningDictionary`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           sorteddictionary_containskey_bare_ref_realmember_rejected_2537) {
+    // Per stdlib §4.17: SortedDictionary drops Add/GetOrAdd but keeps
+    // ContainsKey/TryGetValue/GetOrNull/Remove/Clear. Use ContainsKey.
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var d := new SortedDictionary<string, int>(); "
+        "d[\"a\"] := 1; "
+        "var f := d.ContainsKey; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "a bare reference to `ContainsKey`"));
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "is not yet supported on `SortedDictionary`"));
+    BEZEL_EXPECT_TRUE(hasError(program, "\xC2\xA7""4.17"));
+    BEZEL_EXPECT_TRUE(hasError(program, "#2537"));
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           set_contains_bare_ref_realmember_rejected_2537) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var s := new Set<int>(); "
+        "s.Add(1); "
+        "var f := s.Contains; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "a bare reference to `Contains`"));
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "is not yet supported on `Set`"));
+    BEZEL_EXPECT_TRUE(hasError(program, "\xC2\xA7""4.10"));
+    BEZEL_EXPECT_TRUE(hasError(program, "#2537"));
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           owningset_take_bare_ref_realmember_rejected_2537) {
+    // Per stdlib §4.10: Take is OwningSet-specific. Confirm the #2537
+    // reject covers owning-only methods on OwningSet.
+    const std::string program =
+        "module M; "
+        "class E public N: int := 0; end E; "
+        "class C public static method Main(): int "
+        "using var s := new OwningSet<E>(); "
+        "s.Add(new E()); "
+        "var f := s.Take; "
+        "s.Dispose(); "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "a bare reference to `Take`"));
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "is not yet supported on `OwningSet`"));
+    BEZEL_EXPECT_TRUE(hasError(program, "\xC2\xA7""4.10"));
+    BEZEL_EXPECT_TRUE(hasError(program, "#2537"));
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           sortedset_remove_bare_ref_realmember_rejected_2537) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var s := new SortedSet<int>(); "
+        "s.Add(1); "
+        "var f := s.Remove; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "a bare reference to `Remove`"));
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "is not yet supported on `SortedSet`"));
+    BEZEL_EXPECT_TRUE(hasError(program, "\xC2\xA7""4.18"));
+    BEZEL_EXPECT_TRUE(hasError(program, "#2537"));
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           linkedlist_addlast_bare_ref_realmember_rejected_2537) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var ll := new LinkedList<int>(); "
+        "var f := ll.AddLast; "
+        "f(1); "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "a bare reference to `AddLast`"));
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "is not yet supported on `LinkedList`"));
+    BEZEL_EXPECT_TRUE(hasError(program, "\xC2\xA7""4.6"));
+    BEZEL_EXPECT_TRUE(hasError(program, "#2537"));
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           owninglinkedlist_popfirst_bare_ref_realmember_rejected_2537) {
+    // Per stdlib §4.7: PopFirst/PopLast/TryPopFirst/TryPopLast are
+    // OwningLinkedList-only. Confirm the #2537 reject covers them.
+    const std::string program =
+        "module M; "
+        "class E public N: int := 0; end E; "
+        "class C public static method Main(): int "
+        "using var ll := new OwningLinkedList<E>(); "
+        "ll.AddFirst(new E()); "
+        "var f := ll.PopFirst; "
+        "ll.Dispose(); "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "a bare reference to `PopFirst`"));
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "is not yet supported on `OwningLinkedList`"));
+    BEZEL_EXPECT_TRUE(hasError(program, "\xC2\xA7""4.7"));
+    BEZEL_EXPECT_TRUE(hasError(program, "#2537"));
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+}
+
+// ── Universal Object member (ToString) bare reference — same §27.6
+//    reject applies; mirrors #2470's fold of isUniversalObjectMember
+//    into the same path. ────────────────────────────────────────────────
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           set_tostring_bare_ref_realmember_rejected_2537) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var s := new Set<int>(); "
+        "s.Add(1); "
+        "var f := s.ToString; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "a bare reference to `ToString`"));
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "is not yet supported on `Set`"));
+    BEZEL_EXPECT_TRUE(hasError(program, "#2537"));
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+}
+
+// ── LINQ operator (Where) bare reference — same §27.6 reject applies;
+//    mirrors #2492's fold of isLinqOperator into the same path. ────────
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           dictionary_where_bare_ref_realmember_rejected_2537) {
+    const std::string program =
+        "module M; import System.Collections.Linq; "
+        "class C public static method Main(): int "
+        "var d := new Dictionary<string, int>(); "
+        "d[\"a\"] := 1; "
+        "var f := d.Where; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "a bare reference to `Where`"));
+    BEZEL_EXPECT_TRUE(hasError(
+        program, "is not yet supported on `Dictionary`"));
+    BEZEL_EXPECT_TRUE(hasError(program, "#2537"));
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+}
+
+// ── False-reject guard: the CALL form on a real method must still
+//    compile and work. The §27.6 reject is gated on `!isCallForm`. ────
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           dictionary_add_call_form_unaffected_2537) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var d := new Dictionary<string, int>(); "
+        "d[\"a\"] := 1; "
+        "d.Add(\"b\", 2); "
+        "var b: bool := d.ContainsKey(\"a\"); "
+        "return (if b then 1 else 0); "
+        "end Main; end C;";
+    // No §27.6 reject, no "no member" reject, no ICE — the CALL form is
+    // structurally dispatched in codegen (the #2537 reject is gated on
+    // `!isCallForm`).
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "a bare reference to `Add`"));
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "no member `Add` on `Dictionary`"));
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           set_add_call_form_unaffected_2537) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var s := new Set<int>(); "
+        "s.Add(1); "
+        "s.Add(2); "
+        "var b: bool := s.Contains(1); "
+        "return (if b then 1 else 0); "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "a bare reference to `Add`"));
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "no member `Add` on `Set`"));
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           linkedlist_addfirst_call_form_unaffected_2537) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var ll := new LinkedList<int>(); "
+        "ll.AddFirst(1); "
+        "ll.AddFirst(2); "
+        "return ll.Count; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "a bare reference to `AddFirst`"));
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "no member `AddFirst` on `LinkedList`"));
+    BEZEL_EXPECT_TRUE(!hasInternalIce(program));
+}

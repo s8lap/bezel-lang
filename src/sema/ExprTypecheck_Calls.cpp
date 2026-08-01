@@ -12584,6 +12584,200 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // #2537 (sibling of #2536; mirror of #2470/#2492; stdlib
+        // §4.7/§4.8/§4.9/§4.10/§4.17/§4.18; language spec §8.1/§27.6): a
+        // BARE reference to a REAL, documented method on the same eight
+        // declaration-less builtin collection families the #2536 catch-all
+        // below covers — OwningDictionary, Dictionary, SortedDictionary,
+        // Set, OwningSet, SortedSet, LinkedList, OwningLinkedList — has
+        // the same no-MethodSymbol shape #2470/#2492 reported for Array/
+        // OwningArray/Stack/OwningStack/Queue/OwningQueue: these
+        // collections' native methods are dispatched STRUCTURALLY in
+        // codegen (tryLowerCollectionInstanceCall, the per-call-site lists
+        // in typeCall, and the §5 LINQ dispatch in tryLowerLinqOperatorCall),
+        // never through a real declared-method symbol, so a bare reference
+        // `var f := d.Add;` left `ma`'s exprType UNSET, the LocalDecl's
+        // inferred type was lost, and codegen's #2434 fallback degraded the
+        // local to a zero-init `i32` — `f(...)` later emitted no code at
+        // all (not even a null-pointer crash), the silent-no-op shape #2434
+        // /#2470/#2492 documented. The #2536 block's allow-list
+        // (`isDeclaredMethod || isLinqOperator || isUniversalObjectMember`)
+        // deliberately EXCLUDES these names from the generic "no member"
+        // reject — exactly to avoid a false "no member" diagnostic for a
+        // name that IS documented — but the allow-list then fell through
+        // to the #2434 zero-init ICE. This block fires the same §27.6
+        // "real member but no function value" reject #2470/#2492
+        // introduced for Array/Stack/Queue, citing the family's stdlib
+        // section (one of §4.7/§4.8/§4.9/§4.10/§4.17/§4.18) and #2537
+        // instead of #2470/#2492 (the mechanism is the same; the issue
+        // number is new because the family and the fix are). The CALL
+        // form (`d.Add(...)`, `s.Contains(...)`, `ll.AddFirst(...)`,
+        // `isCallForm` below) is exempted — it routes through
+        // calleeOfCallCtx_ and the existing CALL-site structural dispatch
+        // is completely unaffected. Property names (`Count`/`Keys`/
+        // `Values`) and `IsReadOnly` for the five conformers are NOT in
+        // this reject — they are typed by the property handlers at ~10908/
+        // ~10947 (Count on every family; Keys/Values on Dictionary/
+        // OwningDictionary/SortedDictionary) or are a separate property-
+        // reference gap (IsReadOnly on the five conformers, not the
+        // scope of this fix). Filed rather than silently extended here to
+        // match the #2536 block's "leave property references to the
+        // property handler" stance.
+        if (ma.target && !ctx_.exprType(ma)) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty()) {
+                    std::string_view cn = tt->headName();
+                    bool isOwningDictionary = cn == "OwningDictionary";
+                    bool isDictionaryFamily =
+                        cn == "Dictionary" || cn == "SortedDictionary";
+                    bool isSetFamily =
+                        cn == "Set" || cn == "OwningSet" ||
+                        cn == "SortedSet";
+                    bool isLinkedListFamily =
+                        cn == "LinkedList" || cn == "OwningLinkedList";
+                    if (isOwningDictionary || isDictionaryFamily ||
+                        isSetFamily || isLinkedListFamily) {
+                        const auto& mbr = ma.member;
+                        bool isCallForm = &ma == calleeOfCallCtx_;
+                        // Universal Object members every reference type
+                        // carries (language spec §8.1) — same union
+                        // #2536 / #2457 / #2470 use.
+                        bool isUniversalObjectMember =
+                            mbr == "ToString" || mbr == "Equals" ||
+                            mbr == "GetHashCode" || mbr == "GetType" ||
+                            mbr == "ReferenceEquals";
+                        // Per-family documented METHODS, transcribed
+                        // verbatim from the #2536 block's `isDeclaredMethod`
+                        // below (including the #2538 expand: GetEnumerator
+                        // on every family EXCEPT OwningDictionary — that
+                        // case is caught by the #2521 distinct diagnostic
+                        // above, which returns before this block runs;
+                        // TryAdd on Set/OwningSet/SortedSet; PopValue/
+                        // TryPopValue/Drain on OwningDictionary only;
+                        // PopFirst/PopLast/TryPopFirst/TryPopLast on
+                        // OwningLinkedList only; Dispose on every owning
+                        // family). Excluding property names on purpose
+                        // (see the block comment).
+                        bool isDeclaredMethod =
+                            // Dictionary/OwningDictionary/
+                            // SortedDictionary shared surface
+                            mbr == "Add" || mbr == "Contains" ||
+                            mbr == "ContainsKey" ||
+                            mbr == "Remove" || mbr == "TryGetValue" ||
+                            mbr == "GetOrNull" || mbr == "GetOrAdd" ||
+                            mbr == "Clear" ||
+                            // OwningDictionary-only (stdlib §4.9)
+                            mbr == "PopValue" || mbr == "TryPopValue" ||
+                            mbr == "Drain" ||
+                            // Set/OwningSet/SortedSet surface
+                            mbr == "UnionWith" ||
+                            mbr == "IntersectWith" ||
+                            mbr == "ExceptWith" ||
+                            mbr == "IsSubsetOf" ||
+                            mbr == "IsSupersetOf" ||
+                            // Set/OwningSet/SortedSet — stdlib §4.10/§4.18
+                            mbr == "TryAdd" ||
+                            // LinkedList/OwningLinkedList surface
+                            mbr == "AddFirst" || mbr == "AddLast" ||
+                            mbr == "AddBefore" || mbr == "AddAfter" ||
+                            mbr == "RemoveFirst" ||
+                            mbr == "RemoveLast" ||
+                            mbr == "RemoveNode" || mbr == "Find" ||
+                            // OwningLinkedList-only (stdlib §4.7)
+                            mbr == "PopFirst" || mbr == "PopLast" ||
+                            mbr == "TryPopFirst" ||
+                            mbr == "TryPopLast" ||
+                            // IDisposable (every owning family)
+                            mbr == "Dispose" ||
+                            // #2538: IEnumerable<T> ancestor
+                            // (ICollection<T>/IReadOnlyCollection<T>/
+                            // IOwningCollection<T>). All seven families
+                            // EXCEPT OwningDictionary inherit it
+                            // (OwningDictionary's GetEnumerator is the
+                            // #2521 distinct diagnostic above — that
+                            // block returns before this one runs).
+                            mbr == "GetEnumerator";
+                        // stdlib §5 IEnumerable<T> LINQ extension
+                        // operators. Mirrors the #2536 block's identical
+                        // list verbatim (the same #2484 transcription
+                        // with MinOrNull/MaxOrNull included).
+                        bool isLinqOperator =
+                            mbr == "Where" || mbr == "OfType" ||
+                            mbr == "Select" || mbr == "SelectMany" ||
+                            mbr == "Any" || mbr == "All" ||
+                            mbr == "First" || mbr == "FirstOrNull" ||
+                            mbr == "Last" || mbr == "LastOrNull" ||
+                            mbr == "Single" || mbr == "SingleOrNull" ||
+                            mbr == "ElementAt" || mbr == "Sum" ||
+                            mbr == "Min" || mbr == "Max" ||
+                            mbr == "MinOrNull" || mbr == "MaxOrNull" ||
+                            mbr == "Average" || mbr == "Aggregate" ||
+                            mbr == "OrderBy" ||
+                            mbr == "OrderByDescending" ||
+                            mbr == "Distinct" || mbr == "Union" ||
+                            mbr == "Intersect" || mbr == "Except" ||
+                            mbr == "Take" || mbr == "TakeWhile" ||
+                            mbr == "Skip" || mbr == "SkipWhile" ||
+                            mbr == "Concat" || mbr == "Zip" ||
+                            mbr == "GroupBy" || mbr == "ToArray" ||
+                            mbr == "ToDictionary" ||
+                            mbr == "ToSet" || mbr == "ThenBy" ||
+                            mbr == "ThenByDescending";
+                        if (!isCallForm &&
+                            (isUniversalObjectMember || isDeclaredMethod ||
+                             isLinqOperator)) {
+                            // Family-specific stdlib-section citation —
+                            // exactly the same set the #2536 catch-all
+                            // below uses, so the two rejects are
+                            // internally consistent.
+                            const char* section = "\xC2\xA7""4.x";
+                            if (isOwningDictionary) {
+                                section = "\xC2\xA7""4.9";
+                            } else if (isDictionaryFamily) {
+                                section = cn == "Dictionary"
+                                    ? "\xC2\xA7""4.8"
+                                    : "\xC2\xA7""4.17";
+                            } else if (isSetFamily) {
+                                section = cn == "SortedSet"
+                                    ? "\xC2\xA7""4.18"
+                                    : "\xC2\xA7""4.10";
+                            } else {
+                                // isLinkedListFamily: LinkedList §4.6,
+                                // OwningLinkedList §4.7.
+                                section = cn == "OwningLinkedList"
+                                    ? "\xC2\xA7""4.7"
+                                    : "\xC2\xA7""4.6";
+                            }
+                            auto loc = ma.span.begin;
+                            if (loc.line == 0 && ma.target)
+                                loc = ma.target->span.begin;
+                            ctx_.diagnostics().report(
+                                Severity::Error, loc,
+                                std::string("a bare reference to `") +
+                                    std::string(mbr) + "` (language spec "
+                                    "\xC2\xA7""27.6) is not yet "
+                                    "supported on `" + std::string(cn) +
+                                    "` (stdlib " + std::string(section) +
+                                    ", #2537): `" + std::string(mbr) +
+                                    "` is a real member (declared, a "
+                                    "universal Object member -- language "
+                                    "spec \xC2\xA7""8.1, or a stdlib "
+                                    "\xC2\xA7""5 LINQ extension "
+                                    "operator), but this builtin "
+                                    "collection dispatches it "
+                                    "structurally rather than through a "
+                                    "real method symbol, so no function "
+                                    "value can be formed for it yet "
+                                    "-- call it directly instead (`." +
+                                    std::string(mbr) + "(...)`)");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
         // #2536 (stdlib §4.7/§4.8/§4.9/§4.10/§4.17/§4.18; language spec
         // §8.1/§27.6): bare-reference catch-all "no member" reject for the
         // collection families NOT covered by the #2457 per-family blocks
