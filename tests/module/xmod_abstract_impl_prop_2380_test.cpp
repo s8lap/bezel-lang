@@ -177,6 +177,39 @@ bool compileImportSucceeds2380(const std::string& libSrc,
     return driver.compileFile(bSrc.path, bExe.path, deps).success;
 }
 
+struct ImportCapture2542 {
+    bool dependencyCompiled = false;
+    bool appCompiled = false;
+    std::string error;
+};
+
+// Compile a source-text dependency, then compile an importer while capturing
+// the importer's diagnostic text. Each reject test first asserts that the
+// dependency genuinely compiled, so a malformed two-module setup cannot turn
+// the expected importer rejection into a vacuous pass.
+ImportCapture2542 compileImportSources2542(const std::string& libSrc,
+                                           const std::string& appSrc) {
+    namespace fs = std::filesystem;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bz2542_" + std::to_string(std::rand());
+    TempFile2380 aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile2380 aObj((dir / (stem + "_a.o")).string());
+    writeSource2380(aSrc.path, libSrc);
+
+    ImportCapture2542 out;
+    out.dependencyCompiled =
+        compileToObj2380(aSrc.path, aObj.path) &&
+        std::ifstream(aObj.path).good();
+    if (!out.dependencyCompiled) return out;
+
+    TempFile2380 bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile2380 bExe((dir / (stem + "_b")).string());
+    writeSource2380(bSrc.path, appSrc);
+    out.appCompiled = compileImportCaptureErr2380(
+        bSrc.path, bExe.path, aObj.path, out.error);
+    return out;
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -355,16 +388,22 @@ BEZEL_TEST(xmod_abstract_impl_prop_2380,
 }
 
 // ===========================================================================
-// T5 — ACCEPT + RUN + VALUE: a correct READ-ONLY implementation of an imported
-// interface's property still compiles AND dispatches to the right value across
-// the module boundary.
+// T5 — ACCEPT + RUN + VALUE: a correct READ-ONLY implementation of an
+// imported READ-ONLY interface property still compiles AND dispatches to the
+// right value across the module boundary.
+//
+// Updated by #2542 (§11.2 / §23.3, v0.236): this control originally omitted
+// `readonly` from the interface declaration, accidentally pinning the bug — a
+// getter-only member does not satisfy a read-write interface property. Keep the
+// intended getter-only-vs-readonly control by spelling the interface obligation
+// correctly.
 // ===========================================================================
 BEZEL_TEST(xmod_abstract_impl_prop_2380,
            readonly_correct_implementation_runs_and_dispatches) {
     int r = compileImportAndRun2380(
         "module PropIfaceLib2380T5; "
         "public interface IHasName2380T5 "
-        "  property Name: int; "
+        "  readonly property Name: int; "
         "end IHasName2380T5;",
         "module App2380T5; import PropIfaceLib2380T5; "
         "public class GoodProp2380T5: IHasName2380T5 "
@@ -444,14 +483,17 @@ BEZEL_TEST(xmod_abstract_impl_prop_2380,
 
 // ===========================================================================
 // T7 — ACCEPT-CONTROL (compiles only — see the file header for why the value
-// is not asserted): a CORRECT property inherited from an imported base class,
-// satisfying a local interface's obligation with the RIGHT type, still
-// compiles clean. Guards against the fix over-widening `propType`'s fallback
-// into a false REJECT of a correct T3-shaped witness. Does NOT run the
-// program: this shape hits the separate, PRE-EXISTING codegen null-itable-slot
-// crash documented in the file header (filed as its own issue, out of #2380's
-// sema-only scope) — asserting only compilation keeps this a regression guard
-// on the SEMA fix without asserting on the separately-broken codegen path.
+// is not asserted): a CORRECT getter-only property inherited from an imported
+// base class satisfies a local READ-ONLY interface obligation with the RIGHT
+// type and still compiles clean. Guards against the fix over-widening
+// `propType`'s fallback into a false REJECT of a correct T3-shaped witness.
+// Updated by #2542 (§11.2 / §23.3, v0.236): the interface originally omitted
+// `readonly`, accidentally pinning the imported-candidate accessor-presence
+// bug this fix closes. Does NOT run the program: this shape hits the separate,
+// PRE-EXISTING codegen null-itable-slot crash documented in the file header
+// (filed as its own issue, out of #2380's sema-only scope) — asserting only
+// compilation keeps this a regression guard on the SEMA fix without asserting
+// on the separately-broken codegen path.
 // ===========================================================================
 BEZEL_TEST(xmod_abstract_impl_prop_2380,
            property_inherited_from_imported_base_class_correct_still_compiles) {
@@ -462,12 +504,155 @@ BEZEL_TEST(xmod_abstract_impl_prop_2380,
         "end BaseWithProp2380T7;",
         "module App2380T7; import BasePropLib2380T7; "
         "public interface IHasName2380T7 "
-        "  property Name: int; "
+        "  readonly property Name: int; "
         "end IHasName2380T7; "
         "public class Derived2380T7: BaseWithProp2380T7, IHasName2380T7 "
         "end Derived2380T7; "
         "public class C public static method Main(): int => 0; end C;");
     BEZEL_EXPECT_TRUE(ok);
+}
+
+// ===========================================================================
+// #2542 (§11.2 / §23.3 / §2.8.2 clause 1 / §2.8.3 rule 4,
+// v0.236): imported PropertySymbols have no ast::PropertyDecl. The named-
+// property accessor-presence check used to skip whenever either the interface
+// obligation or its candidate was imported, even though ModuleLoader already
+// publishes MetaMember::hasSetter through importedPropertyHasSetter. These
+// reject cases assert the specific conformance diagnostic text, not merely a
+// failed compile, and first prove that the dependency artifact was produced.
+// ===========================================================================
+BEZEL_TEST(xmod_iface_property_accessor_2542,
+           imported_readwrite_iface_getter_only_class_rejected_11_2_23_3) {
+    auto r = compileImportSources2542(
+        "module PropIfaceLib2542T1; "
+        "public interface IProp2542T1 "
+        "  property Name: int; "
+        "end IProp2542T1;",
+        "module PropIfaceApp2542T1; import PropIfaceLib2542T1; "
+        "public class GetterOnly2542T1: IProp2542T1 "
+        "  private _n: int := 7; "
+        "  public property Name: int => _n + 1; "
+        "end GetterOnly2542T1; "
+        "public class C public static method Main(): int => 0; end C;");
+    BEZEL_EXPECT_TRUE(r.dependencyCompiled);
+    if (!r.dependencyCompiled) return;
+    BEZEL_EXPECT_TRUE(!r.appCompiled);
+    BEZEL_EXPECT_TRUE(r.error.find("property `Name` implements interface") !=
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("getter-only implementation") !=
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("declared read-write") != std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("must provide a setter") !=
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("11.2") != std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("23.3") != std::string::npos);
+}
+
+// The same imported obligation implemented by an explicit getter-only RECORD
+// property. This exercises the identical concreteProps branch with `t` a
+// record, per §9.6's rule that records may implement interfaces.
+BEZEL_TEST(xmod_iface_property_accessor_2542,
+           imported_readwrite_iface_getter_only_record_rejected_9_6_11_2) {
+    auto r = compileImportSources2542(
+        "module PropIfaceLib2542T2; "
+        "public interface IProp2542T2 "
+        "  property Name: int; "
+        "end IProp2542T2;",
+        "module PropIfaceApp2542T2; import PropIfaceLib2542T2; "
+        "public record GetterOnly2542T2(X: int): IProp2542T2 "
+        "  public property Name: int => X; "
+        "end GetterOnly2542T2; "
+        "public class C public static method Main(): int => 0; end C;");
+    BEZEL_EXPECT_TRUE(r.dependencyCompiled);
+    if (!r.dependencyCompiled) return;
+    BEZEL_EXPECT_TRUE(!r.appCompiled);
+    BEZEL_EXPECT_TRUE(r.error.find("getter-only implementation") !=
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("declared read-write") != std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("must provide a setter") !=
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("11.2") != std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("23.3") != std::string::npos);
+}
+
+// A positional record field is represented as a FieldSymbol rather than a
+// PropertySymbol and reaches the sibling concretePosFields branch. Its
+// generated §9.1/§9.4 property is always getter-only, so an IMPORTED
+// read-write obligation must be rejected there too.
+BEZEL_TEST(xmod_iface_property_accessor_2542,
+           imported_readwrite_iface_positional_record_rejected_9_1_9_4_11_2) {
+    auto r = compileImportSources2542(
+        "module PropIfaceLib2542T3; "
+        "public interface IProp2542T3 "
+        "  property Name: int; "
+        "end IProp2542T3;",
+        "module PropIfaceApp2542T3; import PropIfaceLib2542T3; "
+        "public record Positional2542T3(Name: int): IProp2542T3 "
+        "end Positional2542T3; "
+        "public class C public static method Main(): int => 0; end C;");
+    BEZEL_EXPECT_TRUE(r.dependencyCompiled);
+    if (!r.dependencyCompiled) return;
+    BEZEL_EXPECT_TRUE(!r.appCompiled);
+    BEZEL_EXPECT_TRUE(r.error.find("positional field (§9.1)") !=
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("always getter-only") != std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("declared read-write") != std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("must provide a setter") !=
+                      std::string::npos);
+}
+
+// The other side of the old `!ipd || !cpd` gate: a LOCAL read-write interface
+// obligation satisfied by a getter-only property inherited from an IMPORTED
+// base class. `cpd` is null, so candidate accessor presence must use the same
+// imported metadata fallback.
+BEZEL_TEST(xmod_iface_property_accessor_2542,
+           getter_only_imported_base_candidate_rejected_11_2_23_3) {
+    auto r = compileImportSources2542(
+        "module PropBaseLib2542T4; "
+        "public class GetterOnlyBase2542T4 "
+        "  public property Name: int => 7; "
+        "end GetterOnlyBase2542T4;",
+        "module PropIfaceApp2542T4; import PropBaseLib2542T4; "
+        "public interface IProp2542T4 "
+        "  property Name: int; "
+        "end IProp2542T4; "
+        "public class Derived2542T4: GetterOnlyBase2542T4, IProp2542T4 "
+        "end Derived2542T4; "
+        "public class C public static method Main(): int => 0; end C;");
+    BEZEL_EXPECT_TRUE(r.dependencyCompiled);
+    if (!r.dependencyCompiled) return;
+    BEZEL_EXPECT_TRUE(!r.appCompiled);
+    BEZEL_EXPECT_TRUE(r.error.find("getter-only implementation") !=
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("declared read-write") != std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("must provide a setter") !=
+                      std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("11.2") != std::string::npos);
+    BEZEL_EXPECT_TRUE(r.error.find("23.3") != std::string::npos);
+}
+
+// False-reject guard for the positional-record branch: an imported READ-ONLY
+// obligation is fully satisfied by §9.1's generated getter-only property and
+// still dispatches the expected value across the module boundary.
+BEZEL_TEST(xmod_iface_property_accessor_2542,
+           imported_readonly_iface_positional_record_runs_correct_value) {
+    int r = compileImportAndRun2380(
+        "module PropIfaceLib2542T5; "
+        "public interface IProp2542T5 "
+        "  readonly property Name: int; "
+        "end IProp2542T5;",
+        "module PropIfaceApp2542T5; import PropIfaceLib2542T5; "
+        "public record Positional2542T5(Name: int): IProp2542T5 "
+        "end Positional2542T5; "
+        "public class C "
+        "  public static method Main(): int "
+        "    var value := new Positional2542T5(42); "
+        "    var face: IProp2542T5 := value; "
+        "    return face.Name; "
+        "  end Main; "
+        "end C;");
+    if (r == -2) return;
+    BEZEL_EXPECT_EQ(r, 42);
 }
 
 }  // namespace bezel::module
