@@ -5075,7 +5075,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                          // so GetEnumerator yields genericArgs[0] (T).
                          colName == "Set" || colName == "OwningSet" ||
                          colName == "LinkedList" ||
-                         colName == "OwningLinkedList") &&
+                         colName == "OwningLinkedList" ||
+                         // #2546 (stdlib §4.18; language spec §29.1, v0.236):
+                         // SortedSet<T> joins this block — explicit
+                         // `.GetEnumerator()` previously fell through the
+                         // sema gate (the call's result type was never set to
+                         // IEnumerator<T>, so lowerLocalDecl's initializer
+                         // degraded to a zero-initialized value — #2434).
+                         // SortedSet conforms to IReadOnlyCollection<T> via
+                         // ICollection<T>, so GetEnumerator yields T
+                         // (genericArgs[0]).
+                         colName == "SortedSet") &&
                         m == "GetEnumerator" && ce.args.empty() &&
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                         static const ast::Type* kIEnumeratorNode =
@@ -5104,7 +5114,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // manual-protocol MoveNext()→bool/#494 Current typing fires
                     // and codegen's wrap gate (LlvmBackend_Calls2.cpp)
                     // dispatches it through the entry-materialization path.
-                    if (colName == "Dictionary" &&
+                    if ((colName == "Dictionary" ||
+                         // #2546 (stdlib §4.17; language spec §29.1, v0.236):
+                         // SortedDictionary<K,V> joins this block — explicit
+                         // `.GetEnumerator()` previously fell through the
+                         // sema gate (the call's result type was never set to
+                         // IEnumerator<DictionaryEntry<K,V>>, so the call
+                         // expression carried no exprType and downstream
+                         // lowering could not produce a usable local).
+                         // SortedDictionary conforms to IReadOnlyCollection<
+                         // DictionaryEntry<K,V>> via ICollection<DictionaryEntry
+                         // <K,V>>, so GetEnumerator yields DictionaryEntry<K,V>
+                         // (the entry built from genericArgs[0] (K) and
+                         // genericArgs[1] (V)).
+                         colName == "SortedDictionary") &&
                         m == "GetEnumerator" && ce.args.empty() &&
                         recvTy && recvTy->genericArgs.size() >= 2 &&
                         recvTy->genericArgs[0] && recvTy->genericArgs[1]) {
@@ -5373,6 +5396,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  !recvTy->genericArgs.empty() &&
                                  recvTy->genericArgs[0])
                             ctx_.setExprType(&ce, recvTy->genericArgs[0]);
+                        // #2546 (stdlib §4.17; language spec §29.1, v0.236):
+                        // GetEnumerator() — the explicit-GetEnumerator typing
+                        // gate at line 5117 already types the call as
+                        // IEnumerator<DictionaryEntry<K,V>>, but the catch-all
+                        // V-return branch below would CLOBBER that type to V
+                        // (the second generic arg) and turn the local's declType
+                        // into a primitive int — breaking the §29.1 manual
+                        // protocol typing of MoveNext/Current. Skip the V-fallback
+                        // for GetEnumerator; the gate's setting is the canonical
+                        // one.
+                        else if (m == "GetEnumerator") { /* handled by the
+                            #2546 gate at line 5117; do not overwrite */ }
                         // Indexer / Value return: V (second generic arg).
                         else if (recvTy && recvTy->genericArgs.size() > 1 &&
                                  recvTy->genericArgs[1])

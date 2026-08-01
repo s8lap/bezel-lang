@@ -5034,16 +5034,40 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 //   * Dictionary<K,V>: materialises entries (bz_dict_keys_* /
                 //     bz_dict_values_*) in insertion order, matching
                 //     lowerDictEntryFor's foreach order.
+                // #2546 (stdlib §4.17/§4.18; language spec §29.1, v0.236):
+                // `.GetEnumerator()` call. Same §29.11 wrap+clone+dispose
+                // shape as the Set/LinkedList/Dictionary block above, but
+                // each routes through a sorted-snapshot wrap so the element
+                // order matches the `for x in coll do` desugaring
+                // (sorted ascending, per stdlib §4.17/§4.18 / #1426):
+                //   * SortedSet<T>: snapshot keys via bz_dict_keys_gen/str,
+                //     sort via bz_sort_keys_gen/str, decode into a fresh
+                //     bz_array_t, wrap via wrapSortedSetAsIEnumerable.
+                //   * SortedDictionary<K,V>: snapshot keys + values via
+                //     bz_dict_keys_*/values_*, sort together via
+                //     bz_sort_kv_gen/str, decode into a fresh bz_array_t
+                //     of {K, V} entries, wrap via
+                //     wrapSortedDictionaryAsIEnumerable.
                 bool isSetFam = (rbn == "Set" || rbn == "OwningSet");
                 bool isLLFam  = (rbn == "LinkedList" || rbn == "OwningLinkedList");
                 bool isDictFam = (rbn == "Dictionary");
-                if ((isSetFam || isLLFam || isDictFam) && recvTy &&
+                bool isSortedSetFam = (rbn == "SortedSet");
+                bool isSortedDictFam = (rbn == "SortedDictionary");
+                if ((isSetFam || isLLFam || isDictFam ||
+                     isSortedSetFam || isSortedDictFam) && recvTy &&
                         !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                     llvm::Value* recv = lowerExpr(*ma->target);
                     if (recv && recv->getType()->isPointerTy()) {
                         llvm::Value* iter = nullptr;
                         if (isLLFam) {
                             iter = wrapLinkedListAsIEnumerable(recv, recvTy);
+                        } else if (isSortedSetFam) {
+                            // #2546: snapshot + sort + wrap ascending.
+                            // SortedSet is always hash-backed (the
+                            // `where T: IComparable<T>` constraint excludes
+                            // class elements, so the dense-array path is
+                            // not reachable for SortedSet).
+                            iter = wrapSortedSetAsIEnumerable(recv, recvTy);
                         } else if (isSetFam) {
                             // Class-element set is array-backed (dense);
                             // value-element set is hash-backed (snapshot).
@@ -5060,7 +5084,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             } else {
                                 iter = wrapArrayAsIEnumerable(recv, recvTy);
                             }
-                        } else {  // isDictFam — sema typed result as
+                        } else {  // isDictFam / isSortedDictFam — sema typed result as
                                   // IEnumerator<DictionaryEntry<K,V>>; build
                                   // that TypeRef so wrapDictionaryAsIEnumerable
                                   // can recover K and V.
@@ -5091,7 +5115,15 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             iEnumTy->declaration = nullptr;
                             iEnumTy->astNode = kIEnumeratorDictNode;
                             iEnumTy->genericArgs.push_back(entryTy);
-                            iter = wrapDictionaryAsIEnumerable(recv, iEnumTy);
+                            // #2546: SortedDictionary sorts the snapshot
+                            // before materialising entries (#1426 promise).
+                            if (isSortedDictFam) {
+                                iter = wrapSortedDictionaryAsIEnumerable(
+                                    recv, iEnumTy);
+                            } else {
+                                iter = wrapDictionaryAsIEnumerable(
+                                    recv, iEnumTy);
+                            }
                         }
                         if (iter && iter->getType()->isPointerTy()) {
                             // slot 4: fresh independent cursor enumerator
@@ -9472,6 +9504,365 @@ llvm::Value* Emitter::tryBuildOwningEnumeratorForBuiltinSource(
     }
 
     return nullptr;
+}
+
+
+// fix #2546 (stdlib §4.18; language spec §29.1, v0.236):
+// SortedSet<T>.GetEnumerator() codegen. Mirrors the Set hash-backed path
+// (bz_dict_keys_gen → wrapped) but with a sort step so the enumerator
+// yields elements in ascending key order, matching the `for x in s do`
+// desugaring (#1426's promise). The wrap returns an OWNING vtable-backed
+// IEnumerable<T> — the same shape wrapOwnedArrayAsIEnumerable produces —
+// so the dispatch's slot-4 → GetEnumerator + slot-1 → Dispose dance
+// above applies unchanged.
+//
+// SortedSet<T> is always hash-backed (the `where T: IComparable<T>`
+// constraint excludes class elements, so the dense-array path is not
+// reachable for SortedSet). For string elements, the snapshot uses
+// bz_dict_keys_str + bz_sort_keys_str (no comparator needed); for
+// generic-key elements, bz_dict_keys_gen + bz_sort_keys_gen with a
+// per-element-type comparator built by buildSortedKeyComparator.
+//
+// Decoding mirrors wrapDictionaryAsIEnumerable's key decode (no value
+// column — SortedSet is key-only):
+//   * string: malloc + memcpy + nul + calloc + initStringRc (rebuilt
+//     bz_string; released by the wrapper's Dispose path via the owning
+//     array wrapper's Rc machinery).
+//   * generic: load key bytes (key_size bytes per element) into elemTy.
+llvm::Value* Emitter::wrapSortedSetAsIEnumerable(
+        llvm::Value* set, const sema::TypeRef* iEnumTy) {
+    if (!set || !iEnumTy || iEnumTy->genericArgs.empty() ||
+        !iEnumTy->genericArgs[0])
+        return nullptr;
+    const sema::TypeRef* elemTy = iEnumTy->genericArgs[0];
+    llvm::Type* elemLlvm = lowerTypeRef(elemTy);
+    if (!elemLlvm) return nullptr;
+    int64_t esz = (int64_t)module_->getDataLayout().getTypeAllocSize(elemLlvm);
+
+    // String fast path vs generic-key path (mirrors wrapDictionaryAsIEnumerable).
+    using K = sema::TypeRef::Kind;
+    bool isStringElem = elemTy->kind == K::Primitive &&
+                        elemTy->primitive == sema::PrimitiveType::String;
+    bool useGen = !isStringElem;
+
+    auto* keysOutSlot = entryAlloca(ptrTy());
+    auto* lensOutSlot = entryAlloca(ptrTy());
+    auto* cntSlot     = entryAlloca(i64());
+    if (useGen) {
+        auto* kfn = declareC("bz_dict_keys_gen",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {set, keysOutSlot, cntSlot});
+    } else {
+        auto* kfn = declareC("bz_dict_keys_str",
+            llvm::Type::getVoidTy(llvm_),
+            {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {set, keysOutSlot, lensOutSlot, cntSlot});
+    }
+    llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
+    llvm::Value* lensArr = isStringElem
+                               ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                               : nullptr;
+    llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
+
+    // Sort the keys (the §4.18 ascending-order promise).
+    if (useGen) {
+        llvm::Function* cmpFn = buildSortedKeyComparator(elemTy);
+        if (cmpFn) {
+            auto* sortFn = declareC("bz_sort_keys_gen",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(sortFn, {keysArr, cnt, cmpFn});
+        }
+        // Unsupported elem type → fall through unsorted (correctness note
+        // in the for-loop dispatch's #1426 commit; a future type gate
+        // can be added once buildSortedKeyComparator handles more types).
+    } else {
+        auto* sortFn = declareC("bz_sort_keys_str",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+        builder_.CreateCall(sortFn, {keysArr, lensArr, cnt});
+    }
+
+    // Allocate a fresh bz_array_t of T elements.
+    auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+    llvm::Value* arr = builder_.CreateCall(
+        allocFn, {builder_.getInt64(esz), builder_.getInt64(8)},
+        "ssenum.arr");
+    auto* addFn = declareC("bz_array_add",
+        llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+    auto* freeFn = declareC("free",
+        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+
+    // Decode loop: for each sorted key, decode into elemTy and append to arr.
+    auto* idxSlot = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+    auto* elemSlot = entryAlloca(elemLlvm);
+
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "ssenum.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ssenum.body", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "ssenum.end",  currentFn_);
+    builder_.CreateBr(condBB);
+    builder_.SetInsertPoint(condBB);
+    {
+        llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
+    }
+    builder_.SetInsertPoint(bodyBB);
+    {
+        llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
+        llvm::Value* elemDecoded;
+        if (isStringElem) {
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(),
+                                      {ptrTy(), ptrTy(), i64()});
+            auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
+            llvm::Value* kp    = builder_.CreateLoad(ptrTy(), kpPtr);
+            llvm::Value* lpPtr = builder_.CreateGEP(i64(), lensArr, idxB);
+            llvm::Value* kl    = builder_.CreateLoad(i64(), lpPtr);
+            llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
+            llvm::Value* dataCpy = builder_.CreateCall(mallocFn, {dataSz});
+            builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
+            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCpy, kl);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+            llvm::Value* strObj = builder_.CreateCall(
+                callocFn,
+                {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
+            builder_.CreateStore(dataCpy,
+                builder_.CreateStructGEP(stringType(), strObj, 0));
+            builder_.CreateStore(kl,
+                builder_.CreateStructGEP(stringType(), strObj, 1));
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
+                builder_.CreateStructGEP(stringType(), strObj, 2));
+            initStringRc(strObj);
+            builder_.CreateCall(freeFn, {kp});
+            elemDecoded = strObj;
+        } else {
+            llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
+            llvm::Value* keyPtr = builder_.CreateLoad(ptrTy(), kpPtr);
+            elemDecoded = builder_.CreateLoad(elemLlvm, keyPtr, "ssenum.kgen");
+            builder_.CreateCall(freeFn, {keyPtr});
+        }
+        builder_.CreateStore(elemDecoded, elemSlot);
+        builder_.CreateCall(addFn, {arr, elemSlot, builder_.getInt64(esz)});
+        builder_.CreateStore(
+            builder_.CreateAdd(idxB, builder_.getInt64(1)), idxSlot);
+        builder_.CreateBr(condBB);
+    }
+    builder_.SetInsertPoint(endBB);
+    builder_.CreateCall(freeFn, {keysArr});
+    if (isStringElem) builder_.CreateCall(freeFn, {lensArr});
+
+    // Wrap the materialised sorted array as an OWNING IEnumerable<T>. The
+    // string-element case uses the plain wrapOwnedArrayAsIEnumerable (the
+    // bz_array_t holds pointers directly, so the null-element-disposer
+    // bz_array_free path is correct — each slot is a bz_string* ready for
+    // bz_string_release by the owning wrapper's standard #2218-class
+    // machinery). For generic-key elements, the array is a tight
+    // key-bytes array and the plain wrapper is also correct (no per-slot
+    // heap refs).
+    return wrapOwnedArrayAsIEnumerable(arr, iEnumTy);
+}
+
+
+// fix #2546 (stdlib §4.17; language spec §29.1, v0.236):
+// SortedDictionary<K,V>.GetEnumerator() codegen. Mirrors
+// wrapDictionaryAsIEnumerable (LlvmBackend_Assign.cpp) but with a sort
+// step after the snapshot so the entries iterate in ascending key order,
+// matching the `for var e in d do` desugaring (#1426's promise). The
+// snapshot+sort is the only material difference; the entry materialisation
+// (decode key/value, build {K, V} struct, append to array) is identical to
+// wrapDictionaryAsIEnumerable's loop body, inlined here to avoid touching
+// the lane-D file.
+//
+// String-key dictionaries are routed through wrapDictionaryEntryArrayAsIEnumerable
+// (the #2522 string-key Dispose-walker) so the rebuilt bz_string keys are
+// released at Dispose; generic-key dictionaries use the plain
+// wrapOwnedArrayAsIEnumerable (null element disposer — entries are
+// inline-bytes structs with no per-slot heap refs).
+llvm::Value* Emitter::wrapSortedDictionaryAsIEnumerable(
+        llvm::Value* dict, const sema::TypeRef* iEnumTy) {
+    if (!dict || !iEnumTy) return nullptr;
+    if (iEnumTy->genericArgs.empty() || !iEnumTy->genericArgs[0]) return nullptr;
+    const sema::TypeRef* entryTy = iEnumTy->genericArgs[0];
+    if (entryTy->genericArgs.size() < 2 || !entryTy->genericArgs[0] ||
+        !entryTy->genericArgs[1])
+        return nullptr;
+    const sema::TypeRef* keyTy = entryTy->genericArgs[0];
+    const sema::TypeRef* valTy = entryTy->genericArgs[1];
+
+    // Record / nullable-val flags for value (mirrors wrapDictionaryAsIEnumerable).
+    const sema::TypeSymbol* valRec =
+        (valTy->kind == sema::TypeRef::Kind::Named && valTy->declaration &&
+         valTy->declaration->kind == ast::TypeDeclKind::Record)
+            ? valTy->declaration : nullptr;
+    bool valNullableVal = isNullableValueTy(valTy);
+
+    llvm::Type* keyLlvm = lowerTypeRef(keyTy);
+    llvm::Type* valLlvm = lowerTypeRef(valTy);
+    if (!keyLlvm || !valLlvm) return nullptr;
+    llvm::StructType* entryStTy =
+        llvm::StructType::get(llvm_, {keyLlvm, valLlvm});
+    int64_t esz = (int64_t)module_->getDataLayout().getTypeAllocSize(entryStTy);
+
+    using K = sema::TypeRef::Kind;
+    bool isStringKey = keyTy->kind == K::Primitive &&
+                       keyTy->primitive == sema::PrimitiveType::String;
+    bool useGen = !isStringKey;
+
+    auto* keysOutSlot = entryAlloca(ptrTy());
+    auto* lensOutSlot = entryAlloca(ptrTy());
+    auto* cntSlot     = entryAlloca(i64());
+    auto* valsOutSlot = entryAlloca(ptrTy());
+
+    if (useGen) {
+        auto* kfn = declareC("bz_dict_keys_gen",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {dict, keysOutSlot, cntSlot});
+        auto* vfn = declareC("bz_dict_values_gen",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(vfn, {dict, valsOutSlot, entryAlloca(i64())});
+    } else {
+        auto* kfn = declareC("bz_dict_keys_str",
+            llvm::Type::getVoidTy(llvm_),
+            {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(kfn, {dict, keysOutSlot, lensOutSlot, cntSlot});
+        auto* vfn = declareC("bz_dict_values_str",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+        builder_.CreateCall(vfn, {dict, valsOutSlot, entryAlloca(i64())});
+    }
+    llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
+    llvm::Value* lensArr = isStringKey
+                               ? builder_.CreateLoad(ptrTy(), lensOutSlot)
+                               : nullptr;
+    llvm::Value* valsArr = builder_.CreateLoad(ptrTy(), valsOutSlot);
+    llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
+
+    // Sort keys + values together (#1426's ascending-order promise).
+    if (useGen) {
+        llvm::Function* cmpFn = buildSortedKeyComparator(keyTy);
+        if (cmpFn) {
+            auto* sortFn = declareC("bz_sort_kv_gen",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(sortFn, {keysArr, valsArr, cnt, cmpFn});
+        }
+    } else {
+        auto* sortFn = declareC("bz_sort_kv_str",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy(), i64()});
+        builder_.CreateCall(sortFn, {keysArr, lensArr, valsArr, cnt});
+    }
+
+    // Allocate a fresh bz_array_t of {K, V} entries.
+    auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+    llvm::Value* arr = builder_.CreateCall(
+        allocFn, {builder_.getInt64(esz), builder_.getInt64(8)}, "sdenum.arr");
+    auto* addFn = declareC("bz_array_add",
+        llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+    auto* freeFn = declareC("free",
+        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+
+    auto* idxSlot = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+    auto* entrySlot = entryAlloca(entryStTy);
+
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "sdenum.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sdenum.body", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "sdenum.end",  currentFn_);
+    builder_.CreateBr(condBB);
+    builder_.SetInsertPoint(condBB);
+    {
+        llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+        builder_.CreateCondBr(
+            builder_.CreateICmpSLT(idx, cnt), bodyBB, endBB);
+    }
+    builder_.SetInsertPoint(bodyBB);
+    {
+        llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
+
+        // --- decode key ---
+        llvm::Value* keyDecoded;
+        if (isStringKey) {
+            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
+            auto* memcpyFn = declareC("memcpy", ptrTy(),
+                                      {ptrTy(), ptrTy(), i64()});
+            auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
+            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+            uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
+            llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
+            llvm::Value* kp    = builder_.CreateLoad(ptrTy(), kpPtr);
+            llvm::Value* lpPtr = builder_.CreateGEP(i64(), lensArr, idxB);
+            llvm::Value* kl    = builder_.CreateLoad(i64(), lpPtr);
+            llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
+            llvm::Value* dataCpy = builder_.CreateCall(mallocFn, {dataSz});
+            builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
+            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCpy, kl);
+            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
+            llvm::Value* strObj = builder_.CreateCall(
+                callocFn,
+                {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
+            builder_.CreateStore(dataCpy,
+                builder_.CreateStructGEP(stringType(), strObj, 0));
+            builder_.CreateStore(kl,
+                builder_.CreateStructGEP(stringType(), strObj, 1));
+            builder_.CreateStore(
+                llvm::ConstantInt::get(i8Ty, 1),
+                builder_.CreateStructGEP(stringType(), strObj, 2));
+            initStringRc(strObj);
+            builder_.CreateCall(freeFn, {kp});
+            keyDecoded = strObj;
+        } else {
+            llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
+            llvm::Value* keyPtr = builder_.CreateLoad(ptrTy(), kpPtr);
+            keyDecoded = builder_.CreateLoad(keyLlvm, keyPtr, "sdenum.kgen");
+            builder_.CreateCall(freeFn, {keyPtr});
+        }
+
+        // --- decode value ---
+        llvm::Value* vpPtr = builder_.CreateGEP(ptrTy(), valsArr, idxB);
+        llvm::Value* slotV = builder_.CreateLoad(ptrTy(), vpPtr);
+        llvm::Value* valDecoded;
+        if (valRec) {
+            valDecoded = builder_.CreateLoad(valLlvm, slotV, "sdenum.vrec");
+        } else if (valNullableVal && valLlvm->isStructTy()) {
+            valDecoded = builder_.CreateLoad(valLlvm, slotV, "sdenum.vnv");
+        } else if (!valLlvm->isPointerTy()) {
+            llvm::Value* asI64 = builder_.CreatePtrToInt(slotV, i64());
+            if (valLlvm->isDoubleTy())
+                valDecoded = builder_.CreateBitCast(asI64, valLlvm);
+            else if (valLlvm->isFloatTy())
+                valDecoded = builder_.CreateBitCast(
+                    builder_.CreateTrunc(asI64, i32()), valLlvm);
+            else if (valLlvm->isIntegerTy(64))
+                valDecoded = asI64;
+            else
+                valDecoded = builder_.CreateTrunc(asI64, valLlvm);
+        } else {
+            valDecoded = slotV;
+        }
+
+        builder_.CreateStore(keyDecoded,
+            builder_.CreateStructGEP(entryStTy, entrySlot, 0));
+        builder_.CreateStore(valDecoded,
+            builder_.CreateStructGEP(entryStTy, entrySlot, 1));
+        builder_.CreateCall(addFn, {arr, entrySlot, builder_.getInt64(esz)});
+        builder_.CreateStore(
+            builder_.CreateAdd(idxB, builder_.getInt64(1)), idxSlot);
+        builder_.CreateBr(condBB);
+    }
+    builder_.SetInsertPoint(endBB);
+    builder_.CreateCall(freeFn, {keysArr});
+    if (isStringKey) builder_.CreateCall(freeFn, {lensArr});
+    builder_.CreateCall(freeFn, {valsArr});
+
+    // String keys: use the #2522 string-key Dispose-walker so the rebuilt
+    // bz_string keys are released. Generic-key: use the plain
+    // wrapOwnedArrayAsIEnumerable (entries are inline-bytes structs).
+    if (isStringKey) {
+        return wrapDictionaryEntryArrayAsIEnumerable(
+            arr, iEnumTy, entryStTy, esz);
+    }
+    return wrapOwnedArrayAsIEnumerable(arr, iEnumTy);
 }
 
 

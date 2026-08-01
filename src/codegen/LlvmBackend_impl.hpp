@@ -5307,6 +5307,29 @@ private:
         llvm::StructType* entryStTy,
         int64_t esz);
 
+    // fix #2546 (stdlib §4.17/§4.18; language spec §29.1, v0.236):
+    // SortedDictionary<K,V>.GetEnumerator() — snapshot+sort+wrap. Same
+    // materialisation as wrapDictionaryAsIEnumerable, but with a sort step
+    // after the snapshot so the entries iterate in ascending key order
+    // (matching the for-loop path's #1426 promise). String keys use
+    // bz_sort_kv_str (strncmp per §9.6); generic keys use bz_sort_kv_gen
+    // with a per-element-type comparator built by buildSortedKeyComparator.
+    // Lives in LlvmBackend_Calls2.cpp (not LlvmBackend_Assign.cpp) to avoid
+    // the lane-D file-disjoint restriction; the wrap helper is identical
+    // in spirit to wrapDictionaryAsIEnumerable but with the sort interleaved.
+    llvm::Value* wrapSortedDictionaryAsIEnumerable(
+        llvm::Value* dict, const sema::TypeRef* iEnumTy);
+
+    // fix #2546 (stdlib §4.18; language spec §29.1, v0.236):
+    // SortedSet<T>.GetEnumerator() — snapshot+sort+wrap. Same key-snapshot
+    // pattern as wrapDictionaryAsIEnumerable (no values), but with a sort
+    // step so the elements iterate in ascending order. Returns the same
+    // OWNING-vtable-backed wrapper shape as wrapOwnedArrayAsIEnumerable,
+    // so the same slot-4-getenumerator + slot-1-dispose dance in the
+    // dispatch applies.
+    llvm::Value* wrapSortedSetAsIEnumerable(
+        llvm::Value* set, const sema::TypeRef* iEnumTy);
+
 
     // §29.2 (#552): wrap a user-class instance (implementing IEnumerable<T>)
     // in a type-specific vtable-backed enumerator compatible with the iterator

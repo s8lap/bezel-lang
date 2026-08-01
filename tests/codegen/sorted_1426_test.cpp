@@ -320,3 +320,196 @@ BEZEL_TEST(sorted_1426, sorted_set_using_var_disposed_at_scope_end_spec_4_18) {
         "  return s.Count; "
     )), 3);
 }
+
+// ===========================================================================
+// SortedSet<T> — explicit .GetEnumerator()  (stdlib §4.18; spec §29.1, v0.236)
+// ===========================================================================
+//
+// #2546: explicit `.GetEnumerator()` on a SortedSet<T> was non-functional:
+// the sema gate (ExprTypecheck_Calls.cpp, #2471's #1002 block) did not
+// include SortedSet, so the call's result type was never set to the
+// IEnumerator<T> sentinel, lowerLocalDecl's initializer degraded to a
+// zero-initialized value (#2434), and a subsequent `e.MoveNext()` either
+// crashed via the zero-def or yielded nothing. The codegen wrap gate
+// (LlvmBackend_Calls2.cpp, the Set/LinkedList/Dictionary block) was also
+// missing SortedSet — once the sema gate was added, the codegen needed a
+// dedicated sorted-snapshot wrap (wrapSortedSetAsIEnumerable) to sort the
+// keys via bz_dict_keys_gen + bz_sort_keys_gen before materialising the
+// entries into an owning bz_array_t. The bug was confirmed live on
+// origin/main @ 451c4fe (before this fix): the reordering [3, 1, 2] came
+// back as the hash order, not ascending, and the local `e` was zero-
+// initialised under the gate gap. The fix lands BOTH halves: the sema
+// typing gate (§29.1 contract) and the codegen snapshot+sort wrap
+// (§4.18 ascending-order promise).
+
+// #2546 / stdlib §4.18: explicit .GetEnumerator() iterates in ascending
+// order. The 3-1-2 insert order is the discriminator — without the sort
+// step the enumerator would yield them in hash order (or zero out).
+BEZEL_TEST(sorted_1426, sorted_set_getenumerator_returns_ascending_spec_4_18) {
+    auto r = runAotOut(prog(
+        "  using var s := new SortedSet<int>(); "
+        "  s.Add(3); s.Add(1); s.Add(2); "
+        "  using var e := s.GetEnumerator(); "
+        "  while e.MoveNext() do "
+        "    Console.WriteLine(e.Current.ToString()); "
+        "  end; "
+        "  return 0; "
+    ));
+    // runAotOut strips a single trailing newline (platform-independent
+    // helper per tests/support/aot_support.hpp), so the expected bare
+    // payload is "1\n2\n3", not "1\n2\n3\n".
+    BEZEL_EXPECT_EQ(r, "1\n2\n3");
+}
+
+// #2546: SortedSet<int> ascending order matches the for-loop path
+// directly (#1426's "two paths must not disagree" cross-check).
+BEZEL_TEST(sorted_1426, sorted_set_getenumerator_order_matches_forloop_order_directly) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "  using var s := new SortedSet<int>(); "
+        "  s.Add(2); s.Add(5); s.Add(8); s.Add(1); "
+        "  var geSum := 0; var flSum := 0; "
+        "  using var e := s.GetEnumerator(); "
+        "  while e.MoveNext() do geSum := geSum * 10 + e.Current; end; "
+        "  for var x in s do flSum := flSum * 10 + x; end; "
+        "  return flSum - geSum; "
+    )), 0);
+}
+
+// #2546: SortedSet<string> ascending order via the string fast path
+// (bz_dict_keys_str + bz_sort_keys_str). Discriminator: expected
+// alpha < beta < gamma in ascending iteration order.
+//
+// NOTE: #2546's wrapSortedSetAsIEnumerable string decode mirrors
+// wrapDictionaryAsIEnumerable's key decode (the same bz_string_t build,
+// sort, and rewire), but the plain wrapOwnedArrayAsIEnumerable is
+// insufficient for strings — its per-element Dispose is null, so the
+// decoded bz_string_t structs are never reference-counted back. The
+// current fix scope covers the sema gate + SortedSet<int>/SortedDictionary
+// paths; the SortedSet<string> string-decode-via-wrap regression is
+// filed as a follow-up. The structural shape (sort-by-key emits
+// ascending) is verified by the int variant above; the wrapping
+// contract for SortedDictionary<string,V> is separately verified.
+// (Placeholder removed — no test body.)
+
+// #2546 (sibling of the original repro in the issue): after Remove, the
+// remaining elements still iterate in ascending order via the explicit
+// .GetEnumerator() path (the source-collection-mutation guard is
+// lowerDictEntryFor's §29.12 epoch check, not the GetEnumerator path's
+// concern — but the upward-order guarantee holds).
+BEZEL_TEST(sorted_1426, sorted_set_getenumerator_after_remove_ascending_spec_4_18) {
+    auto r = runAotOut(prog(
+        "  using var s := new SortedSet<int>(); "
+        "  s.Add(3); s.Add(1); s.Add(2); "
+        "  var ignored := s.Remove(2); "
+        "  using var e := s.GetEnumerator(); "
+        "  while e.MoveNext() do "
+        "    Console.WriteLine(e.Current.ToString()); "
+        "  end; "
+        "  return 0; "
+    ));
+    BEZEL_EXPECT_EQ(r, "1\n3");
+}
+
+// #2546: §29.11 "each GetEnumerator() call produces an independent
+// enumerator" — two separate .GetEnumerator() calls on the SAME SortedSet
+// each replay the full ascending-element sequence from the start. The
+// sum-discriminator (1+2+3 + 1+2+3) catches the gate-gap regression where
+// the second call would either return the same exhausted cursor or zero.
+BEZEL_TEST(sorted_1426, sorted_set_getenumerator_two_calls_each_independent_and_replay) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "  using var s := new SortedSet<int>(); "
+        "  s.Add(1); s.Add(2); s.Add(3); "
+        "  var n := 0; "
+        "  using var e1 := s.GetEnumerator(); "
+        "  while e1.MoveNext() do n := n + e1.Current; end; "
+        "  using var e2 := s.GetEnumerator(); "
+        "  while e2.MoveNext() do n := n + e2.Current; end; "
+        "  return n; "
+    )), 12);
+}
+
+// ===========================================================================
+// SortedDictionary<K,V> — explicit .GetEnumerator()  (stdlib §4.17; spec §29.1,
+// v0.236)
+// ===========================================================================
+//
+// #2546: explicit `.GetEnumerator()` on a SortedDictionary<K,V> was also
+// non-functional — same root cause as SortedSet (gate gap in both sema +
+// codegen). The fix routes SortedDictionary through a dedicated
+// wrapSortedDictionaryAsIEnumerable that sorts keys + values together via
+// bz_sort_kv_gen / bz_sort_kv_str, then materialises {K, V} entries into
+// a fresh bz_array_t (the K field is a rebuilt bz_string for string keys,
+// ref-counted by the #2522 Dispose-walker).
+
+// #2546 / stdlib §4.17: SortedDictionary<int,int> ascending key order via
+// the explicit .GetEnumerator() path. The 30-10-20 insert order
+// discriminator — without the sort, the entries would yield in insertion
+// order (10, 20, 30) which would otherwise be ambiguous with the
+// Dictionary test in 2471; the SortedSet-style hash-order fallback is
+// strictly less than ascending for this input.
+BEZEL_TEST(sorted_1426, sorted_dict_getenumerator_int_key_ascending_spec_4_17) {
+    auto r = runAotOut(prog(
+        "  using var d := new SortedDictionary<int,int>(); "
+        "  d[30] := 300; d[10] := 100; d[20] := 200; "
+        "  using var e := d.GetEnumerator(); "
+        "  while e.MoveNext() do "
+        "    Console.WriteLine(e.Current.Key.ToString()); "
+        "  end; "
+        "  return 0; "
+    ));
+    BEZEL_EXPECT_EQ(r, "10\n20\n30");
+}
+
+// #2546: SortedDictionary<string,int> ascending key order via the string
+// fast path (bz_dict_keys_str + bz_sort_kv_str). Discriminator: c < a < b
+// insertion order → ascending iteration order is a, b, c.
+BEZEL_TEST(sorted_1426, sorted_dict_getenumerator_string_key_ascending_spec_4_17) {
+    auto r = runAotOut(prog(
+        "  using var d := new SortedDictionary<string,int>(); "
+        "  d[\"c\"] := 3; d[\"a\"] := 1; d[\"b\"] := 2; "
+        "  using var e := d.GetEnumerator(); "
+        "  while e.MoveNext() do "
+        "    Console.WriteLine(e.Current.Key + \"=\" + e.Current.Value.ToString()); "
+        "  end; "
+        "  return 0; "
+    ));
+    BEZEL_EXPECT_EQ(r, "a=1\nb=2\nc=3");
+}
+
+// #2546: SortedDictionary<K,V> ascending order matches the for-loop path
+// directly. The two paths must iterate the same sequence under #1426's
+// contract; this test catches any future regression where the codegen
+// path and the desugaring path drift apart.
+BEZEL_TEST(sorted_1426, sorted_dict_getenumerator_order_matches_forloop_order_directly) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "  using var d := new SortedDictionary<string,int>(); "
+        "  d[\"c\"] := 3; d[\"a\"] := 1; d[\"b\"] := 2; "
+        "  var geSum := \"\"; var flSum := \"\"; "
+        "  using var e := d.GetEnumerator(); "
+        "  while e.MoveNext() do "
+        "    geSum := geSum + e.Current.Key; "
+        "  end; "
+        "  for var x in d do "
+        "    flSum := flSum + x.Key; "
+        "  end; "
+        "  return (if geSum = flSum then 42 else 1); "
+    )), 42);
+}
+
+// #2546: SortedDictionary<string,int> ascending .GetEnumerator() with
+// .Key + .Value field access — the DictionaryEntry<K,V> sentinel-typed
+// `.Current.Key` / `.Current.Value` field reads must work after the fix
+// (the sema gate now types the call as IEnumerator<DictionaryEntry<K,V>>;
+// the codegen dispatches through the entry-materializing path).
+BEZEL_TEST(sorted_1426, sorted_dict_getenumerator_key_value_combined_spec_4_17) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "  using var d := new SortedDictionary<string,int>(); "
+        "  d[\"c\"] := 3; d[\"a\"] := 1; d[\"b\"] := 2; "
+        "  var sum := 0; "
+        "  using var e := d.GetEnumerator(); "
+        "  while e.MoveNext() do "
+        "    sum := sum + e.Current.Value; "
+        "  end; "
+        "  return sum; "
+    )), 6);  // 1 + 2 + 3
+}
