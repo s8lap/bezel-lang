@@ -2890,6 +2890,15 @@ private:
     // The enclosing method's own parameter symbols — distinguishes a real
     // capture of a method parameter from a lambda-internal parameter.
     std::unordered_set<sema::Symbol*> methodParamSet_;
+    // #2342 (§28.14): when non-null, `scopedCollectCaptures` records each
+    // visited lambda's OWN parameter symbols into the pointed-to set. Set
+    // transiently by `checkScopedAdmission` while collecting the captures of
+    // the FORWARDED lambda (its own params + those of any lambda nested
+    // within it are NOT captures — they are internal to the forwarded
+    // closure; params of an enclosing lambda or the method ARE captures).
+    // Null outside that one collection so the many other `scopedCollectCaptures`
+    // call sites are unaffected. // per §28.14, #2342
+    std::unordered_set<sema::Symbol*>* scopedLambdaInternalSink_ = nullptr;
     // §28.3 v0.196 (#1910): the enclosing method's ordered parameter symbol
     // list (matches md->params position-for-position). Used by
     // checkInstanceBorrowReturn to map a ParameterSymbol* back to its

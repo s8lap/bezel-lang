@@ -11737,6 +11737,20 @@ MethodOwnership::ScopedBound MethodOwnership::scopedBoundingLocal(
 void MethodOwnership::scopedCollectCaptures(
     const ast::LambdaExpr& lam,
     std::vector<const ast::IdentifierExpr*>& out) {
+    // #2342 (§28.14): record this lambda's OWN params as internal to the
+    // forwarded closure when collecting for `checkScopedAdmission` (sink
+    // non-null). `scopedCaptureWalkExpr`'s LambdaExpr case recurses back
+    // here for each nested lambda, so all transitively-nested lambda params
+    // are recorded too — the forwarded closure's entire internal param
+    // subtree. The reduction gate then skips exactly those (not captures)
+    // while KEEPING params of an enclosing lambda or the method (which ARE
+    // captures — the prior methodParamSet_-only gate wrongly skipped them).
+    // Null everywhere else so the other call sites are unaffected.
+    if (scopedLambdaInternalSink_) {
+        if (const std::vector<sema::Symbol*>* syms = ctx_.lambdaParams(&lam)) {
+            for (sema::Symbol* s : *syms) scopedLambdaInternalSink_->insert(s);
+        }
+    }
     if (lam.exprBody) scopedCaptureWalkExpr(*lam.exprBody, out);
     for (const auto& bs : lam.stmts)
         if (bs) scopedCaptureWalkStmt(*bs, out);
@@ -11950,6 +11964,15 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
                                            const ast::Expr* eventTarget) {
     // Classify the argument form and enumerate its captures.
     std::vector<const ast::IdentifierExpr*> rawIds;
+    // #2342 (§28.14): while collecting captures below, record the FORWARDED
+    // lambda's own params (+ nested lambdas' params) into this set so the
+    // reduction gate can skip them (they are internal to the forwarded
+    // closure, not captures) WITHOUT skipping params of an enclosing lambda
+    // (which ARE captures — the residual from #1432's methodParamSet_-only
+    // gate). Populated only by the lambda-argument branches below via
+    // `scopedLambdaInternalSink_`; empty for the class-borrow / identifier /
+    // method-reference / null forms.
+    std::unordered_set<sema::Symbol*> forwardedInternalParams;
     // §28.14 (v0.180, #1439/#1545) "scoped construction": a class/interface-
     // typed `scoped` argument is a passive BORROW, not a function value —
     // it has exactly ONE source (not an enumerated capture set). Reduce it
@@ -11981,7 +12004,11 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
         }
         rawIds.push_back(root);
     } else if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg)) {
+        // #2342: record this forwarded lambda's own/nested params so the
+        // reduction gate skips them while keeping enclosing-lambda params.
+        scopedLambdaInternalSink_ = &forwardedInternalParams;
         scopedCollectCaptures(*lam, rawIds);
+        scopedLambdaInternalSink_ = nullptr;
     } else if (dynamic_cast<const ast::NullLiteralExpr*>(&arg)) {
         return;  // clearing a nullable scoped position — nothing captured
     } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&arg)) {
@@ -12026,7 +12053,11 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
         auto lit = scopedLambdaLocalInit_.find(sym);
         if (lit != scopedLambdaLocalInit_.end() &&
             scopedAssignedSyms_.count(sym) == 0) {
+            // #2342: same as the direct-lambda branch — record the local's
+            // lambda-literal's own/nested params for the reduction gate.
+            scopedLambdaInternalSink_ = &forwardedInternalParams;
             scopedCollectCaptures(*lit->second, rawIds);
+            scopedLambdaInternalSink_ = nullptr;
         } else {
             report(Severity::Error, arg.span.begin,
                    std::string("the captures of the function value `") +
@@ -12099,7 +12130,21 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
             return;
         }
         if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
-            if (!methodParamSet_.count(sym)) continue;  // lambda-internal param
+            // #2342 (§28.14): skip ONLY params internal to the FORWARDED
+            // lambda (its own params + those of any lambda nested within
+            // it — recorded in forwardedInternalParams during capture
+            // collection). Params of the enclosing METHOD (methodParamSet_)
+            // or an enclosing LAMBDA are REAL captures and must be
+            // classified below. The prior gate was
+            // `if (!methodParamSet_.count(sym)) continue;`, which treated
+            // EVERY lambda's parameters as lambda-internal — correct for
+            // the forwarded lambda's own params (also not in
+            // methodParamSet_) but WRONG for an enclosing lambda's params
+            // (the #2342 residual from #1432): a nested closure capturing
+            // the outer lambda's own function-typed parameter, forwarded
+            // to a `scoped` position, was silently admitted because the
+            // gate skipped the capture before the call-bounded check ran.
+            if (forwardedInternalParams.count(sym)) continue;
             // §28.14 v0.177 (#1419): a closure CAPTURING a call-bounded
             // function-typed parameter cannot enter storage-bounded
             // admission — the stored closure would extend the callback past
