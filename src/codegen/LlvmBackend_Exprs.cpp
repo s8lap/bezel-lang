@@ -4553,6 +4553,99 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             }
             return builder_.CreateLoad(gv->getValueType(), gv);
         }
+        // fix #2547 (sibling of #2477): the third #605 / generic-new(T) silent-
+        // zero family shape — a bare MemberAccessExpr read `obj.f` (no parens,
+        // not a CallExpr callee) on a concrete-type receiver. The #2477 fix
+        // added the specific diagnostic at lowerCall's `if (!ms)` fall-through
+        // and at lowerNew's genericSubstSemaTy_ substitution; the CG8 field-read
+        // path was not covered. By the time control reaches this point both
+        // fieldAddr and staticFieldGlobal have returned null (no instance slot
+        // and no backing global), so the only prior signal was the generic
+        // #2434 internal warning emitted by lowerLocalDecl's zero-init fallback
+        // — which named the slot but not the member or the receiver type, so
+        // the slot-degraded-to-zero case was silently wrong. The SPECIFIC
+        // complement that names the member and the receiver type is added here.
+        // Gated on !hasErrors() to mirror the lowerCall / lowerNew guards
+        // (same message-quality rationale: don't stack this on top of an
+        // already-diagnosed shape). The pre-existing #2434 generic warning
+        // remains unchanged for the existing control test
+        // `tests/lit/local_decl_zero_init_fallback_warns_2434.bzl`.
+        //
+        // §27.6 carve-out: a bare MemberAccessExpr whose sema symbol is a
+        // MethodSymbol (a method reference like `a.GetVal` assigned to a
+        // function-typed local) is NOT a fall-through — CG60 below
+        // (`Class.StaticMethod` / `obj.InstanceMethod` used as a value)
+        // builds the closure struct. Without this carve-out, the canonical
+        // §27.6 idiom falsely trips the #2547 warning on the first reading.
+        // §27.6 (v0.184, #1758) carve-out: same goes for a primitive-
+        // intrinsic static-method reference (`int.Parse`, `char.IsDigit`,
+        // …) handled by the `isPrimIntrinsicMethodRef` branch immediately
+        // below — these have no MethodSymbol (intrinsics are name-recognized)
+        // and would otherwise fall through to CG8's nullptr return, falsely
+        // tripping this diagnostic on a legitimate method-reference read.
+        if (!ctx_.diagnostics().hasErrors() &&
+            !dynamic_cast<const sema::MethodSymbol*>(ctx_.exprSymbol(e)) &&
+            !isPrimIntrinsicMethodRef(&e)) {
+            const sema::TypeRef* recvTy = ma->target
+                ? ctx_.exprType(*ma->target) : nullptr;
+            using K = sema::TypeRef::Kind;
+            using P = sema::PrimitiveType;
+            // Shape 1: receiver is a concrete type whose declared member set
+            // is known to the type system (Named + declaration, or a primitive)
+            // — the silent-zero degradation is observable here. Object is
+            // included because Object has no documented members beyond the
+            // universal 5; an unknown member on Object is exactly the §3 /
+            // #605 case the lowerCall diagnostic also handles (with parens).
+            bool isConcreteType = recvTy && (
+                (recvTy->kind == K::Named && recvTy->declaration) ||
+                (recvTy->kind == K::Primitive &&
+                 recvTy->primitive != P::None));
+            // The universal Object surface (ToString/GetHashCode/Equals/
+            // GetType/Dispose) is always present on a value even when the
+            // static type is opaque. Anything else on a concrete type is
+            // genuinely undefined.
+            bool isUniversalObjMember =
+                ma->member == "ToString" ||
+                ma->member == "GetHashCode" ||
+                ma->member == "Equals" ||
+                ma->member == "GetType" ||
+                ma->member == "Dispose";
+            // Shape 2: bare type parameter in the dead template body (no
+            // monomorphization binding for this type parameter) — the
+            // abstract-generic-body form per #2477's analysis. Mirrors the
+            // lowerCall guard.
+            bool isBareTypeParamInDeadTemplate =
+                emittingGenericTemplateBody_ &&
+                recvTy && recvTy->kind == K::Named &&
+                !recvTy->declaration && recvTy->astNode &&
+                recvTy->astNode->name &&
+                !recvTy->astNode->name->parts.empty() &&
+                templateGenericParamNames_.count(
+                    recvTy->astNode->name->parts.back());
+            if (isConcreteType ? !isUniversalObjMember
+                                : isBareTypeParamInDeadTemplate) {
+                std::string recvName;
+                if (recvTy->kind == K::Primitive &&
+                    recvTy->astNode && recvTy->astNode->name &&
+                    !recvTy->astNode->name->parts.empty()) {
+                    recvName = std::string(
+                        recvTy->astNode->name->parts.back());
+                } else if (recvTy->declaration) {
+                    recvName = recvTy->declaration->name;
+                } else {
+                    recvName = std::string(recvTy->headName());
+                }
+                ctx_.diagnostics().report(
+                    Severity::Warning, ma->span.begin,
+                    "internal: codegen cannot read member '" +
+                    std::string(ma->member) + "' on receiver of type '" +
+                    recvName + "': permissive acceptance (spec §3 / "
+                    "issue #605) admits this site but no concrete "
+                    "member dispatch exists (CG8's fall-through "
+                    "degrades the slot to zero via lowerLocalDecl's "
+                    "initializer-failed fallback — #2547)");
+            }
+        }
     }
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
         // §24.3 (#747): a BARE event identifier read in VALUE position (e.g.
