@@ -182,6 +182,13 @@ bool compileImportSucceeds2401(const std::string& libSrc,
 // property inherited from an IMPORTED BASE class. Pre-fix: silently returns
 // 0. Asserts `Name + 100` (not just `Name`), so a coincidental zero return
 // cannot masquerade as success.
+//
+// Updated by #2542 (§11.2 / §23.3, v0.236): the interface obligation is now
+// declared `readonly` to match the getter-only inherited implementation. The
+// pre-#2542 read-write declaration was silently pinning the cross-module
+// accessor-presence bug this fix closes (a getter-only member does not
+// satisfy a read-write interface property obligation, even when both sides
+// are imported).
 // ===========================================================================
 BEZEL_TEST(xmod_iface_prop_event_import_2401,
            getter_through_imported_interface_dispatches_correct_value) {
@@ -191,7 +198,7 @@ BEZEL_TEST(xmod_iface_prop_event_import_2401,
         "  public property Name: int => 1; "
         "end BaseWithProp2401T1; "
         "public interface IHasName2401T1 "
-        "  property Name: int; "
+        "  readonly property Name: int; "
         "end IHasName2401T1;",
         "module App2401T1; import BasePropLib2401T1; "
         "public class DerivedGood2401T1: BaseWithProp2401T1, IHasName2401T1 "
@@ -215,6 +222,10 @@ BEZEL_TEST(xmod_iface_prop_event_import_2401,
 // a fix that only widens the itable index space for a directly-declared
 // imported interface property and mishandles the inherited-through-two-
 // imported-levels shape.
+//
+// Updated by #2542 (§11.2 / §23.3, v0.236): the interface obligation is now
+// declared `readonly` to match the getter-only inherited implementation (see
+// T1's note).
 // ===========================================================================
 BEZEL_TEST(xmod_iface_prop_event_import_2401,
            getter_two_levels_imported_inheritance_through_imported_iface) {
@@ -226,7 +237,7 @@ BEZEL_TEST(xmod_iface_prop_event_import_2401,
         "public class MiddleDerived2401T2: BaseWithProp2401T2 "
         "end MiddleDerived2401T2; "
         "public interface IHasName2401T2 "
-        "  property Name: int; "
+        "  readonly property Name: int; "
         "end IHasName2401T2;",
         "module App2401T2; import BasePropLib2401T2; "
         "public class Derived2401T2: MiddleDerived2401T2, IHasName2401T2 "
@@ -248,16 +259,20 @@ BEZEL_TEST(xmod_iface_prop_event_import_2401,
 // loop (each `TypeSymbol` in `ctx_.importedSymbols()` resets `idx` to 0 —
 // this pins that the reset, and the per-interface map entries, stay correct
 // across multiple imported interfaces in the same compilation).
+//
+// Updated by #2542 (§11.2 / §23.3, v0.236): both interface obligations are
+// now declared `readonly` to match the getter-only implementations (see T1's
+// note).
 // ===========================================================================
 BEZEL_TEST(xmod_iface_prop_event_import_2401,
            getter_two_independent_imported_interfaces_both_dispatch) {
     int r = compileImportAndRun2401(
         "module TwoIfaceLib2401T3; "
         "public interface IHasFoo2401T3 "
-        "  property Foo: int; "
+        "  readonly property Foo: int; "
         "end IHasFoo2401T3; "
         "public interface IHasBar2401T3 "
-        "  property Bar: int; "
+        "  readonly property Bar: int; "
         "end IHasBar2401T3;",
         "module App2401T3; import TwoIfaceLib2401T3; "
         "public class Impl2401T3: IHasFoo2401T3, IHasBar2401T3 "

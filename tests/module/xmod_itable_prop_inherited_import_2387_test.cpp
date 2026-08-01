@@ -164,6 +164,13 @@ bool compileImportSucceeds2387(const std::string& libSrc,
 // coincidental zero return cannot masquerade as success — the fix's own
 // verification caught exactly this: the sibling imported-INTERFACE shape
 // (a separate bug, not fixed here) silently returns 0 rather than crashing).
+//
+// Updated by #2542 (§11.2 / §23.3, v0.236): the interface obligation is now
+// declared `readonly` to match the getter-only inherited implementation. The
+// pre-#2542 read-write declaration was silently pinning the cross-module
+// accessor-presence bug this fix closes (a getter-only member does not
+// satisfy a read-write interface property obligation, even when the witness
+// is inherited from an imported base class).
 // ===========================================================================
 BEZEL_TEST(xmod_itable_prop_inherited_import_2387,
            getter_inherited_from_imported_base_local_iface_runs_and_dispatches) {
@@ -174,7 +181,7 @@ BEZEL_TEST(xmod_itable_prop_inherited_import_2387,
         "end BaseWithProp2387T1;",
         "module App2387T1; import BasePropLib2387T1; "
         "public interface IHasName2387T1 "
-        "  property Name: int; "
+        "  readonly property Name: int; "
         "end IHasName2387T1; "
         "public class Derived2387T1: BaseWithProp2387T1, IHasName2387T1 "
         "end Derived2387T1; "
@@ -194,6 +201,10 @@ BEZEL_TEST(xmod_itable_prop_inherited_import_2387,
 // (itself with no interface), which the LOCAL class then extends. Guards
 // against a fix that only walks one level (e.g. checking the immediate base's
 // decl rather than using classPropertyByName's full-chain walk).
+//
+// Updated by #2542 (§11.2 / §23.3, v0.236): the interface obligation is now
+// declared `readonly` to match the getter-only inherited implementation (see
+// T1's note).
 // ===========================================================================
 BEZEL_TEST(xmod_itable_prop_inherited_import_2387,
            getter_inherited_two_levels_through_imported_bases_runs_and_dispatches) {
@@ -206,7 +217,7 @@ BEZEL_TEST(xmod_itable_prop_inherited_import_2387,
         "end MiddleDerived2387T2;",
         "module App2387T2; import BasePropLib2387T2; "
         "public interface IHasName2387T2 "
-        "  property Name: int; "
+        "  readonly property Name: int; "
         "end IHasName2387T2; "
         "public class Derived2387T2: MiddleDerived2387T2, IHasName2387T2 "
         "end Derived2387T2; "
@@ -226,13 +237,17 @@ BEZEL_TEST(xmod_itable_prop_inherited_import_2387,
 // module. Guards against the fix breaking the ordinary, already-working path
 // (`ensurePropertyAccessorFn` must still take its normal `pd`-populated
 // branch when the property genuinely IS local).
+//
+// Updated by #2542 (§11.2 / §23.3, v0.236): the interface obligation is now
+// declared `readonly` to match the getter-only local implementation (see T1's
+// note).
 // ===========================================================================
 BEZEL_TEST(xmod_itable_prop_inherited_import_2387,
            getter_declared_locally_control_runs_and_dispatches) {
     int r = compileImportAndRun2387(
         "module PropIfaceLib2387T3; "
         "public interface IHasName2387T3 "
-        "  property Name: int; "
+        "  readonly property Name: int; "
         "end IHasName2387T3;",
         "module App2387T3; import PropIfaceLib2387T3; "
         "public class GoodProp2387T3: IHasName2387T3 "
