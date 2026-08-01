@@ -162,6 +162,14 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // into the semantic hash the same way hasSetter does above, or a
     // consumer's staleness check cannot see the change (§2.8.3 rule 3).
     hashBool(h, m.hasGetter);
+    // fix #2421 (§24/§2.8.2): an Event's static/async classification is
+    // part of its signature identity — a library flipping either bit changes
+    // the event's struct slot presence (static vs. instance) or itable slot
+    // presence (sync vs. async), reshaping the cross-module layout contract,
+    // so it must fold into the semantic hash the same way hasSetter/
+    // isAutoProperty do above (§2.8.3 rule 3 staleness detection).
+    hashBool(h, m.isEventStatic);
+    hashBool(h, m.isEventAsync);
     hashU64(h, m.contracts.size());
     for (const MetaContractRecord& c : m.contracts) hashContract(h, c);
     hashType(h, m.type);
@@ -302,7 +310,8 @@ MetaMember::MetaMember(const MetaMember& o)
       fieldInitText(o.fieldInitText),
       isPure(o.isPure), hasSetter(o.hasSetter),
       setterVisibility(o.setterVisibility), isAutoProperty(o.isAutoProperty),
-      hasGetter(o.hasGetter), contracts(o.contracts),
+      hasGetter(o.hasGetter), isEventStatic(o.isEventStatic),
+      isEventAsync(o.isEventAsync), contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
       hasEnumValue(o.hasEnumValue), enumValue(o.enumValue) {
@@ -319,6 +328,7 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         isPure = o.isPure; hasSetter = o.hasSetter;
         setterVisibility = o.setterVisibility;
         isAutoProperty = o.isAutoProperty; hasGetter = o.hasGetter;
+        isEventStatic = o.isEventStatic; isEventAsync = o.isEventAsync;
         contracts = o.contracts;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
@@ -353,7 +363,14 @@ bool MetaMember::operator==(const MetaMember& o) const {
            isAutoProperty == o.isAutoProperty &&
            // fix #2461 (§22.3/§23): getter presence is part of the Property's
            // signature identity — see the hashMember comment above.
-           hasGetter == o.hasGetter && contracts == o.contracts &&
+           hasGetter == o.hasGetter &&
+           // fix #2421 (§24/§2.8.2): an Event's static/async
+           // classification is part of its signature identity — a static vs.
+           // instance event or a sync vs. async event have DIFFERENT struct
+           // and itable layouts, so two events that differ on either bit are
+           // NOT the same member (see the hashMember comment above).
+           isEventStatic == o.isEventStatic &&
+           isEventAsync == o.isEventAsync && contracts == o.contracts &&
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
            hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
@@ -507,7 +524,13 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // `sc.size() < 8` gate never looks past index 7, so it too is
     // unaffected; see the hasGetter field comment in ModuleMetadata.hpp for
     // why the missing-scalar default is `true` (not `false` like hasSetter).
-    llvm::SmallVector<std::uint64_t, 14> sc{
+    // fix #2421 (§24/§2.8.2, additive within v7): isEventStatic/
+    // isEventAsync are 15th/16th trailing scalars, same additive shape — a
+    // pre-#2421 reader's `sc.size() < 8` gate never looks past index 7, so it
+    // too is unaffected; see the field comments in ModuleMetadata.hpp for why
+    // the missing-scalar default is `false` for both (the common instance-
+    // sync event classification).
+    llvm::SmallVector<std::uint64_t, 16> sc{
         static_cast<std::uint64_t>(m.kind),
         static_cast<std::uint64_t>(m.visibility),
         m.isOperator ? 1u : 0u,
@@ -522,6 +545,8 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
         static_cast<std::uint64_t>(m.setterVisibility),
         m.isAutoProperty ? 1u : 0u,
         m.hasGetter ? 1u : 0u,
+        m.isEventStatic ? 1u : 0u,
+        m.isEventAsync ? 1u : 0u,
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, m.name);
@@ -1021,6 +1046,16 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     // dependency (write-only-as-ref stays the pre-existing linker error;
     // read-write-as-ref stays a clean accept).
     m.hasGetter = sc.size() < 14 || sc[13] != 0;
+    // fix #2421 (§24/§2.8.2, additive within v7): 15th/16th scalars. A
+    // pre-#2421 blob has at most 14 scalars; both default to `false` — the
+    // classification a plain instance sync `event E: T;` (the common case)
+    // carries, so a stale not-yet-recompiled dependency keeps its already-
+    // broken pre-fix behavior (the imported event silently no-op'd before
+    // #2421 regardless) rather than guessing static/async and risking an
+    // itable/struct-layout mismatch (see the field comments in
+    // ModuleMetadata.hpp).
+    m.isEventStatic = sc.size() >= 15 && sc[14] != 0;
+    m.isEventAsync = sc.size() >= 16 && sc[15] != 0;
     if (!expectString(r, m.name)) return false;
     if (!readStringList(r, m.modifiers)) return false;
     if (!readType(r, m.type)) return false;

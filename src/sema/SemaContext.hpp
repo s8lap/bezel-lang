@@ -446,6 +446,38 @@ public:
         return it == importedPropertyHasGetter_.end() || it->second;
     }
 
+    // fix #2421 (§24/§2.8.2): an imported Event member's static/async
+    // classification — MetaMember::isEventStatic/isEventAsync (see their
+    // field comments in ModuleMetadata.hpp). ast::EventDecl is the SOLE
+    // carrier in the local path (SymbolCollection.cpp never copies these onto
+    // EventSymbol::modifiers), and an imported EventSymbol has no decl at all
+    // (ModuleLoader reconstructs it without one). The codegen event-dispatch
+    // path's `eventIsStatic`/`eventIsAsync` helpers (LlvmBackend_impl.hpp)
+    // consult THIS side table as the decl-null fallback for an imported event,
+    // so collectInstanceStorage/emitOwnFieldInit/ctor-cleanup (isStatic) and
+    // the ifaceEventIndex_ mirror + itab$C$I build (isAsync) classify an
+    // imported event IDENTICALLY to the exporter's real layout — the only way
+    // to avoid an itable/struct-layout mismatch. Absent (never set — any
+    // non-event import, or an event imported from a pre-#2421 blob with no
+    // 15th/16th MEMBER_BLOCK scalar) defaults to `false` for both — the
+    // classification a plain instance sync event carries (the common case),
+    // so a stale not-yet-recompiled dependency keeps its already-broken pre-
+    // fix behavior rather than guessing and risking the mismatch.
+    void setImportedEventIsStatic(const Symbol* m, bool isStatic) {
+        importedEventIsStatic_[m] = isStatic;
+    }
+    bool importedEventIsStatic(const Symbol* m) const {
+        auto it = importedEventIsStatic_.find(m);
+        return it != importedEventIsStatic_.end() && it->second;
+    }
+    void setImportedEventIsAsync(const Symbol* m, bool isAsync) {
+        importedEventIsAsync_[m] = isAsync;
+    }
+    bool importedEventIsAsync(const Symbol* m) const {
+        auto it = importedEventIsAsync_.find(m);
+        return it != importedEventIsAsync_.end() && it->second;
+    }
+
     // §22.12 (issue #328 FINDING [3] BUG A): an imported class-level `const` has
     // no storage symbol in the library — a const initializer is a compile-time
     // constant expression, so the library emits no global. The loader records
@@ -546,6 +578,10 @@ private:
     // fix #2461 (§22.3/§23): imported property/indexer getter presence, from
     // MetaMember::hasGetter.
     std::unordered_map<const Symbol*, bool> importedPropertyHasGetter_;
+    // fix #2421 (§24/§2.8.2): imported event static/async classification,
+    // from MetaMember::isEventStatic/isEventAsync.
+    std::unordered_map<const Symbol*, bool> importedEventIsStatic_;
+    std::unordered_map<const Symbol*, bool> importedEventIsAsync_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const Symbol*, std::string> importedConstValues_;
     // §14 / #662c: imported SourceFile objects that own re-parsed ctor/dtor

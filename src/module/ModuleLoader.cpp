@@ -647,6 +647,14 @@ struct Loader {
                 e->parent = &parent;
                 e->scope = parent.memberScope;
                 fieldTypes_[e] = convert(mm.type);  // §24 payload type
+                // fix #2421 (§24/§2.8.2): record the wire-carried static/
+                // async classification bits so the codegen event-dispatch
+                // path's eventIsStatic/eventIsAsync helpers classify this
+                // imported event IDENTICALLY to the exporter (avoiding an
+                // itable/struct-layout mismatch). Published to the SemaContext
+                // side table below; see MetaMember::isEventStatic/isEventAsync.
+                eventIsStatic_[e] = mm.isEventStatic;
+                eventIsAsync_[e] = mm.isEventAsync;
                 applyBehavior(e);
                 return e;
             }
@@ -690,6 +698,11 @@ struct Loader {
     // MetaMember::hasGetter — published to ctx.setImportedPropertyHasGetter()
     // below.
     std::unordered_map<const sema::MemberSymbol*, bool> propHasGetter_;
+    // fix #2421 (§24/§2.8.2): imported event static/async classification,
+    // from MetaMember::isEventStatic/isEventAsync — published to
+    // ctx.setImportedEventIsStatic/Async() below.
+    std::unordered_map<const sema::MemberSymbol*, bool> eventIsStatic_;
+    std::unordered_map<const sema::MemberSymbol*, bool> eventIsAsync_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const sema::MemberSymbol*, std::string> constValues_;
 };
@@ -2196,6 +2209,17 @@ static void loadMetadataPass2(
     // error on the undefined `...$propget` symbol).
     for (auto& [m, hg] : loader.propHasGetter_)
         ctx.setImportedPropertyHasGetter(m, hg);
+    // fix #2421 (§24/§2.8.2): publish imported event static/async
+    // classification so the codegen event-dispatch path's eventIsStatic/
+    // eventIsAsync helpers (LlvmBackend_impl.hpp) can classify an imported
+    // event IDENTICALLY to the exporter — collectInstanceStorage/
+    // emitOwnFieldInit/ctor-cleanup (isStatic) and the ifaceEventIndex_
+    // mirror + itab$C$I build (isAsync), avoiding an itable/struct-layout
+    // mismatch.
+    for (auto& [m, st] : loader.eventIsStatic_)
+        ctx.setImportedEventIsStatic(m, st);
+    for (auto& [m, asy] : loader.eventIsAsync_)
+        ctx.setImportedEventIsAsync(m, asy);
     // §22.12 (issue #328 FINDING [3] BUG A): publish imported const values so
     // codegen can fold an imported `const` read without a storage symbol.
     for (auto& [m, val] : loader.constValues_)

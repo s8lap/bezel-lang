@@ -1105,8 +1105,18 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
     }
     if (dynamic_cast<const sema::EventSymbol*>(&m)) {
         out.kind = MetaMemberKind::Event;
-        if (auto* ed = dynamic_cast<const ast::EventDecl*>(m.decl))
+        if (auto* ed = dynamic_cast<const ast::EventDecl*>(m.decl)) {
             out.type = convertAstType(ed->type.get(), ctx);  // §24 payload type
+            // fix #2421 (§24/§2.8.2): carry the two ast::EventDecl layout
+            // classification bits across the boundary so the importer's
+            // collectInstanceStorage/emitOwnFieldInit/ctor-cleanup (isStatic)
+            // and ifaceEventIndex_ mirror + itab$C$I build (isAsync) classify
+            // an imported event IDENTICALLY to the exporter — the only way to
+            // avoid an itable/struct-layout mismatch (see MetaMember::
+            // isEventStatic/isEventAsync's field comment).
+            out.isEventStatic = ed->isStatic;
+            out.isEventAsync = ed->isAsync;
+        }
         return true;
     }
     if (dynamic_cast<const sema::ConstMemberSymbol*>(&m)) {

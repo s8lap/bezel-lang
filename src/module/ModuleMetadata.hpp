@@ -586,6 +586,44 @@ struct MetaMember {
     // (at link time), not silently accepted.
     bool hasGetter = true;
 
+    // §24 / §2.8.2 (fix #2421, additive within v7 — same shape as
+    // hasSetter/hasGetter/isAutoProperty above): for an Event member, the two
+    // ast::EventDecl classification bits the codegen event-dispatch path needs
+    // to mirror the exporter's struct/itable layout exactly. An imported
+    // EventSymbol has NO ast::EventDecl (ModuleLoader.cpp's Event case
+    // reconstructs the symbol without one — mirrors Property/Indexer's own
+    // #503/#2414 limitation), and SymbolCollection.cpp's EventDecl case never
+    // copies these onto EventSymbol::modifiers either (so even a LOCAL event
+    // recovers them only via es->decl). Two separate codegen consumers
+    // decl-null-gate on these bits and silently dropped an imported event
+    // before this field existed (filed as #2421, found one layer past #2407's
+    // symbol reconstruction):
+    //   - collectInstanceStorage / emitOwnFieldInit / ctor-cleanup
+    //     (LlvmBackend_impl.hpp / LlvmBackend_Setup.cpp) need `!isStatic` to
+    //     give a DIRECTLY-typed imported event (or an imported-base event) its
+    //     per-instance backing-field slot — without it fieldIndex_ gets no
+    //     entry and the EventSource lives at no offset.
+    //   - the ifaceEventIndex_ index/mirror AND the itab$C$I BUILD loops
+    //     (LlvmBackend_Setup.cpp declareVtables / Pass D / record-box itable)
+    //     need `!isAsync` to reserve a per-class EventSource-accessor itable
+    //     slot for an IMPORTED interface's sync event (§24.7: only a sync event
+    //     is an itable member; an async event is not). Both the INDEX lookup
+    //     (eventSourcePtr) and the itable ARRAY build must classify identically
+    //     or the importer reserves a slot the exporter's real itable layout
+    //     does not have (or vice versa) — an itable/struct-layout MISMATCH
+    //     between the two compilations, the exact hazard #2420/#2406 caught
+    //     elsewhere. A wrong guess is therefore not just an imprecision; this
+    //     wire bit is the only way the importer can recover the exporter's real
+    //     classification. Ignored for every kind but Event. A pre-#2421 blob
+    //     has no 15th/16th MEMBER_BLOCK scalar; the reader defaults BOTH to
+    //     `false` — the classification a plain instance sync `event E: T;`
+    //     (the common case) carries, so a stale not-yet-recompiled dependency
+    //     keeps its already-broken pre-fix behavior (the imported event was
+    //     silently no-op before #2421 regardless) rather than guessing
+    //     `static`/`async` and risking the layout mismatch.
+    bool isEventStatic = false;
+    bool isEventAsync = false;
+
     // §22.16 / §2.8.2: clauses in declaration order. For a `when` form from
     // §22.4 the builder emits the equivalent static-ensures record here.
     std::vector<MetaContractRecord> contracts;

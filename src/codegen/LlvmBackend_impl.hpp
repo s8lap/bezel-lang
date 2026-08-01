@@ -3600,6 +3600,44 @@ private:
         return ctx_.importedPropertyIsAutoStorage(ps);
     }
 
+    // fix #2421 (§24/§2.8.2/§2.8.3 rule 4, v0.236): the EventSymbol
+    // classification bits the event-dispatch path recovers from
+    // `ast::EventDecl` in the LOCAL path (collectInstanceStorage /
+    // emitOwnFieldInit / ctor-cleanup need isStatic; the ifaceEventIndex_
+    // index + itab$C$I BUILD loops need isAsync) are decl-dependent
+    // (`dynamic_cast<const ast::EventDecl*>(es->decl)`), so they always
+    // returned false for an IMPORTED EventSymbol (no decl crosses the module
+    // boundary — ModuleLoader.cpp's Event case reconstructs the symbol
+    // without one). An imported event was therefore silently DROPPED by every
+    // one of those consumers: no fieldIndex_ slot, no itable index, no itable
+    // entry — so cross-module Subscribe/Raise resolved to nothing and the
+    // handler never fired (filed as #2421, one layer past #2407's symbol
+    // reconstruction). These helpers mirror isAutoPropertyStorage's shape
+    // exactly: try the local decl-based bit first (unchanged for every LOCAL
+    // event); when the decl is null (an imported event), consult the wire-
+    // carried classification (ctx_.importedEventIsStatic/Async, set from
+    // MetaMember::isEventStatic/isEventAsync by ModuleLoader.cpp) instead of
+    // silently treating it as a non-event. A WRONG guess on either bit is a
+    // real hazard, not just an imprecision — it would reserve an importer-
+    // side itable/struct slot the exporter's real layout does not have (or
+    // vice versa), an itable/struct-layout MISMATCH between the two
+    // compilations (the exact class #2420/#2406 caught elsewhere) — so the
+    // wire bit is the sole safe source of truth for an imported event.
+    bool eventIsStatic(const sema::EventSymbol* es) {
+        if (!es) return false;
+        if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl))
+            return ed->isStatic;
+        if (es->decl != nullptr) return false;  // non-EventDecl decl
+        return ctx_.importedEventIsStatic(es);
+    }
+    bool eventIsAsync(const sema::EventSymbol* es) {
+        if (!es) return false;
+        if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl))
+            return ed->isAsync;
+        if (es->decl != nullptr) return false;  // non-EventDecl decl
+        return ctx_.importedEventIsAsync(es);
+    }
+
     // CG33b: the arrow-getter expression of a computed property, or null
     // (auto-properties, indexers, and block/explicit-accessor getters
     // are not arrow getters).
@@ -3779,9 +3817,12 @@ private:
             // slot. Static events (static-init backed) are handled separately in
             // the staticEventGlobals_ path and must not appear here.
             if (auto* es = dynamic_cast<const sema::EventSymbol*>(m)) {
-                if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
-                    if (!ed->isStatic) out.push_back(m);
-                }
+                // fix #2421 (§24/§2.8.2): eventIsStatic, not the bare
+                // decl-dependent `ed->isStatic` — an IMPORTED (decl-null) event
+                // was silently dropped here before, giving it no fieldIndex_
+                // slot so a directly-typed/imported-base event's EventSource
+                // lived at no offset.
+                if (!eventIsStatic(es)) out.push_back(m);
             }
         }
     }
@@ -4360,8 +4401,12 @@ private:
             for (sema::Symbol* m : t->members) {
                 auto* es = dynamic_cast<sema::EventSymbol*>(m);
                 if (!es || es->name != name) continue;
-                auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
-                if (ed && !ed->isStatic && !ed->isAsync &&
+                // fix #2421 (§24/§2.8.2): eventIsStatic/eventIsAsync, not
+                // the bare decl-dependent bits — an event inherited from an
+                // IMPORTED base (decl-null) was silently never resolved here,
+                // so the implementing class's itable got a null accessor for a
+                // sync imported-base event the exporter did lay out.
+                if (!eventIsStatic(es) && !eventIsAsync(es) &&
                     fieldIndex_.count(es))
                     return es;
             }

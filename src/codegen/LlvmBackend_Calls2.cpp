@@ -2367,8 +2367,22 @@ llvm::Value* Emitter::eventSourcePtr(const ast::Expr& e) {
 const sema::TypeRef* Emitter::eventPayloadType(const sema::EventSymbol* es) {
     if (!es) return nullptr;
     auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
-    if (!ed || !ed->type) return nullptr;  // no-payload event → unit
-    return ctx_.resolvedType(*ed->type);
+    if (ed) {
+        if (!ed->type) return nullptr;  // no-payload event → unit
+        return ctx_.resolvedType(*ed->type);
+    }
+    if (es->decl != nullptr) return nullptr;  // non-EventDecl decl
+    // fix #2421 (§24/§2.8.2): imported event (decl-null) — recover the
+    // payload type from the wire-carried side table (ModuleLoader's fieldTypes_,
+    // populated from MetaMember::type). Without this, dispatchEventMethods got
+    // a null payload for an imported event, so lowerEventHandlerClosure built
+    // the handler closure as a `() -> ()` function and the lambda's payload
+    // parameter (and any `e.V` body reference) failed to lower. A Unit type
+    // (the exporter's encoding of an omitted `: T`) means a no-payload event →
+    // null, matching the local `!ed->type` path.
+    const sema::TypeRef* rt = ctx_.importedMemberType(es);
+    if (!rt || rt->kind == sema::TypeRef::Kind::Unit) return nullptr;
+    return rt;
 }
 
 // per §24.5: invoke every active handler closure with `payloadLL` (the lowered

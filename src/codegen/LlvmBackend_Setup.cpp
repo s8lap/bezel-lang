@@ -3189,11 +3189,16 @@ void Emitter::declareVtables() {
             }
             // fix #2401: mirror ifaceEventIndex_ for imported interfaces, exactly
             // as Pass 0 does for local ones above (§24.7 / #477 B7).
+            // fix #2421 (§24/§2.8.2): eventIsAsync, not the bare decl-
+            // dependent `ed->isAsync` — an IMPORTED interface's event (decl-
+            // null) was silently given NO itable index here, so eventSourcePtr's
+            // ifaceEventIndex_.find(es) returned end() and Subscribe/Raise
+            // through the imported interface resolved to a null source (the
+            // handler never fired). This was #2421's primary repro.
             for (sema::Symbol* m : ts->members) {
                 auto* es = dynamic_cast<sema::EventSymbol*>(m);
                 if (!es) continue;
-                auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
-                if (ed && !ed->isAsync) ifaceEventIndex_[es] = idx++;
+                if (!eventIsAsync(es)) ifaceEventIndex_[es] = idx++;
             }
             // fix #2401: mirror ifacePropertyGetIndex_/ifacePropertySetIndex_ for
             // imported interfaces, exactly as Pass 0 does for local ones above
@@ -3481,12 +3486,18 @@ void Emitter::declareVtables() {
             }
             // §24.7 (#477 B7): collect iface's sync events in declaration order
             // (after the methods, matching ifaceEventIndex_'s numbering).
+            // fix #2421 (§24/§2.8.2): eventIsAsync, not the bare decl-
+            // dependent `ed->isAsync` — when `iface` is an IMPORTED interface
+            // (a local class implementing an imported interface, the #2421
+            // repro shape) its events are decl-null and were silently dropped
+            // here, so the itab$C$I array was built SHORTER than
+            // ifaceEventIndex_'s numbering expects (the index points past the
+            // array). The build loop and the index must classify identically.
             std::vector<sema::EventSymbol*> ifaceEvents;
             for (sema::Symbol* m : iface->members) {
                 auto* es = dynamic_cast<sema::EventSymbol*>(m);
                 if (!es) continue;
-                auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
-                if (ed && !ed->isAsync) ifaceEvents.push_back(es);
+                if (!eventIsAsync(es)) ifaceEvents.push_back(es);
             }
             // #481 / §13 / §23: collect iface's properties in declaration order
             // (after the events, matching ifacePropertyGetIndex_'s numbering).
@@ -7246,12 +7257,14 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
         // cleanup block.  Including EventSymbol here ensures the cleanup block is
         // emitted even when the class has only events and no other owned fields.
         if (auto* es = dynamic_cast<const sema::EventSymbol*>(m)) {
-            if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
-                if (!ed->isStatic &&
-                    fieldIndex_.find(es) != fieldIndex_.end()) {
-                    hasOwnedToClean = true;
-                    break;
-                }
+            // fix #2421 (§24/§2.8.2): eventIsStatic (decl-null fallback) —
+            // an event inherited from an IMPORTED base was silently omitted
+            // from the ctor-throw cleanup set before, leaking its backing
+            // EventSource if the ctor body threw after it was allocated.
+            if (!eventIsStatic(es) &&
+                fieldIndex_.find(es) != fieldIndex_.end()) {
+                hasOwnedToClean = true;
+                break;
             }
         }
     }
@@ -7392,9 +7405,11 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
         if (fs && !isStaticField(fs)) { storage.push_back(m); continue; }
         if (isAutoProperty(m)) { storage.push_back(m); continue; }
         if (auto* es = dynamic_cast<const sema::EventSymbol*>(m)) {
-            if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
-                if (!ed->isStatic) storage.push_back(m);
-            }
+            // fix #2421 (§24/§2.8.2): eventIsStatic (decl-null fallback) —
+            // an event on an IMPORTED base class was silently omitted from
+            // own-field init before, so its backing EventSource slot was never
+            // initialized by the importer's emitInstanceInit walk.
+            if (!eventIsStatic(es)) storage.push_back(m);
         }
     }
     for (const sema::Symbol* m : storage) {
@@ -20242,12 +20257,14 @@ void Emitter::setupBoxDescriptors() {
             // a record implements may declare events; their slots must be
             // present (as null entries) to keep the property-slot offsets
             // consistent with ifacePropertyGetIndex_.
+            // fix #2421 (§24/§2.8.2): eventIsAsync (decl-null fallback) —
+            // mirrors the class-side Pass D fix so a record implementing an
+            // IMPORTED interface classifies its events identically.
             std::vector<sema::EventSymbol*> ifaceEvents;
             for (sema::Symbol* m : iface->members) {
                 auto* es = dynamic_cast<sema::EventSymbol*>(m);
                 if (!es) continue;
-                auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
-                if (ed && !ed->isAsync) ifaceEvents.push_back(es);
+                if (!eventIsAsync(es)) ifaceEvents.push_back(es);
             }
             // #481 / §13 / §23: collect iface's properties in declaration order
             // (after the events, matching ifacePropertyGetIndex_'s numbering).
