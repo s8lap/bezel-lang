@@ -3759,32 +3759,24 @@ void Resolver::checkAbstractImplementations() {
         // iface->genericParams.empty() (it is sound, and strictly more
         // complete, to run it unconditionally).
         //
-        // #2542 (§11.2 / §23.3 / §2.8.2 clause 1 / §2.8.3 rule 4,
-        // v0.236): an imported interface property's PropertySymbol has no
-        // ast::PropertyDecl (ModuleLoader reconstructs the symbol but cannot
-        // reconstruct source AST), so the former `if (!ipd || !cpd) continue`
-        // silently skipped this accessor-presence obligation. The setter bit
-        // already crosses the module boundary as MetaMember::hasSetter and is
-        // published through ctx_.importedPropertyHasSetter (#2400); read that
-        // same bit when either side lacks a local AST, exactly as the sibling
-        // iface-indexer check does (#2529). This also covers a witness inherited
-        // from an imported base class and the positional-record branch below.
+        // Local-only, per #2413's confirmed scope: `ps->decl` is null for an
+        // IMPORTED property (no syntactic AST for a body-less imported
+        // declaration — ModuleLoader::convertMember's Property case), and
+        // there is no accessor-presence side table for that case yet (#2406,
+        // in flight separately, covers the cross-module
+        // propertyHasSetter/importedPropertyHasSetter gap). Skipping when
+        // either side is imported keeps this check to the confirmed local
+        // shape rather than guessing at the cross-module one.
         for (auto& [name, info] : ifaceProps) {
             PropertySymbol* ips = info.first;
             TypeSymbol* iface = info.second;
             auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ips->decl);
-            auto ifaceHasSetter = [&]() -> bool {
-                if (ipd) return propertyDeclHasSetter(ipd);
-                return ctx_.importedPropertyHasSetter(ips);
-            };
             auto cit = concreteProps.find(name);
             if (cit != concreteProps.end()) {
                 auto* cpd =
                     dynamic_cast<const ast::PropertyDecl*>(cit->second->decl);
-                const bool candidateHasSetter =
-                    cpd ? propertyDeclHasSetter(cpd)
-                        : ctx_.importedPropertyHasSetter(cit->second);
-                if (ifaceHasSetter() && !candidateHasSetter) {
+                if (!ipd || !cpd) continue;  // imported side — left to #2406
+                if (propertyDeclHasSetter(ipd) && !propertyDeclHasSetter(cpd)) {
                     // Reported at t->declLoc, not cit->second->declLoc: probed
                     // and confirmed (during this fix) that PropertySymbol::
                     // declLoc — like every other non-TypeSymbol member kind — is
@@ -3820,7 +3812,8 @@ void Resolver::checkAbstractImplementations() {
             auto pfit = concretePosFields.find(name);
             if (pfit == concretePosFields.end())
                 continue;  // missing → reported above
-            if (ifaceHasSetter()) {
+            if (!ipd) continue;  // imported interface side — left to #2406
+            if (propertyDeclHasSetter(ipd)) {
                 ctx_.diagnostics().report(
                     Severity::Error, t->declLoc,
                     std::string("property `") + std::string(name) +
