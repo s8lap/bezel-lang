@@ -229,7 +229,12 @@ BEZEL_TEST(dictsetll_bareref_nomember_2536,
 }
 
 BEZEL_TEST(dictsetll_bareref_nomember_2536,
-           linkedlist_bogus_bare_ref_rejected_spec_4_7) {
+           linkedlist_bogus_bare_ref_rejected_spec_4_6) {
+    // #2539 (sibling of #2536): `LinkedList<T>` is stdlib §4.6 (borrowing);
+    // `OwningLinkedList<T>` is stdlib §4.7 (owning). The pre-#2539 generic
+    // §-citation in ExprTypecheck_Calls.cpp~12792 cited §4.7 for BOTH —
+    // rename + assertion updated so this test now FAILS without the fix
+    // (the diagnostic cites §4.7) and PASSES with it (§4.6).
     const std::string program =
         "module M; "
         "class C public static method Main(): int "
@@ -240,12 +245,17 @@ BEZEL_TEST(dictsetll_bareref_nomember_2536,
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(hasError(program, "no member `TotallyBogusLLMember`"));
     BEZEL_EXPECT_TRUE(hasError(program, "LinkedList"));
-    BEZEL_EXPECT_TRUE(hasError(program, "\xC2\xA7""4.7"));
+    BEZEL_EXPECT_TRUE(hasError(program, "\xC2\xA7""4.6"));
+    // #2539 also pins the NEGATIVE: the wrong (owning-family) heading must
+    // NOT appear in the borrowing diagnostic.
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "\xC2\xA7""4.7"));
     BEZEL_EXPECT_TRUE(!hasInternalIce(program));
 }
 
 BEZEL_TEST(dictsetll_bareref_nomember_2536,
            owninglinkedlist_bogus_bare_ref_rejected_spec_4_7) {
+    // #2539 (sibling of #2536): `OwningLinkedList<T>` is stdlib §4.7 (owning).
     // OwningLinkedList<T> requires T: class (§4.2 / §14.4).
     const std::string program =
         "module M; "
@@ -259,6 +269,11 @@ BEZEL_TEST(dictsetll_bareref_nomember_2536,
     BEZEL_EXPECT_TRUE(
         hasError(program, "no member `TotallyBogusOLLMember`"));
     BEZEL_EXPECT_TRUE(hasError(program, "OwningLinkedList"));
+    BEZEL_EXPECT_TRUE(hasError(program, "\xC2\xA7""4.7"));
+    // #2539 pins the NEGATIVE for the owning direction: the wrong
+    // (borrowing-family) heading §4.6 must NOT appear in the diagnostic.
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "\xC2\xA7""4.6"));
     BEZEL_EXPECT_TRUE(!hasInternalIce(program));
 }
 

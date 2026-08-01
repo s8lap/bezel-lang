@@ -12924,8 +12924,13 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                                   "IsReadOnly/GetEnumerator";
                                     }
                                 } else {
-                                    // isLinkedListFamily
-                                    // §4.6 LinkedList / §4.7 OwningLinkedList.
+                                    // isLinkedListFamily — stdlib §4.6 is
+                                    // `LinkedList<T>` (borrowing), §4.7 is
+                                    // `OwningLinkedList<T>` (owning); they
+                                    // are split the same way Dictionary
+                                    // (§4.8/§4.17) and Array (§4.4/§4.5)
+                                    // are, unlike `Set<T>`/`OwningSet<T>`
+                                    // which share a heading (§4.10).
                                     // Both inherit `IEnumerable<T>` via
                                     // `ICollection<T>` (LinkedList, §4.1) or
                                     // `IOwningCollection<T>` (OwningLinkedList,
@@ -12934,7 +12939,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                     // conformers. OwningLinkedList additionally
                                     // carries `PopFirst`/`PopLast`/
                                     // `TryPopFirst`/`TryPopLast` (§4.7).
-                                    section = "\xC2\xA7""4.7";
+                                    section = cn == "OwningLinkedList"
+                                        ? "\xC2\xA7""4.7"
+                                        : "\xC2\xA7""4.6";
                                     if (cn == "LinkedList") {
                                         surface = "AddFirst/AddLast/AddBefore/"
                                                   "AddAfter/RemoveFirst/"
