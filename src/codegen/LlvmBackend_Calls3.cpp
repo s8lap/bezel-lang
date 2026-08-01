@@ -1325,8 +1325,23 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                 builder_.CreateCall(freeFn, {lensArr});
             builder_.CreateCall(freeFn, {valsArr});
 
-            auto* ownFn =
-                declareC("bz_lazy_from_owned_array", ptrTy(), {ptrTy(), i64()});
+            // #2544 (stdlib §4.8/§4.12; spec §29.1, v0.236): for string-keyed
+            // dictionaries the rebuilt bz_string keys at struct offset 0 are
+            // +1 ref-counted producers (initStringRc → rc=1) and need
+            // bz_string_release when the lazy source is disposed. The plain
+            // bz_lazy_from_owned_array calls bz_array_free(arr, null) — a null
+            // element disposer that never reaches the string at struct offset 0
+            // (it is for pointer-element arrays only). bz_lazy_from_owned_str_dict_array
+            // is the sibling of bz_lazy_from_owned_grouping_array (#1914) and
+            // sets arr_str_keys := 1 so bz_lazy_dispose walks the array and
+            // releases each Key before freeing the array. Non-string-keyed
+            // dictionaries (int/record/enum keys) keep the plain wrapper — their
+            // keys are inline bytes with no heap ownership, so the null-disposer
+            // free is correct.
+            const char* ownName = isStringKey
+                ? "bz_lazy_from_owned_str_dict_array"
+                : "bz_lazy_from_owned_array";
+            auto* ownFn = declareC(ownName, ptrTy(), {ptrTy(), i64()});
             return builder_.CreateCall(ownFn,
                 {arr, builder_.getInt64(esz)}, "lazy.dict");
         }
