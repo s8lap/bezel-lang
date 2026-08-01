@@ -2506,13 +2506,27 @@ void Emitter::declareImportedPropertySetters() {
 // (ctx_.importedMemberType for the element type, each ParameterSymbol's
 // resolvedDeclType for an index parameter) — an imported indexer has no
 // ast::PropertyDecl to read them from (ModuleLoader.cpp's Indexer case).
+//
+// fix #2545 (§23.4/§12.1/§2.8.2, v0.236): a VIRTUAL indexer on an IMPORTED
+// BASE — the cross-module abstract-typed indexer dispatch — was previously
+// SKIPPED here (the `if (propGetSlot_.count(ps)) continue;` line that
+// followed), leaving the importer-side call site in `lowerIndexerGet`'s
+// `!pd` gate (LlvmBackend_Assign.cpp) without an entry in
+// `importedIndexerGetterFns_`, falling through to the `#2491` emitReturn
+// zero/null fallback. The iface-indexer twin (dispatch through the itable,
+// #2422/#2528) and the LOCAL twin (pd != null, falls through to the ast
+// body) both work; the abstract-CLASS dispatch needs a vtable-dispatch
+// wrapper emitted here. The wrapper is InternalLinkage (no cross-module ABI
+// to maintain — the vtable layout is the cross-module contract, and the
+// importer's view matches the exporter's because both came from the same
+// metadata). It's then registered in `importedIndexerGetterFns_` so the
+// existing `lowerIndexerGet` `!pd` gate picks it up (signature matches
+// the indexer's, so the gate's arg-coercion path is unchanged).
 void Emitter::declareImportedIndexerGetters() {
     for (sema::Symbol* sym : ctx_.importedSymbols()) {
         auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
         if (!ps || !ps->isIndexer) continue;
-        // Skip virtual: dispatches through the vtable slot.
-        if (propGetSlot_.count(ps)) continue;
-        // Also skip interface indexers: those dispatch through the itable.
+        // Skip interface indexers: those dispatch through the itable.
         if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface)
             continue;
         if (importedIndexerGetterFns_.count(ps)) continue;
@@ -2524,6 +2538,55 @@ void Emitter::declareImportedIndexerGetters() {
             auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
             sema::TypeRef* pt = pps ? pps->resolvedDeclType : nullptr;
             paramTys.push_back(pt ? lowerTypeRef(pt) : i32());
+        }
+        // fix #2545: emit a vtable-dispatch wrapper for a VIRTUAL imported
+        // indexer. The wrapper body is `vptr = load(this); fnptr = load(vptr +
+        // slot); return fnptr(this, idx...);` — the slot offset comes from
+        // `propGetSlot_` (populated by buildVtable, which is called earlier
+        // for both local and imported types). The wrapper's own name encodes
+        // the slot offset so an imported base's slot change is observable
+        // (avoids stale-link ODR collisions when the same base is imported
+        // by two different importers into the same module).
+        if (auto slotIt = propGetSlot_.find(ps);
+            slotIt != propGetSlot_.end()) {
+            std::string clsName = ps->parent ? mangledTypeName(ps->parent)
+                                             : "";
+            std::string wrapperName = "bz$" + clsName + "$vt$idxget$" +
+                                       std::to_string(ps->indexerParams.size()) +
+                                       "$" +
+                                       std::to_string(slotIt->second);
+            if (auto* existing = module_->getFunction(wrapperName)) {
+                importedIndexerGetterFns_[ps] = existing;
+                continue;
+            }
+            auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage, wrapperName,
+                module_.get());
+            // Emit the dispatch body: load vptr from `this`, GEP to the
+            // slot, load the fn-ptr, and indirect-call it with the wrapper's
+            // own args (§22.9 / §23.4: signature matches the indexer's, so
+            // the caller-side lowering unchanged).
+            auto* savedFn = currentFn_;
+            auto* savedInsert = builder_.GetInsertBlock();
+            currentFn_ = fn;
+            auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+            builder_.SetInsertPoint(entry);
+            llvm::Value* thisPtr = &*fn->args().begin();
+            llvm::Value* vptr = builder_.CreateLoad(ptrTy(), thisPtr);
+            llvm::Value* slotPtr = builder_.CreateGEP(
+                ptrTy(), vptr, {builder_.getInt32(slotIt->second)});
+            llvm::Value* fnPtr =
+                builder_.CreateLoad(ptrTy(), slotPtr, "idxget");
+            std::vector<llvm::Value*> callArgs;
+            for (auto& a : fn->args()) callArgs.push_back(&a);
+            llvm::Value* result =
+                builder_.CreateCall(fnTy, fnPtr, callArgs);
+            builder_.CreateRet(result);
+            currentFn_ = savedFn;
+            if (savedInsert) builder_.SetInsertPoint(savedInsert);
+            importedIndexerGetterFns_[ps] = fn;
+            continue;
         }
         std::string clsName = ps->parent ? mangledTypeName(ps->parent) : "";
         std::string mangled = "bz$" + clsName + "$idxget$" +
@@ -2548,11 +2611,16 @@ void Emitter::declareImportedIndexerGetters() {
 // field comment in ModuleMetadata.hpp), mirroring declareImportedProperty
 // Setters's exact reasoning for why an unconditional declare would be wrong
 // (a getter-only indexer's setter symbol was never exported).
+//
+// fix #2545 (§23.4/§12.1/§2.8.2, v0.236): the SETTER twin of the getter
+// fix above — a VIRTUAL read-write indexer on an IMPORTED BASE needs the
+// matching vtable-dispatch wrapper registered in
+// `importedIndexerSetterFns_` so the call site in `lowerIndexerSet`'s `!pd`
+// gate (LlvmBackend_Assign.cpp) finds it.
 void Emitter::declareImportedIndexerSetters() {
     for (sema::Symbol* sym : ctx_.importedSymbols()) {
         auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
         if (!ps || !ps->isIndexer) continue;
-        if (propSetSlot_.count(ps)) continue;
         if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface)
             continue;
         if (!ctx_.importedPropertyHasSetter(ps)) continue;
@@ -2567,6 +2635,44 @@ void Emitter::declareImportedIndexerSetters() {
             paramTys.push_back(pt ? lowerTypeRef(pt) : i32());
         }
         paramTys.push_back(valTy);  // implicit `value`
+        // fix #2545: same vtable-dispatch wrapper as the getter side above.
+        if (auto slotIt = propSetSlot_.find(ps);
+            slotIt != propSetSlot_.end()) {
+            std::string clsName = ps->parent ? mangledTypeName(ps->parent)
+                                             : "";
+            std::string wrapperName = "bz$" + clsName + "$vt$idxset$" +
+                                       std::to_string(ps->indexerParams.size()) +
+                                       "$" +
+                                       std::to_string(slotIt->second);
+            if (auto* existing = module_->getFunction(wrapperName)) {
+                importedIndexerSetterFns_[ps] = existing;
+                continue;
+            }
+            auto* fnTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), paramTys, false);
+            auto* fn = llvm::Function::Create(
+                fnTy, llvm::Function::InternalLinkage, wrapperName,
+                module_.get());
+            auto* savedFn = currentFn_;
+            auto* savedInsert = builder_.GetInsertBlock();
+            currentFn_ = fn;
+            auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+            builder_.SetInsertPoint(entry);
+            llvm::Value* thisPtr = &*fn->args().begin();
+            llvm::Value* vptr = builder_.CreateLoad(ptrTy(), thisPtr);
+            llvm::Value* slotPtr = builder_.CreateGEP(
+                ptrTy(), vptr, {builder_.getInt32(slotIt->second)});
+            llvm::Value* fnPtr =
+                builder_.CreateLoad(ptrTy(), slotPtr, "idxset");
+            std::vector<llvm::Value*> callArgs;
+            for (auto& a : fn->args()) callArgs.push_back(&a);
+            builder_.CreateCall(fnTy, fnPtr, callArgs);
+            builder_.CreateRetVoid();
+            currentFn_ = savedFn;
+            if (savedInsert) builder_.SetInsertPoint(savedInsert);
+            importedIndexerSetterFns_[ps] = fn;
+            continue;
+        }
         std::string clsName = ps->parent ? mangledTypeName(ps->parent) : "";
         std::string mangled = "bz$" + clsName + "$idxset$" +
                               std::to_string(ps->indexerParams.size());

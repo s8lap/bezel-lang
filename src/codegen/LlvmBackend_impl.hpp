@@ -4328,9 +4328,22 @@ private:
     // (mirrors how #1085 keys method-overload slots by arity).
     std::string indexerSlotKey(const sema::PropertySymbol* ps) {
         std::string key(ps->name);  // ".this"
-        // Key off the AST index-parameter type spellings (the same source
-        // lowerIndexerGet uses); the sema ParameterSymbols' resolvedDeclType is
-        // not reliably populated when buildVtable runs.
+        // fix #2545 (§23.4 / §12.1 / §2.8.2 clause 1, v0.236): an abstract
+        // IMPORTED indexer has no ast::PropertyDecl (ModuleLoader's Indexer
+        // case reconstructs `indexerParams` as ParameterSymbols with
+        // `resolvedDeclType`), but the key MUST still include the index-param
+        // TYPE spellings — otherwise the abstract base's key (just ".this")
+        // does NOT match the derived class's override key (".this#int."), and
+        // `buildVtable` invokes the existing assignSlot override reuse exactly
+        // once (key match) so the override gets a NEW slot (slot 8) instead of
+        // reusing the base's (slot 6). The vtable then has BOTH slots — the
+        // base's abstract slot is null (no body), and the override is at a
+        // different offset. The cross-module dispatch through the base slot
+        // lands on null, segfaulting the abstract-typed `b[i]` call. Read
+        // the parameter types from the reconstructed side tables (the same
+        // mirror of #2414's `indexerParamType` fallback) when the AST is
+        // absent, so the abstract base and the concrete derived class's
+        // overrides share the same key across the chain.
         if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
             for (const auto& p : pd->indexerParams) {
                 key += "#";
@@ -4339,6 +4352,57 @@ private:
                         key += std::string(part);
                         key += ".";
                     }
+                } else {
+                    key += "?";
+                }
+            }
+        } else {
+            for (sema::Symbol* p : ps->indexerParams) {
+                key += "#";
+                auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
+                sema::TypeRef* tr = pps ? pps->resolvedDeclType : nullptr;
+                if (!tr) {
+                    key += "?";
+                } else if (tr->kind == sema::TypeRef::Kind::Primitive) {
+                    // #2545: an imported indexer parameter's type is
+                    // reconstructed as a Primitive TypeRef (no AST, no
+                    // imports). Map the PrimitiveType enum to the same
+                    // lowercase spelling the local AST `parts` iteration
+                    // produces above (the source-keyed spelling — case
+                    // matters, e.g. "int" vs "Int"), so the abstract base's
+                    // key matches the derived class's override key.
+                    switch (tr->primitive) {
+                        case sema::PrimitiveType::Bool:    key += "bool";    break;
+                        case sema::PrimitiveType::Char:    key += "char";    break;
+                        case sema::PrimitiveType::String:  key += "string";  break;
+                        case sema::PrimitiveType::Byte:    key += "byte";    break;
+                        case sema::PrimitiveType::SByte:   key += "sbyte";   break;
+                        case sema::PrimitiveType::Short:   key += "short";   break;
+                        case sema::PrimitiveType::UShort:  key += "ushort";  break;
+                        case sema::PrimitiveType::Int:     key += "int";     break;
+                        case sema::PrimitiveType::UInt:    key += "uint";    break;
+                        case sema::PrimitiveType::Long:    key += "long";    break;
+                        case sema::PrimitiveType::ULong:   key += "ulong";   break;
+                        case sema::PrimitiveType::Float:   key += "float";   break;
+                        case sema::PrimitiveType::Double:  key += "double";  break;
+                        case sema::PrimitiveType::Decimal: key += "decimal"; break;
+                        case sema::PrimitiveType::Object:  key += "Object";  break;
+                        default:                           key += "?";       break;
+                    }
+                    key += ".";
+                } else if (!tr->headName().empty()) {
+                    // headName() returns the alias-transparent head for a
+                    // Named type (the underlying builtin head for an alias,
+                    // the use-site syntactic head for a local Named type, the
+                    // metadata importedName for an imported type). The local
+                    // AST path above iterates over parts with "." separators;
+                    // for an imported/abstracted key this single-head
+                    // shorthand is enough (the override's key, computed
+                    // locally with the same shape, ends in the same head).
+                    for (auto part : tr->headName()) {
+                        key += part;
+                    }
+                    key += ".";
                 } else {
                     key += "?";
                 }
