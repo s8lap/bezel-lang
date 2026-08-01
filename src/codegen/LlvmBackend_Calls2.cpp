@@ -8803,6 +8803,28 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     // default `null` — reproduces identically through plain `and`/`or`
     // (this call site is new; the branch's own logic is unmodified).
     ensureOutVarSlots(call);
+    // fix #2410 (§7.5/§7.9/§22.4, v0.236): `ensureOutVarSlots(call)` only
+    // pre-creates/zero-stores THIS call's OWN inline `out var` recipients —
+    // it does not recurse into the call's ARGUMENTS the way
+    // `hoistSkippableOutVarSlots` (added by #2395 for `and`/`or`) does. So a
+    // skippable out-var producer NESTED inside a `?.`-guarded call's argument
+    // list — `recv?.Foo(Other.TryParse("x", out var n))` or
+    // `recv?.Foo(new Widget("x", out var n).ok)` — had its zero-store (once
+    // #2395/#2402 land it for the nested producer) emitted from inside
+    // `callBB` below, which the receiver-null short-circuit (`endBB`
+    // predecessor) never executes: a read of `n` past the `if` on the
+    // call-skipped path observed stack garbage instead of the §7.9 default
+    // `null`. Mirror `lowerShortCircuit`'s placement (it hoists
+    // `*bin.right` before its own branch): run the SAME idempotent
+    // `hoistSkippableOutVarSlots` over every argument HERE, before the
+    // receiver-null branch is emitted, so the nested producer's zero-store
+    // dominates both predecessors of `endBB`. §7.5 ("if any segment of a
+    // chain is null, the remainder is not evaluated") governs ARGUMENT
+    // EVALUATION (the call's argument expressions still lower only inside
+    // `callBB`), not the dominating SLOT CREATION this hoist performs —
+    // exactly the distinction #2395 already established for `and`/`or`.
+    for (const auto& a : call.args)
+        if (a.value) hoistSkippableOutVarSlots(*a.value);
     auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call.callee));
     // §28.11 / §28.2 / #889: `local?.Dispose()` — the canonical null-safe
     // discharge of a conservatively-Owned local (e.g. an `out owned` item that is
