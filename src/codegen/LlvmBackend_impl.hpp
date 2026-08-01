@@ -5224,6 +5224,25 @@ private:
     llvm::Value* wrapDictionaryAsIEnumerable(
         llvm::Value* dict, const sema::TypeRef* iEnumTy);
 
+    // fix #2522 (stdlib §4.8/§4.12; language spec §29.1, v0.236): the
+    // string-keyed sibling of wrapOwnedArrayAsIEnumerable, used by
+    // wrapDictionaryAsIEnumerable when the rebuilt DictionaryEntry<K,V>
+    // array's K field (offset 0) holds a ref-counted bz_string*. The plain
+    // owning Dispose (`bz_array_free(arr, null)`) cannot reach struct-
+    // embedded string pointers — bz_array_free's element-disposer is
+    // `void(*)(void*)` and treats each slot as a pointer. This wrapper's
+    // Dispose walks arr->count slots via bz_array_ptr_at, calls
+    // bz_string_release on the string at each struct offset 0, then frees
+    // the array (null disposer) and the wrapper struct. MoveNext/Current
+    // are reused from the plain array-enum machinery (they don't touch
+    // element ownership). `entryStTy`/`esz` describe the materialised
+    // {K, V} struct layout used to size the slot walk.
+    llvm::Value* wrapDictionaryEntryArrayAsIEnumerable(
+        llvm::Value* arr,
+        const sema::TypeRef* iEnumTy,
+        llvm::StructType* entryStTy,
+        int64_t esz);
+
 
     // §29.2 (#552): wrap a user-class instance (implementing IEnumerable<T>)
     // in a type-specific vtable-backed enumerator compatible with the iterator

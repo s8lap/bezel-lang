@@ -5735,7 +5735,245 @@ llvm::Value* Emitter::wrapDictionaryAsIEnumerable(
     // (slot-1 Dispose frees the snapshot; GetEnumerator clones over it). The
     // element type/stride come from iEnumTy's DictionaryEntry<K,V> arg, so
     // ensureArrayEnumMachinery builds the correct {K, V} struct layout.
+    //
+    // fix #2522 (v0.236, sibling of the Calls3 LINQ source residual): for
+    // string-keyed dictionaries the rebuilt bz_string keys at struct offset 0
+    // are ref-counted producers (initStringRc → rc=1) and need bz_string_release
+    // when the snapshot is dropped. The plain owning wrapper's Dispose calls
+    // bz_array_free(arr, null) — a null element disposer — and bz_array_free's
+    // element-disposer signature is `void(*)(void*)` cast on each slot, which
+    // only works for pointer-element arrays. The entries are {K, V} STRUCTS,
+    // so the plain wrapper leaks every rebuilt key (one ~24-byte header + its
+    // data buffer per entry, bounded — value-correct). wrapDictionaryEntryArrayAsIEnumerable
+    // is a Dictionary-entry-specific owning wrapper whose Dispose walks the
+    // array via bz_array_ptr_at and calls bz_string_release on each Key slot
+    // at struct offset 0 before freeing the array.
+    if (isStringKey) {
+        return wrapDictionaryEntryArrayAsIEnumerable(arr, iEnumTy, entryStTy, esz);
+    }
     return wrapOwnedArrayAsIEnumerable(arr, iEnumTy);
+}
+
+
+// #2522 (stdlib §4.8/§4.12; language spec §29.1, v0.236): OWNING wrapper for
+// the materialised Dictionary<string,V> entry array. The plain
+// wrapOwnedArrayAsIEnumerable releases the array via bz_array_free(arr, null)
+// — a null element disposer, which is correct for pointer-element arrays
+// only. The Dictionary<string,V> materialisation stores {bz_string*, V}
+// STRUCTS inline (one malloc per entry, the bz_string at offset 0), so the
+// plain wrapper never reaches the rebuilt string at struct offset 0 and
+// every iteration leaks it (bounded, value-correct, but visible to LSan —
+// ~24-byte header + the data buffer per entry).
+//
+// This wrapper mirrors wrapOwnedArrayAsIEnumerable's struct layout and
+// vtable protocol (5-slot vtable: self/Dispose/MoveNext/Current/GetEnumerator)
+// and reuses the plain array-enum machinery's MoveNext/Current (they
+// operate on bz_array_t* length/element access and never touch element
+// ownership). The only difference is the owning Dispose, which walks the
+// array via bz_array_ptr_at(arr, i, esz) for i in [0, count), loads the
+// bz_string pointer at struct offset 0 of each entry, and calls
+// bz_string_release on it BEFORE bz_array_free(arr, null) frees the array.
+// The wrapper is keyed by entry-layout-shape so multiple Dictionary<string,V>
+// instantiations (with the same {K, V} struct shape) share the same Dispose
+// and vtable globals.
+//
+// Per-element-type custom Dispose machinery, similar in spirit to how
+// OwningArray<T> threads an element disposer; here the "array" holds
+// fixed-layout structs so we walk them manually rather than via the
+// per-slot void(*)(void*) hook.
+//
+// Non-string-keyed dictionaries (int/record/enum keys) DO NOT take this
+// path — wrapDictionaryAsIEnumerable keeps the plain wrapOwnedArrayAsIEnumerable
+// for them (the keys are inline bytes with no heap ownership, so the
+// plain null-disposer free is correct).
+llvm::Value* Emitter::wrapDictionaryEntryArrayAsIEnumerable(
+        llvm::Value* arr,
+        const sema::TypeRef* iEnumTy,
+        llvm::StructType* entryStTy,
+        int64_t esz) {
+    // The plain array-enum machinery is keyed on the element TYPE — for
+    // Dictionary<string,V> that is DictionaryEntry<string,V> (a struct),
+    // so ensureArrayEnumMachinery(<entry struct type>) builds the same
+    // {ptr vtable, ptr arr, i64 idx, i64 esz} wrapper layout used by
+    // wrapOwnedArrayAsIEnumerable. MoveNext/Current from the plain
+    // machinery are correct here (they only walk the array).
+    ArrEnumMachinery m = ensureArrayEnumMachinery(entryStTy);
+    llvm::StructType* stTy = m.stTy;
+
+    // Element-name key matches ensureArrayEnumMachinery's per-element-type
+    // scheme (it falls back to "f" for non-integer/non-pointer types —
+    // including structs). Reusing the same prefix means MoveNext/Current
+    // created by the plain machinery are looked up under the SAME name as
+    // wrapOwnedArrayAsIEnumerable uses when it was invoked first (e.g. by
+    // the foreach dictionary path), avoiding two parallel sets of identical
+    // MoveNext/Current for the same entry type.
+    std::string elemName = entryStTy->isIntegerTy()
+        ? ("i" + std::to_string(entryStTy->getIntegerBitWidth()))
+        : (entryStTy->isPointerTy() ? "ptr" : "f");
+    std::string plainPrefix = "bz$arrenum$" + elemName + "$";
+    std::string prefix = "bz$dictentryenumown$" + elemName + "$";
+
+    // --- Owning Dispose ---
+    //   for i in 0..count: bz_string_release(entry[i].Key)
+    //   bz_array_free(arr, null); free(self)
+    auto* dispFn = module_->getFunction(prefix + "Dispose");
+    if (!dispFn) {
+        dispFn = llvm::Function::Create(
+            llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+            llvm::GlobalValue::InternalLinkage, prefix + "Dispose",
+            module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", dispFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = dispFn->arg_begin();
+        llvm::Value* arrPtr = b.CreateLoad(
+            ptrTy(), b.CreateStructGEP(stTy, self, 1));
+
+        // count = bz_array_len(arr)
+        auto* lenFn = module_->getOrInsertFunction(
+            "bz_array_len",
+            llvm::FunctionType::get(i64(), {ptrTy()}, false)).getCallee();
+        llvm::Value* cnt = b.CreateCall(
+            llvm::FunctionType::get(i64(), {ptrTy()}, false),
+            lenFn, {arrPtr}, "de.disp.cnt");
+
+        // Loop: for i = 0; i < count; i++.
+        auto* idxSlot = b.CreateAlloca(i64(), nullptr, "de.disp.idx");
+        b.CreateStore(b.getInt64(0), idxSlot);
+        auto* condBB = llvm::BasicBlock::Create(llvm_, "de.disp.cond", dispFn);
+        auto* bodyBB = llvm::BasicBlock::Create(llvm_, "de.disp.body", dispFn);
+        auto* endBB  = llvm::BasicBlock::Create(llvm_, "de.disp.end",  dispFn);
+        b.CreateBr(condBB);
+
+        b.SetInsertPoint(condBB);
+        llvm::Value* ci = b.CreateLoad(i64(), idxSlot, "de.disp.i");
+        b.CreateCondBr(b.CreateICmpSLT(ci, cnt), bodyBB, endBB);
+
+        b.SetInsertPoint(bodyBB);
+        {
+            // entryPtr = bz_array_ptr_at(arr, i, esz)
+            auto* ptrAtFT = llvm::FunctionType::get(
+                ptrTy(), {ptrTy(), i64(), i64()}, false);
+            auto* ptrAtFn = module_->getOrInsertFunction(
+                "bz_array_ptr_at", ptrAtFT).getCallee();
+            llvm::Value* ci2 = b.CreateLoad(i64(), idxSlot, "de.disp.i2");
+            llvm::Value* entryPtr = b.CreateCall(ptrAtFT, ptrAtFn,
+                {arrPtr, ci2, b.getInt64(esz)}, "de.disp.ep");
+
+            // strPtr = entryPtr->Key (field 0 of the {K, V} struct, K = bz_string*)
+            llvm::Value* strPtr = b.CreateLoad(
+                ptrTy(),
+                b.CreateStructGEP(entryStTy, entryPtr, 0),
+                "de.disp.k");
+
+            // bz_string_release(strPtr) — null-safe (a null slot would have
+            // leaked only as a stale sentinel; release is null-safe per §8.6).
+            auto* relFn = module_->getOrInsertFunction(
+                "bz_string_release",
+                llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
+            b.CreateCall(
+                llvm::FunctionType::get(
+                    llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+                relFn, {strPtr});
+
+            b.CreateStore(
+                b.CreateAdd(ci2, b.getInt64(1)), idxSlot);
+            b.CreateBr(condBB);
+        }
+
+        b.SetInsertPoint(endBB);
+        // bz_array_free(arr, null) — the entries' string keys have been
+        // released above; the array itself holds no further heap references
+        // at this point (values are int / record / class pointer copies by
+        // value into the slot — NOT retrained copies — so they need no
+        // disposal here; the source dictionary still owns its values).
+        auto* freeArrFn = module_->getOrInsertFunction(
+            "bz_array_free", llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false))
+            .getCallee();
+        b.CreateCall(
+            llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false),
+            freeArrFn, {arrPtr, llvm::ConstantPointerNull::get(ptrTy())});
+
+        // free(self)
+        auto* freeFn = module_->getOrInsertFunction(
+            "free", llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
+        b.CreateCall(
+            llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+            freeFn, {self});
+        b.CreateRetVoid();
+    }
+
+    // --- Owning GetEnumerator ---
+    // Same as wrapOwnedArrayAsIEnumerable: a fresh NON-owning clone over the
+    // shared array (idx = -1, NON-owning vtable). The clone's Dispose frees
+    // only its own struct; the source owns the array exactly once.
+    auto* geFn = module_->getFunction(prefix + "GetEnumerator");
+    if (!geFn) {
+        geFn = llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+            llvm::GlobalValue::InternalLinkage, prefix + "GetEnumerator",
+            module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", geFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = geFn->arg_begin();
+        uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
+        auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+        auto* callocC = module_->getOrInsertFunction("calloc", callocFT).getCallee();
+        llvm::Value* clone = b.CreateCall(callocFT, callocC,
+            {llvm::ConstantInt::get(i64(), 1),
+             llvm::ConstantInt::get(i64(), (int64_t)cloneSz)});
+        // Clone gets the NON-owning vtable (borrows the array).
+        b.CreateStore(m.vtGV, b.CreateStructGEP(stTy, clone, 0));
+        llvm::Value* arrCp = b.CreateLoad(ptrTy(),
+            b.CreateStructGEP(stTy, self, 1));
+        b.CreateStore(arrCp, b.CreateStructGEP(stTy, clone, 1));
+        llvm::Value* eszCp = b.CreateLoad(i64(),
+            b.CreateStructGEP(stTy, self, 3));
+        b.CreateStore(eszCp, b.CreateStructGEP(stTy, clone, 3));
+        b.CreateStore(llvm::ConstantInt::get(i64(), -1),
+            b.CreateStructGEP(stTy, clone, 2));
+        b.CreateRet(clone);
+    }
+
+    // --- Owning vtable ---
+    // [0]=self, [1]=owning Dispose, [2]=plain MoveNext, [3]=plain Current,
+    // [4]=owning GetEnumerator. MoveNext/Current reuse the plain machinery
+    // (the same shared bz$arrenum$struct$MoveNext/Current that wrapOwnedArrayAsIEnumerable
+    // uses when the Dictionary entry type is a struct).
+    auto* mnFn = module_->getFunction(plainPrefix + "MoveNext");
+    auto* curFn = module_->getFunction(plainPrefix + "Current");
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getGlobalVariable(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: self-ptr (below)
+            dispFn, mnFn, curFn, geFn
+        };
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
+    // Allocate + fill the OWNING enumerator instance { owningVt, arr, idx=-1, esz }.
+    uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
+    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+    llvm::Value* en = builder_.CreateCall(callocFn2,
+        {builder_.getInt64(1), builder_.getInt64(stSz)}, "dictentryenumown");
+    builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, en, 0));
+    builder_.CreateStore(arr, builder_.CreateStructGEP(stTy, en, 1));
+    builder_.CreateStore(builder_.getInt64(-1),
+        builder_.CreateStructGEP(stTy, en, 2));
+    builder_.CreateStore(builder_.getInt64(m.esz),
+        builder_.CreateStructGEP(stTy, en, 3));
+    return en;
 }
 
 
