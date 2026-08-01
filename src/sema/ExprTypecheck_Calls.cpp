@@ -13442,6 +13442,97 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
     }
     if (!member) {
+        // #2517 (§9.2, §35.7): the §9.2 record use-site gate and §35.7 choice
+        // use-site gate for direct `.Equals(...)` / `.GetHashCode()` calls fire
+        // HERE, BEFORE the null-decl (`!targetType->decl`) builtin-class branch
+        // below. Before this fix, both gates lived nested inside the
+        // `else if (Record || Enum || Choice)` branch below — which is reached
+        // only when `targetType->decl != nullptr` (a local AST TypeDecl).
+        // IMPORTED records and choices have `decl == nullptr` (the loader's
+        // reconstructTypeSymbol never sets it, §11.3/issue #501), so they took
+        // the `if (!decl)` branch — intended for builtin classes (Console,
+        // Math, Guid, …) — fell through with no match, then past the "no
+        // member" reject (which exempts Equals/GetHashCode as universal
+        // members, §8.1), and compiled silently: a §9.2 / §35.7 use-site
+        // diagnostic bypass (the structural twin of #2374's `astNode`-gated
+        // defect). Hoisting these gates out of the `else if` branch makes
+        // them fire for BOTH null-decl (imported) and non-null-decl (local)
+        // records/choices, exactly as #2483's `=`/`<>` gate already does
+        // (ExprTypecheck_Exprs.cpp). En and ToString / GetType are NOT
+        // affected — the §8.5/§9.1 default ToString remains for every record,
+        // and GetType is universal.
+        const auto& gateMember = ma.member;
+        if (gateMember == "Equals" || gateMember == "GetHashCode") {
+            if (targetType->kind == ast::TypeDeclKind::Record) {
+                // §9.2 (v0.156)/§9.3 (v0.158, #1383): a direct
+                // `.Equals(...)`/`.GetHashCode()` on a body / combined-form
+                // record that is not auto-equality-bearing and declares no
+                // explicit `=`/`<>` overloads is a compile error. The
+                // `positional` flag uses `hasPositionalFields` first (covers
+                // imported records per #501), then falls back to the local
+                // `ast::TypeDecl` for any record that has one.
+                bool positional = targetType->hasPositionalFields;
+                if (!positional)
+                    if (auto* td =
+                            dynamic_cast<const ast::TypeDecl*>(targetType->decl))
+                        positional = td->hasPositionalFields;
+                bool isEq = positional
+                                ? isPositionalRecordEqualityBearing(
+                                      targetType, ctx_)
+                                : isAutoEqualityBearingBodyRecord(
+                                      targetType, ctx_);
+                if (!isEq && !recordHasUserDeclaredEquality(targetType)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "`." + std::string(gateMember) +
+                        "` is not available on record `" +
+                        std::string(targetType->name) +
+                        "`: it is not auto-equality-bearing (§9.2/§9.3). Declare"
+                        " `=` and `<>` overloads (with `Equals`/`GetHashCode`),"
+                        " or simplify the record to an auto-equality-bearing"
+                        " form.");
+                }
+            } else if (targetType->kind == ast::TypeDeclKind::Choice) {
+                // §35.7 (v0.200, #2045; v0.226, #2110): a choice rejects direct
+                // `.Equals(...)`/`.GetHashCode()` at the call site when it is
+                // NOT auto-equality-bearing — any borrow-bearing or owning
+                // choice, AND any value-like choice whose case payload fails
+                // the §9.2 admissible-component rule. Mirrors the record gate
+                // above (and `=`/`<>`, isEqualityBearing §3.6, `where T:
+                // hashable` §14.2, checkHashContainerKeys — same predicate).
+                sema::TypeRef rt;
+                rt.kind = sema::TypeRef::Kind::Named;
+                rt.declaration = targetType;
+                if (!isAutoEqualityBearingChoice(targetType, ctx_, &rt)) {
+                    auto verdict = common::classifyChoiceType(&rt, ctx_);
+                    std::string reason;
+                    if (verdict &&
+                        *verdict != common::ChoiceClassification::ValueLike) {
+                        reason =
+                            std::string("it is not auto-equality-bearing "
+                                        "(§35.7) — the choice is ") +
+                            (*verdict == common::ChoiceClassification::Owning
+                                 ? "owning"
+                                 : "borrow-bearing") +
+                            ", and a non-value-like choice carries no "
+                            "value equality";
+                    } else {
+                        reason =
+                            "it is not auto-equality-bearing (§35.7): the "
+                            "choice is value-like but a case payload is not "
+                            "an admissible equality component (§9.2)";
+                    }
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "`." + std::string(gateMember) +
+                        "` is not available on choice `" +
+                        std::string(targetType->name) + "`: " + reason +
+                        ". Declare `=` and `<>` overloads (with "
+                        "`Equals`/`GetHashCode`), or restructure the choice "
+                        "payload to an admissible component type.");
+                }
+            }
+        }
         // §2.3: built-in class TypeSymbols (Console, Math, Convert, …)
         // have null `decl` and empty members. Assign return types for
         // their known methods so callers can infer the call result type.
@@ -13734,98 +13825,12 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // interpolation) can infer it. ToString → string (§8.5/§9.1);
             // GetHashCode → int (§8.3); Equals → bool (§8.3/§8.4).
             const auto& m = ma.member;
-            // §9.2 (v0.156)/§8.3: a direct `.Equals(...)` / `.GetHashCode()`
-            // on a body record that is not auto-equality-bearing and declares no
-            // explicit `operator =`/`<>` is a compile error at the call site.
-            // This branch is only reached when lookupMember found NO user member
-            // of that name: if the record declares `override Equals`/`GetHashCode`,
-            // lookupMember finds them and dispatches directly (skipping this
-            // path).  recordHasUserDeclaredEquality returns true only for
-            // operator=/operator<> overloads (not bare Equals/GetHashCode — see
-            // #1249 / §9.2 v0.156).  ToString is not covered: ineligible records
-            // keep the type-name default ToString per §8.5/§9.2.
-            if ((m == "Equals" || m == "GetHashCode") &&
-                targetType->kind == ast::TypeDeclKind::Record) {
-                // §9.3 (v0.158, #1383): positional/combined-form records with
-                // non-admissible fields are also not equality-bearing and get
-                // the same use-site error. Check TypeSymbol flag first (covers
-                // imported records per #501), then ast::TypeDecl.
-                bool positional = targetType->hasPositionalFields;
-                if (!positional)
-                    if (auto* td =
-                            dynamic_cast<const ast::TypeDecl*>(targetType->decl))
-                        positional = td->hasPositionalFields;
-                bool isEq = positional
-                                ? isPositionalRecordEqualityBearing(
-                                      targetType, ctx_)
-                                : isAutoEqualityBearingBodyRecord(
-                                      targetType, ctx_);
-                if (!isEq && !recordHasUserDeclaredEquality(targetType)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, ma.span.begin,
-                        "`." + std::string(m) + "` is not available on record `" +
-                        std::string(targetType->name) +
-                        "`: it is not auto-equality-bearing (§9.2/§9.3). Declare"
-                        " `=` and `<>` overloads (with `Equals`/`GetHashCode`),"
-                        " or simplify the record to an auto-equality-bearing"
-                        " form.");
-                }
-            }
-            // §35.7 (v0.200, #2045; v0.226, #2110): a choice rejects direct
-            // `.Equals(...)` / `.GetHashCode()` at the call site exactly when
-            // it is NOT auto-equality-bearing — i.e. any borrow-bearing or
-            // owning choice, AND any value-like choice whose case payload fails
-            // the §9.2 admissible-component rule (§35.7's recursive clause:
-            // "any value-like choice with an inadmissible payload"). This
-            // mirrors the record rule above (§9.2 use-site discipline) and
-            // routes through the SAME isAutoEqualityBearingChoice predicate as
-            // the `=`/`<>` use-site check, isEqualityBearing (§3.6), the §14.2
-            // `where T: hashable` constraint, and checkHashContainerKeys — so
-            // every consumer agrees. (A function-typed or `Object` payload is
-            // classification-neutral per §35.4 — still ValueLike — yet outside
-            // the §9.2 admissible-component list, so it reaches here; the
-            // former classification-only "recursion is deferred" note is
-            // retired.)
-            if ((m == "Equals" || m == "GetHashCode") &&
-                targetType->kind == ast::TypeDeclKind::Choice) {
-                sema::TypeRef rt;
-                rt.kind = sema::TypeRef::Kind::Named;
-                rt.declaration = targetType;
-                // §35.7 (v0.226, #2110): the recursive admissibility check
-                // lives inside isAutoEqualityBearingChoice; the classification
-                // is consulted only to phrase the diagnostic (owning /
-                // borrow-bearing vs value-like-with-inadmissible-payload).
-                if (!isAutoEqualityBearingChoice(targetType, ctx_, &rt)) {
-                    auto verdict = common::classifyChoiceType(&rt, ctx_);
-                    std::string reason;
-                    if (verdict &&
-                        *verdict != common::ChoiceClassification::ValueLike) {
-                        reason =
-                            std::string("it is not auto-equality-bearing "
-                                        "(§35.7) — the choice is ") +
-                            (*verdict == common::ChoiceClassification::Owning
-                                 ? "owning"
-                                 : "borrow-bearing") +
-                            ", and a non-value-like choice carries no "
-                            "value equality";
-                    } else {
-                        // Value-like yet still not auto-equality-bearing:
-                        // a case payload failed the §9.2 admissible-component
-                        // rule (§35.7's recursive clause).
-                        reason =
-                            "it is not auto-equality-bearing (§35.7): the "
-                            "choice is value-like but a case payload is not "
-                            "an admissible equality component (§9.2)";
-                    }
-                    ctx_.diagnostics().report(
-                        Severity::Error, ma.span.begin,
-                        "`." + std::string(m) + "` is not available on choice `" +
-                        std::string(targetType->name) + "`: " + reason +
-                        ". Declare `=` and `<>` overloads (with "
-                        "`Equals`/`GetHashCode`), or restructure the choice "
-                        "payload to an admissible component type.");
-                }
-            }
+            // #2517 (§9.2, §35.7): the §9.2 record use-site gate and §35.7
+            // choice use-site gate for direct `.Equals(...)`/`.GetHashCode()`
+            // have been HOISTED to fire for BOTH null-decl (imported) and
+            // non-null-decl (local) records/choices, ahead of this `if (!decl)`
+            // branch — see the new block at the top of `if (!member)`.
+            // ToString / GetType / Serialize / Deserialize typing follows.
             if (m == "ToString")
                 ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
             else if (m == "GetHashCode")
