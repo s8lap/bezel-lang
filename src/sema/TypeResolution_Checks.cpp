@@ -2654,17 +2654,22 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
         // instantiated), but NOT for this semantic match, where it would
         // false-reject the canonical `abstract property`/`abstract indexer`
         // + get-only override idiom (the LOCAL twin of #1614's lit cases).
-        // Apply the same §12.5 correction sema's local predicate does. For a
-        // property, `importedPropertyIsAutoStorage` (#2478) identifies the
-        // Auto-shorthand shape precisely (a block-form abstract property
-        // with a real `set` arm keeps the builder bit — the local path
-        // accepts that shape too). For an INDEXER, the metadata cannot
-        // distinguish the Auto shorthand from a block form (isAutoProperty
-        // excludes indexers by design, #2478), so an abstract indexer is
-        // treated as the get-only shorthand — correct for the canonical
-        // idiom; the exotic abstract-block-indexer-with-set twin is a filed
-        // metadata-completeness residual. A pre-#2400 blob defaults the bit
-        // to false (see MetaMember::hasSetter's field comment); the project's
+        // Apply the same §12.5 correction sema's local predicate does.
+        // `importedPropertyIsAutoStorage` (#2478, extended by #2523 to cover
+        // Auto-body INDEXERS in addition to Auto-body properties) identifies
+        // the Auto-shorthand shape precisely — a block-form abstract
+        // property OR indexer with a real `set` arm keeps the builder bit
+        // (the local path accepts that exotic shape, and so does this one).
+        // Before #2523 the metadata bit was property-only
+        // (`isAutoProperty` excluded indexers, #2478), so an abstract
+        // indexer could only be detected via the coarse `base->isIndexer`
+        // branch — which incorrectly fired for an exotic abstract BLOCK-
+        // form indexer with an explicit `set` arm too, false-rejecting the
+        // override (the #2390 residual #2523 fixes). Now the bit carries
+        // the §12.5-correct shape and the §12.5 correction is exactly
+        // `baseAbstract && isAutoShorthand`, with no indexer-specific
+        // special case. A pre-#2400 blob defaults the bit to false (see
+        // MetaMember::hasSetter's field comment); the project's
         // recompile-the-world model means a stale dependency is recompiled
         // rather than trusted with a stale accessor shape.
         bool bHasSetter;
@@ -2677,8 +2682,7 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
                 for (auto mod : base->modifiers)
                     if (mod == "abstract") { baseAbstract = true; break; }
                 if (baseAbstract &&
-                    (base->isIndexer ||
-                     ctx_.importedPropertyIsAutoStorage(base))) {
+                    ctx_.importedPropertyIsAutoStorage(base)) {
                     bHasSetter = false;  // §12.5 abstract shorthand = get-only
                 }
             }

@@ -1028,14 +1028,34 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             // declared in AUTO form (a real instance-storage member, §9.2) so
             // the importer's `collectInstanceStorage`/`collectRecordValue`
             // storage-layout walk can classify it correctly — mirroring
-            // `sema::isAutoPropertySymbol`'s own predicate EXACTLY (Auto
-            // bodyKind, non-indexer, non-static) so the wire-carried
-            // classification and the local-decl classification agree by
-            // construction. See `out.isAutoProperty`'s field comment in
-            // ModuleMetadata.hpp for the full rationale and the confirmed
-            // live memory-safety hazard this closes.
-            out.isAutoProperty = pd->bodyKind == ast::PropertyBodyKind::Auto &&
-                !prop->isIndexer;
+            // `sema::isAutoPropertySymbol`'s own predicate (Auto bodyKind,
+            // non-static) so the wire-carried classification and the local-decl
+            // classification agree by construction. See `out.isAutoProperty`'s
+            // field comment in ModuleMetadata.hpp for the full rationale and
+            // the confirmed live memory-safety hazard this closes.
+            //
+            // fix #2523 (§12.1/§12.5, v0.236, sibling of #2478): the
+            // `!prop->isIndexer` exclusion the original #2478 carried (because
+            // an indexer is never *storage*) is dropped — the bit is now set
+            // for Auto-body INDEXERS as well, so the importer-side
+            // `ctx_.importedPropertyIsAutoStorage(base)` correctly reports
+            // "is in §12.5 shorthand form" for the abstract-indexer override
+            // check (`checkPropertyOverrideSignatureMatch`,
+            // TypeResolution_Checks.cpp ~2680). Storage consumers are
+            // UNAFFECTED — `LlvmBackend_impl.hpp`'s `isAutoPropertyStorage`
+            // helper still filters `ps->isIndexer` explicitly (line ~3599)
+            // before consulting this side table, so an imported Auto-body
+            // indexer never appears in `collectInstanceStorage`/
+            // `collectRecordStorage`. The `!prop->isIndexer` exclusion was
+            // only here because #2478 thought of the bit in pure-storage
+            // terms; the #2523 reuse re-derives the same Auto-bodyKind/non-
+            // static predicate at a SEMANTIC level (§12.5 abstract shorthand
+            // = get-only, regardless of storage). `sema::isAutoPropertySymbol`
+            // itself is deliberately LEFT UNCHANGED (still excludes indexers)
+            // — its many call sites (definite assignment, record equality,
+            // ARC) treat the predicate as "real storage member", which an
+            // indexer isn't; only this wire-bit repurposes it.
+            out.isAutoProperty = pd->bodyKind == ast::PropertyBodyKind::Auto;
             for (auto mod : m.modifiers)
                 if (mod == "static") { out.isAutoProperty = false; break; }
             // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): mirror

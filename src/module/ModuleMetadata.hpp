@@ -526,18 +526,34 @@ struct MetaMember {
     // widening every consumer at once risked mixing at least three
     // different failure directions (silent wrong data, spurious rejects,
     // and a double-free-adjacent disposal miscount) into one unreviewed
-    // change. Computed once by the exporter mirroring
-    // `sema::isAutoPropertySymbol`'s own predicate exactly (Auto bodyKind,
-    // non-indexer, non-static) so the importer-side fallback and the
-    // local-decl path classify identically. Ignored for every kind but
-    // Property (an Indexer is never "auto" — `isAutoPropertySymbol`
-    // excludes `ps->isIndexer` unconditionally, so this is left `false`
-    // for Indexer members). A pre-#2478 blob has no 13th scalar; the
-    // reader defaults this to `false` — the SAME (already-broken, not
-    // newly-regressed) "not storage" behavior an old dependency exhibits
-    // today, exactly mirroring hasSetter's own missing-scalar default
-    // reasoning: a stale (not-yet-recompiled) dependency keeps its
-    // pre-fix behavior until recompiled, rather than the reader guessing.
+    // change.
+    //
+    // Computed once by the exporter mirroring `sema::isAutoPropertySymbol`'s
+    // own predicate (Auto bodyKind, non-static). Since fix #2523
+    // (§12.1/§12.5, v0.236, sibling of #2478), the bit is also set for
+    // INDEXERS in Auto body form (e.g. `abstract property [i]: T;`, the
+    // §12.5 abstract shorthand — get-only) — the wire bit's predicate is
+    // the SEMANTIC "Auto shorthand shape" check, no longer the pure-storage
+    // check #2478 originally framed it as. The importer-side
+    // `ctx_.importedPropertyIsAutoStorage(base)` now correctly reports
+    // "is the base in §12.5 shorthand form" for the abstract-indexer
+    // override check (`checkPropertyOverrideSignatureMatch`,
+    // TypeResolution_Checks.cpp ~2680). Storage consumers are UNAFFECTED
+    // because `LlvmBackend_impl.hpp`'s `isAutoPropertyStorage` helper still
+    // filters `ps->isIndexer` explicitly before consulting this side table
+    // (line ~3599), so an imported Auto-body indexer never appears in
+    // `collectInstanceStorage`/`collectRecordStorage`. The
+    // `sema::isAutoPropertySymbol` predicate itself is deliberately LEFT
+    // UNCHANGED (still excludes indexers) — its many call sites (definite
+    // assignment, record equality, ARC, the codegen `isAutoProperty`
+    // consumers) treat the predicate as "real storage member", which an
+    // indexer isn't; only this wire-bit repurposes it. A pre-#2478 blob has
+    // no 13th scalar; the reader defaults this to `false` — the SAME
+    // (already-broken, not newly-regressed) "not storage" / "not shorthand"
+    // behavior an old dependency exhibits today, exactly mirroring
+    // hasSetter's own missing-scalar default reasoning: a stale
+    // (not-yet-recompiled) dependency keeps its pre-fix behavior until
+    // recompiled, rather than the reader guessing.
     bool isAutoProperty = false;
 
     // §22.3 / §23 (fix #2461, additive within v7 — the getter-presence
