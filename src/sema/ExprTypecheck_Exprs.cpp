@@ -1844,6 +1844,37 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             ctx_.setExprType(
                                 &e, substituteMemberType(
                                         rt, ix->target.get(), ps->parent));
+                        // fix #2530 (§22.3 / §23, v0.236): attach the resolved
+                        // indexer PropertySymbol to the IndexExpr. The ref/out
+                        // operand pass (`checkRefOutOperandCategory`,
+                        // ExprTypecheck.cpp) dispatches `obj[i]` through the
+                        // exact `exprSymbol(target)` -> PropertySymbol ->
+                        // `checkRefOutPropertyOperand` site that the named-
+                        // member `obj.P` path already uses, but the indexer
+                        // branch was missing this attachment — so a
+                        // write-only indexer as `ref` fell through to codegen
+                        // with no write-only gate (#2461's hasGetter bit is
+                        // published for indexers too, but the IndexExpr
+                        // operand path never consulted it). Without this,
+                        // LOCAL write-only indexer-as-`ref` ICEs at
+                        // "lowerExpr returned null ... #1386" in
+                        // `buildOrderedArgs` (lowerIndexerGet's no-getter path
+                        // returns null) and IMPORTED write-only indexer-as-`ref`
+                        // emits a call to the externally-declared-but-undefined
+                        // `bz$<Class>$idxget$<arity>` stub → "undefined
+                        // reference" linker error. With the attachment, both
+                        // shapes reach `checkRefOutPropertyOperand`, whose
+                        // imported (!pd) branch (already covers #2461) and
+                        // whose local branch (this commit's hasGetter twin)
+                        // reject write-only-as-`ref` with a clean §22.3/§23
+                        // message. `kind == "ref"` is enforced downstream of
+                        // this check, so `out` (where §22.3: "no getter call
+                        // occurs") is correctly admitted — issue's case 3.
+                        // Set ONLY for the user-defined indexer branch (an
+                        // Array<T>/OwningDictionary<>/etc. collection returns
+                        // no PropertySymbol here, and the inline-array path is
+                        // a GEP-load with no slot semantics to gate).
+                        ctx_.setExprSymbol(&e, ps);
                         // per §7.4 (v0.182, #1593): a user-defined indexer
                         // access `obj[i]` invokes an "accessor" (get/set)
                         // that can run user code — invalidate a mutably-

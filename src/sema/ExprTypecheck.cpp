@@ -4227,6 +4227,64 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
             "(§22.3 / §23.3)");
         return;
     }
+    // fix #2530 (§22.3 / §23, v0.236): the LOCAL-branch twin of the
+    // imported `!pd`-branch's hasGetter check (#2461). §22.3: "for `ref`,
+    // the getter is called once to produce the callee's slot value (for
+    // `out` no getter call occurs)" — so a write-only property (setter but
+    // NO getter) is a legal `out` target but NOT a legal `ref` target. The
+    // earlier propertyDeclIsSetOnly READ gate in ExprTypecheck_Calls.cpp
+    // covers the LOCAL named-property `d.W` read form, but does NOT fire
+    // for an IndexExpr (`d[i]`), and is therefore not widened for ref/out
+    // here (it would false-reject the spec-LEGAL write-only-as-`out`
+    // case). Mirror #2461's `kind == "ref"` guard so `out` is correctly
+    // admitted (§22.3: no getter call for `out`). The indexer coverage
+    // becomes uniform once ExprTypecheck_Exprs.cpp's IndexExpr visit
+    // attaches the resolved PropertySymbol — without that, this branch's
+    // exact message shape only fires for a LOCAL write-only INDEXER and a
+    // LOCAL write-only named PROPERTY reachable via `obj[i]` is still
+    // gated only by the original (IndexedExpr-doesn't-apply) read gate.
+    // hasGetter mirrors propertyDeclIsSetOnly's INVERSE exactly:
+    //   * Expression / Auto bodyKinds always have a getter (auto-derived).
+    //   * Block bodyKind has a getter iff any accessor is a `get` arm
+    //     (the same loop shape the hasSetter block above uses, inverted
+    //     on `acc.isSet`).
+    bool hasGetter = false;
+    if (pd->bodyKind == ast::PropertyBodyKind::Expression ||
+        pd->bodyKind == ast::PropertyBodyKind::Auto) {
+        hasGetter = true;
+    } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+        for (const auto& acc : pd->accessors)
+            if (!acc.isSet) { hasGetter = true; break; }
+    }
+    if (hasGetter == false && kind[0] == 'r' /* "ref", not "out" */) {
+        // §22.3 / §23: a `ref` argument requires a readable property — a
+        // write-only one has no getter for the copy-in. (`out` is correct
+        // here per the `kind` guard above and §22.3: "for `out` no getter
+        // call occurs".) The name-and-parent label mirrors the
+        // propertyDeclIsSetOnly gate's "property `W` is write-only" shape
+        // (ExprTypecheck_Calls.cpp) for the named property case; an INDEXER
+        // has no usable `pd->name` (the parser leaves it empty for the
+        // `property this[i: T]: U` form), so use the indexer label "the
+        // indexer" and the declaring type's name for that case.
+        std::string label;
+        if (pd->isIndexer) {
+            std::string typeName = ps.parent
+                ? std::string(ps.parent->name)
+                : std::string();
+            label = typeName.empty()
+                ? std::string("the indexer")
+                : ("the `" + typeName + "` indexer");
+        } else {
+            label = "`" + std::string(pd->name) + "`";
+        }
+        ctx_.diagnostics().report(
+            Severity::Error, target.span.begin,
+            std::string("a `ref` argument requires a readable property — ")
+            + label +
+            " is write-only (it declares only a `set` accessor) and has no "
+            "getter for the copy-in (§22.3 / §23)");
+        return;
+    }
     bool isReadonlyAuto = false;
     if (pd->bodyKind == ast::PropertyBodyKind::Auto)
         for (auto mod : pd->modifiers)
