@@ -8919,9 +8919,14 @@ bool MethodOwnership::isDeferredActivationCallResult(
 // returnTypeIsDeferredActivation (the enclosing method's declared return) and
 // lambdaReturnTypeIsDeferredActivation (a lambda's own ascribed `: Type`).
 // Null `t` (no ascription) returns false — the inferred case is handled by the
-// caller via isDeferredActivationCallResult on the body. // per §28.14, §28.3 v0.196
+// caller via isDeferredActivationCallResult on the body. Nullable `t?` returns
+// false: the deferred-activation announcement is the caller's re-establishment
+// against its own arguments, but a nullable return type permits a null result
+// the caller does not establish against, so the frame-residence carve-out does
+// not apply — same shape `isDeferredActivationCallResult` rejects via the
+// `rt->nullable` check on the call result's `TypeRef`. // per §28.14, §28.3 v0.196
 static bool isDeferredActivationTypeNode(const ast::Type* t) {
-    if (!t || t->kind != ast::TypeKind::Named || !t->name ||
+    if (!t || t->kind != ast::TypeKind::Named || t->nullable || !t->name ||
         t->name->parts.size() != 1)
         return false;
     std::string_view head = t->name->parts.front();

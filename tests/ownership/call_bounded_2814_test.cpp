@@ -465,3 +465,43 @@ BEZEL_TEST(call_bounded_2814, frame_over_callback_via_escaping_closure_rejected)
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(diagContains(r, "call-bounded"));
 }
+
+// ===========================================================================
+// #2531 (§28.14 v0.196): deferred-activation frame returned under a WIDENING
+// (non-deferred-activation) return type is the return sink — the announced
+// frame residence only composes when the declared return type itself names
+// a deferred-activation shape (one of the §28.14 v0.196 iterator/async-
+// iterator interfaces or Task-family) AND is non-nullable. Widening the
+// return to `Object`, an unconstrained generic, or a nullable iterator
+// (`IEnumerable<int>?`) hides the frame residence from the caller and so
+// admits the callback's escape — rejected. The companion ACCEPT cells
+// above pin that the matching (deferred-activation) return-type path
+// stays admitted.
+//
+// Mechanical verification: this cell was added with the §28.14 *Call-bounded
+// × deferred activation* (v0.196) nullable-widening fix and fails without
+// it (the carve-out in `isDeferredActivationTypeNode` previously treated
+// `T?` as `T`-equivalent, so the boolean returned TRUE for `IEnumerable<int>?`
+// and `returnTypeIsDeferredActivation()` admitted the carrier). The other
+// widening shapes (`Object`, unconstrained generic `T`) were already
+// rejected by the pre-#2531 code path and need no fix.
+// ===========================================================================
+
+// #2531 / §28.14 v0.196: method block body widening via a nullable deferred-
+// activation return type `IEnumerable<int>?` — the nullable adornment is
+// itself a non-deferred-activation shape (a null result the caller does not
+// establish against), so the frame-residence carve-out does not apply and
+// the carrier is rejected.
+BEZEL_TEST(call_bounded_2814,
+           frame_returned_under_nullable_widening_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Filtered(xs: Array<int>, f: (int) -> bool) "
+        ": IEnumerable<int>? "
+        "    return xs.Where(f); "
+        "  end Filtered; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagContains(r, "call-bounded"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "may not be returned"));
+}

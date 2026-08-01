@@ -285,6 +285,29 @@ BEZEL_TEST(lambda_own_param_call_bounded_1432,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
+// #2531 / §28.14 v0.196: the #2343 lambda-`=>` shape with a NULLABLE widening
+// lambda return type `: IEnumerable<int>?`. The carve-out
+// (lambdaReturnTypeIsDeferredActivation → isDeferredActivationTypeNode) is
+// false for the nullable adornment, so the implicit return of `xs.Where(g)`
+// falls through to `reportCallBounded`. Same shape as the method case above
+// — confirms #2343's parity across the three return-sink paths (method
+// block, method `=>`, lambda `=>`) once #2531's nullable fix is in.
+BEZEL_TEST(lambda_own_param_call_bounded_1432,
+          expr_body_frame_returned_under_nullable_widening_rejected) {
+    auto r = parseAndCheckOwnership(
+        "module M; class C "
+        "  public static method Apply(xs: Array<int>, "
+        "                             f: (int) -> bool): IEnumerable<int> "
+        "    var mk := lambda(g: (int) -> bool): IEnumerable<int>? "
+        "             => xs.Where(g); "
+        "    return mk(f); "
+        "  end Apply; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagContains(r, "call-bounded"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "may not be returned"));
+}
+
 // ===========================================================================
 // Forbidden sink: forwarding into a `scoped` parameter position
 // ===========================================================================
