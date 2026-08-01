@@ -527,50 +527,111 @@ BEZEL_TEST(sema_symbols, toplevel_decl_locations_are_populated_2418) {
     BEZEL_EXPECT_TRUE(xb != nullptr);
     if (xb) {
         BEZEL_EXPECT_EQ(xb->declLoc.line, std::uint32_t(6));
-        // ExternDecl (the per-method entry) carries no span of its own
-        // (ast::ExternDecl is not an ast::Node) — falls back to the
-        // enclosing block's location rather than staying at 0:0.
+        // fix #2482: ExternDecl now carries its own source location (stamped
+        // at the decl's first token) — points at the method's own line (7),
+        // not the enclosing block's (6). Pre-#2482 this fell back to the
+        // block's location because ast::ExternDecl is not an ast::Node.
         BEZEL_EXPECT_EQ(xb->decls.size(), std::size_t(1));
         if (xb->decls.size() == 1) {
-            BEZEL_EXPECT_EQ(xb->decls[0]->declLoc.line, std::uint32_t(6));
+            BEZEL_EXPECT_EQ(xb->decls[0]->declLoc.line, std::uint32_t(7));
         }
     }
 }
 
-// fix #2418: a record's positional fields (§9.1) and an enum's constants
-// (§10) carry no span of their own (ast::Param / ast::EnumConstant are not
-// ast::Node) — they fall back to the declaring TypeDecl's own (now-real)
-// location rather than staying at 0:0.
-BEZEL_TEST(sema_symbols, positional_field_and_enum_constant_fall_back_to_type_loc_2418) {
+// fix #2482 (follow-up to #2418): positional record fields (§9.1), enum
+// constants (§10), choice cases (§35.1), and extern decls (§32) are the four
+// member kinds whose AST node is NOT an ast::Node (ast::Param /
+// ast::EnumConstant / ast::ChoiceCase / ast::ExternDecl carry no `span`), so
+// #2418 had their member declLoc FALL BACK to the enclosing type/block's
+// location — a diagnostic on one of these members cited the enclosing TYPE's
+// line, not the member's own. #2482 adds a per-member SourceLocation to each
+// of those structs (stamped by the parser at the member's first token) and
+// reads it in SymbolCollection, so each member's declLoc is its OWN line.
+//
+// Each member is deliberately placed on a DIFFERENT source line than its
+// enclosing type so the assertion is a real fail-without/pass-with proof:
+// without the fix every member below resolves to its type's line; with it,
+// to the member's own line. (Diagnostic source-location quality, §8.)
+BEZEL_TEST(sema_symbols, member_kind_decl_locations_point_at_own_line_2482) {
     const std::string src =
-        "module M;\n"                     // 1
-        "public record R(x: int);\n"       // 2
-        "public enum E\n"                  // 3
-        "  Red, Green;\n"                  // 4
-        "end E;\n";
+        "module M;\n"                                  // 1
+        "public record R(\n"                           // 2  TypeDecl
+        "  x: int);\n"                                 // 3  positional field
+        "public enum E\n"                              // 4  TypeDecl
+        "  Red,\n"                                     // 5  EnumConstant
+        "  Green;\n"                                   // 6  EnumConstant
+        "end E;\n"                                     // 7
+        "public choice Op\n"                           // 8  TypeDecl
+        "  Add,\n"                                     // 9  ChoiceCase
+        "  Sub;\n"                                     // 10 ChoiceCase
+        "end Op;\n"                                    // 11
+        "extern \"libc\"\n"                            // 12 ExternBlock
+        "  method fopen(p: int): int;\n"               // 13 ExternDecl
+        "end;\n";                                      // 14
     auto r = parseAndCollect(src);
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_EQ(r.ctx->module()->children.size(), std::size_t(2));
-    if (r.ctx->module()->children.size() != 2) return;
+    BEZEL_EXPECT_EQ(r.ctx->module()->children.size(), std::size_t(4));
+    if (r.ctx->module()->children.size() != 4) return;
 
-    const auto* rec = dynamic_cast<const bezel::sema::TypeSymbol*>(
+    // Helper: find a member of `t` by name (order-independent assertions).
+    auto findMember = [](const bezel::sema::TypeSymbol* t,
+                         std::string_view name) -> const bezel::sema::Symbol* {
+        for (auto* m : t->members)
+            if (m->name == name) return m;
+        return nullptr;
+    };
+
+    // record R (line 2); positional field x on its OWN line (3).
+    auto* rec = dynamic_cast<const bezel::sema::TypeSymbol*>(
         r.ctx->module()->children[0]);
     BEZEL_EXPECT_TRUE(rec != nullptr);
     if (rec) {
         BEZEL_EXPECT_EQ(rec->declLoc.line, std::uint32_t(2));
         BEZEL_EXPECT_EQ(rec->members.size(), std::size_t(1));
-        if (rec->members.size() == 1) {
-            BEZEL_EXPECT_EQ(rec->members[0]->declLoc.line, std::uint32_t(2));
-        }
+        auto* x = dynamic_cast<const bezel::sema::FieldSymbol*>(findMember(rec, "x"));
+        BEZEL_EXPECT_TRUE(x != nullptr);
+        if (x) BEZEL_EXPECT_EQ(x->declLoc.line, std::uint32_t(3));
     }
-    const auto* en = dynamic_cast<const bezel::sema::TypeSymbol*>(
+
+    // enum E (line 4); constants Red/Green on their OWN lines (5/6).
+    auto* en = dynamic_cast<const bezel::sema::TypeSymbol*>(
         r.ctx->module()->children[1]);
     BEZEL_EXPECT_TRUE(en != nullptr);
     if (en) {
-        BEZEL_EXPECT_EQ(en->declLoc.line, std::uint32_t(3));
+        BEZEL_EXPECT_EQ(en->declLoc.line, std::uint32_t(4));
         BEZEL_EXPECT_EQ(en->members.size(), std::size_t(2));
-        for (auto* m : en->members) {
-            BEZEL_EXPECT_EQ(m->declLoc.line, std::uint32_t(3));
+        auto* red = dynamic_cast<const bezel::sema::EnumConstantSymbol*>(
+            findMember(en, "Red"));
+        if (red) BEZEL_EXPECT_EQ(red->declLoc.line, std::uint32_t(5));
+        auto* green = dynamic_cast<const bezel::sema::EnumConstantSymbol*>(
+            findMember(en, "Green"));
+        if (green) BEZEL_EXPECT_EQ(green->declLoc.line, std::uint32_t(6));
+    }
+
+    // choice Op (line 8); cases Add/Sub on their OWN lines (9/10).
+    auto* op = dynamic_cast<const bezel::sema::TypeSymbol*>(
+        r.ctx->module()->children[2]);
+    BEZEL_EXPECT_TRUE(op != nullptr);
+    if (op) {
+        BEZEL_EXPECT_EQ(op->declLoc.line, std::uint32_t(8));
+        BEZEL_EXPECT_EQ(op->members.size(), std::size_t(2));
+        auto* add = dynamic_cast<const bezel::sema::ChoiceCaseSymbol*>(
+            findMember(op, "Add"));
+        if (add) BEZEL_EXPECT_EQ(add->declLoc.line, std::uint32_t(9));
+        auto* sub = dynamic_cast<const bezel::sema::ChoiceCaseSymbol*>(
+            findMember(op, "Sub"));
+        if (sub) BEZEL_EXPECT_EQ(sub->declLoc.line, std::uint32_t(10));
+    }
+
+    // extern block (line 12); the per-method ExternDecl on its OWN line (13).
+    auto* xb = dynamic_cast<const bezel::sema::ExternBlockSymbol*>(
+        r.ctx->module()->children[3]);
+    BEZEL_EXPECT_TRUE(xb != nullptr);
+    if (xb) {
+        BEZEL_EXPECT_EQ(xb->declLoc.line, std::uint32_t(12));
+        BEZEL_EXPECT_EQ(xb->decls.size(), std::size_t(1));
+        if (xb->decls.size() == 1) {
+            BEZEL_EXPECT_EQ(xb->decls[0]->declLoc.line, std::uint32_t(13));
         }
     }
 }

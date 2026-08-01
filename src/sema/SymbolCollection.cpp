@@ -299,14 +299,13 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
             fs->visibility = ast::Visibility::Public;
             fs->parent = sym;
             fs->decl = &td;
-            // fix #2418: ast::Param (a record's positional-field shape)
-            // carries no span of its own — unlike ast::Member, it isn't an
-            // ast::Node — so there is no per-field location to read. Fall
-            // back to the declaring TypeDecl's already-populated location
-            // (same fallback TypeResolution_Checks.cpp already uses
-            // explicitly at a handful of call sites, e.g. the enum-constant
-            // initializer check) rather than leaving 0:0.
-            fs->declLoc = sym->declLoc;
+            // fix #2482 (follow-up to #2418): ast::Param now carries its own
+            // source location (stamped by the parser at the field's first
+            // token), so point at the member's own line rather than the
+            // enclosing type's. The type-fallback remains a safety net for a
+            // decl whose loc was not populated (default 0:0:0 — e.g. a
+            // synthesized prelude decl built without going through the parser).
+            fs->declLoc = (pf.loc.line != 0) ? pf.loc : sym->declLoc;
             fs->posParam = &pf;
             fs->scope = sym->memberScope;
             sym->members.push_back(fs);
@@ -317,11 +316,10 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
         auto* esym = ctx.makeSymbol<EnumConstantSymbol>();
         esym->name = ec.name;
         esym->parent = sym;
-        // fix #2418: ast::EnumConstant carries no span of its own (only its
-        // optional `:= ConstExpr` initializer does) — fall back to the
-        // enclosing TypeDecl's location, same reasoning as the positional
-        // field above.
-        esym->declLoc = sym->declLoc;
+        // fix #2482 (follow-up to #2418): ast::EnumConstant now carries its
+        // own source location (stamped at the constant's name token); fall
+        // back to the enclosing TypeDecl's location only when unpopulated.
+        esym->declLoc = (ec.loc.line != 0) ? ec.loc : sym->declLoc;
         esym->scope = sym->memberScope;
         sym->members.push_back(esym);
     }
@@ -334,9 +332,10 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
         csym->name = cc.name;
         csym->parent = sym;
         csym->caseDecl = &cc;
-        // fix #2418: ast::ChoiceCase carries no span of its own — same
-        // fallback as EnumConstant above.
-        csym->declLoc = sym->declLoc;
+        // fix #2482 (follow-up to #2418): ast::ChoiceCase now carries its
+        // own source location (stamped at the case's name token); fall back
+        // to the enclosing TypeDecl's location only when unpopulated.
+        csym->declLoc = (cc.loc.line != 0) ? cc.loc : sym->declLoc;
         csym->scope = sym->memberScope;
         sym->members.push_back(csym);
     }
@@ -407,11 +406,11 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
             dsym->scope = xbScope;
             dsym->params = collectParams(d.params, ctx, xbScope);
             dsym->externDecl = &d;
-            // fix #2418: ast::ExternDecl (a single FFI method inside the
-            // block) carries no span of its own — fall back to the
-            // enclosing ExternBlock's location, same reasoning as the
-            // positional-field/enum-constant/choice-case fallbacks above.
-            dsym->declLoc = sym->declLoc;
+            // fix #2482 (follow-up to #2418): ast::ExternDecl now carries
+            // its own source location (stamped at the decl's first token);
+            // fall back to the enclosing ExternBlock's location only when
+            // unpopulated.
+            dsym->declLoc = (d.loc.line != 0) ? d.loc : sym->declLoc;
             sym->decls.push_back(dsym);
         }
         return sym;

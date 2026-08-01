@@ -505,6 +505,13 @@ struct Param {
     std::string_view name;
     std::unique_ptr<Type> type;
     std::unique_ptr<Expr> defaultValue; // null when no `:= Expr`
+    // fix #2482: Param is NOT an ast::Node (it carries no span), so without a
+    // location of its own a positional record field / class primary-ctor param
+    // / choice-case payload field had no per-member source position —
+    // diagnostics keyed on the member's declLoc fell back to the enclosing
+    // type's line (#2418). The parser stamps this at the parameter's first
+    // token; SymbolCollection reads it for the member-shaped Param uses.
+    SourceLocation loc;
     // §22.4 (v0.183, #1585): the `when true`/`when false` out-nullability
     // postcondition (A.5 OutNullPostcond), or None when absent.
     OutNullWhen outNullPostcond = OutNullWhen::None;
@@ -739,6 +746,11 @@ struct EnumConstant {
     // `serialized "name"` form (skip and optional are rejected per the §A.3
     // grammar note).
     std::unique_ptr<SerializedClause> serialized;
+    // fix #2482: EnumConstant is NOT an ast::Node and carries no span, so its
+    // member declLoc fell back to the enclosing enum type's line (#2418). The
+    // parser stamps this at the constant's name token for a precise per-member
+    // diagnostic location.
+    SourceLocation loc;
 };
 
 // §A.3 / §35.1 (v0.200, #2044):
@@ -757,6 +769,11 @@ struct ChoiceCase {
     std::vector<Param> payload;
     // Null when no `serialized "..."` clause is present on the case.
     std::unique_ptr<SerializedClause> serialized;
+    // fix #2482: ChoiceCase is NOT an ast::Node and carries no span, so its
+    // member declLoc fell back to the enclosing choice type's line (#2418).
+    // The parser stamps this at the case's name token for a precise per-member
+    // diagnostic location.
+    SourceLocation loc;
 };
 
 // Class-like top-level declaration. The five kinds share enough shape that one
@@ -1305,6 +1322,11 @@ struct ExternDecl {
     std::vector<Param> params;
     std::unique_ptr<Type> returnType;
     bool returnOwned = false;
+    // fix #2482: ExternDecl is NOT an ast::Node and carries no span, so its
+    // member declLoc fell back to the enclosing extern block's line (#2418).
+    // The parser stamps this at the decl's first token (the optional visibility
+    // keyword, else `method`) for a precise per-member diagnostic location.
+    SourceLocation loc;
 };
 
 // A.3 `ExternBlock ::= "extern" StringLiteral ("convention" StringLiteral)?

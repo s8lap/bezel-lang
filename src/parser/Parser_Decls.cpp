@@ -475,6 +475,7 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                 "one)");
         } else {
             ast::EnumConstant ec;
+            ec.loc = current_.location;  // fix #2482: name token's position
             ec.name = current_.text;
             advance();
             if (consumePunctuator(":=")) {
@@ -495,6 +496,7 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                     break;
                 }
                 ast::EnumConstant ec2;
+                ec2.loc = current_.location;  // fix #2482
                 ec2.name = current_.text;
                 advance();
                 if (consumePunctuator(":=")) {
@@ -544,6 +546,7 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                         Severity::Error, current_.location,
                         "expected choice case name");
                 } else {
+                    c.loc = current_.location;  // fix #2482: name token
                     c.name = current_.text;
                     advance();
                 }
@@ -713,6 +716,10 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
     while (!isKeyword("end") &&
            current_.kind != TokenKind::EndOfFile) {
         ast::ExternDecl decl;
+        // fix #2482: stamp the decl's own location at its first token (the
+        // optional visibility keyword, else `method`) so a diagnostic on this
+        // member points at its own line, not the enclosing extern block's.
+        decl.loc = current_.location;
         // Visibility?
         if (isKeyword("public"))         { decl.visibility = ast::Visibility::Public; advance(); }
         else if (isKeyword("private"))   { decl.visibility = ast::Visibility::Private; advance(); }
@@ -2354,6 +2361,11 @@ std::vector<ast::Param> Parser::parseParamList() {
 
     auto parseOne = [&]() -> ast::Param {
         ast::Param p;
+        // fix #2482: stamp the parameter's own location at its first token
+        // (the optional modifier, else the name). Meaningful for the
+        // member-shaped Param uses — a class primary-ctor param becomes a
+        // positional FieldSymbol — and harmless for ordinary method params.
+        p.loc = current_.location;
         if (consumeKeyword("ref")) {
             p.modifier = "ref";
         } else if (consumeKeyword("out")) {
@@ -2571,6 +2583,9 @@ std::vector<ast::Param> Parser::parsePositionalFieldList() {
     if (isPunctuator(")")) return fields;
     auto parseOne = [&]() -> ast::Param {
         ast::Param p;
+        // fix #2482: stamp the field's own location at its first token (the
+        // name) so a member diagnostic points at the field, not the record.
+        p.loc = current_.location;
         if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected positional field name");
@@ -2609,6 +2624,9 @@ std::vector<ast::Param> Parser::parseCasePayloadList() {
     if (isPunctuator(")")) return fields;
     auto parseOne = [&]() -> ast::Param {
         ast::Param p;
+        // fix #2482: stamp the field's own location at its first token (the
+        // optional `owned` marker, else the name).
+        p.loc = current_.location;
         // Optional leading `owned` marker.
         if (isKeyword("owned")) {
             p.modifier = "owned";
