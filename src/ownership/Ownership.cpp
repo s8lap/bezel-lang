@@ -3722,16 +3722,22 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
             if (retTy->kind == sema::TypeRef::Kind::Named &&
                 retTy->astNode && retTy->astNode->name &&
                 !retTy->astNode->name->parts.empty()) {
+                // #2512 / §28.3 (v0.221, #1787 ruling; #2369): consult the
+                // shared `kOwningTypeHeads` set (the #1414 registry refactor
+                // this site was missed by) — a hand-maintained literal here
+                // drifts every time a new owning head is added. The set
+                // already covers Shared / Weak / ChannelSender / OwningTask /
+                // the six owning-collection heads / IOwningEnumerable /
+                // CancellationTokenSource AND the three owning iterable-
+                // interface heads (IOwningEnumerator, IOwningAsyncEnumerable,
+                // IOwningAsyncEnumerator) that #2369 added; without the
+                // registry hop, a fresh async yield-iterator returning one of
+                // the three sibling heads is misclassified Borrowed → the
+                // caller carries no disposal obligation and the freshly-
+                // allocated state-machine frame leaks at program exit.
                 std::string_view head = retTy->headName();
-                if (head == "Shared"          || head == "Weak"            ||
-                    head == "ChannelSender"    || head == "OwningTask"       ||
-                    head == "OwningArray"       || head == "OwningDictionary" ||
-                    head == "OwningSet"         || head == "OwningStack"      ||
-                    head == "OwningQueue"       || head == "OwningLinkedList" ||
-                    head == "IOwningEnumerable"  ||
-                    head == "CancellationTokenSource") {
+                if (common::isOwningTypeHead(head))
                     return OwnershipState::Owned;
-                }
             }
         }
     }
