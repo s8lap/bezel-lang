@@ -236,9 +236,32 @@ BEZEL_TEST(array_unresolved_member_2457, legit_bare_equals_reference_now_rejecte
         "27.6) is not yet supported on `Array<T>`"));
 }
 
-// A LINQ bare method reference (requires the §5 import) — the largest,
-// least-obvious slice of the exempt list.
-BEZEL_TEST(array_unresolved_member_2457, legit_linq_bare_method_reference_not_regressed) {
+// #2492 (stdlib §5; language spec §27.6): a BARE reference to a stdlib §5
+// LINQ extension operator (`Where`/`Select`/`Take`/...) on a declaration-less
+// builtin collection is the identical #2470/#2493 silent-no-op shape — the
+// operator is dispatched STRUCTURALLY by name in codegen's
+// tryLowerLinqOperatorCall (LlvmBackend_Calls3.cpp), never through a real
+// MethodSymbol, so sema left `ma`'s exprType UNSET and codegen's #2434
+// fallback degraded the local to a zero-initialized value (every later call
+// through it lowered to NO CODE). Confirmed live on origin/main before this
+// fix: `var f := a.Where;` compiled CLEAN (no diagnostic from sema —
+// `isLinqOperator` was exempted from BOTH the #2470 bare-reference reject
+// and the "no member" reject) and emitted only the codegen-internal
+// `lowerLocalDecl's initializer ... degraded to a zero-initialized value --
+// #2434`. sema now folds `isLinqOperator` into the same #2470 reject, so the
+// forbidden clean-compile-then-silently-do-nothing outcome is replaced with
+// an honest "not yet supported ... call it directly instead" diagnostic.
+//
+// This test was originally `legit_linq_bare_method_reference_not_regressed`
+// asserting `run(program) == 0`, but that was VACUOUS — it never CALLED `f`,
+// so it passed whether the bare reference genuinely worked OR silently
+// no-op'd (the defect). It is repurposed here to assert the reject (FAILS
+// without this fix: no error, silent no-op; PASSES with it: reject fires).
+// The reject message says "not yet supported" (NOT "no member"), which also
+// preserves the original test's intent: confirm `Where` IS recognized as a
+// genuine stdlib §5 LINQ member of the receiver (in `isLinqOperator`), not a
+// bogus name — the false-"no member"-reject regression #2484 guarded against.
+BEZEL_TEST(array_unresolved_member_2457, legit_bare_linq_reference_now_rejected_2492) {
     const std::string program =
         "module M; import System.Collections.Linq; "
         "class C public static method Main(): int "
@@ -248,19 +271,44 @@ BEZEL_TEST(array_unresolved_member_2457, legit_linq_bare_method_reference_not_re
         "  a.Dispose(); "
         "  return 0; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 0);
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `Where` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Array<T>`"));
 }
 
-// #2484: `.MinOrNull`/`.MaxOrNull` bare reference — both are genuine members
-// of stdlib §5.1's `IEnumerable<T> where T: IComparable<T>` extension with
-// no per-type override on Array/OwningArray, but were missing from this
-// slice's own `isLinqOperator` list (found by independently re-deriving the
-// whole §5/§5.1 surface against the doc, not by diffing against slice 2's
-// already-corrected Stack/Queue list — the same "MinOrNull` bare reference
-// falsely rejected" shape slice 2's own review caught in its own list,
-// commit bd41a69). Confirmed on origin/main before this fix: `var f :=
-// a.MinOrNull;` was rejected with "no member `MinOrNull` on `Array<T>`".
-BEZEL_TEST(array_unresolved_member_2457, legit_minornull_maxornull_bare_method_reference_not_regressed) {
+// #2492 adversarial: `.Select`/`.Take`/`.First` bare references share the
+// identical root cause on Array<T> — sweep the shape, not just `Where`.
+BEZEL_TEST(array_unresolved_member_2457, legit_bare_linq_select_take_first_now_rejected_2492) {
+    const std::string program =
+        "module M; import System.Collections.Linq; "
+        "class C public static method Main(): int "
+        "  var a := new Array<int>(3); "
+        "  a.Add(1); a.Add(2); a.Add(3); "
+        "  var f := a.Select; "
+        "  var g := a.Take; "
+        "  var h := a.First; "
+        "  a.Dispose(); "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `Select` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Array<T>`"));
+}
+
+// #2484/#2492: `.MinOrNull`/`.MaxOrNull` bare reference — both are genuine
+// members of stdlib §5.1's `IEnumerable<T> where T: IComparable<T>` extension
+// with no per-type override on Array/OwningArray (added to `isLinqOperator` by
+// #2484 to stop a false "no member" reject). #2492 folds them into the same
+// bare-reference reject as the other LINQ operators: the CALL form
+// (`a.MinOrNull()`) is unaffected (exempted by `!isCallForm`), but the BARE
+// form (`var f := a.MinOrNull;`) is now honestly rejected instead of silently
+// no-op'ing. The reject message says "not yet supported" (NOT "no member"),
+// preserving #2484's intent: the names ARE recognized as genuine LINQ members
+// (in `isLinqOperator`), not bogus names. Repurposed from the prior vacuous
+// `run(program) == 0` assertion (which never called `f`/`g`).
+BEZEL_TEST(array_unresolved_member_2457, legit_minornull_maxornull_bare_reference_now_rejected_2492) {
     const std::string program =
         "module M; import System.Collections.Linq; "
         "class C public static method Main(): int "
@@ -271,7 +319,29 @@ BEZEL_TEST(array_unresolved_member_2457, legit_minornull_maxornull_bare_method_r
         "  a.Dispose(); "
         "  return 0; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 0);
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `MinOrNull` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Array<T>`"));
+}
+
+// #2492 adversarial VALUE-correctness: the CALL form `a.Where(lambda).First()`
+// MUST still compile and return the correct value after the bare-reference
+// reject (the reject is gated on `!isCallForm`). From [1,2,3,4], `Where(x > 2)`
+// yields [3,4] and `First()` returns 3 — proving the call form's real LINQ
+// dispatch survives the fix (the control for the bare-form reject above).
+BEZEL_TEST(array_unresolved_member_2457, legit_where_call_form_value_correct_2492) {
+    const std::string program =
+        "module M; import System.Collections.Linq; "
+        "class C public static method Main(): int "
+        "  var a := new Array<int>(4); "
+        "  a.Add(1); a.Add(2); a.Add(3); a.Add(4); "
+        "  var e := a.Where(lambda(x) => x > 2); "
+        "  var v := e.First(); "
+        "  a.Dispose(); "
+        "  return v; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(program), 3);
 }
 
 // Call-form methods across the declared surface still work — sampled, not

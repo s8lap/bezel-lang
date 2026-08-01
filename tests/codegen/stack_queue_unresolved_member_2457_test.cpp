@@ -386,9 +386,26 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_reverse_call_queue_value_co
     BEZEL_EXPECT_EQ(run(program), 3);
 }
 
-// A LINQ bare method reference (requires the §5 import) — the largest,
-// least-obvious slice of the exempt list, mirrors slice 1's identical guard.
-BEZEL_TEST(stack_queue_unresolved_member_2457, legit_linq_bare_method_reference_not_regressed) {
+// #2492 (stdlib §5; language spec §27.6): a BARE reference to a stdlib §5
+// LINQ extension operator (`Where`/`Select`/`Take`/...) on Stack<T>/Queue<T>
+// (and the OwningStack/OwningQueue twins) shares the identical #2470/#2493
+// silent-no-op root cause — the operator is dispatched STRUCTURALLY by name
+// in codegen's tryLowerLinqOperatorCall, never through a real MethodSymbol,
+// so sema left `ma`'s exprType UNSET and codegen's #2434 fallback degraded
+// the local to a zero-init value. Confirmed live on origin/main before this
+// fix: `var f := s.Where;` on Stack<int> compiled CLEAN (no sema diagnostic
+// — `isLinqOperator` was exempted from BOTH the #2470 bare-reference reject
+// and the "no member" reject) and emitted only the codegen-internal `...
+// degraded to a zero-initialized value -- #2434`. sema now folds
+// `isLinqOperator` into the same #2470 reject. This test was originally
+// `legit_linq_bare_method_reference_not_regressed` asserting `run(program)
+// == 0`, but that was VACUOUS — it never CALLED `f`, so it passed whether
+// the bare reference genuinely worked OR silently no-op'd (the defect).
+// Repurposed to assert the reject (FAILS without this fix: no error, silent
+// no-op; PASSES with it: reject fires). The "not yet supported" message
+// (NOT "no member") preserves the original intent: `Where` IS recognized as
+// a genuine stdlib §5 LINQ member (in `isLinqOperator`).
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_linq_reference_stack_now_rejected_2492) {
     const std::string program =
         "module M; import System.Collections.Linq; "
         "class C public static method Main(): int "
@@ -397,7 +414,26 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_linq_bare_method_reference_
         "  var f := s.Where; "
         "  return 0; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 0);
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `Where` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Stack<T>`"));
+}
+
+// #2492 Queue twin — same root cause, same reject.
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_linq_reference_queue_now_rejected_2492) {
+    const std::string program =
+        "module M; import System.Collections.Linq; "
+        "class C public static method Main(): int "
+        "  var q := new Queue<int>(); "
+        "  q.Enqueue(1); q.Enqueue(2); q.Enqueue(3); "
+        "  var f := q.Where; "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `Where` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Queue<T>`"));
 }
 
 // `.ToArray` bare reference — found MISSING from this slice's own
@@ -405,11 +441,16 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_linq_bare_method_reference_
 // genuine stdlib §5 `IEnumerable<T>` extension with no per-type override on
 // Stack/Queue, unlike `Array<T>`/`OwningArray<T>`, which separately declare
 // their OWN native `ToArray()` — stdlib §4.4/§4.5 — masking the identical
-// omission in slice 1's list). The call form (`s.ToArray()`) was never
-// affected (exempted via `isCallForm`, then the pre-existing #920/#1112
-// `allowedNonOwningMethod` list, which DOES include `ToArray`) — only the
-// bare-reference spelling regressed before this fix.
-BEZEL_TEST(stack_queue_unresolved_member_2457, legit_toarray_bare_method_reference_not_regressed) {
+// omission in slice 1's list). #2492 folds it into the same bare-reference
+// reject as the other LINQ operators: the CALL form (`s.ToArray()`) is
+// unaffected (exempted via `!isCallForm`, then the pre-existing #920/#1112
+// `allowedNonOwningMethod` list, which DOES include `ToArray` — guarded by
+// legit_toarray_call_form_value_correct below) — only the BARE spelling
+// silently no-op'd before, now honestly rejected. The "not yet supported"
+// message (NOT "no member") confirms `ToArray` IS in `isLinqOperator`
+// (preserving the original #2457-slice-2 intent). Repurposed from the prior
+// vacuous `run(program) == 0` assertion (which never called `f`).
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_toarray_bare_reference_stack_now_rejected_2492) {
     const std::string program =
         "module M; import System.Collections.Linq; "
         "class C public static method Main(): int "
@@ -418,17 +459,22 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_toarray_bare_method_referen
         "  var f := s.ToArray; "
         "  return 0; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 0);
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `ToArray` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Stack<T>`"));
 }
 
-// `.MinOrNull`/`.MaxOrNull` bare reference — a SECOND gap this fix's own
+// `.MinOrNull`/`.MaxOrNull` bare reference — a SECOND gap this slice's own
 // independent re-derivation of stdlib §5/§5.1 found (not caught by the
 // coordinator's review, which flagged only `ToArray`): both are genuine
 // members of the `IEnumerable<T> where T: IComparable<T>` extension (§5.1)
-// with no per-type override on Stack, and were missing from both this
-// slice's list AND slice 1's already-merged Array/OwningArray list (filed
-// as a follow-up for slice 1, out of this fix's own scope to amend).
-BEZEL_TEST(stack_queue_unresolved_member_2457, legit_minornull_maxornull_bare_method_reference_not_regressed) {
+// with no per-type override on Stack. #2492 folds them into the same
+// bare-reference reject: the CALL form is unaffected, the BARE form is now
+// honestly rejected (was a silent no-op). The "not yet supported" message
+// (NOT "no member") confirms both names ARE in `isLinqOperator` (preserving
+// the original intent). Repurposed from the prior vacuous `run == 0` form.
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_minornull_maxornull_bare_reference_stack_now_rejected_2492) {
     const std::string program =
         "module M; import System.Collections.Linq; "
         "class C public static method Main(): int "
@@ -438,7 +484,28 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_minornull_maxornull_bare_me
         "  var g := s.MaxOrNull; "
         "  return 0; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 0);
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `MinOrNull` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Stack<T>`"));
+}
+
+// #2492 adversarial VALUE-correctness: the CALL form `s.Where(lambda).First()`
+// MUST still compile and return the correct value after the bare-reference
+// reject (the reject is gated on `!isCallForm`). From Stack pushed 1,2,3,4
+// (top=4), `Where(x > 2)` yields the elements > 2 and `First()` returns the
+// first of them — proving the call form's real LINQ dispatch survives the
+// fix (the control for the bare-form reject above). Mirrors the Array twin.
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_where_call_form_stack_value_correct_2492) {
+    const std::string program =
+        "module M; import System.Collections.Linq; "
+        "class C public static method Main(): int "
+        "  var s := new Stack<int>(); "
+        "  s.Push(1); s.Push(2); s.Push(3); s.Push(4); "
+        "  var e := s.Where(lambda(x) => x > 2); "
+        "  return e.First(); "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(program), 3);
 }
 
 // `.ToArray()` CALL form, VALUE-correct — proves the older #920/#1112

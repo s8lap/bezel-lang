@@ -12022,8 +12022,39 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // bare reference to any of these five names on these
                         // receivers (only their CALL forms, unaffected here),
                         // so folding them into this reject regresses nothing.
-                        if ((isDeclaredMethod || isUniversalObjectMember) &&
-                                !isCallForm) {
+                        // #2492 (stdlib §5; language spec §27.6):
+                        // `isLinqOperator` folds into this SAME reject for the
+                        // identical root cause -- stdlib §5's LINQ extension
+                        // operators (Where/Select/Take/Skip/First/.../ToArray/
+                        // MinOrNull/...) are dispatched STRUCTURALLY by name in
+                        // codegen's tryLowerLinqOperatorCall
+                        // (LlvmBackend_Calls3.cpp), never through a real
+                        // MethodSymbol, so a BARE reference to one hits the
+                        // identical #2434 zero-init degradation: confirmed live
+                        // on origin/main, `var f := a.Where;` (or `.Select`/
+                        // `.Take`/`.First`) compiled clean and emitted
+                        // `lowerLocalDecl's initializer ... degraded to a
+                        // zero-initialized value -- #2434` (the same silent
+                        // no-op #2470 documented for `a.Add`), while the CALL
+                        // form `a.Where(lambda(x) => x > 2).First()` returned
+                        // the correct value (3). The CALL form (`isCallForm`
+                        // above) is unaffected: it is exempted by `!isCallForm`
+                        // here and by `!isCallForm` in the "no member" reject
+                        // below, so it still compiles and codegen structurally
+                        // dispatches it. The earlier `isLinqOperator` entries
+                        // in this list (and the matching Stack/Queue block's)
+                        // were added by #2484 to STOP a false "no member"
+                        // reject on the bare form -- that fix was correct that
+                        // the name IS a genuine LINQ member (not "no member"),
+                        // but it left the bare form slipping through BOTH
+                        // rejects (exempted from #2470's because
+                        // isLinqOperator was not in its condition, exempted
+                        // from "no member" by !isLinqOperator) as a silent
+                        // no-op; #2492 routes it to the same honest reject
+                        // instead. The reject message's parenthetical still
+                        // names the LINQ case so the diagnostic stays accurate.
+                        if ((isDeclaredMethod || isUniversalObjectMember ||
+                                isLinqOperator) && !isCallForm) {
                             auto loc = ma.span.begin;
                             if (loc.line == 0 && ma.target)
                                 loc = ma.target->span.begin;
@@ -12033,16 +12064,18 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                     std::string(mbr) + "` (language spec "
                                     "\xC2\xA7""27.6) is not yet supported on "
                                     "`" + std::string(cn) + "<T>` (stdlib "
-                                    "\xC2\xA7""4.4/\xC2\xA7""4.5, #2470): `" +
+                                    "\xC2\xA7""4.4/\xC2\xA7""4.5/\xC2\xA7""5, "
+                                    "#2470/#2492): `" +
                                     std::string(mbr) + "` is a real member "
-                                    "(declared, or a universal Object member "
-                                    "-- language spec \xC2\xA7""8.1), but this "
-                                    "builtin collection dispatches it "
-                                    "structurally rather than through a real "
-                                    "method symbol, so no function value can "
-                                    "be formed for it yet -- call it directly "
-                                    "instead (`." + std::string(mbr) +
-                                    "(...)`)");
+                                    "(declared, a universal Object member "
+                                    "-- language spec \xC2\xA7""8.1, or a "
+                                    "stdlib \xC2\xA7""5 LINQ extension "
+                                    "operator), but this builtin collection "
+                                    "dispatches it structurally rather than "
+                                    "through a real method symbol, so no "
+                                    "function value can be formed for it yet "
+                                    "-- call it directly instead (`." +
+                                    std::string(mbr) + "(...)`)");
                             return;
                         }
                         if (!isUniversalObjectMember && !isLengthAlias &&
@@ -12287,8 +12320,35 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // by `!isCallForm` here and by `!isCallForm` in the
                         // "no member" reject below, so it still compiles and
                         // codegen structurally dispatches it.
+                        //
+                        // #2492 (stdlib §5; language spec §27.6):
+                        // `isLinqOperator` folds into this SAME reject for the
+                        // identical root cause as slice 1's Array/OwningArray
+                        // block (see that block's #2492 comment) -- stdlib §5's
+                        // LINQ extension operators (Where/Select/Take/.../
+                        // ToArray/MinOrNull/...) are dispatched STRUCTURALLY
+                        // by name in codegen's tryLowerLinqOperatorCall
+                        // (LlvmBackend_Calls3.cpp), never through a real
+                        // MethodSymbol, so a BARE reference to one hits the
+                        // identical #2434 zero-init degradation: confirmed
+                        // live on origin/main, `var f := s.Where;` on
+                        // Stack<int> compiled clean and emitted
+                        // `lowerLocalDecl's initializer ... degraded to a
+                        // zero-initialized value -- #2434` (the same silent
+                        // no-op #2470 documented for `s.Push` and #2493 for
+                        // `s.Reverse`), while the CALL form
+                        // `s.Where(lambda(x) => x > 2).First()` returned the
+                        // correct value (3). The CALL form (`isCallForm`
+                        // above) is unaffected (exempted by `!isCallForm`
+                        // here and in the "no member" reject below). As in
+                        // slice 1's block, the earlier isLinqOperator entries
+                        // (#2484) correctly stopped a false "no member" reject
+                        // but left the bare form slipping through BOTH
+                        // rejects as a silent no-op; #2492 routes it to the
+                        // same honest reject.
                         if ((isDeclaredMethod || isUniversalObjectMember ||
-                                isUndocumentedCallableAlias) && !isCallForm) {
+                                isUndocumentedCallableAlias ||
+                                isLinqOperator) && !isCallForm) {
                             auto loc = ma.span.begin;
                             if (loc.line == 0 && ma.target)
                                 loc = ma.target->span.begin;
@@ -12298,17 +12358,20 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                     std::string(mbr) + "` (language spec "
                                     "\xC2\xA7""27.6) is not yet supported on "
                                     "`" + std::string(cn) + "<T>` (stdlib "
-                                    "\xC2\xA7""4.11, #2470/#2493): `" +
+                                    "\xC2\xA7""4.11/\xC2\xA7""5, "
+                                    "#2470/#2493/#2492): `" +
                                     std::string(mbr) + "` is a real member "
                                     "(declared, a universal Object member "
-                                    "-- language spec \xC2\xA7""8.1, or an "
+                                    "-- language spec \xC2\xA7""8.1, an "
                                     "undocumented-but-working structural "
-                                    "callable), but this builtin collection "
-                                    "dispatches it structurally rather than "
-                                    "through a real method symbol, so no "
-                                    "function value can be formed for it yet "
-                                    "-- call it directly instead (`." +
-                                    std::string(mbr) + "(...)`)");
+                                    "callable, or a stdlib \xC2\xA7""5 LINQ "
+                                    "extension operator), but this builtin "
+                                    "collection dispatches it structurally "
+                                    "rather than through a real method "
+                                    "symbol, so no function value can be "
+                                    "formed for it yet -- call it directly "
+                                    "instead (`." + std::string(mbr) +
+                                    "(...)`)");
                             return;
                         }
                         if (!isUniversalObjectMember &&
