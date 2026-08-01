@@ -953,11 +953,14 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 cd->contractClauses, cd->params, ctor->params,
                 contractGenerics, ctx, source, moduleNameFor(ctx),
                 ctor->parent);
-            // §14 / #662c: for a GENERIC class, export the full constructor
-            // declaration source text (extracted via AST span) so the importer
-            // can re-parse and inline it with genericSubst_ active.  The span
-            // is stamped by parseMember (#662c change); skip if zero (no span).
-            if (isGenericType && !source.empty() &&
+            // §14 / §22.7 / #2525: export record constructor declaration
+            // text as well as generic-class bodies. Imported record construction
+            // is lowered inline by value, so the consumer needs the body to
+            // execute an explicit constructor (the signature alone is not
+            // sufficient to recover its field stores).
+            if ((isGenericType ||
+                 (ctor->parent && ctor->parent->kind == ast::TypeDeclKind::Record)) &&
+                !source.empty() &&
                 cd->span.begin.offset < cd->span.end.offset &&
                 cd->span.end.offset <= source.size()) {
                 out.ctorBodyText = std::string(

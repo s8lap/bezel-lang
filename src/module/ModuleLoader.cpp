@@ -1029,9 +1029,11 @@ static std::string buildMethodStub(const MetaMember& mm) {
 static std::string buildSyntheticClassSource(
     const MetaTypeDecl& td, const std::string& ctorBodyText) {
     std::string src = "module _662c_reparsed_;\n";
-    // Class header with visibility and generic params.
+    // Record constructors must be reconstructed as records: buildRecordValue
+    // binds `this` to the by-value storage and inlines this declaration.
     src += metaVisibilityToKeyword(td.visibility);
-    src += " class ";
+    src += " ";
+    src += (td.kind == MetaTypeDeclKind::Record ? "record " : "class ");
     src += td.name;
     if (!td.genericParams.empty()) {
         src += "<";
@@ -2007,8 +2009,10 @@ static void loadMetadataPass2(
     for (std::size_t i = 0; i < md.types.size(); ++i) {
         const MetaTypeDecl& td = md.types[i];
         sema::TypeSymbol* t = created[i];
-        // Only generic classes carry exported bodies.
-        if (t->kind != ast::TypeDeclKind::Class || td.genericParams.empty())
+        // Only generic classes and records carry exported constructor bodies.
+        if ((t->kind != ast::TypeDeclKind::Class &&
+             t->kind != ast::TypeDeclKind::Record) ||
+            (t->kind == ast::TypeDeclKind::Class && td.genericParams.empty()))
             continue;
 
         // Ctor bodies: find each Constructor member with non-empty ctorBodyText.

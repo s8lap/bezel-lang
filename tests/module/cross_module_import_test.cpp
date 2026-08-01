@@ -5142,6 +5142,54 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_EQ(code, 77);
 }
 
+// #2525 / §2.8.2: an imported RECORD constructor in a generic static-field
+// initializer must be reconstructed with its body and lowered by value. Before
+// the fix, sema reconstructed `new Point(73, 2)` but buildRecordValue found an
+// imported ConstructorSymbol with no decl and returned null.
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_field_init_record_ctor_spec_2525_2_8_2) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2525_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+
+    writeSource(baseSrc.path,
+        "module Base2525; "
+        "public record Point "
+        "  public X: int; public Y: int; "
+        "  public constructor(a: int, b: int) "
+        "    X := a; Y := b; "
+        "  end constructor; "
+        "end Point; "
+        "public class Reg<T> "
+        "  public static readonly Origin: Point := new Point(73, 2); "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    writeSource(appSrc.path,
+        "module App2525; import Base2525; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var p := Reg<int>.Origin; return p.X; "
+        "  end Main; end Program;");
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency dep;
+    dep.metadataPath = baseObj.path;
+    dep.objectPath = baseObj.path;
+    deps.push_back(dep);
+    bezel::CompileResult rApp = driver.compileFile(appSrc.path, appExe.path, deps);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+    int status = std::system(appExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 73);
+}
+
 // #2351 self-pass (c) / §22.13 "Disposal of static owned fields": an `owned`
 // static field's exit disposal must run EXACTLY ONCE process-wide even when
 // TWO SEPARATE importers each independently reconstruct the field's
