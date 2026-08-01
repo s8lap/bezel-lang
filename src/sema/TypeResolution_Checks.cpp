@@ -2552,6 +2552,25 @@ static bool propertyDeclHasSetter(const ast::PropertyDecl* pd) {
     return true;
 }
 
+// #2549 / §11.2 / §23.3 / §2.8.2 clause 1 / §2.8.3 rule 4
+// (v0.236): symmetric inverse of propertyDeclHasSetter — does the
+// property/indexer declaration have a getter? An expression-bodied property's
+// body IS the getter; an Auto-bodied property has the synthesized getter; a
+// Block-bodied property has a getter iff it declares a `get` arm. (The §12.5
+// abstract-shorthand refinement from propertyDeclHasSetter is irrelevant on
+// the getter axis: an abstract Auto-shorthand property still DECLARES a
+// getter, just no body to fill it — the iface-side getter-presence question
+// is satisfied even for an abstract read-write obligation.)
+static bool propertyDeclHasGetter(const ast::PropertyDecl* pd) {
+    if (!pd) return false;
+    if (pd->bodyKind == ast::PropertyBodyKind::Expression) return true;
+    if (pd->bodyKind == ast::PropertyBodyKind::Auto) return true;
+    // Block body: has a getter iff any accessor is a `get` arm.
+    for (const auto& a : pd->accessors)
+        if (!a.isSet) return true;
+    return false;
+}
+
 void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
                                                    PropertySymbol* base) {
     auto err = [&](const std::string& what) {
@@ -3769,6 +3788,49 @@ void Resolver::checkAbstractImplementations() {
         // same bit when either side lacks a local AST, exactly as the sibling
         // iface-indexer check does (#2529). This also covers a witness inherited
         // from an imported base class and the positional-record branch below.
+        //
+        // #2549 / §11.2 / §23.3 / §2.8.2 clause 1 / §2.8.3 rule 4
+        // (v0.236): the symmetric getter axis. The setter check below
+        // rejects a getter-only impl of a read-write iface property (the
+        // missing-setter side); its mirror — a setter-only impl of a
+        // read-write iface property (the missing-getter side, the inverse
+        // of #2542's NAMED-property twin) — was silently ACCEPTED: the
+        // iface was read-write (the Auto-body kind has both arms by default),
+        // the impl had a Block body with only a `set` arm (no `get` arm),
+        // and `ifaceHasSetter() && !candidateHasSetter` never fired because
+        // the impl DID declare a setter. The runtime then dispatched through
+        // a null getter itable slot and SIGSEGV'd at pc=0x0. The added
+        // check is the getter-axis mirror of the setter check below: when
+        // the iface declares a getter (every non-write-only iface property
+        // does — Auto bodyKind with no `readonly` modifier, as iface
+        // members always are), the candidate must also declare one. Block
+        // body with a `set` arm but no `get` arm is the exact setter-only
+        // implementation this rejects.
+        //
+        // Both the setter (#2542) and getter (#2549) checks run in BOTH
+        // the LOCAL and IMPORTED shapes via the same fallback lambdas —
+        // the `importedPropertyHasSetter` and `importedPropertyHasGetter`
+        // side tables (#2400's `MetaMember::hasSetter` and #2461's
+        // `MetaMember::hasGetter` bits, already published to SemaContext)
+        // carry the accessor presence across the module boundary, so a
+        // getter-only or setter-only impl of an IMPORTED read-write iface
+        // property can be rejected on either side. The getter-only pattern
+        // in IMPORTED tests was cleaned up in the #2542 re-attempt
+        // (#2552 follow-up: legacy #2401/#2387 fixtures now declare
+        // `readonly` to match the corrected spec-correct behavior). The
+        // setter-only pattern is rare in the corpus (swept manually
+        // during the #2549 fix across tests/module/ and tests/sema/ —
+        // every iface-property impl in those directories is either
+        // expression-bodied, full block (get + set), or positional-record
+        // — none pair a setter-only block with a read-write iface), so
+        // the IMPORTED-side fallbacks ship alongside the local fix.
+        //
+        // The accessor-presence bit is shape-factual (#2413's note), not
+        // type-dependent, so these checks are intentionally NOT gated on
+        // t->genericParams.empty() / iface->genericParams.empty(). Mirror
+        // the indexer-side `ifaceHasSetter`/`candidateHasSetter` lambdas in
+        // this same file's ifaceIndexerObligations loop a few hundred lines
+        // below (#2529/#2449).
         for (auto& [name, info] : ifaceProps) {
             PropertySymbol* ips = info.first;
             TypeSymbol* iface = info.second;
@@ -3784,6 +3846,16 @@ void Resolver::checkAbstractImplementations() {
                 const bool candidateHasSetter =
                     cpd ? propertyDeclHasSetter(cpd)
                         : ctx_.importedPropertyHasSetter(cit->second);
+                const bool candidateHasGetter =
+                    cpd ? propertyDeclHasGetter(cpd)
+                        : ctx_.importedPropertyHasGetter(cit->second);
+                // SETTER check (gate fires for both LOCAL and IMPORTED via
+                // the candidateHasSetter fallback above; the W9-D sibling
+                // originally gated this on `ipd && cpd` because it
+                // considered the IMPORTED-side setter check speculative,
+                // but the W9-A re-attempt (with test fixture cleanup)
+                // closed the #2552 follow-up so the IMPORTED-side check
+                // is now sound).
                 if (ifaceHasSetter() && !candidateHasSetter) {
                     // Reported at t->declLoc, not cit->second->declLoc: probed
                     // and confirmed (during this fix) that PropertySymbol::
@@ -3803,6 +3875,58 @@ void Resolver::checkAbstractImplementations() {
                         std::string(iface->name) + "." + std::string(name) +
                         "` is declared read-write — an implementation of a "
                         "read-write interface property must provide a setter "
+                        "(§11.2 / §23.3)");
+                }
+                // #2549 / §11.2 / §23.3 / §2.8.2 clause 1 / §2.8.3 rule 4
+                // (v0.236): the symmetric getter-axis check. Mirrors the
+                // setter check above: a read-write iface property obligation
+                // requires the implementation to declare a getter.
+                // Expression-bodied / Auto-bodied impls always have one
+                // (§23.3's read-only-on-block-form rule); a Block impl has
+                // a getter iff it declares a `get` arm. A Block with only a
+                // `set` arm is the exact setter-only impl this rejects.
+                //
+                // Unlike the setter check above, this check runs in BOTH the
+                // LOCAL and IMPORTED shapes — the
+                // `importedPropertyHasGetter` side table (#2461's
+                // `MetaMember::hasGetter` bit, published by ModuleLoader)
+                // carries the accessor presence across the module boundary,
+                // so a setter-only impl of an IMPORTED read-write iface
+                // property (the inverse of #2542's NAMED-property twin,
+                // #2549) can be rejected on either side. The setter-only
+                // pattern is rare in the corpus (swept manually across
+                // tests/module/ and tests/sema/ — every iface-property
+                // impl in those directories is either expression-bodied,
+                // full block (get + set), or positional-record — none pair
+                // a setter-only block with a read-write iface), so the
+                // IMPORTED-side fallback has no legacy fixtures to clean
+                // up and ships alongside the local fix in this single
+                // commit. The setter check above is LOCAL-only for the
+                // separate reason #2552 documents: the legacy
+                // #2401/#2387 tests paired getter-only impls with read-
+                // write iface obligations and would false-reject without a
+                // fixture cleanup pass (separate lane).
+                //
+                // The accessor-presence bit is shape-factual (#2413's
+                // note), not type-dependent, so this check is
+                // intentionally NOT gated on t->genericParams.empty() /
+                // iface->genericParams.empty(). Mirrors the indexer-side
+                // `ifaceHasSetter`/`candidateHasSetter` lambdas in this
+                // same file's ifaceIndexerObligations loop a few hundred
+                // lines below (#2529/#2449).
+                auto ifaceHasGetter = [&]() -> bool {
+                    return ipd ? propertyDeclHasGetter(ipd)
+                               : ctx_.importedPropertyHasGetter(ips);
+                };
+                if (ifaceHasGetter() && !candidateHasGetter) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        std::string("property `") + std::string(name) +
+                        "` implements interface `" + std::string(iface->name) +
+                        "` with a setter-only implementation, but `" +
+                        std::string(iface->name) + "." + std::string(name) +
+                        "` is declared read-write — an implementation of a "
+                        "read-write interface property must provide a getter "
                         "(§11.2 / §23.3)");
                 }
                 continue;
