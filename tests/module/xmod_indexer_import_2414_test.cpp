@@ -374,4 +374,38 @@ BEZEL_TEST(xmod_indexer_import_2414, multidim_get_through_imported_interface_ind
     BEZEL_EXPECT_EQ(r, 34);
 }
 
+// ==========================================================================
+// T8 — fix #2528 (§23.4 / §11.2 / §14.1, v0.236): a generic interface
+// indexer's concrete element type must survive imported itable dispatch. The
+// interface metadata carries `T`, while the receiver is `IFlag<bool>`; the
+// branch discriminator proves the call is typed as bool/i1, not erased i32.
+// Pre-fix this is the imported twin of the local malformed-IR repro.
+// ==========================================================================
+BEZEL_TEST(xmod_indexer_import_2414,
+           generic_interface_bool_indexer_2528) {
+    int r = compileImportAndRun2414(
+        "module IdxIfaceLib2528T8; "
+        "public interface IFlag2528T8<T> "
+        "  property [i: int]: T; "
+        "end IFlag2528T8;",
+        "module App2528T8; import IdxIfaceLib2528T8; "
+        "public class Flags2528T8: IFlag2528T8<bool> "
+        "  private _b: bool := false; "
+        "  public property [i: int]: bool "
+        "    get => i > 2; "
+        "    set => _b := value; "
+        "  end; "
+        "end Flags2528T8; "
+        "public class C "
+        "  public static method Main(): int "
+        "    using var obj := new Flags2528T8(); "
+        "    var f: IFlag2528T8<bool> := obj; "
+        "    const g: bool := f[5]; "
+        "    if g then return 1; else return 0; end if; "
+        "  end Main; "
+        "end C;");
+    if (r == -2) return;  // dependency toolchain unavailable — skip
+    BEZEL_EXPECT_EQ(r, 1);
+}
+
 }  // namespace bezel::module

@@ -53,6 +53,37 @@ std::size_t indexerParamCount(const sema::PropertySymbol* ps) {
         return pd->indexerParams.size();
     return ps->indexerParams.size();
 }
+
+// fix #2528 (§23.4 / §11.2 / §14.1, v0.236): an interface indexer's element
+// type is declared in the interface generic parameter list, but an itable call
+// is lowered from the concrete receiver type (`IFlag<bool>`). Do the positional
+// substitution before lowering the signature; lowerType(T) otherwise returns
+// the non-null i32 generic-erasure placeholder and locks the call to the wrong
+// ABI. This covers both local AST declarations and imported side-table types.
+const sema::TypeRef* interfaceIndexerElementType(
+    sema::SemaContext& ctx, const ast::IndexExpr& ix,
+    const sema::TypeSymbol* iface, const sema::PropertySymbol* ps) {
+    if (!iface || !ps || !ix.target) return nullptr;
+    const sema::TypeRef* elem = nullptr;
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+        if (pd->type) elem = ctx.resolvedType(*pd->type);
+    } else {
+        elem = ctx.importedMemberType(ps);
+    }
+    if (!elem || elem->kind != sema::TypeRef::Kind::Named ||
+        elem->declaration || iface->genericParams.empty())
+        return elem;
+    const sema::TypeRef* recvTy = ctx.exprType(*ix.target);
+    if (!recvTy || recvTy->genericArgs.empty()) return elem;
+    const std::string_view elemName = elem->headName();
+    for (std::size_t i = 0; i < iface->genericParams.size(); ++i) {
+        auto* gp = dynamic_cast<const sema::GenericParamSymbol*>(
+            iface->genericParams[i]);
+        if (gp && gp->name == elemName && i < recvTy->genericArgs.size())
+            return recvTy->genericArgs[i];
+    }
+    return elem;
+}
 }  // namespace
 
 // fix #2437/#2442 (§11.2/§23.4, v0.235): find the class `ts`'s (or an
@@ -1402,22 +1433,16 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         auto descIt = descArray_.find(recvDecl);
         if (ifIt == ifacePropertyGetIndex_.end() || descIt == descArray_.end())
             return nullptr;
-        // fix #2422 (§23.4/§11.2, v0.236): an IMPORTED interface indexer has
-        // pd == null — read the element type off ctx_.importedMemberType
-        // (mirroring #2401's lowerVirtualPropertyGet imported-property fix) and
-        // the index-param count/types off the #2414 helpers, instead of pd.
-        // A LOCAL interface indexer (pd != null) keeps reading pd directly.
-        llvm::Type* retTy = nullptr;
-        if (pd) retTy = lowerType(pd->type.get());
-        else if (auto* tr = ctx_.importedMemberType(ps)) retTy = lowerTypeRef(tr);
-        if (!retTy) {
-            // Generic T return (e.g. IReadOnlySpan<T> indexer): recover the
-            // concrete element type from the receiver's first generic arg. // per §4.16
-            const sema::TypeRef* recvTy = ctx_.exprType(*ix.target);
-            if (recvTy && !recvTy->genericArgs.empty())
-                retTy = lowerTypeRef(recvTy->genericArgs[0]);
-            if (!retTy) retTy = i32();
-        }
+        // fix #2422 (§23.4/§11.2, v0.236): an imported interface indexer
+        // carries its element type in ctx_.importedMemberType rather than an AST.
+        // fix #2528 (§23.4/§11.2/§14.1, v0.236): resolve an interface generic
+        // parameter against the receiver instantiation BEFORE LLVM lowering;
+        // lowerTypeRef on the declared bare T yields a non-null i32 placeholder,
+        // so a null-only fallback can never recover `IFlag<bool>`'s i1 ABI.
+        const sema::TypeRef* retRef = interfaceIndexerElementType(
+            ctx_, ix, recvDecl, ps);
+        llvm::Type* retTy = lowerTypeRef(resolveTypeParamRef(retRef));
+        if (!retTy) retTy = i32();
         const std::size_t nparams = indexerParamCount(ps);
         std::vector<llvm::Type*> paramTys;
         paramTys.push_back(ptrTy());
@@ -1723,14 +1748,12 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
         auto descIt = descArray_.find(recvDecl);
         if (ifIt == ifacePropertySetIndex_.end() || descIt == descArray_.end())
             return false;
-        // fix #2422 (§23.4/§11.2, v0.236): the SETTER twin of lowerIndexerGet's
-        // interface branch — an IMPORTED interface indexer has pd == null; read
-        // the value type off ctx_.importedMemberType and the index-param
-        // count/types off the #2414 helpers. A LOCAL interface indexer keeps
-        // reading pd directly.
-        llvm::Type* valTy = nullptr;
-        if (pd) valTy = lowerType(pd->type.get());
-        else if (auto* tr = ctx_.importedMemberType(ps)) valTy = lowerTypeRef(tr);
+        // fix #2422 (§23.4/§11.2, v0.236): imported-interface signature
+        // reconstruction; fix #2528: the setter's implicit value has the same
+        // receiver-instantiated generic type as the getter return (per §14.1).
+        const sema::TypeRef* valRef = interfaceIndexerElementType(
+            ctx_, ix, recvDecl, ps);
+        llvm::Type* valTy = lowerTypeRef(resolveTypeParamRef(valRef));
         if (!valTy) valTy = i32();
         const std::size_t nparams = indexerParamCount(ps);
         std::vector<llvm::Type*> paramTys;
