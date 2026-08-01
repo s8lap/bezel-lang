@@ -12714,6 +12714,18 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             // a real, documented property — the exact
                             // false-reject failure mode the standing
                             // protocol weights most heavily against.
+                            //
+                            // #2538: `IsReadOnly` is declared on
+                            // `ICollection<T>` (§4.1) and `IOwningCollection<T>`
+                            // (§4.2); every standard collection implementing
+                            // either inherits it (the stdlib §4.1 prose names
+                            // `Array<T>`, `LinkedList<T>`, `Set<T>`,
+                            // `Dictionary<K,V>` and the owning-family
+                            // counterpart). OwningDictionary intentionally
+                            // omits (it implements `IDisposable` only, §4.9),
+                            // so IsReadOnly is gated on the family name
+                            // (checked together with the rest of the
+                            // documented surface further below).
                             bool isKnownProperty =
                                 mbr == "Count" || mbr == "Keys" ||
                                 mbr == "Values";
@@ -12724,11 +12736,36 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             // variants share most names; the ones that
                             // differ — PopValue/TryPopValue/Drain on
                             // OwningDictionary only, GetOrAdd on
-                            // Dictionary only — are included
-                            // unconditionally so a name legitimate on
-                            // EITHER variant is allowed on both, matching
-                            // the #2457 blocks' identical over-inclusion
-                            // reasoning).
+                            // Dictionary only, PopFirst/PopLast/
+                            // TryPopFirst/TryPopLast on OwningLinkedList
+                            // only — are included unconditionally so a
+                            // name legitimate on EITHER variant is allowed
+                            // on both, matching the #2457 blocks' identical
+                            // over-inclusion reasoning).
+                            //
+                            // #2538 (follow-up to #2536): the original block
+                            // omitted the names inherited from the underlying
+                            // interfaces — `GetEnumerator` (from
+                            // `IEnumerable<T>` via `ICollection<T>` on the
+                            // borrowing families and via `IReadOnlyCollection
+                            // <T>` on `IOwningCollection<T>` for the owning
+                            // ones, stdlib §4.1/§4.12; OwningDictionary
+                            // correctly omits per §4.9 — it implements
+                            // `IDisposable` only) and `TryAdd` (from
+                            // `Set<T>`/`OwningSet<T>` §4.10 and
+                            // `SortedSet<T>` §4.18). A bare reference to a
+                            // real documented member is supposed to fall through
+                            // to the #2537 "real member but no function value"
+                            // path (the symptom this catch-all is designed to
+                            // avoid conflating with the bogus-name case); the
+                            // omission produced a false "no member" reject
+                            // (#2538). Also includes `IsReadOnly` (from
+                            // `ICollection<T>` §4.1 / `IOwningCollection<T>`
+                            // §4.2 — all six non-dictionary-owning families
+                            // inherit it; OwningDictionary intentionally
+                            // omits) and the OwningLinkedList-only Pop/Pop
+                            // exhausters (stdlib §4.7 — same Union reasoning
+                            // as PopValue/TryPopValue/Drain above).
                             bool isDeclaredMethod =
                                 // Dictionary/OwningDictionary/
                                 // SortedDictionary shared surface
@@ -12746,18 +12783,64 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                 mbr == "ExceptWith" ||
                                 mbr == "IsSubsetOf" ||
                                 mbr == "IsSupersetOf" ||
+                                // Set/OwningSet/SortedSet — stdlib §4.10 /
+                                // §4.18 (TryAdd: false on duplicate, the
+                                // bool-returning counterpart of `Add`).
+                                mbr == "TryAdd" ||
                                 // LinkedList/OwningLinkedList surface
                                 mbr == "AddFirst" || mbr == "AddLast" ||
                                 mbr == "AddBefore" || mbr == "AddAfter" ||
                                 mbr == "RemoveFirst" ||
                                 mbr == "RemoveLast" ||
                                 mbr == "RemoveNode" || mbr == "Find" ||
+                                // OwningLinkedList-only (stdlib §4.7)
+                                mbr == "PopFirst" || mbr == "PopLast" ||
+                                mbr == "TryPopFirst" ||
+                                mbr == "TryPopLast" ||
                                 // IDisposable (every owning family)
-                                mbr == "Dispose";
+                                mbr == "Dispose" ||
+                                // #2538 sweep: IEnumerable<T> ancestor
+                                // (`ICollection<T>` §4.1 / `IReadOnlyCollection
+                                // <T>` §4.1 / `IOwningCollection<T>` §4.2 →
+                                // `IEnumerable<T>` §4.12). All seven families
+                                // in this block EXCEPT OwningDictionary
+                                // inherit it; included unconditionally for
+                                // the same over-inclusion reasoning
+                                // (GetOrAdd on Dictionary only, etc.).
+                                mbr == "GetEnumerator";
+                            // #2538: `IsReadOnly` is declared on
+                            // `ICollection<T>` (§4.1) and `IOwningCollection<T>`
+                            // (§4.2); every standard collection that conforms
+                            // to either inherits it. The families that
+                            // implement (any of) those interfaces are
+                            // `Dictionary` (§4.8 — `ICollection
+                            // <DictionaryEntry<K,V>>`), `Set` (§4.10 —
+                            // `ICollection<T>`), `OwningSet` (§4.10 —
+                            // `IOwningCollection<T>`), `LinkedList`
+                            // (§4.6 — `ICollection<T>`), `OwningLinkedList`
+                            // (§4.7 — `IOwningCollection<T>`). The
+                            // `SortedDictionary` (§4.17), `SortedSet`
+                            // (§4.18), and `OwningDictionary` (§4.9)
+                            // DEFS use `IReadOnlyCollection<…>` or
+                            // `IDisposable`-only conformance and do NOT
+                            // inherit `IsReadOnly` — the bare reference
+                            // keeps rejecting (`OwningDictionary`) or
+                            // doesn't reach this block
+                            // (`SortedDictionary`/`SortedSet` — the
+                            // dedicated property handler at ~10947 doesn't
+                            // name `IsReadOnly` either, so the bare form
+                            // currently lands here and rejects; that is the
+                            // documented behavior, not a bug).
+                            bool isInheritedIsReadOnly =
+                                mbr == "IsReadOnly" &&
+                                (cn == "Dictionary" || cn == "Set" ||
+                                 cn == "OwningSet" || cn == "LinkedList" ||
+                                 cn == "OwningLinkedList");
                             if (!isUniversalObjectMember &&
                                 !isLinqOperator &&
                                 !isDeclaredMethod &&
-                                !isKnownProperty) {
+                                !isKnownProperty &&
+                                !isInheritedIsReadOnly) {
                                 // Build a family-specific surface citation
                                 // so the diagnostic names the real
                                 // documented members (§4.7-§4.10, §4.17,
@@ -12767,33 +12850,106 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                 std::string surface;
                                 const char* section = "\xC2\xA7""4.x";
                                 if (isOwningDictionary) {
+                                    // §4.9: OwningDictionary implements
+                                    // `IDisposable` only — no `GetEnumerator`
+                                    // (the #2521 distinct diagnostic above
+                                    // covers that), no `IsReadOnly`. Cite
+                                    // only the union of the family + its
+                                    // interface ancestors.
                                     section = "\xC2\xA7""4.9";
                                     surface = "Add/ContainsKey/Contains/"
                                               "Remove/TryGetValue/"
                                               "GetOrNull/GetOrAdd/PopValue/"
                                               "TryPopValue/Drain/Clear";
                                 } else if (isDictionaryFamily) {
+                                    // §4.8 Dictionary / §4.17 SortedDictionary:
+                                    // both inherit `IEnumerable<T>` (via
+                                    // `ICollection<DictionaryEntry<K,V>>` and
+                                    // `IReadOnlyCollection<DictionaryEntry<K,V>>`
+                                    // respectively, §4.1) and `ICollection<T>`'s
+                                    // `IsReadOnly` (Dictionary only, §4.1).
+                                    // SortedDictionary uses `IReadOnlyCollection`
+                                    // so the `IsReadOnly` prose does not apply
+                                    // — the comment sharpens the citation
+                                    // below.
                                     section = cn == "Dictionary"
                                         ? "\xC2\xA7""4.8"
                                         : "\xC2\xA7""4.17";
-                                    surface = "Add/ContainsKey/Contains/"
-                                              "Remove/TryGetValue/"
-                                              "GetOrNull/GetOrAdd/Clear";
+                                    if (cn == "Dictionary") {
+                                        surface = "Add/ContainsKey/Contains/"
+                                                  "Remove/TryGetValue/"
+                                                  "GetOrNull/GetOrAdd/Clear/"
+                                                  "IsReadOnly/GetEnumerator";
+                                    } else {
+                                        // SortedDictionary: drops
+                                        // `Add`/`GetOrAdd`/`IsReadOnly`
+                                        // (no `ICollection<T>`) but adds
+                                        // `FirstKey`/`LastKey` (note: those
+                                        // two are typed by the dedicated
+                                        // property handler at ~11081, so the
+                                        // catch-all here is only relevant if
+                                        // `FirstKey`/`LastKey` ever fell
+                                        // through).
+                                        surface = "ContainsKey/Contains/"
+                                                  "TryGetValue/GetOrNull/"
+                                                  "Remove/Clear/FirstKey/"
+                                                  "LastKey/GetEnumerator";
+                                    }
                                 } else if (isSetFamily) {
+                                    // §4.10 Set/OwningSet, §4.18 SortedSet.
+                                    // All three inherit `IEnumerable<T>` via
+                                    // `ICollection<T>` (Set, §4.1) or
+                                    // `IReadOnlyCollection<T>` (OwningSet,
+                                    // §4.2; SortedSet, §4.18). `IsReadOnly`
+                                    // applies to the two `ICollection<T>` /
+                                    // `IOwningCollection<T>` conformers
+                                    // (Set, OwningSet) — SortedSet uses
+                                    // `IReadOnlyCollection` only and does
+                                    // not declare `IsReadOnly`. `TryAdd`
+                                    // (§4.10 / §4.18) and `First`/`Last`
+                                    // (SortedSet §4.18) round out the
+                                    // surface.
                                     section = cn == "SortedSet"
                                         ? "\xC2\xA7""4.18"
                                         : "\xC2\xA7""4.10";
-                                    surface = "Add/Remove/Contains/Clear/"
-                                              "UnionWith/IntersectWith/"
-                                              "ExceptWith/IsSubsetOf/"
-                                              "IsSupersetOf";
+                                    if (cn == "SortedSet") {
+                                        surface = "Add/Remove/Contains/Clear/"
+                                                  "TryAdd/GetEnumerator/First/"
+                                                  "Last";
+                                    } else {
+                                        surface = "Add/Remove/Contains/Clear/"
+                                                  "UnionWith/IntersectWith/"
+                                                  "ExceptWith/IsSubsetOf/"
+                                                  "IsSupersetOf/TryAdd/"
+                                                  "IsReadOnly/GetEnumerator";
+                                    }
                                 } else {
                                     // isLinkedListFamily
+                                    // §4.6 LinkedList / §4.7 OwningLinkedList.
+                                    // Both inherit `IEnumerable<T>` via
+                                    // `ICollection<T>` (LinkedList, §4.1) or
+                                    // `IOwningCollection<T>` (OwningLinkedList,
+                                    // §4.2). `IsReadOnly` applies to the
+                                    // `ICollection<T>` / `IOwningCollection<T>`
+                                    // conformers. OwningLinkedList additionally
+                                    // carries `PopFirst`/`PopLast`/
+                                    // `TryPopFirst`/`TryPopLast` (§4.7).
                                     section = "\xC2\xA7""4.7";
-                                    surface = "AddFirst/AddLast/AddBefore/"
-                                              "AddAfter/RemoveFirst/"
-                                              "RemoveLast/RemoveNode/Find/"
-                                              "Contains/Clear";
+                                    if (cn == "LinkedList") {
+                                        surface = "AddFirst/AddLast/AddBefore/"
+                                                  "AddAfter/RemoveFirst/"
+                                                  "RemoveLast/RemoveNode/Find/"
+                                                  "Contains/Clear/IsReadOnly/"
+                                                  "GetEnumerator";
+                                    } else {
+                                        surface = "AddFirst/AddLast/AddBefore/"
+                                                  "AddAfter/RemoveFirst/"
+                                                  "RemoveLast/RemoveNode/Find/"
+                                                  "Contains/Clear/IsReadOnly/"
+                                                  "GetEnumerator/PopFirst/"
+                                                  "PopLast/TryPopFirst/"
+                                                  "TryPopLast";
+                                    }
                                 }
                                 auto loc = ma.span.begin;
                                 if (loc.line == 0 && ma.target)

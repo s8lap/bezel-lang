@@ -320,3 +320,379 @@ BEZEL_TEST(dictsetll_bareref_nomember_2536,
         !hasError(program, "it is not part of this collection's "
                            "documented surface"));
 }
+
+// ── Issue #2538 (follow-up to #2536): the #2536 catch-all's allow-list of
+//    documented members was incomplete — the documented members inherited
+//    from the underlying interfaces (IEnumerable<T> via ICollection<T> /
+//    IReadOnlyCollection<T> / IOwningCollection<T>, ICollection<T>/
+//    IOwningCollection<T>'s IsReadOnly, and the Set/OwningSet/SortedSet
+//    TryAdd) were missing. A bare reference to a real documented member is
+//    supposed to fall through to the #2537 "real member but no function
+//    value" path (the symptom this catch-all is designed to avoid
+//    conflating with the bogus-name case); the omission converted that
+//    fall-through into a false "no member" reject. The fix expands the
+//    allow-list (isDeclaredMethod / isKnownProperty) inside the #2536 block
+//    and the family-specific surface citation strings.
+//    Per stdlib §4.1/§4.10/§4.12/§4.18: GetEnumerator is on every collection
+//    that inherits IEnumerable<T> (Dictionary/SortedDictionary via
+//    ICollection<DictionaryEntry<K,V>>/IReadOnlyCollection<DictionaryEntry
+//    <K,V>>, Set via ICollection<T>, OwningSet/OwningLinkedList via
+//    IOwningCollection<T> → IReadOnlyCollection<T>, SortedSet via
+//    IReadOnlyCollection<T>, LinkedList via ICollection<T>). OwningDictionary
+//    correctly omits per §4.9 (the #2521 distinct diagnostic handles that).
+//    Per stdlib §4.10/§4.18: TryAdd is documented on Set/OwningSet/SortedSet.
+//    Per stdlib §4.1/§4.2: IsReadOnly is documented on ICollection<T> and
+//    IOwningCollection<T> (every family that conforms to either).
+//    Per stdlib §4.7: PopFirst/PopLast/TryPopFirst/TryPopLast are documented
+//    on OwningLinkedList only.
+//    Each axis below asserts the bare-reference does NOT produce the
+//    generic "no member" diagnostic from THIS block. The bare-reference
+//    itself is expected to fall through to the #2537 / #2434 path (filed
+//    separately) — what we are pinning here is only the false-reject. ───
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           dictionary_getenumerator_not_false_rejected) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var d := new Dictionary<string, int>(); "
+        "d[\"a\"] := 1; "
+        "var f := d.GetEnumerator; "
+        "return 0; "
+        "end Main; end C;";
+    // The generic "no member" reject from the #2536 block must NOT fire.
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "no member `GetEnumerator` on `Dictionary`"));
+    // The surface citation must mention GetEnumerator now (so the
+    // diagnostic is internally consistent if a future name DOES reject).
+    // Verified indirectly: if it produced the reject, the §4.8 citation
+    // WOULD include GetEnumerator — the test above is the load-bearing
+    // assertion.
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "GetEnumerator` on `Dictionary` (stdlib "
+                           "\xC2\xA7""4.8)"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           sorteddictionary_getenumerator_not_false_rejected) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var d := new SortedDictionary<string, int>(); "
+        "d[\"a\"] := 1; "
+        "var f := d.GetEnumerator; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "GetEnumerator` on `SortedDictionary`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           set_getenumerator_not_false_rejected) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var s := new Set<int>(); "
+        "s.Add(1); "
+        "var f := s.GetEnumerator; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "GetEnumerator` on `Set`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           set_tryadd_not_false_rejected) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var s := new Set<int>(); "
+        "var f := s.TryAdd; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "TryAdd` on `Set`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           owningset_tryadd_not_false_rejected) {
+    // OwningSet<T> requires T: class (§4.2 / §14.4) — use a tiny class
+    // for the element type, not an int.
+    const std::string program =
+        "module M; "
+        "class E public N: int := 0; end E; "
+        "class C public static method Main(): int "
+        "using var s := new OwningSet<E>(); "
+        "var f := s.TryAdd; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "TryAdd` on `OwningSet`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           sortedset_getenumerator_not_false_rejected) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var s := new SortedSet<int>(); "
+        "s.Add(1); "
+        "var f := s.GetEnumerator; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "GetEnumerator` on `SortedSet`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           sortedset_tryadd_not_false_rejected) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var s := new SortedSet<int>(); "
+        "var f := s.TryAdd; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "TryAdd` on `SortedSet`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           linkedlist_getenumerator_not_false_rejected) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var ll := new LinkedList<int>(); "
+        "ll.AddFirst(1); "
+        "var f := ll.GetEnumerator; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "GetEnumerator` on `LinkedList`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           owninglinkedlist_getenumerator_not_false_rejected) {
+    const std::string program =
+        "module M; "
+        "class E public N: int := 0; end E; "
+        "class C public static method Main(): int "
+        "using var ll := new OwningLinkedList<E>(); "
+        "ll.AddFirst(new E()); "
+        "var f := ll.GetEnumerator; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "GetEnumerator` on `OwningLinkedList`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           owninglinkedlist_popfirst_not_false_rejected) {
+    const std::string program =
+        "module M; "
+        "class E public N: int := 0; end E; "
+        "class C public static method Main(): int "
+        "using var ll := new OwningLinkedList<E>(); "
+        "ll.AddFirst(new E()); "
+        "var f := ll.PopFirst; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "PopFirst` on `OwningLinkedList`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           owninglinkedlist_trypopfirst_not_false_rejected) {
+    const std::string program =
+        "module M; "
+        "class E public N: int := 0; end E; "
+        "class C public static method Main(): int "
+        "using var ll := new OwningLinkedList<E>(); "
+        "ll.AddFirst(new E()); "
+        "var f := ll.TryPopFirst; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "TryPopFirst` on `OwningLinkedList`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           dictionary_isreadonly_not_false_rejected) {
+    // Per stdlib §4.1: IsReadOnly is the documented property on
+    // ICollection<T> (every standard collection implementing it inherits
+    // it; §4.1 prose names Array<T>/LinkedList<T>/Set<T>/Dictionary<K,V>).
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var d := new Dictionary<string, int>(); "
+        "var f := d.IsReadOnly; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "IsReadOnly` on `Dictionary`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           linkedlist_isreadonly_not_false_rejected) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var ll := new LinkedList<int>(); "
+        "var f := ll.IsReadOnly; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "IsReadOnly` on `LinkedList`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           owningset_isreadonly_not_false_rejected) {
+    // Per stdlib §4.2: IsReadOnly is documented on IOwningCollection<T>.
+    const std::string program =
+        "module M; "
+        "class E public N: int := 0; end E; "
+        "class C public static method Main(): int "
+        "using var s := new OwningSet<E>(); "
+        "var f := s.IsReadOnly; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "IsReadOnly` on `OwningSet`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           owninglinkedlist_isreadonly_not_false_rejected) {
+    const std::string program =
+        "module M; "
+        "class E public N: int := 0; end E; "
+        "class C public static method Main(): int "
+        "using var ll := new OwningLinkedList<E>(); "
+        "var f := ll.IsReadOnly; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "IsReadOnly` on `OwningLinkedList`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           owningdictionary_isreadonly_still_rejected) {
+    // OwningDictionary implements `IDisposable` only (§4.9) — it does NOT
+    // implement IOwningCollection<T> or any interface that declares
+    // IsReadOnly, so IsReadOnly must CONTINUE to reject. (The #2536
+    // block's allow-list deliberately omits it.)
+    const std::string program =
+        "module M; "
+        "class V public N: int := 0; "
+        "public constructor(n: int) this.N := n; end constructor; end V; "
+        "class C public static method Main(): int "
+        "using var d := new OwningDictionary<string, V>(); "
+        "var f := d.IsReadOnly; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        hasError(program, "no member `IsReadOnly`"));
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "lowerLocalDecl's initializer"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           owningdictionary_getenumerator_still_rejected) {
+    // OwningDictionary's GetEnumerator rejection must remain the #2521
+    // DISTINCT diagnostic ("implements `IDisposable` only"), not the
+    // generic "no member" from THIS block. The #2521 block at ~12560 runs
+    // first and returns before the #2536 generic catch-all at ~12628.
+    const std::string program =
+        "module M; "
+        "class V public N: int := 0; "
+        "public constructor(n: int) this.N := n; end constructor; end V; "
+        "class C public static method Main(): int "
+        "using var d := new OwningDictionary<string, V>(); "
+        "var f := d.GetEnumerator; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        hasError(program, "implements `IDisposable` only"));
+    BEZEL_EXPECT_TRUE(
+        !hasError(program, "it is not part of this collection's "
+                           "documented surface"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           bogus_bare_ref_still_rejected_after_fix) {
+    // Regression guard: the fix expands the allow-list, but the
+    // out-of-surface rejection must still fire for genuinely bogus names.
+    // Picks one per family to confirm the diagnostic still cites the
+    // family's stdlib section.
+    const std::string dictProg =
+        "module M; "
+        "class C public static method Main(): int "
+        "var d := new Dictionary<string, int>(); "
+        "var f := d.TotallyBogus; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        hasError(dictProg, "no member `TotallyBogus` on `Dictionary`"));
+    BEZEL_EXPECT_TRUE(
+        hasError(dictProg, "\xC2\xA7""4.8"));
+
+    const std::string setProg =
+        "module M; "
+        "class C public static method Main(): int "
+        "var s := new Set<int>(); "
+        "var f := s.TotallyBogus; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        hasError(setProg, "no member `TotallyBogus` on `Set`"));
+    BEZEL_EXPECT_TRUE(
+        hasError(setProg, "\xC2\xA7""4.10"));
+
+    const std::string osProg =
+        "module M; "
+        "class E public N: int := 0; end E; "
+        "class C public static method Main(): int "
+        "using var s := new OwningSet<E>(); "
+        "var f := s.TotallyBogus; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        hasError(osProg, "no member `TotallyBogus` on `OwningSet`"));
+
+    const std::string ollProg =
+        "module M; "
+        "class E public N: int := 0; end E; "
+        "class C public static method Main(): int "
+        "using var ll := new OwningLinkedList<E>(); "
+        "var f := ll.TotallyBogus; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        hasError(ollProg, "no member `TotallyBogus` on `OwningLinkedList`"));
+}
+
+BEZEL_TEST(dictsetll_bareref_nomember_2536,
+           sortedset_bogus_surface_cites_tryadd) {
+    // The fix updates the SortedSet surface citation to include TryAdd.
+    // A genuinely bogus name on SortedSet must reject, and the diagnostic
+    // for an unrelated "Add" (already in the list) — wait, Add IS in the
+    // list, so that's not a good choice. Use a name that's NEVER been
+    // documented on SortedSet, e.g. "Tap" — should reject and the
+    // surface citation mentions TryAdd.
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "var s := new SortedSet<int>(); "
+        "s.Add(1); "
+        "var f := s.Tap; "
+        "return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(
+        hasError(program, "no member `Tap` on `SortedSet`"));
+    // The surface citation should mention TryAdd (now in the per-family
+    // surface string for SortedSet).
+    BEZEL_EXPECT_TRUE(
+        hasError(program, "TryAdd"));
+    // And it should mention §4.18.
+    BEZEL_EXPECT_TRUE(
+        hasError(program, "\xC2\xA7""4.18"));
+}
