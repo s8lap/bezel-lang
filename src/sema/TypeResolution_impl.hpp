@@ -459,6 +459,19 @@ private:
     bool constraintSetsEquivalent(const ast::GenericConstraint* a,
                                   const ast::GenericConstraint* b);
 
+    // fix #2391 (§14.2/§2.8.2, v0.236): the IMPORTED-base analog of
+    // `constraintSetsEquivalent`. Compares an override's locally-declared
+    // `where T: ...` clause (the `ast::GenericConstraint* d` form) against an
+    // IMPORTED base method's reconstructed clause set (the
+    // `ImportedGenericConstraint* b` side-table form, populated by
+    // ModuleLoader from MetaMember::genericParams). `b == nullptr` denotes the
+    // imported base had no `where` clause for this parameter at all (the empty
+    // set). Used by checkOverrideSignatureMatch when the base method is an
+    // IMPORTED generic declaration (no `ast::MethodDecl`).
+    bool derivedConstraintMatchesImported(
+        const ast::GenericConstraint* d,
+        const ImportedGenericConstraint* b);
+
     // Build the base-class generic substitution map (base class T → the
     // concrete arg the derived class binds it to) for an override pair, e.g.
     // Container<T> base, IntBox : Container<int> → {T → int}. Shared by

@@ -26,6 +26,27 @@
 
 namespace bezel::sema {
 
+// fix #2391 (§14.2/§2.8.2, v0.236): constraints on an IMPORTED generic base
+// method's type parameters — reconstructed from MetaMember::genericParams's
+// per-param `constraintTypes`/`specialConstraints` payload (which the metadata
+// builder has carried since #1579/v0.182). The loader stashes one entry per
+// generic parameter, positionally aligned with `MethodSymbol::genericParams`,
+// so `Resolver::checkOverrideSignatureMatch`'s §14.2 override-restatement
+// check can compare against an imported generic base method's clause set the
+// way it already does against a same-module base's `ast::GenericConstraint`
+// set. The metadata builder folds the modifier form (`where T is owned`) into
+// the same `specialConstraints` list as the regular-kind items
+// (`where T: class`), so this struct deliberately does NOT split them — the
+// override check compares a combined multiset (see
+// `derivedConstraintMatchesImported`), which is equivalent to the AST-vs-AST
+// `constraintSetsEquivalent` for every valid input (the grammar admits items
+// XOR a modifier on a single clause).
+struct ImportedGenericConstraint {
+    std::string_view typeParam;  // generic parameter name
+    std::vector<std::string_view> specialConstraints;  // "class"/"value"/"new"/...
+    std::vector<TypeRef*> constraintTypes;  // resolved type-constraint TypeRefs
+};
+
 class SemaContext {
 public:
     explicit SemaContext(DiagnosticEngine& diagnostics)
@@ -325,6 +346,23 @@ public:
         auto it = importedMemberTypes_.find(m);
         return it == importedMemberTypes_.end() ? nullptr : it->second;
     }
+    // fix #2391 (§14.2/§2.8.2, v0.236): per-generic-parameter constraint
+    // payload for an IMPORTED generic base method, populated by ModuleLoader
+    // from MetaMember::genericParams. Positionally aligned with the method's
+    // `MethodSymbol::genericParams`. Absent (nullptr) for any non-generic
+    // import or a method imported from a pre-#1579 blob — in either case the
+    // §14.2 override-restatement check has nothing to compare against and
+    // (preserving the long-standing accept behavior for unrecognized shapes)
+    // skips the imported-base path; the same-module path is unaffected.
+    void setImportedGenericConstraints(const Symbol* m,
+                                       std::vector<ImportedGenericConstraint> v) {
+        importedGenericConstraints_[m] = std::move(v);
+    }
+    const std::vector<ImportedGenericConstraint>* importedGenericConstraints(
+        const Symbol* m) const {
+        auto it = importedGenericConstraints_.find(m);
+        return it == importedGenericConstraints_.end() ? nullptr : &it->second;
+    }
 
     // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): whether an imported Property (or
     // Indexer) member declares a setter — MetaMember::hasSetter (see its field
@@ -467,6 +505,10 @@ private:
     std::unordered_map<const Symbol*, TypeRef*> importedReturnTypes_;
     std::unordered_set<const Symbol*> importedReturnOwned_;
     std::unordered_map<const Symbol*, TypeRef*> importedMemberTypes_;
+    // fix #2391 (§14.2/§2.8.2, v0.236): imported generic base method's
+    // per-parameter constraint payload, from MetaMember::genericParams.
+    std::unordered_map<const Symbol*, std::vector<ImportedGenericConstraint>>
+        importedGenericConstraints_;
     // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): imported property/indexer setter
     // presence, from MetaMember::hasSetter.
     std::unordered_map<const Symbol*, bool> importedPropertyHasSetter_;

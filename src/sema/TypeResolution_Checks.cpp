@@ -2261,6 +2261,73 @@ bool Resolver::constraintSetsEquivalent(const ast::GenericConstraint* a,
     return true;
 }
 
+// fix #2391 (§14.2/§2.8.2, v0.236): the IMPORTED-base analog of
+// `constraintSetsEquivalent` above. `d` is the locally-declared override's
+// `where T: ...` clause; `b` is the imported base's reconstructed clause set
+// (nullptr = base had no clause at all = empty set). The metadata builder
+// folds the modifier form (`where T is owned`, §14.4) into the same
+// `specialConstraints` list as the regular-kind items (`where T: class`,
+// §14.2), so this comparison deliberately treats the derived side's items
+// bag and modifier string as ONE combined multiset — semantically identical
+// to `constraintSetsEquivalent`'s two-check (modifier equality + items
+// multiset) for every valid input, since the grammar admits items XOR a
+// modifier on a single clause (the two come from disjoint alphabets).
+bool Resolver::derivedConstraintMatchesImported(
+    const ast::GenericConstraint* d,
+    const ImportedGenericConstraint* b) {
+    // Derived-side flattened bag: each item's `kind` string for special kinds
+    // (class/value/new/notnull/...), plus the modifier string when populated.
+    // Type-constraint items (kind == "type") are matched by TypeRef below, so
+    // excluded from the string bag.
+    std::vector<std::string_view> dSpec;
+    std::vector<TypeRef*> dTypes;
+    if (d) {
+        for (const auto& item : d->items) {
+            if (item.kind == "type") {
+                dTypes.push_back(item.typeArg
+                                     ? ctx_.resolvedType(*item.typeArg)
+                                     : nullptr);
+            } else if (!item.kind.empty()) {
+                dSpec.push_back(item.kind);
+            }
+        }
+        if (!d->modifierConstraint.empty())
+            dSpec.push_back(d->modifierConstraint);
+    }
+    const auto& bSpec = b ? b->specialConstraints
+                          : std::vector<std::string_view>{};
+    const auto& bTypes = b ? b->constraintTypes : std::vector<TypeRef*>{};
+    if (dSpec.size() != bSpec.size()) return false;
+    if (dTypes.size() != bTypes.size()) return false;
+    // Multiset match on special-constraint strings.
+    std::vector<bool> usedStr(bSpec.size(), false);
+    for (std::string_view s : dSpec) {
+        bool matched = false;
+        for (std::size_t j = 0; j < bSpec.size(); ++j) {
+            if (usedStr[j]) continue;
+            if (s != bSpec[j]) continue;
+            usedStr[j] = true;
+            matched = true;
+            break;
+        }
+        if (!matched) return false;
+    }
+    // Multiset match on type-constraint TypeRefs (after alias resolution).
+    std::vector<bool> usedTy(bTypes.size(), false);
+    for (TypeRef* t : dTypes) {
+        bool matched = false;
+        for (std::size_t j = 0; j < bTypes.size(); ++j) {
+            if (usedTy[j]) continue;
+            if (!typeRefEqual(t, bTypes[j])) continue;
+            usedTy[j] = true;
+            matched = true;
+            break;
+        }
+        if (!matched) return false;
+    }
+    return true;
+}
+
 void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                            MemberSymbol* baseSym) {
     auto* derived = dynamic_cast<MethodSymbol*>(derivedSym);
@@ -2399,43 +2466,56 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
     // substitution — a method-level type parameter is fresh per declaration
     // regardless of name reuse.
     //
-    // #2386: deliberately STILL gated on `bDecl` (unlike the return-type and
-    // parameter-type checks above, now fixed) — an imported generic method's
-    // `where` clauses are not reconstructed anywhere on the imported side.
-    // MetaGenericParam does carry constraintTypes/specialConstraints
-    // (ModuleMetadataBuilder.cpp's convertGenericParams), but
-    // ModuleLoader::convertGenericParams only reads `name`/`variance` off it
-    // when rebuilding a GenericParamSymbol — the constraint payload is
-    // dropped on import, and GenericParamSymbol itself has no field to hold
-    // it. So this restatement check cannot be reconstructed from a
-    // `ctx_.imported*` side table the way return/parameter types can; adding
-    // one is a metadata-schema change, out of this fix's scope per CLAUDE.md
-    // rule 4 (decline-with-reasons rather than invent). Filed as #2391.
-    if (dDecl && bDecl &&
-        dDecl->genericParams.size() == bDecl->genericParams.size()) {
-        for (std::size_t gi = 0; gi < dDecl->genericParams.size(); ++gi) {
-            std::string_view dName = dDecl->genericParams[gi].name;
+    // #2386/#2391 (v0.236): the base side is no longer required to carry an
+    // ast::MethodDecl. When `base` is an IMPORTED generic method, `bDecl` is
+    // null (§2.8.2/§2.8.3: the artifact interface carries no AST); the
+    // fallback consults `ctx_.importedGenericConstraints(base)` — a per-
+    // parameter payload reconstructed from MetaMember::genericParams by
+    // ModuleLoader — via `derivedConstraintMatchesImported` (the imported
+    // analog of `constraintSetsEquivalent`). Absent side table = stale/
+    // pre-#1579 metadata OR a base with no clauses at all for this param —
+    // the safe direction (skip the check, preserving long-standing accept)
+    // per CLAUDE.md rule 4.
+    if (!dDecl) return;
+    const auto* importedGCs = (!bDecl)
+        ? ctx_.importedGenericConstraints(base) : nullptr;
+    if (!bDecl && !importedGCs) return;  // non-generic / stale metadata
+    if (dDecl->genericParams.size() != (bDecl ? bDecl->genericParams.size()
+                                              : base->genericParams.size()))
+        return;  // arity mismatch already diagnosed elsewhere
+    for (std::size_t gi = 0; gi < dDecl->genericParams.size(); ++gi) {
+        std::string_view dName = dDecl->genericParams[gi].name;
+        const ast::GenericConstraint* dc = nullptr;
+        for (const auto& gc : dDecl->genericConstraints)
+            if (gc.typeParam == dName) { dc = &gc; break; }
+        // No `where` clause on the OVERRIDE for this type parameter at
+        // all means "exactly the inherited set" — always legal, the
+        // recommended spelling; nothing to compare.
+        if (!dc) continue;
+        bool mismatch = false;
+        if (bDecl) {
+            // Same-module base: AST-vs-AST comparison.
             std::string_view bName = bDecl->genericParams[gi].name;
-            const ast::GenericConstraint* dc = nullptr;
-            for (const auto& gc : dDecl->genericConstraints)
-                if (gc.typeParam == dName) { dc = &gc; break; }
-            // No `where` clause on the OVERRIDE for this type parameter at
-            // all means "exactly the inherited set" — always legal, the
-            // recommended spelling; nothing to compare.
-            if (!dc) continue;
             const ast::GenericConstraint* bc = nullptr;
             for (const auto& gc : bDecl->genericConstraints)
                 if (gc.typeParam == bName) { bc = &gc; break; }
-            if (!constraintSetsEquivalent(dc, bc)) {
-                ctx_.diagnostics().report(
-                    Severity::Error, derived->declLoc,
-                    std::string("override of `") + std::string(derived->name) +
-                    "` restates a `where " + std::string(dName) +
-                    ": ...` clause that differs from the inherited "
-                    "constraint set — omit the clause to inherit it exactly, "
-                    "or restate the identical set (§14.2)");
-                return;
-            }
+            mismatch = !constraintSetsEquivalent(dc, bc);
+        } else {
+            // #2391: IMPORTED base — consult the side table populated by
+            // ModuleLoader from MetaMember::genericParams.
+            mismatch = !derivedConstraintMatchesImported(
+                dc, gi < importedGCs->size() ? &(*importedGCs)[gi]
+                                             : nullptr);
+        }
+        if (mismatch) {
+            ctx_.diagnostics().report(
+                Severity::Error, derived->declLoc,
+                std::string("override of `") + std::string(derived->name) +
+                "` restates a `where " + std::string(dName) +
+                ": ...` clause that differs from the inherited "
+                "constraint set — omit the clause to inherit it exactly, "
+                "or restate the identical set (§14.2)");
+            return;
         }
     }
 }

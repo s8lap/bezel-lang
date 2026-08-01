@@ -350,6 +350,32 @@ struct Loader {
                 // resolution / codegen can read it (see returnTypeOf below).
                 returnTypes_[m] = convert(mm.type);
                 returnOwned_[m] = mm.returnOwned;
+                // fix #2391 (§14.2/§2.8.2, v0.236): capture the per-generic-
+                // parameter constraint payload that the metadata builder
+                // (ModuleMetadataBuilder::convertGenericParams, #1579/v0.182)
+                // already exports on each MetaGenericParam, but that
+                // `convertGenericParams` above (the import-side reconstructor)
+                // silently drops — GenericParamSymbol carries only name/variance.
+                // Without this side table, an override of an imported generic
+                // base method skips the §14.2 constraint-restatement check
+                // (checkOverrideSignatureMatch had no `bDecl` and no fallback),
+                // so a mismatched-constraint override compiled clean. Aligned
+                // positionally with `m->genericParams`.
+                if (!mm.genericParams.empty()) {
+                    std::vector<sema::ImportedGenericConstraint> gcs;
+                    gcs.reserve(mm.genericParams.size());
+                    for (const MetaGenericParam& mg : mm.genericParams) {
+                        sema::ImportedGenericConstraint c;
+                        c.typeParam = ctx.internString(mg.name);
+                        for (const std::string& sc : mg.specialConstraints)
+                            c.specialConstraints.push_back(
+                                ctx.internString(sc));
+                        for (const MetaType& ct : mg.constraintTypes)
+                            c.constraintTypes.push_back(convert(ct));
+                        gcs.push_back(std::move(c));
+                    }
+                    methodGenericConstraints_[m] = std::move(gcs);
+                }
                 applyBehavior(m);
                 return m;
             }
@@ -623,6 +649,17 @@ struct Loader {
     std::unordered_map<sema::MethodSymbol*, sema::TypeRef*> returnTypes_;
     std::unordered_map<sema::MethodSymbol*, bool> returnOwned_;
     std::unordered_map<const sema::MemberSymbol*, sema::TypeRef*> fieldTypes_;
+    // fix #2391 (§14.2/§2.8.2, v0.236): imported generic base method's
+    // per-parameter constraint payload, from MetaMember::genericParams (the
+    // builder's `convertGenericParams` has carried `constraintTypes`/
+    // `specialConstraints` per param since #1579/v0.182). Published to
+    // ctx.setImportedGenericConstraints() below so
+    // checkOverrideSignatureMatch's §14.2 override-restatement leg can verify
+    // an override against an imported generic base. Positionally aligned with
+    // the method's `MethodSymbol::genericParams`.
+    std::unordered_map<const sema::MethodSymbol*,
+                       std::vector<sema::ImportedGenericConstraint>>
+        methodGenericConstraints_;
     // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): imported property setter presence,
     // from MetaMember::hasSetter — published to
     // ctx.setImportedPropertyHasSetter() below.
@@ -2056,6 +2093,11 @@ static void loadMetadataPass2(
         ctx.setImportedReturnType(m, ret, loader.returnOwned_[m]);
     for (auto& [m, ty] : loader.fieldTypes_)
         ctx.setImportedMemberType(m, ty);
+    // fix #2391 (§14.2/§2.8.2, v0.236): publish imported generic base
+    // methods' per-parameter constraint payload so checkOverrideSignatureMatch
+    // can verify an override's restated clause set against an imported base.
+    for (auto& [m, gcs] : loader.methodGenericConstraints_)
+        ctx.setImportedGenericConstraints(m, std::move(gcs));
     // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): publish imported property setter
     // presence so declareImportedPropertySetters (LlvmBackend_Setup.cpp) can
     // tell a genuinely settable imported property from a getter-only one.
