@@ -1353,7 +1353,16 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // here per §23.5's "Enums may not declare indexers", confirmed still
     // enforced by probe — but kept for defense-in-depth, matching every
     // sibling spill site's own belt-and-suspenders posture).
-    if (!pd) {
+    // fix #2422 (§23.4/§11.2/§2.8.2 clause 1, v0.236): an IMPORTED INTERFACE-
+    // typed receiver also has pd == null (the imported interface's indexer has
+    // no AST, same as an imported class indexer above). The external-stub
+    // dispatch below is specific to a Class/Record receiver; an Interface-typed
+    // receiver dispatches through the itable (the #730 branch immediately
+    // after), which now also handles pd == null by reading the signature types
+    // off the reconstructed side tables (ctx_.importedMemberType /
+    // indexerParamType), mirroring #2401's property-through-imported-interface
+    // fix. Let it fall through by excluding Interface from this gate.
+    if (!pd && recvDecl->kind != ast::TypeDeclKind::Interface) {
         if (recvDecl->kind != ast::TypeDeclKind::Class &&
             recvDecl->kind != ast::TypeDeclKind::Record) return nullptr;
         auto git = importedIndexerGetterFns_.find(ps);
@@ -1393,7 +1402,14 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         auto descIt = descArray_.find(recvDecl);
         if (ifIt == ifacePropertyGetIndex_.end() || descIt == descArray_.end())
             return nullptr;
-        llvm::Type* retTy = lowerType(pd->type.get());
+        // fix #2422 (§23.4/§11.2, v0.236): an IMPORTED interface indexer has
+        // pd == null — read the element type off ctx_.importedMemberType
+        // (mirroring #2401's lowerVirtualPropertyGet imported-property fix) and
+        // the index-param count/types off the #2414 helpers, instead of pd.
+        // A LOCAL interface indexer (pd != null) keeps reading pd directly.
+        llvm::Type* retTy = nullptr;
+        if (pd) retTy = lowerType(pd->type.get());
+        else if (auto* tr = ctx_.importedMemberType(ps)) retTy = lowerTypeRef(tr);
         if (!retTy) {
             // Generic T return (e.g. IReadOnlySpan<T> indexer): recover the
             // concrete element type from the receiver's first generic arg. // per §4.16
@@ -1402,10 +1418,17 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
                 retTy = lowerTypeRef(recvTy->genericArgs[0]);
             if (!retTy) retTy = i32();
         }
+        const std::size_t nparams = indexerParamCount(ps);
         std::vector<llvm::Type*> paramTys;
         paramTys.push_back(ptrTy());
-        for (const auto& p : pd->indexerParams) {
-            llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+        for (std::size_t k = 0; k < nparams; ++k) {
+            llvm::Type* pt = nullptr;
+            if (pd) {
+                if (k < pd->indexerParams.size() && pd->indexerParams[k].type)
+                    pt = lowerType(pd->indexerParams[k].type.get());
+            } else if (auto* tr = indexerParamType(ctx_, ps, k)) {
+                pt = lowerTypeRef(tr);
+            }
             paramTys.push_back(pt ? pt : i32());
         }
         auto* gFnTy = llvm::FunctionType::get(retTy, paramTys, false);
@@ -1426,7 +1449,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
             "idxget");
         std::vector<llvm::Value*> callArgs;
         callArgs.push_back(obj);
-        for (std::size_t k = 0; k < pd->indexerParams.size() &&
+        for (std::size_t k = 0; k < nparams &&
              k < ix.indices.size(); ++k) {
             if (!ix.indices[k].value) return nullptr;
             llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
@@ -1640,7 +1663,12 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
     // `localSlot`/`fieldAddr`) over `lowerExpr`; fall back to `lowerExpr` +
     // spill only for a non-addressable (temporary) receiver, where no
     // "original" exists to preserve.
-    if (!pd) {
+    // fix #2422 (§23.4/§11.2/§2.8.2 clause 1, v0.236): the SETTER twin of
+    // lowerIndexerGet's gate immediately above — an IMPORTED INTERFACE-typed
+    // receiver also has pd == null, and must fall through to the itable-dispatch
+    // branch below (which now handles pd == null) rather than be captured by
+    // this Class/Record-only external-stub gate. See that gate's comment.
+    if (!pd && recvDecl->kind != ast::TypeDeclKind::Interface) {
         if (recvDecl->kind != ast::TypeDeclKind::Class &&
             recvDecl->kind != ast::TypeDeclKind::Record) return false;
         auto sit = importedIndexerSetterFns_.find(ps);
@@ -1695,12 +1723,26 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
         auto descIt = descArray_.find(recvDecl);
         if (ifIt == ifacePropertySetIndex_.end() || descIt == descArray_.end())
             return false;
-        llvm::Type* valTy = lowerType(pd->type.get());
+        // fix #2422 (§23.4/§11.2, v0.236): the SETTER twin of lowerIndexerGet's
+        // interface branch — an IMPORTED interface indexer has pd == null; read
+        // the value type off ctx_.importedMemberType and the index-param
+        // count/types off the #2414 helpers. A LOCAL interface indexer keeps
+        // reading pd directly.
+        llvm::Type* valTy = nullptr;
+        if (pd) valTy = lowerType(pd->type.get());
+        else if (auto* tr = ctx_.importedMemberType(ps)) valTy = lowerTypeRef(tr);
         if (!valTy) valTy = i32();
+        const std::size_t nparams = indexerParamCount(ps);
         std::vector<llvm::Type*> paramTys;
         paramTys.push_back(ptrTy());
-        for (const auto& p : pd->indexerParams) {
-            llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+        for (std::size_t k = 0; k < nparams; ++k) {
+            llvm::Type* pt = nullptr;
+            if (pd) {
+                if (k < pd->indexerParams.size() && pd->indexerParams[k].type)
+                    pt = lowerType(pd->indexerParams[k].type.get());
+            } else if (auto* tr = indexerParamType(ctx_, ps, k)) {
+                pt = lowerTypeRef(tr);
+            }
             paramTys.push_back(pt ? pt : i32());
         }
         paramTys.push_back(valTy);
@@ -1723,7 +1765,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
             "idxset");
         std::vector<llvm::Value*> callArgs;
         callArgs.push_back(obj);
-        for (std::size_t k = 0; k < pd->indexerParams.size() &&
+        for (std::size_t k = 0; k < nparams &&
              k < ix.indices.size(); ++k) {
             if (!ix.indices[k].value) return false;
             llvm::Value* argVal = lowerExpr(*ix.indices[k].value);

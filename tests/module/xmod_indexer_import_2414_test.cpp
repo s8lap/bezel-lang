@@ -47,16 +47,18 @@
 // index-parameter type signature — see the file-level limitation note below).
 //
 // SCOPE / WHAT REMAINS BROKEN (probed, NOT fixed here, filed separately):
-// an indexer reached through a LOCAL class satisfying an IMPORTED
-// interface's indexer obligation (the itable-dispatched shape, #730/#1080's
-// `ensureIndexerGetterFn` itable-fill path and `indexerSlotKey`) still
-// requires `ps->decl` for a DIFFERENT reason (deriving the vtable-slot KEY
-// from the index-parameter type spellings) and is not exercised here — see
-// T4 below (accept-control, compile-only, mirrors #2401 T5's documented
-// deferral pattern). Also not addressed: overloaded indexers of the SAME
-// arity but different parameter TYPES exported cross-module collide on the
-// same `bz$<Class>$idxget$<arity>` symbol (a documented simplification, not
-// exercised by any test here — no spec example needs it).
+// The itable-dispatched shape (an indexer reached through a LOCAL class
+// satisfying an IMPORTED interface's indexer obligation) was the deferral
+// #2414 filed as #2422, now LANDED — T5/T6/T7 below assert its runtime VALUE
+// (get, set-then-get, multi-dim), and T4 remains as the compile-only
+// accept-control. Not addressed by either #2414 or #2422: overloaded indexers
+// of the SAME arity but different parameter TYPES exported cross-module
+// collide on the same `bz$<Class>$idxget$<arity>` symbol (a documented
+// simplification, not exercised by any test here — no spec example needs it);
+// and a GENERIC interface indexer whose element type is a type parameter
+// (e.g. `IFlag<T>` read as `bool`) erases to i32 in the itable-dispatch
+// return type for BOTH local and imported interfaces — pre-existing, filed
+// separately (not a #2422 regression: the local twin fails identically).
 //
 // CONSTANTS: kept < 256 throughout — `runAot`'s (and a plain child-process)
 // exit status is WEXITSTATUS-masked to 8 bits (see #2401's own test file for
@@ -241,14 +243,12 @@ BEZEL_TEST(xmod_indexer_import_2414, local_class_indexer_control_unaffected) {
 // ===========================================================================
 // T4 — ACCEPT-CONTROL (compiles only — mirrors #2401 T5's documented
 // deferral pattern): an indexer reached through a LOCAL class satisfying an
-// IMPORTED interface's indexer obligation (itable-dispatched shape). NOT
-// asserted for VALUE — see the file header's "SCOPE" note: this shape needs
-// `indexerSlotKey`/`ensureIndexerGetterFn`'s itable-fill path to also grow a
-// decl-null fallback, which this fix does not attempt (filed separately).
-// Pins only that the shape still compiles clean, so a future regression in
-// the itable-slot-count machinery (the #2406-style layout-shift hazard) is
-// at least caught as a compile failure here even before the value-level fix
-// lands.
+// IMPORTED interface's indexer obligation (itable-dispatched shape). The
+// runtime VALUE for this shape is now asserted by T5/T6/T7 below (fix #2422);
+// this cell stays compile-only to pin that the shape still compiles clean
+// independently, so a future regression in the itable-slot-count machinery
+// (the #2406-style layout-shift hazard) is at least caught as a compile
+// failure here even before value-level coverage runs.
 // ===========================================================================
 BEZEL_TEST(xmod_indexer_import_2414,
            indexer_through_imported_interface_still_compiles_accept_control) {
@@ -270,6 +270,108 @@ BEZEL_TEST(xmod_indexer_import_2414,
         "  end Main; "
         "end C;");
     BEZEL_EXPECT_TRUE(ok);
+}
+
+// ===========================================================================
+// T5 — fix #2422 (§23.4 / §11.2 / §2.8.2 clause 1, v0.236): the VALUE-level
+// twin of T4 — a GET reached through a LOCAL class satisfying an IMPORTED
+// interface's indexer obligation (itable-dispatched, the #2414 deferral).
+// Pre-fix: compiles/runs clean but the IndexExpr failed to lower — the
+// interface-dispatch branch in `lowerIndexerGet` read `pd->type`/
+// `pd->indexerParams` unconditionally, and an IMPORTED interface's indexer
+// has no ast::PropertyDecl (`pd == null`), so the `!pd` gate just above it
+// returned nullptr and the call degraded to a zero return (#2491): exit 0,
+// not 8. Post-fix: `8` (`_v (7) + i (1)`), the issue's own confirmed
+// expectation. Confirmed mechanically: patch out → r==0; patch in → r==8.
+// ===========================================================================
+BEZEL_TEST(xmod_indexer_import_2414, get_through_imported_interface_indexer_2422) {
+    int r = compileImportAndRun2414(
+        "module IdxIfaceLib2422T5; "
+        "public interface IIdx2422T5 "
+        "  property [i: int]: int; "
+        "end IIdx2422T5;",
+        "module App2422T5; import IdxIfaceLib2422T5; "
+        "public class Impl2422T5: IIdx2422T5 "
+        "  private _v: int := 7; "
+        "  public property [i: int]: int "
+        "    get => _v + i; "
+        "    set => _v := value - i; "
+        "  end; "
+        "end Impl2422T5; "
+        "public class C "
+        "  public static method Main(): int "
+        "    using var obj := new Impl2422T5(); "
+        "    var b: IIdx2422T5 := obj; "
+        "    return b[1]; "
+        "  end Main; "
+        "end C;");
+    if (r == -2) return;  // dependency toolchain unavailable — skip
+    BEZEL_EXPECT_EQ(r, 8);
+}
+
+// ===========================================================================
+// T6 — fix #2422 (§23.4 / §11.2): the SETTER twin of T5 — SET then GET
+// through the IMPORTED interface (itable-dispatched both ways). `b[5] := 9`
+// sets `_v := 9 - 5 = 4`; a subsequent `b[2]` reads `_v (4) + 2 = 6`. Guards
+// against a fix that reconstructs the itable-dispatch getter but not the
+// setter. Pre-fix: r==0 (both the set and the read degraded); post-fix: 6.
+// ===========================================================================
+BEZEL_TEST(xmod_indexer_import_2414, set_then_get_through_imported_interface_indexer_2422) {
+    int r = compileImportAndRun2414(
+        "module IdxIfaceLib2422T6; "
+        "public interface IIdx2422T6 "
+        "  property [i: int]: int; "
+        "end IIdx2422T6;",
+        "module App2422T6; import IdxIfaceLib2422T6; "
+        "public class Impl2422T6: IIdx2422T6 "
+        "  private _v: int := 7; "
+        "  public property [i: int]: int "
+        "    get => _v + i; "
+        "    set => _v := value - i; "
+        "  end; "
+        "end Impl2422T6; "
+        "public class C "
+        "  public static method Main(): int "
+        "    using var obj := new Impl2422T6(); "
+        "    var b: IIdx2422T6 := obj; "
+        "    b[5] := 9; "
+        "    return b[2]; "
+        "  end Main; "
+        "end C;");
+    if (r == -2) return;
+    BEZEL_EXPECT_EQ(r, 6);
+}
+
+// ===========================================================================
+// T7 — fix #2422 (§23.4 / §11.2): a MULTI-DIM indexer reached through an
+// IMPORTED interface — `g[3, 4]` returns `(3 * 10) + 4 = 34`. Guards that the
+// fix's `indexerParamCount`/`indexerParamType` fallback scales past arity 1
+// (the itable slot carries a `T get(ptr this, int, int)` signature, built by
+// iterating the reconstructed index-param side table).
+// ===========================================================================
+BEZEL_TEST(xmod_indexer_import_2414, multidim_get_through_imported_interface_indexer_2422) {
+    int r = compileImportAndRun2414(
+        "module IdxIfaceLib2422T7; "
+        "public interface IGrid2422T7 "
+        "  property [i: int, j: int]: int; "
+        "end IGrid2422T7;",
+        "module App2422T7; import IdxIfaceLib2422T7; "
+        "public class Grid2422T7: IGrid2422T7 "
+        "  private _v: int := 0; "
+        "  public property [i: int, j: int]: int "
+        "    get => (i * 10) + j; "
+        "    set => _v := value; "
+        "  end; "
+        "end Grid2422T7; "
+        "public class C "
+        "  public static method Main(): int "
+        "    using var obj := new Grid2422T7(); "
+        "    var g: IGrid2422T7 := obj; "
+        "    return g[3, 4]; "
+        "  end Main; "
+        "end C;");
+    if (r == -2) return;
+    BEZEL_EXPECT_EQ(r, 34);
 }
 
 }  // namespace bezel::module
