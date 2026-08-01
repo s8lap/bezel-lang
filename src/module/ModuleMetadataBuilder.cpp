@@ -1050,6 +1050,31 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 for (const auto& a : pd->accessors)
                     if (a.isSet) { out.hasSetter = true; break; }
             }
+            // fix #2461 (§22.3/§23, v0.236): mirror
+            // ExprTypecheck_Calls.cpp's propertyDeclIsSetOnly predicate's
+            // INVERSE exactly — that LOCAL read-of-write-only gate returns
+            // true (write-only) iff Block bodyKind with a `set` arm but no
+            // `get` arm, so hasGetter is its negation on the getter axis:
+            // Expression/Auto bodyKinds always have a getter (the former's
+            // body IS the getter; the latter is backed by compiler storage
+            // with a synthesized get), and a Block bodyKind has a getter iff
+            // any accessor is a `get` arm. Computed here (export time) rather
+            // than shared across the module/codegen boundary because, like
+            // hasSetter above, the importer never reconstructs an
+            // ast::PropertyDecl to derive this from. Applied to BOTH
+            // properties and indexers (an indexer may also be write-only — a
+            // `set`-only indexer block — and §22.3's copy-in/getter rule
+            // applies to an indexer slot ref/out target identically, per
+            // checkRefOutPropertyOperand's IndexExpr path).
+            if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
+                out.hasGetter = true;
+            } else if (pd->bodyKind == ast::PropertyBodyKind::Auto) {
+                out.hasGetter = true;
+            } else {
+                out.hasGetter = false;
+                for (const auto& a : pd->accessors)
+                    if (!a.isSet) { out.hasGetter = true; break; }
+            }
             // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): mirror
             // ExprTypecheck.cpp's local `:=`-assignment-target `sv`
             // computation exactly (and checkRefOutPropertyOperand's ref/out

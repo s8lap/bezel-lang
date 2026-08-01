@@ -184,6 +184,22 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // world, so a stale pre-#2392 dependency artifact keeps the old false-reject
 // behavior until its own module is recompiled, same as any other additive
 // field in this schema).
+//
+// §22.3 / §23 (#2461, additive within v7): MetaMember::hasGetter — the
+// getter-presence twin of #2400's hasSetter (an 11th scalar). A 14th
+// trailing scalar in MEMBER_BLOCK's REC_SCALARS. NO bump: the rule above is
+// that a bump is reserved for a change that makes an OLD reader misinterpret
+// an EXISTING field, and this only ADDS a trailing scalar — a pre-#2461
+// reader's `sc.size() < 8` gate never looks past index 7, so it is
+// unaffected. A v7+ reader given a pre-#2461 blob (at most 13 scalars) reads
+// the missing 14th scalar as the field's default `true` (NOT `false` like
+// hasSetter — see the hasGetter field comment for why the opposite default is
+// load-bearing: a false default would false-reject a legitimate `ref` to a
+// read-write property from a stale dependency). Closes the message-quality
+// gap where a write-only imported property used as a `ref` argument fell
+// through sema to a raw linker error (undefined `...$propget`) instead of a
+// clean §22.3/§23 rejection; see checkRefOutPropertyOperand's `!pd` branch
+// (ExprTypecheck.cpp) for the consuming side.
 inline constexpr std::uint32_t kSchemaVersion = 7;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
@@ -523,6 +539,52 @@ struct MetaMember {
     // reasoning: a stale (not-yet-recompiled) dependency keeps its
     // pre-fix behavior until recompiled, rather than the reader guessing.
     bool isAutoProperty = false;
+
+    // §22.3 / §23 (fix #2461, additive within v7 — the getter-presence
+    // TWIN of hasSetter above): for a Property (or Indexer) member, whether
+    // it declares a getter. §22.3 "`ref` and `out` argument locations":
+    // "for `ref`, the getter is called once to produce the callee's slot
+    // value (for `out` no getter call occurs)" — so a write-only property
+    // (hasSetter && !hasGetter) is a legal `out` target but NOT a legal
+    // `ref` target (the copy-in has no getter to call). checkRefOutProperty
+    // Operand (ExprTypecheck.cpp) enforces exactly that distinction for an
+    // IMPORTED property — but it could not before this bit existed: an
+    // imported PropertySymbol has no ast::PropertyDecl (ModuleLoader never
+    // reconstructs one), so the getter-presence could not be recovered,
+    // and a write-only imported property used as `ref` fell through sema
+    // to a raw LINKER error (undefined `...$propget` symbol — the exporter
+    // never emitted one), rather than a clean §23 rejection. The LOCAL
+    // same-module shape was already correctly rejected, but by a SEPARATE
+    // earlier check (ExprTypecheck_Calls.cpp's propertyDeclIsSetOnly gate
+    // on the `d.W` member-access READ), which is also `pd`-gated and so
+    // also does not cover an imported property. This bit is computed by
+    // mirroring that propertyDeclIsSetOnly predicate's INVERSE exactly
+    // (Expression/Auto bodyKinds always have a getter; a Block bodyKind
+    // has a getter iff any accessor is a `get` arm), so the wire-carried
+    // classification and the local-decl classification agree by
+    // construction. Ignored for every kind but Property/Indexer.
+    //
+    // MISSING-SCALAR DEFAULT IS `true` — the OPPOSITE direction from
+    // hasSetter (which defaults `false` to reject-conservative). The
+    // asymmetry is deliberate and load-bearing: a false `hasSetter`
+    // REJECTS a cross-module write (the safe direction — refuses rather
+    // than risking an unresolved `...$propset` symbol); but a false
+    // `hasGetter` would REJECT a cross-module `ref` READ, which would
+    // FALSE-REJECT a legitimate read-write property from a stale
+    // (pre-#2461, 13-scalar) dependency — a regression that breaks
+    // working code. Defaulting `true` instead preserves the pre-#2461
+    // behavior for a stale dependency exactly (a write-only property as
+    // `ref` stays the pre-existing linker error — still rejected, just
+    // confusingly; a read-write property as `ref` stays a clean accept),
+    // and only a dependency RECOMPILED with #2461 gets the clean §23
+    // diagnostic for its write-only properties. This is the same
+    // "a stale dependency keeps its pre-fix behavior until recompiled"
+    // model every other additive scalar in this schema follows
+    // (§2.8.5 disclaims ABI stability across recompilation); it does NOT
+    // violate §2.8.2 clause 1's "must reject" because no semantics are
+    // silently altered — the stale write-only-as-ref was already rejected
+    // (at link time), not silently accepted.
+    bool hasGetter = true;
 
     // §22.16 / §2.8.2: clauses in declaration order. For a `when` form from
     // §22.4 the builder emits the equivalent static-ensures record here.

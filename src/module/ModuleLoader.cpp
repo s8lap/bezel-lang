@@ -491,6 +491,14 @@ struct Loader {
                 // field's comment in ModuleMetadata.hpp for why this cannot be
                 // derived from `p->modifiers` alone.
                 propHasSetter_[p] = mm.hasSetter;
+                // fix #2461 (§22.3/§23): MetaMember::hasGetter, published to
+                // ctx.importedPropertyHasGetter() below — the getter-presence
+                // twin of hasSetter, needed so checkRefOutPropertyOperand can
+                // reject a write-only imported property used as a `ref`
+                // argument (§22.3: ref's copy-in calls the getter) with a
+                // clean diagnostic instead of falling through to a raw linker
+                // error (undefined `...$propget`).
+                propHasGetter_[p] = mm.hasGetter;
                 // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4):
                 // MetaMember::setterVisibility, published to
                 // ctx.importedPropertySetterVisibility() below — the
@@ -574,6 +582,10 @@ struct Loader {
                 // comment in ModuleMetadata.hpp ("Ignored for every kind but
                 // Property/Indexer").
                 propHasSetter_[p] = mm.hasSetter;
+                // fix #2461's bit, reused for indexers per its own field
+                // comment in ModuleMetadata.hpp — a write-only (`set`-only)
+                // indexer is equally illegal as a `ref` target under §22.3.
+                propHasGetter_[p] = mm.hasGetter;
                 // fix #2415's bit, reused for indexers per its own field
                 // comment in ModuleMetadata.hpp ("Ignored for every kind but
                 // Property/Indexer").
@@ -674,6 +686,10 @@ struct Loader {
     // from MetaMember::isAutoProperty — published to
     // ctx.setImportedPropertyIsAutoStorage() below.
     std::unordered_map<const sema::MemberSymbol*, bool> propIsAutoStorage_;
+    // fix #2461 (§22.3/§23): imported property/indexer getter presence, from
+    // MetaMember::hasGetter — published to ctx.setImportedPropertyHasGetter()
+    // below.
+    std::unordered_map<const sema::MemberSymbol*, bool> propHasGetter_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const sema::MemberSymbol*, std::string> constValues_;
 };
@@ -2173,6 +2189,13 @@ static void loadMetadataPass2(
     // imported type's storage correctly.
     for (auto& [m, isAuto] : loader.propIsAutoStorage_)
         ctx.setImportedPropertyIsAutoStorage(m, isAuto);
+    // fix #2461 (§22.3/§23): publish imported property/indexer getter
+    // presence so checkRefOutPropertyOperand (ExprTypecheck.cpp) can reject a
+    // write-only imported property used as a `ref` argument with a clean
+    // §22.3/§23 diagnostic (instead of falling through to a raw linker
+    // error on the undefined `...$propget` symbol).
+    for (auto& [m, hg] : loader.propHasGetter_)
+        ctx.setImportedPropertyHasGetter(m, hg);
     // §22.12 (issue #328 FINDING [3] BUG A): publish imported const values so
     // codegen can fold an imported `const` read without a storage symbol.
     for (auto& [m, val] : loader.constValues_)

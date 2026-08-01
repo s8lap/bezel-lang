@@ -4139,34 +4139,53 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
         // setter-visibility check — the ref/out sibling of #2412 (hasSetter)
         // and #2415 (setter visibility), which fixed the identical gap for
         // the plain `:=` assignment-target check in the same file. Falls
-        // back to the SAME two side tables #2412/#2415 already publish (no
-        // new metadata needed — #2415 already proved the metadata exists
-        // and round-trips): `ctx_.importedPropertyHasSetter(ps)` and
-        // `ctx_.importedPropertySetterVisibility(ps)`.
+        // back to the SAME side tables #2412/#2415/#2461 publish:
+        // `ctx_.importedPropertyHasSetter(ps)`,
+        // `ctx_.importedPropertySetterVisibility(ps)`, and (fix #2461)
+        // `ctx_.importedPropertyHasGetter(ps)`.
         //
-        // NOT covered here (deliberately, decline-with-reasons): a
-        // WRITE-ONLY property (no getter) is invalid as a `ref` argument
-        // (§22.3: "for `ref`, the getter is called once to produce the
-        // callee's slot value") but valid as `out` (§22.3: "for `out` no
-        // getter call occurs"). The LOCAL `pd`-present branch below does
-        // NOT enforce this distinction either — a write-only LOCAL
-        // property's illegal use as `ref` is instead caught by a SEPARATE,
-        // EARLIER general "reading a write-only property" check
-        // (ExprTypecheck_Calls.cpp's propertyDeclIsSetOnly gate), which is
-        // ALSO `pd`-gated and so ALSO does not cover an imported property.
-        // Recovering "has a getter" for an imported property would need a
-        // THIRD new metadata bit (no `hasGetter`/`isSetOnly` scalar exists
-        // today) — filed as #2461 rather than guessed at here; today a
-        // write-only imported property used as `ref` is still soundly
-        // rejected, just via a confusing codegen-level "internal: no
-        // setter" diagnostic (#1302) instead of a clean §23 message, since
-        // codegen's copy-in getter call has nothing to call.
+        // fix #2461 (§22.3/§23, v0.236): the getter-presence check this
+        // branch previously lacked. §22.3: "for `ref`, the getter is called
+        // once to produce the callee's slot value (for `out` no getter call
+        // occurs)" — so a write-only property (setter but NO getter) is a
+        // legal `out` target but NOT a legal `ref` target. Before this bit
+        // existed, a write-only imported property used as `ref` fell through
+        // this check (and the separate ExprTypecheck_Calls.cpp
+        // propertyDeclIsSetOnly READ gate, which is also `pd`-gated) all the
+        // way to a raw LINKER error (undefined `...$propget` symbol — the
+        // exporter never emitted one), rather than a clean §23 rejection.
+        // The LOCAL same-module shape was already correctly rejected, but by
+        // that earlier propertyDeclIsSetOnly gate on the `d.W` member-access
+        // read, which (deliberately per §23) treats ANY non-`:=`-target
+        // access of a write-only property as an illegal read — including the
+        // `d.W` inside `out d.W`, which is why that gate is NOT widened to
+        // imported properties here (it would false-reject the spec-legal
+        // write-only-as-`out` case, see xmod_refout_prop_visibility_2454's
+        // T6). This check instead keys off the `kind` string so `out` is
+        // correctly admitted (§22.3: no getter call for `out`).
         if (!ctx_.importedPropertyHasSetter(&ps)) {
             ctx_.diagnostics().report(
                 Severity::Error, target.span.begin,
                 std::string("a `") + kind + "` argument must be a property "
                 "with an accessible setter — this property has no setter "
                 "(§22.3 / §23.3)");
+            return;
+        }
+        // fix #2461 (§22.3/§23): `ref` additionally requires a getter (the
+        // copy-in calls it once); `out` does not ("for `out` no getter call
+        // occurs"). A write-only imported property (hasSetter && !hasGetter)
+        // as `ref` is therefore rejected here with a clean §22.3/§23 message
+        // instead of the pre-fix raw linker error. The property name is
+        // included to match the LOCAL propertyDeclIsSetOnly gate's message
+        // shape ("property `W` is write-only ...").
+        if (kind[0] == 'r' /* "ref", not "out" */ &&
+            !ctx_.importedPropertyHasGetter(&ps)) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `ref` argument requires a readable property — "
+                            "`") + std::string(ps.name) +
+                "` is write-only (it declares only a `set` accessor) and "
+                "has no getter for the copy-in (§22.3 / §23)");
             return;
         }
         ast::Visibility sv = ctx_.importedPropertySetterVisibility(&ps);

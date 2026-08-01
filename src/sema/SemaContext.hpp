@@ -423,6 +423,29 @@ public:
         return it != importedPropertyIsAutoStorage_.end() && it->second;
     }
 
+    // fix #2461 (§22.3/§23): whether an imported Property (or Indexer) member
+    // declares a getter — MetaMember::hasGetter (the getter-presence twin of
+    // #2400's hasSetter above). §22.3: "for `ref`, the getter is called once
+    // to produce the callee's slot value (for `out` no getter call occurs)",
+    // so a write-only property (setter but no getter) is a legal `out` target
+    // but NOT a legal `ref` target. checkRefOutPropertyOperand consults this
+    // to reject a write-only imported property used as `ref` with a clean
+    // §22.3/§23 diagnostic; without it, the operand fell through sema to a
+    // raw linker error (undefined `...$propget`). Absent (never set — any
+    // non-property import, or a property imported from a pre-#2461 blob with
+    // no 14th MEMBER_BLOCK scalar) defaults to `true` — NOT `false` like
+    // hasSetter: a false default would false-reject a legitimate `ref` to a
+    // read-write property from a stale dependency, while `true` preserves the
+    // pre-#2461 behavior for a stale dependency (see the hasGetter field
+    // comment in ModuleMetadata.hpp for the full rationale).
+    void setImportedPropertyHasGetter(const Symbol* m, bool hasGetter) {
+        importedPropertyHasGetter_[m] = hasGetter;
+    }
+    bool importedPropertyHasGetter(const Symbol* m) const {
+        auto it = importedPropertyHasGetter_.find(m);
+        return it == importedPropertyHasGetter_.end() || it->second;
+    }
+
     // §22.12 (issue #328 FINDING [3] BUG A): an imported class-level `const` has
     // no storage symbol in the library — a const initializer is a compile-time
     // constant expression, so the library emits no global. The loader records
@@ -520,6 +543,9 @@ private:
     // fix #2478 (§9.2/§22.8): imported property AUTO-storage classification,
     // from MetaMember::isAutoProperty.
     std::unordered_map<const Symbol*, bool> importedPropertyIsAutoStorage_;
+    // fix #2461 (§22.3/§23): imported property/indexer getter presence, from
+    // MetaMember::hasGetter.
+    std::unordered_map<const Symbol*, bool> importedPropertyHasGetter_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const Symbol*, std::string> importedConstValues_;
     // §14 / #662c: imported SourceFile objects that own re-parsed ctor/dtor
