@@ -885,6 +885,10 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
         if (fs->posParam != nullptr) {
             out.kind = MetaMemberKind::Field;
             out.type = convertAstType(fs->posParam->type.get(), ctx);
+            // fix #2516 (§9.2/§9.3/§2.8.3 rule 4): carry the positional vs
+            // body distinction across the wire — see isPositional's field
+            // comment in ModuleMetadata.hpp.
+            out.isPositional = true;
             return true;
         }
     }

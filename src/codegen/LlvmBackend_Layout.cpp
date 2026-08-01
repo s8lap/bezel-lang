@@ -1010,8 +1010,14 @@ llvm::Type* Emitter::storageType(const sema::Symbol* m) {
         return ptrTy();
     // §9.1: a record's positional field carries its type on the
     // originating Param, not a FieldDecl (its `decl` is the TypeDecl).
+    // fix #2516: for an IMPORTED positional field the importer synthesizes a
+    // null-type ast::Param so `fs->posParam != nullptr` distinguishes
+    // positional from body fields at the sema layer (SymbolCollection.cpp /
+    // ModuleLoader.cpp) — but the type itself is NOT recoverable from that
+    // synthetic Param. Fall through to the importedMemberType side table so
+    // the layout gets the real field type from `fieldTypes_`.
     if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m))
-        if (fs->posParam)
+        if (fs->posParam && fs->posParam->type)
             return lowerType(fs->posParam->type.get());
     // §2.5 / §22.8 (issue #328 FINDING [7]): an IMPORTED instance field has no
     // ast::FieldDecl — its resolved type rides the importedMemberType side table

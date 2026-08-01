@@ -396,6 +396,23 @@ struct Loader {
                 // non-foldable initializer (`new Array()`, `DateTime.Now`) is not
                 // carried (valueText empty) — see ModuleMetadataBuilder.
                 if (!mm.valueText.empty()) constValues_[f] = mm.valueText;
+                // fix #2516 (§9.2/§9.3/§2.8.3 rule 4): a positional-record
+                // field is reconstructed with a synthetic ast::Param whose
+                // `type` is null, so `fs->posParam != nullptr` distinguishes
+                // it from a body field at the sema layer (mirrors the LOCAL
+                // path at SymbolCollection.cpp:295-313, which points posParam
+                // at a real td.positionalFields[i]). `storageComponentType`'s
+                // existing `if (fs->posParam && fs->posParam->type)` gate
+                // returns false for the synthetic case (posParam->type is
+                // null) and falls through to `ctx.importedMemberType(m)` —
+                // the importer's `fieldTypes_` side table — so no downstream
+                // consumer dereferences the synthetic Param. The Param is
+                // owned by the SemaContext's `importedSymbols_` arena so it
+                // lives at least as long as the FieldSymbol.
+                if (mm.isPositional) {
+                    auto* p = ctx.makeImportedParam();
+                    f->posParam = p;
+                }
                 applyBehavior(f);
                 return f;
             }

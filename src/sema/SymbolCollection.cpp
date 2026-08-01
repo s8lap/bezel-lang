@@ -655,14 +655,19 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
 // not include disqualifiers (§9.3 applies §9.2's membership and disqualifier
 // rules to the full storage set: positional fields + body auto-properties).
 // Imported positional records (no ast::TypeDecl — only hasPositionalFields flag)
-// are conservatively treated as equality-bearing: individual field types are not
-// available across module boundaries (see the §3.6 rule-2 per-instantiation
-// discipline; this function is the LOCAL record side, not the cross-module side).
+// are conservatively treated as equality-bearing for the positional-field
+// admissibility check (individual field types are not fully inspectable cross-
+// module; see the §3.6 rule-2 per-instantiation discipline). For the
+// body-member disqualifier scan, an imported record's FieldSymbol IS marked as
+// positional vs body via the importer setting `posParam` from the metadata's
+// `isPositional` bit (#2516), so the SAME member-walk the local path does
+// below applies verbatim — including the body-field disqualifier (#2516's
+// finding: a pre-fix unconditional `return true` for the import case
+// false-accepted `=`/`<>` on imported combined-form records whose exporter
+// already rejects them).
 bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
                                         const SemaContext& ctx) {
     if (!rec) return false;
-    // Imported positional record: no ast::TypeDecl to inspect → conservative.
-    if (!dynamic_cast<const ast::TypeDecl*>(rec->decl)) return true;
     for (const Symbol* m : rec->members) {
         if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
             if (fs->posParam) {

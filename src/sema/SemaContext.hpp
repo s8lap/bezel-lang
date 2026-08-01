@@ -219,6 +219,17 @@ public:
         return raw;
     }
 
+    // fix #2516 (§9.2/§9.3/§2.8.3 rule 4): allocate a synthetic ast::Param
+    // for an imported positional FieldSymbol — mirrors the LOCAL path's
+    // `posParam = &pf` at SymbolCollection.cpp:309, but the importer has no
+    // AST to borrow from so we synthesize one. Kept alive by `importedParams_`.
+    ast::Param* makeImportedParam() {
+        auto owned = std::make_unique<ast::Param>();
+        ast::Param* raw = owned.get();
+        importedParams_.push_back(std::move(owned));
+        return raw;
+    }
+
     // Register an imported, exported top-level TypeSymbol under its module's
     // §2.1 dotted name. One module may export many types.
     void registerImportedType(const std::string& moduleName, TypeSymbol* t) {
@@ -551,6 +562,13 @@ private:
     // plus the module-name → exported-type registry and the imported-symbol set.
     std::vector<std::unique_ptr<Symbol>> importedSymbols_;
     std::vector<std::unique_ptr<TypeRef>> importedTypeRefs_;
+    // fix #2516 (§9.2/§9.3/§2.8.3 rule 4): synthetic ast::Param instances
+    // attached to imported positional FieldSymbols so `fs->posParam != nullptr`
+    // distinguishes positional from body fields cross-module (mirrors the
+    // LOCAL SymbolCollection.cpp:295-313 path, which points posParam at a real
+    // td.positionalFields[i]). The Params live at least as long as the
+    // FieldSymbols that reference them.
+    std::vector<std::unique_ptr<ast::Param>> importedParams_;
     std::unordered_map<std::string, std::vector<TypeSymbol*>> importedByModule_;
     // §26 / §2.5 (#735): imported extension blocks, keyed by defining module.
     std::unordered_map<std::string, std::vector<ExtensionSymbol*>>

@@ -530,7 +530,11 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // too is unaffected; see the field comments in ModuleMetadata.hpp for why
     // the missing-scalar default is `false` for both (the common instance-
     // sync event classification).
-    llvm::SmallVector<std::uint64_t, 16> sc{
+    // fix #2516 (§9.2/§9.3/§2.8.3 rule 4, additive within v7): isPositional
+    // is a 17th trailing scalar — same additive shape; a pre-#2516 reader's
+    // `sc.size() < 8` gate never looks past index 7, so it too is unaffected.
+    // See the isPositional field comment in ModuleMetadata.hpp.
+    llvm::SmallVector<std::uint64_t, 17> sc{
         static_cast<std::uint64_t>(m.kind),
         static_cast<std::uint64_t>(m.visibility),
         m.isOperator ? 1u : 0u,
@@ -547,6 +551,7 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
         m.hasGetter ? 1u : 0u,
         m.isEventStatic ? 1u : 0u,
         m.isEventAsync ? 1u : 0u,
+        m.isPositional ? 1u : 0u,
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, m.name);
@@ -1056,6 +1061,10 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     // ModuleMetadata.hpp).
     m.isEventStatic = sc.size() >= 15 && sc[14] != 0;
     m.isEventAsync = sc.size() >= 16 && sc[15] != 0;
+    // fix #2516 (§9.2/§9.3/§2.8.3 rule 4, additive within v7): 17th scalar.
+    // A pre-#2516 blob has at most 16 scalars; isPositional defaults to `false`
+    // — see the field comment in ModuleMetadata.hpp.
+    m.isPositional = sc.size() >= 17 && sc[16] != 0;
     if (!expectString(r, m.name)) return false;
     if (!readStringList(r, m.modifiers)) return false;
     if (!readType(r, m.type)) return false;

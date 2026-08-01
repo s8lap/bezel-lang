@@ -624,6 +624,27 @@ struct MetaMember {
     bool isEventStatic = false;
     bool isEventAsync = false;
 
+    // §9.2 / §9.3 / §2.8.3 rule 4 (fix #2516, additive within v7): for a Field
+    // member, whether it is a §9.1 positional-record field (`record R(x: int)
+    // ... end`'s `x`) rather than a body field (`record R(x: int) private _y:
+    // int := 0; end`'s `_y`). The exporter distinguishes the two by
+    // `fs->posParam != nullptr` on the local FieldSymbol (§9.1,
+    // ModuleMetadataBuilder.cpp's convertMember positional branch) — that
+    // distinction was NOT carried across the wire before this fix, so an
+    // importer reconstructing a combined-form record's TypeSymbol created
+    // FieldSymbols with `posParam == nullptr` for BOTH positional and body
+    // fields and the §9.2 auto-equality classifier
+    // (`isPositionalRecordEqualityBearing`) had to conservatively treat every
+    // imported FieldSymbol as a positional field (false-accept of `=`/`<>` on
+    // imported combined-form records whose exporter already rejects them,
+    // #2516's finding). A pre-#2516 blob has no 17th scalar; this defaults to
+    // `false` — the SAME "treat as positional" classification a stale
+    // not-yet-recompiled dependency already exhibits today (its body fields
+    // are silently considered positional, so the pre-fix false-accept holds
+    // for the dependency until recompiled — §2.8.5 disclaims ABI stability
+    // across recompilation). Ignored for every kind but Field.
+    bool isPositional = false;
+
     // §22.16 / §2.8.2: clauses in declaration order. For a `when` form from
     // §22.4 the builder emits the equivalent static-ensures record here.
     std::vector<MetaContractRecord> contracts;
