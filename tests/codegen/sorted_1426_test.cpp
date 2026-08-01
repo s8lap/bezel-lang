@@ -375,21 +375,68 @@ BEZEL_TEST(sorted_1426, sorted_set_getenumerator_order_matches_forloop_order_dir
     )), 0);
 }
 
-// #2546: SortedSet<string> ascending order via the string fast path
-// (bz_dict_keys_str + bz_sort_keys_str). Discriminator: expected
-// alpha < beta < gamma in ascending iteration order.
+// #2550: SortedSet<string> ascending order via the explicit
+// .GetEnumerator() path. The #2546 wrapSortedSetAsIEnumerable string
+// decode was a leftover from the SortedDictionary<string,V> family —
+// it called `bz_dict_keys_str` / `bz_sort_keys_str` on a SortedSet's
+// GENERIC-key backing (`bz_dict_set_gen` stores each element as a
+// malloc(8) buffer holding the bz_string_struct* pointer value, NOT
+// the raw chars SortedDictionary uses), so the runtime read those 8
+// pointer bytes as char data and produced garbage bytes for the
+// bz_string_t readback (#2546's reproducer `alpha\\nbeta\\ngamma\\n`
+// came back as `<F\\n0<F\\nP<F\\n`). The fix switches the string
+// element path to `bz_dict_keys_gen` + a `bz_sort_kv_gen` driven by a
+// codegen-side string-content comparator (`bz$sscmp$string`: deref
+// each keys[i] into its bz_string_struct*, load data/len, forward to
+// `bz_string_compare`) — same comparator contract SortedDictionary
+// uses via its own strcmp-driven bz_sort_kv_str path. Decoding stores
+// the live `bz_string_struct*` directly in the result array; the
+// wrapper shares the SortedSet's +1 (single owner at scope end via
+// `bz_set_string_keys_release` → `bz_string_release`).
 //
-// NOTE: #2546's wrapSortedSetAsIEnumerable string decode mirrors
-// wrapDictionaryAsIEnumerable's key decode (the same bz_string_t build,
-// sort, and rewire), but the plain wrapOwnedArrayAsIEnumerable is
-// insufficient for strings — its per-element Dispose is null, so the
-// decoded bz_string_t structs are never reference-counted back. The
-// current fix scope covers the sema gate + SortedSet<int>/SortedDictionary
-// paths; the SortedSet<string> string-decode-via-wrap regression is
-// filed as a follow-up. The structural shape (sort-by-key emits
-// ascending) is verified by the int variant above; the wrapping
-// contract for SortedDictionary<string,V> is separately verified.
-// (Placeholder removed — no test body.)
+// Discriminator: a 3-string input [gamma, alpha, beta] must iterate
+// as alpha, beta, gamma (ascending order, real chars per line).
+BEZEL_TEST(sorted_1426, sorted_set_getenumerator_string_ascending_spec_4_18) {
+    auto r = runAotOut(prog(
+        "  using var s := new SortedSet<string>(); "
+        "  s.Add(\"gamma\"); s.Add(\"alpha\"); s.Add(\"beta\"); "
+        "  using var e := s.GetEnumerator(); "
+        "  while e.MoveNext() do "
+        "    Console.WriteLine(e.Current); "
+        "  end; "
+        "  return 0; "
+    ));
+    BEZEL_EXPECT_EQ(r, "alpha\nbeta\ngamma");
+}
+
+// #2550: ascending order holds across more elements (reverse-insert
+// fan-out) and after a Remove — both the read path (sort comparator)
+// and the underlying bz_dict_t mutators are exercised.
+BEZEL_TEST(sorted_1426, sorted_set_getenumerator_string_after_remove_spec_4_18) {
+    auto r = runAotOut(prog(
+        "  using var s := new SortedSet<string>(); "
+        "  s.Add(\"delta\"); s.Add(\"charlie\"); s.Add(\"alpha\"); "
+        "  s.Add(\"bravo\"); "
+        "  var ignored := s.Remove(\"charlie\"); "
+        "  using var e := s.GetEnumerator(); "
+        "  while e.MoveNext() do "
+        "    Console.WriteLine(e.Current); "
+        "  end; "
+        "  return 0; "
+    ));
+    BEZEL_EXPECT_EQ(r, "alpha\nbravo\ndelta");
+}
+
+// #2550 follow-on (NOT in scope for this fix; filed separately):
+// `for var x in s` over a SortedSet<string> currently iterates in
+// insertion order (the for-in path's lowerIEnumerableFor dispatches the
+// interface-inherited GetEnumerator() differently from the explicit
+// `using var e := s.GetEnumerator()` call — the former hits the
+// stdlib-synthesised IEnumerator without the sorted-snapshot wrap).
+// Cross-checking `for-in == GetEnumerator` here would mask the real
+// sibling bug; the two paths must agree on ascending order before this
+// cross-check can run. Today's two tests prove the explicit-GetEnumerator
+// path — the for-in path is a separate regression.
 
 // #2546 (sibling of the original repro in the issue): after Remove, the
 // remaining elements still iterate in ascending order via the explicit

@@ -9539,46 +9539,95 @@ llvm::Value* Emitter::wrapSortedSetAsIEnumerable(
     if (!elemLlvm) return nullptr;
     int64_t esz = (int64_t)module_->getDataLayout().getTypeAllocSize(elemLlvm);
 
-    // String fast path vs generic-key path (mirrors wrapDictionaryAsIEnumerable).
+    // fix #2550: SortedSet<string>'s backing store uses the GENERIC-key dict
+    // (bz_dict_set_gen stores each element as a malloc(8) buffer holding the
+    // bz_string_struct* pointer — keys are pointers, not chars), so the
+    // snapshot/sort MUST go through bz_dict_keys_gen + a string-content
+    // comparator — bz_dict_keys_str would treat those 8-byte pointer buffers
+    // as char data and produce garbage bytes for the bz_string_t readback.
+    // buildValueHashTrampoline's elementHashFn / elementEqFn already route
+    // string elements through bz_str_hash / bz_string_compare; we mirror that
+    // here for the runtime-allocated `int (*)(const void*, const void*)` that
+    // bz_sort_kv_gen requires. The string comparator below dereferences both
+    // keys[i] into their bz_string_struct* and forwards data/len to
+    // bz_string_compare — same content ordering SortedDictionary<string,V>
+    // gets from its strcmp-driven bz_sort_kv_str path.
     using K = sema::TypeRef::Kind;
     bool isStringElem = elemTy->kind == K::Primitive &&
                         elemTy->primitive == sema::PrimitiveType::String;
     bool useGen = !isStringElem;
 
     auto* keysOutSlot = entryAlloca(ptrTy());
-    auto* lensOutSlot = entryAlloca(ptrTy());
     auto* cntSlot     = entryAlloca(i64());
-    if (useGen) {
-        auto* kfn = declareC("bz_dict_keys_gen",
-            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
-        builder_.CreateCall(kfn, {set, keysOutSlot, cntSlot});
-    } else {
-        auto* kfn = declareC("bz_dict_keys_str",
-            llvm::Type::getVoidTy(llvm_),
-            {ptrTy(), ptrTy(), ptrTy(), ptrTy()});
-        builder_.CreateCall(kfn, {set, keysOutSlot, lensOutSlot, cntSlot});
-    }
+    auto* kfn = declareC("bz_dict_keys_gen",
+        llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), ptrTy()});
+    builder_.CreateCall(kfn, {set, keysOutSlot, cntSlot});
     llvm::Value* keysArr = builder_.CreateLoad(ptrTy(), keysOutSlot);
-    llvm::Value* lensArr = isStringElem
-                               ? builder_.CreateLoad(ptrTy(), lensOutSlot)
-                               : nullptr;
     llvm::Value* cnt     = builder_.CreateLoad(i64(), cntSlot);
 
     // Sort the keys (the §4.18 ascending-order promise).
     if (useGen) {
         llvm::Function* cmpFn = buildSortedKeyComparator(elemTy);
         if (cmpFn) {
-            auto* sortFn = declareC("bz_sort_keys_gen",
-                llvm::Type::getVoidTy(llvm_), {ptrTy(), i64(), ptrTy()});
-            builder_.CreateCall(sortFn, {keysArr, cnt, cmpFn});
+            auto* sortFn = declareC("bz_sort_kv_gen",
+                llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(sortFn,
+                {keysArr, llvm::ConstantPointerNull::get(ptrTy()),
+                 cnt, cmpFn});
         }
         // Unsupported elem type → fall through unsorted (correctness note
         // in the for-loop dispatch's #1426 commit; a future type gate
         // can be added once buildSortedKeyComparator handles more types).
     } else {
-        auto* sortFn = declareC("bz_sort_keys_str",
-            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
-        builder_.CreateCall(sortFn, {keysArr, lensArr, cnt});
+        // #2550 string comparator: two `void*` args (each pointing to a
+        // malloc(8) buffer holding a bz_string_struct* pointer value).
+        // Single-load each to recover the bz_string_struct*, then load
+        // data/len and forward to bz_string_compare — yielding the same
+        // ordinal ordering SortedDictionary<string,V> gets from its
+        // strcmp-driven bz_sort_kv_str path.
+        llvm::Function* strCmp = nullptr;
+        if (auto* existing = module_->getFunction("bz$sscmp$string"))
+            strCmp = existing;
+        if (!strCmp) {
+            auto* fnTy = llvm::FunctionType::get(
+                i32(), {ptrTy(), ptrTy()}, false);
+            strCmp = llvm::Function::Create(fnTy,
+                llvm::Function::InternalLinkage, "bz$sscmp$string",
+                module_.get());
+            auto* bb = llvm::BasicBlock::Create(llvm_, "entry", strCmp);
+            auto savedIP = builder_.saveIP();
+            llvm::Function* savedFn = currentFn_;
+            currentFn_ = strCmp;
+            builder_.SetInsertPoint(bb);
+            // Each arg is itself a `void*` pointing to malloc(8) holding a
+            // bz_string_struct* pointer value; a single ptrTy-load recovers
+            // the bz_string_struct* directly (DOUBLE-LOADING would read the
+            // data field, not the struct — that's the #2550 regress).
+            llvm::Value* aStr = builder_.CreateLoad(
+                ptrTy(), strCmp->getArg(0), "sa");
+            llvm::Value* bStr = builder_.CreateLoad(
+                ptrTy(), strCmp->getArg(1), "sb");
+            llvm::Value* aData = loadStringData(aStr);
+            llvm::Value* aLen  = loadStringLen(aStr);
+            llvm::Value* bData = loadStringData(bStr);
+            llvm::Value* bLen  = loadStringLen(bStr);
+            auto* cmpFnRt = declareC("bz_string_compare",
+                i32(), {ptrTy(), i64(), ptrTy(), i64(), i32()});
+            llvm::Value* res = builder_.CreateCall(cmpFnRt,
+                {aData, aLen, bData, bLen,
+                 llvm::ConstantInt::get(i32(), 0)},
+                "scmp");
+            builder_.CreateRet(res);
+            builder_.restoreIP(savedIP);
+            currentFn_ = savedFn;
+        }
+        auto* sortFn = declareC("bz_sort_kv_gen",
+            llvm::Type::getVoidTy(llvm_),
+            {ptrTy(), ptrTy(), i64(), ptrTy()});
+        builder_.CreateCall(sortFn,
+            {keysArr, llvm::ConstantPointerNull::get(ptrTy()),
+             cnt, strCmp});
     }
 
     // Allocate a fresh bz_array_t of T elements.
@@ -9611,33 +9660,21 @@ llvm::Value* Emitter::wrapSortedSetAsIEnumerable(
         llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
         llvm::Value* elemDecoded;
         if (isStringElem) {
-            auto* mallocFn = declareC("malloc", ptrTy(), {i64()});
-            auto* memcpyFn = declareC("memcpy", ptrTy(),
-                                      {ptrTy(), ptrTy(), i64()});
-            auto* callocFn = declareC("calloc", ptrTy(), {i64(), i64()});
-            auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-            uint64_t strSz = module_->getDataLayout().getTypeAllocSize(stringType());
+            // #2550: keysArr[i] is a void* to malloc(8) holding the
+            // bz_string_struct* pointer value (the SortedSet's generic-key
+            // storage). Dereference it to get the live bz_string_struct* and
+            // use it directly — no copy/repack (the SortedSet owns the +1;
+            // the wrapper's array just borrows the pointer; the SortedSet's
+            // own disposal via bz_set_string_keys_release → bz_string_release
+            // frees each string at SortedSet scope end exactly once).
             llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
             llvm::Value* kp    = builder_.CreateLoad(ptrTy(), kpPtr);
-            llvm::Value* lpPtr = builder_.CreateGEP(i64(), lensArr, idxB);
-            llvm::Value* kl    = builder_.CreateLoad(i64(), lpPtr);
-            llvm::Value* dataSz  = builder_.CreateAdd(kl, builder_.getInt64(1));
-            llvm::Value* dataCpy = builder_.CreateCall(mallocFn, {dataSz});
-            builder_.CreateCall(memcpyFn, {dataCpy, kp, kl});
-            llvm::Value* nulPtr = builder_.CreateGEP(i8Ty, dataCpy, kl);
-            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 0), nulPtr);
-            llvm::Value* strObj = builder_.CreateCall(
-                callocFn,
-                {builder_.getInt64(1), builder_.getInt64((int64_t)strSz)});
-            builder_.CreateStore(dataCpy,
-                builder_.CreateStructGEP(stringType(), strObj, 0));
-            builder_.CreateStore(kl,
-                builder_.CreateStructGEP(stringType(), strObj, 1));
-            builder_.CreateStore(llvm::ConstantInt::get(i8Ty, 1),
-                builder_.CreateStructGEP(stringType(), strObj, 2));
-            initStringRc(strObj);
+            // Read 8 bytes from kp into a pointer-typed slot. The single
+            // ptrTy-typed load (without explicit bitcast) recovers the
+            // bz_string_struct* pointer value from the malloc(8) buffer.
+            elemDecoded = builder_.CreateLoad(
+                ptrTy(), kp, "ssenum.str");
             builder_.CreateCall(freeFn, {kp});
-            elemDecoded = strObj;
         } else {
             llvm::Value* kpPtr = builder_.CreateGEP(ptrTy(), keysArr, idxB);
             llvm::Value* keyPtr = builder_.CreateLoad(ptrTy(), kpPtr);
@@ -9652,7 +9689,6 @@ llvm::Value* Emitter::wrapSortedSetAsIEnumerable(
     }
     builder_.SetInsertPoint(endBB);
     builder_.CreateCall(freeFn, {keysArr});
-    if (isStringElem) builder_.CreateCall(freeFn, {lensArr});
 
     // Wrap the materialised sorted array as an OWNING IEnumerable<T>. The
     // string-element case uses the plain wrapOwnedArrayAsIEnumerable (the
