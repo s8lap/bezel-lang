@@ -9071,10 +9071,27 @@ bool MethodOwnership::localIsOwnedObligation(const sema::LocalSymbol* ls) const 
 // provenance-row scope (T2 lambda literal + T3 method reference).
 void MethodOwnership::deferredActivationCaptureSources(
     const ast::Expr& arg, std::vector<CapSource>& out) {
+    // #2527 (§28.3 v0.196, sibling of #2342 §28.14): record the FORWARDED
+    // lambda's own params (+ nested lambdas' params within it) so the
+    // reduction gate below skips ONLY those (they are internal to the
+    // forwarded closure, not captures) WITHOUT skipping params of an
+    // ENCLOSING LAMBDA (which ARE captures — the #2527 residual from the
+    // methodParamSet_-only gate that #2342 just fixed in
+    // checkScopedAdmission). Populated by `scopedCollectCaptures` via the
+    // transient `scopedLambdaInternalSink_` (the #2342 mechanism, reused
+    // here for the §28.3 path) so the many other `scopedCollectCaptures`
+    // call sites are unaffected.
+    std::unordered_set<sema::Symbol*> forwardedInternalParams;
     std::vector<const ast::IdentifierExpr*> rawIds;
     if (const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg)) {
-        // FIRST provenance row (T2): a lambda LITERAL — enumerate its captures.
+        // FIRST provenance row (T2): a lambda LITERAL — enumerate its
+        // captures. The sink records the forwarded lambda's params (and any
+        // nested lambdas' params — `scopedCollectCaptures` recurses into
+        // LambdaExpr cases via `scopedCaptureWalkExpr`) so the gate below
+        // classifies enclosing-lambda params as real captures.
+        scopedLambdaInternalSink_ = &forwardedInternalParams;
         scopedCollectCaptures(*lam, rawIds);
+        scopedLambdaInternalSink_ = nullptr;
     } else if (const auto* mref =
                    dynamic_cast<const ast::MemberAccessExpr*>(&arg)) {
         // METHOD-REFERENCE provenance row (T3, §28.3, v0.196): a method
@@ -9142,9 +9159,22 @@ void MethodOwnership::deferredActivationCaptureSources(
         sema::Symbol* sym = ctx_.exprSymbol(*id);
         if (!sym || !seen.insert(sym).second) continue;
         if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
-            // A lambda-internal parameter is not a capture of the enclosing
-            // frame (checkScopedAdmission's methodParamSet_ gate).
-            if (!methodParamSet_.count(sym)) continue;
+            // #2527 (§28.3, sibling of #2342 §28.14): skip ONLY params
+            // internal to the FORWARDED lambda (its own params + those of
+            // any lambda nested within it — recorded in
+            // `forwardedInternalParams` during collection above). Params
+            // of the enclosing METHOD (methodParamSet_) or an ENCLOSING
+            // LAMBDA are REAL captures and must be classified below. The
+            // prior gate was `if (!methodParamSet_.count(sym)) continue;`,
+            // which treated EVERY lambda's parameters as lambda-internal —
+            // correct for the forwarded lambda's own params (also not in
+            // methodParamSet_) but WRONG for an enclosing lambda's params
+            // (the #2527 residual from #2342's pre-fix state): an inner
+            // closure capturing an outer lambda's `owned` parameter and
+            // forwarded to a deferred-activation frame was silently
+            // classified as non-owned-obligation, so the carried-source
+            // reject (the loop below) never fired.
+            if (forwardedInternalParams.count(sym)) continue;
             // An enclosing `owned` parameter is a live owned obligation this
             // method discharges at exit; a plain (borrow) parameter outlives
             // the method and the caller re-establishes the frame's constraint
