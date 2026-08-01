@@ -3132,6 +3132,10 @@ void Emitter::declareVtables() {
             ifacePropertyGetIndex_[ps] = idx++;
             if (propertyHasSetter(ps)) ifacePropertySetIndex_[ps] = idx++;
         }
+        // fix #2506: record this interface's total itable fn-ptr slot count
+        // (the trailing owner-kind flag is appended at exactly this index —
+        // see ifaceItabSlotCount_'s header comment).
+        ifaceItabSlotCount_[ts] = idx;
     }
     // §12.1 / §2.5 / §2.6 (issue #426 / #328): populate ifaceMethodIndex_ for
     // IMPORTED interfaces too. A cross-module interface call (either on an
@@ -3200,6 +3204,10 @@ void Emitter::declareVtables() {
                 ifacePropertyGetIndex_[ps] = idx++;
                 if (propertyHasSetter(ps)) ifacePropertySetIndex_[ps] = idx++;
             }
+            // fix #2506: mirror the total-slot-count capture for an IMPORTED
+            // interface, so the importer reads the owner-kind flag at the SAME
+            // trailing index the exporter appended it at.
+            ifaceItabSlotCount_[ts] = idx;
         }
     }
     // Pass A: assign vtable slots for all classes (base-first).
@@ -3579,6 +3587,20 @@ void Emitter::declareVtables() {
                     itabElems.push_back(setFp);
                 }
             }
+            // fix #2506 (§23.3/§28.9, v0.236): append the trailing owner-kind
+            // flag — NON-NULL here because a CLASS implementor's auto-property
+            // setter body always RETAINS its incoming value
+            // (ensurePropertyAccessorFn's class-gated retain/release, §23.3),
+            // so lowerVirtualPropertySet's itable branch MUST release a direct
+            // +1 producer to balance that retain. The flag is at
+            // ifaceItabSlotCount_[iface] (== itabElems.size() before this
+            // append); see ifaceItabSlotCount_'s header comment for the full
+            // cross-module-soundness rationale. Only compared to null at the
+            // read site (never dereferenced), so the non-null sentinel value is
+            // arbitrary.
+            itabElems.push_back(llvm::ConstantExpr::getIntToPtr(
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_), 1),
+                ptrTy()));
             auto* itabArrTy = llvm::ArrayType::get(ptrTy(), itabElems.size());
             auto* itabGV = new llvm::GlobalVariable(
                 *module_, itabArrTy, /*isConstant=*/true,
@@ -4901,6 +4923,12 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
             unsigned numSlots = existingInit->getType()->getNumElements();
             std::vector<llvm::Constant*> newItabElems;
             newItabElems.reserve(numSlots);
+            // fix #2506: numSlots INCLUDES the trailing owner-kind flag the
+            // source class itable appended, so the slot-by-slot copy below
+            // carries that non-null (CLASS-backed) flag forward unchanged — a
+            // specialized generic CLASS is still a class, and its setter still
+            // retains. The method-override loop rewrites only method indices,
+            // leaving the flag word (the last element) untouched.
             for (unsigned i = 0; i < numSlots; ++i)
                 newItabElems.push_back(existingInit->getAggregateElement(i));
             for (unsigned mi = 0; mi < ifaceMethods.size() && mi < numSlots; ++mi) {
@@ -20449,6 +20477,19 @@ void Emitter::setupBoxDescriptors() {
                     itabElems.push_back(setFp);
                 }
             }
+            // fix #2506 (§23.3/§28.9, v0.236): append the trailing owner-kind
+            // flag — NULL here because a RECORD implementor's auto-property
+            // setter body keeps the pre-fix PLAIN STORE (ensurePropertyAccessorFn's
+            // retain/release is class-gated; §9/§9.7 — a record's reference
+            // fields are borrows with no independent +1 and no disposer), so
+            // lowerVirtualPropertySet's itable branch must NOT release a direct
+            // +1 producer (that would drop the field's only reference → UAF,
+            // the live failure #2490's own adversarial pass found for the
+            // direct-set record case). The read site compares this word to
+            // null; null ⇒ box/record ⇒ skip the release. Index ==
+            // ifaceItabSlotCount_[iface] (== itabElems.size() before this
+            // append), identical to the class itable's flag position.
+            itabElems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
             auto* itabArrTy = llvm::ArrayType::get(ptrTy(), itabElems.size());
             auto* itabGV = new llvm::GlobalVariable(
                 *module_, itabArrTy, /*isConstant=*/true,

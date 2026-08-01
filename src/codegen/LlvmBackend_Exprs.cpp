@@ -4950,6 +4950,10 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
     v = boxForTarget(v, ctx_.exprType(target), valueExpr);
 
     llvm::Value* fnPtr = nullptr;
+    // fix #2506: retained across the dispatch so the post-call release can
+    // read the trailing owner-kind flag (class-backed vs box/record-backed) —
+    // see the release block below.
+    llvm::Value* itabForFlag = nullptr;
     if (isIfaceProp) {
         llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
         auto* lookupFn = declareC("bz_itable_lookup", ptrTy(),
@@ -4962,6 +4966,7 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
         llvm::Value* itab = builder_.CreateCall(
             llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
             lookupFn, {itmapPtr, descIt->second}, "itab");
+        itabForFlag = itab;
         unsigned k = ifSetIt->second;
         fnPtr = builder_.CreateLoad(
             ptrTy(),
@@ -4974,35 +4979,38 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
     }
     builder_.CreateCall(fnTy, fnPtr, {recv, v});
     emitPendingCheck();
-    // fix #2490 (§23.3/§4.6/§27.5/§28.9, v0.236): the virtual/interface-
-    // dispatch twin of lowerImportedPropertySetValue's ARGUMENT-PASS release
-    // — see that function's comment for the full rationale (the callee
-    // ensurePropertyAccessorFn built now retains a plain setter parameter,
-    // but ONLY for a CLASS-owned property, §9/§9.7; a RECORD's stays a plain
-    // store, so releasing a producer the callee never retained would UAF).
+    // fix #2490/#2500/#2506 (§23.3/§4.6/§27.5/§28.9, v0.236): the virtual/
+    // interface-dispatch twin of lowerImportedPropertySetValue's ARGUMENT-PASS
+    // release — see that function's comment for the full rationale. The callee
+    // (ensurePropertyAccessorFn) retains its incoming `value` ONLY for a
+    // CLASS-owned property (§9/§9.7 — a RECORD's auto-property backing field
+    // is a borrow with no independent +1 and no disposer, so its setter keeps
+    // the plain store); a +1 producer passed directly as the value then holds
+    // an independent, doubled reference nothing else releases, and must be
+    // released HERE to balance the class setter's retain. A bare borrow (a
+    // named local/field) is unaffected either way.
     //
-    // Restricted to the NON-interface (`!isIfaceProp`) branch — a class's own
-    // vtable-slot virtual/override property. There `ps->parent` IS reliably
-    // the declaring CLASS (records cannot enter a vtable hierarchy at all:
-    // "A record cannot derive from another record or from a class", §9), so
-    // the callee is guaranteed to be the CLASS-gated retaining setter.
-    //
-    // The `isIfaceProp` (itable) branch is DELIBERATELY left WITHOUT this
-    // release: `ps` there is the INTERFACE's own declared PropertySymbol, so
-    // `ps->parent->kind` is always Interface — it carries no information
-    // about the CONCRETE runtime receiver, which per §11 may be a class
-    // instance OR a boxed record ("a record may implement any number of
-    // interfaces" / "an interface-typed variable holds a reference: to a
-    // class instance directly, [or] to a record value boxed at assignment").
-    // Distinguishing which concrete setter an itable call will actually
-    // invoke is a runtime fact this call site cannot see statically, and a
-    // wrong guess here risks exactly the live UAF this fix's own adversarial
-    // pass just found for the direct-set record case — so this leaks a
-    // direct-producer argument passed through an INTERFACE-dispatched setter
-    // (leak-over-UAF, the safe direction) until that distinction can be made
-    // soundly. Filed as a follow-up alongside the other known gaps this fix
-    // records rather than guesses at.
-    if (!isIfaceProp) {
+    // The release must fire ONLY when the concrete setter actually retained:
+    //   * `!isIfaceProp` — a class's own vtable-slot virtual/override
+    //     property. `ps->parent` IS reliably the declaring CLASS (records
+    //     cannot enter a vtable hierarchy at all: "A record cannot derive
+    //     from another record or from a class", §9), so the callee is
+    //     guaranteed to be the CLASS-gated retaining setter → unconditional.
+    //   * `isIfaceProp` — itable dispatch. `ps->parent` is always the
+    //     Interface, which carries no information about the CONCRETE runtime
+    //     receiver, which per §11 may be a class instance OR a boxed record.
+    //     fix #2506 added a trailing owner-kind flag word to every class and
+    //     record itable (non-null = class-backed retaining setter, null =
+    //     box/record plain-store setter) baked in by the concrete type's OWN
+    //     module, so the flag travels inside the itable bytes and is sound to
+    //     read cross-module regardless of vtable/descriptor linkage. Release
+    //     ONLY on the class-backed path; the box/record path skips (releasing
+    //     a producer the record's plain-store setter never retained drops the
+    //     field's only reference → UAF, the live failure #2490's adversarial
+    //     pass found for the direct-set record case). If the interface's flag
+    //     index is somehow unavailable, stay conservative and skip (leak-
+    //     over-UAF, the safe direction).
+    auto emitProducerRelease = [&] {
         if (valueExpr && isPlusOneStringProducer(valueExpr))
             emitStringRelease(v);
         else if (valueExpr && (isPlusOneClosureProducer(valueExpr) ||
@@ -5023,6 +5031,32 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
                     isUserMethodBoxReturnCall(valueExpr))
                     emitBoxRelease(v);
             }
+        }
+    };
+    if (!isIfaceProp) {
+        emitProducerRelease();
+    } else if (itabForFlag) {
+        auto cntIt = ifaceItabSlotCount_.find(ps->parent);
+        if (cntIt != ifaceItabSlotCount_.end()) {
+            llvm::Value* flagAddr = builder_.CreateGEP(
+                ptrTy(), itabForFlag,
+                {builder_.getInt32(cntIt->second)}, "pset.flagaddr");
+            llvm::Value* flag = builder_.CreateLoad(
+                ptrTy(), flagAddr, "pset.flagval");
+            llvm::Value* isClassBacked = builder_.CreateICmpNE(
+                flag, llvm::ConstantPointerNull::get(ptrTy()),
+                "pset.isclass");
+            llvm::BasicBlock* curBB = builder_.GetInsertBlock();
+            llvm::Function* fn = curBB->getParent();
+            llvm::BasicBlock* relBB =
+                llvm::BasicBlock::Create(llvm_, "pset.rel", fn);
+            llvm::BasicBlock* doneBB =
+                llvm::BasicBlock::Create(llvm_, "pset.done", fn);
+            builder_.CreateCondBr(isClassBacked, relBB, doneBB);
+            builder_.SetInsertPoint(relBB);
+            emitProducerRelease();
+            builder_.CreateBr(doneBB);
+            builder_.SetInsertPoint(doneBB);
         }
     }
     return true;

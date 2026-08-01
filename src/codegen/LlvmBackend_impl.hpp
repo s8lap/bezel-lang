@@ -1900,6 +1900,23 @@ private:
         ifacePropertyGetIndex_;
     std::unordered_map<const sema::PropertySymbol*, unsigned>
         ifacePropertySetIndex_;
+    // fix #2506 (§23.3/§28.9, v0.236): TOTAL number of fn-ptr slots in every
+    // itable built for this interface — the running `idx` value at the end of
+    // the methods+events+properties indexing loop above (methods + sync events +
+    // one getter per property + one setter per settable property). Every
+    // itable$C$I / itable$box$R$I appends ONE trailing "owner-kind" flag word at
+    // exactly this index (non-null = CLASS-backed retaining setter, null =
+    // box/record-backed plain-store setter), which lowerVirtualPropertySet's
+    // itable branch reads to decide whether to ARGUMENT-PASS release a +1
+    // producer: the call site cannot see the concrete runtime receiver's kind
+    // from `ps->parent` (always the Interface), but the flag travels INSIDE the
+    // itable bytes the concrete type's own module produced, so it is sound
+    // cross-module regardless of vtable/descriptor linkage. Captured for both
+    // local and imported interfaces (the import mirror below runs the identical
+    // indexing loop). Method-only box itables (prim/span/value-builtin) omit
+    // the flag: their interfaces declare no settable property, so a setter
+    // dispatch never indexes into them and the absence is never observed.
+    std::unordered_map<const sema::TypeSymbol*, unsigned> ifaceItabSlotCount_;
     // Per (class × interface): the itab$C$I global (array of fn ptrs in
     // interface declaration order). Key: (cls, iface).
     std::map<std::pair<const sema::TypeSymbol*, const sema::TypeSymbol*>,
