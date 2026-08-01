@@ -7418,8 +7418,21 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
             init = fd->initializer.get();
         else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
             init = pd->autoInitializer.get();  // CG33: `property X := v;`
-        if (!init) continue;  // no initializer → calloc-zeroed
         auto idxIt = fieldIndex_.find(m);
+        if (!init && m->decl == nullptr) {
+            // fix #2524: imported generic no-ctor bases are monomorphized here,
+            // so replay their constant-foldable wire initializer locally.
+            const std::string* text = ctx_.importedConstValue(m);
+            if (text && !text->empty() && idxIt != fieldIndex_.end()) {
+                const sema::TypeRef* rt = ctx_.importedMemberType(
+                    dynamic_cast<const sema::MemberSymbol*>(m));
+                if (llvm::Value* v = foldImportedConstText(*text, rt))
+                    builder_.CreateStore(
+                        v, builder_.CreateStructGEP(st, obj, idxIt->second));
+            }
+            continue;
+        }
+        if (!init) continue;  // no initializer → calloc-zeroed
         if (idxIt == fieldIndex_.end()) continue;
         // §15.1 / §16: collection literal `[e1, e2, …]` initializer.
         // Build the array in-place via GEP into the field slot.
@@ -8161,9 +8174,25 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
 // per-instantiation `bz$<Type>$init` symbol to link against).
 bool Emitter::emitImportedBaseFieldInit(const sema::TypeSymbol* base,
                                         llvm::Value* obj) {
-    if (!ctx_.isImported(base) || hasAnyConstructor(base) ||
-        !base->genericParams.empty())
+    if (!ctx_.isImported(base) || hasAnyConstructor(base))
         return false;
+    if (!base->genericParams.empty()) {
+        // fix #2524 (§14.1 / §22.8 / §2.8.2-§2.8.3, v0.236): an imported
+        // generic has no stable exported `$init` symbol; its construction is
+        // monomorphized in the importer.  Its reconstructed storage members
+        // already carry the wire initializer text used by emitOwnFieldInit,
+        // while emitInstanceInit builds the per-instantiation vtable.  Run
+        // those two steps locally instead of falling through to a nonexistent
+        // `bz$<Base>$init` reference.
+        llvm::StructType* bst = classStruct(base);
+        llvm::Value* vtSlot = builder_.CreateStructGEP(bst, obj, 0, "b.vt.slot");
+        llvm::Value* savedVt = builder_.CreateLoad(ptrTy(), vtSlot, "b.vt.save");
+        emitInstanceInit(base, obj, bst);
+        emitImplicitBase(base, obj);
+        emitOwnFieldInit(base, obj, bst);
+        builder_.CreateStore(savedVt, vtSlot);
+        return true;
+    }
     // Route through `bz$<Base>$init` — the SAME entry point a *direct*
     // `new ImportedBase()` already uses correctly (confirming the exported
     // body itself is right; only the locally-derived-construction paths

@@ -458,4 +458,32 @@ BEZEL_TEST(xmod_private_field_layout_import_2456,
     BEZEL_EXPECT_EQ(r, 42);
 }
 
+
+// fix #2524 (§14.1 / §22.8 / §2.8.2-§2.8.3, v0.236): a local generic
+// class deriving from an imported generic no-ctor base must monomorphize the
+// base initialization in the importing module; no stable exported generic
+// `$init` symbol exists.  The field value distinguishes successful base field
+// initialization from calloc-zero, while the compile/run result pins linkage.
+BEZEL_TEST(xmod_private_field_layout_import_2456,
+           generic_derived_imported_generic_base_initializes_field_2524) {
+    int r = compileImportAndRun2456(
+        "module BaseLib2524; "
+        "public class Base2524<T> "
+        "  public field: int := 68; "
+        "end Base2524;",
+        "module App2524; import BaseLib2524; "
+        "public class Derived2524<T>: Base2524<T> "
+        "  private own: int := 5; "
+        "  public property Own: int => own; "
+        "end Derived2524; "
+        "public class C2524 "
+        "  public static method Main(): int "
+        "    using var d := new Derived2524<int>(); "
+        "    return d.field + d.Own; "
+        "  end Main; "
+        "end C2524;");
+    if (r == -2) return;
+    BEZEL_EXPECT_EQ(r, 73);
+}
+
 }  // namespace bezel::module
