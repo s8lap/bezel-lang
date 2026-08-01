@@ -12538,6 +12538,52 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
         }
+        // #2521 (stdlib §4.9): `OwningDictionary<K, V>` implements `IDisposable`
+        // ONLY — unlike the other five owning containers (OwningArray/
+        // OwningStack/OwningQueue/OwningSet/OwningLinkedList, all of which reach
+        // `IEnumerable<T>` via `IReadOnlyCollection<T>` per §4.5/§4.6/§4.10/§4.11),
+        // it does NOT implement `IEnumerable<T>` nor `IOwningEnumerable<T>`, so
+        // `GetEnumerator`/`GetAsyncEnumerator` are genuinely NOT members. The
+        // blanket enumerable-protocol exemption in typeCall's `allowedOwningMethod`
+        // (correct for the other five) is wrong for OwningDictionary, and BOTH the
+        // call form `d.GetEnumerator()` and the bare form `var f := d.GetEnumerator;`
+        // fell through every block untyped to codegen's zero-init fallback (the
+        // #2434 "internal" ICE). This single reject covers both syntactic shapes:
+        // resolveMemberAccess runs on the MemberAccessExpr `d.GetEnumerator`
+        // whether it is a bare reference or the callee of a call, so diagnosing
+        // here (rather than in typeCall) catches both with one diagnostic.
+        // Mirrors the foreach-form §4.9 reject (ExprTypecheck.cpp's §4.9 case).
+        // The other five owning collections' bare-reference `GetEnumerator` is
+        // caught by their dedicated per-family blocks above (the #2470 "real
+        // member but no function value" reject); OwningDictionary uses a distinct
+        // wording because GetEnumerator is not a member at all here.
+        if (ma.target && !ctx_.exprType(ma)) {
+            if (const TypeRef* tt = ctx_.exprType(*ma.target)) {
+                if (tt->kind == TypeRef::Kind::Named && !tt->declaration &&
+                    tt->astNode && tt->astNode->name &&
+                    !tt->astNode->name->parts.empty() &&
+                    tt->headName() == "OwningDictionary") {
+                    const auto& mbr = ma.member;
+                    if (mbr == "GetEnumerator" ||
+                        mbr == "GetAsyncEnumerator") {
+                        auto loc = ma.span.begin;
+                        if (loc.line == 0 && ma.target)
+                            loc = ma.target->span.begin;
+                        ctx_.diagnostics().report(
+                            Severity::Error, loc,
+                            std::string("`") + std::string(mbr) +
+                            "` is not a member of `OwningDictionary<K, V>` "
+                            "(stdlib \xC2\xA7""4.9: it implements `IDisposable` "
+                            "only, not `IEnumerable<T>`/`IOwningEnumerable<T>`); "
+                            "the owning map is not directly iterable -- use "
+                            "`d.Drain()` (ownership-transferring, yields "
+                            "`DrainedEntry<K, V>`) or iterate `d.Keys` "
+                            "(borrowing) instead");
+                        return;
+                    }
+                }
+            }
+        }
         // #2444 (sibling gap to #2423/#2433; stdlib §4.8/§4.9; language spec
         // §8.1/§8.3/§8.5/§8.7): the builtin entry sentinels
         // `DictionaryEntry<K, V>` (a RECORD) and `DrainedEntry<K, V>` (a
