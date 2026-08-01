@@ -309,6 +309,83 @@ BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_tostring_reference_sta
         "27.6) is not yet supported on `Stack<T>`"));
 }
 
+// #2493 (stdlib §4.11; language spec §27.6): a BARE reference to `.Reverse`
+// on Stack/Queue shares #2470's exact no-MethodSymbol no-op — `.Reverse` is a
+// genuine callable on these receivers (an undocumented-but-working structural
+// alias dispatched in codegen via the same isCollectionTypeName path
+// Array<T>'s own §4.4 in-place Reverse uses, NOT one of stdlib §5's LINQ
+// operators — see the §5 naming note, v0.195: the lazy `Reverse(): IEnumerable<T>`
+// applies only where the receiver's static type has no instance `Reverse`, and
+// codegen commits to the in-place mutation here). The CALL form `s.Reverse()`
+// works (legit_reverse_alias_stack_value_correct above proves the real
+// in-place mutation); the BARE form `var f := s.Reverse;` was a SILENT NO-OP
+// — confirmed live on `origin/main` before this fix:
+//
+//   var s := new Stack<int>(); s.Push(1); s.Push(2); s.Push(3);
+//   var f := s.Reverse; f(); return s.Pop();
+//
+// returned `3` (the no-op: `s` was never reversed, so Pop returns the
+// un-flipped top) where a working reverse returns `1` (the original
+// first-pushed element), with the diagnostic `lowerLocalDecl's initializer
+// expression failed to lower to a value for this local's slot (degraded to a
+// zero-initialized value) — #2434` — the identical codegen degradation
+// #2470 documented for `s.Push`. sema now rejects the bare reference at the
+// reference site (folding `.Reverse` into the same #2470 reject), so the
+// forbidden clean-compile-then-silently-do-nothing outcome is replaced with
+// an honest "not yet supported" diagnostic. This test FAILS without the fix
+// (no error — the program compiled and silently no-op'd) and PASSES with it
+// (the reject fires).
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_reverse_reference_stack_now_rejected_2493) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "  var s := new Stack<int>(); "
+        "  s.Push(1); s.Push(2); s.Push(3); "
+        "  var f := s.Reverse; "
+        "  f(); "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `Reverse` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Stack<T>`"));
+}
+
+// #2493 Queue twin — same root cause, same reject.
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_bare_reverse_reference_queue_now_rejected_2493) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "  var q := new Queue<int>(); "
+        "  q.Enqueue(1); q.Enqueue(2); q.Enqueue(3); "
+        "  var f := q.Reverse; "
+        "  f(); "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_TRUE(hasError(
+        program,
+        "a bare reference to `Reverse` (language spec \xC2\xA7"
+        "27.6) is not yet supported on `Queue<T>`"));
+}
+
+// #2493 adversarial: the CALL form `s.Reverse()` MUST still compile and work
+// after the bare-reference reject (the reject is gated on `!isCallForm`).
+// Queue twin of legit_reverse_alias_stack_value_correct above: after
+// enqueuing 1,2,3 (front=1, back=3), the in-place Reverse() flips the
+// backing storage so Dequeue() (reads the front) returns the ORIGINAL back
+// element, 3 — proving the call form's real mutation survives the fix.
+BEZEL_TEST(stack_queue_unresolved_member_2457, legit_reverse_call_queue_value_correct_2493) {
+    const std::string program =
+        "module M; "
+        "class C public static method Main(): int "
+        "  var q := new Queue<int>(); "
+        "  q.Enqueue(1); q.Enqueue(2); q.Enqueue(3); "
+        "  q.Reverse(); "
+        "  return q.Dequeue(); "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(run(program), 3);
+}
+
 // A LINQ bare method reference (requires the §5 import) — the largest,
 // least-obvious slice of the exempt list, mirrors slice 1's identical guard.
 BEZEL_TEST(stack_queue_unresolved_member_2457, legit_linq_bare_method_reference_not_regressed) {

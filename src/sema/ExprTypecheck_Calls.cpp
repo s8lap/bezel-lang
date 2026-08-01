@@ -12155,10 +12155,32 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             mbr == "ToString"    || mbr == "Equals" ||
                             mbr == "GetHashCode" || mbr == "GetType" ||
                             mbr == "ReferenceEquals";
-                        // `.Length` / `.Reverse` — undocumented-but-real
-                        // structural aliases, see the block comment above.
-                        bool isUndocumentedWorkingAlias =
-                            mbr == "Length" || mbr == "Reverse";
+                        // `.Length` — undocumented-but-real structural alias
+                        // for `.Count`, see the block comment above. A VALUE
+                        // read (property), genuinely working and unaffected
+                        // by #2470's bare-reference no-MethodSymbol concern
+                        // (no function value is ever formed for it).
+                        bool isUndocumentedWorkingAlias = mbr == "Length";
+                        // `.Reverse` — also undocumented for Stack/Queue in
+                        // stdlib §4.11 (only Array<T>/OwningArray<T>'s own
+                        // §4.4/§4.5 declares an in-place `Reverse()`), but
+                        // UNLIKE `.Length` this is a genuine CALLABLE method
+                        // (structurally dispatched in codegen via the same
+                        // isCollectionTypeName path Array's Reverse uses --
+                        // see legit_reverse_alias_stack_value_correct). It is
+                        // NOT one of stdlib §5's LINQ operators either: §5's
+                        // lazy `Reverse(): IEnumerable<T>` applies only where
+                        // the receiver's static type has no instance
+                        // `Reverse` (stdlib §5 naming note, v0.195), and
+                        // codegen commits to the in-place mutation here. The
+                        // CALL form (`s.Reverse()`) works; the BARE form
+                        // (`var f := s.Reverse;`) shares #2470's exact
+                        // no-MethodSymbol no-op (confirmed live: the local is
+                        // degraded to a zero-init i32 and `f()` emits no
+                        // code -- #2493), so it is folded into the same
+                        // #2470 reject below rather than left exempted by
+                        // isUndocumentedWorkingAlias.
+                        bool isUndocumentedCallableAlias = mbr == "Reverse";
                         // stdlib §4.11's own declared methods, unioned across
                         // Stack/OwningStack/Queue/OwningQueue rather than
                         // split per-type (harmless to exempt a name legit
@@ -12250,8 +12272,23 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         // existing test exercises the bare form of any of
                         // these five names on Stack/Queue (only their CALL
                         // forms, unaffected here).
-                        if ((isDeclaredMethod || isUniversalObjectMember) &&
-                                !isCallForm) {
+                        //
+                        // #2493: `isUndocumentedCallableAlias` (`.Reverse`)
+                        // folds into this SAME reject for the identical
+                        // reason -- it is a real callable dispatched
+                        // structurally (the CALL form works, see
+                        // legit_reverse_alias_stack_value_correct), so a bare
+                        // reference to it hits the same no-MethodSymbol
+                        // no-op (#2434's zero-init degradation, confirmed
+                        // live: `var f := s.Reverse; f(); return s.Pop();`
+                        // returns 3 -- the silent no-op -- where a working
+                        // reverse returns 1). The CALL form (`s.Reverse()`,
+                        // `isCallForm` above) is unaffected: it is exempted
+                        // by `!isCallForm` here and by `!isCallForm` in the
+                        // "no member" reject below, so it still compiles and
+                        // codegen structurally dispatches it.
+                        if ((isDeclaredMethod || isUniversalObjectMember ||
+                                isUndocumentedCallableAlias) && !isCallForm) {
                             auto loc = ma.span.begin;
                             if (loc.line == 0 && ma.target)
                                 loc = ma.target->span.begin;
@@ -12261,20 +12298,22 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                     std::string(mbr) + "` (language spec "
                                     "\xC2\xA7""27.6) is not yet supported on "
                                     "`" + std::string(cn) + "<T>` (stdlib "
-                                    "\xC2\xA7""4.11, #2470): `" +
+                                    "\xC2\xA7""4.11, #2470/#2493): `" +
                                     std::string(mbr) + "` is a real member "
-                                    "(declared, or a universal Object member "
-                                    "-- language spec \xC2\xA7""8.1), but this "
-                                    "builtin collection dispatches it "
-                                    "structurally rather than through a real "
-                                    "method symbol, so no function value can "
-                                    "be formed for it yet -- call it directly "
-                                    "instead (`." + std::string(mbr) +
-                                    "(...)`)");
+                                    "(declared, a universal Object member "
+                                    "-- language spec \xC2\xA7""8.1, or an "
+                                    "undocumented-but-working structural "
+                                    "callable), but this builtin collection "
+                                    "dispatches it structurally rather than "
+                                    "through a real method symbol, so no "
+                                    "function value can be formed for it yet "
+                                    "-- call it directly instead (`." +
+                                    std::string(mbr) + "(...)`)");
                             return;
                         }
                         if (!isUniversalObjectMember &&
                                 !isUndocumentedWorkingAlias &&
+                                !isUndocumentedCallableAlias &&
                                 !isDeclaredMethod && !isLinqOperator &&
                                 !isCallForm) {
                             auto loc = ma.span.begin;
