@@ -232,7 +232,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         as->target.get())) {
                     llvm::Value* rhsOnce = lowerExpr(*as->value);
                     if (!rhsOnce) return false;
-                    if (lowerIndexerSet(*ix, rhsOnce)) return false;
+                    // fix #2540: pass `as->value.get()` so the interface-
+                    // dispatch branch in lowerIndexerSet can gate its paired
+                    // call-site retain on the RHS being a tracked string
+                    // NAMED LOCAL (matches the StringEscapeWalker's
+                    // stringReleaseEligible_ / stringBorrowRetainEligible_
+                    // sets — see the ifaceIdxNamedLocalEligible comment in
+                    // LlvmBackend_Assign.cpp at this function's
+                    // TypeDeclKind::Interface branch). nullptr would skip
+                    // the retain (leak-over-UAF, the safe direction for any
+                    // caller that doesn't have the source expression in
+                    // scope — the ref-arg write-back path in
+                    // emitAccessorRefArgWriteBacks which calls
+                    // lowerIndexerSet from a pre-loaded value).
+                    if (lowerIndexerSet(*ix, rhsOnce, as->value.get())) return false;
                     // issue #388 / stdlib §4.4-§4.9: heap-collection indexer
                     // setter `a[i] := v` / `dict[key] := v` (the OWNING
                     // variants dispose the displaced owner, §4.5 / §4.9).

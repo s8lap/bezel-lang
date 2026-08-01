@@ -3464,8 +3464,17 @@ private:
     llvm::Value* lowerIndexerGet(const ast::IndexExpr& ix);
 
     // §22.10: emit the setter of an indexer property via inline body.
-    // Returns true if the setter was handled.
-    bool lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val);
+    // Returns true if the setter was handled. `valueExpr` is the original
+    // (pre-lowering) RHS expression on `as->value.get()` — used to gate the
+    // paired call-site retain (#2540) so only the named-local RHS shapes the
+    // walker armed for scope-end release get the balancing +1 on the
+    // record-backed itable path (mirrors #2535's lowerVirtualPropertySet
+    // `ifaceNamedLocalEligible` gate). nullptr is a safe no-op (no retain
+    // emitted) — used by the ref-arg write-back path
+    // (emitAccessorRefArgWriteBacks) where the value arrives pre-loaded and
+    // has no associated source expression the walker could have armed.
+    bool lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
+                         const ast::Expr* valueExpr = nullptr);
 
     // §20 / §23.4: compound assignment `a[i] OP= v` through a user-defined
     // indexer — evaluates the receiver and each index param ONCE, calls the

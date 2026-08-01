@@ -1647,7 +1647,8 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
 }
 
 
-bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
+bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
+                              const ast::Expr* valueExpr) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return false;
     const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix.target.get());
@@ -1799,6 +1800,115 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val) {
         callArgs.push_back(coerceNumericToType(val, valTy, false));
         builder_.CreateCall(sFnTy, fnPtr, callArgs);
         emitPendingCheck();
+        // fix #2540 (§23.4/§28.9/§11, v0.236): the INDEXER twin of
+        // lowerVirtualPropertySet's #2535 paired call-site retain
+        // (LlvmBackend_Exprs.cpp ~5178 — `lowerVirtualPropertySet`'s
+        // `classBB`/`recordBB`/`doneBB` block). The walker above
+        // (LlvmBackend_Setup.cpp, the new `classOrIfaceIdxSet` discriminant
+        // in AssignmentStmt's `if (classOrIfaceIdxSet) { ... return; }`)
+        // now treats `iiface[i] := s;` as a CALL-BOUNDED BORROW when `s`
+        // is a tracked string NAMED LOCAL — arming the local's scope-end
+        // release. That release needs a paired +1 on the heap it can drop
+        // without danging any other reference — the setter provides it on
+        // the CLASS-backed path (setter retains → field has +1, local
+        // keeps its +1, scope-end release drops the local's, sound); on
+        // the RECORD-backed path the setter keeps the PLAIN STORE (§9/
+        // §9.7 — a boxed record's reference fields are borrows with no
+        // disposer), so the field ALIASES the local's only reference and
+        // the scope-end release would free the field's only ref → UAF.
+        // Mint that extra +1 here, on the record path ONLY, so the scope-
+        // end release has a balanced +1 to drop. Restricted to the NAMED
+        // LOCAL case (an IdentifierExpr whose LocalSymbol's decl is in
+        // stringReleaseEligible_ / stringBorrowRetainEligible_ — the SAME
+        // sets the walker uses) so a producer-temporary RHS (whose only
+        // release is the class-path emitProducerRelease on the property
+        // side) doesn't get a phantom retain — that would leave a
+        // stranded +1 on the heap. Mirrors #2535's gating: a runtime
+        // owner-kind flag read from the itable's trailing word
+        // (`ifaceItabSlotCount_[ps->parent]`, NULL = record-backed plain-
+        // store, non-NULL = class-backed retaining setter) selects class-
+        // backed (no extra retain) vs record-backed (mint the named-local
+        // retain on the value before the scope-end release drops it).
+        //
+        // The itable flag travels inside the bytes the concrete type's
+        // OWN module produced, so cross-module soundness carries over
+        // (the importer reads it through `itab` at the same index; the
+        // itable linkage is per-module InternalLinkage and not comparable
+        // cross-module, but the flag itself is data the concrete-type
+        // module baked — same shape #2506 / #2535 use for the property
+        // case).
+        //
+        // On the class-vtable path (the `if (recvDecl->kind == Class)`
+        // block below) and the local-inline path (the inlined setter
+        // body dispatched via lowerScopedBlock further below) no such
+        // retain is needed: the class's own setter
+        // (ensureIndexerAccessorFn's class-gated retain) is unconditional
+        // for the vtable-slot case (a vtable slot is always a class's
+        // own slot, never a record's — §9: "A record cannot derive from
+        // another record or from a class"), and the inline path is
+        // gated on `ps->parent->kind == Class` by the property-SET gate
+        // — the class-retain invariant holds soundly and the scope-end
+        // release is balanced without help. Only the itable dispatch can
+        // land on a record-backed runtime receiver, so the paired retain
+        // lives ONLY on this itable path.
+        auto isTrackedStringLocalForRelease = [&](const ast::Expr* e) -> bool {
+            if (!e || currentFn_ != stringReleaseEligibleFn_) return false;
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+            if (!id) return false;
+            auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+            if (!loc || !loc->decl) return false;
+            const void* declNode = static_cast<const void*>(loc->decl);
+            return stringReleaseEligible_.count(declNode) ||
+                   stringBorrowRetainEligible_.count(declNode);
+        };
+        bool ifaceIdxNamedLocalEligible =
+            valueExpr && val && val->getType()->isPointerTy() &&
+            isTrackedStringLocalForRelease(valueExpr);
+        auto cntIt = ifaceItabSlotCount_.find(ps->parent);
+        if (cntIt != ifaceItabSlotCount_.end()) {
+            // The owner-kind flag lives at itab[ifaceItabSlotCount_[iface]]
+            // (the LAST word in the itable, appended by #2506). Read it
+            // HERE from the `itab` we already have in scope (the same
+            // value computed for the fn-ptr load above; do not reload it
+            // post-call — the receiver has been mutated by the setter and
+            // reload could race).
+            llvm::Value* flagAddr = builder_.CreateGEP(
+                ptrTy(), itab,
+                {builder_.getInt32(cntIt->second)}, "idxset.flagaddr");
+            llvm::Value* flag = builder_.CreateLoad(
+                ptrTy(), flagAddr, "idxset.flagval");
+            llvm::Value* isClassBacked = builder_.CreateICmpNE(
+                flag, llvm::ConstantPointerNull::get(ptrTy()),
+                "idxset.isclass");
+            llvm::BasicBlock* curBB = builder_.GetInsertBlock();
+            llvm::Function* fn = curBB->getParent();
+            llvm::BasicBlock* classBB =
+                llvm::BasicBlock::Create(llvm_, "idxset.class", fn);
+            llvm::BasicBlock* recordBB =
+                llvm::BasicBlock::Create(llvm_, "idxset.record", fn);
+            llvm::BasicBlock* doneBB =
+                llvm::BasicBlock::Create(llvm_, "idxset.done", fn);
+            builder_.CreateCondBr(isClassBacked, classBB, recordBB);
+            // CLASS-backed branch: setter retained → no producer release
+            // (the indexer shape does not yet have emitProducerRelease —
+            // that's a separate #2548 lane; the named-local CLOSE this
+            // fix lands is the property case's analogue, the producer-RHS
+            // family is its own work item), and no extra retain needed —
+            // the class setter's retain is the field's +1, the scope-end
+            // release on the walker-armed local drops the local's +1, all
+            // +1's accounted for.
+            builder_.SetInsertPoint(classBB);
+            builder_.CreateBr(doneBB);
+            // RECORD-backed branch: setter plain-stored → field aliases
+            // the local's only reference. For a tracked-string NAMED LOCAL
+            // RHS, mint the extra +1 here so the walker's scope-end
+            // release on the local has a balanced +1 to drop.
+            builder_.SetInsertPoint(recordBB);
+            if (ifaceIdxNamedLocalEligible)
+                emitStringRetain(val);
+            builder_.CreateBr(doneBB);
+            builder_.SetInsertPoint(doneBB);
+        }
         return true;
     }
     // #1080 / §23.4: a virtual/override/abstract indexer SETTER on a CLASS

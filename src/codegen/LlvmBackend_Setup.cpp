@@ -14769,6 +14769,93 @@ struct StringEscapeWalker {
                     expr(as->value.get(), /*safeRead=*/true);
                     return;
                 }
+                // fix #2540 (§23.4 "Block-form indexers" / §28.9 / §11
+                // interfaces, v0.236): the indexer twin of the property-SET
+                // relaxation immediately above (mirrors the shape #2535 added
+                // for properties). The IndexExpr's exprSymbol IS the indexer's
+                // PropertySymbol (set by ExprTypecheck_Exprs.cpp ~1877 for
+                // any user-defined indexer access, including imported; #2530
+                // fixed the prior gap where ctx.exprSymbol(*ix) returned
+                // null for indexer IndexExpr), so the walker can identify
+                // the indexer's parent kind the same way the property gate
+                // above does.
+                //
+                // Without this, `h[i] := s;` / `iiface[i] := s;` falls
+                // through to the conservative escape below, which taints
+                // the local as ESCAPED and suppresses its scope-end release
+                // — leaking the local's +1 per call (190 bytes / 10
+                // allocations under LSan on origin/main 1a3a373 with this
+                // branch; confirmed by direct bezelc probe). The IndexExpr
+                // branch sits AFTER the property branch above (the two are
+                // mutually exclusive on the LHS shape — a MemberAccessExpr
+                // is never also an IndexExpr), so the existing property
+                // gate is unchanged.
+                //
+                // Same over-approximation the property gate applies for
+                // non-auto class setters (which the user may write without
+                // an explicit retain):
+                //   * CLASS parent (concrete `h[i] := s;`) ⇒ the setter
+                //     body is user code; in the common shape the setter
+                //     EITHER retains into a string-typed field via the
+                //     auto-retaining _f := value; field store
+                //     (lowerStringFieldStore's load-old / retain-new /
+                //     store-new / release-old) OR discards the value
+                //     without storing it — the local's +1 is balanced by
+                //     the callee's own retain OR by the local's scope-end
+                //     release against an un-aliased value. Same case as
+                //     non-auto class property setters (`set => do _v := value;
+                //     end;` with a separate backing `var _v`), which the
+                //     property gate already arms soundly.
+                //   * INTERFACE parent (`iiface[i] := s;`) ⇒ the static
+                //     receiver is interface but the runtime implementor may
+                //     be a class or a record. The COMMON class-implementor
+                //     case is the same shape as the CLASS parent above
+                //     (sound; the setter retains). The rarer record-
+                //     implementor case where the user's setter stores
+                //     `value` into a reference-typed field WITHOUT retaining
+                //     would UAF on the scope-end release here at the local's
+                //     scope end. This is exactly the paired-call-site-retain
+                //     path the property case (#2535) added in
+                //     lowerVirtualPropertySet's `recordBB` (class-backed ⇒
+                //     setter retains, no extra retain; record-backed ⇒
+                //     mint an extra +1 on the heap so the scope-end release
+                //     has a balanced +1 to drop). The indexer twin lives in
+                //     lowerIndexerSet's interface-dispatch branch
+                //     (LlvmBackend_Assign.cpp, the `if (recvDecl->kind ==
+                //     ast::TypeDeclKind::Interface)` block), mirroring
+                //     #2535's shape — gated on `ifaceItabSlotCount_[ps->
+                //     parent]` (the trailing owner-kind flag #2506 bakes
+                //     into every itable, NULL = record-backed plain-store,
+                //     non-NULL = class-backed retaining setter).
+                //   * RECORD parent ⇒ unchanged: setter keeps the plain
+                //     store (§9/§9.7 — a record's reference fields are
+                //     borrows with no independent +1 and no disposer), so
+                //     the field ALIASES the local's only reference; the
+                //     gate stays conservative (no widening).
+                //
+                // Gated on stringReleaseMode, mirroring the property gate
+                // (sound only for the string-release analysis; the dict-
+                // materializer / grouping / borrowing-Array walks share
+                // this SAME walker but have no retain on the LHS, so the
+                // gate stays closed for them).
+                bool classOrIfaceIdxSet = false;
+                if (auto* ix = dynamic_cast<const ast::IndexExpr*>(
+                        as->target.get())) {
+                    if (auto* ps = dynamic_cast<sema::PropertySymbol*>(
+                            ctx.exprSymbol(*ix))) {
+                        auto k = ps->parent ? ps->parent->kind
+                                            : ast::TypeDeclKind::Class;
+                        classOrIfaceIdxSet =
+                            ps->isIndexer && ps->parent &&
+                            (k == ast::TypeDeclKind::Class ||
+                             k == ast::TypeDeclKind::Interface);
+                    }
+                }
+                if (classOrIfaceIdxSet) {
+                    expr(as->target.get(), /*safeRead=*/false);
+                    expr(as->value.get(), /*safeRead=*/true);
+                    return;
+                }
             }
             expr(as->target.get(), /*safeRead=*/false);
             expr(as->value.get(), /*safeRead=*/false);
