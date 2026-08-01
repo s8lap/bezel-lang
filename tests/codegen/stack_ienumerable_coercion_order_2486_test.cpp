@@ -341,18 +341,19 @@ BEZEL_TEST(stack_ienumerable_coercion_order_2486, owningarray_return_coercion_un
     BEZEL_EXPECT_EQ(run(program), 38);
 }
 
-// ── §2487 (nested composition): confirmed reachable, confirmed still ────
-// ── FORWARD/wrong — a separate, materially larger surface, not fixed ────
-// ── here. Guards the CURRENT (wrong) value against silent drift either ──
-// ── way (an accidental fix here, or an accidental extra breakage). ──────
+// ── #2487 (nested composition): these two were flip-on-fix guards in the ─
+// ── original #2486 commit (asserting the then-current WRONG value so an ──
+// ── accidental fix or extra breakage was caught either way). #2487's fix ─
+// ── (ensureIEnumViewFactory now Stack-aware in both directions) flips ────
+// ── them to the §4.11-correct pop-order values; richer cases live in ────
+// ── tests/codegen/nested_ienumerable_stack_order_2487_test.cpp. ──────────
 
 // Outer Array<Stack<int>>, elements are Stack<int>: outer order (forward) is
-// already correct for Array, but each Stack ELEMENT's own leaf wrap
-// (ensureIEnumViewFactory's leaf branch) is not yet Stack-aware, so the
-// inner traversal stays forward. §4.11-correct value would be 86; current
-// (still #2487-tracked) value is 38.
+// already correct for Array; each Stack ELEMENT's own leaf wrap
+// (ensureIEnumViewFactory's leaf branch) now iterates §4.11 pop order.
+// s = Push(1);Push(2);Push(3) -> 3,2,1 -> n = 3*25+2*5+1 = 86.
 BEZEL_TEST(stack_ienumerable_coercion_order_2486,
-           nested_array_of_stack_element_order_still_forward_2487) {
+           nested_array_of_stack_element_pop_order_2487) {
     const std::string program =
         "module M; "
         "class C public static method Sum(src: IEnumerable<IEnumerable<int>>): int "
@@ -369,16 +370,14 @@ BEZEL_TEST(stack_ienumerable_coercion_order_2486,
         "  outer.Add(s); "
         "  return C.Sum(outer); "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 38);  // #2487: should be 86 once fixed
+    BEZEL_EXPECT_EQ(run(program), 86);  // #2487 fix: was 38 (forward) before
 }
 
 // Outer Stack<Array<int>>: the OUTER traversal itself (over the two inner
-// Array<int> elements) is not yet reversed for a Stack outer container in
-// the nested factory. Pop order over the outer would visit a2=[2] then
-// a1=[1] -> n = 2*5+1 = 11; current (still #2487-tracked) forward value is
-// a1 then a2 -> n = 1*5+2 = 7.
+// Array<int> elements) now iterates §4.11 pop order. Pop order visits
+// a2=[2] then a1=[1] -> n = 2*5+1 = 11.
 BEZEL_TEST(stack_ienumerable_coercion_order_2486,
-           nested_stack_of_array_outer_order_still_forward_2487) {
+           nested_stack_of_array_outer_pop_order_2487) {
     const std::string program =
         "module M; "
         "class C public static method Sum(src: IEnumerable<IEnumerable<int>>): int "
@@ -395,5 +394,5 @@ BEZEL_TEST(stack_ienumerable_coercion_order_2486,
         "  outer.Push(a1); outer.Push(a2); "
         "  return C.Sum(outer); "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(run(program), 7);  // #2487: should be 11 once fixed
+    BEZEL_EXPECT_EQ(run(program), 11);  // #2487 fix: was 7 (forward) before
 }

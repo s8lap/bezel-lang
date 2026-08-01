@@ -4089,13 +4089,12 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         // §29 / §12.9 (#1850): a nested covariant view whose elements are
         // themselves array-backed collections viewed as pure IEnumerable<T>
         // needs the per-element re-wrapping nested enumerator, not the plain
-        // one. #2486: the nested factory (ensureIEnumViewFactory /
-        // wrapNestedArrayAsIEnumerable) is NOT yet Stack-aware in either
-        // direction — a Stack<T> OUTER container's traversal and a Stack<T>
-        // ELEMENT's per-item leaf wrap both stay forward-only there — so it
-        // is deliberately left untouched here (filed as #2487, a distinct,
-        // larger surface per the same "land clean, file the rest" reasoning
-        // #2486 itself was scoped out of #2471 with).
+        // one. #2487 (stdlib §4.11 "Iteration order" v0.195; language spec
+        // §29.1, v0.236): the nested factory (ensureIEnumViewFactory /
+        // wrapNestedArrayAsIEnumerable) is now Stack-aware in BOTH directions
+        // — a Stack<T> OUTER container traverses pop order, and a Stack<T>
+        // ELEMENT's leaf wrap reuses #2471's reverse machinery — so this
+        // dispatch is correct as-is for the nested shape too.
         if (nestedIEnumViewNeeded(actualTy, targetTy))
             return wrapNestedArrayAsIEnumerable(v, actualTy, targetTy);
         // #2486 (stdlib §4.11 "Iteration order" v0.195; language spec §29.1,
@@ -4989,11 +4988,44 @@ llvm::Function* Emitter::ensureIEnumViewFactory(const sema::TypeRef* storedTy,
         ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
         : (elemTy->isPointerTy() ? "ptr" : "f");
 
+    // fix #2487 (stdlib §4.11 "Iteration order" v0.195; language spec §29.1,
+    // v0.236): the collection whose backing THIS recursion level enumerates
+    // may itself be a Stack<T>/OwningStack<T>, in which case ITS OWN traversal
+    // must be top-to-bottom (pop order), not physical/forward order —
+    // independent of whether the element needs per-item re-wrapping. Two
+    // independent defects, both captured here by reading storedTy's head name
+    // at this level:
+    //   * Defect B (leaf): a Stack<T> ELEMENT of an outer Array<Stack<T>>
+    //     recurses in here as storedTy=Stack<T>, viewTy=IEnumerable<T>. The
+    //     leaf branch hardcoded the forward ensureArrayEnumMachinery; it must
+    //     instead reuse #2471's reverse ensureStackEnumMachinery and seed
+    //     idx = bz_array_len(backing) (runtime before-top sentinel).
+    //   * Defect A (nested): a Stack<T> OUTER container (e.g.
+    //     Stack<Array<T>>) is handled at THIS level as storedTy=
+    //     Stack<Array<T>>. The nested MoveNext/GetEnumerator hardcoded a
+    //     forward cursor (idx = -1, idx++, idx < len); it must count DOWN
+    //     (idx = len, idx--, idx >= 0), mirroring ensureStackEnumMachinery.
+    auto isStackBacking = [](const sema::TypeRef* t) -> bool {
+        if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+        std::string_view h = t->headName();
+        return h == "Stack" || h == "OwningStack";
+    };
+    bool backingIsStack = isStackBacking(storedTy);
+
     if (!elemNeedsWrap) {
-        // Leaf: a plain array enumerator over the (borrowed) backing array.
-        std::string name = "bz$viewfac$P$" + elemName;
+        // Leaf: a plain enumerator over the (borrowed) backing array. #2487
+        // Defect B: route a Stack/OwningStack leaf through #2471's reverse
+        // machinery (ensureStackEnumMachinery) instead of the forward
+        // ensureArrayEnumMachinery, and seed idx = bz_array_len (the runtime
+        // before-top sentinel) instead of the fixed -1. The cache key (and
+        // machinery) carry an "S" tag so a Stack<int> leaf and an Array<int>
+        // leaf in the same module get DISTINCT factories/vtables.
+        std::string name = (backingIsStack ? "bz$viewfac$SP$" : "bz$viewfac$P$")
+                           + elemName;
         if (auto* f = module_->getFunction(name)) return f;
-        ArrEnumMachinery m = ensureArrayEnumMachinery(elemTy);
+        ArrEnumMachinery m = backingIsStack
+            ? ensureStackEnumMachinery(elemTy)
+            : ensureArrayEnumMachinery(elemTy);
         auto* ft = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
         auto* f = llvm::Function::Create(ft, llvm::Function::InternalLinkage,
                                          name, module_.get());
@@ -5009,8 +5041,18 @@ llvm::Function* Emitter::ensureIEnumViewFactory(const sema::TypeRef* storedTy,
              llvm::ConstantInt::get(i64(), (int64_t)stSz)});
         b.CreateStore(m.vtGV, b.CreateStructGEP(m.stTy, en, 0));
         b.CreateStore(backing, b.CreateStructGEP(m.stTy, en, 1));
-        b.CreateStore(llvm::ConstantInt::get(i64(), -1),
-                      b.CreateStructGEP(m.stTy, en, 2));
+        if (backingIsStack) {
+            // idx = bz_array_len(backing) — runtime before-top sentinel,
+            // matching wrapStackAsIEnumerator (#2471).
+            auto* lenFT = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+            auto* lenFn = module_->getOrInsertFunction("bz_array_len", lenFT)
+                              .getCallee();
+            llvm::Value* len = b.CreateCall(lenFT, lenFn, {backing});
+            b.CreateStore(len, b.CreateStructGEP(m.stTy, en, 2));
+        } else {
+            b.CreateStore(llvm::ConstantInt::get(i64(), -1),
+                          b.CreateStructGEP(m.stTy, en, 2));
+        }
         b.CreateStore(llvm::ConstantInt::get(i64(), m.esz),
                       b.CreateStructGEP(m.stTy, en, 3));
         b.CreateRet(en);
@@ -5021,19 +5063,31 @@ llvm::Function* Emitter::ensureIEnumViewFactory(const sema::TypeRef* storedTy,
     // the inner factory. Recurse to get it first (its name encodes the inner
     // shape, so this factory's cache key is unique per whole wrap shape).
     llvm::Function* innerFac = ensureIEnumViewFactory(storedElem, viewElem);
-    std::string name = "bz$viewfac$N$" + innerFac->getName().str();
+    // #2487 Defect A: encode the OUTER backing kind in this factory's name AND
+    // the nested machinery's struct/function prefix. A Stack<Array<T>> (reverse
+    // outer) and an Array<Array<T>> (forward outer) share the SAME innerFac
+    // (both leaf over Array<T> → IEnumerable<T>), so without this tag they
+    // would collide on one nested MoveNext/GetEnumerator — the only pieces
+    // that differ by outer direction. The "S" tag keeps them distinct, exactly
+    // as the leaf branch's tag keeps a Stack<int> leaf distinct from an
+    // Array<int> leaf.
+    std::string name = (backingIsStack ? "bz$viewfac$SN$" : "bz$viewfac$N$")
+                       + innerFac->getName().str();
     if (auto* f = module_->getFunction(name)) return f;
 
     // Nested enumerator struct: { ptr vtable, ptr arr, i64 idx, i64 esz,
     //                             ptr curInner }.  esz here is 8 — the outer
     //  backing array's elements are collection pointers (bz_array_t*).
-    std::string stName = "arrenumnest." + elemName;
+    std::string stName = (backingIsStack ? "stackarrenumnest." : "arrenumnest.")
+                         + elemName;
     auto* stTy = llvm::StructType::getTypeByName(llvm_, stName);
     if (!stTy)
         stTy = llvm::StructType::create(
             llvm_, {ptrTy(), ptrTy(), i64(), i64(), ptrTy()}, stName);
 
-    std::string prefix = "bz$arrenumnest$" + elemName + "$";
+    std::string prefix = (backingIsStack ? "bz$stackarrenumnest$"
+                                         : "bz$arrenumnest$")
+                         + elemName + "$";
     auto* voidTy = llvm::Type::getVoidTy(llvm_);
     auto getOrCreate = [&](const std::string& fname, llvm::FunctionType* ft,
                            std::function<void(llvm::Function*)> fill)
@@ -5083,7 +5137,10 @@ llvm::Function* Emitter::ensureIEnumViewFactory(const sema::TypeRef* storedTy,
         });
 
     // MoveNext(self): dispose the previous element's inner view, advance idx,
-    // return idx < len(arr).
+    // return whether another element remains. #2487 Defect A: a Stack OUTER
+    // counts DOWN (idx--; return idx >= 0) — §4.11 pop order — mirroring
+    // ensureStackEnumMachinery's own MoveNext; an Array/Queue outer counts UP
+    // (idx++; return idx < len), as before.
     auto* mnFn = getOrCreate(prefix + "MoveNext",
         llvm::FunctionType::get(i1(), {ptrTy()}, false),
         [&](llvm::Function* f) {
@@ -5093,16 +5150,22 @@ llvm::Function* Emitter::ensureIEnumViewFactory(const sema::TypeRef* storedTy,
             disposeCurInner(b, self);
             llvm::Value* idxF = b.CreateStructGEP(stTy, self, 2);
             llvm::Value* idx = b.CreateLoad(i64(), idxF);
-            llvm::Value* next =
-                b.CreateAdd(idx, llvm::ConstantInt::get(i64(), 1));
+            llvm::Value* next = backingIsStack
+                ? b.CreateSub(idx, llvm::ConstantInt::get(i64(), 1))
+                : b.CreateAdd(idx, llvm::ConstantInt::get(i64(), 1));
             b.CreateStore(next, idxF);
-            llvm::Value* arrPtr =
-                b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
-            auto* lenFT = llvm::FunctionType::get(i64(), {ptrTy()}, false);
-            auto* lenFn = module_->getOrInsertFunction("bz_array_len", lenFT)
-                              .getCallee();
-            llvm::Value* len = b.CreateCall(lenFT, lenFn, {arrPtr});
-            b.CreateRet(b.CreateICmpSLT(next, len));
+            if (backingIsStack) {
+                b.CreateRet(b.CreateICmpSGE(
+                    next, llvm::ConstantInt::get(i64(), 0)));
+            } else {
+                llvm::Value* arrPtr =
+                    b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
+                auto* lenFT = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+                auto* lenFn = module_->getOrInsertFunction("bz_array_len", lenFT)
+                                  .getCallee();
+                llvm::Value* len = b.CreateCall(lenFT, lenFn, {arrPtr});
+                b.CreateRet(b.CreateICmpSLT(next, len));
+            }
         });
 
     // Current(self): if the inner view for this element is already materialised,
@@ -5146,7 +5209,11 @@ llvm::Function* Emitter::ensureIEnumViewFactory(const sema::TypeRef* storedTy,
         });
 
     // GetEnumerator(self): a FRESH nested enumerator over the same backing array,
-    // before the first element (idx = -1, curInner = null) — §29.11 replay.
+    // before the first element (curInner = null) — §29.11 replay. #2487 Defect A:
+    // a Stack OUTER seeds idx = bz_array_len(arrCp), re-fetched fresh in THIS
+    // clone (not copied from self's idx, which may be partway through its own
+    // walk), matching ensureStackEnumMachinery's own GetEnumerator; an Array/
+    // Queue outer seeds the fixed -1, as before.
     auto* geFn = getOrCreate(prefix + "GetEnumerator",
         llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
         [&](llvm::Function* f) {
@@ -5167,8 +5234,17 @@ llvm::Function* Emitter::ensureIEnumViewFactory(const sema::TypeRef* storedTy,
             llvm::Value* arrCp =
                 b.CreateLoad(ptrTy(), b.CreateStructGEP(stTy, self, 1));
             b.CreateStore(arrCp, b.CreateStructGEP(stTy, clone, 1));
-            b.CreateStore(llvm::ConstantInt::get(i64(), -1),
-                          b.CreateStructGEP(stTy, clone, 2));
+            if (backingIsStack) {
+                auto* lenFT = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+                auto* lenFn =
+                    module_->getOrInsertFunction("bz_array_len", lenFT)
+                        .getCallee();
+                llvm::Value* len = b.CreateCall(lenFT, lenFn, {arrCp});
+                b.CreateStore(len, b.CreateStructGEP(stTy, clone, 2));
+            } else {
+                b.CreateStore(llvm::ConstantInt::get(i64(), -1),
+                              b.CreateStructGEP(stTy, clone, 2));
+            }
             b.CreateStore(llvm::ConstantInt::get(i64(), 8),
                           b.CreateStructGEP(stTy, clone, 3));
             // curInner (slot 4) already null from calloc.
@@ -5206,8 +5282,19 @@ llvm::Function* Emitter::ensureIEnumViewFactory(const sema::TypeRef* storedTy,
          llvm::ConstantInt::get(i64(), (int64_t)stSz)});
     b.CreateStore(vtGV, b.CreateStructGEP(stTy, en, 0));
     b.CreateStore(backing, b.CreateStructGEP(stTy, en, 1));
-    b.CreateStore(llvm::ConstantInt::get(i64(), -1),
-                  b.CreateStructGEP(stTy, en, 2));
+    // #2487 Defect A: a Stack OUTER seeds idx = bz_array_len(backing) (runtime
+    // before-top sentinel, matching wrapStackAsIEnumerator); an Array/Queue
+    // outer seeds the fixed -1.
+    if (backingIsStack) {
+        auto* lenFT = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+        auto* lenFn = module_->getOrInsertFunction("bz_array_len", lenFT)
+                          .getCallee();
+        llvm::Value* len = b.CreateCall(lenFT, lenFn, {backing});
+        b.CreateStore(len, b.CreateStructGEP(stTy, en, 2));
+    } else {
+        b.CreateStore(llvm::ConstantInt::get(i64(), -1),
+                      b.CreateStructGEP(stTy, en, 2));
+    }
     b.CreateStore(llvm::ConstantInt::get(i64(), 8),
                   b.CreateStructGEP(stTy, en, 3));
     // curInner (slot 4) already null from calloc.
