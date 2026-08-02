@@ -48,6 +48,8 @@ There is really only one disposal mechanism. At the end of a scope, every owned 
 
 **The habit to unlearn.** Elsewhere, a trailing `foo.Dispose()` at the end of a block is the anti-pattern `using` blocks exist to kill, because a thrown exception skips the trailing call. In Bezel the unwinding edge *always* disposes live owned values, so a trailing `Dispose()` is exception-safe by construction. It therefore never means "cleanup plumbing." It means one thing only: *release this early.* Auto-drop is the safety net underneath all four forms. You are choosing *when* and *how loudly*, never *whether*.
 
+**When there is nothing to dispose: trivial-dispose classes.** The four spellings above are the story for classes that *own something*. Not every class does. A class with no destructor, no `owned` fields, and no owning-inline-array fields (on a trivial-dispose base) has a `Dispose()` that provably does nothing, and the compiler classifies it **trivial-dispose** and drops the discharge discipline entirely (spec §28.9): `var r := new Random();` compiles clean with no `using var` and no warning, abandoning the reference leaks no cleanup, and `_ := new StringBuilder();` is legal and purely cosmetic. This is derived from the declaration, never opted into — your own classes qualify automatically, and for a generic it is computed per instantiation: `Array<T>` qualifies (it borrows its elements — Guide 5 §1), `OwningArray<T>` never does. The memory is still reclaimed: an implementation-defined runtime mechanism frees the instance's storage with no user code running — the spec names reference counting and region allocation as admissible spellings, and the choice is invisible to programs (spec §28; it is not a garbage collector in the sense Bezel avoids). Two cautions. The classification is part of a public class's contract: adding a destructor or an `owned` field later flips it, and formerly-silent call sites immediately draw the standard obligations (rationale §5.9) — `using var` remains accepted, as a no-op, where you want to be robust against that flip in advance. And the exemption is about *disposal only*, never lifetime: a trivial-dispose object's class-typed fields are borrows, and every borrow rule in §3 applies to them unchanged.
+
 ---
 
 ## 3. Borrowing: the default for "just let me use it"
@@ -404,6 +406,7 @@ end;
 | Hand an owned local to a method that takes it | `M(owned x)` (marker required) |
 | Move an owned field's contents out | `move _f` (then reassign `_f` before exit) |
 | Dispose an unwanted owned value now | `_ := x;` (or `x.Dispose();` for an early release) |
+| Make a resource-free helper (no destructor, no `owned` fields) | just `new` it — trivial-dispose, no `using var` needed (§2) |
 | Drain an owning collection | `for var e in coll.Drain() do using var x := owned e; … end;` |
 | Merge branches with mixed ownership | equalize first (Pattern A or B, §8) |
 
