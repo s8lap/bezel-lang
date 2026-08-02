@@ -608,6 +608,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled && currentFn_ == stringReleaseEligibleFn_)
                     handled = lowerStringLocalReassign(*as->target, addr, elemTy,
                                                        rhs, as->value.get());
+                // #2321 / §22.3 / §28.9: a `ref`/`out` string param has no
+                // localSlot (lives in refParams_) and is not a class field, so
+                // the helpers above both returned false — without this the
+                // callee's `s := s + "!"` plain-stored the new heap string and
+                // the caller's previous value's +1 leaked (and so did the new
+                // value's +1 in the caller's slot, for a different reason — the
+                // local-slot escape walk does not cover ref-aliased slots).
+                // Mirror lowerStringLocalReassign's retain-new (transfer a
+                // producer) / store / release-old. Gated on the helper returning
+                // true (which requires a ref-param, string-typed, non-nullable,
+                // bare-ptr target) so a non-ref-param target cannot accidentally
+                // reach here.
+                if (!handled)
+                    handled = lowerStringRefParamStore(*as->target, addr, elemTy,
+                                                       rhs, as->value.get());
                 // #429 (closure FIELD-STORE category) / §27.5 / §28.9: a store
                 // into a CLASS closure (function-typed) field / auto-property
                 // takes an independent +1 (retain-new or transfer-producer /

@@ -13783,6 +13783,51 @@ bool Emitter::lowerStringLocalReassign(const ast::Expr& target,
 }
 
 
+// #2321 / §22.3 / §28.9: REASSIGNMENT through a string-typed `ref`/`out` PARAMETER.
+// The store through the alias is an ordinary assignment to the caller's slot
+// (per §22.3's "`ref` argument naming a mutable local or writable field is a
+// true alias"), so §28.9 demands the same retain-new (transfer a producer) /
+// release-old balance the local-slot and field-store paths emit. Without this
+// the callee's `s := s + "!"` plain-stores the new heap string into the
+// caller's slot: the caller's previous value is now orphaned (no release) and
+// the new value's +1 leaks (the caller's slot has no other owner). lowerStringLocalReassign
+// does not fire because localSlot(target) returns null for a ref-param (the
+// param lives in refParams_, not locals_/paramSlots_); lowerStringFieldStore does
+// not fire because the target is not a class field. Mirrors lowerStringLocalReassign
+// exactly — same load-old / retain-or-transfer / store-new / release-old order,
+// null-safety from bz_string_retain/release, retain-before-release keeping a
+// self-assignment safe — gated on (a) target being a ref/out string-typed param
+// and (b) elemTy a bare `ptr` (the !nullable restriction matches the local-
+// reassign helper, to keep the surface in step with bind-time arming). The
+// caller-side slot owns the +1; the callee-side refParamAddr simply points at
+// it, so a store through the alias is the same kind of slot ownership change
+// the local-reassign path balances.
+bool Emitter::lowerStringRefParamStore(const ast::Expr& target,
+                                      llvm::Value* slotAddr, llvm::Type* elemTy,
+                                      llvm::Value* newVal,
+                                      const ast::Expr* valueExpr) {
+    if (!slotAddr || !newVal) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    if (!elemTy || !elemTy->isPointerTy()) return false;  // not a `ptr` slot
+    if (!isStringExprType(target)) return false;            // not string-typed
+    // Confirm the target is a `ref`/`out` param — a local-slot reassignment
+    // would have been caught by lowerStringLocalReassign; this helper exists
+    // for the ref/out alias shape specifically.
+    if (!dynamic_cast<const ast::IdentifierExpr*>(&target)) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym) return false;
+    if (refParams_.find(sym) == refParams_.end()) return false;
+    if (const sema::TypeRef* tt = ctx_.exprType(target))
+        if (tt->nullable) return false;  // mirror local-reassign restriction
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "strrp.old");
+    if (!isPlusOneStringProducer(valueExpr))
+        emitStringRetain(newVal);
+    builder_.CreateStore(newVal, slotAddr);
+    emitStringRelease(oldVal);
+    return true;
+}
+
+
 // #429 / §4.6 / §28.9: emit the reference-count bookkeeping for a `var` STRING
 // local at bind time and arm its scope-end release. The slot store itself is
 // performed by the caller (lowerLocalDecl). The model gives EVERY string local

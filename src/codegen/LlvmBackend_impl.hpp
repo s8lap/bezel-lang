@@ -8107,6 +8107,19 @@ private:
     bool lowerStringLocalReassign(const ast::Expr& target, llvm::Value* slotAddr,
                                   llvm::Type* elemTy, llvm::Value* newVal,
                                   const ast::Expr* valueExpr);
+    // #2321 / §22.3 / §28.9: REASSIGNMENT through a string-typed `ref`/`out`
+    // PARAMETER (the assignment is an ordinary store through the alias, not a
+    // local-slot reassignment). The caller's slot owns an INDEPENDENT +1 that
+    // the local-slot escape walk (stringReleaseEligible_) does not cover, so
+    // a plain `CreateStore` leaves the heap string leaked — the new value is
+    // an independent producer the caller has no other release for, and the
+    // displaced previous value had its +1 in this slot. Emit the same retain-
+    // new (transfer a producer) / store / release-old pair lowerStringLocalReassign
+    // does, against the `refParamAddr` pointer the caller already resolved.
+    // Mirrors lowerStringLocalReassign; returns true when handled.
+    bool lowerStringRefParamStore(const ast::Expr& target, llvm::Value* slotAddr,
+                                 llvm::Type* elemTy, llvm::Value* newVal,
+                                 const ast::Expr* valueExpr);
     // #429 / §4.6 / §28.9: the set of `var` string LocalDecl nodes whose
     // initializer is a BORROW (NOT a +1 producer) and which the escape walk
     // proved non-escaping — these are RETAINED at bind and RELEASED at scope end
