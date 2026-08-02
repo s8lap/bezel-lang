@@ -1137,7 +1137,8 @@ private:
     // "out var"/"out using var"/"out owned var" always declare a FRESH
     // local (no pre-existing-location question), and "owned"/"scoped" are
     // unrelated call-site markers (§22.3 / §28.14).
-    void checkRefOutOperandCategory(const ast::CallArgument& a);
+    void checkRefOutOperandCategory(const ast::CallArgument& a,
+                                    std::string_view formalParamModifier = "");
     // Shared by the Identifier and MemberAccess cases of
     // checkRefOutOperandCategory: readonly-outside-context (§22.8) and
     // mutable-static-rule-2 (§22.12) for a field operand.

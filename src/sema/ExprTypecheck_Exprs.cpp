@@ -2,6 +2,7 @@
 
 #include "common/BuiltinRegistry.hpp"
 #include "common/OwnershipFacts.hpp"  // §35.7 (#2045): classifyChoiceType
+#include "sema/TypeResolution.hpp"  // fix #2320: typeRefEqual for ctor overload re-resolution
 
 #include <cmath>
 #include <unordered_set>
@@ -5194,8 +5195,28 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // §22.3 (v0.184, #1682): validate the operand category of a
             // bare `ref`/`out` argument (a no-op for every other modifier).
             // Runs after the argument's own visitExpr above so exprSymbol is
-            // populated for it.
-            checkRefOutOperandCategory(a);
+            // populated for it. fix #2320 / §22.3 / §22.4: pass the FORMAL
+            // parameter's modifier so the function can emit a clean §22.3
+            // rejection for the `out owned` variant when the argument is
+            // anything other than an inline `out using var` / `out owned var`
+            // declaration (an indexer slot, a property, a bare local, …) —
+            // those used to leak through to codegen's #1386 fallback.
+            {
+                std::string_view formalMod;
+                if (calleeMd2) {
+                    std::size_t pidx = pos2;
+                    if (!a.name.empty()) {
+                        for (std::size_t j = 0; j < calleeMd2->params.size(); ++j)
+                            if (calleeMd2->params[j].name == a.name) {
+                                pidx = j;
+                                break;
+                            }
+                    }
+                    if (pidx < calleeMd2->params.size())
+                        formalMod = calleeMd2->params[pidx].modifier;
+                }
+                checkRefOutOperandCategory(a, formalMod);
+            }
             ++pos2;
         }
     } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
@@ -5464,8 +5485,127 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // §22.3 (v0.184, #1682): validate a bare `ref`/`out` constructor
             // argument's operand category (a no-op for every other
             // modifier) — grammar A.4 admits ParamModifiers on a
-            // constructor's ParamList same as a method's.
-            checkRefOutOperandCategory(a);
+            // constructor's ParamList same as a method's. fix #2320:
+            // thread the constructor's formal param modifier so an
+            // `out owned` constructor parameter receives the same
+            // §22.3/§22.4 rejection as a method's. The ctor overload
+            // resolution that `checkNewExprArgs` already ran BEFORE
+            // visitChildren is the authority — the `ctorDecl` chosen
+            // here is the same sole-or-first-arity guess the `out var`
+            // block above uses, which mis-binds under same-arity
+            // overloads (an `out owned Cell` ctor declared before an
+            // `out int` ctor would otherwise wrongly tag an
+            // `out n` argument as §22.3-out-owned). Re-resolve here by
+            // `bindArgsToParams` on every arity-matching ctor, then
+            // type-filter (a ref/out argument's type must EXACTLY match
+            // the param's referent type per §14.5/§22.3, and a plain
+            // argument's type must be §5.1-assignable to the param) to
+            // find the candidate overload-resolution would pick. Apply
+            // the rejection ONLY when exactly one type-compatible
+            // candidate exists. Zero candidates defer; multiple
+            // candidates defer (genuinely ambiguous — let overload-
+            // resolution emit its own diagnostic). Mirrors
+            // checkNewExprArgs's overload handling at ~line 8693.
+            {
+                std::string_view formalMod;
+                if (ctorDecl && ne->type) {
+                    if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                        if (rt->kind == TypeRef::Kind::Named &&
+                            rt->declaration) {
+                            const ast::Param* pickedParam = nullptr;
+                            int compatibleCount = 0;
+                            for (Symbol* m : rt->declaration->members) {
+                                if (auto* cs =
+                                        dynamic_cast<ConstructorSymbol*>(m)) {
+                                    if (cs->isStatic) continue;
+                                    auto* cd = dynamic_cast<
+                                        const ast::ConstructorDecl*>(
+                                        cs->decl);
+                                    if (!cd) continue;
+                                    if (cd->params.size() != ne->args.size())
+                                        continue;
+                                    BindResult b = bindArgsToParams(
+                                        cd->params, ne->args, ne->span.begin,
+                                        /*calleeDesc=*/std::string(),
+                                        /*emit=*/false);
+                                    if (!b.ok) continue;
+                                    // Type filter: each ref/out argument
+                                    // must exactly match the param's
+                                    // referent type per §14.5/§22.3 (a
+                                    // ref/out argument aliases the
+                                    // caller's storage, so no implicit
+                                    // conversion is admitted). Plain
+                                    // positional args without a modifier
+                                    // go through the standard overload-
+                                    // resolution path (resolveOverload +
+                                    // checkArgsAgainstParams in
+                                    // checkNewExprArgs) — we do NOT
+                                    // duplicate the §5.1 assignability
+                                    // probe here; an exact ref/out
+                                    // filter is sufficient to pick the
+                                    // resolved overload for the §22.3/§22.4
+                                    // diagnostic the issue calls out
+                                    // (the indexer-slot/property cases
+                                    // all carry an explicit `out`/`ref`/
+                                    // `out owned` modifier).
+                                    bool typeOk = true;
+                                    for (std::size_t j = 0;
+                                         j < cd->params.size(); ++j) {
+                                        int ai = b.paramToArg[j];
+                                        if (ai < 0) continue;
+                                        const ast::CallArgument& arg =
+                                            ne->args[ai];
+                                        if (!arg.value) continue;
+                                        const std::string_view am =
+                                            arg.modifier;
+                                        if (am != "ref" && am != "out")
+                                            continue;
+                                        const ast::Param& rp = cd->params[j];
+                                        if (!rp.type) continue;
+                                        TypeRef* argTy =
+                                            ctx_.exprType(*arg.value);
+                                        TypeRef* paramTy =
+                                            ctx_.resolvedType(*rp.type);
+                                        if (!argTy || !paramTy) continue;
+                                        // §14.5 / §22.3: exact type
+                                        // match for ref/out.
+                                        if (!typeRefEqual(argTy,
+                                                          paramTy)) {
+                                            typeOk = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!typeOk) continue;
+                                    ++compatibleCount;
+                                    if (compatibleCount == 1) {
+                                        std::size_t pidx = posn;
+                                        if (!a.name.empty()) {
+                                            for (std::size_t j = 0;
+                                                 j < cd->params.size(); ++j)
+                                                if (cd->params[j].name ==
+                                                    a.name) {
+                                                    pidx = j;
+                                                    break;
+                                                }
+                                        }
+                                        if (pidx < cd->params.size())
+                                            pickedParam = &cd->params[pidx];
+                                    }
+                                }
+                            }
+                            // Ambiguous or unresolved: defer —
+                            // overload-resolution will pick the winner
+                            // (and emit its own modifier-match
+                            // diagnostic for an unmatched modifier).
+                            // Picking here would risk a wrong-formal /
+                            // false-reject.
+                            if (compatibleCount == 1 && pickedParam)
+                                formalMod = pickedParam->modifier;
+                        }
+                    }
+                }
+                checkRefOutOperandCategory(a, formalMod);
+            }
             ++posn;
         }
     } else if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {

@@ -3989,12 +3989,38 @@ void ExprTC::checkLValueChainNotCallBased(const ast::Expr& target) {
 // §22.3 "ref and out argument locations" (v0.184, #1682). See the header for
 // the full contract; this covers the DECLARATION-based categories only (the
 // dataflow-based owned-state exclusion is MethodOwnership::
-// checkRefOutOwnedOperand in the ownership pass).
-void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a) {
+// checkRefOutOwnedOperand in the ownership pass). `formalParamModifier` is the
+// callee's parameter modifier for `a`'s slot when known ("" when not), and is
+// used to specialize the §22.3/§22.4 rule for the OWNED output variant — "for
+// `out owned`, the accepted forms remain exactly the inline `out using var
+// x` / `out owned var x` of §22.4", so an indexer slot / property / bare
+// local recipient against an `out owned` parameter is a clean rejection
+// instead of leaking through to codegen's #1386 fallback (#2320).
+void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a,
+                                        std::string_view formalParamModifier) {
     if (!a.value) return;
     if (a.modifier != "ref" && a.modifier != "out") return;
     const ast::Expr& target = *a.value;
     const char* kind = (a.modifier == "ref") ? "ref" : "out";
+    // §22.3 / §22.4 / fix #2320: when the formal parameter is `out owned`,
+    // the call-site recipient must be an INLINE declaration — `out using var
+    // x` / `out owned var x`. Any other shape (an indexer slot, a property,
+    // a pre-existing local, a discard) reaches the callee through a path
+    // §22.4 does not bless: codegen's accessor-ref-arg bracket (#1302) was
+    // deliberately narrowed to plain `ref`/`out` precisely so an `out owned`
+    // indexer slot wouldn't silently become a write-into-a-borrowing-slot
+    // (§28.6 leak prevention / §28.11 "collections do not own elements");
+    // the result is the `internal: … — #1386` fallback at buildOrderedArgs.
+    // Reject upfront with the §22.3/§22.4 citation so the user sees a clear
+    // "must be `out using var x` / `out owned var x`" instead of an internal
+    // error message. Inline `out using var` / `out owned var` declarations
+    // (modifier == "out using var" / "out owned var") keep working — those
+    // declare a fresh local, no pre-existing-location question.
+    if (formalParamModifier == "out owned") {
+        std::string msg = std::string("an `out owned` argument must be an inline `out using var x` or `out owned var x` declaration (§22.3 / §22.4); a pre-existing storage location has no place to discharge the value the callee produces");
+        ctx_.diagnostics().report(Severity::Error, target.span.begin, msg);
+        return;
+    }
 
     // Structural shape (§6.6 / A.6's lvalue shape, reused from
     // checkLValueChainNotCallBased): strip `.field` / `[index]` / postfix
