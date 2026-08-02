@@ -6378,10 +6378,10 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
 
     // §29.7 (#623): register the enumerator for disposal on all exit paths
     // (break / return / exception / normal exhaustion).  Use a dedicated scope
-    // around the loop so emitLoopDisposals(outerDepth) on `break` disposes it.
-    // The iterator vtable has Dispose at slot 1 (not slot 2 like class vtables),
-    // so we use iterEnumDispose rather than dynamicDispose.
-    std::size_t outerDepth = disposeStack_.size();
+    // around the loop so the loop body / `continue` reads from slots owned by
+    // MY scope, not the enclosing one (the wrapper/enumerator must outlive
+    // every continue). The iterator vtable has Dispose at slot 1 (not slot 2
+    // like class vtables), so we use iterEnumDispose rather than dynamicDispose.
     disposeStack_.emplace_back();
     {
         Disposal d{enumSlot, nullptr};
@@ -6527,10 +6527,17 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     emitPendingCheck();  // TakeCurrent may raise IOE (#1349)
     builder_.CreateStore(curVal, varSlot);
 
-    // §29.7 (#623): loopScopeDepth = outerDepth (BEFORE enumerator scope push)
-    // so that emitLoopDisposals on `break` disposes both the body scope AND
-    // the enumerator scope (calls Dispose on the iterator frame).
-    loopStack_.push_back({condBB, endBB, outerDepth});
+    // §29.7 (#623) / fix #2556 (v0.236): scopeDepth = MY scope's index (after
+    // push), not outerDepth (before push). The prior `outerDepth` form made
+    // emitLoopDisposals on `continue` walk the loop's wrapper/enumerator scope
+    // too — `iterEnumDispose` nulls the enumSlot, then condBB re-loads via
+    // `Load(enumSlot)` and dereferences NULL → SEGV. Matches the existing
+    // lowerIEnumerableForSortedSet (#2553): `disposeStack_.size()` here, since
+    // the scope was just pushed via `disposeStack_.emplace_back()` a few
+    // lines up — the current size IS the new scope's index. The wrapper/
+    // enumerator resources must outlive every continue; `break` / normal
+    // exhaustion still dispose them via the endBB / outer-scope paths.
+    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
     lowerForBody(fs);
     loopStack_.pop_back();
     if (!builder_.GetInsertBlock()->getTerminator())
@@ -6793,7 +6800,6 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                                   enumPtr, "ien.enown"),
             enumDisposeSlot);
     }
-    std::size_t outerDepth = disposeStack_.size();
     disposeStack_.emplace_back();
     // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): a genuinely UNOWNED
     // temporary iterable source (`for var x in new IntRange(...) do ... end`
@@ -6919,10 +6925,15 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
         }
     }
 
-    // §29.7 (#972): loopScopeDepth = outerDepth (BEFORE enumerator scope push)
-    // so that emitLoopDisposals on `break` disposes both the body scope AND
-    // the enumerator scope (calls Dispose on the user class enumerator).
-    loopStack_.push_back({condBB, endBB, outerDepth});
+    // §29.7 (#972) / fix #2556 (v0.236): scopeDepth = MY scope's index (after
+    // push), not outerDepth (before push). See the sibling comment in
+    // lowerIEnumerableBuiltinFor: `outerDepth` made `continue` walk the
+    // enumerator's slot to dispose, nulling it, and condBB's `Load(enumSlot)`
+    // then dereferenced NULL → SEGV. Matches lowerIEnumerableForSortedSet's
+    // existing `disposeStack_.size()` (after push). The enumerator/wrapper
+    // remain loop-scope resources that must outlive every continue; `break` /
+    // normal exhaustion still dispose them via the endBB path.
+    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
     bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(condBB);
