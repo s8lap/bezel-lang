@@ -43,12 +43,44 @@ REPO_ROOT="$(git rev-parse --show-toplevel)"   # top of THIS invocation's tree
 if [ "$DO_WT" = 1 ]; then
   git -C "$REPO_ROOT" fetch -q origin main 2>/dev/null || true  # best-effort freshen
   locked="$(git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree /{p=$2} /^locked/{print p}')"
+  # One pass over /proc for every live process's cwd. Used below to spot a
+  # worktree some process is actually sitting in. Cheap; done once, not per-wt.
+  live_cwds="$(readlink /proc/[0-9]*/cwd 2>/dev/null | sort -u)"
   git -C "$REPO_ROOT" worktree list --porcelain | awk '/^worktree /{print $2}' | while read -r wt; do
     [ "$wt" = "$MAIN" ] && continue     # never the canonical main worktree
     [ "$wt" = "$CUR" ] && continue      # nor the worktree we are running in
     printf '%s\n' "$locked" | grep -qxF "$wt" && continue
     if [ -n "$(git -C "$wt" status --porcelain -uno 2>/dev/null)" ]; then
       echo "[gc] KEEP (WIP, uncommitted): $wt"; continue
+    fi
+    # ── IN-USE guards ───────────────────────────────────────────────────────
+    # A REUSED warm-pool worktree (.claude/worktrees/pool-N) becomes "landed"
+    # the instant its batch is pushed — which is exactly when the next lane is
+    # starting work in it. Since gate_and_push.sh runs this script with --apply
+    # after every successful push, the WIP + unmerged guards alone would delete
+    # a live lane's tree mid-run (a 2026-07-30 dry-run offered to reap all four
+    # pool worktrees while four lanes were working in them). A freshly-created
+    # pool worktree at origin/main has NO commits and NO dirty files, so it
+    # passes both existing guards; only these two catch it.
+    #
+    # (1) Some live process is cwd'd inside it. Uses cwd rather than cmdline
+    #     matching, which is unreliable — a build under dev_heavy.sh does not
+    #     carry the worktree path in its argv. String prefix, not regex, so
+    #     paths containing regex metacharacters are safe.
+    if printf '%s\n' "$live_cwds" |
+         awk -v w="$wt" '$0==w || index($0, w"/")==1 {f=1} END{exit !f}'; then
+      echo "[gc] KEEP (IN USE: a live process is cwd'd inside it): $wt"; continue
+    fi
+    # (2) Recently active. (1) alone is not sufficient: a lane sitting between
+    #     tool calls has no live process in its tree at that instant. The git
+    #     index is touched by checkout/commit/status, so its mtime tracks lane
+    #     activity. Conservative by design — a finished worktree is merely
+    #     reaped one cycle later. Override with BEZEL_GC_WT_IDLE_MIN=0.
+    idle_min="${BEZEL_GC_WT_IDLE_MIN:-120}"
+    if [ "$idle_min" != 0 ] &&
+       [ -n "$(find "$(git -C "$wt" rev-parse --git-dir 2>/dev/null || echo /nonexistent)/index" \
+                    -newermt "-${idle_min} minutes" 2>/dev/null)" ]; then
+      echo "[gc] KEEP (active within ${idle_min}m): $wt"; continue
     fi
     br="$(git -C "$wt" symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)"
     # Landed = no commits on this branch lack a cherry-equivalent in origin/main.

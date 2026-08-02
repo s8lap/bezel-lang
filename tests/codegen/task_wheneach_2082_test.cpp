@@ -21,11 +21,20 @@
 // The #1813 input seam (stdlib §6.7): a borrowed `Array<Task<T>>` slot takes no
 // ownership, so `tasks.Add(freshCall())` abandons the freshly-minted task. All
 // BORROWING tests here build the array over NAMED task bindings. The OWNING
-// variant takes ownership, so its tests build the OwningArray inside a producer
-// method and pass it as a fresh-producer owned-sink argument
-// (`Task.WhenEachOwned(owned C.Make())`); the documented named-local owned-move
-// form (`... owned tasks`) needs a separate ownership-pass fix for the for-loop
-// iterable position (filed follow-up) and is out of scope for this runtime lane.
+// variant takes ownership, so most of its tests build the OwningArray inside a
+// producer method and pass it as a FRESH-PRODUCER owned-sink argument —
+// `Task.WhenEachOwned(C.Make())`, written WITHOUT the call-site marker, because
+// §22.3 (v0.169) reserves `owned` for a *named owned binding* (the argument form
+// the call leaves moved-from) and makes it an error on a fresh producer: "A fresh
+// producer — a `new` expression, a call returning `owned T`, an operator result,
+// or a `move obj._field` — stays unmarked: no live binding is invalidated, so
+// there is nothing to announce." `C.Make()` is declared `owned OwningArray<…>`,
+// i.e. exactly that second form. (These calls carried a spurious `owned` marker
+// until #2278: the for-loop ITERABLE expression was not walked by the ownership
+// pass at all, so no §22.3 check reached them; #2109 added the walk and the
+// marker was correctly rejected. The marker is dropped here rather than admitted
+// — the spec rule is unambiguous.) The documented named-local owned-move form is
+// covered by owned_named_local_marker_transfers below.
 
 #include <string>
 
@@ -255,7 +264,7 @@ BEZEL_TEST(task_wheneach_2082, owned_break_unconsumed_disposed_once) {
         "  end Make; "
         "  public static async method Main(): Task<int> "
         "    var count := 0; "
-        "    await for var tk in Task.WhenEachOwned(owned C.Make()) do "
+        "    await for var tk in Task.WhenEachOwned(C.Make()) do "
         "      using var x := await tk; "
         "      count := count + 1; "
         "      break; "  // dispose with two OwningTask<Cell> still queued
@@ -282,7 +291,7 @@ BEZEL_TEST(task_wheneach_2082, owned_full_consume_disposed_once) {
         "  end Make; "
         "  public static async method Main(): Task<int> "
         "    var count := 0; "
-        "    await for var tk in Task.WhenEachOwned(owned C.Make()) do "
+        "    await for var tk in Task.WhenEachOwned(C.Make()) do "
         "      using var x := await tk; "
         "      count := count + 1; "
         "    end; "
@@ -316,7 +325,7 @@ BEZEL_TEST(task_wheneach_2082, owned_faulted_input_unconsumed_disposed_no_leak) 
         "  end Make; "
         "  public static async method Main(): Task<int> "
         "    var count := 0; "
-        "    await for var tk in Task.WhenEachOwned(owned C.Make()) do "
+        "    await for var tk in Task.WhenEachOwned(C.Make()) do "
         "      using var x := await tk; "
         "      count := count + 1; "
         "      break; "  // dispose with a faulted + an ok task still queued
@@ -336,7 +345,7 @@ BEZEL_TEST(task_wheneach_2082, owned_empty_completes_immediately) {
         "  end Make; "
         "  public static async method Main(): Task<int> "
         "    var count := 0; "
-        "    await for var tk in Task.WhenEachOwned(owned C.Make()) do "
+        "    await for var tk in Task.WhenEachOwned(C.Make()) do "
         "      using var x := await tk; "
         "      count := count + 1; "
         "    end; "
@@ -398,7 +407,7 @@ BEZEL_TEST(task_wheneach_2082, owned_still_running_parks_then_delivers) {
         "  end Make; "
         "  public static async method Main(): Task<int> "
         "    var count := 0; "
-        "    await for var tk in Task.WhenEachOwned(owned C.Make()) do "
+        "    await for var tk in Task.WhenEachOwned(C.Make()) do "
         "      using var x := await tk; "
         "      count := count + 1; "
         "    end; "
@@ -439,7 +448,7 @@ BEZEL_TEST(task_wheneach_2082, owned_dispose_in_flight_observer_frees) {
         "  end Make; "
         "  public static async method Main(): Task<int> "
         "    var count := 0; "
-        "    await for var tk in Task.WhenEachOwned(owned C.Make()) do "
+        "    await for var tk in Task.WhenEachOwned(C.Make()) do "
         "      using var x := await tk; "
         "      count := count + 1; "
         "      break; "  // dispose with two OwningTask<Cell> still running
@@ -479,11 +488,48 @@ BEZEL_TEST(task_wheneach_2082, owned_faulted_in_flight_dispose_no_leak) {
         "  end Make; "
         "  public static async method Main(): Task<int> "
         "    var count := 0; "
-        "    await for var tk in Task.WhenEachOwned(owned C.Make()) do "
+        "    await for var tk in Task.WhenEachOwned(C.Make()) do "
         "      using var x := await tk; "
         "      count := count + 1; "
         "      break; "  // dispose with a faulted + an ok task still running
         "    end; "
         "    return count; "  // 1; deferred observers free the exc object + the Cell
         "  end Main; end C;"), 1);
+}
+
+// ============================================================
+// §22.3 (v0.169) call-site marker in the for-loop ITERABLE position — the
+// documented proposal 0023 D7 form `Task.WhenEachOwned(owned tasks)` over a
+// NAMED owned local. This is the marker's *valid* half, the exact complement of
+// the fresh-producer rejection the tests above now honor: `tasks` is a named
+// owned binding, so the call leaves it moved-from and §22.3 REQUIRES the marker.
+//
+// Fails-without / passes-with: the for-loop iterable expression sits in the
+// pre-loop CFG block and was not walked by the ownership pass until #2109's
+// `forOrigins` walk. Without that walk the transfer is never recorded, `tasks`
+// stays Owned at method-scope end, and §28.3's "would be dropped here without
+// disposal" rejects the program (r.ran == false -> -999). With the walk, the
+// §22.3 marker consumes `tasks`, the enumerator owns the array, and the whole
+// thing is ASan/LSan clean. Oracle: count == 2 and Cell.n == 0 -> 20 + 2 = 22;
+// a leak / double-free / UAF flips runAotChecked's oracle to -999.
+// per stdlib §6.7 v0.212, spec §22.3 v0.169, §28.3
+BEZEL_TEST(task_wheneach_2082, owned_named_local_marker_transfers) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kCell +
+        "class C "
+        "  public static method Make(): owned OwningArray<OwningTask<Cell>> "
+        "    var arr := new OwningArray<OwningTask<Cell>>(); "
+        "    arr.Add(Task.FromOwnedResult<Cell>(new Cell())); "
+        "    arr.Add(Task.FromOwnedResult<Cell>(new Cell())); "
+        "    return arr; "
+        "  end Make; "
+        "  public static async method Main(): Task<int> "
+        "    var tasks := C.Make(); "      // named owned local
+        "    var count := 0; "
+        "    await for var tk in Task.WhenEachOwned(owned tasks) do "
+        "      using var x := await tk; "
+        "      count := count + 1; "
+        "    end; "
+        "    return 20 - Cell.n * 10 + count; "  // 22 iff every Cell disposed once
+        "  end Main; end C;"), 22);
 }

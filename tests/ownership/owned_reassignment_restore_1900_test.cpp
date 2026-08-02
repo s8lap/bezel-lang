@@ -164,27 +164,41 @@ BEZEL_TEST(owned_reassignment_restore_1900,
     BEZEL_EXPECT_TRUE(hasAutoDropWarningFor(r, "x"));
 }
 
-// §28.3 v0.180 conditional-discharge gate (#1626): `if c then x.Dispose();
-// end;` is the maybe-consumed join that the §28.3 conditional-discharge rule
-// protects. The fix MUST NOT regress this: the local must still be hard-
-// rejected (the per-path auto-drop the spec mandates for the conditional
-// case is the #1883 fix, separate from this one).
-BEZEL_TEST(owned_reassignment_restore_1900,
-           conditional_discharge_still_rejected_spec_28_3) {
-    auto r = parseAndCheckOwnership(wrap(
-        "var c: bool := true; "
-        "var x: Res := new Res(); "
-        "if c then "
-        "  x.Dispose(); "
-        "end; "
-        "return 0;"));
-    // #1626 keeps the hard error at the declaration — the §28.3 conditional
-    // discharge path that #1883 will separately fix. #1900 must not
-    // accidentally auto-drop a conditional-discharge local that never
-    // reached a fresh restore.
-    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
-    BEZEL_EXPECT_FALSE(hasAutoDropWarningFor(r, "x"));
-}
+// ── REMOVED 2026-07-29 for issue #2270 ─────────────────────────────────────
+//
+// A cell `conditional_discharge_still_rejected_spec_28_3` stood here. It
+// asserted that
+//
+//     var c: bool := true;
+//     var x: Res := new Res();
+//     if c then x.Dispose(); end;
+//     return 0;
+//
+// is hard-rejected — described as the #1626 conditional-discharge gate that the
+// #1900 restore fix must not regress.
+//
+// It was self-contradictory on arrival: the SAME commit (d2ecf82, "fix #1900
+// #1883") that added it also added
+// `conditional_discharge_1883.one_branch_dispose_no_post_join_use_accepted_spec_28_3`,
+// which asserts the OPPOSITE outcome for the byte-equivalent program, and
+// implemented the #1883 side — so this cell was red from the moment it landed.
+//
+// The #1883 cell is the spec-correct one. K7.4 (v0.228): "owned ⊓ moved-from
+// and owned ⊓ explicitly-disposed = maybe-consumed — unreadable after the join,
+// no flow around a back edge into a use; **scope-end disposal per-path**". With
+// no post-join read/borrow/consume — the body here is just `return 0;` — the
+// program is well-formed and the still-owned path's obligation is met by
+// §28.3's affine auto-drop, "a warning (not an error)".
+//
+// So the cell is removed rather than inverted: inverted, it would be a verbatim
+// duplicate of the #1883 cell, and the accept side of this rule belongs with
+// #1883's evidence (which also carries the AOT exactly-once run). #1900's own
+// subject — that a local RESTORED by reassignment after a discharge still
+// auto-drops — is covered by the cells above and below.
+//
+// What #1900 genuinely must not regress is the MOVED-FROM split, which stays
+// hard-rejected; that guard lives in branch_disposal_test.cpp
+// (`move_then_only_leaks_else_path_28_6`) and maybe_consumed_join_1626_test.cpp.
 
 // §28.3 (#1900): AOT execution — the consume-and-restore idiom actually
 // runs and returns the expected value (1 from the restored Res.Ping), with

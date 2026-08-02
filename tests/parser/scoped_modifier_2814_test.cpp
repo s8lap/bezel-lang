@@ -1,11 +1,14 @@
 // Parser tests for the `scoped` contextual modifier — spec §28.14 / §22.3 /
-// A.4 ParamModifiers / A.6 FuncParamMods (v0.175, #808).
+// A.4 ParamModifiers / A.6 FuncParamMods / A.7 LambdaParam (v0.175 / v0.228,
+// #808 / #2344).
 //
 // §22.3: "`scoped` — on a *function-typed* parameter only: the callee may
 // store the callback, bounded by the storing object's lifetime." A.4 adds
-// `"scoped"` to ParamModifiers; A.6 adds it to FuncParamMods. §28.14 defines
-// the `scoped` FIELD ("A `scoped` field holds such a callback"). §32:
-// "`scoped` function-typed parameters are ILLEGAL on `extern` declarations."
+// `"scoped"` to ParamModifiers; A.6 adds it to FuncParamMods; A.7 re-uses
+// FuncParamMods for LambdaParam, so a lambda's own parameter may carry
+// `scoped`. §28.14 defines the `scoped` FIELD ("A `scoped` field holds such
+// a callback"). §32: "`scoped` function-typed parameters are ILLEGAL on
+// `extern` declarations."
 //
 // `scoped` is CONTEXTUAL (lexed as Identifier, not reserved): a parameter, a
 // field, or a named type spelled `scoped` must keep parsing as before. The
@@ -35,6 +38,17 @@ const ast::MethodDecl* firstMethod(const bezel::test::ParseResult& r) {
     for (const auto& m : td->members)
         if (auto* md = dynamic_cast<const ast::MethodDecl*>(m.get())) return md;
     return nullptr;
+}
+
+// Reach the first statement of the first method when that statement is a
+// `_ := <expr>;` DiscardStmt (the shape used to plant a single expression for
+// AST-level assertions); returns the discarded expression or nullptr.
+const ast::Expr* firstDiscardValue(const bezel::test::ParseResult& r) {
+    const ast::MethodDecl* md = firstMethod(r);
+    if (!md || md->stmts.empty()) return nullptr;
+    const auto* ds = dynamic_cast<const ast::DiscardStmt*>(md->stmts[0].get());
+    if (!ds) return nullptr;
+    return ds->value.get();
 }
 
 }  // namespace
@@ -194,4 +208,63 @@ BEZEL_TEST(scoped_modifier_2814, extern_plain_function_param_accepted) {
         "  method Register(cb: (int) -> int); "
         "end;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// A.7 LambdaParam / FuncParamMods (v0.228, #2344): a lambda's own parameter
+// may carry `scoped` — the production re-uses FuncParamMods, the same set as
+// A.4 ParamModifiers / A.6 FuncParamMods. Before the fix the modifier was
+// consumed as the parameter's own NAME, cascading `expected ')'` errors.
+// (The §28.14 storage-bounded-capture semantics for a lambda's own parameter
+// is a separate, sema-side open question; the parser only admits the token
+// the grammar admits.)
+BEZEL_TEST(scoped_modifier_2814, lambda_param_scoped_recorded_a7_2344) {
+    auto r = parseAll(
+        "module M; class C "
+        "  public method Run() _ := lambda(scoped cb: () -> ()) => 1; end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    const auto* e = firstDiscardValue(r);
+    const auto* lam = dynamic_cast<const ast::LambdaExpr*>(e);
+    BEZEL_EXPECT_TRUE(lam != nullptr && lam->params.size() == 1);
+    if (lam && lam->params.size() == 1) {
+        BEZEL_EXPECT_EQ(std::string(lam->params[0].modifier), "scoped");
+        BEZEL_EXPECT_EQ(std::string(lam->params[0].name), "cb");
+    }
+}
+
+// A.7 contextual control: a lambda parameter NAMED `scoped` (followed by `:`)
+// is a plain parameter, not the modifier — `scoped` is not a reserved
+// keyword. Mirrors `param_named_scoped_still_parses` for the lambda path.
+BEZEL_TEST(scoped_modifier_2814, lambda_param_named_scoped_still_parses) {
+    auto r = parseAll(
+        "module M; class C "
+        "  public method Run() _ := lambda(scoped: int) => scoped; end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    const auto* e = firstDiscardValue(r);
+    const auto* lam = dynamic_cast<const ast::LambdaExpr*>(e);
+    BEZEL_EXPECT_TRUE(lam != nullptr && lam->params.size() == 1);
+    if (lam && lam->params.size() == 1) {
+        BEZEL_EXPECT_TRUE(lam->params[0].modifier.empty());
+        BEZEL_EXPECT_EQ(std::string(lam->params[0].name), "scoped");
+    }
+}
+
+// A.7 contextual control: a lone lambda parameter token `scoped` (no name
+// follows, no `:`) is a plain untyped parameter named `scoped` — the
+// `peekAt(1) == Identifier` guard on the modifier match naturally excludes
+// this. Mirrors the method-param path's disambiguation.
+BEZEL_TEST(scoped_modifier_2814, lambda_param_lone_token_scoped_is_name) {
+    auto r = parseAll(
+        "module M; class C "
+        "  public method Run() _ := lambda(scoped) => scoped; end Run; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    const auto* e = firstDiscardValue(r);
+    const auto* lam = dynamic_cast<const ast::LambdaExpr*>(e);
+    BEZEL_EXPECT_TRUE(lam != nullptr && lam->params.size() == 1);
+    if (lam && lam->params.size() == 1) {
+        BEZEL_EXPECT_TRUE(lam->params[0].modifier.empty());
+        BEZEL_EXPECT_EQ(std::string(lam->params[0].name), "scoped");
+    }
 }

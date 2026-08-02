@@ -13,9 +13,11 @@
 #include "driver/Driver.hpp"
 #include "support/aot_support.hpp"   // runAot — AOT test harness (JIT->AOT migration)
 #include "support/codegen_support.hpp"
+#include "support/ownership_support.hpp" // parseAndCheckOwnership — #1718 vacuous-lint verifier
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 
 namespace {
 
@@ -577,4 +579,101 @@ BEZEL_TEST(codegen_ffi_types, rawbytes_extern_return_rejected_spec_32_5_1720) {
             d.message.find("\xC2\xA7""32.5") != std::string::npos)
             cited = true;
     BEZEL_EXPECT_TRUE(cited);
+}
+
+// fix #1718 / spec §32.6 / §28.1 (v0.186): a `using var` bound to an extern
+// returning `owned CString?` is NOT vacuous — §32.6 says "a `using var`
+// discharges it" (the spec's strdup example), and §28.10's vacuous-pin lint
+// must not fire on such a binding. Before the fix producerState fell through
+// to a Borrowed classification (it never consulted ExternDeclSymbol::returnOwned)
+// AND rhsIsDisposableClassType returned false for the CString head, so the
+// binding was reported vacuous (a §28.10 lint that mis-stated a code site
+// carrying a genuine free() obligation). Fails-without → the §28.10 vacuous
+// warning fires; passes-with → the warning does not fire and the program runs.
+BEZEL_TEST(codegen_ffi_types, owned_extern_cstring_using_var_not_vacuous_spec_32_6_1718) {
+    auto r = runAot(
+        "module M; "
+        "extern \"c\" public method strdup(s: CString): owned CString?; end; "
+        "class C public static method Main(): int "
+        "  using var c := strdup(CString.From(\"hello-ffi-owned\")); "
+        "  if c = null then return 99; end; "
+        "  return 1; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+// fix #1718 / spec §32.6 / §28.1 (v0.186): the ownership pass must classify a
+// CallExpr whose callee is an owned-returning EXTERN as `Owned` (so the
+// using-var chain reaches the §32.6 "free() discharges it" path end-to-end)
+// and the rhsIsDisposableClassType classifier must recognize CString as a
+// disposable-buffer type so the §28.10 vacuous-pin lint does not fire on the
+// binding. Both lived previously as gaps: producerState looked only at
+// MethodDecl::returnOwned / importedReturnOwned (never ExternDeclSymbol::returnOwned),
+// and rhsIsDisposableClassType's builtin-head allowlist did not include
+// CString/WString/RawBytes. Fails-without → the §28.10 vacuous warning fires;
+// passes-with → it does not.
+BEZEL_TEST(ownership_extern_1718, owned_extern_cstring_using_var_no_vacuous_lint_spec_32_6) {
+    auto r = bezel::test::parseAndCheckOwnership(
+        "module M; "
+        "extern \"c\" public method strdup(s: CString): owned CString?; end; "
+        "class C public static method Main(): int "
+        "  using var c := strdup(CString.From(\"hello\")); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // No §28.10 vacuous-pin warning on the using var binding (the fix widened
+    // rhsIsDisposableClassType to admit the CString head).
+    bool hasVacuous = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Warning) continue;
+        if (d.message.find("vacuous") != std::string::npos &&
+            d.message.find("`c`") != std::string::npos)
+            hasVacuous = true;
+    }
+    BEZEL_EXPECT_FALSE(hasVacuous);
+}
+
+// fix #1718 / spec §32.6 / §28.1 (v0.186): a `using var` over WString (also
+// a FFI-buffer builtin head) must NOT trigger the §28.10 vacuous lint either.
+// The fix's rhsIsDisposableClassType widening covers the whole CString /
+// WString / RawBytes allowlist; this case pins the WString branch.
+BEZEL_TEST(ownership_extern_1718, owned_extern_wstring_using_var_no_vacuous_lint_spec_32_6) {
+    auto r = bezel::test::parseAndCheckOwnership(
+        "module M; "
+        "extern \"c\" public method some_wcsdup(s: WString): owned WString?; end; "
+        "class C public static method Main(): int "
+        "  using var w := some_wcsdup(WString.From(\"wide\")); "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    bool hasVacuous = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Warning) continue;
+        if (d.message.find("vacuous") != std::string::npos &&
+            d.message.find("`w`") != std::string::npos)
+            hasVacuous = true;
+    }
+    BEZEL_EXPECT_FALSE(hasVacuous);
+}
+
+// fix #1718 / spec §32.6 / §28.1 (v0.186): the strdup'd buffer must be freed
+// at scope end when bound by `using var`. The post-fix path registers a
+// null-guarded free() at the local's scope end (registerUsingDisposal's
+// isFfiBuf branch, which keys on the CString head on the initializer's
+// exprType). runAotChecked links with ASan; a leaking strdup'd buffer is
+// flagged at exit (LSan). Passes-with → ran=true (no LSan leak); the
+// negative path is covered by the existing #977 / #985 rawbytes_free tests
+// for the established CString.From / RawBytes.From shapes.
+BEZEL_TEST(codegen_ffi_types, owned_extern_cstring_using_var_frees_strdup_buffer_spec_32_6_1718) {
+    auto r = runAotChecked(
+        "module M; "
+        "extern \"c\" public method strdup(s: CString): owned CString?; end; "
+        "class C public static method Main(): int "
+        "  using var c := strdup(CString.From(\"hello-1718\")); "
+        "  if c = null then return 99; end; "
+        "  return 1; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
 }

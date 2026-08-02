@@ -533,7 +533,26 @@ void Resolver::checkEnumRestrictions() {
                 continue;
             }
             if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
-                if (ps->isIndexer) bad("an indexer");
+                if (ps->isIndexer) { bad("an indexer"); continue; }
+                // fix #2499 (§10.5): "Block-form properties or properties
+                // with backing storage" are forbidden on an enum. §10.4
+                // permits only the expression-bodied READ-ONLY form
+                // (`public property Name: string => …;` — grammar A.4's
+                // `ExpressionPropertyDecl`; the "=>" production is
+                // inherently read-only, no setter form exists for it, so
+                // PropertyBodyKind::Expression is always the legal §10.4
+                // shape and never needs a settability check here). Any
+                // other body kind is rejected regardless of whether it
+                // declares a setter: a GETTER-ONLY block-form property
+                // (`get => 7; end P;`) is still "block-form" and equally
+                // forbidden by §10.5's unqualified wording, not just a
+                // settable one.
+                if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                    if (pd->bodyKind == ast::PropertyBodyKind::Block)
+                        bad("a block-form property");
+                    else if (pd->bodyKind == ast::PropertyBodyKind::Auto)
+                        bad("a property with backing storage");
+                }
                 continue;
             }
             // per §24.1 (v0.180): an event's compiler-generated `owned
@@ -921,6 +940,47 @@ void Resolver::checkRecordRestrictions() {
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t || t->kind != ast::TypeDeclKind::Record) continue;
+        // §9.6 / §12.5 (issue #2431): `abstract` is defined ONLY for a
+        // class — §12.5 ("Abstract classes and members") states "`abstract`
+        // on a class permits abstract members and forbids direct
+        // instantiation," with every example and every other mention of
+        // `abstract` in the spec written in terms of a class. §9.6
+        // ("Records and inheritance") states plainly "Records are
+        // implicitly sealed" and "A record cannot derive from another
+        // record or from a class" — so a record can never have a subclass
+        // through ANY route, which an `abstract` class awaits (possibly in
+        // a different, later-compiled module). An `abstract record` would
+        // therefore be permanently uninstantiable with no concrete type
+        // ever able to provide bodies for its abstract members — a
+        // meaningless combination the parser over-admits (it deliberately
+        // defers all modifier-combination validity to sema, matching its
+        // own §11.7-citing comment in Parser_Decls.cpp) and that nothing
+        // previously rejected. `checkClassModifierCombinations`
+        // (§11.7-driven `static`+`abstract` / `static`+`sealed` exclusion)
+        // is filtered to `TypeDeclKind::Class` only and never inspects a
+        // record's modifiers at all — this is a DECLINE-WITH-REASONS
+        // interpretation (CLAUDE.md rule 4), not a spec ruling: the spec
+        // does not explicitly forbid the token sequence `abstract record`,
+        // but simply never defines a meaning for it, and per CLAUDE.md's
+        // "when the spec is unclear ... implement the simplest
+        // interpretation, document it" guidance, rejecting is the chosen,
+        // recorded reading (see issue #2431 for the full analysis and the
+        // alternative considered — declining to write code and instead
+        // requesting a human ruling — before this was judged clear enough
+        // to implement directly).
+        bool recordIsAbstract = false;
+        for (auto mod : t->modifiers)
+            if (mod == "abstract") { recordIsAbstract = true; break; }
+        if (recordIsAbstract) {
+            ctx_.diagnostics().report(
+                Severity::Error, t->declLoc,
+                std::string("record `") + std::string(t->name) +
+                "` may not be `abstract` — records are implicitly sealed "
+                "and can never be derived from (§9.6), so an abstract "
+                "record could never have a concrete subclass to provide "
+                "bodies for its abstract members; `abstract` is defined "
+                "only for a class (§12.5)");
+        }
         for (Symbol* m : t->members) {
             if (dynamic_cast<DestructorSymbol*>(m)) {
                 ctx_.diagnostics().report(
@@ -2201,6 +2261,73 @@ bool Resolver::constraintSetsEquivalent(const ast::GenericConstraint* a,
     return true;
 }
 
+// fix #2391 (§14.2/§2.8.2, v0.236): the IMPORTED-base analog of
+// `constraintSetsEquivalent` above. `d` is the locally-declared override's
+// `where T: ...` clause; `b` is the imported base's reconstructed clause set
+// (nullptr = base had no clause at all = empty set). The metadata builder
+// folds the modifier form (`where T is owned`, §14.4) into the same
+// `specialConstraints` list as the regular-kind items (`where T: class`,
+// §14.2), so this comparison deliberately treats the derived side's items
+// bag and modifier string as ONE combined multiset — semantically identical
+// to `constraintSetsEquivalent`'s two-check (modifier equality + items
+// multiset) for every valid input, since the grammar admits items XOR a
+// modifier on a single clause (the two come from disjoint alphabets).
+bool Resolver::derivedConstraintMatchesImported(
+    const ast::GenericConstraint* d,
+    const ImportedGenericConstraint* b) {
+    // Derived-side flattened bag: each item's `kind` string for special kinds
+    // (class/value/new/notnull/...), plus the modifier string when populated.
+    // Type-constraint items (kind == "type") are matched by TypeRef below, so
+    // excluded from the string bag.
+    std::vector<std::string_view> dSpec;
+    std::vector<TypeRef*> dTypes;
+    if (d) {
+        for (const auto& item : d->items) {
+            if (item.kind == "type") {
+                dTypes.push_back(item.typeArg
+                                     ? ctx_.resolvedType(*item.typeArg)
+                                     : nullptr);
+            } else if (!item.kind.empty()) {
+                dSpec.push_back(item.kind);
+            }
+        }
+        if (!d->modifierConstraint.empty())
+            dSpec.push_back(d->modifierConstraint);
+    }
+    const auto& bSpec = b ? b->specialConstraints
+                          : std::vector<std::string_view>{};
+    const auto& bTypes = b ? b->constraintTypes : std::vector<TypeRef*>{};
+    if (dSpec.size() != bSpec.size()) return false;
+    if (dTypes.size() != bTypes.size()) return false;
+    // Multiset match on special-constraint strings.
+    std::vector<bool> usedStr(bSpec.size(), false);
+    for (std::string_view s : dSpec) {
+        bool matched = false;
+        for (std::size_t j = 0; j < bSpec.size(); ++j) {
+            if (usedStr[j]) continue;
+            if (s != bSpec[j]) continue;
+            usedStr[j] = true;
+            matched = true;
+            break;
+        }
+        if (!matched) return false;
+    }
+    // Multiset match on type-constraint TypeRefs (after alias resolution).
+    std::vector<bool> usedTy(bTypes.size(), false);
+    for (TypeRef* t : dTypes) {
+        bool matched = false;
+        for (std::size_t j = 0; j < bTypes.size(); ++j) {
+            if (usedTy[j]) continue;
+            if (!typeRefEqual(t, bTypes[j])) continue;
+            usedTy[j] = true;
+            matched = true;
+            break;
+        }
+        if (!matched) return false;
+    }
+    return true;
+}
+
 void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
                                            MemberSymbol* baseSym) {
     auto* derived = dynamic_cast<MethodSymbol*>(derivedSym);
@@ -2234,19 +2361,49 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
     }
     auto* dDecl = dynamic_cast<const ast::MethodDecl*>(derived->decl);
     auto* bDecl = dynamic_cast<const ast::MethodDecl*>(base->decl);
-    if (dDecl && bDecl) {
+    // §2.8.2/§12.1 (v0.235, #2386): `base` may be an IMPORTED virtual/
+    // abstract ancestor member — the BFS at this check's `override`-handling
+    // call site walks the full inheritance chain with no same-module
+    // restriction, and ModuleLoader never attaches an ast::MethodDecl to a
+    // body-less imported declaration (§2.8.2/§2.8.3: the artifact interface
+    // carries no AST). The old `if (dDecl && bDecl)` gate made `bDecl`
+    // unconditionally null for a cross-module base, silently skipping the
+    // ENTIRE return-type/`owned`-return comparison — a false ACCEPT of any
+    // override with a mismatched return type. Confirmed: overriding an
+    // imported `public abstract method Get(): int;` with `override method
+    // Get(): string => "garbage marker string"` compiled clean; dispatched
+    // through the base-typed reference, `b.Get()` (statically `int`) read a
+    // garbage int off the string body's actual return (observed v=4610944).
+    // `derived` is always a LOCAL override (from `t`'s own module), so
+    // `dDecl` needs no fallback. Mirrors #2373's fallback for the identical
+    // read shape in `checkAbstractImplementations` (same file): fall back to
+    // ctx_.importedReturnType/importedReturnOwned (ModuleLoader::
+    // setImportedReturnType) when the base has no AST node.
+    TypeRef* bRet = nullptr;
+    bool bDeclaresReturn = false;
+    bool bRetOwned = false;
+    if (bDecl) {
+        bRet = bDecl->returnType ? ctx_.resolvedType(*bDecl->returnType)
+                                 : nullptr;
+        bDeclaresReturn = (bDecl->returnType != nullptr);
+        bRetOwned = bDecl->returnOwned;
+    } else {
+        bRetOwned = ctx_.importedReturnOwned(base);
+        TypeRef* r = ctx_.importedReturnType(base);
+        if (r && r->kind != TypeRef::Kind::Unit) bRet = r;
+        bDeclaresReturn = (bRet != nullptr);
+    }
+    if (dDecl) {
         // Return type (null == unit) and owned-return modifier.
         TypeRef* dRet = dDecl->returnType
             ? ctx_.resolvedType(*dDecl->returnType) : nullptr;
-        TypeRef* bRet = bDecl->returnType
-            ? ctx_.resolvedType(*bDecl->returnType) : nullptr;
         // Apply substitution to base return type (T → int, etc.).
         TypeRef* bRetSubst = applyGenericSubst(bRet, genericSubst);
-        bool bothNullReturn = !dDecl->returnType && !bDecl->returnType;
+        bool bothNullReturn = !dDecl->returnType && !bDeclaresReturn;
         if (!bothNullReturn && !typeRefEqual(dRet, bRetSubst)) {
             err("return type");
         }
-        if (dDecl->returnOwned != bDecl->returnOwned) {
+        if (dDecl->returnOwned != bRetOwned) {
             err("`owned` return modifier");
         }
     }
@@ -2272,8 +2429,19 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
         }
         TypeRef* dt = dp->declType ? ctx_.resolvedType(*dp->declType)
                                    : nullptr;
+        // §2.8.2/§12.1 (v0.235, #2386): mirrors #2373's ParameterSymbol
+        // fallback (checkAbstractImplementations, same file) — an IMPORTED
+        // base member's parameter carries no syntactic `declType` at all;
+        // ModuleLoader::convertParams stashes the already-resolved type on
+        // `resolvedDeclType` instead (there is no ast::Type to attach).
+        // Reading `declType` alone made `bt` null for every imported base
+        // parameter, silently skipping this whole comparison via
+        // `if (dt && btSubst && ...)` below — a further false ACCEPT,
+        // independent of the return-type gate above (this loop was never
+        // gated on `dDecl`/`bDecl`). `dp` is always a LOCAL override
+        // parameter, so `dt` needs no fallback.
         TypeRef* bt = bp->declType ? ctx_.resolvedType(*bp->declType)
-                                   : nullptr;
+                                   : bp->resolvedDeclType;
         // Apply substitution to base parameter type. §12.1 (v0.181, #1560):
         // a parameter may widen the base's `T` to `T?` (monotone down the
         // chain — see overrideParamTypeMatches); every other mismatch,
@@ -2297,31 +2465,57 @@ void Resolver::checkOverrideSignatureMatch(MemberSymbol* derivedSym,
     // `method Foo<T>` on both sides), not the enclosing class's generic
     // substitution — a method-level type parameter is fresh per declaration
     // regardless of name reuse.
-    if (dDecl && bDecl &&
-        dDecl->genericParams.size() == bDecl->genericParams.size()) {
-        for (std::size_t gi = 0; gi < dDecl->genericParams.size(); ++gi) {
-            std::string_view dName = dDecl->genericParams[gi].name;
+    //
+    // #2386/#2391 (v0.236): the base side is no longer required to carry an
+    // ast::MethodDecl. When `base` is an IMPORTED generic method, `bDecl` is
+    // null (§2.8.2/§2.8.3: the artifact interface carries no AST); the
+    // fallback consults `ctx_.importedGenericConstraints(base)` — a per-
+    // parameter payload reconstructed from MetaMember::genericParams by
+    // ModuleLoader — via `derivedConstraintMatchesImported` (the imported
+    // analog of `constraintSetsEquivalent`). Absent side table = stale/
+    // pre-#1579 metadata OR a base with no clauses at all for this param —
+    // the safe direction (skip the check, preserving long-standing accept)
+    // per CLAUDE.md rule 4.
+    if (!dDecl) return;
+    const auto* importedGCs = (!bDecl)
+        ? ctx_.importedGenericConstraints(base) : nullptr;
+    if (!bDecl && !importedGCs) return;  // non-generic / stale metadata
+    if (dDecl->genericParams.size() != (bDecl ? bDecl->genericParams.size()
+                                              : base->genericParams.size()))
+        return;  // arity mismatch already diagnosed elsewhere
+    for (std::size_t gi = 0; gi < dDecl->genericParams.size(); ++gi) {
+        std::string_view dName = dDecl->genericParams[gi].name;
+        const ast::GenericConstraint* dc = nullptr;
+        for (const auto& gc : dDecl->genericConstraints)
+            if (gc.typeParam == dName) { dc = &gc; break; }
+        // No `where` clause on the OVERRIDE for this type parameter at
+        // all means "exactly the inherited set" — always legal, the
+        // recommended spelling; nothing to compare.
+        if (!dc) continue;
+        bool mismatch = false;
+        if (bDecl) {
+            // Same-module base: AST-vs-AST comparison.
             std::string_view bName = bDecl->genericParams[gi].name;
-            const ast::GenericConstraint* dc = nullptr;
-            for (const auto& gc : dDecl->genericConstraints)
-                if (gc.typeParam == dName) { dc = &gc; break; }
-            // No `where` clause on the OVERRIDE for this type parameter at
-            // all means "exactly the inherited set" — always legal, the
-            // recommended spelling; nothing to compare.
-            if (!dc) continue;
             const ast::GenericConstraint* bc = nullptr;
             for (const auto& gc : bDecl->genericConstraints)
                 if (gc.typeParam == bName) { bc = &gc; break; }
-            if (!constraintSetsEquivalent(dc, bc)) {
-                ctx_.diagnostics().report(
-                    Severity::Error, derived->declLoc,
-                    std::string("override of `") + std::string(derived->name) +
-                    "` restates a `where " + std::string(dName) +
-                    ": ...` clause that differs from the inherited "
-                    "constraint set — omit the clause to inherit it exactly, "
-                    "or restate the identical set (§14.2)");
-                return;
-            }
+            mismatch = !constraintSetsEquivalent(dc, bc);
+        } else {
+            // #2391: IMPORTED base — consult the side table populated by
+            // ModuleLoader from MetaMember::genericParams.
+            mismatch = !derivedConstraintMatchesImported(
+                dc, gi < importedGCs->size() ? &(*importedGCs)[gi]
+                                             : nullptr);
+        }
+        if (mismatch) {
+            ctx_.diagnostics().report(
+                Severity::Error, derived->declLoc,
+                std::string("override of `") + std::string(derived->name) +
+                "` restates a `where " + std::string(dName) +
+                ": ...` clause that differs from the inherited "
+                "constraint set — omit the clause to inherit it exactly, "
+                "or restate the identical set (§14.2)");
+            return;
         }
     }
 }
@@ -2356,6 +2550,25 @@ static bool propertyDeclHasSetter(const ast::PropertyDecl* pd) {
     for (auto mod : pd->modifiers)
         if (mod == "readonly") return false;
     return true;
+}
+
+// #2549 / §11.2 / §23.3 / §2.8.2 clause 1 / §2.8.3 rule 4
+// (v0.236): symmetric inverse of propertyDeclHasSetter — does the
+// property/indexer declaration have a getter? An expression-bodied property's
+// body IS the getter; an Auto-bodied property has the synthesized getter; a
+// Block-bodied property has a getter iff it declares a `get` arm. (The §12.5
+// abstract-shorthand refinement from propertyDeclHasSetter is irrelevant on
+// the getter axis: an abstract Auto-shorthand property still DECLARES a
+// getter, just no body to fill it — the iface-side getter-presence question
+// is satisfied even for an abstract read-write obligation.)
+static bool propertyDeclHasGetter(const ast::PropertyDecl* pd) {
+    if (!pd) return false;
+    if (pd->bodyKind == ast::PropertyBodyKind::Expression) return true;
+    if (pd->bodyKind == ast::PropertyBodyKind::Auto) return true;
+    // Block body: has a getter iff any accessor is a `get` arm.
+    for (const auto& a : pd->accessors)
+        if (!a.isSet) return true;
+    return false;
 }
 
 void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
@@ -2404,7 +2617,22 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
 
     auto* dDecl = dynamic_cast<const ast::PropertyDecl*>(derived->decl);
     auto* bDecl = dynamic_cast<const ast::PropertyDecl*>(base->decl);
-    if (dDecl && bDecl) {
+    // §2.8.2/§12.1/§23 (v0.235, #2386): the OVERRIDE-MATCHING twin of #2380's
+    // `checkAbstractImplementations` fix (§11.2 conformance, same file) for
+    // the identical bDecl-null-for-imported-base gap. ModuleLoader never
+    // attaches an ast::PropertyDecl to a body-less imported declaration; the
+    // resolved property type instead rides the same importedMemberType side
+    // table used for imported fields/consts (ModuleLoader.cpp ~437: "the
+    // getter BODY is not reconstructed here"). Falling back there when
+    // `bDecl` is null covers the property-TYPE comparison for an override of
+    // an imported base member — the confirmed false-accept shape in #2386
+    // (overriding an imported `public abstract property Val: int;` with
+    // `override property Val: string => ...` compiled clean). `derived` is
+    // always a LOCAL override, so `dDecl` needs no fallback.
+    TypeRef* bTy = bDecl ? (bDecl->type ? ctx_.resolvedType(*bDecl->type)
+                                        : nullptr)
+                         : ctx_.importedMemberType(base);
+    if (dDecl) {
         // The property type is the getter's return type (and the setter's
         // implicit `value` parameter type). Per §12.1, return types must
         // match exactly — no covariance in this version — so no T→T?
@@ -2412,8 +2640,6 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
         // parameter, which are inputs).
         TypeRef* dTy =
             dDecl->type ? ctx_.resolvedType(*dDecl->type) : nullptr;
-        TypeRef* bTy =
-            bDecl->type ? ctx_.resolvedType(*bDecl->type) : nullptr;
         TypeRef* bTySubst = applyGenericSubst(bTy, genericSubst);
         if (!typeRefEqual(dTy, bTySubst)) {
             err("property type");
@@ -2424,8 +2650,63 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
         // slot shape — codegen installs a separate `$set` slot only when a
         // property has a setter (LlvmBackend_Setup.cpp), so a mismatched
         // override leaves a slot unfilled or orphaned. propertyDeclHasSetter
-        // is the same predicate codegen uses to decide slot allocation.
-        if (propertyDeclHasSetter(dDecl) != propertyDeclHasSetter(bDecl)) {
+        // is the same predicate codegen uses to decide slot allocation; it
+        // reads the base's AST accessor shape directly. For an IMPORTED base
+        // (bDecl null — ModuleLoader's Property case never reconstructs an
+        // ast::PropertyDecl, §2.8.2/§2.8.3: the artifact interface carries no
+        // AST) the bit rides the artifact interface instead: MetaMember::
+        // hasSetter, reconstructed by the loader into the #2400 side table
+        // ctx_.importedPropertyHasSetter — the accessor-presence analog of
+        // the property-TYPE fallback to ctx_.importedMemberType above
+        // (#2386). #2390: this fallback was deliberately deferred from
+        // #2386 because the hasSetter schema bit had not yet been added;
+        // #2400 added it (and codegen's propertyHasSetter already consumes
+        // it), so this sema check now consumes it too — closing the
+        // imported-base twin of the LOCAL-only gate #2386 had to leave in
+        // place.
+        //
+        // The builder bit mirrors CODEGEN's predicate, which — per
+        // propertyDeclHasSetter's own comment — SPURIOUSLY reports a setter
+        // for an abstract Auto-shorthand member (`abstract property P: T;` /
+        // `abstract property [i]: T;`, §12.5 = get-only): harmless for
+        // codegen's vtable slot allocation (an abstract class is never
+        // instantiated), but NOT for this semantic match, where it would
+        // false-reject the canonical `abstract property`/`abstract indexer`
+        // + get-only override idiom (the LOCAL twin of #1614's lit cases).
+        // Apply the same §12.5 correction sema's local predicate does.
+        // `importedPropertyIsAutoStorage` (#2478, extended by #2523 to cover
+        // Auto-body INDEXERS in addition to Auto-body properties) identifies
+        // the Auto-shorthand shape precisely — a block-form abstract
+        // property OR indexer with a real `set` arm keeps the builder bit
+        // (the local path accepts that exotic shape, and so does this one).
+        // Before #2523 the metadata bit was property-only
+        // (`isAutoProperty` excluded indexers, #2478), so an abstract
+        // indexer could only be detected via the coarse `base->isIndexer`
+        // branch — which incorrectly fired for an exotic abstract BLOCK-
+        // form indexer with an explicit `set` arm too, false-rejecting the
+        // override (the #2390 residual #2523 fixes). Now the bit carries
+        // the §12.5-correct shape and the §12.5 correction is exactly
+        // `baseAbstract && isAutoShorthand`, with no indexer-specific
+        // special case. A pre-#2400 blob defaults the bit to false (see
+        // MetaMember::hasSetter's field comment); the project's
+        // recompile-the-world model means a stale dependency is recompiled
+        // rather than trusted with a stale accessor shape.
+        bool bHasSetter;
+        if (bDecl) {
+            bHasSetter = propertyDeclHasSetter(bDecl);
+        } else {
+            bHasSetter = ctx_.importedPropertyHasSetter(base);
+            if (bHasSetter) {
+                bool baseAbstract = false;
+                for (auto mod : base->modifiers)
+                    if (mod == "abstract") { baseAbstract = true; break; }
+                if (baseAbstract &&
+                    ctx_.importedPropertyIsAutoStorage(base)) {
+                    bHasSetter = false;  // §12.5 abstract shorthand = get-only
+                }
+            }
+        }
+        if (propertyDeclHasSetter(dDecl) != bHasSetter) {
             err("accessor set/get presence");
         }
     }
@@ -2458,8 +2739,13 @@ void Resolver::checkPropertyOverrideSignatureMatch(PropertySymbol* derived,
             }
             TypeRef* dt =
                 dp->declType ? ctx_.resolvedType(*dp->declType) : nullptr;
+            // §2.8.2/§12.1 (v0.235, #2386): same ParameterSymbol fallback as
+            // the method-override parameter loop above — an imported base
+            // indexer's index parameter carries no `declType`, only
+            // `resolvedDeclType` (ModuleLoader::convertParams).
             TypeRef* bt =
-                bp->declType ? ctx_.resolvedType(*bp->declType) : nullptr;
+                bp->declType ? ctx_.resolvedType(*bp->declType)
+                             : bp->resolvedDeclType;
             TypeRef* btSubst = applyGenericSubst(bt, genericSubst);
             if (dt && btSubst &&
                 !overrideParamTypeMatches(dt, btSubst,
@@ -2791,8 +3077,23 @@ void Resolver::checkAbstractImplementations() {
         -> TypeRef* {
         if (!d) return d;
         if (d->kind != TypeRef::Kind::Named) return d;
-        if (!d->declaration && d->astNode && d->astNode->name &&
-            d->astNode->name->parts.size() == 1 && d->genericArgs.empty()) {
+        // §2.8.2/§12.5 (#2373): the §11.2 instance-member twin of #2359 bug
+        // 2d's `checkStaticInterfaceConformance::subst()` fix. `d` is a
+        // bare-type-parameter reference read off the interface/abstract
+        // member's own declared signature; when that member is IMPORTED
+        // (an interface reached from another module), its declared type
+        // carries no `astNode` at all — only `importedName`
+        // (ModuleLoader::convert). The old `astNode`-only guard made this
+        // substitution a silent no-op for an imported ancestor's bare `T`,
+        // so the return/param type stayed unsubstituted "T" and the
+        // subsequent `typesMatch` comparison against the implementation's
+        // concrete type spuriously failed ("does not match ... on
+        // parameter"/"does not match ... return type" — a false REJECT of a
+        // correct generic implementation). Read the name via the shared
+        // alias-transparent `TypeRef::headName()` (falls back to
+        // `importedName`) instead, matching #2359's fix shape at its four
+        // sibling sites.
+        if (!d->declaration && !d->headName().empty() && d->genericArgs.empty()) {
             auto it = map.find(d->headName());
             if (it != map.end() && it->second) {
                 const TypeRef* s = it->second;
@@ -2850,7 +3151,36 @@ void Resolver::checkAbstractImplementations() {
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t) continue;
-        if (t->kind != ast::TypeDeclKind::Class) continue;
+        // #2416 / §11.2 / §9.6: records may implement interfaces exactly like
+        // classes ("A record may implement any number of interfaces" — §9.6)
+        // and are bound by the identical §11.2 conformance obligations, but
+        // this function's outer loop previously filtered to Class only, so a
+        // record got NONE of the checks below — not #489's "field doesn't
+        // satisfy a property" check, not #2380's property-type-match check,
+        // and not #2413's accessor-set check. That reproduced #2413's exact
+        // null-itable-setter-slot SIGSEGV for a record's getter-only property
+        // satisfying a read-write interface property obligation (confirmed by
+        // probe before this fix). Widened to admit Record here; each check
+        // below was individually audited for class-specific assumptions (see
+        // the per-check comments) before being left enabled for records.
+        const char* kindWord =
+            (t->kind == ast::TypeDeclKind::Record) ? "record" : "class";
+        if (t->kind != ast::TypeDeclKind::Class &&
+            t->kind != ast::TypeDeclKind::Record)
+            continue;
+        // #2416: `isAbstract` — records cannot be inherited from and are
+        // implicitly sealed (§9.6), and the grammar's shared Modifier*
+        // production over-admits `abstract` on a RecordDecl the same way it
+        // over-admits `ref`/`out`/`scoped` on primary-constructor parameters
+        // (§22.10) — sema is the semantic gate, per the parser's own comment
+        // at parseTopDecl. No existing check rejects `abstract record`
+        // (verified: checkClassModifierCombinations, the only §11.7 modifier-
+        // combination check, filters to Class only and never reports on a
+        // record). Whether `abstract record` should itself be a compile error
+        // is a separate, pre-existing question this fix does not decide either
+        // way — out of scope for #2416 (filed as #2431); this loop simply
+        // preserves the existing "abstract types need not implement
+        // obligations" reading for whichever type kind carries the modifier.
         bool isAbstract = false;
         for (auto mod : t->modifiers) {
             if (mod == "abstract") { isAbstract = true; break; }
@@ -2912,6 +3242,33 @@ void Resolver::checkAbstractImplementations() {
         std::unordered_map<std::string_view,
                            std::pair<PropertySymbol*, TypeSymbol*>> ifaceProps;
         std::unordered_map<std::string_view, PropertySymbol*> concreteProps;
+        // §9.1 / #2416: a RECORD's positional field auto-generates a public
+        // read-only property of the same name (§9.1), but is represented
+        // internally as a FieldSymbol with `posParam` set, not a
+        // PropertySymbol (#815 — the optimization codegen's
+        // classPositionalFieldProperty / the box-vtable Pass C fallback both
+        // key off). concreteProps above is typed to PropertySymbol* and
+        // cannot hold it, so it is tracked separately here — the accessor-set
+        // (#2413) and type-match (§2380) checks below both consult this map
+        // when concreteProps has no entry, so a positional-field satisfaction
+        // is checked exactly like a declared property one (always getter-
+        // only, since §9.1's generated property never has a setter).
+        std::unordered_map<std::string_view, FieldSymbol*> concretePosFields;
+        // #2417 / §11.2 / §23.4: interface INDEXER obligations, tracked
+        // separately from ifaceProps just above (whose loop below skips
+        // indexers outright) because indexers are ANONYMOUS — §23.4: "An
+        // indexer is a property whose name is replaced by `[parameters]`" —
+        // so there is no name to key a map on, and §23.4 permits overloading
+        // by index-parameter type list ("Indexers may be overloaded by
+        // parameter type list"). Kept as a flat vector, not deduped: two
+        // DIFFERENT interfaces each declaring a read-write indexer are two
+        // separate obligations. Checked after the BFS below (search
+        // "ifaceIndexerObligations" for the check itself).
+        struct IfaceIndexerObligation {
+            PropertySymbol* ips;
+            TypeSymbol* iface;
+        };
+        std::vector<IfaceIndexerObligation> ifaceIndexerObligations;
         // #2186: BFS over the inheritance chain tracking the per-node
         // substitution the path induces. Dedup is by (TypeSymbol, subst-key)
         // — not TypeSymbol alone — so a generic interface reached through two
@@ -2998,7 +3355,24 @@ void Resolver::checkAbstractImplementations() {
                 // §11.2 / §23 (#489): interface properties require a matching
                 // PropertySymbol, not merely a same-named FieldSymbol.
                 if (auto* ps = dynamic_cast<PropertySymbol*>(m)) {
-                    if (ps->isIndexer) continue;  // indexers are separate
+                    if (ps->isIndexer) {
+                        // #2417 / §23.5 "Static indexers are not supported" —
+                        // the isStatic guard is defensive parity with the
+                        // named-property branch below (and with codegen's
+                        // own indexer helpers, which carry the identical
+                        // guard despite the same restriction).
+                        bool isStaticIdx = false;
+                        for (auto mod : ps->modifiers)
+                            if (mod == "static") { isStaticIdx = true; break; }
+                        if (curIsIface && !isStaticIdx)
+                            ifaceIndexerObligations.push_back({ps, cur});
+                        continue;  // indexers have no name; concrete side is
+                                   // matched directly off `t->members` below,
+                                   // not tracked through this BFS (mirrors
+                                   // codegen's classIndexerImplementing,
+                                   // which never walks the base chain either
+                                   // — see the check itself for why).
+                    }
                     bool isStatic = false;
                     for (auto mod : ps->modifiers)
                         if (mod == "static") { isStatic = true; break; }
@@ -3011,6 +3385,29 @@ void Resolver::checkAbstractImplementations() {
                         // A class PropertySymbol satisfies the contract.
                         concretePropertyNames.insert(ps->name);
                         concreteProps.emplace(ps->name, ps);
+                    }
+                }
+                // §9.1 / #2416: a record's POSITIONAL field stands in for a
+                // public read-only property (see concretePosFields'
+                // declaration above) — record it as a satisfying candidate
+                // the same way the PropertySymbol branch above does. Gated on
+                // `cur->kind == Record` specifically, NOT merely `fs->
+                // posParam != nullptr`: a CLASS's primary-constructor
+                // parameter also produces a posParam-carrying FieldSymbol
+                // (§22.10), but §22.10 is explicit that a class's primary-
+                // ctor parameters are "not automatically promoted to public
+                // properties" — unlike a record's positional fields (§9.1),
+                // a class's positional field must NOT satisfy a property
+                // obligation. `cur` here is never a record reached from a
+                // class's ancestor chain (§9.6: records cannot be inherited
+                // from, and cannot derive from a class), so this is
+                // equivalent to (and simpler than) gating on `t->kind`.
+                if (cur->kind == ast::TypeDeclKind::Record) {
+                    if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
+                        if (fs->posParam) {
+                            concretePropertyNames.insert(fs->name);
+                            concretePosFields.emplace(fs->name, fs);
+                        }
                     }
                 }
             }
@@ -3046,7 +3443,7 @@ void Resolver::checkAbstractImplementations() {
             if (!concreteNames.count(name)) {
                 ctx_.diagnostics().report(
                     Severity::Error, t->declLoc,
-                    std::string("concrete class `") +
+                    std::string("concrete ") + kindWord + " `" +
                     std::string(t->name) +
                     "` does not implement inherited abstract member `" +
                     std::string(name) + "` (§12.5)");
@@ -3065,7 +3462,7 @@ void Resolver::checkAbstractImplementations() {
                 if (cit == concreteArities.end() || !cit->second.count(arity)) {
                     ctx_.diagnostics().report(
                         Severity::Error, t->declLoc,
-                        std::string("class `") + std::string(t->name) +
+                        std::string(kindWord) + " `" + std::string(t->name) +
                         "` does not implement inherited member `" +
                         std::string(name) + "` with the required " +
                         std::to_string(arity) + "-parameter signature — the "
@@ -3170,19 +3567,50 @@ void Resolver::checkAbstractImplementations() {
                 auto* imDecl = dynamic_cast<const ast::MethodDecl*>(im->decl);
                 auto* implDecl =
                     dynamic_cast<const ast::MethodDecl*>(impl->decl);
-                if (imDecl && implDecl &&
-                    imDecl->returnOwned != implDecl->returnOwned) {
+                // §2.8.2/§12.5 (#2373): `im` may be an IMPORTED interface/
+                // abstract member. ModuleLoader never attaches an
+                // ast::MethodDecl to a body-less imported member (there is
+                // no syntactic AST to attach), so `imDecl` is unconditionally
+                // null for every cross-module obligation — which silently
+                // skipped BOTH this `owned`-return check and the return-type
+                // match below for any imported interface (a false ACCEPT of
+                // any return-type/`owned`-return mismatch). Derive the
+                // interface member's return the same way #2294 already
+                // established for `checkStaticInterfaceConformance`'s twin
+                // loop: from the AST when present, else from
+                // ctx_.importedReturnType/importedReturnOwned (ModuleLoader::
+                // setImportedReturnType). `impl` is always a LOCAL class
+                // member (obligation witnesses only ever come from `t`'s own
+                // module's BFS above), so `implDecl` needs no fallback.
+                const bool imHasAstDecl = (imDecl != nullptr);
+                const ast::Type* imRetNode =
+                    imDecl ? imDecl->returnType.get() : nullptr;
+                bool imRetOwned = imDecl ? imDecl->returnOwned : false;
+                TypeRef* imRetRef = nullptr;
+                bool imDeclaresReturn;
+                if (imHasAstDecl) {
+                    imRetRef = resolvedOf(imRetNode);
+                    imDeclaresReturn = (imRetNode != nullptr);
+                } else {
+                    imRetOwned = ctx_.importedReturnOwned(im);
+                    TypeRef* r = ctx_.importedReturnType(im);
+                    if (r && r->kind != TypeRef::Kind::Unit) imRetRef = r;
+                    imDeclaresReturn = (imRetRef != nullptr);
+                }
+                const bool implRetOwned = implDecl ? implDecl->returnOwned
+                                                    : false;
+                if (implDecl && imRetOwned != implRetOwned) {
                     ctx_.diagnostics().report(
                         Severity::Error, impl->declLoc,
                         std::string("method `") + std::string(name) +
                         "` does not match interface member `" +
                         std::string(name) + "`'s `owned` return modifier "
                         "(§11.2): the interface declares the return type " +
-                        (imDecl->returnOwned
+                        (imRetOwned
                              ? std::string("`owned`")
                              : std::string("without `owned`")) +
                         "; the implementation declares it " +
-                        (implDecl->returnOwned
+                        (implRetOwned
                              ? std::string("`owned`")
                              : std::string("without `owned`")) +
                         " (§11.2)");
@@ -3222,7 +3650,22 @@ void Resolver::checkAbstractImplementations() {
                     auto* cp = dynamic_cast<ParameterSymbol*>(impl->params[pi]);
                     if (!ip || !cp) continue;
                     if (ip->modifier != cp->modifier) continue;  // reported above
-                    TypeRef* it = resolvedOf(ip->declType);
+                    // §2.8.2/§12.5 (#2373): `im` (and so `ip`) may belong to
+                    // an IMPORTED interface/abstract member — its parameters
+                    // carry no syntactic `declType` at all;
+                    // ModuleLoader::convertParams stashes the already-
+                    // resolved type on `resolvedDeclType` instead (no
+                    // ast::Type exists to attach). Reading `declType` alone
+                    // made `it` null for every imported obligation, which
+                    // silently skipped this whole parameter-type check (a
+                    // false ACCEPT of any parameter-type mismatch) — the
+                    // fallback mirrors #2294's established fix for
+                    // `checkStaticInterfaceConformance`'s twin loop. `cp` is
+                    // always a LOCAL class member here (impl candidates only
+                    // ever come from `t`'s own module's BFS above), so only
+                    // the interface side needs the fallback.
+                    TypeRef* it = ip->declType ? resolvedOf(ip->declType)
+                                                : ip->resolvedDeclType;
                     TypeRef* ct = resolvedOf(cp->declType);
                     if (!it || !ct) continue;
                     if (it->kind == TypeRef::Kind::Error ||
@@ -3257,17 +3700,22 @@ void Resolver::checkAbstractImplementations() {
                 // wrong-typed interface dispatch the issue calls out (a
                 // statically int?-typed call dispatching to a string?-
                 // returning body).
-                const ast::Type* imRetNode =
-                    imDecl ? imDecl->returnType.get() : nullptr;
+                //
+                // §2.8.2/§12.5 (#2373): reuses `imRetRef`/`imDeclaresReturn`
+                // derived above (AST for a local interface, ctx_.
+                // importedReturnType for an imported one) rather than
+                // re-deriving from `imDecl` here — `imDecl` is unconditionally
+                // null for an imported member, so re-deriving from it (the
+                // pre-fix shape) silently skipped this entire return-type
+                // check for every cross-module obligation.
                 const ast::Type* implRetNode =
                     implDecl ? implDecl->returnType.get() : nullptr;
-                if (imRetNode && implRetNode) {
-                    TypeRef* irt = resolvedOf(imRetNode);
+                if (imDeclaresReturn && implRetNode) {
                     TypeRef* crt = resolvedOf(implRetNode);
-                    if (irt && crt &&
-                        irt->kind != TypeRef::Kind::Error &&
+                    if (imRetRef && crt &&
+                        imRetRef->kind != TypeRef::Kind::Error &&
                         crt->kind != TypeRef::Kind::Error) {
-                        const TypeRef* irtSub = substTypeRef(irt, obl.subst);
+                        const TypeRef* irtSub = substTypeRef(imRetRef, obl.subst);
                         const TypeRef* crtSub = substTypeRef(crt, implSubst);
                         if (!typesMatch(irtSub, crtSub)) {
                             ctx_.diagnostics().report(
@@ -3293,12 +3741,520 @@ void Resolver::checkAbstractImplementations() {
             if (!concretePropertyNames.count(name)) {
                 ctx_.diagnostics().report(
                     Severity::Error, t->declLoc,
-                    std::string("class `") + std::string(t->name) +
+                    std::string(kindWord) + " `" + std::string(t->name) +
                     "` does not implement interface property `" +
                     std::string(name) +
                     "` — a field does not satisfy a property contract;"
                     " declare `public property " + std::string(name) +
                     ": T` (§11.2 / §23)");
+            }
+        }
+        // §11.2 / §23.3 (v0.235, #2413): the ACCESSOR-SET sibling of #489's
+        // "field doesn't satisfy a property" check just above and #2380's
+        // property TYPE-match check below. §11.2's "matches" rule requires an
+        // implementation to provide the accessors the interface obligation
+        // declares; §11.2's diamond-resolution note states the one-directional
+        // relaxation explicitly — "A read-write member satisfies a read-only
+        // interface member of the same name and type" — which by omission
+        // means the converse does NOT hold: a read-only (getter-only) member
+        // does not satisfy a read-write interface property obligation.
+        // Before this fix, only the INTERFACE's own declared accessor set
+        // gated whether codegen's declareVtables Pass D
+        // (LlvmBackend_Setup.cpp) allocated an itable setter slot for that
+        // interface property — the ACTUAL implementing property's accessor
+        // set was never consulted here. A getter-only class property was
+        // therefore accepted as satisfying a read-write interface property
+        // obligation; ensurePropertyAccessorFn(ts, impl, isSet=true)
+        // correctly returns nullptr for the getter-only impl (its
+        // PropertyBodyKind::Expression branch), so Pass D silently installed
+        // ConstantPointerNull in the unfillable setter slot with no
+        // diagnostic anywhere — `iface.Prop := v` then called through that
+        // null pointer (SIGSEGV, confirmed via gdb: RIP=0x0).
+        //
+        // Accessor PRESENCE is a shape fact, not a typed one — unlike the
+        // type-match check below, substituting a generic interface's type
+        // parameters does not change which accessors it declares, so this
+        // check is intentionally NOT gated on t->genericParams.empty() /
+        // iface->genericParams.empty() (it is sound, and strictly more
+        // complete, to run it unconditionally).
+        //
+        // #2542 (§11.2 / §23.3 / §2.8.2 clause 1 / §2.8.3 rule 4,
+        // v0.236): an imported interface property's PropertySymbol has no
+        // ast::PropertyDecl (ModuleLoader reconstructs the symbol but cannot
+        // reconstruct source AST), so the former `if (!ipd || !cpd) continue`
+        // silently skipped this accessor-presence obligation. The setter bit
+        // already crosses the module boundary as MetaMember::hasSetter and is
+        // published through ctx_.importedPropertyHasSetter (#2400); read that
+        // same bit when either side lacks a local AST, exactly as the sibling
+        // iface-indexer check does (#2529). This also covers a witness inherited
+        // from an imported base class and the positional-record branch below.
+        //
+        // #2549 / §11.2 / §23.3 / §2.8.2 clause 1 / §2.8.3 rule 4
+        // (v0.236): the symmetric getter axis. The setter check below
+        // rejects a getter-only impl of a read-write iface property (the
+        // missing-setter side); its mirror — a setter-only impl of a
+        // read-write iface property (the missing-getter side, the inverse
+        // of #2542's NAMED-property twin) — was silently ACCEPTED: the
+        // iface was read-write (the Auto-body kind has both arms by default),
+        // the impl had a Block body with only a `set` arm (no `get` arm),
+        // and `ifaceHasSetter() && !candidateHasSetter` never fired because
+        // the impl DID declare a setter. The runtime then dispatched through
+        // a null getter itable slot and SIGSEGV'd at pc=0x0. The added
+        // check is the getter-axis mirror of the setter check below: when
+        // the iface declares a getter (every non-write-only iface property
+        // does — Auto bodyKind with no `readonly` modifier, as iface
+        // members always are), the candidate must also declare one. Block
+        // body with a `set` arm but no `get` arm is the exact setter-only
+        // implementation this rejects.
+        //
+        // Both the setter (#2542) and getter (#2549) checks run in BOTH
+        // the LOCAL and IMPORTED shapes via the same fallback lambdas —
+        // the `importedPropertyHasSetter` and `importedPropertyHasGetter`
+        // side tables (#2400's `MetaMember::hasSetter` and #2461's
+        // `MetaMember::hasGetter` bits, already published to SemaContext)
+        // carry the accessor presence across the module boundary, so a
+        // getter-only or setter-only impl of an IMPORTED read-write iface
+        // property can be rejected on either side. The getter-only pattern
+        // in IMPORTED tests was cleaned up in the #2542 re-attempt
+        // (#2552 follow-up: legacy #2401/#2387 fixtures now declare
+        // `readonly` to match the corrected spec-correct behavior). The
+        // setter-only pattern is rare in the corpus (swept manually
+        // during the #2549 fix across tests/module/ and tests/sema/ —
+        // every iface-property impl in those directories is either
+        // expression-bodied, full block (get + set), or positional-record
+        // — none pair a setter-only block with a read-write iface), so
+        // the IMPORTED-side fallbacks ship alongside the local fix.
+        //
+        // The accessor-presence bit is shape-factual (#2413's note), not
+        // type-dependent, so these checks are intentionally NOT gated on
+        // t->genericParams.empty() / iface->genericParams.empty(). Mirror
+        // the indexer-side `ifaceHasSetter`/`candidateHasSetter` lambdas in
+        // this same file's ifaceIndexerObligations loop a few hundred lines
+        // below (#2529/#2449).
+        for (auto& [name, info] : ifaceProps) {
+            PropertySymbol* ips = info.first;
+            TypeSymbol* iface = info.second;
+            auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ips->decl);
+            auto ifaceHasSetter = [&]() -> bool {
+                if (ipd) return propertyDeclHasSetter(ipd);
+                return ctx_.importedPropertyHasSetter(ips);
+            };
+            auto cit = concreteProps.find(name);
+            if (cit != concreteProps.end()) {
+                auto* cpd =
+                    dynamic_cast<const ast::PropertyDecl*>(cit->second->decl);
+                const bool candidateHasSetter =
+                    cpd ? propertyDeclHasSetter(cpd)
+                        : ctx_.importedPropertyHasSetter(cit->second);
+                const bool candidateHasGetter =
+                    cpd ? propertyDeclHasGetter(cpd)
+                        : ctx_.importedPropertyHasGetter(cit->second);
+                // SETTER check (gate fires for both LOCAL and IMPORTED via
+                // the candidateHasSetter fallback above; the W9-D sibling
+                // originally gated this on `ipd && cpd` because it
+                // considered the IMPORTED-side setter check speculative,
+                // but the W9-A re-attempt (with test fixture cleanup)
+                // closed the #2552 follow-up so the IMPORTED-side check
+                // is now sound).
+                if (ifaceHasSetter() && !candidateHasSetter) {
+                    // Reported at t->declLoc, not cit->second->declLoc: probed
+                    // and confirmed (during this fix) that PropertySymbol::
+                    // declLoc — like every other non-TypeSymbol member kind — is
+                    // never populated by SymbolCollection.cpp's collectMember
+                    // (only TypeSymbol::declLoc is set, a few hundred lines away
+                    // in a different function), so it always reads as 0:0. That
+                    // pre-existing, broadly-scoped gap is out of scope for #2413
+                    // (filed separately); t->declLoc is populated and already
+                    // the choice the sibling #489 "missing interface property"
+                    // diagnostic three lines above uses for the same reason.
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        std::string("property `") + std::string(name) +
+                        "` implements interface `" + std::string(iface->name) +
+                        "` with a getter-only implementation, but `" +
+                        std::string(iface->name) + "." + std::string(name) +
+                        "` is declared read-write — an implementation of a "
+                        "read-write interface property must provide a setter "
+                        "(§11.2 / §23.3)");
+                }
+                // #2549 / §11.2 / §23.3 / §2.8.2 clause 1 / §2.8.3 rule 4
+                // (v0.236): the symmetric getter-axis check. Mirrors the
+                // setter check above: a read-write iface property obligation
+                // requires the implementation to declare a getter.
+                // Expression-bodied / Auto-bodied impls always have one
+                // (§23.3's read-only-on-block-form rule); a Block impl has
+                // a getter iff it declares a `get` arm. A Block with only a
+                // `set` arm is the exact setter-only impl this rejects.
+                //
+                // Unlike the setter check above, this check runs in BOTH the
+                // LOCAL and IMPORTED shapes — the
+                // `importedPropertyHasGetter` side table (#2461's
+                // `MetaMember::hasGetter` bit, published by ModuleLoader)
+                // carries the accessor presence across the module boundary,
+                // so a setter-only impl of an IMPORTED read-write iface
+                // property (the inverse of #2542's NAMED-property twin,
+                // #2549) can be rejected on either side. The setter-only
+                // pattern is rare in the corpus (swept manually across
+                // tests/module/ and tests/sema/ — every iface-property
+                // impl in those directories is either expression-bodied,
+                // full block (get + set), or positional-record — none pair
+                // a setter-only block with a read-write iface), so the
+                // IMPORTED-side fallback has no legacy fixtures to clean
+                // up and ships alongside the local fix in this single
+                // commit. The setter check above is LOCAL-only for the
+                // separate reason #2552 documents: the legacy
+                // #2401/#2387 tests paired getter-only impls with read-
+                // write iface obligations and would false-reject without a
+                // fixture cleanup pass (separate lane).
+                //
+                // The accessor-presence bit is shape-factual (#2413's
+                // note), not type-dependent, so this check is
+                // intentionally NOT gated on t->genericParams.empty() /
+                // iface->genericParams.empty(). Mirrors the indexer-side
+                // `ifaceHasSetter`/`candidateHasSetter` lambdas in this
+                // same file's ifaceIndexerObligations loop a few hundred
+                // lines below (#2529/#2449).
+                auto ifaceHasGetter = [&]() -> bool {
+                    return ipd ? propertyDeclHasGetter(ipd)
+                               : ctx_.importedPropertyHasGetter(ips);
+                };
+                if (ifaceHasGetter() && !candidateHasGetter) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        std::string("property `") + std::string(name) +
+                        "` implements interface `" + std::string(iface->name) +
+                        "` with a setter-only implementation, but `" +
+                        std::string(iface->name) + "." + std::string(name) +
+                        "` is declared read-write — an implementation of a "
+                        "read-write interface property must provide a getter "
+                        "(§11.2 / §23.3)");
+                }
+                continue;
+            }
+            // §9.1 / #2416: satisfied by a RECORD's positional-field-backed
+            // property (concretePosFields, see its declaration above) instead
+            // of a declared PropertySymbol. §9.1's positional-field property
+            // is always getter-only ("Properties auto-generated from
+            // positional fields are read-only" — §9.4), so — exactly like a
+            // getter-only PropertySymbol above — it cannot satisfy a
+            // read-write interface property obligation; codegen has no setter
+            // to install there either (the identical null-itable-setter-slot
+            // SIGSEGV shape #2413 fixed, reproduced for this record shape and
+            // confirmed by probe before this fix).
+            auto pfit = concretePosFields.find(name);
+            if (pfit == concretePosFields.end())
+                continue;  // missing → reported above
+            if (ifaceHasSetter()) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string("property `") + std::string(name) +
+                    "` implements interface `" + std::string(iface->name) +
+                    "` with a positional field (§9.1), which is always "
+                    "getter-only, but `" + std::string(iface->name) + "." +
+                    std::string(name) + "` is declared read-write — an "
+                    "implementation of a read-write interface property must "
+                    "provide a setter (§9.1 / §9.4 / §11.2 / §23.3)");
+            }
+        }
+        // #2417 / §11.2 / §23.4: the INDEXER sibling of #2413's/#2416's
+        // accessor-set check just above. `declareVtables` Pass D
+        // (LlvmBackend_Setup.cpp, the `ip->isIndexer` branch) installs
+        // `ConstantPointerNull` into an interface indexer's setter itable
+        // slot whenever the implementing class's matched indexer has no
+        // setter, with no diagnostic anywhere — `iface[i] := v` then calls
+        // through that null pointer (SIGSEGV, confirmed by the issue's own
+        // repro via gdb: RIP=0x0). Exactly #2413's bug, on the sibling
+        // accessor-presence gap §23.4 shares with §23.3 ("An indexer is a
+        // property whose name is replaced by `[parameters]`").
+        //
+        // MATCHING (the hard part): indexers are anonymous, and §23.4 admits
+        // overloading by index-parameter type list ("Indexers may be
+        // overloaded by parameter type list"), so — unlike a plain property,
+        // matched by name — the obligation must be paired with a concrete
+        // candidate by parameter shape. The candidate this check selects is
+        // not a fresh, independent §11.2 full-parameter-list matcher; it
+        // deliberately MIRRORS the exact selection codegen's own
+        // `classIndexerImplementing`/`findIndexer` (LlvmBackend_Assign.cpp)
+        // uses to fill the itable slot, so sema never accepts a candidate
+        // codegen would not itself install (a false ACCEPT of the exact
+        // SIGSEGV shape this check exists to close — see #2417's own commit
+        // for why an independent, "more correct" matcher was considered and
+        // rejected).
+        //
+        // #2437 / §11.2 / §23.4 (v0.235, landed in its own prior commit —
+        // codegen's `findIndexer` carried the identical defect and was fixed
+        // together with this mirror then, per the mirroring above; #2442
+        // just below is a SEPARATE, later commit that builds on top of it):
+        // matching is by the interface indexer's FULL parameter list —
+        // arity AND every parameter type — not just the first. The prior
+        // first-parameter-only match matched a `[i:int,j:int]` obligation
+        // against a class's narrower `[i:int]` overload whenever the two
+        // shared a first parameter type (confirmed: installed the wrong
+        // getter, silently returning a value from the WRONG indexer — the
+        // issue's own repro). There is also no more "fall back to the
+        // first-declared indexer when nothing matches exactly": that
+        // fallback was an UNBOUNDED version of the same arity-blind defect
+        // (it would accept ANY indexer of ANY shape as "the implementation"
+        // once no exact match existed). `candidate == nullptr` after a full
+        // search is now the sole, correctly-scoped "no implementation"
+        // condition — see the `!candidate` branch below.
+        //
+        // #2442 / §11.2 / §23.4 (v0.235): the search also now walks `t`'s
+        // base CLASS chain (mirroring `classPropertyByName`'s identical walk
+        // for named properties, a few hundred lines above), not `t->members`
+        // alone: §11.2 says a class "implements an interface implicitly: by
+        // declaring matching public members" and imposes no restriction that
+        // the match be declared directly on the implementing type (ordinary
+        // member inheritance applies, exactly as it does for methods via
+        // `findMethodByName` and properties via `classPropertyByName`), so a
+        // class satisfying the obligation only through an INHERITED indexer
+        // (declared on a base class, never redeclared) is a valid
+        // implementation.
+        //
+        // #2449 / §11.2 / §23.4 (v0.235): a candidate reached through the
+        // base walk is accepted when it is either LOCAL (a genuine
+        // `ast::PropertyDecl`, `candWireable` below) or a wireable IMPORTED
+        // indexer — non-static, non-virtual, not itself an interface member.
+        // `candWireable`/`candParamCount`/`candParamTy` below deliberately
+        // mirror codegen's `indexerCandidateWireable`/`indexerParamCount`/
+        // `indexerParamType` (LlvmBackend_Assign.cpp/-_impl.hpp) exactly:
+        // #2449's codegen half teaches `ensureIndexerGetterFn`/`-SetterFn`'s
+        // caller (`Emitter::indexerItableAccessor`, LlvmBackend_Setup.cpp
+        // Pass D) to install #2414's already-declared cross-module ABI stub
+        // (`bz$<Class>$idxget$<arity>`/`$idxset$<arity>`,
+        // `declareImportedIndexerGetters`/`-Setters`) for a candidate that
+        // has no local body to build one from — so an inherited indexer from
+        // an IMPORTED base is now ALSO actually wireable, not just an
+        // inherited LOCAL one. A VIRTUAL (or interface-declared) imported
+        // candidate stays excluded: it dispatches through a vtable/itable
+        // slot instead of this direct-call ABI, and
+        // declareImportedIndexerGetters/-Setters themselves never declare a
+        // stub for one — accepting it here would be a false ACCEPT of a
+        // program codegen still cannot wire, the exact anti-pattern this
+        // whole check exists to avoid. `t` itself is always LOCAL (this
+        // function's outer loop walks `ctx_.module()->children` only), so
+        // `cur` only becomes IMPORTED after the first `baseTypes` hop.
+        //
+        // Accessor PRESENCE is a shape fact, not a typed one (see the
+        // sibling property check's identical note above) — substituting a
+        // generic interface's type parameters does not change which
+        // accessors an indexer declares, so this runs unconditionally, not
+        // gated on genericParams.empty().
+        //
+        // Records get this check for free: this function's outer loop
+        // already admits Record (#2416), and an indexer obligation is
+        // resolved the same way regardless of `t->kind` (unlike a named
+        // property, an indexer has no positional-field analog to special-
+        // case — §9.1's auto-generated property applies to named fields
+        // only). §23.4 ("positional-only records may not [declare read-
+        // write indexers]") is not re-derived here: a positional-only
+        // record's indexer, if it declares one at all, is necessarily
+        // getter-only, so it already falls out of this same check with no
+        // extra machinery.
+        //
+        // #2438 / §11.2 / §23.4: this loop ALSO reports when `t` (own
+        // members plus its base-class chain) provides no matching indexer AT
+        // ALL — the more severe sibling #2417 itself deferred:
+        // `classIndexerImplementing` returns null in that shape, so
+        // `declareVtables` Pass D installs `ConstantPointerNull` in the
+        // GETTER slot too, not just the setter (confirmed by probe: a plain
+        // READ SIGSEGVs, exit 139, even for a `readonly` obligation — the
+        // getter-only-vs-read-write branch below never even runs in that
+        // shape, since there is no accessor set to compare against). This is
+        // NOT implemented by widening #489's own ifacePropertyNames/
+        // concretePropertyNames name-keyed "does not implement interface
+        // property" check a few hundred lines above (the naturally-looking
+        // fix, and the literal reading of "extend the existing check"):
+        // EVERY indexer's PropertySymbol::name is the same synthetic
+        // ".this" (SymbolCollection.cpp), regardless of parameter list —
+        // that collision is exactly why indexers were excluded from that
+        // name-keyed check in the first place (pre-dating both #2417 and
+        // #2438). Widening it would report `t` as satisfying ANY interface
+        // indexer obligation as soon as `t` declares ANY indexer of ANY
+        // shape — a false ACCEPT for a class whose only indexer has the
+        // wrong parameter list. This loop's own candidate search is already
+        // shape-aware (mirrors codegen's classIndexerImplementing/
+        // findIndexer, per the comment above), so `candidate == nullptr`
+        // here is the already-computed, sound condition.
+        //
+        // #2529 (§11.2 / §23.4 / §2.8.2 clause 1 / §2.8.3 rule 4, v0.236):
+        // for an IMPORTED interface indexer — `ips->decl` is null, because
+        // ModuleLoader's Indexer case (#2414) reconstructs `indexerParams`
+        // as ParameterSymbols but attaches no `ast::PropertyDecl` (there is
+        // no syntactic AST to attach — "the getter BODY is not reconstructed
+        // here") — the obligation was silently SKIPPED via `if (!ipd)
+        // continue;` below. A getter-only impl of an imported read-write
+        // interface indexer therefore compiled clean (verified: `b[1]` on a
+        // `property [i: int]: int` interface with a getter-only local impl
+        // returned `_v + i`, no diagnostic); the LOCAL twin — same source,
+        // no import — was, and remains, correctly REJECTED with the
+        // §11.2/§23.4 diagnostic (#2417). This is the indexer sibling of
+        // the property-side #2406-shaped gap; the ifaceProps loop below
+        // already has the analogous property-type fallback to
+        // `ctx_.importedMemberType` for its imported side (#2380), so this
+        // loop is extended the same way: `ifaceParamCount`/`ifaceParamTy`
+        // and `ifaceHasSetter` read from the LOCAL `ast::PropertyDecl`
+        // when present (the original shape) and fall back to the
+        // RECONSTRUCTED `PropertySymbol::indexerParams` (ParameterSymbols
+        // with `resolvedDeclType`) and to `ctx_.importedPropertyHasSetter`
+        // (#2400's `propHasSetter_` side table, populated by ModuleLoader's
+        // Indexer case from `MetaMember::hasSetter`) otherwise. No new
+        // metadata bit is needed — every imported indexer obligation is
+        // fully reconstructable from what #2414 + #2400 already publish.
+        for (auto& obl : ifaceIndexerObligations) {
+            PropertySymbol* ips = obl.ips;
+            auto* ipd = dynamic_cast<const ast::PropertyDecl*>(ips->decl);
+
+            // #2529: count/type of the interface indexer's parameter list,
+            // local or imported — mirrors the candidate-side `candParamCount`
+            // /`candParamTy` fallbacks already present in this loop (#2449).
+            auto ifaceParamCount = [&]() -> std::size_t {
+                if (ipd) return ipd->indexerParams.size();
+                return ips->indexerParams.size();
+            };
+            const std::size_t nparams = ifaceParamCount();
+            auto ifaceParamTy = [&](std::size_t k) -> TypeRef* {
+                if (ipd) {
+                    return (k < ipd->indexerParams.size() &&
+                            ipd->indexerParams[k].type)
+                               ? resolvedOf(ipd->indexerParams[k].type.get())
+                               : nullptr;
+                }
+                if (k < ips->indexerParams.size())
+                    if (auto* p = dynamic_cast<ParameterSymbol*>(
+                            ips->indexerParams[k]))
+                        return p->resolvedDeclType;
+                return nullptr;
+            };
+            // #2529: whether the interface's own indexer declares a setter.
+            // Mirrors the candidate-side `cpd ? propertyDeclHasSetter(cpd)
+            // : ctx_.importedPropertyHasSetter(candidate)` fallback a few
+            // lines below (#2449) — same MetaMember::hasSetter bit
+            // (#2400), the same one codegen's `declareImportedIndexerSetters`
+            // gate uses to reserve a setter itable slot.
+            auto ifaceHasSetter = [&]() -> bool {
+                if (ipd) return propertyDeclHasSetter(ipd);
+                return ctx_.importedPropertyHasSetter(ips);
+            };
+
+            // #2449: a candidate's arity/k-th param type, read from its
+            // local ast::PropertyDecl OR — for an imported candidate, no
+            // ast::PropertyDecl to read — its reconstructed indexerParams
+            // (ParameterSymbols with resolvedDeclType, ModuleLoader.cpp's
+            // Indexer case). Mirrors codegen's identically-shaped
+            // indexerParamType/indexerParamCount (LlvmBackend_Assign.cpp)
+            // so sema and codegen agree on what a candidate's signature IS,
+            // not just on which candidate wins.
+            auto candParamCount = [](PropertySymbol* cand) -> std::size_t {
+                if (auto* cpd = dynamic_cast<const ast::PropertyDecl*>(cand->decl))
+                    return cpd->indexerParams.size();
+                return cand->indexerParams.size();
+            };
+            auto candParamTy = [&](PropertySymbol* cand,
+                                   std::size_t k) -> TypeRef* {
+                if (auto* cpd =
+                        dynamic_cast<const ast::PropertyDecl*>(cand->decl)) {
+                    return (k < cpd->indexerParams.size() &&
+                            cpd->indexerParams[k].type)
+                               ? resolvedOf(cpd->indexerParams[k].type.get())
+                               : nullptr;
+                }
+                if (k < cand->indexerParams.size())
+                    if (auto* p =
+                            dynamic_cast<ParameterSymbol*>(cand->indexerParams[k]))
+                        return p->resolvedDeclType;
+                return nullptr;
+            };
+            // #2449: mirrors codegen's indexerCandidateWireable exactly —
+            // see the block comment above for why.
+            auto candWireable = [](PropertySymbol* cand) -> bool {
+                if (dynamic_cast<const ast::PropertyDecl*>(cand->decl))
+                    return true;  // local
+                if (cand->decl) return false;  // defensive
+                for (auto mod : cand->modifiers)
+                    if (mod == "virtual" || mod == "override" ||
+                        mod == "abstract")
+                        return false;
+                return !(cand->parent &&
+                         cand->parent->kind == ast::TypeDeclKind::Interface);
+            };
+
+            // #2437/#2442/#2449: full parameter-list match over `t`'s own
+            // members then its base-class chain, gated on wireability — see
+            // the block comment above.
+            PropertySymbol* candidate = nullptr;
+            for (TypeSymbol* cur = t; cur && !candidate;) {
+                for (Symbol* m : cur->members) {
+                    auto* cps = dynamic_cast<PropertySymbol*>(m);
+                    if (!cps || !cps->isIndexer) continue;
+                    bool isStaticIdx = false;
+                    for (auto mod : cps->modifiers)
+                        if (mod == "static") { isStaticIdx = true; break; }
+                    if (isStaticIdx) continue;
+                    if (!candWireable(cps)) continue;
+                    if (candParamCount(cps) != nparams) continue;
+                    bool all = true;
+                    for (std::size_t k = 0; k < nparams; ++k) {
+                        TypeRef* pty = candParamTy(cps, k);
+                        TypeRef* ity = ifaceParamTy(k);
+                        if (!pty || !ity || !typeRefEqual(pty, ity)) {
+                            all = false;
+                            break;
+                        }
+                    }
+                    if (all) { candidate = cps; break; }
+                }
+                TypeSymbol* base = nullptr;
+                for (TypeSymbol* b : cur->baseTypes)
+                    if (b && b->kind == ast::TypeDeclKind::Class) {
+                        base = b;
+                        break;
+                    }
+                cur = base;
+            }
+
+            if (!candidate) {
+                // #2438: no indexer, own or inherited, matches the
+                // obligation's full parameter list — mirrors #489's "does
+                // not implement interface property" message a few hundred
+                // lines above, adapted for indexers (see the block comment
+                // above this loop for why that check itself isn't reused
+                // directly).
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string(kindWord) + " `" + std::string(t->name) +
+                    "` does not implement interface `" +
+                    std::string(obl.iface->name) + "`'s indexer — declare a "
+                    "matching `public property [params]: T` on `" +
+                    std::string(t->name) + "` or an ancestor class, with the "
+                    "same parameter count and types (§11.2 / §23.4)");
+                continue;
+            }
+
+            if (!ifaceHasSetter())
+                continue;  // read-only obligation, candidate found: satisfied
+
+            // #2449: an IMPORTED candidate has no ast::PropertyDecl to read
+            // accessor presence off; use the reconstructed hasSetter bit
+            // instead (#2400/#2414's propHasSetter_ side table, published
+            // through ctx_.importedPropertyHasSetter — the SAME bit
+            // declareImportedIndexerSetters, LlvmBackend_Setup.cpp, gates
+            // stub declaration on, so sema and codegen read one source of
+            // truth for accessor presence here too).
+            auto* cpd = dynamic_cast<const ast::PropertyDecl*>(candidate->decl);
+            bool candidateHasSetter =
+                cpd ? propertyDeclHasSetter(cpd)
+                    : ctx_.importedPropertyHasSetter(candidate);
+
+            if (!candidateHasSetter) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    std::string(kindWord) + " `" + std::string(t->name) +
+                    "` implements interface `" + std::string(obl.iface->name) +
+                    "`'s indexer with a getter-only implementation, but the "
+                    "interface's indexer is declared read-write — an "
+                    "implementation of a read-write interface indexer must "
+                    "provide a setter (§11.2 / §23.4)");
             }
         }
         // R39 / §11.2 ("Return types must match exactly — no covariance"): a
@@ -3311,30 +4267,90 @@ void Resolver::checkAbstractImplementations() {
         // can be compared, which is deferred (so generic conformance is never
         // false-rejected here).
         if (t->genericParams.empty()) {
+            // §2.8.2/§11.2/§12.5 (#2380): the PROPERTY sibling of #2373's
+            // METHOD fix in this same function. `ps` here is applied to BOTH
+            // sides of the comparison below (`ips`, always from an interface
+            // reached by the ancestor BFS above, and `cit->second`, from a
+            // non-interface `cur` in that SAME BFS — which, per the BFS's own
+            // reach, can be a base CLASS from another module just as readily
+            // as `ips`'s interface can be) — so either side may be an
+            // IMPORTED PropertySymbol: an interface property declared on an
+            // imported interface, or a property inherited from an imported
+            // base class that happens to satisfy a (possibly local)
+            // interface's obligation. Confirmed reachable for both shapes by
+            // probe before this fix (an imported interface's property and,
+            // separately, a local interface satisfied by a property inherited
+            // from an imported base class both silently accepted a type
+            // mismatch).
+            //
+            // ModuleLoader::convertMember's Property case never attaches an
+            // ast::PropertyDecl to a body-less imported declaration (there is
+            // no syntactic AST to attach — "the getter BODY is not
+            // reconstructed here"); the resolved property type instead rides
+            // the same importedMemberType side table used for imported
+            // fields/consts (ModuleLoader.cpp ~445, comment: "The resolved
+            // property TYPE rides fieldTypes_ ... so ctx.importedMemberType()
+            // can read it"). The old decl-only read made `propType` return
+            // null for EVERY imported property, silently skipping the §11.2
+            // exact-type-match check below via `if (!itype || !ctype)
+            // continue;` — a false ACCEPT of any property-type mismatch
+            // (verified: a `string`-typed local property satisfying an
+            // imported `Name: int` interface property compiled clean and,
+            // read through the interface reference, produced a garbage `int`
+            // off the string's representation).
             auto propType = [&](PropertySymbol* ps) -> const TypeRef* {
                 auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-                if (!pd || !pd->type) return nullptr;
-                return ctx_.resolvedType(*pd->type);
+                if (pd) {
+                    if (!pd->type) return nullptr;
+                    return ctx_.resolvedType(*pd->type);
+                }
+                return ctx_.importedMemberType(ps);
             };
             for (auto& [name, info] : ifaceProps) {
                 PropertySymbol* ips = info.first;
                 TypeSymbol* iface = info.second;
                 if (!iface || !iface->genericParams.empty()) continue;
-                auto cit = concreteProps.find(name);
-                if (cit == concreteProps.end()) continue;  // missing → reported above
                 const TypeRef* itype = propType(ips);
-                const TypeRef* ctype = propType(cit->second);
+                auto cit = concreteProps.find(name);
+                if (cit != concreteProps.end()) {
+                    const TypeRef* ctype = propType(cit->second);
+                    if (!itype || !ctype) continue;
+                    if (itype->kind == TypeRef::Kind::Error ||
+                        ctype->kind == TypeRef::Kind::Error) continue;
+                    if (!typeRefEqual(itype, ctype)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, cit->second->declLoc,
+                            std::string("property `") + std::string(name) +
+                            "` implements interface `" +
+                            std::string(iface->name) +
+                            "` with a different type than the interface "
+                            "declares — property types must match exactly "
+                            "(no covariance) (§11.2)");
+                    }
+                    continue;
+                }
+                // §9.1 / #2416: the positional-field-backed satisfaction —
+                // compare the interface property's type against the field's
+                // own declared type (`posParam->type`) the same way.
+                auto pfit = concretePosFields.find(name);
+                if (pfit == concretePosFields.end())
+                    continue;  // missing → reported above
+                FieldSymbol* fs = pfit->second;
+                const TypeRef* ctype =
+                    (fs->posParam && fs->posParam->type)
+                        ? ctx_.resolvedType(*fs->posParam->type)
+                        : nullptr;
                 if (!itype || !ctype) continue;
                 if (itype->kind == TypeRef::Kind::Error ||
                     ctype->kind == TypeRef::Kind::Error) continue;
                 if (!typeRefEqual(itype, ctype)) {
                     ctx_.diagnostics().report(
-                        Severity::Error, cit->second->declLoc,
+                        Severity::Error, t->declLoc,
                         std::string("property `") + std::string(name) +
                         "` implements interface `" + std::string(iface->name) +
-                        "` with a different type than the interface declares — "
-                        "property types must match exactly (no covariance) "
-                        "(§11.2)");
+                        "` with a positional field of a different type than "
+                        "the interface declares — property types must match "
+                        "exactly (no covariance) (§9.1 / §11.2)");
                 }
             }
         }
@@ -3384,8 +4400,22 @@ void Resolver::checkStaticInterfaceConformance() {
         -> TypeRef* {
         if (!d) return d;
         if (d->kind != TypeRef::Kind::Named) return d;
-        if (!d->declaration && d->astNode && d->astNode->name &&
-            d->astNode->name->parts.size() == 1 && d->genericArgs.empty()) {
+        // §2.8.2/§11.8 (#2359 bug 2d): the SAME imported-TypeRef gap as bugs
+        // 2a/2b/2c. `d` is a bare-type-parameter reference substituted here
+        // for BOTH the direct-conformance case and (since 4349fdc) the
+        // ancestor-interface-chain case; when the ancestor interface is
+        // IMPORTED, its own declared return/param TypeRef (e.g. IBase3's
+        // `owned T`, read via `ctx_.importedReturnType`) carries no `astNode`
+        // at all — only `importedName`. The old `astNode`-only guard made
+        // this substitution a silent no-op for an imported ancestor's bare
+        // `T`, so the return type stayed unsubstituted "T" and the
+        // subsequent `typesMatch` comparison against the conforming type's
+        // concrete return spuriously failed ("different signature"). Read
+        // the name via the shared alias-transparent `TypeRef::headName()`
+        // (falls back to `importedName`) instead, matching the fix shape at
+        // the other three sites.
+        if (!d->declaration && !d->headName().empty() &&
+            d->genericArgs.empty()) {
             auto it = map.find(d->headName());
             if (it != map.end() && it->second) {
                 TypeRef* s = it->second;
@@ -3454,9 +4484,35 @@ void Resolver::checkStaticInterfaceConformance() {
         if (t->kind != ast::TypeDeclKind::Class &&
             t->kind != ast::TypeDeclKind::Record)
             continue;
-        for (std::size_t bi = 0; bi < t->baseTypes.size(); ++bi) {
-            TypeSymbol* iface = t->baseTypes[bi];
-            if (!iface || iface->kind != ast::TypeDeclKind::Interface) continue;
+        // §11.8 (#1425 sub-item 1): a class conforms via a DERIVED interface
+        // (`class Meters: IRich<Meters>` where `IRich<T>: INumber<T>`) —
+        // IRich declares no statics of its own, they live on the ANCESTOR
+        // INumber. The pre-fix loop below scanned only `iface->members` for
+        // each DIRECT base interface, so a class conforming via IRich was
+        // never required to supply INumber's statics: a Meters with NONE of
+        // Zero/One/+/-/*//< implemented compiled clean (a false-accept —
+        // confirmed by probe before this fix). checkIfaceStatics is now a
+        // recursive walk: run the existing per-interface check on `iface`,
+        // then recurse into `iface`'s OWN base interfaces (`iface->baseTypes`
+        // / `baseTypeRefs`, populated for an interface's `: Base<...>` list
+        // exactly like a class's — TypeResolution_Names.cpp), composing the
+        // substitution map at each hop (ancestor's own generic-param names →
+        // `subst(ancestor-arg, the-CALLER's-map)`) so a multi-hop chain
+        // resolves the recurrence parameter all the way down to `t`'s own
+        // conformance argument. `visited` guards a diamond re-visit
+        // (`IRich<T>: INumber<T>, IOrderable<T>` both reaching a common
+        // ancestor) against a duplicate diagnostic; it can never be a true
+        // cycle (interface-inheritance cycles are rejected elsewhere, the
+        // §12.10 checkCycleFrom pass below runs over the same `baseTypes`).
+        std::function<void(TypeSymbol*,
+                           const std::unordered_map<std::string_view, TypeRef*>&,
+                           std::unordered_set<TypeSymbol*>&)>
+            checkIfaceStatics =
+            [&](TypeSymbol* iface,
+                const std::unordered_map<std::string_view, TypeRef*>& map,
+                std::unordered_set<TypeSymbol*>& visited) {
+            if (!iface || iface->kind != ast::TypeDeclKind::Interface) return;
+            if (!visited.insert(iface).second) return;
             // Collect the interface's static members (static methods and
             // operators — every interface operator is static per §11.8).
             std::vector<MethodSymbol*> statics;
@@ -3466,33 +4522,51 @@ void Resolver::checkStaticInterfaceConformance() {
                 if (ms->isOperator || hasMod(ms, "static"))
                     statics.push_back(ms);
             }
-            if (statics.empty()) continue;
-            // Bind the interface's type-parameter names to the conformance
-            // declaration's arguments (`: INumber<Meters>` → T → Meters).
-            std::unordered_map<std::string_view, TypeRef*> map;
-            TypeRef* baseRef = bi < t->baseTypeRefs.size()
-                                   ? t->baseTypeRefs[bi] : nullptr;
-            if (!iface->genericParams.empty()) {
-                if (!baseRef || baseRef->genericArgs.size() !=
-                                    iface->genericParams.size())
-                    continue;  // arity error reported elsewhere
-                for (std::size_t gi = 0; gi < iface->genericParams.size(); ++gi)
-                    if (iface->genericParams[gi] && baseRef->genericArgs[gi])
-                        map[iface->genericParams[gi]->name] =
-                            baseRef->genericArgs[gi];
-            }
             for (MethodSymbol* im : statics) {
                 // The interface member's declared signature pieces.
+                //
+                // §11.8 / §2.8.2 (#2294): the interface may be IMPORTED, in
+                // which case `im->decl` is not a local ast::MethodDecl — an
+                // imported member carries no syntactic AST at all. Its resolved
+                // return type rides SemaContext's imported side table
+                // (ModuleLoader::setImportedReturnType) and its parameters carry
+                // `resolvedDeclType` instead of a syntactic `declType`. Reading
+                // only the AST conflated "imported" with "unit-returning" and
+                // left every imported parameter type null, so a CORRECT witness
+                // for an imported static-interface member was rejected with the
+                // "different signature" diagnostic below (a false rejection:
+                // §11.8 conformance was unusable across a module boundary).
                 const ast::Type* imRetNode = nullptr;
                 bool imRetOwned = false;
+                bool imHasAstDecl = false;
                 if (auto* imd = dynamic_cast<const ast::MethodDecl*>(im->decl)) {
                     imRetNode = imd->returnType.get();
                     imRetOwned = imd->returnOwned;
+                    imHasAstDecl = true;
                 } else if (auto* iod =
                                dynamic_cast<const ast::OperatorDecl*>(im->decl)) {
                     imRetNode = iod->returnType.get();
                     imRetOwned = iod->returnOwned;
+                    imHasAstDecl = true;
                 }
+                // The interface member's return, resolved from whichever source
+                // it has. `imRetRef` is null exactly when the member returns
+                // unit — for a local member that is a missing `: Type` node, for
+                // an imported one a `Unit`-kind (or absent) recorded type.
+                TypeRef* imRetRef = nullptr;
+                if (imHasAstDecl) {
+                    imRetRef = resolvedOf(imRetNode);
+                } else {
+                    imRetOwned = ctx_.importedReturnOwned(im);
+                    TypeRef* r = ctx_.importedReturnType(im);
+                    if (r && r->kind != TypeRef::Kind::Unit) imRetRef = r;
+                }
+                // "Declares a return" — the unit-vs-typed test below. For a
+                // local member with a `: Type` node whose resolution failed,
+                // keep the old behaviour (typed, and the match then fails on the
+                // null TypeRef) rather than silently reclassifying it as unit.
+                const bool imDeclaresReturn =
+                    imHasAstDecl ? (imRetNode != nullptr) : (imRetRef != nullptr);
                 const std::string memberSpelling =
                     im->isOperator
                         ? ("operator " + std::string(im->operatorToken))
@@ -3520,7 +4594,15 @@ void Resolver::checkStaticInterfaceConformance() {
                         auto* ip = dynamic_cast<ParameterSymbol*>(im->params[pi]);
                         auto* cp = dynamic_cast<ParameterSymbol*>(cms->params[pi]);
                         if (!ip || !cp) { ok = false; break; }
-                        TypeRef* it2 = resolvedOf(ip->declType);
+                        // §11.8 / §2.8.2 (#2294): an IMPORTED interface
+                        // parameter has no syntactic `declType`; the loader
+                        // records its already-resolved type in
+                        // `resolvedDeclType` instead (ModuleLoader::
+                        // convertParams). `cp` is always local here (the
+                        // conforming type is a member of this module), so only
+                        // the interface side needs the fallback.
+                        TypeRef* it2 = ip->declType ? resolvedOf(ip->declType)
+                                                    : ip->resolvedDeclType;
                         TypeRef* ct = resolvedOf(cp->declType);
                         if (!it2 || !ct) { ok = false; break; }
                         // §11.8/§28.1 (v0.196, #2063): an `owned`/`out owned`
@@ -3564,18 +4646,17 @@ void Resolver::checkStaticInterfaceConformance() {
                     // C` interface return and an unresolved bare-T both retain.
                     bool effImRetOwned = imRetOwned;
                     TypeRef* subIrt = nullptr;
-                    if (imRetNode) {
-                        TypeRef* irt = resolvedOf(imRetNode);
-                        if (irt) {
-                            subIrt = subst(irt, map);
-                            if (subIrt != irt && effImRetOwned &&
-                                ownedMarkerErasedAtSubstitutedType(subIrt))
-                                effImRetOwned = false;
-                        }
+                    if (imRetRef) {
+                        subIrt = subst(imRetRef, map);
+                        if (subIrt != imRetRef && effImRetOwned &&
+                            ownedMarkerErasedAtSubstitutedType(subIrt))
+                            effImRetOwned = false;
                     }
                     if (effImRetOwned != cRetOwned) continue;
-                    if (!imRetNode != !cRetNode) continue;  // unit vs typed
-                    if (imRetNode) {
+                    // unit vs typed (#2294: `imDeclaresReturn`, not the presence
+                    // of an AST node — an imported member never has one).
+                    if (imDeclaresReturn != (cRetNode != nullptr)) continue;
+                    if (imDeclaresReturn) {
                         TypeRef* crt = resolvedOf(cRetNode);
                         if (!subIrt || !crt) continue;
                         if (!typesMatch(subIrt, crt)) continue;
@@ -3611,6 +4692,54 @@ void Resolver::checkStaticInterfaceConformance() {
                         "return type including `owned` (§11.2 / §11.8)");
                 }
             }
+            // §11.8 (#1425 sub-item 1): recurse into THIS interface's own
+            // base interfaces, composing the substitution — `anc`'s own
+            // generic-param names map to `subst(anc's-arg-as-written-on-
+            // iface, map)`, i.e. resolved one hop further toward `t`'s
+            // concrete conformance argument. E.g. `IRich<T>: INumber<T>`
+            // conformed via `Meters: IRich<Meters>`: iface=IRich,
+            // map={T(IRich's)->Meters}; anc=INumber, ancRef=INumber<T> (T is
+            // IRich's own param), ancMap={T(INumber's)->subst(T(IRich's),
+            // map)=Meters}.
+            for (std::size_t bi2 = 0; bi2 < iface->baseTypeRefs.size(); ++bi2) {
+                TypeSymbol* anc = bi2 < iface->baseTypes.size()
+                                       ? iface->baseTypes[bi2] : nullptr;
+                if (!anc || anc->kind != ast::TypeDeclKind::Interface) continue;
+                TypeRef* ancRef = iface->baseTypeRefs[bi2];
+                std::unordered_map<std::string_view, TypeRef*> ancMap;
+                if (!anc->genericParams.empty()) {
+                    if (!ancRef || ancRef->genericArgs.size() !=
+                                       anc->genericParams.size())
+                        continue;  // arity error reported elsewhere
+                    for (std::size_t gi = 0; gi < anc->genericParams.size();
+                         ++gi)
+                        if (anc->genericParams[gi] && ancRef->genericArgs[gi])
+                            ancMap[anc->genericParams[gi]->name] =
+                                subst(ancRef->genericArgs[gi], map);
+                }
+                checkIfaceStatics(anc, ancMap, visited);
+            }
+        };
+
+        for (std::size_t bi = 0; bi < t->baseTypes.size(); ++bi) {
+            TypeSymbol* iface = t->baseTypes[bi];
+            if (!iface || iface->kind != ast::TypeDeclKind::Interface) continue;
+            // Bind the interface's type-parameter names to the conformance
+            // declaration's arguments (`: INumber<Meters>` → T → Meters).
+            std::unordered_map<std::string_view, TypeRef*> map;
+            TypeRef* baseRef = bi < t->baseTypeRefs.size()
+                                   ? t->baseTypeRefs[bi] : nullptr;
+            if (!iface->genericParams.empty()) {
+                if (!baseRef || baseRef->genericArgs.size() !=
+                                    iface->genericParams.size())
+                    continue;  // arity error reported elsewhere
+                for (std::size_t gi = 0; gi < iface->genericParams.size(); ++gi)
+                    if (iface->genericParams[gi] && baseRef->genericArgs[gi])
+                        map[iface->genericParams[gi]->name] =
+                            baseRef->genericArgs[gi];
+            }
+            std::unordered_set<TypeSymbol*> visited;
+            checkIfaceStatics(iface, map, visited);
         }
     }
 }
@@ -4861,11 +5990,16 @@ void Resolver::checkVarianceMarkerScope() {
 //   - A Shared<T> or Weak<T> whose element T is an eligible component type
 //     (§9.8 v0.141): Shared<T> serializes as an identity participant
 //     ($id/$ref), Weak<T> as a back-reference ($ref)
+//   - A non-owning inline array [N]T whose element type is eligible (§9.8
+//     v0.228, issue #1065): encoded like any other standard sequence
+//     collection (BeginArray(N)/per-element/EndArray)
 // NOT eligible:
 //   - A class without a `serialized tree`/`graph`/`cyclic` clause
 //   - A record that does not itself declare ISerializable/IDeserializable
 //   - Any other Named type (interface, etc.)
-//   - Function, inline-array, unit types
+//   - An OWNING inline array ([N owned]T) — no spec text admits it (§9.8
+//     v0.228, issue #1065)
+//   - Function, unit types
 //
 // A field marked `serialized skip` is excluded from the component set and does
 // not disqualify the type (§9.8).
@@ -4883,6 +6017,39 @@ void Resolver::checkVarianceMarkerScope() {
 // `Weak<T>`-typed components are therefore eligible only when the containing
 // type is a class, never a record (interface-typed components are already
 // unconditionally ineligible below, satisfying the same rule for records).
+// Codegen restriction helper for the InlineArray branch of
+// isSerializationEligibleType below (issue #1065 follow-up, filed): true when
+// `tr` is a `string`, OR a Named record/choice/class (which may itself carry
+// a `string` component, transitively) — i.e. a shape that MAY carry a
+// runtime-managed reference the record-scope-end release walk
+// (LlvmBackend_impl.hpp recordHasStringFields / emitRecordStringFieldReleases,
+// fix #1747) would need to reach through an inline array to release, but
+// currently does not (that walk inspects only a record's own DIRECT storage
+// members' kind). Deliberately conservative — it excludes every Named
+// element type rather than attempting the transitive "does this nested
+// record contain a string" walk, which is future work once the release walk
+// itself is extended to recurse into inline arrays (tracked in the filed
+// follow-up). Primitives-other-than-string, enums, and nested non-owning
+// inline arrays of the same carry no such obligation and are unaffected.
+static bool typeRiskingUnreleasedStringInInlineArray(const TypeRef* tr) {
+    if (!tr) return false;
+    using K = TypeRef::Kind;
+    if (tr->kind == K::Primitive)
+        return tr->primitive == PrimitiveType::String;
+    if (tr->kind == K::InlineArray)
+        return typeRiskingUnreleasedStringInInlineArray(tr->arrayElement);
+    if (tr->kind == K::Named) {
+        // A resolved Named type is a record, enum, choice, or class; only an
+        // enum is guaranteed string-free (its representation is an integer,
+        // §10.3). Everything else (record/choice/class, and an unresolved
+        // Named with no declaration, e.g. Shared<T>/Weak<T>) is excluded
+        // conservatively.
+        return !(tr->declaration &&
+                 tr->declaration->kind == ast::TypeDeclKind::Enum);
+    }
+    return false;
+}
+
 static bool isSerializationEligibleType(
         const TypeRef* tr,
         std::unordered_set<const TypeSymbol*>& visited,
@@ -4915,6 +6082,43 @@ static bool isSerializationEligibleType(
                 return false;
         }
     }
+    // §9.8 (v0.228, issue #1065): a non-owning inline array `[N]T` is a
+    // serialization-eligible standard sequence collection when its element
+    // type is eligible — "or a standard sequence collection (Array<T>,
+    // OwningArray<T>, LinkedList<T>, etc., and inline arrays [N]T) whose
+    // element type is serialization-eligible (encoded with
+    // BeginArray/EndArray)". Record-admissibility (the record clause, same
+    // section) further requires the array be NON-OWNING: "a non-owning
+    // inline array [N]T/[N]T? of record-admissible element type" — an
+    // owning inline array (`[N owned]T`) is a move-only value type with a
+    // per-element disposal obligation that BeginArray/EndArray's plain
+    // element-encoding does not model, and no spec text admits it as a
+    // component in either the record or the class list, so it is rejected
+    // here for both (simplest reading of an otherwise-silent case; recorded
+    // per CLAUDE.md rule 4 — see issue #1065 for the record of this choice).
+    if (tr->kind == K::InlineArray) {
+        if (tr->arrayOwned) return false;
+        if (!tr->arrayElement) return false;
+        // Codegen restriction (issue #1065 follow-up, filed): the synthesized
+        // Deserialize's element-materialization loop (LlvmBackend_Serialization.cpp)
+        // constructs the inline array via a raw GEP-store loop that bypasses the
+        // `recordHasStringFields`/`emitRecordStringFieldReleases` retain/release
+        // bookkeeping (LlvmBackend_impl.hpp, fix #1747) — that bookkeeping only
+        // inspects a record's DIRECT storage members' kind (Primitive/String), so
+        // it does not see a `string` (or a string-bearing record/choice) nested
+        // inside an inline-array component. Admitting such an element type here
+        // would synthesize a Deserialize that leaks every array-element string on
+        // the caller's scope exit (verified: a `[N]string` field leaks 2
+        // allocations per round-trip under ASan/LSan). Excluded here, conservatively,
+        // until that retain/release walk is extended to recurse into inline
+        // arrays; primitives-other-than-string, enums, and nested non-owning
+        // inline arrays thereof carry no such obligation and are unaffected.
+        if (typeRiskingUnreleasedStringInInlineArray(tr->arrayElement))
+            return false;
+        return isSerializationEligibleType(tr->arrayElement, visited, ctx,
+                                            forRecordComponent);
+    }
+
     if (tr->kind != K::Named) return false;
 
     // §9.8 (v0.141): Shared<T> and Weak<T> are serialization-eligible component
@@ -5362,418 +6566,17 @@ void Resolver::checkSerializationEligibility() {
             continue;
         }
 
-        // Classes: §9.8 tier-2 eligibility checking.
-        if (isClass) {
-            if (!td->serializedClass) {
-                // §9.8 v0.141: after the synthesis pre-pass at the top of this
-                // function, a class with no clause here is fully hand-written
-                // (Serialize + Deserialize) — it satisfies the conformance
-                // without synthesis, so there is nothing to check.
-                continue;
-            }
-
-            // Class has a serialized-class clause. §9.8: eligibility requires
-            // every serialized component to itself be serialization-eligible.
-            // The serialized components of a class are its owned and value-typed
-            // fields and auto-properties in declaration order (§9.8).
-            // Per §9.8 v0.136: a borrowing (non-owned) class-typed field is a
-            // back-edge — eligible only under serialized graph/cyclic (tier 3+).
-            // For tier 2 (serialized tree), only owned and value-typed components
-            // are admitted.
-            //
-            // Hand-written suppression: if the class has hand-written Serialize
-            // AND hand-written Deserialize, no synthesis occurs — skip check.
-            bool hwS2 = typeHasHandWrittenMethod(t, "Serialize");
-            bool hwD2 = typeHasHandWrittenMethod(t, "Deserialize");
-            if (hwS2 && hwD2) continue;  // fully hand-written: always valid
-
-            // Check: ineligible polymorphic registered types (§9.8).
-            // A registered type that is not serialization-eligible is a compile
-            // error at the registry.  Also: each registered type must be
-            // assignable to (a subtype of) the declaring base class (§9.8:
-            // "each named type must be assignable to the declaring class").
-            const auto& scc = *td->serializedClass;
-            bool polyError = false;
-
-            // BFS subtype predicate: is `sub` a subtype of `base`?
-            // Used to enforce §9.8 assignability.
-            auto isSubtypeOf = [](const TypeSymbol* sub,
-                                  const TypeSymbol* base) -> bool {
-                if (!sub || !base) return false;
-                std::vector<const TypeSymbol*> frontier;
-                frontier.push_back(sub);
-                std::unordered_set<const TypeSymbol*> seen;
-                std::size_t i = 0;
-                while (i < frontier.size()) {
-                    const TypeSymbol* cur = frontier[i++];
-                    if (!seen.insert(cur).second) continue;
-                    if (cur == base) return true;
-                    for (TypeSymbol* b : cur->baseTypes) {
-                        if (b) frontier.push_back(b);
-                    }
-                }
-                return false;
-            };
-
-            for (const auto& pc : scc.polyCases) {
-                if (!pc.type) continue;
-                const TypeRef* pcTr = ctx_.resolvedType(*pc.type);
-                if (!pcTr || !pcTr->declaration) continue;
-                const TypeSymbol* pcTs = pcTr->declaration;
-                auto* pcTd = dynamic_cast<const ast::TypeDecl*>(pcTs->decl);
-                if (!pcTd || !pcTd->serializedClass) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t->declLoc,
-                        "class `" + std::string(t->name) + "` polymorphic "
-                        "registry: registered type `" + std::string(pcTs->name) +
-                        "` has no `serialized tree`/`graph`/`cyclic` clause and "
-                        "is not serialization-eligible (§9.8); add a graph-shape "
-                        "clause to the registered type");
-                    polyError = true;
-                    continue;
-                }
-                // §9.8: "each named type must be assignable to the declaring class"
-                if (!isSubtypeOf(pcTs, t)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t->declLoc,
-                        "class `" + std::string(t->name) + "` polymorphic "
-                        "registry: registered type `" + std::string(pcTs->name) +
-                        "` is not a subtype of `" + std::string(t->name) +
-                        "` (§9.8 — each registered type must be assignable to "
-                        "the declaring class)");
-                    polyError = true;
-                }
-            }
-
-            // §9.8: each discriminator must be a unique non-empty string literal
-            // within the clause.
-            if (!scc.polyCases.empty()) {
-                std::unordered_set<std::string> seenDiscs;
-                for (const auto& pc : scc.polyCases) {
-                    if (pc.discriminator.empty()) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, t->declLoc,
-                            "class `" + std::string(t->name) + "` polymorphic "
-                            "registry: discriminator must be a non-empty string "
-                            "literal (§9.8)");
-                        polyError = true;
-                        continue;
-                    }
-                    std::string disc(pc.discriminator);
-                    if (!seenDiscs.insert(disc).second) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, t->declLoc,
-                            "class `" + std::string(t->name) + "` polymorphic "
-                            "registry: discriminator \"" + disc + "\" is not "
-                            "unique within the clause (§9.8); each discriminator "
-                            "must appear exactly once");
-                        polyError = true;
-                    }
-                }
-            }
-
-            if (polyError) continue;   // skip component checks on registry errors
-
-            // Check component eligibility for owned/value fields and auto-props.
-            std::unordered_set<const TypeSymbol*> visited;
-            visited.insert(t);
-
-            auto reportIneligible = [&](std::string_view memberName,
-                                        std::string_view reason) {
-                ctx_.diagnostics().report(
-                    Severity::Error, t->declLoc,
-                    "class `" + std::string(t->name) + "` declares `ISerializable`/"
-                    "`IDeserializable` but is not serialization-eligible (§9.8): "
-                    "field `" + std::string(memberName) + "` " +
-                    std::string(reason) + "; remove the conformance declaration, "
-                    "mark the field `serialized skip`, make the field type "
-                    "serializable, or hand-write `Serialize`/`Deserialize`");
-            };
-
-            // Check owned class-typed fields and auto-properties whose types
-            // are class-typed.  A non-owned (borrowing) class-typed field is a
-            // back-edge; back-edges require tier-3 (serialized graph/cyclic back-
-            // edge serialization) and are not yet implemented.
-            bool foundBackEdge = false;
-            for (const Symbol* m : t->members) {
-                // Fields (FieldDecl).
-                auto* fs = dynamic_cast<const FieldSymbol*>(m);
-                if (fs) {
-                    auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-                    if (!fd) continue;
-                    // Check static: FieldDecl.modifiers contains "static".
-                    bool isStat = false;
-                    bool isOwned = false;
-                    for (auto mod : fd->modifiers) {
-                        if (mod == "static") isStat = true;
-                        if (mod == "owned")  isOwned = true;
-                    }
-                    if (isStat) continue;
-                    const TypeRef* tr = ctx_.resolvedType(*fd->type);
-                    if (!tr) continue;
-                    // §9.8 tier-boundary: a non-owned class-typed field is a
-                    // back-edge; back-edge serialization is tier 3 (not yet
-                    // implemented — issue #550 tier 3).
-                    bool fieldIsClass = (tr->kind == TypeRef::Kind::Named &&
-                                        tr->declaration &&
-                                        tr->declaration->kind ==
-                                            ast::TypeDeclKind::Class);
-                    // Nullable T?: peel and check inner.
-                    bool fieldIsNullableClass = false;
-                    if (!fieldIsClass && tr->nullable) {
-                        TypeRef inner = *tr; inner.nullable = false;
-                        fieldIsNullableClass =
-                            inner.kind == TypeRef::Kind::Named &&
-                            inner.declaration &&
-                            inner.declaration->kind == ast::TypeDeclKind::Class;
-                    }
-                    if ((fieldIsClass || fieldIsNullableClass) && !isOwned) {
-                        // §9.8 / tier 3: back-edge fields (non-owned class-typed
-                        // fields) are serialization-eligible under `serialized graph`
-                        // and `serialized cyclic` — they are written as tag references
-                        // and resolved from the tag→object table on deserialize.
-                        // Under `serialized tree`, aliasing is forbidden (back-edges
-                        // violate the tree assertion), so they remain an error there.
-                        if (scc.shape == "tree") {
-                            ctx_.diagnostics().report(
-                                Severity::Error, t->declLoc,
-                                "class `" + std::string(t->name) + "` (`serialized "
-                                "tree`): field `" + std::string(fs->name) +
-                                "` is a non-owned (borrowing) class-typed field "
-                                "(a back-edge); `serialized tree` forbids aliasing — "
-                                "mark the field `owned`, declare `serialized skip`, "
-                                "or change the clause to `serialized graph`");
-                            foundBackEdge = true;
-                            break;
-                        }
-                        // Under `serialized graph` / `serialized cyclic`:
-                        // back-edge is eligible (§9.8 tier 3 implemented).
-                        // Verify the target type has a graph-shape clause.
-                        const TypeSymbol* beDecl = tr->declaration;
-                        if (!beDecl && tr->nullable) beDecl = tr->declaration;
-                        if (beDecl) {
-                            auto* beTd = dynamic_cast<const ast::TypeDecl*>(beDecl->decl);
-                            if (!beTd || !beTd->serializedClass) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, t->declLoc,
-                                    "class `" + std::string(t->name) +
-                                    "` (`serialized " + std::string(scc.shape) +
-                                    "`): back-edge field `" + std::string(fs->name) +
-                                    "` has type `" + std::string(beDecl->name) +
-                                    "` which has no `serialized tree`/`graph`/`cyclic` "
-                                    "clause; the back-edge target must itself be "
-                                    "serialization-eligible (§9.8)");
-                                foundBackEdge = true;
-                                break;
-                            }
-                        }
-                        // Valid back-edge under graph/cyclic — continue.
-                        continue;
-                    }
-                    if (!isSerializationEligibleType(tr, visited, ctx_)) {
-                        reportIneligible(fs->name,
-                            "has a type that is not serialization-eligible");
-                        break;
-                    }
-                    continue;
-                }
-                // Auto-properties (PropertySymbol with auto backing).
-                if (!isAutoPropertySymbol(m)) continue;
-                auto* ps = dynamic_cast<const PropertySymbol*>(m);
-                if (!ps) continue;
-                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-                if (!pd) continue;
-                if (pd->serialized && pd->serialized->isSkip) continue;
-                // §2.15 v0.139: `serialized "xxx"` rename beginning with `$` reserved.
-                if (pd->serialized && !pd->serialized->name.empty() &&
-                    pd->serialized->name.front() == '$') {
-                    ctx_.diagnostics().report(
-                        Severity::Error, t->declLoc,
-                        "class `" + std::string(t->name) + "`: `serialized` "
-                        "rename `" + std::string(pd->serialized->name) +
-                        "` for property `" + std::string(m->name) +
-                        "` begins with `$`, which is reserved for JSON "
-                        "graph-identity tokens (§2.15 v0.139); choose a name "
-                        "that does not start with `$`");
-                    break;
-                }
-                if (!pd->type) continue;
-                const TypeRef* tr = ctx_.resolvedType(*pd->type);
-                if (!tr) continue;
-                if (!isSerializationEligibleType(tr, visited, ctx_)) {
-                    reportIneligible(m->name,
-                        "has a type that is not serialization-eligible");
-                    break;
-                }
-            }
-            if (foundBackEdge) continue;
-
-            // §9.8 / `serialized cyclic`: the constructor must be self-contained.
-            // Self-contained: assigns own fields from constructor params/value fields
-            // only.  MUST NOT: (1) read a back-edge field; (2) call any instance
-            // method on `this`; (3) let `this` escape; (4) call virtual/abstract.
-            // We check rule (2) — calling an instance method on `this` — which is
-            // detectable via a simple AST walk.
-            if (scc.shape == "cyclic") {
-                // Walk constructor bodies looking for `this.SomeMethod()` calls.
-                for (const Symbol* m : t->members) {
-                    auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
-                    if (!cs || cs->isStatic) continue;
-                    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-                    if (!cd) continue;
-
-                    if (stmtsContainThisMethodCall(cd->body)) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, t->declLoc,
-                            "class `" + std::string(t->name) + "` (`serialized "
-                            "cyclic`) constructor is not self-contained (§9.8): "
-                            "it calls an instance method on `this`, which is "
-                            "forbidden; the constructor may only assign own "
-                            "fields from constructor parameters and own value "
-                            "fields (§9.8, rule 2)");
-                        break;
-                    }
-                }
-            }
-
-            // §9.8 v0.136 constructor-selection check (applies when synthesis of
-            // Deserialize is needed — i.e. !hwD2).
-            // Rule: there must be exactly one non-static constructor whose
-            // parameter names match exactly the set of serialized component
-            // declared identifiers (bijection, order-insensitive, case-
-            // insensitive).  `serialized "<name>"` renames do NOT affect the
-            // match — which uses declared identifiers only (§9.8 v0.136).
-            // Case-insensitivity: Bezel convention is PascalCase fields and
-            // camelCase parameters; `id` and `Id` are treated as the same
-            // component name in the synthesized-Deserialize match.
-            //
-            // §9.8 tier-4 exception: a class with a non-empty `polymorphic`
-            // registry is a polymorphic base.  Its synthesized Deserialize is
-            // a pure dispatcher — it reads $type and delegates to the registered
-            // concrete type's Deserialize; it does NOT invoke any constructor on
-            // the base class itself.  Therefore the constructor-matching check
-            // does not apply to the declaring base.  Skip it.
-            if (!scc.polyCases.empty()) { /* skip ctor check for poly base */ }
-            else if (!hwD2) {
-                // Helper: fold to lowercase (ASCII).
-                auto toLower = [](std::string_view sv) {
-                    std::string r(sv);
-                    for (char& c : r)
-                        c = (char)std::tolower((unsigned char)c);
-                    return r;
-                };
-
-                // Collect the lowercased declared identifiers of ALL serialized
-                // components — including `serialized skip` ones.  Skip
-                // components are still passed to the constructor as default(T),
-                // so they count toward the parameter-name match.  What `skip`
-                // means is only that the value is not read/written on the wire;
-                // the param name must still appear in the ctor (§9.8 v0.136).
-                // For field members: FieldDecl.name (non-static).
-                // For auto-property members: the member name (all, skip or not).
-                std::unordered_set<std::string> compNamesLower;
-                std::vector<std::string> compNamesOrig;  // for error message
-                for (const Symbol* m : t->members) {
-                    auto* fs = dynamic_cast<const FieldSymbol*>(m);
-                    if (fs) {
-                        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
-                        if (!fd) continue;
-                        bool isStat = false;
-                        for (auto mod : fd->modifiers)
-                            if (mod == "static") { isStat = true; break; }
-                        if (isStat) continue;
-                        compNamesLower.insert(toLower(fd->name));
-                        compNamesOrig.push_back(std::string(fd->name));
-                        continue;
-                    }
-                    if (!isAutoPropertySymbol(m)) continue;
-                    auto* ps = dynamic_cast<const PropertySymbol*>(m);
-                    if (!ps) continue;
-                    // Include skip-marked auto-properties: skip means "don't
-                    // serialize" but the component still appears in the ctor.
-                    compNamesLower.insert(toLower(m->name));
-                    compNamesOrig.push_back(std::string(m->name));
-                }
-
-                // Collect non-static constructors and check which ones match.
-                std::vector<std::string> matchingCtors;  // for error message
-                std::vector<std::string> allCtors;
-                for (const Symbol* m : t->members) {
-                    auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
-                    if (!cs || cs->isStatic) continue;
-                    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-                    if (!cd) continue;
-
-                    // Build a string representation for the error message.
-                    std::string ctorDesc = "constructor(";
-                    for (unsigned pi = 0; pi < cd->params.size(); ++pi) {
-                        if (pi) ctorDesc += ", ";
-                        ctorDesc += std::string(cd->params[pi].name);
-                    }
-                    ctorDesc += ")";
-                    allCtors.push_back(ctorDesc);
-
-                    // Match: param count == component count AND every param
-                    // name (lowercased) appears in compNamesLower (bijection).
-                    if (cd->params.size() != compNamesLower.size()) continue;
-                    bool allMatch = true;
-                    for (const auto& p : cd->params) {
-                        if (compNamesLower.find(toLower(p.name)) ==
-                                compNamesLower.end()) {
-                            allMatch = false;
-                            break;
-                        }
-                    }
-                    if (allMatch) matchingCtors.push_back(ctorDesc);
-                }
-
-                if (matchingCtors.size() != 1) {
-                    // Build candidate list for the error message.
-                    std::string candidates;
-                    const auto& list = allCtors.empty() ? matchingCtors : allCtors;
-                    for (const auto& c : list) {
-                        if (!candidates.empty()) candidates += ", ";
-                        candidates += c;
-                    }
-                    if (candidates.empty()) candidates = "(none)";
-                    // Build component-set string for the error message.
-                    std::string compSet;
-                    for (const auto& n : compNamesOrig) {
-                        if (!compSet.empty()) compSet += ", ";
-                        compSet += n;
-                    }
-                    if (matchingCtors.size() == 0) {
-                        ctx_.diagnostics().report(
-                            Severity::Error, t->declLoc,
-                            "class `" + std::string(t->name) + "` declares "
-                            "`IDeserializable` (`serialized " +
-                            std::string(scc.shape) +
-                            "`): no constructor has parameter names matching "
-                            "the serialized component set {" + compSet +
-                            "} — candidates: " + candidates +
-                            " (§9.8 v0.136: constructor selection is by name, "
-                            "case-insensitive, order-insensitive)");
-                    } else {
-                        // >1 match
-                        std::string matchList;
-                        for (const auto& c : matchingCtors) {
-                            if (!matchList.empty()) matchList += ", ";
-                            matchList += c;
-                        }
-                        ctx_.diagnostics().report(
-                            Severity::Error, t->declLoc,
-                            "class `" + std::string(t->name) + "` declares "
-                            "`IDeserializable` (`serialized " +
-                            std::string(scc.shape) +
-                            "`): more than one constructor matches the serialized "
-                            "component set — ambiguous: " + matchList +
-                            " (§9.8 v0.136: the unique matching constructor is "
-                            "required)");
-                    }
-                }
-            }
-            continue;
-        }
+        // Classes: §9.8 tier-2 eligibility checking — MOVED to the late pass
+        // checkClassSerializationEligibilityLate() (see the declaration
+        // comment in TypeResolution_impl.hpp / #2325): the check needs
+        // FieldSymbol::posParamBodyRef, which ExprTypecheck computes AFTER
+        // resolveTypes() (this function) has already run. The PRE-PASS above
+        // (synthesizing td->serializedClass's tree/graph shape from field
+        // TYPES alone, which does not need posParam capture classification)
+        // still runs here, unchanged, because ExprTypecheck's own
+        // `.Serialize()`/`.Deserialize()` call resolution depends on that
+        // shape already being set.
+        if (isClass) continue;
 
         // Record: check hand-written suppression and then eligibility.
         // §9.8: "Hand-writing `Serialize` suppresses synthesis of that direction."
@@ -6012,6 +6815,614 @@ void Resolver::checkSerializationEligibility() {
 }
 
 // ---------------------------------------------------------------------------
+// Resolver::checkClassSerializationEligibilityLate  §9.8 / #2325
+//
+// The CLASS half of checkSerializationEligibility's component-eligibility and
+// constructor-selection checks (see that function's declaration comment,
+// TypeResolution_impl.hpp, for why this is a separate LATE pass called by the
+// driver after typecheckExpressions() rather than as part of resolveTypes()).
+// Logic is otherwise unchanged from the original (pre-#2325) class branch,
+// plus the #2325 posParam-capture handling: a primary-constructor parameter
+// captured into a private field (§11.1 — referenced in a body position, e.g.
+// `property Id: int => id;`) is a genuine serialized component (its type via
+// `posParam->type`, ownership via `posParam->modifier`), and the class's own
+// implicit PRIMARY constructor (`td->positionalFields`) is itself a
+// constructor-selection match candidate alongside any explicit
+// `constructor(...)` members (there is no ConstructorSymbol for it —
+// SymbolCollection.cpp creates one only for an explicit ast::ConstructorDecl).
+// ---------------------------------------------------------------------------
+void Resolver::checkClassSerializationEligibilityLate() {
+    if (!ctx_.module()) return;
+
+    for (Symbol* child : ctx_.module()->children) {
+        auto* t = dynamic_cast<TypeSymbol*>(child);
+        if (!t || t->kind != ast::TypeDeclKind::Class) continue;
+
+        auto* td = dynamic_cast<const ast::TypeDecl*>(t->decl);
+        if (!td) continue;
+
+        bool wantsIS = declaredConformance(*td, "ISerializable");
+        bool wantsID = declaredConformance(*td, "IDeserializable");
+        if (!wantsIS && !wantsID) continue;
+
+            if (!td->serializedClass) {
+                // §9.8 v0.141: after the synthesis pre-pass in
+                // checkSerializationEligibility, a class with no clause here
+                // is fully hand-written (Serialize + Deserialize) — it
+                // satisfies the conformance without synthesis, so there is
+                // nothing to check.
+                continue;
+            }
+
+            // Class has a serialized-class clause. §9.8: eligibility requires
+            // every serialized component to itself be serialization-eligible.
+            // The serialized components of a class are its owned and value-typed
+            // fields and auto-properties in declaration order (§9.8).
+            // Per §9.8 v0.136: a borrowing (non-owned) class-typed field is a
+            // back-edge — eligible only under serialized graph/cyclic (tier 3+).
+            // For tier 2 (serialized tree), only owned and value-typed components
+            // are admitted.
+            //
+            // Hand-written suppression: if the class has hand-written Serialize
+            // AND hand-written Deserialize, no synthesis occurs — skip check.
+            bool hwS2 = typeHasHandWrittenMethod(t, "Serialize");
+            bool hwD2 = typeHasHandWrittenMethod(t, "Deserialize");
+            if (hwS2 && hwD2) continue;  // fully hand-written: always valid
+
+            // §9.8 does not specify the inheritance × synthesis interaction
+            // (a documented spec silence — serialization_tier2_classes_test.cpp
+            // SILENCE-1). The synthesized Deserialize (emitClassDeserialize,
+            // LlvmBackend_Serialization.cpp) does not construct a base-class
+            // subobject at all on EITHER the primary-ctor or explicit-ctor
+            // construction path (no emitImplicitBase / base-ctor-chain call
+            // exists there) — so a derived class's INHERITED fields are
+            // silently left at their calloc-zeroed defaults on Deserialize.
+            // Verified reachable (not merely theoretical): `class Derived():
+            // Base(999), ISerializable, IDeserializable ... end;` compiles
+            // and RUNS, round-tripping Base's field as 0 instead of 999, with
+            // no diagnostic — instance-corrupting, not merely incomplete.
+            // Per the spec's governing principle for a shape an
+            // implementation cannot carry correctly (§2.8.2: "An
+            // implementation unable to carry some body shape ... must reject
+            // the export, or the import, with a diagnostic naming the shape;
+            // it must not alter the instantiation's semantics" — §2.8.2
+            // itself governs cross-module artifact interfaces, not
+            // serialization, but the same reasoning applies: silently
+            // altering semantics is strictly worse than a clean rejection),
+            // reject synthesis of Deserialize specifically for a class whose
+            // base chain actually carries storage, rather than emit a
+            // deserializer that silently corrupts the base portion of the
+            // instance. Serialize alone is UNAFFECTED and not rejected:
+            // writing an already-fully-constructed instance's inherited
+            // fields is sound today (collectInstanceStorage /
+            // emitClassSerialize already walk the base chain correctly —
+            // verified) — only CONSTRUCTION (Deserialize) has no
+            // base-subobject path. This turns the live corruption bug into a
+            // clean compile-time rejection until inheritance is supported
+            // (tracked: issue #2364).
+            //
+            // NOT a blanket "any base class" rejection: the §9.8 tier-4
+            // `polymorphic` pattern (serialization_tier2_classes_test.cpp)
+            // has an abstract base (`Shape`) that carries NO storage of its
+            // own (only the `polymorphic` registry — a member clause, not a
+            // field — and an abstract method) — a base with zero own
+            // components has nothing for Deserialize to lose, so it is not
+            // rejected here. `baseHasOwnStorage` walks the FULL base chain
+            // (mirroring collectInstanceStorage's own recursion) checking
+            // each level's OWN fields/auto-properties/captured posParams —
+            // any single level with storage is disqualifying.
+            auto classHasOwnStorage = [](const TypeSymbol* cls) -> bool {
+                for (const Symbol* m : cls->members) {
+                    auto* fs = dynamic_cast<const FieldSymbol*>(m);
+                    if (fs) {
+                        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                        if (fd) {
+                            bool isStat = false;
+                            for (auto mod : fd->modifiers)
+                                if (mod == "static") { isStat = true; break; }
+                            if (!isStat) return true;
+                        } else if (fs->posParam && fs->posParamBodyRef) {
+                            return true;
+                        }
+                        continue;
+                    }
+                    if (isAutoPropertySymbol(m)) return true;
+                }
+                return false;
+            };
+            bool needsDeserHere = wantsID && !hwD2;
+            bool hasBaseClass = !t->baseTypes.empty() &&
+                                t->baseTypes[0]->kind == ast::TypeDeclKind::Class;
+            bool baseHasOwnStorage = false;
+            if (hasBaseClass) {
+                for (const TypeSymbol* cur = t->baseTypes[0]; cur; ) {
+                    if (classHasOwnStorage(cur)) { baseHasOwnStorage = true; break; }
+                    cur = (!cur->baseTypes.empty() &&
+                           cur->baseTypes[0]->kind == ast::TypeDeclKind::Class)
+                              ? cur->baseTypes[0] : nullptr;
+                }
+            }
+            if (needsDeserHere && hasBaseClass && baseHasOwnStorage) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    "class `" + std::string(t->name) + "` declares "
+                    "`IDeserializable` and inherits from `" +
+                    std::string(t->baseTypes[0]->name) + "`, which carries "
+                    "its own serialized storage — synthesized class "
+                    "deserialization does not yet support inheritance over a "
+                    "base with storage (§9.8 does not specify base-class "
+                    "field construction, and the synthesized Deserialize "
+                    "does not construct the base subobject, which would "
+                    "silently leave inherited fields at their default value "
+                    "instead of the deserialized data — issue #2364); "
+                    "remove the `IDeserializable` conformance declaration, "
+                    "remove the base class, or hand-write a static "
+                    "`Deserialize` yourself");
+                continue;
+            }
+
+            // Check: ineligible polymorphic registered types (§9.8).
+            // A registered type that is not serialization-eligible is a compile
+            // error at the registry.  Also: each registered type must be
+            // assignable to (a subtype of) the declaring base class (§9.8:
+            // "each named type must be assignable to the declaring class").
+            const auto& scc = *td->serializedClass;
+            bool polyError = false;
+
+            // BFS subtype predicate: is `sub` a subtype of `base`?
+            // Used to enforce §9.8 assignability.
+            auto isSubtypeOf = [](const TypeSymbol* sub,
+                                  const TypeSymbol* base) -> bool {
+                if (!sub || !base) return false;
+                std::vector<const TypeSymbol*> frontier;
+                frontier.push_back(sub);
+                std::unordered_set<const TypeSymbol*> seen;
+                std::size_t i = 0;
+                while (i < frontier.size()) {
+                    const TypeSymbol* cur = frontier[i++];
+                    if (!seen.insert(cur).second) continue;
+                    if (cur == base) return true;
+                    for (TypeSymbol* b : cur->baseTypes) {
+                        if (b) frontier.push_back(b);
+                    }
+                }
+                return false;
+            };
+
+            for (const auto& pc : scc.polyCases) {
+                if (!pc.type) continue;
+                const TypeRef* pcTr = ctx_.resolvedType(*pc.type);
+                if (!pcTr || !pcTr->declaration) continue;
+                const TypeSymbol* pcTs = pcTr->declaration;
+                auto* pcTd = dynamic_cast<const ast::TypeDecl*>(pcTs->decl);
+                if (!pcTd || !pcTd->serializedClass) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "class `" + std::string(t->name) + "` polymorphic "
+                        "registry: registered type `" + std::string(pcTs->name) +
+                        "` has no `serialized tree`/`graph`/`cyclic` clause and "
+                        "is not serialization-eligible (§9.8); add a graph-shape "
+                        "clause to the registered type");
+                    polyError = true;
+                    continue;
+                }
+                // §9.8: "each named type must be assignable to the declaring class"
+                if (!isSubtypeOf(pcTs, t)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "class `" + std::string(t->name) + "` polymorphic "
+                        "registry: registered type `" + std::string(pcTs->name) +
+                        "` is not a subtype of `" + std::string(t->name) +
+                        "` (§9.8 — each registered type must be assignable to "
+                        "the declaring class)");
+                    polyError = true;
+                }
+            }
+
+            // §9.8: each discriminator must be a unique non-empty string literal
+            // within the clause.
+            if (!scc.polyCases.empty()) {
+                std::unordered_set<std::string> seenDiscs;
+                for (const auto& pc : scc.polyCases) {
+                    if (pc.discriminator.empty()) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` polymorphic "
+                            "registry: discriminator must be a non-empty string "
+                            "literal (§9.8)");
+                        polyError = true;
+                        continue;
+                    }
+                    std::string disc(pc.discriminator);
+                    if (!seenDiscs.insert(disc).second) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` polymorphic "
+                            "registry: discriminator \"" + disc + "\" is not "
+                            "unique within the clause (§9.8); each discriminator "
+                            "must appear exactly once");
+                        polyError = true;
+                    }
+                }
+            }
+
+            if (polyError) continue;   // skip component checks on registry errors
+
+            // Check component eligibility for owned/value fields and auto-props.
+            std::unordered_set<const TypeSymbol*> visited;
+            visited.insert(t);
+
+            auto reportIneligible = [&](std::string_view memberName,
+                                        std::string_view reason) {
+                ctx_.diagnostics().report(
+                    Severity::Error, t->declLoc,
+                    "class `" + std::string(t->name) + "` declares `ISerializable`/"
+                    "`IDeserializable` but is not serialization-eligible (§9.8): "
+                    "field `" + std::string(memberName) + "` " +
+                    std::string(reason) + "; remove the conformance declaration, "
+                    "mark the field `serialized skip`, make the field type "
+                    "serializable, or hand-write `Serialize`/`Deserialize`");
+            };
+
+            // Check owned class-typed fields and auto-properties whose types
+            // are class-typed.  A non-owned (borrowing) class-typed field is a
+            // back-edge; back-edges require tier-3 (serialized graph/cyclic back-
+            // edge serialization) and are not yet implemented.
+            //
+            // §9.8 / #2325: a class's serialized components are its `owned`
+            // and value-typed fields/auto-properties — which, for a class with
+            // PRIMARY-CONSTRUCTOR parameters (§11.1), includes any parameter
+            // CAPTURED into a private field (referenced in a body position —
+            // a method/property/constructor/destructor body — represented as
+            // a FieldSymbol with `posParam` set and `posParamBodyRef == true`,
+            // since fs->decl for such a symbol is the owning TypeDecl, not a
+            // FieldDecl — see the FieldSymbol comment in Symbol.hpp). A
+            // parameter referenced ONLY in an initializer position generates
+            // no field of its own (§11.1) — its value flows into whichever
+            // explicit field consumes it, which is already counted there — so
+            // it is excluded here to avoid double-counting. This resolves
+            // against the stdlib §2.14 `Order` worked example, which
+            // serializes `Id` via a captured `id` (a primary-ctor param read
+            // only from `property Id: int => id;`), while `customer`/`lines`
+            // — consumed only by the explicit `Customer`/`Lines` field
+            // initializers — are not themselves separately counted.
+            auto checkComponentType = [&](std::string_view fieldName,
+                                          const TypeRef* tr,
+                                          bool isOwned) -> int {
+                // 0 = eligible; 1 = back-edge OK (not disqualifying);
+                // 2 = error (already reported; caller sets foundBackEdge).
+                bool fieldIsClass = (tr->kind == TypeRef::Kind::Named &&
+                                    tr->declaration &&
+                                    tr->declaration->kind ==
+                                        ast::TypeDeclKind::Class);
+                // Nullable T?: peel and check inner.
+                bool fieldIsNullableClass = false;
+                if (!fieldIsClass && tr->nullable) {
+                    TypeRef inner = *tr; inner.nullable = false;
+                    fieldIsNullableClass =
+                        inner.kind == TypeRef::Kind::Named &&
+                        inner.declaration &&
+                        inner.declaration->kind == ast::TypeDeclKind::Class;
+                }
+                if ((fieldIsClass || fieldIsNullableClass) && !isOwned) {
+                    // §9.8 / tier 3: back-edge fields (non-owned class-typed
+                    // fields) are serialization-eligible under `serialized graph`
+                    // and `serialized cyclic` — they are written as tag references
+                    // and resolved from the tag→object table on deserialize.
+                    // Under `serialized tree`, aliasing is forbidden (back-edges
+                    // violate the tree assertion), so they remain an error there.
+                    if (scc.shape == "tree") {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` (`serialized "
+                            "tree`): field `" + std::string(fieldName) +
+                            "` is a non-owned (borrowing) class-typed field "
+                            "(a back-edge); `serialized tree` forbids aliasing — "
+                            "mark the field `owned`, declare `serialized skip`, "
+                            "or change the clause to `serialized graph`");
+                        return 2;
+                    }
+                    // Under `serialized graph` / `serialized cyclic`:
+                    // back-edge is eligible (§9.8 tier 3 implemented).
+                    // Verify the target type has a graph-shape clause.
+                    const TypeSymbol* beDecl = tr->declaration;
+                    if (!beDecl && tr->nullable) beDecl = tr->declaration;
+                    if (beDecl) {
+                        auto* beTd = dynamic_cast<const ast::TypeDecl*>(beDecl->decl);
+                        if (!beTd || !beTd->serializedClass) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, t->declLoc,
+                                "class `" + std::string(t->name) +
+                                "` (`serialized " + std::string(scc.shape) +
+                                "`): back-edge field `" + std::string(fieldName) +
+                                "` has type `" + std::string(beDecl->name) +
+                                "` which has no `serialized tree`/`graph`/`cyclic` "
+                                "clause; the back-edge target must itself be "
+                                "serialization-eligible (§9.8)");
+                            return 2;
+                        }
+                    }
+                    // Valid back-edge under graph/cyclic.
+                    return 1;
+                }
+                if (!isSerializationEligibleType(tr, visited, ctx_)) {
+                    reportIneligible(fieldName,
+                        "has a type that is not serialization-eligible");
+                    return 2;
+                }
+                return 0;
+            };
+
+            bool foundBackEdge = false;
+            for (const Symbol* m : t->members) {
+                // Fields (FieldDecl).
+                auto* fs = dynamic_cast<const FieldSymbol*>(m);
+                if (fs) {
+                    auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                    if (!fd) {
+                        // §9.8 / #2325: a primary-constructor-parameter-
+                        // derived FieldSymbol (see the comment above) — only
+                        // a CAPTURED one is a real serialized component.
+                        if (!fs->posParam || !fs->posParamBodyRef) continue;
+                        if (!fs->posParam->type) continue;
+                        const TypeRef* tr = ctx_.resolvedType(*fs->posParam->type);
+                        if (!tr) continue;
+                        bool isOwned = fs->posParam->modifier == "owned";
+                        int r = checkComponentType(fs->name, tr, isOwned);
+                        if (r == 2) { foundBackEdge = true; break; }
+                        continue;
+                    }
+                    // Check static: FieldDecl.modifiers contains "static".
+                    bool isStat = false;
+                    bool isOwned = false;
+                    for (auto mod : fd->modifiers) {
+                        if (mod == "static") isStat = true;
+                        if (mod == "owned")  isOwned = true;
+                    }
+                    if (isStat) continue;
+                    const TypeRef* tr = ctx_.resolvedType(*fd->type);
+                    if (!tr) continue;
+                    int r = checkComponentType(fs->name, tr, isOwned);
+                    if (r == 2) { foundBackEdge = true; break; }
+                    continue;
+                }
+                // Auto-properties (PropertySymbol with auto backing).
+                if (!isAutoPropertySymbol(m)) continue;
+                auto* ps = dynamic_cast<const PropertySymbol*>(m);
+                if (!ps) continue;
+                auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                if (!pd) continue;
+                if (pd->serialized && pd->serialized->isSkip) continue;
+                // §2.15 v0.139: `serialized "xxx"` rename beginning with `$` reserved.
+                if (pd->serialized && !pd->serialized->name.empty() &&
+                    pd->serialized->name.front() == '$') {
+                    ctx_.diagnostics().report(
+                        Severity::Error, t->declLoc,
+                        "class `" + std::string(t->name) + "`: `serialized` "
+                        "rename `" + std::string(pd->serialized->name) +
+                        "` for property `" + std::string(m->name) +
+                        "` begins with `$`, which is reserved for JSON "
+                        "graph-identity tokens (§2.15 v0.139); choose a name "
+                        "that does not start with `$`");
+                    break;
+                }
+                if (!pd->type) continue;
+                const TypeRef* tr = ctx_.resolvedType(*pd->type);
+                if (!tr) continue;
+                if (!isSerializationEligibleType(tr, visited, ctx_)) {
+                    reportIneligible(m->name,
+                        "has a type that is not serialization-eligible");
+                    break;
+                }
+            }
+            if (foundBackEdge) continue;
+
+            // §9.8 / `serialized cyclic`: the constructor must be self-contained.
+            // Self-contained: assigns own fields from constructor params/value fields
+            // only.  MUST NOT: (1) read a back-edge field; (2) call any instance
+            // method on `this`; (3) let `this` escape; (4) call virtual/abstract.
+            // We check rule (2) — calling an instance method on `this` — which is
+            // detectable via a simple AST walk.
+            if (scc.shape == "cyclic") {
+                // Walk constructor bodies looking for `this.SomeMethod()` calls.
+                for (const Symbol* m : t->members) {
+                    auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
+                    if (!cs || cs->isStatic) continue;
+                    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                    if (!cd) continue;
+
+                    if (stmtsContainThisMethodCall(cd->body)) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` (`serialized "
+                            "cyclic`) constructor is not self-contained (§9.8): "
+                            "it calls an instance method on `this`, which is "
+                            "forbidden; the constructor may only assign own "
+                            "fields from constructor parameters and own value "
+                            "fields (§9.8, rule 2)");
+                        break;
+                    }
+                }
+            }
+
+            // §9.8 v0.136 constructor-selection check (applies when synthesis of
+            // Deserialize is needed — i.e. !hwD2).
+            // Rule: there must be exactly one non-static constructor whose
+            // parameter names match exactly the set of serialized component
+            // declared identifiers (bijection, order-insensitive, case-
+            // insensitive).  `serialized "<name>"` renames do NOT affect the
+            // match — which uses declared identifiers only (§9.8 v0.136).
+            // Case-insensitivity: Bezel convention is PascalCase fields and
+            // camelCase parameters; `id` and `Id` are treated as the same
+            // component name in the synthesized-Deserialize match.
+            //
+            // §9.8 tier-4 exception: a class with a non-empty `polymorphic`
+            // registry is a polymorphic base.  Its synthesized Deserialize is
+            // a pure dispatcher — it reads $type and delegates to the registered
+            // concrete type's Deserialize; it does NOT invoke any constructor on
+            // the base class itself.  Therefore the constructor-matching check
+            // does not apply to the declaring base.  Skip it.
+            if (!scc.polyCases.empty()) { /* skip ctor check for poly base */ }
+            else if (!hwD2) {
+                // Helper: fold to lowercase (ASCII).
+                auto toLower = [](std::string_view sv) {
+                    std::string r(sv);
+                    for (char& c : r)
+                        c = (char)std::tolower((unsigned char)c);
+                    return r;
+                };
+
+                // Collect the lowercased declared identifiers of ALL serialized
+                // components — including `serialized skip` ones.  Skip
+                // components are still passed to the constructor as default(T),
+                // so they count toward the parameter-name match.  What `skip`
+                // means is only that the value is not read/written on the wire;
+                // the param name must still appear in the ctor (§9.8 v0.136).
+                // For field members: FieldDecl.name (non-static).
+                // For auto-property members: the member name (all, skip or not).
+                std::unordered_set<std::string> compNamesLower;
+                std::vector<std::string> compNamesOrig;  // for error message
+                for (const Symbol* m : t->members) {
+                    auto* fs = dynamic_cast<const FieldSymbol*>(m);
+                    if (fs) {
+                        auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl);
+                        if (!fd) {
+                            // §9.8 / #2325: a captured primary-ctor-param
+                            // field (see the eligibility-loop comment above)
+                            // is a genuine serialized component too.
+                            if (fs->posParam && fs->posParamBodyRef) {
+                                compNamesLower.insert(toLower(fs->name));
+                                compNamesOrig.push_back(std::string(fs->name));
+                            }
+                            continue;
+                        }
+                        bool isStat = false;
+                        for (auto mod : fd->modifiers)
+                            if (mod == "static") { isStat = true; break; }
+                        if (isStat) continue;
+                        compNamesLower.insert(toLower(fd->name));
+                        compNamesOrig.push_back(std::string(fd->name));
+                        continue;
+                    }
+                    if (!isAutoPropertySymbol(m)) continue;
+                    auto* ps = dynamic_cast<const PropertySymbol*>(m);
+                    if (!ps) continue;
+                    // Include skip-marked auto-properties: skip means "don't
+                    // serialize" but the component still appears in the ctor.
+                    compNamesLower.insert(toLower(m->name));
+                    compNamesOrig.push_back(std::string(m->name));
+                }
+
+                // Collect non-static constructors and check which ones match.
+                std::vector<std::string> matchingCtors;  // for error message
+                std::vector<std::string> allCtors;
+
+                // §9.8 / #2325: a class's PRIMARY constructor (§11.1) — its
+                // parameter list is `td->positionalFields` — is itself a
+                // match candidate alongside any explicit `constructor(...)`
+                // declarations. There is no separate ConstructorSymbol for
+                // it (SymbolCollection.cpp creates one only for an explicit
+                // ast::ConstructorDecl), so it is checked here directly from
+                // the AST, using the exact same bijection rule as below.
+                if (td->hasPositionalFields) {
+                    std::string ctorDesc = "constructor(";
+                    for (unsigned pi = 0; pi < td->positionalFields.size(); ++pi) {
+                        if (pi) ctorDesc += ", ";
+                        ctorDesc += std::string(td->positionalFields[pi].name);
+                    }
+                    ctorDesc += ")";
+                    allCtors.push_back(ctorDesc);
+                    if (td->positionalFields.size() == compNamesLower.size()) {
+                        bool allMatch = true;
+                        for (const auto& pf : td->positionalFields) {
+                            if (compNamesLower.find(toLower(pf.name)) ==
+                                    compNamesLower.end()) {
+                                allMatch = false;
+                                break;
+                            }
+                        }
+                        if (allMatch) matchingCtors.push_back(ctorDesc);
+                    }
+                }
+
+                for (const Symbol* m : t->members) {
+                    auto* cs = dynamic_cast<const sema::ConstructorSymbol*>(m);
+                    if (!cs || cs->isStatic) continue;
+                    auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+                    if (!cd) continue;
+
+                    // Build a string representation for the error message.
+                    std::string ctorDesc = "constructor(";
+                    for (unsigned pi = 0; pi < cd->params.size(); ++pi) {
+                        if (pi) ctorDesc += ", ";
+                        ctorDesc += std::string(cd->params[pi].name);
+                    }
+                    ctorDesc += ")";
+                    allCtors.push_back(ctorDesc);
+
+                    // Match: param count == component count AND every param
+                    // name (lowercased) appears in compNamesLower (bijection).
+                    if (cd->params.size() != compNamesLower.size()) continue;
+                    bool allMatch = true;
+                    for (const auto& p : cd->params) {
+                        if (compNamesLower.find(toLower(p.name)) ==
+                                compNamesLower.end()) {
+                            allMatch = false;
+                            break;
+                        }
+                    }
+                    if (allMatch) matchingCtors.push_back(ctorDesc);
+                }
+
+                if (matchingCtors.size() != 1) {
+                    // Build candidate list for the error message.
+                    std::string candidates;
+                    const auto& list = allCtors.empty() ? matchingCtors : allCtors;
+                    for (const auto& c : list) {
+                        if (!candidates.empty()) candidates += ", ";
+                        candidates += c;
+                    }
+                    if (candidates.empty()) candidates = "(none)";
+                    // Build component-set string for the error message.
+                    std::string compSet;
+                    for (const auto& n : compNamesOrig) {
+                        if (!compSet.empty()) compSet += ", ";
+                        compSet += n;
+                    }
+                    if (matchingCtors.size() == 0) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` declares "
+                            "`IDeserializable` (`serialized " +
+                            std::string(scc.shape) +
+                            "`): no constructor has parameter names matching "
+                            "the serialized component set {" + compSet +
+                            "} — candidates: " + candidates +
+                            " (§9.8 v0.136: constructor selection is by name, "
+                            "case-insensitive, order-insensitive)");
+                    } else {
+                        // >1 match
+                        std::string matchList;
+                        for (const auto& c : matchingCtors) {
+                            if (!matchList.empty()) matchList += ", ";
+                            matchList += c;
+                        }
+                        ctx_.diagnostics().report(
+                            Severity::Error, t->declLoc,
+                            "class `" + std::string(t->name) + "` declares "
+                            "`IDeserializable` (`serialized " +
+                            std::string(scc.shape) +
+                            "`): more than one constructor matches the serialized "
+                            "component set — ambiguous: " + matchList +
+                            " (§9.8 v0.136: the unique matching constructor is "
+                            "required)");
+                    }
+                }
+            }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // §22.12 rules 2 and 4 (v0.163, #1363; two-form admission v0.181, #1556):
 // statics-and-domains checks.
 // ---------------------------------------------------------------------------
@@ -6108,6 +7519,144 @@ static std::string staticRefTypeName(const TypeRef* rt) {
     return rt ? std::string(rt->headName()) : std::string();
 }
 
+// ---------------------------------------------------------------------------
+// §22.12 rule 2 forms (iii)/(iv) and the residual error categories (#1393
+// warned-admission ruling, spec v0.221 -> v0.228 text unchanged): the
+// primitive/enum/plain-inline-array warned admission, the owning-inline-array
+// static FIELD warned admission, and the compile-error residual (`string`,
+// records, choices, value builtins, function types, generic-parameter types,
+// disqualified inline arrays, and inline-array-typed auto-properties). This
+// governs every mutable static NOT already handled by the class/interface
+// path above (isRule2GovernedReference) — i.e. primitives, enums, records,
+// choices, value builtins, `string`, function types, generic-parameter
+// types, the unit type, and inline arrays of any of these.
+// ---------------------------------------------------------------------------
+
+// §22.12 rule 2 form (iii) primitive/enum leg: a primitive value type
+// (§3.1 — bool, the integer types, float, double, decimal, char; `string`
+// and `Object` excluded) or a user-declared enum type. `nullable` is a flag
+// on the SAME TypeRef (not a distinct Kind), so the nullable form of either
+// is covered with no extra check.
+static bool isForm3PrimitiveOrEnum(const TypeRef* rt) {
+    if (!rt) return false;
+    if (rt->kind == TypeRef::Kind::Primitive)
+        return rt->primitive != PrimitiveType::String &&
+               rt->primitive != PrimitiveType::Object &&
+               rt->primitive != PrimitiveType::None;
+    if (rt->kind == TypeRef::Kind::Named && rt->declaration)
+        return rt->declaration->kind == ast::TypeDeclKind::Enum;
+    return false;
+}
+
+// §22.12 rule 2 form (iii) inline-array leg (fields only, gated by the
+// caller): a plain inline array (`[N]T`, no `owned` slot marker, §15.1)
+// whose element type is itself, recursively, form-(iii)-eligible. §15.1
+// currently forbids an inline array being the element of another inline
+// array (`[N][M]T` is a compile error), so the recursive arm is unreachable
+// today; it is kept because the spec text states the admission recursively
+// and a future multi-dimensional-array revision should not have to
+// rediscover this.
+static bool isForm3EligiblePlainInlineArray(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::InlineArray) return false;
+    if (rt->arrayOwned) return false;
+    const TypeRef* elem = rt->arrayElement;
+    if (!elem) return false;
+    return isForm3PrimitiveOrEnum(elem) || isForm3EligiblePlainInlineArray(elem);
+}
+
+// §22.12 rule 2 residual: `string`/`string?`.
+static bool isStringTypeRef(const TypeRef* rt) {
+    return rt && rt->kind == TypeRef::Kind::Primitive &&
+           rt->primitive == PrimitiveType::String;
+}
+
+// §22.12 rule 2 residual: a user-declared record type.
+static bool isRecordTypeRef(const TypeRef* rt) {
+    return rt && rt->kind == TypeRef::Kind::Named && rt->declaration &&
+           rt->declaration->kind == ast::TypeDeclKind::Record;
+}
+
+// §22.12 rule 2 residual: a user-declared choice type (§35).
+static bool isChoiceTypeRef(const TypeRef* rt) {
+    return rt && rt->kind == TypeRef::Kind::Named && rt->declaration &&
+           rt->declaration->kind == ast::TypeDeclKind::Choice;
+}
+
+// §22.12 rule 2 residual: a compiler-known value-builtin type (DateTime,
+// Guid, TimeSpan, CancellationToken, Range, …). Mirrors the two shapes these
+// reach TypeResolution as (SemaContext.hpp's isValueBuiltinByName doc
+// comment): a synthesized TypeSymbol with isValueBuiltin=true (reached via
+// ExprTypecheck's `new T()` inference), or — the shape a declared static
+// FIELD/property's type actually resolves to — a Named TypeRef with
+// declaration=null whose syntactic head is one of the registered names.
+static bool isValueBuiltinTypeRef(const TypeRef* rt) {
+    if (!rt || rt->kind != TypeRef::Kind::Named) return false;
+    if (rt->declaration) return rt->declaration->isValueBuiltin;
+    return isValueBuiltinByName(rt->headName());
+}
+
+// Primitive-type keyword spelling for diagnostics (mirrors
+// ExprTypecheck_Calls.cpp's file-local spellTypeRefForDiag switch, which is
+// not visible from this translation unit).
+static const char* primitiveKeyword(PrimitiveType p) {
+    switch (p) {
+        case PrimitiveType::Bool:    return "bool";
+        case PrimitiveType::Char:    return "char";
+        case PrimitiveType::String:  return "string";
+        case PrimitiveType::Byte:    return "byte";
+        case PrimitiveType::SByte:   return "sbyte";
+        case PrimitiveType::Short:   return "short";
+        case PrimitiveType::UShort:  return "ushort";
+        case PrimitiveType::Int:     return "int";
+        case PrimitiveType::UInt:    return "uint";
+        case PrimitiveType::Long:    return "long";
+        case PrimitiveType::ULong:   return "ulong";
+        case PrimitiveType::Float:   return "float";
+        case PrimitiveType::Double:  return "double";
+        case PrimitiveType::Decimal: return "decimal";
+        case PrimitiveType::Object:  return "Object";
+        default:                     return "?";
+    }
+}
+
+// Display spelling of a static field/property's VALUE-kind type for a
+// diagnostic (primitives, enums/records/choices/value-builtins, inline
+// arrays, function types, the unit type) — the counterpart to
+// staticRefTypeName above, which only handles the reference-type path.
+static std::string describeStaticValueType(const TypeRef* rt) {
+    if (!rt) return "?";
+    switch (rt->kind) {
+        case TypeRef::Kind::Primitive: {
+            std::string s(primitiveKeyword(rt->primitive));
+            if (rt->nullable) s += '?';
+            return s;
+        }
+        case TypeRef::Kind::Named: {
+            std::string s = rt->declaration ? std::string(rt->declaration->name)
+                                            : std::string(rt->headName());
+            if (s.empty()) s = "?";
+            if (rt->nullable) s += '?';
+            return s;
+        }
+        case TypeRef::Kind::InlineArray: {
+            std::string s = "[";
+            s += rt->arraySizeValue >= 0 ? std::to_string(rt->arraySizeValue)
+                                          : "N";
+            if (rt->arrayOwned) s += " owned";
+            s += "]";
+            s += describeStaticValueType(rt->arrayElement);
+            return s;
+        }
+        case TypeRef::Kind::Function:
+            return "<function type>";
+        case TypeRef::Kind::Unit:
+            return "()";
+        case TypeRef::Kind::Error:
+            return "?";
+    }
+    return "?";
+}
+
 void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
     // §22.12 rule 2 (v0.181, #1556): a mutable static reference field/property is
     // a compile error unless its type is a form-(i) synchronized handle or a
@@ -6144,6 +7693,155 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             "domain or ensure its own internal synchronization "
             "(§22.12 rule 4, #1363)");
     };
+    // §22.12 rule 2 forms (iii)/(iv) + residual (#1393 warned-admission
+    // ruling): a mutable static NOT governed by the class/interface path
+    // above (isRule2GovernedReference) is a primitive/enum/plain-inline-array
+    // (form iii, WARNING), an owning-inline-array FIELD (form iv, WARNING),
+    // or one of the residual categories the ruling declined to admit
+    // (`string`, records, choices, value builtins, function types,
+    // generic-parameter types, disqualified inline arrays, and any
+    // inline-array-typed auto-property) — a compile ERROR naming rule 2.
+    // `isField` distinguishes the FIELDS-only admission of (iii)'s
+    // inline-array leg and all of (iv) from the auto-property case, where
+    // every inline-array shape is a residual error regardless of element
+    // type or `owned`-ness.
+    auto reportValueStatic = [&](const TypeRef* rt, std::string_view name,
+                                 std::string_view what, SourceLocation loc,
+                                 bool isField) {
+        if (!rt || rt->kind == TypeRef::Kind::Error) return;
+
+        // A static whose declared type is one of the ENCLOSING TYPE's generic
+        // parameters (`T`, `T?`) is deliberately left at status quo — no
+        // warning, no error. §22.12 rule 2 enumerates its admitted forms by
+        // TYPE, and a bare type parameter has no single one: the same
+        // declaration is a primitive static in `Holder<int>` (form (iii)) and
+        // a class-typed one in `Holder<Cell>` (rule 2's residual error), so
+        // the category is only decided per monomorphization. Rule 2's prose
+        // names no form for it, and diagnosing at the DECLARATION — the only
+        // site this check runs at — would have to assume one instantiation
+        // for all. Erroring here regressed the pre-existing spec-cited
+        // `generic_static_state_536` round-trip cases (§22.12/§28.5), which
+        // exercise exactly `public static owned shared: T?;`.
+        // Per CLAUDE.md rule 1 this is left to a ruling rather than settled
+        // in the implementation: see #2331.
+        if (rt->kind == TypeRef::Kind::Named && !rt->declaration) {
+            for (Symbol* gp : t->genericParams) {
+                if (gp && gp->name == rt->headName()) return;
+            }
+        }
+
+        // Form (iii) primitive/enum leg — admitted for fields AND
+        // auto-properties alike; the "fields only" qualifier in the spec
+        // text scopes only the inline-array alternative below.
+        if (isForm3PrimitiveOrEnum(rt)) {
+            ctx_.diagnostics().report(
+                Severity::Warning, loc,
+                std::string("mutable static ") + std::string(what) + " `" +
+                std::string(name) + "` has type `" +
+                describeStaticValueType(rt) + "` — a primitive/enum value "
+                "static is admitted only with a declaration-site warning "
+                "(§22.12 rule 2 form (iii)): the storage is process-global "
+                "and reachable from every domain; confine every read and "
+                "write to one domain, or use a synchronized spelling "
+                "(`AtomicInteger<T>`/`Atomic<T>` for the cell-sized "
+                "primitives, a `Mutex`/`Locked<T>` cell for `decimal` and "
+                "enums) (§22.12 rule 2, v0.221, #1393)");
+            return;
+        }
+
+        // Inline-array-typed statics: (iii)'s array leg and all of (iv) are
+        // FIELDS only — an inline-array-typed auto-property is a residual
+        // error regardless of element type or `owned`-ness.
+        if (rt->kind == TypeRef::Kind::InlineArray) {
+            if (!isField) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    std::string("mutable static ") + std::string(what) +
+                    " `" + std::string(name) + "` has inline-array type `" +
+                    describeStaticValueType(rt) + "`; §22.12 rule 2 admits "
+                    "inline-array-typed mutable statics for FIELDS only "
+                    "(forms (iii)/(iv)) — an inline-array-typed auto-"
+                    "property is not admitted (§22.12 rule 2, v0.221, "
+                    "#1393)");
+                return;
+            }
+            if (rt->arrayOwned) {
+                ctx_.diagnostics().report(
+                    Severity::Warning, loc,
+                    std::string("mutable static ") + std::string(what) +
+                    " `" + std::string(name) +
+                    "` has owning-inline-array type `" +
+                    describeStaticValueType(rt) + "` — admitted with a "
+                    "declaration-site warning (§22.12 rule 2 form (iv)): "
+                    "the array's owned instances are reachable from every "
+                    "domain and its slots are mutable; confine every slot "
+                    "read/write, `move arr[j]`, and whole-field "
+                    "reassignment to one domain, or restructure behind a "
+                    "`Locked<T>` registry (§22.12 rule 2, v0.221, #1393)");
+                return;
+            }
+            if (isForm3EligiblePlainInlineArray(rt)) {
+                ctx_.diagnostics().report(
+                    Severity::Warning, loc,
+                    std::string("mutable static ") + std::string(what) +
+                    " `" + std::string(name) + "` has type `" +
+                    describeStaticValueType(rt) + "` — a plain inline array "
+                    "of primitive/enum element type is admitted only with "
+                    "a declaration-site warning (§22.12 rule 2 form (iii)): "
+                    "confine every read and write to one domain, or use a "
+                    "`Mutex`/`Locked<T>` cell (§22.12 rule 2, v0.221, "
+                    "#1393)");
+                return;
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("mutable static ") + std::string(what) + " `" +
+                std::string(name) + "` has type `" +
+                describeStaticValueType(rt) + "`, which §22.12 rule 2 does "
+                "not admit as a mutable static — a plain inline array's "
+                "element type is outside the primitive/enum recursion (a "
+                "`string`- or record-element array imports its element "
+                "category's dilemma; a class- or interface-element array "
+                "carries borrows, whose cross-domain dangling is memory-"
+                "unsafe) (§22.12 rule 2, v0.221, #1393)");
+            return;
+        }
+
+        // Residual: `string`, records, choices, value builtins, function
+        // types, generic-parameter types, the unit type — none admitted.
+        std::string_view reason;
+        if (isStringTypeRef(rt))
+            reason = "a `string`(-bearing) static's overwrite must either "
+                     "release the displaced referent (a cross-domain "
+                     "use-after-free) or never release it (an unbounded "
+                     "leak); use a `Mutex`/`Locked<T>` cell instead";
+        else if (isRecordTypeRef(rt))
+            reason = "a multi-word record static's torn cross-domain read "
+                     "can fabricate a value violating the record's own "
+                     "invariants; use a `Mutex`/`Locked<T>` cell instead";
+        else if (isChoiceTypeRef(rt))
+            reason = "a multi-word choice static's torn cross-domain read "
+                     "can fabricate an invalid value; use a "
+                     "`Mutex`/`Locked<T>` cell instead";
+        else if (isValueBuiltinTypeRef(rt))
+            reason = "compiler-known value-builtin types (DateTime, Guid, "
+                     "\xE2\x80\xA6) are not in the admitted category set; "
+                     "use a `Mutex`/`Locked<T>` cell instead";
+        else if (rt->kind == TypeRef::Kind::Function)
+            reason = "function-typed statics are not in the admitted "
+                     "category set";
+        else
+            reason = "the admitted category set (primitive/enum value "
+                     "statics, owning-inline-array fields, or the "
+                     "form-(i)/(ii) synchronized-handle/task-cache "
+                     "reference forms) does not include this type";
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            std::string("mutable static ") + std::string(what) + " `" +
+            std::string(name) + "` has type `" + describeStaticValueType(rt) +
+            "`, which §22.12 rule 2 does not admit as a mutable static — " +
+            std::string(reason) + " (§22.12 rule 2, v0.221, #1393)");
+    };
 
     for (Symbol* m : t->members) {
         // Check FieldSymbol (body fields, not positional record fields).
@@ -6155,10 +7853,15 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             const TypeRef* rt = ctx_.resolvedType(*fd->type);
             if (!rt) continue;
 
-            if (!hasMod(fs, "readonly"))
-                reportRule2(rt, fs->name, "field", m->declLoc);
-            else
+            if (!hasMod(fs, "readonly")) {
+                if (isRule2GovernedReference(rt))
+                    reportRule2(rt, fs->name, "field", m->declLoc);
+                else
+                    reportValueStatic(rt, fs->name, "field", m->declLoc,
+                                      /*isField=*/true);
+            } else {
                 reportRule4(rt, fs->name, "field", m->declLoc);
+            }
             continue;
         }
 
@@ -6174,10 +7877,15 @@ void Resolver::checkTypeStaticFieldDomains(TypeSymbol* t) {
             const TypeRef* rt = ctx_.resolvedType(*pd->type);
             if (!rt) continue;
 
-            if (!hasMod(ps, "readonly"))
-                reportRule2(rt, ps->name, "property", m->declLoc);
-            else
+            if (!hasMod(ps, "readonly")) {
+                if (isRule2GovernedReference(rt))
+                    reportRule2(rt, ps->name, "property", m->declLoc);
+                else
+                    reportValueStatic(rt, ps->name, "property", m->declLoc,
+                                      /*isField=*/false);
+            } else {
                 reportRule4(rt, ps->name, "property", m->declLoc);
+            }
         }
     }
 }

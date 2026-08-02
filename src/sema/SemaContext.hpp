@@ -26,6 +26,27 @@
 
 namespace bezel::sema {
 
+// fix #2391 (§14.2/§2.8.2, v0.236): constraints on an IMPORTED generic base
+// method's type parameters — reconstructed from MetaMember::genericParams's
+// per-param `constraintTypes`/`specialConstraints` payload (which the metadata
+// builder has carried since #1579/v0.182). The loader stashes one entry per
+// generic parameter, positionally aligned with `MethodSymbol::genericParams`,
+// so `Resolver::checkOverrideSignatureMatch`'s §14.2 override-restatement
+// check can compare against an imported generic base method's clause set the
+// way it already does against a same-module base's `ast::GenericConstraint`
+// set. The metadata builder folds the modifier form (`where T is owned`) into
+// the same `specialConstraints` list as the regular-kind items
+// (`where T: class`), so this struct deliberately does NOT split them — the
+// override check compares a combined multiset (see
+// `derivedConstraintMatchesImported`), which is equivalent to the AST-vs-AST
+// `constraintSetsEquivalent` for every valid input (the grammar admits items
+// XOR a modifier on a single clause).
+struct ImportedGenericConstraint {
+    std::string_view typeParam;  // generic parameter name
+    std::vector<std::string_view> specialConstraints;  // "class"/"value"/"new"/...
+    std::vector<TypeRef*> constraintTypes;  // resolved type-constraint TypeRefs
+};
+
 class SemaContext {
 public:
     explicit SemaContext(DiagnosticEngine& diagnostics)
@@ -198,10 +219,41 @@ public:
         return raw;
     }
 
+    // fix #2516 (§9.2/§9.3/§2.8.3 rule 4): allocate a synthetic ast::Param
+    // for an imported positional FieldSymbol — mirrors the LOCAL path's
+    // `posParam = &pf` at SymbolCollection.cpp:309, but the importer has no
+    // AST to borrow from so we synthesize one. Kept alive by `importedParams_`.
+    ast::Param* makeImportedParam() {
+        auto owned = std::make_unique<ast::Param>();
+        ast::Param* raw = owned.get();
+        importedParams_.push_back(std::move(owned));
+        return raw;
+    }
+
     // Register an imported, exported top-level TypeSymbol under its module's
     // §2.1 dotted name. One module may export many types.
     void registerImportedType(const std::string& moduleName, TypeSymbol* t) {
         importedByModule_[moduleName].push_back(t);
+    }
+
+    // §26 / §2.5 (#735): register an imported `public extension T` block under
+    // its defining module's §2.1 dotted name. Kept in its own registry (NOT in
+    // ModuleSymbol::children) for two reasons: the importing file's own module
+    // symbol must keep holding only ITS OWN declarations (the §23.2 / §26.3
+    // per-block checks in TypeResolution walk `children` and must not re-check
+    // a dependency's already-checked block), and §26.5 step 2 visibility is
+    // `import`-gated exactly like an imported type's.
+    void registerImportedExtension(const std::string& moduleName,
+                                   ExtensionSymbol* e) {
+        importedExtensionsByModule_[moduleName].push_back(e);
+    }
+
+    // The imported extension blocks of a loaded module, or null if the module
+    // was never loaded (§26.5 step 2 — consulted only for `import`ed modules).
+    const std::vector<ExtensionSymbol*>* importedExtensionsOf(
+        const std::string& moduleName) const {
+        auto it = importedExtensionsByModule_.find(moduleName);
+        return it == importedExtensionsByModule_.end() ? nullptr : &it->second;
     }
 
     // §14 / #662c: take ownership of a re-parsed SourceFile that holds
@@ -305,6 +357,137 @@ public:
         auto it = importedMemberTypes_.find(m);
         return it == importedMemberTypes_.end() ? nullptr : it->second;
     }
+    // fix #2391 (§14.2/§2.8.2, v0.236): per-generic-parameter constraint
+    // payload for an IMPORTED generic base method, populated by ModuleLoader
+    // from MetaMember::genericParams. Positionally aligned with the method's
+    // `MethodSymbol::genericParams`. Absent (nullptr) for any non-generic
+    // import or a method imported from a pre-#1579 blob — in either case the
+    // §14.2 override-restatement check has nothing to compare against and
+    // (preserving the long-standing accept behavior for unrecognized shapes)
+    // skips the imported-base path; the same-module path is unaffected.
+    void setImportedGenericConstraints(const Symbol* m,
+                                       std::vector<ImportedGenericConstraint> v) {
+        importedGenericConstraints_[m] = std::move(v);
+    }
+    const std::vector<ImportedGenericConstraint>* importedGenericConstraints(
+        const Symbol* m) const {
+        auto it = importedGenericConstraints_.find(m);
+        return it == importedGenericConstraints_.end() ? nullptr : &it->second;
+    }
+
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): whether an imported Property (or
+    // Indexer) member declares a setter — MetaMember::hasSetter (see its field
+    // comment in ModuleMetadata.hpp for why this cannot be recovered from
+    // `modifiers` alone, unlike a field's "readonly"). Absent (never set) for
+    // any non-property import, and for a property imported from a pre-#2400
+    // blob (no 11th MEMBER_BLOCK scalar) — both correctly default to `false`
+    // ("no cross-module setter"), the safe direction.
+    void setImportedPropertyHasSetter(const Symbol* m, bool hasSetter) {
+        importedPropertyHasSetter_[m] = hasSetter;
+    }
+    bool importedPropertyHasSetter(const Symbol* m) const {
+        auto it = importedPropertyHasSetter_.find(m);
+        return it != importedPropertyHasSetter_.end() && it->second;
+    }
+
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): an imported
+    // Property (or Indexer) member's setter's EFFECTIVE visibility —
+    // MetaMember::setterVisibility (see its field comment in
+    // ModuleMetadata.hpp). `hasSetter` above only recovers whether a setter
+    // EXISTS; this recovers WHO may call it — without it, a `private set` /
+    // `protected set` / `internal set` on an imported property was
+    // unenforceable at the cross-module `:=` assignment site (the identical
+    // same-module shape was, correctly, already rejected). Absent (never
+    // set, e.g. any non-property import) defaults to `ast::Visibility::
+    // Private` — the reject-conservative direction, so an unrecognized
+    // shape is refused rather than silently permitted (§2.8.2 clause 1).
+    void setImportedPropertySetterVisibility(const Symbol* m,
+                                             ast::Visibility v) {
+        importedPropertySetterVisibility_[m] = v;
+    }
+    ast::Visibility importedPropertySetterVisibility(const Symbol* m) const {
+        auto it = importedPropertySetterVisibility_.find(m);
+        return it != importedPropertySetterVisibility_.end()
+            ? it->second
+            : ast::Visibility::Private;
+    }
+
+    // fix #2478 (§9.2/§22.8): whether an imported Property member is declared
+    // in AUTO form (a real instance-storage member, §9.2) — MetaMember::
+    // isAutoProperty (see its field comment in ModuleMetadata.hpp for the
+    // full rationale and the confirmed live memory-safety hazard this
+    // closes). `sema::isAutoPropertySymbol`/`Emitter::isAutoProperty` are
+    // decl-dependent and always return `false` for an imported PropertySymbol
+    // (no ast::PropertyDecl crosses the module boundary); THIS side table is
+    // the wire-carried fallback `collectInstanceStorage`/
+    // `collectRecordStorage`'s `isAutoPropertyStorage` helper
+    // (LlvmBackend_impl.hpp) consults for a decl-null Property. Absent
+    // (never set — any non-property import, or a property imported from a
+    // pre-#2478 blob with no 13th MEMBER_BLOCK scalar) defaults to `false`
+    // — the SAME "not storage" behavior already exhibited today, not a new
+    // regression for a stale dependency.
+    void setImportedPropertyIsAutoStorage(const Symbol* m, bool isAuto) {
+        importedPropertyIsAutoStorage_[m] = isAuto;
+    }
+    bool importedPropertyIsAutoStorage(const Symbol* m) const {
+        auto it = importedPropertyIsAutoStorage_.find(m);
+        return it != importedPropertyIsAutoStorage_.end() && it->second;
+    }
+
+    // fix #2461 (§22.3/§23): whether an imported Property (or Indexer) member
+    // declares a getter — MetaMember::hasGetter (the getter-presence twin of
+    // #2400's hasSetter above). §22.3: "for `ref`, the getter is called once
+    // to produce the callee's slot value (for `out` no getter call occurs)",
+    // so a write-only property (setter but no getter) is a legal `out` target
+    // but NOT a legal `ref` target. checkRefOutPropertyOperand consults this
+    // to reject a write-only imported property used as `ref` with a clean
+    // §22.3/§23 diagnostic; without it, the operand fell through sema to a
+    // raw linker error (undefined `...$propget`). Absent (never set — any
+    // non-property import, or a property imported from a pre-#2461 blob with
+    // no 14th MEMBER_BLOCK scalar) defaults to `true` — NOT `false` like
+    // hasSetter: a false default would false-reject a legitimate `ref` to a
+    // read-write property from a stale dependency, while `true` preserves the
+    // pre-#2461 behavior for a stale dependency (see the hasGetter field
+    // comment in ModuleMetadata.hpp for the full rationale).
+    void setImportedPropertyHasGetter(const Symbol* m, bool hasGetter) {
+        importedPropertyHasGetter_[m] = hasGetter;
+    }
+    bool importedPropertyHasGetter(const Symbol* m) const {
+        auto it = importedPropertyHasGetter_.find(m);
+        return it == importedPropertyHasGetter_.end() || it->second;
+    }
+
+    // fix #2421 (§24/§2.8.2): an imported Event member's static/async
+    // classification — MetaMember::isEventStatic/isEventAsync (see their
+    // field comments in ModuleMetadata.hpp). ast::EventDecl is the SOLE
+    // carrier in the local path (SymbolCollection.cpp never copies these onto
+    // EventSymbol::modifiers), and an imported EventSymbol has no decl at all
+    // (ModuleLoader reconstructs it without one). The codegen event-dispatch
+    // path's `eventIsStatic`/`eventIsAsync` helpers (LlvmBackend_impl.hpp)
+    // consult THIS side table as the decl-null fallback for an imported event,
+    // so collectInstanceStorage/emitOwnFieldInit/ctor-cleanup (isStatic) and
+    // the ifaceEventIndex_ mirror + itab$C$I build (isAsync) classify an
+    // imported event IDENTICALLY to the exporter's real layout — the only way
+    // to avoid an itable/struct-layout mismatch. Absent (never set — any
+    // non-event import, or an event imported from a pre-#2421 blob with no
+    // 15th/16th MEMBER_BLOCK scalar) defaults to `false` for both — the
+    // classification a plain instance sync event carries (the common case),
+    // so a stale not-yet-recompiled dependency keeps its already-broken pre-
+    // fix behavior rather than guessing and risking the mismatch.
+    void setImportedEventIsStatic(const Symbol* m, bool isStatic) {
+        importedEventIsStatic_[m] = isStatic;
+    }
+    bool importedEventIsStatic(const Symbol* m) const {
+        auto it = importedEventIsStatic_.find(m);
+        return it != importedEventIsStatic_.end() && it->second;
+    }
+    void setImportedEventIsAsync(const Symbol* m, bool isAsync) {
+        importedEventIsAsync_[m] = isAsync;
+    }
+    bool importedEventIsAsync(const Symbol* m) const {
+        auto it = importedEventIsAsync_.find(m);
+        return it != importedEventIsAsync_.end() && it->second;
+    }
 
     // §22.12 (issue #328 FINDING [3] BUG A): an imported class-level `const` has
     // no storage symbol in the library — a const initializer is a compile-time
@@ -379,12 +562,44 @@ private:
     // plus the module-name → exported-type registry and the imported-symbol set.
     std::vector<std::unique_ptr<Symbol>> importedSymbols_;
     std::vector<std::unique_ptr<TypeRef>> importedTypeRefs_;
+    // fix #2516 (§9.2/§9.3/§2.8.3 rule 4): synthetic ast::Param instances
+    // attached to imported positional FieldSymbols so `fs->posParam != nullptr`
+    // distinguishes positional from body fields cross-module (mirrors the
+    // LOCAL SymbolCollection.cpp:295-313 path, which points posParam at a real
+    // td.positionalFields[i]). The Params live at least as long as the
+    // FieldSymbols that reference them.
+    std::vector<std::unique_ptr<ast::Param>> importedParams_;
     std::unordered_map<std::string, std::vector<TypeSymbol*>> importedByModule_;
+    // §26 / §2.5 (#735): imported extension blocks, keyed by defining module.
+    std::unordered_map<std::string, std::vector<ExtensionSymbol*>>
+        importedExtensionsByModule_;
     std::unordered_set<Symbol*> imported_;
     std::vector<std::unique_ptr<std::string>> internedStrings_;
     std::unordered_map<const Symbol*, TypeRef*> importedReturnTypes_;
     std::unordered_set<const Symbol*> importedReturnOwned_;
     std::unordered_map<const Symbol*, TypeRef*> importedMemberTypes_;
+    // fix #2391 (§14.2/§2.8.2, v0.236): imported generic base method's
+    // per-parameter constraint payload, from MetaMember::genericParams.
+    std::unordered_map<const Symbol*, std::vector<ImportedGenericConstraint>>
+        importedGenericConstraints_;
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): imported property/indexer setter
+    // presence, from MetaMember::hasSetter.
+    std::unordered_map<const Symbol*, bool> importedPropertyHasSetter_;
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): imported
+    // property/indexer setter EFFECTIVE visibility, from
+    // MetaMember::setterVisibility.
+    std::unordered_map<const Symbol*, ast::Visibility>
+        importedPropertySetterVisibility_;
+    // fix #2478 (§9.2/§22.8): imported property AUTO-storage classification,
+    // from MetaMember::isAutoProperty.
+    std::unordered_map<const Symbol*, bool> importedPropertyIsAutoStorage_;
+    // fix #2461 (§22.3/§23): imported property/indexer getter presence, from
+    // MetaMember::hasGetter.
+    std::unordered_map<const Symbol*, bool> importedPropertyHasGetter_;
+    // fix #2421 (§24/§2.8.2): imported event static/async classification,
+    // from MetaMember::isEventStatic/isEventAsync.
+    std::unordered_map<const Symbol*, bool> importedEventIsStatic_;
+    std::unordered_map<const Symbol*, bool> importedEventIsAsync_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const Symbol*, std::string> importedConstValues_;
     // §14 / #662c: imported SourceFile objects that own re-parsed ctor/dtor

@@ -735,6 +735,16 @@ MetaParam convertParam(const sema::ParameterSymbol& p, sema::SemaContext& ctx) {
         mp.type = convertType(p.resolvedDeclType);
     else
         mp.type = convertAstType(p.declType, ctx);
+    // §22.4 / §12.1 (#2392): carry the `when true`/`when false` out-
+    // nullability postcondition so an importer can reconstruct
+    // ParameterSymbol::outNullPostcond for an override-signature comparison
+    // against this (possibly base) parameter. The `when` clause is ALSO
+    // exported as a contract record (below, canonical text like
+    // "not result or %0 <> null") — that is the §2.8.2 contract-record
+    // mechanism for §22.16 proving/consumption, a distinct purpose from this
+    // per-parameter field, which exists so the override-match check has a
+    // structured value to compare rather than needing to parse contract text.
+    mp.outNullWhen = static_cast<std::uint8_t>(p.outNullPostcond);
     // §22.5 default value (textual). The ast::Param carries the default
     // expression; the ParameterSymbol's `decl` is not the Param, so we read the
     // default from the owning declaration where available. We only have the
@@ -832,14 +842,41 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
         // the §22.12 const valueText path). renderConstExpr returns "" for a
         // non-foldable initializer (`new Array()`, `DateTime.Now`, an expression
         // referencing other members) — that initializer does NOT cross the
-        // boundary and is a documented limitation. Static fields are exported as
-        // EXTERNAL storage globals (their initializer runs in the exporter), so
-        // they need no valueText here.
+        // boundary and is a documented limitation.
+        //
+        // Static fields of a NON-generic type are exported as EXTERNAL storage
+        // globals (their initializer runs once in the DECLARING module's own
+        // compilation, §22.12 rule 1), so they need no textual carriage here —
+        // no other compilation ever needs to run that initializer.
+        //
+        // §2.8.2 clause 2 / §22.12 rule 1 / §22.13 (#2351): a GENERIC type's
+        // static field is different — each consumer's compilation independently
+        // monomorphizes its OWN copy of the per-instantiation static state
+        // (#1513's LinkOnceODR-shared cell), and the exporting module's own
+        // compilation never itself instantiates every consumer's type
+        // arguments, so it cannot run the initializer on the consumer's behalf.
+        // §2.8.2 clause 2 requires "an external instantiation behaves
+        // identically to a same-module instantiation of the same generic at
+        // the same arguments" — so the initializer EXPRESSION source text must
+        // cross the boundary (mirrors ctorBodyText/methodBodyText) for the
+        // importer to reconstruct and run it. See fieldInitText's doc comment
+        // (ModuleMetadata.hpp) for the wire shape.
         bool isStaticField = false;
         for (auto mod : m.modifiers)
             if (mod == "static") isStaticField = true;
-        if (!isStaticField && fd->initializer)
+        if (!isStaticField && fd->initializer) {
             out.valueText = renderConstExpr(fd->initializer.get());
+        } else if (isStaticField && isGenericType && fd->initializer &&
+                   !source.empty()) {
+            const ast::Expr* init = fd->initializer.get();
+            if (init->span.begin.offset < init->span.end.offset &&
+                init->span.end.offset <= source.size()) {
+                out.fieldInitText = std::string(
+                    source.substr(init->span.begin.offset,
+                                  init->span.end.offset -
+                                      init->span.begin.offset));
+            }
+        }
         return true;
     }
     // §9.1 positional record field — the FieldSymbol's decl is the TypeDecl and
@@ -848,6 +885,10 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
         if (fs->posParam != nullptr) {
             out.kind = MetaMemberKind::Field;
             out.type = convertAstType(fs->posParam->type.get(), ctx);
+            // fix #2516 (§9.2/§9.3/§2.8.3 rule 4): carry the positional vs
+            // body distinction across the wire — see isPositional's field
+            // comment in ModuleMetadata.hpp.
+            out.isPositional = true;
             return true;
         }
     }
@@ -916,11 +957,14 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 cd->contractClauses, cd->params, ctor->params,
                 contractGenerics, ctx, source, moduleNameFor(ctx),
                 ctor->parent);
-            // §14 / #662c: for a GENERIC class, export the full constructor
-            // declaration source text (extracted via AST span) so the importer
-            // can re-parse and inline it with genericSubst_ active.  The span
-            // is stamped by parseMember (#662c change); skip if zero (no span).
-            if (isGenericType && !source.empty() &&
+            // §14 / §22.7 / #2525: export record constructor declaration
+            // text as well as generic-class bodies. Imported record construction
+            // is lowered inline by value, so the consumer needs the body to
+            // execute an explicit constructor (the signature alone is not
+            // sufficient to recover its field stores).
+            if ((isGenericType ||
+                 (ctor->parent && ctor->parent->kind == ast::TypeDeclKind::Record)) &&
+                !source.empty() &&
                 cd->span.begin.offset < cd->span.end.offset &&
                 cd->span.end.offset <= source.size()) {
                 out.ctorBodyText = std::string(
@@ -939,13 +983,167 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
                 out.params = convertParams(prop->indexerParams, ctx);
                 fillParamDefaults(out.params, pd->indexerParams);
             }
+            // fix #2467 (§9.2/§2.5, v0.235): carry an instance AUTO-PROPERTY's
+            // constant-foldable initializer (`property X: T := v;`) textually,
+            // mirroring the FieldDecl branch above exactly (same renderConstExpr
+            // / §22.8 FINDING [7] wire precedent — `valueText` already "rides
+            // every member", ModuleMetadata.hpp v2/v3 notes, so this populates
+            // an existing always-serialized-but-previously-always-empty field
+            // for Property, no schema bump). The FieldDecl branch above only
+            // ever matches `m.decl` as an `ast::FieldDecl` — an auto-property's
+            // `PropertyDecl` never takes that branch — so an auto-property's
+            // own default value was NOT carried at all before this fix, a
+            // strictly separate gap from the Field case (which already
+            // worked). This is the root cause of #2467's confirmed repro (a
+            // fully public `record BodOnly { public property W: int := 42; }`
+            // reading `0` after import): §9.2's record construction
+            // (`buildRecordValue`, LlvmBackend_Exprs2.cpp) reads a body
+            // member's initializer off `m->decl`, which is null for every
+            // imported symbol (no AST crosses the boundary) — with no wire
+            // carriage at all, the importer had nothing to fall back to. See
+            // buildRecordValue's decl-null fallback (this issue) for the
+            // consuming side.
+            //
+            // Scoped identically to the Field case: only a NON-STATIC
+            // auto-property's foldable initializer crosses (a static
+            // auto-property is admitted by §22.12 rule 2 but follows the
+            // external-storage-global story like a static field — no
+            // textual carriage needed here). Applies to BOTH classes and
+            // records — for classes this rides alongside the FieldDecl
+            // carriage as inert, unconsumed data (classes replay field/auto-
+            // property initializers via the exported `bz$<Type>$init`
+            // function, #2452, which needs no textual carriage at all,
+            // exactly as the Field branch's own comment already notes for
+            // the class case) — only `buildRecordValue`'s new fallback
+            // (this issue) reads it.
+            if (pd->bodyKind == ast::PropertyBodyKind::Auto &&
+                pd->autoInitializer) {
+                bool isStaticProp = false;
+                for (auto mod : m.modifiers)
+                    if (mod == "static") { isStaticProp = true; break; }
+                if (!isStaticProp)
+                    out.valueText = renderConstExpr(pd->autoInitializer.get());
+            }
+            // fix #2478 (§9.2/§22.8, v0.235): carry whether this Property is
+            // declared in AUTO form (a real instance-storage member, §9.2) so
+            // the importer's `collectInstanceStorage`/`collectRecordValue`
+            // storage-layout walk can classify it correctly — mirroring
+            // `sema::isAutoPropertySymbol`'s own predicate (Auto bodyKind,
+            // non-static) so the wire-carried classification and the local-decl
+            // classification agree by construction. See `out.isAutoProperty`'s
+            // field comment in ModuleMetadata.hpp for the full rationale and
+            // the confirmed live memory-safety hazard this closes.
+            //
+            // fix #2523 (§12.1/§12.5, v0.236, sibling of #2478): the
+            // `!prop->isIndexer` exclusion the original #2478 carried (because
+            // an indexer is never *storage*) is dropped — the bit is now set
+            // for Auto-body INDEXERS as well, so the importer-side
+            // `ctx_.importedPropertyIsAutoStorage(base)` correctly reports
+            // "is in §12.5 shorthand form" for the abstract-indexer override
+            // check (`checkPropertyOverrideSignatureMatch`,
+            // TypeResolution_Checks.cpp ~2680). Storage consumers are
+            // UNAFFECTED — `LlvmBackend_impl.hpp`'s `isAutoPropertyStorage`
+            // helper still filters `ps->isIndexer` explicitly (line ~3599)
+            // before consulting this side table, so an imported Auto-body
+            // indexer never appears in `collectInstanceStorage`/
+            // `collectRecordStorage`. The `!prop->isIndexer` exclusion was
+            // only here because #2478 thought of the bit in pure-storage
+            // terms; the #2523 reuse re-derives the same Auto-bodyKind/non-
+            // static predicate at a SEMANTIC level (§12.5 abstract shorthand
+            // = get-only, regardless of storage). `sema::isAutoPropertySymbol`
+            // itself is deliberately LEFT UNCHANGED (still excludes indexers)
+            // — its many call sites (definite assignment, record equality,
+            // ARC) treat the predicate as "real storage member", which an
+            // indexer isn't; only this wire-bit repurposes it.
+            out.isAutoProperty = pd->bodyKind == ast::PropertyBodyKind::Auto;
+            for (auto mod : m.modifiers)
+                if (mod == "static") { out.isAutoProperty = false; break; }
+            // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): mirror
+            // LlvmBackend_impl.hpp's propertyHasSetter exactly. That codegen
+            // helper only ever operates on a LOCAL decl (the same `pd`
+            // available here, in the same translation unit as the export),
+            // so its logic is duplicated at export time rather than shared
+            // across the module/codegen boundary. See hasSetter's field
+            // comment in ModuleMetadata.hpp for why an importer cannot
+            // recover this from `modifiers` alone.
+            if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
+                out.hasSetter = false;
+            } else if (pd->bodyKind == ast::PropertyBodyKind::Auto) {
+                out.hasSetter = true;
+                for (auto mod : pd->modifiers)
+                    if (mod == "readonly") { out.hasSetter = false; break; }
+            } else {
+                out.hasSetter = false;
+                for (const auto& a : pd->accessors)
+                    if (a.isSet) { out.hasSetter = true; break; }
+            }
+            // fix #2461 (§22.3/§23, v0.236): mirror
+            // ExprTypecheck_Calls.cpp's propertyDeclIsSetOnly predicate's
+            // INVERSE exactly — that LOCAL read-of-write-only gate returns
+            // true (write-only) iff Block bodyKind with a `set` arm but no
+            // `get` arm, so hasGetter is its negation on the getter axis:
+            // Expression/Auto bodyKinds always have a getter (the former's
+            // body IS the getter; the latter is backed by compiler storage
+            // with a synthesized get), and a Block bodyKind has a getter iff
+            // any accessor is a `get` arm. Computed here (export time) rather
+            // than shared across the module/codegen boundary because, like
+            // hasSetter above, the importer never reconstructs an
+            // ast::PropertyDecl to derive this from. Applied to BOTH
+            // properties and indexers (an indexer may also be write-only — a
+            // `set`-only indexer block — and §22.3's copy-in/getter rule
+            // applies to an indexer slot ref/out target identically, per
+            // checkRefOutPropertyOperand's IndexExpr path).
+            if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
+                out.hasGetter = true;
+            } else if (pd->bodyKind == ast::PropertyBodyKind::Auto) {
+                out.hasGetter = true;
+            } else {
+                out.hasGetter = false;
+                for (const auto& a : pd->accessors)
+                    if (!a.isSet) { out.hasGetter = true; break; }
+            }
+            // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): mirror
+            // ExprTypecheck.cpp's local `:=`-assignment-target `sv`
+            // computation exactly (and checkRefOutPropertyOperand's ref/out
+            // mirror of the same logic) — an accessor-level visibility
+            // override (`pd->accessors[i].visibility` for a block property,
+            // `pd->autoAccessorVis` for the `private set;` auto-property
+            // shorthand, §13.6) wins when present; otherwise the setter
+            // inherits the property's own declared visibility. Computed
+            // here (export time) rather than shared across the
+            // module/codegen boundary because, like hasSetter above, the
+            // importer never reconstructs an ast::PropertyDecl to read this
+            // from. Only meaningful when out.hasSetter is true; harmless
+            // (ignored on read) otherwise.
+            ast::Visibility sv = pd->visibility;
+            if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+                for (const auto& a : pd->accessors)
+                    if (a.isSet && a.visibility != ast::Visibility::None) {
+                        sv = a.visibility;
+                        break;
+                    }
+            } else if (pd->bodyKind == ast::PropertyBodyKind::Auto &&
+                       pd->hasAutoAccessorVis && pd->autoAccessorIsSet) {
+                sv = pd->autoAccessorVis;
+            }
+            out.setterVisibility = toMetaVisibility(sv, inInterface);
         }
         return true;
     }
     if (dynamic_cast<const sema::EventSymbol*>(&m)) {
         out.kind = MetaMemberKind::Event;
-        if (auto* ed = dynamic_cast<const ast::EventDecl*>(m.decl))
+        if (auto* ed = dynamic_cast<const ast::EventDecl*>(m.decl)) {
             out.type = convertAstType(ed->type.get(), ctx);  // §24 payload type
+            // fix #2421 (§24/§2.8.2): carry the two ast::EventDecl layout
+            // classification bits across the boundary so the importer's
+            // collectInstanceStorage/emitOwnFieldInit/ctor-cleanup (isStatic)
+            // and ifaceEventIndex_ mirror + itab$C$I build (isAsync) classify
+            // an imported event IDENTICALLY to the exporter — the only way to
+            // avoid an itable/struct-layout mismatch (see MetaMember::
+            // isEventStatic/isEventAsync's field comment).
+            out.isEventStatic = ed->isStatic;
+            out.isEventAsync = ed->isAsync;
+        }
         return true;
     }
     if (dynamic_cast<const sema::ConstMemberSymbol*>(&m)) {
@@ -1061,6 +1259,25 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         bool isMethod = dynamic_cast<const sema::MethodSymbol*>(ms) != nullptr;
         bool isField  = !isMethod &&
             dynamic_cast<const sema::FieldSymbol*>(ms) != nullptr;
+        // fix #2473 (§9.2/§23.1/§22.8/§13, v0.236): an instance auto-property
+        // (`private property W: int := 41;` — backed by compiler-generated
+        // storage, §23.1 "the compiler generates the backing field") is a real
+        // instance-storage member exactly like a plain field, but is a
+        // PropertySymbol, not a FieldSymbol — so the existing `isField` test
+        // never matched it, and a private/internal auto-property was dropped
+        // from `out.members` entirely (the identical layout-aliasing/
+        // under-allocation hazard #2456 fixed for plain FIELDS, just for the
+        // auto-property subtype of storage member; #2478 closed the
+        // IMPORTER-SIDE classification but presupposed the PropertySymbol
+        // exists in `t->members` at all, which for a private/internal
+        // auto-property it did not). `sema::isAutoPropertySymbol` excludes
+        // indexers and static auto-properties, so this matches ONLY instance-
+        // storage auto-properties — the storage members
+        // `collectInstanceStorage`/`collectRecordStorage`
+        // (LlvmBackend_impl.hpp) count via `isAutoPropertyStorage` (#2478's
+        // importer-side wire-bit fallback). On the EXPORTER side (here) the
+        // decl is always present, so the decl-based predicate is exact.
+        bool isAutoPropStorage = !isMethod && sema::isAutoPropertySymbol(ms);
         bool exported = isExportedMember(member->visibility, inInterface);
         // For generic classes, also include private/internal METHODS so the
         // importer's ctor/dtor body re-parsing can resolve self-calls (#695).
@@ -1081,14 +1298,117 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         // exported — no initializer, no ABI change. Mirrors the private-method
         // rationale (#695): the field is not accessible outside the class;
         // the stub is used solely for sema name-resolution in re-parsed bodies.
-        bool includeForMethodBody = isGenericClass && isField &&
+        bool includeForMethodBody = isGenericClass && (isField || isAutoPropStorage) &&
             !exported &&
             (member->visibility == ast::Visibility::Private ||
              member->visibility == ast::Visibility::Internal);
-        if (!exported && !includeForCtorBody && !includeForMethodBody) continue;
+        // fix #2456 (§22.8 / §2.8.2-§2.8.3, v0.235): a non-static instance
+        // field occupies a slot in the class's PHYSICAL layout regardless of
+        // its §13 visibility — declaration order, not exported-surface
+        // membership, drives §22.8's storage layout. Before this, a
+        // private/internal field on a NON-generic class was invisible to
+        // `out.members` entirely (only the generic-class case above,
+        // `includeForMethodBody`, carried private fields, and only for sema
+        // name-resolution in re-parsed bodies). `collectInstanceStorage`/
+        // `classStruct` (LlvmBackend_Layout.cpp) walk an imported base's
+        // `t->members` with NO visibility gate at all to lay out a LOCAL
+        // derived class's own fields — so a hidden private base field left
+        // every subsequent field one slot short of the exporter's own
+        // compiled layout: the derived class's own first field silently
+        // ALIASED the base's real (invisible) field's physical slot, and a
+        // *direct* `new ImportedBase()` under-allocated the instance
+        // entirely (missing the hidden field's slot) — a genuine heap-
+        // buffer-overflow the moment the exporter's real (correctly-sized)
+        // init/ctor/accessor bodies wrote to it. Confirmed via direct
+        // instrumentation: the exporter's own compilation of a class with
+        // `private _v: int := 42;` lays out `_v` at struct index 2; the
+        // importer's reconstruction — before this fix — had ZERO storage
+        // members for that same class, so a locally-declared subclass's own
+        // `_own` field landed at index 2 too, aliasing `_v`.
+        // A static field is excluded: it has no instance-layout footprint
+        // (process-global storage, §22.12) — this fix is scoped to §22.8
+        // instance layout only, not the separate static cross-module story.
+        //
+        // fix #2468 (§9.1/§22.8, v0.235): extended to RECORDS. This was
+        // originally scoped to CLASSES ONLY because a positional record's
+        // storage order interleaves body fields BEFORE the positional fields
+        // in `t.members` (confirmed by instrumentation — a record's
+        // positional field is appended to `t.members` AFTER its body fields,
+        // regardless of source order), and `buildRecordValue`'s positional-
+        // constructor-argument-to-slot mapping (LlvmBackend_Exprs2.cpp) used
+        // to assume `args[i]` maps to `fields[i]` by raw storage index —
+        // widening this for records regressed a previously-CORRECT read
+        // (`r.x` went from the right value to 0 once a private record body
+        // field became visible for layout). That ordering defect is now
+        // root-caused and fixed by #2464: `buildRecordValue` maps each
+        // positional argument to the correct POSITIONAL field (the trailing
+        // `args.size()` entries of `fields`/`t->members`, which stay a
+        // contiguous block regardless of body-field count) rather than by
+        // raw index, so a newly-visible hidden body field only shifts WHERE
+        // the positional block starts, never which entries are in it.
+        // Re-verified directly (this issue): the exact repro that motivated
+        // the classes-only scoping —
+        //   public record Rec(x: int)
+        //     private _hidden: int := 77;
+        //     public property Hidden: int => _hidden;
+        //   end Rec;
+        // — now round-trips `r.x` correctly cross-module with this gate
+        // widened (see xmod_record_private_field_layout_import_2468_test.cpp
+        // T1). Classes have an analogous non-interleaving guarantee:
+        // `collectInstanceStorage` always lays the base class's storage down
+        // FIRST, monotonically, before any derived class's own fields
+        // (§22.8), so a newly-visible base field only ever shifts LATER
+        // fields.
+        //
+        // NOTE: this makes a private/internal record body field's STORAGE
+        // SLOT visible (fixing the identical aliasing/under-allocation
+        // hazard #2456 fixes for classes — §9.1's storage layout is a
+        // property of declaration order, not of the §13 exported surface,
+        // exactly as §22.8 is for classes) but does NOT make its declared
+        // DEFAULT VALUE correct cross-module for a PRIVATE member — that
+        // value replay gap is #2467, fixed in this same issue pair only for
+        // the already-exported (public) case; see buildRecordValue
+        // (LlvmBackend_Exprs2.cpp) and this loop's
+        // `mm.valueText.clear()` below, which deliberately keeps a
+        // layout-only member's carriage genuinely layout-only (no
+        // initializer, no ABI change — mirrors the class precedent).
+        bool isStaticFieldMember = false;
+        for (auto mod : member->modifiers)
+            if (mod == "static") { isStaticFieldMember = true; break; }
+        // fix #2473 (§9.2/§23.1/§22.8): widen `includeForLayout` to also
+        // match an instance auto-property (`isAutoPropStorage`, recognized
+        // above) — the same storage-layout hazard #2456 (classes) / #2468
+        // (records) fixed for plain fields applies verbatim to an
+        // auto-property's compiler-generated backing slot. `isAutoPropStorage`
+        // already excludes static auto-properties, so `!isStaticFieldMember`
+        // is redundant for that arm but kept for the plain-field path; an
+        // indexer (PropertySymbol with `isIndexer`) is excluded by
+        // `isAutoPropertySymbol` and never reaches this gate.
+        bool includeForLayout = (isField || isAutoPropStorage) &&
+            !exported && !isStaticFieldMember &&
+            (t.kind == ast::TypeDeclKind::Class ||
+             t.kind == ast::TypeDeclKind::Record);
+        if (!exported && !includeForCtorBody && !includeForMethodBody &&
+            !includeForLayout)
+            continue;
         MetaMember mm;
-        if (convertMember(*member, inInterface, ctx, mm, isGenericClass, source))
+        if (convertMember(*member, inInterface, ctx, mm, isGenericClass, source)) {
+            // A field included ONLY for layout (not otherwise exported, and
+            // not already carried for generic-body name resolution) is
+            // name-invisible outside the class — strip the initializer text
+            // convertMember unconditionally attaches for any foldable field
+            // initializer. Only the field's NAME, TYPE, and declaration-order
+            // POSITION are needed to reconstruct the physical layout; the
+            // default value is not, and dropping it keeps this genuinely a
+            // layout-only carriage (mirrors the "no initializer, no ABI
+            // change" contract the generic-class `includeForMethodBody` case
+            // above already documents for the same reason).
+            if (includeForLayout && !exported && !includeForMethodBody) {
+                mm.valueText.clear();
+                mm.fieldInitText.clear();
+            }
             out.members.push_back(std::move(mm));
+        }
     }
 
     // §10 enum constants (declared on the TypeDecl, collected as symbols but
@@ -1159,6 +1479,51 @@ void pinInLlvmUsed(llvm::Module& module, llvm::GlobalVariable* gv) {
 
 }  // namespace
 
+// §26 / §2.5 (#735): convert one `public extension T` block into its wire form,
+// or return false to skip it (a shape whose cross-module dispatch is not exactly
+// the exported `bz$ext$<T>$<M>` symbol — see MetaExtension's header note).
+static bool convertExtension(const sema::ExtensionSymbol& ext,
+                             sema::SemaContext& ctx, MetaExtension& out,
+                             std::string_view source) {
+    const auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext.decl);
+    if (decl == nullptr || !decl->targetType) return false;
+    // §13.2 / §26.3: an `internal` block (the default) is not downstream-visible.
+    if (decl->visibility != ast::Visibility::Public) return false;
+    // §26.4: a block with `where` constraints, or a target carrying type
+    // arguments, binds block-level type parameters — the exported symbol was
+    // compiled against the exporter's placeholder layout, so dispatching it
+    // importer-side needs the #783 monomorphization machinery. Not exported.
+    if (!decl->genericConstraints.empty()) return false;
+    if (!decl->targetType->genericArgs.empty()) return false;
+    const sema::TypeRef* target = ctx.resolvedType(*decl->targetType);
+    if (target == nullptr) return false;
+    // §26.4: a bare single-segment identifier in the head introduces a fresh
+    // block-level type parameter; TypeResolution leaves such a head as a
+    // null-declaration Named ref. Only a resolved type (or a primitive, §26.2)
+    // has a stable cross-module identity to dispatch against.
+    if (target->kind == sema::TypeRef::Kind::Named &&
+        target->declaration == nullptr)
+        return false;
+    out.target = convertType(target);
+    out.visibility = toMetaVisibility(decl->visibility, /*inInterface=*/false);
+    for (sema::Symbol* m : ext.members) {
+        auto* meth = dynamic_cast<const sema::MethodSymbol*>(m);
+        // §26.3: extensions declare methods and computed read-only properties.
+        // A property has no exported accessor symbol (it is inlined at the use
+        // site), so only methods cross; a generic extension method would need
+        // importer-side monomorphization (as above).
+        if (meth == nullptr || meth->isOperator) continue;
+        if (!meth->genericParams.empty()) continue;
+        if (!isExportedMember(meth->visibility, /*inInterface=*/false)) continue;
+        if (dynamic_cast<const ast::MethodDecl*>(meth->decl) == nullptr) continue;
+        MetaMember mm;
+        if (convertMember(*meth, /*inInterface=*/false, ctx, mm,
+                          /*isGenericType=*/false, source))
+            out.members.push_back(std::move(mm));
+    }
+    return !out.members.empty();
+}
+
 ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
                                     std::string_view source) {
     ModuleMetadata md;
@@ -1183,8 +1548,17 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
     }
 
     for (sema::Symbol* child : mod->children) {
+        // §26 / §2.5 (#735): a `public extension T` block IS part of the
+        // exported surface — §26.5 step 2 requires an importer to search "all
+        // imported modules" for extension blocks on the receiver's type.
+        if (auto* ext = dynamic_cast<const sema::ExtensionSymbol*>(child)) {
+            MetaExtension me;
+            if (convertExtension(*ext, ctx, me, source))
+                md.extensions.push_back(std::move(me));
+            continue;
+        }
         auto* ts = dynamic_cast<const sema::TypeSymbol*>(child);
-        if (ts == nullptr) continue;  // aliases/extensions/externs: see note
+        if (ts == nullptr) continue;  // aliases/externs: see note
         if (!isExportedType(*ts)) continue;  // §13.2 internal types not exported
         // §2.20/#2047: the auto-imported stdlib prelude decl (Result) is NOT
         // part of this module's public interface — every importer injects its
@@ -1205,8 +1579,9 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
     // TopDecl — TopDecl is only TypeDecl / TypeAlias / ExtensionDecl /
     // ExternBlock (ast::SourceFile::topDecls). So nothing populates md.functions
     // / md.constants here; the fields stay empty until that grammar lands. Type
-    // aliases, extensions, and extern blocks are likewise out of this
-    // increment's scope (their cross-module-import semantics are Increment 3+).
+    // aliases and extern blocks are likewise out of this increment's scope
+    // (their cross-module-import semantics are Increment 3+). Extension blocks
+    // ARE exported (§26 / #735) — see the loop above and MetaExtension.
     return md;
 }
 

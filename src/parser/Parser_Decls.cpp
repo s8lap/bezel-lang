@@ -222,6 +222,13 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
     //   Visibility? Modifier* keyword Identifier ... ClassBody
     // Slice 3 limits the body to the empty form `end Identifier? ;`.
 
+    // fix #1761: capture the source span [start, end] so SymbolCollection can
+    // populate the resulting TypeSymbol's declLoc (see SymbolCollection.cpp's
+    // `sym->declLoc = td.span.begin`). Without this, the kind keyword below
+    // advances past the type's first token before its span is recorded, and
+    // diagnostics keyed on the symbol's declLoc all report 0:0.
+    const SourceLocation start = current_.location;
+
     // The keyword that selects which kind of top-level declaration this is.
     ast::TypeDeclKind kind;
     if (isKeyword("class"))          kind = ast::TypeDeclKind::Class;
@@ -366,11 +373,25 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                 // Remaining base types (interfaces) — only one class base is
                 // valid for a primary-ctor class (sema enforces); parse further
                 // items for completeness, discarding their '(...)' groups.
+                // fix #2466 (Appendix A.3 InheritItem grammar note, v0.236):
+                // a NON-empty argument list on any of these interface-position
+                // items was previously silently discarded here with no
+                // diagnostic, the same gap #2466 closes in `parseInheritance`
+                // for record/interface decls. Per Appendix A.3's note, the
+                // argument list is "permitted only on the base class (the
+                // first item), not on interfaces"; an EMPTY list (`IFoo()`)
+                // drops no data and stays accepted, matching #2455's carve-out.
                 while (isPunctuator(",")) {
                     advance();
                     auto t = parseType();
                     decl->baseTypes.push_back(std::move(t));
                     if (isPunctuator("(")) {
+                        const SourceLocation argListLoc = current_.location;
+                        // EMPTY `()` drops no data — only a non-empty list is
+                        // rejected (consistent with #2455 / #2466 elsewhere).
+                        const bool argListNonEmpty =
+                            peekNext().kind != TokenKind::Punctuator ||
+                            peekNext().text != ")";
                         int depth = 1;
                         advance();
                         while (depth > 0 && current_.kind != TokenKind::EndOfFile) {
@@ -378,11 +399,20 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                             else if (isPunctuator(")")) --depth;
                             advance();
                         }
+                        if (argListNonEmpty) {
+                            diagnostics_.report(
+                                Severity::Error, argListLoc,
+                                "an argument list is not permitted here — per "
+                                "Appendix A's `InheritItem` grammar (v0.236), "
+                                "it is permitted only on the base class (the "
+                                "first item in the inheritance list), not on "
+                                "an interface");
+                        }
                     }
                 }
             }
         } else {
-            decl->baseTypes = parseInheritance();
+            decl->baseTypes = parseInheritance(decl.get());
         }
         decl->genericConstraints = parseGenericConstraints();
     }
@@ -391,6 +421,14 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
     if (decl->kind == ast::TypeDeclKind::Record &&
         consumePunctuator(";")) {
         decl->isRecordShorthand = true;
+        // fix #2418: this early return bypassed the #1761 span-stamp below
+        // (which only the non-shorthand `... end ...;` path reached), so
+        // EVERY shorthand record's TypeSymbol::declLoc silently stayed 0:0
+        // even before this fix — the "TypeSymbol is the one already-working
+        // precedent" premise held only for the non-shorthand forms. Stamp
+        // it here too, identically to the #1761 logic.
+        decl->span.begin = start;
+        decl->span.end = current_.location;
         return decl;
     }
 
@@ -437,6 +475,7 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                 "one)");
         } else {
             ast::EnumConstant ec;
+            ec.loc = current_.location;  // fix #2482: name token's position
             ec.name = current_.text;
             advance();
             if (consumePunctuator(":=")) {
@@ -457,6 +496,7 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                     break;
                 }
                 ast::EnumConstant ec2;
+                ec2.loc = current_.location;  // fix #2482
                 ec2.name = current_.text;
                 advance();
                 if (consumePunctuator(":=")) {
@@ -506,6 +546,7 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                         Severity::Error, current_.location,
                         "expected choice case name");
                 } else {
+                    c.loc = current_.location;  // fix #2482: name token
                     c.name = current_.text;
                     advance();
                 }
@@ -589,6 +630,12 @@ std::unique_ptr<ast::TypeDecl> Parser::parseTypeOrInterfaceDecl(
                             "expected ';' after 'end'");
     }
 
+    // fix #1761: stamp the type's [start, current_.location] span so the
+    // resulting TypeSymbol's declLoc is populated at symbol collection.
+    if (decl && decl->span.begin.line == 0) {
+        decl->span.begin = start;
+        decl->span.end = current_.location;
+    }
     return decl;
 }
 
@@ -596,6 +643,15 @@ std::unique_ptr<ast::TopDecl> Parser::parseExtensionDecl(
     ast::Visibility visibility) {
     // A.3 `ExtensionDecl ::= Visibility? "extension" Type GenericConstraints*
     //                         ExtensionMember* "end" ";"`.
+    // #1307: capture the `extension` keyword's own position (matching
+    // parseTypeDeclBody's `start` convention just above — the kind keyword's
+    // location, not the visibility prefix's) so the block carries a real span;
+    // previously ExtensionDecl::span was never stamped at all (neither call
+    // site in parseTopDecl wraps this in the file's `stampSpan` helper, unlike
+    // e.g. parseImportDecl), so every extension-block diagnostic that wants a
+    // declaration site — including the new §26.5 rule-4 ambiguity diagnostic —
+    // had nothing to report but 0:0.
+    const SourceLocation start = current_.location;
     auto ext = std::make_unique<ast::ExtensionDecl>();
     ext->visibility = visibility;
     advance(); // past `extension`
@@ -619,6 +675,10 @@ std::unique_ptr<ast::TopDecl> Parser::parseExtensionDecl(
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after 'end' of extension block");
     }
+    // #1307: stamp [start, current_.location] — mirrors parseTypeDeclBody's
+    // identical stamp just above (fix #1761).
+    ext->span.begin = start;
+    ext->span.end = current_.location;
     return std::unique_ptr<ast::TopDecl>(ext.release());
 }
 
@@ -626,6 +686,11 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
     // A.3 `ExternBlock ::= "extern" StringLiteral
     //                        ("convention" StringLiteral)?
     //                        ExternDecl+ "end" ";"`.
+    // fix #2418: ExternBlock's span was never stamped — SymbolCollection's
+    // ExternBlockSymbol::declLoc (and, via fallback, each ExternDeclSymbol)
+    // had nothing to read. Mirrors the #1761 TypeSymbol / #662c ctor-dtor
+    // span convention.
+    const SourceLocation start = current_.location;
     auto blk = std::make_unique<ast::ExternBlock>();
     advance(); // past `extern`
     if (current_.kind != TokenKind::StringLiteral) {
@@ -651,6 +716,10 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
     while (!isKeyword("end") &&
            current_.kind != TokenKind::EndOfFile) {
         ast::ExternDecl decl;
+        // fix #2482: stamp the decl's own location at its first token (the
+        // optional visibility keyword, else `method`) so a diagnostic on this
+        // member points at its own line, not the enclosing extern block's.
+        decl.loc = current_.location;
         // Visibility?
         if (isKeyword("public"))         { decl.visibility = ast::Visibility::Public; advance(); }
         else if (isKeyword("private"))   { decl.visibility = ast::Visibility::Private; advance(); }
@@ -722,6 +791,8 @@ std::unique_ptr<ast::TopDecl> Parser::parseExternBlock() {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after 'end' of extern block");
     }
+    blk->span.begin = start;
+    blk->span.end = current_.location;
     return std::unique_ptr<ast::TopDecl>(blk.release());
 }
 
@@ -730,6 +801,10 @@ std::unique_ptr<ast::TypeAlias> Parser::parseTypeAlias() {
     //                          GenericConstraints* ";"`. (v0.160: ":=" replaces
     // the old "=" — all bindings in Bezel use ":="; §27.8.) Slice 27 completes
     // the optional GenericParams and trailing GenericConstraints.
+    // fix #2418: TypeAlias's span was never stamped — SymbolCollection's
+    // TypeAliasSymbol::declLoc had nothing to read. Mirrors the #1761
+    // TypeSymbol / #662c ctor-dtor span convention.
+    const SourceLocation start = current_.location;
     auto alias = std::make_unique<ast::TypeAlias>();
     advance(); // past `type`
 
@@ -762,6 +837,8 @@ std::unique_ptr<ast::TypeAlias> Parser::parseTypeAlias() {
         diagnostics_.report(Severity::Error, current_.location,
                             "expected ';' after type alias");
     }
+    alias->span.begin = start;
+    alias->span.end = current_.location;
     return alias;
 }
 
@@ -926,9 +1003,15 @@ std::unique_ptr<ast::Type> Parser::parseType() {
 std::unique_ptr<ast::Member> Parser::parseMember() {
     // #662c: record the start offset of the member's first token (visibility
     // keyword or modifier or `constructor`/`destructor`) so that the builder
-    // can extract source text for cross-module ctor/dtor body export.  The
-    // offset is stamped onto ConstructorDecl/DestructorDecl nodes before
-    // returning; all other member kinds leave their span at 0 (existing behaviour).
+    // can extract source text for cross-module ctor/dtor body export. Stamped
+    // onto ConstructorDecl/DestructorDecl nodes for that purpose.
+    // fix #2418: the SAME `memberStart` also anchors `span.begin` on every
+    // other member kind returned from here (FieldDecl/ConstDecl/EventDecl/
+    // PropertyDecl/NestedTypeMember; MethodDecl gets it via the memberStart
+    // parameter threaded into parseMethodDeclBody, #783) — this is what
+    // lets SymbolCollection.cpp's collectMember populate each member
+    // symbol's declLoc from a real source location instead of leaving it at
+    // the default {0,0}.
     const SourceLocation memberStart = current_.location;
 
     // §13: most members declare their visibility explicitly. Destructors
@@ -1016,6 +1099,15 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         auto td = parseTypeOrInterfaceDecl(visibility, std::move(modifiers));
         auto ntm = std::make_unique<ast::NestedTypeMember>();
         ntm->decl = std::move(td);
+        // fix #2418: NestedTypeMember's own span was never stamped (only its
+        // wrapped TypeDecl's span is, via parseTypeOrInterfaceDecl's #1761
+        // fix) — SymbolCollection's NestedTypeSymbol wrapper had nothing to
+        // read its declLoc from. `current_.location` here is just past the
+        // nested type's closing `end ... ;`, mirroring the ctor/dtor
+        // #662c span convention (begin = first member token, end = just
+        // past the terminator).
+        ntm->span.begin = memberStart;
+        ntm->span.end = current_.location;
         return std::unique_ptr<ast::Member>(ntm.release());
     }
 
@@ -1052,6 +1144,11 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after const declaration");
         }
+        // fix #2418: ConstDecl's span was never stamped — SymbolCollection's
+        // ConstMemberSymbol::declLoc had nothing to read. Mirrors the ctor/
+        // dtor #662c span convention.
+        cd->span.begin = memberStart;
+        cd->span.end = current_.location;
         return std::unique_ptr<ast::Member>(cd.release());
     }
     if (isKeyword("event")) {
@@ -1097,6 +1194,11 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after event declaration");
         }
+        // fix #2418: EventDecl's span was never stamped — SymbolCollection's
+        // EventSymbol::declLoc had nothing to read. Mirrors the ctor/dtor
+        // #662c span convention.
+        ed->span.begin = memberStart;
+        ed->span.end = current_.location;
         return std::unique_ptr<ast::Member>(ed.release());
     }
     if (isKeyword("property")) {
@@ -1224,6 +1326,12 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
                 }
             }
         }
+        // fix #2418: PropertyDecl's span was never stamped — SymbolCollection's
+        // PropertySymbol::declLoc had nothing to read. Mirrors the ctor/dtor
+        // #662c span convention. (All three body-kind branches above
+        // converge here, after their own terminating `;` is consumed.)
+        pd->span.begin = memberStart;
+        pd->span.end = current_.location;
         return std::unique_ptr<ast::Member>(pd.release());
     }
     // `method` (slice 10), `method operator` (slice 27),
@@ -1234,7 +1342,8 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
         if (current_.kind == TokenKind::Identifier &&
             current_.text == "operator") {
             advance();
-            return parseOperatorDeclBody(visibility, std::move(modifiers));
+            return parseOperatorDeclBody(visibility, std::move(modifiers),
+                                         memberStart);
         }
         return std::unique_ptr<ast::Member>(
             parseMethodDeclBody(visibility, std::move(modifiers),
@@ -1432,6 +1541,11 @@ std::unique_ptr<ast::Member> Parser::parseMember() {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected ';' after field declaration");
     }
+    // fix #2418: FieldDecl's span was never stamped — SymbolCollection's
+    // FieldSymbol::declLoc had nothing to read. Mirrors the ctor/dtor #662c
+    // span convention.
+    field->span.begin = memberStart;
+    field->span.end = current_.location;
 
     // Reseat the raw pointer explicitly (Node's deleted move blocks the
     // implicit unique_ptr<Derived> -> unique_ptr<Base> conversion).
@@ -1447,6 +1561,12 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
     // §11.8 (v0.176, #807) — `static` for the abstract-only static method /
     // static operator forms. All are scanned tentatively then dispatched on
     // the kind keyword.
+    // fix #2418: record the member's first token so every branch below can
+    // stamp `span.begin` — mirrors parseMember's `memberStart` (#662c/#783);
+    // interface members never had ANY span before (SymbolCollection's
+    // PropertySymbol/EventSymbol/MethodSymbol/ConstMemberSymbol::declLoc had
+    // nothing to read for an interface-declared member).
+    const SourceLocation memberStart = current_.location;
     bool readonlyMod = false;
     bool asyncMod = false;
     bool staticMod = false;
@@ -1544,6 +1664,9 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
                     "expected ';' after interface property declaration");
             }
         }
+        // fix #2418: see memberStart comment at the top of this function.
+        pd->span.begin = memberStart;
+        pd->span.end = current_.location;
         return std::unique_ptr<ast::Member>(pd.release());
     }
 
@@ -1581,6 +1704,9 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
                 Severity::Error, current_.location,
                 "expected ';' after interface event declaration");
         }
+        // fix #2418: see memberStart comment at the top of this function.
+        ed->span.begin = memberStart;
+        ed->span.end = current_.location;
         return std::unique_ptr<ast::Member>(ed.release());
     }
 
@@ -1640,6 +1766,9 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
                 "expected ';' after interface method signature");
         }
         m->bodyKind = ast::MethodBodyKind::Abstract;
+        // fix #2418: see memberStart comment at the top of this function.
+        m->span.begin = memberStart;
+        m->span.end = current_.location;
         return std::unique_ptr<ast::Member>(m.release());
     }
 
@@ -1694,6 +1823,9 @@ std::unique_ptr<ast::Member> Parser::parseInterfaceMember() {
                 "expected ';' after static interface operator signature");
         }
         op->bodyKind = ast::MethodBodyKind::Abstract;
+        // fix #2418: see memberStart comment at the top of this function.
+        op->span.begin = memberStart;
+        op->span.end = current_.location;
         return std::unique_ptr<ast::Member>(op.release());
     }
 
@@ -2131,7 +2263,8 @@ std::unique_ptr<ast::MethodDecl> Parser::parseMethodDeclBody(
 }
 
 std::unique_ptr<ast::Member> Parser::parseOperatorDeclBody(
-    ast::Visibility visibility, std::vector<std::string_view> modifiers) {
+    ast::Visibility visibility, std::vector<std::string_view> modifiers,
+    SourceLocation memberStart) {
     // A.4 `OperatorDecl ::= "public" "static" "pure"? "method" "operator"
     //                        OpToken "(" ParamList ")" ":" "owned"? Type
     //                        OperatorBody` (v0.202, #2052). Caller has consumed
@@ -2210,6 +2343,13 @@ std::unique_ptr<ast::Member> Parser::parseOperatorDeclBody(
                                 "expected ';' after 'end' of operator");
         }
     }
+    // fix #2418: OperatorDecl's span was never stamped — SymbolCollection's
+    // MethodSymbol::declLoc (operators reuse MethodSymbol) had nothing to
+    // read for the class-body operator form. `memberStart` defaults to {}
+    // when a caller has none to give (matching parseMethodDeclBody's
+    // convention); the class-body call site (parseMember) does supply it.
+    op->span.begin = memberStart;
+    op->span.end = current_.location;
     return std::unique_ptr<ast::Member>(op.release());
 }
 
@@ -2221,6 +2361,11 @@ std::vector<ast::Param> Parser::parseParamList() {
 
     auto parseOne = [&]() -> ast::Param {
         ast::Param p;
+        // fix #2482: stamp the parameter's own location at its first token
+        // (the optional modifier, else the name). Meaningful for the
+        // member-shaped Param uses — a class primary-ctor param becomes a
+        // positional FieldSymbol — and harmless for ordinary method params.
+        p.loc = current_.location;
         if (consumeKeyword("ref")) {
             p.modifier = "ref";
         } else if (consumeKeyword("out")) {
@@ -2438,6 +2583,9 @@ std::vector<ast::Param> Parser::parsePositionalFieldList() {
     if (isPunctuator(")")) return fields;
     auto parseOne = [&]() -> ast::Param {
         ast::Param p;
+        // fix #2482: stamp the field's own location at its first token (the
+        // name) so a member diagnostic points at the field, not the record.
+        p.loc = current_.location;
         if (current_.kind != TokenKind::Identifier) {
             diagnostics_.report(Severity::Error, current_.location,
                                 "expected positional field name");
@@ -2476,6 +2624,9 @@ std::vector<ast::Param> Parser::parseCasePayloadList() {
     if (isPunctuator(")")) return fields;
     auto parseOne = [&]() -> ast::Param {
         ast::Param p;
+        // fix #2482: stamp the field's own location at its first token (the
+        // optional `owned` marker, else the name).
+        p.loc = current_.location;
         // Optional leading `owned` marker.
         if (isKeyword("owned")) {
             p.modifier = "owned";
@@ -2727,18 +2878,121 @@ std::vector<ast::GenericParam> Parser::parseGenericParams() {
     return params;
 }
 
-std::vector<std::unique_ptr<ast::Type>> Parser::parseInheritance() {
+std::vector<std::unique_ptr<ast::Type>> Parser::parseInheritance(
+    const ast::TypeDecl* decl) {
     // A.3: `Inheritance ::= ":" InheritItem ("," InheritItem)*`.
-    // `InheritItem ::= Type ("(" ArgList? ")")?` — the optional argument
-    // list is tokenized away here; ArgList contains expressions which
-    // arrive in the expression slice.
+    // `InheritItem ::= Type ("(" ArgList? ")")?`.
+    //
+    // fix #2455 (§11.1 / §22.10 / §12.8, v0.235): this function is reached
+    // for interface decls, record decls, and — via the caller's
+    // `!(kind==Class && hasPositionalFields)` branch — for CLASS decls that
+    // have NO primary-constructor parameter list of its own. Previously an
+    // argument list here was silently tokenized away with no AST record and
+    // no diagnostic: `class D: Base(99)` compiled and ran `Base()` with no
+    // arguments, silently dropping the 99 (issue #2455's confirmed repro,
+    // LOCAL bases included — not cross-module-specific).
+    //
+    // The spec ties the header argument-list shorthand exclusively to a
+    // primary constructor: §11.1 "If the class has a base class that
+    // requires constructor arguments, the base's arguments appear in
+    // parentheses after the base class name in the inheritance list" is
+    // stated within the "Primary constructors" subsection, and §22.10 says
+    // the sugar "replaces an explicit base(...) call" that a primary
+    // constructor would otherwise need. For a class with NO primary
+    // constructor and no explicit constructor, §12.8 gives the general,
+    // unconditional rule instead: "If neither base(...) nor this(...) is
+    // written, the compiler inserts an implicit base() call" — a
+    // NO-ARGUMENT call, with no provision anywhere for a header argument
+    // list to feed it. Confirmed against the existing (correct, tested)
+    // implementation too: `class D(): Base(99)` — an explicit EMPTY primary-
+    // ctor parameter list — already threads 99 through
+    // `decl->primaryBaseCtorArgs` (the `hasPositionalFields` branch above)
+    // and runs correctly; only the bare `class D: Base(99)` spelling (no
+    // primary ctor at all) was silently accepting and discarding. So a
+    // class-header argument list without an owning primary constructor has
+    // no defined destination — reject it rather than silently drop it
+    // (CLAUDE.md rule 4: silently picking a semantics for an unspecified
+    // shape is the forbidden option; here the simplest SOUND reading is
+    // rejection, since inventing "which constructor does this bind to" for
+    // a class that may declare several independently-chaining explicit
+    // constructors has no textual answer).
+    //
+    // fix #2466 (Appendix A.3 InheritItem grammar note, §9.6, §11.2,
+    // v0.236): record and interface decls reach this same function and
+    // previously kept the original tokenize-away behaviour. Every item in
+    // their inheritance list is an interface (records cannot inherit a
+    // class at all, other than the implicit `Object` root, per §9.6;
+    // interfaces only extend other interfaces, per §11.2), so an argument
+    // list there is inert nonsense rather than silently-dropped DATA
+    // (nothing was ever going to consume it) — but Appendix A.3's own note
+    // on `InheritItem` documents the restriction ("permitted only on the
+    // base class ... not on interfaces"), so the silent tokenize-away is
+    // now upgraded to a diagnostic for these kinds too. Only an EMPTY arg
+    // list (`IFoo()`) stays accepted, matching #2455's "no data lost"
+    // carve-out and the pre-existing
+    // parser_generics_inheritance.inheritance_with_unparsed_arg_list_
+    // does_not_error regression test's expectation for that shape.
+    const bool classNoPrimaryCtor = decl != nullptr &&
+        decl->kind == ast::TypeDeclKind::Class;
+    const bool recordOrInterface = decl != nullptr &&
+        (decl->kind == ast::TypeDeclKind::Record ||
+         decl->kind == ast::TypeDeclKind::Interface);
     std::vector<std::unique_ptr<ast::Type>> items;
     if (!isPunctuator(":")) return items;
     advance(); // past ':'
 
+    // `itemIndex` distinguishes the base-class position (0) from an
+    // interface position (>0) for the diagnostic wording — per the grammar
+    // note on `InheritItem` (Appendix A.3), an argument list is syntactically
+    // admitted on every item but semantically meaningful only on the first.
+    std::size_t itemIndex = 0;
     auto parseOne = [&]() -> std::unique_ptr<ast::Type> {
+        const std::size_t thisIndex = itemIndex++;
         auto t = parseType();
         if (isPunctuator("(")) {
+            const SourceLocation argListLoc = current_.location;
+            // An EMPTY arg list (`Base()`) drops no data — it supplies zero
+            // arguments, exactly what §12.8's implicit `base()` call already
+            // does for a class with neither a primary nor an explicit
+            // constructor. Only a NON-empty list silently discards a real
+            // value (the issue's actual bug), so only that is rejected;
+            // `Base()` keeps parsing as a harmless no-op (regression guard:
+            // parser_generics_inheritance.inheritance_with_unparsed_arg_list_
+            // does_not_error already asserts this stays accepted).
+            const bool argListNonEmpty = peekNext().kind != TokenKind::Punctuator ||
+                                          peekNext().text != ")";
+            if (argListNonEmpty) {
+                if (classNoPrimaryCtor && thisIndex == 0) {
+                    // #2455: class without a primary constructor, base-class
+                    // position — the arg list has no defined destination.
+                    diagnostics_.report(
+                        Severity::Error, argListLoc,
+                        "class `" + std::string(decl->name) + "` supplies a "
+                        "base-constructor argument list here, but `" +
+                        std::string(decl->name) + "` declares no primary-"
+                        "constructor parameter list of its own — the header "
+                        "argument-list shorthand feeds a primary "
+                        "constructor's `base(...)` chain (§11.1, §22.10, "
+                        "v0.236), and a class without one gets an implicit "
+                        "no-argument `base()` call instead (§12.8, v0.236) "
+                        "that cannot receive these arguments; add an empty "
+                        "primary-constructor parameter list (`" +
+                        std::string(decl->name) + "()`) or declare an "
+                        "explicit constructor that chains via `base(...)`");
+                } else if (classNoPrimaryCtor || recordOrInterface) {
+                    // #2455 (class interface positions, item 1+) and #2466
+                    // (every record/interface item, all interface positions
+                    // per §9.6 / §11.2): Appendix A.3's `InheritItem` note
+                    // admits the arg list only on the base class, not on
+                    // interfaces.
+                    diagnostics_.report(
+                        Severity::Error, argListLoc,
+                        "an argument list is not permitted here — per "
+                        "Appendix A's `InheritItem` grammar (v0.236), it is "
+                        "permitted only on the base class (the first item "
+                        "in the inheritance list), not on an interface");
+                }
+            }
             // Skip a balanced parenthesised group without parsing its contents.
             int depth = 1;
             advance();

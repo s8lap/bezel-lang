@@ -147,6 +147,14 @@ static void collectClassComponents(
         comp.declName = std::string(m->name);
         comp.ty       = nullptr;
 
+        // §9.8 / #2325: a primary-constructor-parameter-derived FieldSymbol
+        // (posParam != null) has `decl` set to the owning TypeDecl, not a
+        // FieldDecl/PropertyDecl — see the FieldSymbol comment in Symbol.hpp
+        // and the parallel sema check (TypeResolution_Checks.cpp,
+        // checkSerializationEligibility). Detected up front so the dispatch
+        // below can route it before falling into the "no decl" fallback.
+        const auto* fsPos = dynamic_cast<const FieldSymbol*>(m);
+
         // Determine ty, wireName, skip, optional, isOwned from the symbol's decl.
         if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl)) {
             // Check if owned modifier is set.
@@ -186,6 +194,47 @@ static void collectClassComponents(
                 comp.wireName = comp.declName;
             }
             if (pd->type) comp.ty = ctx.resolvedType(*pd->type);
+        } else if (fsPos && fsPos->posParam) {
+            // §9.8 / #2325: a primary-constructor-parameter-derived field.
+            // `storage` (collectInstanceStorage) reserves a physical slot for
+            // EVERY primary-ctor parameter unconditionally, whether or not it
+            // is captured — so a parameter referenced only in an initializer
+            // (§11.1: "parameters referenced only in initializers do not
+            // generate backing fields") still reaches this branch with a
+            // valid fieldIndex entry but is not a genuine field of the type.
+            // Only a CAPTURED parameter (posParamBodyRef) is a real serialized
+            // component — matches the parallel sema check exactly, so this
+            // guard and the eligibility check never disagree.
+            if (!fsPos->posParamBodyRef) continue;
+            if (!fsPos->posParam->type) continue;
+            // Primary-ctor params carry no `serialized` clause (the grammar
+            // only allows one on a record's PositionalField / a class body
+            // FieldDecl/PropertyDecl — Parser_Decls.cpp), so the wire name is
+            // always the declared identifier.
+            bool isOwned = fsPos->posParam->modifier == "owned";
+            comp.isOwned  = isOwned;
+            comp.wireName = comp.declName;
+            comp.ty = ctx.resolvedType(*fsPos->posParam->type);
+
+            // §9.8 tier 3: identify back-edges (non-owned class-typed fields),
+            // mirroring the FieldDecl branch above exactly.
+            if (!isOwned && comp.ty) {
+                bool fieldIsClass =
+                    (comp.ty->kind == sema::TypeRef::Kind::Named &&
+                     comp.ty->declaration &&
+                     comp.ty->declaration->kind == ast::TypeDeclKind::Class);
+                bool fieldIsNullableClass = false;
+                if (!fieldIsClass && comp.ty->nullable) {
+                    fieldIsNullableClass =
+                        comp.ty->kind == sema::TypeRef::Kind::Named &&
+                        comp.ty->declaration &&
+                        comp.ty->declaration->kind == ast::TypeDeclKind::Class;
+                }
+                if (fieldIsClass || fieldIsNullableClass) {
+                    if (!includeBackEdges) continue;  // skip for tree mode
+                    comp.isBackEdge = true;
+                }
+            }
         } else {
             // Fallback (no decl — e.g. imported field).
             comp.wireName = comp.declName;
@@ -574,6 +623,34 @@ void Emitter::emitSerializeField(llvm::Value* val,
         return;
     }
 
+    // §9.8 v0.228 (issue #1065): a non-owning inline array [N]T is a standard
+    // sequence component, encoded exactly like a heap collection would be —
+    // BeginArray(N), each element via a recursive emitSerializeField, EndArray
+    // — except N is compile-time-constant (§15.1), so the element loop
+    // unrolls rather than reading a runtime Count. `val` is the raw LLVM
+    // ArrayType VALUE embedded in the record's struct (an inline array is a
+    // value type stored inline, not a heap pointer) — the same shape
+    // emitInlineArrayEquality consumes for auto-equality (§9.2).  An OWNING
+    // inline array never reaches here: isSerializationEligibleType rejects it
+    // (§9.8 record clause admits only "a non-owning inline array"), so a
+    // `serializedClass`/record component of that shape is already a compile
+    // error at the conformance declaration — this is defensive.
+    if (fieldTy->kind == K::InlineArray && !fieldTy->arrayOwned &&
+        fieldTy->arrayElement && val->getType()->isArrayTy()) {
+        auto* arrTy = llvm::cast<llvm::ArrayType>(val->getType());
+        unsigned n = static_cast<unsigned>(arrTy->getNumElements());
+        auto* beginFn = declareC("bz_binser_begin_array", voidTy,
+                                 {ptrTy(), i32()});
+        builder_.CreateCall(beginFn, {serPtr, builder_.getInt32(n)});
+        for (unsigned i = 0; i < n; ++i) {
+            llvm::Value* elem = builder_.CreateExtractValue(val, {i});
+            emitSerializeField(elem, fieldTy->arrayElement, serPtr);
+        }
+        auto* endFn = declareC("bz_binser_end_array", voidTy, {ptrTy()});
+        builder_.CreateCall(endFn, {serPtr});
+        return;
+    }
+
     if (fieldTy->kind == K::Named && fieldTy->declaration) {
         const TypeSymbol* fieldTs = fieldTy->declaration;
 
@@ -800,18 +877,29 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     // fix #668: §9.8 / §2.15: allocate seen-flags for required components.
     // Required = non-skip AND non-optional. `serialized optional` exempts a
     // component; naked nullable T? (no optional clause) is still required.
+    //
+    // fix #2399 / §9.8 v0.235 + stdlib §2.15 v0.235 ("a duplicate field
+    // name ... raises SerializationException unconditionally"; "missing
+    // required fields, duplicates, and type mismatches remain unconditional
+    // errors regardless of the [unknown-field] setting"): a seen-flag is now
+    // allocated for EVERY non-skip component, not just required ones -- a
+    // duplicate `serialized optional` field is equally a structural fault,
+    // so the per-field dispatch loop below needs a flag to re-check even for
+    // an optional component. `required` gates ONLY the missing-field check
+    // further down (optional: missing is still fine).
     struct RecordSeenEntry {
         unsigned compIdx;
         std::string declName;
         llvm::AllocaInst* seenSlot;  // i8: 0=unseen, 1=seen
+        bool required;               // false for `serialized optional` components
     };
     std::vector<RecordSeenEntry> recSeenFlags;
     for (unsigned i = 0; i < components.size(); ++i) {
         if (components[i].isSkip) continue;
-        if (components[i].isOptional) continue;
         llvm::AllocaInst* sf = entryAlloca(i8());
         builder_.CreateStore(builder_.getInt8(0), sf);
-        recSeenFlags.push_back({i, components[i].declName, sf});
+        recSeenFlags.push_back(
+            {i, components[i].declName, sf, !components[i].isOptional});
     }
 
     // §9.8 / #1635 leak-safety: the per-iteration field-name string returned by
@@ -840,6 +928,77 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         Disposal nd{namePtrSlot, nullptr};
         nd.stringRelease = true;
         disposeStack_.back().push_back(nd);
+    }
+
+    // fix #2398 / §9.8 / §28.3/§28.9: a dedicated scope guarding already-
+    // populated component slots against a LATER component's read throwing —
+    // mirrors #2378's emitClassDeserialize fix (Bug B) for the record case.
+    // A record's serialized components are record-admissible only (§9.8:
+    // "primitive, string, an enum, another serialization-eligible record,
+    // a value-like serialization-eligible choice, T? of a record-admissible
+    // T, or a non-owning inline array" — no class-, interface-, Shared<T>-,
+    // Weak<T>-, or heap-collection-typed component is ever admitted), so
+    // there is no class half to mirror here — but §4.6's string is a
+    // runtime-managed +1 reference like any other, and a nested record
+    // component may itself own one. Pushed before any component is read;
+    // each string-typed slot is registered as a plain stringRelease
+    // disposal, and each NESTED-RECORD-typed slot whose own storage owns a
+    // string (recordHasStringFields, the #1747 mechanism) is registered to
+    // release ITS direct string members via the existing
+    // emitRecordStringFieldReleases helper — reusing #1747's proven,
+    // one-level-deep release rather than inventing new machinery. (That
+    // reuse is intentionally narrow, matching #1747's own scope: it does
+    // NOT recurse into a nested record's own nested-record/choice
+    // components, and it excludes a NULLABLE record component, whose slot
+    // is the wrapped {i8, T} struct, not the bare record layout
+    // emitRecordStringFieldReleases expects — isRecordWithStringFieldsTypeRef
+    // already guards both. A record component that is itself a value-like
+    // CHOICE with a string payload, or a record nested TWO OR MORE levels
+    // deep, is a documented residual gap: no equivalent release helper
+    // exists for choices yet, and the reused helper here is one level
+    // only — issue #2405 filed.)
+    // Popped WITHOUT disposal once every required component is confirmed
+    // present (below, just before construction begins) — by then each
+    // slot's value is about to be consumed into the constructed record.
+    //
+    // Without this: a component slot populated by an EARLIER successful
+    // read (e.g. `first: string` read before `second: int`) had no
+    // disposal registered anywhere. A LATER component's read that throws —
+    // a truncated wire value, or a nested record/choice Deserialize that
+    // throws from deep inside its own recursive call — unwinds straight
+    // past this function's own explicit skip/match dispatch (which only
+    // releases namePtr, never a component slot), orphaning the already-read
+    // value (issue #2398, the same shape as #2378's own follow-up leak;
+    // empirically confirmed: 63 bytes / 2 allocations for the issue's exact
+    // record repro, matching #2378's class-side signature exactly).
+    disposeStack_.emplace_back();
+    for (unsigned i = 0; i < components.size(); ++i) {
+        if (components[i].isSkip || !slots[i] || !components[i].ty) continue;
+        const auto* cty = components[i].ty;
+        if (cty->kind == sema::TypeRef::Kind::Primitive &&
+            cty->primitive == sema::PrimitiveType::String) {
+            Disposal sd{slots[i], nullptr};
+            sd.stringRelease = true;
+            disposeStack_.back().push_back(sd);
+        } else if (isRecordWithStringFieldsTypeRef(cty)) {
+            Disposal rd{slots[i], cty->declaration};
+            rd.recordStringFields = true;
+            disposeStack_.back().push_back(rd);
+        } else if (!cty->nullable && cty->kind == sema::TypeRef::Kind::Named &&
+                   cty->declaration &&
+                   cty->declaration->kind == ast::TypeDeclKind::Choice &&
+                   choiceHasStringFields(cty->declaration)) {
+            // fix #2425 / §9.8 / §28.3/§28.9 / §35.4: a record component may
+            // itself be a value-like CHOICE (record-admissible per §9.8)
+            // that owns a string somewhere reachable from its active case —
+            // the residual gap #2405 documented (no release walker existed
+            // for choices at all). Released via emitChoiceStringFieldReleases,
+            // a separate tag-switched walker (see the Disposal.choiceStringFields
+            // comment in LlvmBackend_impl.hpp).
+            Disposal cd{slots[i], cty->declaration};
+            cd.choiceStringFields = true;
+            disposeStack_.back().push_back(cd);
+        }
     }
 
     // BeginObject → read field count.
@@ -875,6 +1034,40 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     // it if a nested emitDeserializeField throws before the normal match/skip
     // release below. (null-safe: a null namePtr stored here is a no-op release.)
     builder_.CreateStore(namePtr, namePtrSlot);
+
+    // fix #2404 / §9.8 / §28.9: bz_binder_read_field_name can still return a
+    // NULL bz_string* WITHOUT a pending exception on the OOM allocation-
+    // failure paths inside bz_binder_read_bz_string (malloc/calloc returning
+    // null while building the decoded string/header) -- the ordinary
+    // truncated-input path is already caught by the emitPendingCheck() just
+    // above, since fix #2403 made bz_binder_read_bz_string raise
+    // SerializationException before ever returning null on truncation (both
+    // the binary length/data-truncation case and, transitively, the JSON
+    // unterminated-object case, which bz_jder_count_object_fields already
+    // rejects before this loop's first iteration). Without this check, a
+    // null namePtr here is dereferenced unguarded a few lines down
+    // (CreateStructGEP/CreateLoad against namePtr for the wire-name
+    // comparison) -- a null-pointer read. Mirrors emitClassDeserialize's
+    // identical defence (its errBB, ~line 3144) for the exact same
+    // OOM-residual gap; unlike the class path, no manual per-slot dispose
+    // loop is needed here -- the #2398 disposeStack_ scope pushed above
+    // (before this loop started) already registers every already-filled
+    // component slot (string / one-level nested-record) for automatic
+    // release, and emitThrowBuiltin's emitUnwindDisposals() sweeps it on
+    // this throw exactly as it does for every other throw in this function
+    // (including namePtrSlot itself, just stored above).
+    {
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            namePtr, llvm::ConstantPointerNull::get(ptrTy()), "deser.fname.isnull");
+        auto* nullBB = llvm::BasicBlock::Create(llvm_, "deser.fname.null", currentFn_);
+        auto* liveBB = llvm::BasicBlock::Create(llvm_, "deser.fname.live", currentFn_);
+        builder_.CreateCondBr(isNull, nullBB, liveBB);
+        builder_.SetInsertPoint(nullBB);
+        emitThrowBuiltin("SerializationException");
+        if (!builder_.GetInsertBlock()->getTerminator())
+            builder_.CreateUnreachable();
+        builder_.SetInsertPoint(liveBB);
+    }
 
     // Dispatch: compare namePtr against each component's wire name.
     // Use bz_string_compare (runtime ordinal comparison) to test equality.
@@ -923,6 +1116,39 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
         builder_.CreateCondBr(isMatch, readBB, nextBB);
 
         builder_.SetInsertPoint(readBB);
+
+        // fix #2399 / §9.8 v0.235 + stdlib §2.15 v0.235 (quoted above the
+        // recSeenFlags allocation): a component matched a SECOND time by the
+        // wire (its seen-flag already 1) is a duplicate field name -- raised
+        // BEFORE reading anything for this occurrence, so the value already
+        // sitting in slots[ci] from the first occurrence is left untouched
+        // for the #2398 disposal scope (pushed above) to release on the
+        // emitThrowBuiltin unwind below -- mirrors emitClassDeserialize's
+        // identical fix.
+        {
+            llvm::AllocaInst* mySeenSlot = nullptr;
+            for (const auto& rse : recSeenFlags) {
+                if (rse.compIdx == ci) { mySeenSlot = rse.seenSlot; break; }
+            }
+            if (mySeenSlot) {
+                llvm::Value* alreadySeen = builder_.CreateLoad(
+                    i8(), mySeenSlot, "rdeser.dup.seen");
+                llvm::Value* isDup = builder_.CreateICmpNE(
+                    alreadySeen, builder_.getInt8(0), "rdeser.dup.isdup");
+                auto* dupBB = llvm::BasicBlock::Create(
+                    llvm_, "rdeser.dup", currentFn_);
+                auto* freshBB = llvm::BasicBlock::Create(
+                    llvm_, "rdeser.fresh", currentFn_);
+                builder_.CreateCondBr(isDup, dupBB, freshBB);
+
+                builder_.SetInsertPoint(dupBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+
+                builder_.SetInsertPoint(freshBB);
+            }
+        }
         // Read the field value into its slot.
         llvm::Value* fieldVal = emitDeserializeField(comp.ty, derPtr);
         if (fieldVal && slots[ci]) {
@@ -981,14 +1207,16 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
     emitPendingCheck();
 
     // fix #668: §9.8 / §2.15: check all required components were seen.
-    // Records have no owned class fields so there is nothing to dispose on this
-    // path — any already-read value-type slots (int, string, etc.) are held in
-    // allocas that will simply be ignored if we throw.  String slots may hold a
-    // bz_string* that needs release if it was already populated; for simplicity
-    // we accept the minor leak on this rare structural-error path (matching the
-    // behaviour of the truncated-input path for records which also does not
-    // release string slots before emitThrowBuiltin).
+    // fix #2398: this missing-required-component throw is now ALSO covered
+    // by the component-disposal scope pushed above (still open at this
+    // point — it is popped only below, once construction is about to
+    // begin) — an already-read string/nested-record slot is disposed on
+    // this path too, not just a sibling's-read-throws path.
+    // fix #2399: recSeenFlags now also holds entries for OPTIONAL components
+    // (so the dispatch loop's duplicate check above can see them); skip
+    // those here -- missing stays fine for an optional field.
     for (const auto& rse : recSeenFlags) {
+        if (!rse.required) continue;
         llvm::Value* seen = builder_.CreateLoad(i8(), rse.seenSlot, "rdeser.seen");
         llvm::Value* notSeen = builder_.CreateICmpEQ(seen, builder_.getInt8(0), "rdeser.nseen");
         auto* missBB = llvm::BasicBlock::Create(llvm_, "rdeser.miss", currentFn_);
@@ -1000,6 +1228,16 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
             builder_.CreateUnreachable();
         builder_.SetInsertPoint(okBB);
     }
+
+    // fix #2398 / §9.8 / §28.3/§28.9: pop the component-disposal scope
+    // pushed above (guarding already-populated string/nested-record slots
+    // against a later throw during the field loop / the missing-required-
+    // component check just above). Every required component is now
+    // confirmed present and construction is about to begin, consuming each
+    // slot's value into the constructed record — nothing in this scope
+    // should be disposed on this (normal) path, so pop it WITHOUT invoking
+    // its disposals (mirrors #2378's emitClassDeserialize pop).
+    disposeStack_.pop_back();
 
     // §9.8 v0.182 (#1572): if the record declares an explicit (non-static)
     // constructor, the synthesized Deserialize CALLS the unique constructor
@@ -1198,66 +1436,100 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
         case sema::PrimitiveType::Bool: {
             auto* fn = declareC("bz_binder_read_bool", i8(), {ptrTy()});
             llvm::Value* b8 = builder_.CreateCall(fn, {derPtr}, "deser.bool");
+            // fix #2378 / §9.8 / §2.15: bz_binder_read_bool can raise (JSON:
+            // "Expected JSON bool") — mirror lowerDeserializerReadMethod's
+            // ReadBool, which already pending-checks every read. Without this,
+            // a pending exception set here is left unchecked and later
+            // SUPERSEDED (without disposal) by a subsequent, unrelated throw
+            // elsewhere in this recursive field loop — leaking the exception
+            // object + its message (the #2378 pattern).
+            emitPendingCheck();
             return builder_.CreateTrunc(b8, i1(), "deser.bool1");
         }
         case sema::PrimitiveType::Char: {
             auto* fn = declareC("bz_binder_read_char", i32(), {ptrTy()});
-            return builder_.CreateCall(fn, {derPtr}, "deser.char");
+            llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.char");
+            emitPendingCheck();  // fix #2378 — see the Bool case above.
+            return v;
         }
         case sema::PrimitiveType::Byte: {
             auto* fn = declareC("bz_binder_read_uint", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.u64");
+            // fix #2378 / §9.8 / §2.15: bz_binder_read_uint raises
+            // SerializationException on truncated binary input
+            // (bz_ser_throw_at_binary) — see the Bool case above for why an
+            // unchecked pending exception here leaks.
+            emitPendingCheck();
             return builder_.CreateTrunc(v, i8(), "deser.byte");
         }
         case sema::PrimitiveType::SByte: {
             auto* fn = declareC("bz_binder_read_int", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.i64");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
             return builder_.CreateTrunc(v, i8(), "deser.sbyte");
         }
         case sema::PrimitiveType::Short: {
             auto* fn = declareC("bz_binder_read_int", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.i64");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
             return builder_.CreateTrunc(v, i16(), "deser.short");
         }
         case sema::PrimitiveType::UShort: {
             auto* fn = declareC("bz_binder_read_uint", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.u64");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
             return builder_.CreateTrunc(v, i16(), "deser.ushort");
         }
         case sema::PrimitiveType::Int: {
             auto* fn = declareC("bz_binder_read_int", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.i64");
+            // fix #2378 / §9.8 / §2.15 (the reported repro): bz_binder_read_int
+            // raises SerializationException on truncated binary input — see the
+            // Bool case above for why an unchecked pending exception here leaks
+            // the exception object bz_ser_throw allocated.
+            emitPendingCheck();
             return builder_.CreateTrunc(v, i32(), "deser.int");
         }
         case sema::PrimitiveType::UInt: {
             auto* fn = declareC("bz_binder_read_uint", i64(), {ptrTy()});
             llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.u64");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
             return builder_.CreateTrunc(v, i32(), "deser.uint");
         }
         case sema::PrimitiveType::Long: {
             auto* fn = declareC("bz_binder_read_int", i64(), {ptrTy()});
-            return builder_.CreateCall(fn, {derPtr}, "deser.long");
+            llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.long");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
+            return v;
         }
         case sema::PrimitiveType::ULong: {
             auto* fn = declareC("bz_binder_read_uint", i64(), {ptrTy()});
-            return builder_.CreateCall(fn, {derPtr}, "deser.ulong");
+            llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.ulong");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
+            return v;
         }
         case sema::PrimitiveType::Float: {
             auto* fn = declareC("bz_binder_read_float",
                                 llvm::Type::getDoubleTy(llvm_), {ptrTy()});
             llvm::Value* d = builder_.CreateCall(fn, {derPtr}, "deser.dbl");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
             return builder_.CreateFPTrunc(d, llvm::Type::getFloatTy(llvm_), "deser.f");
         }
         case sema::PrimitiveType::Double: {
             auto* fn = declareC("bz_binder_read_float",
                                 llvm::Type::getDoubleTy(llvm_), {ptrTy()});
-            return builder_.CreateCall(fn, {derPtr}, "deser.dbl");
+            llvm::Value* d = builder_.CreateCall(fn, {derPtr}, "deser.dbl");
+            emitPendingCheck();  // fix #2378 — see the Byte case above.
+            return d;
         }
         case sema::PrimitiveType::Decimal: {
             // §2.14 / #665: ReadDecimal — bz_binder_read_decimal returns a
             // void* (ptr to alloca'd 16-byte struct), load it back to a value.
             auto* fn = declareC("bz_binder_read_decimal", ptrTy(), {ptrTy()});
             llvm::Value* decPtr = builder_.CreateCall(fn, {derPtr}, "deser.decptr");
+            // fix #2378 / §9.8 / §2.15: the JSON path (bz_jder_parse_decimal)
+            // can raise SerializationException — see the Bool case above.
+            emitPendingCheck();
             // decPtr is a ptr to a 16-byte {i32×4} struct on the runtime stack.
             // Load the decimal value via the pointer.
             llvm::AllocaInst* slot = entryAlloca(decimalStructType());
@@ -1280,11 +1552,60 @@ llvm::Value* Emitter::emitDeserializeField(const sema::TypeRef* fieldTy,
         }
         case sema::PrimitiveType::String: {
             auto* fn = declareC("bz_binder_read_string", ptrTy(), {ptrTy()});
-            return builder_.CreateCall(fn, {derPtr}, "deser.str");
+            llvm::Value* v = builder_.CreateCall(fn, {derPtr}, "deser.str");
+            // fix #2378 / §9.8 / §2.15: bz_binder_read_string's JSON path can
+            // raise SerializationException — see the Bool case above. (The
+            // binary path's own truncated-payload leak is fixed separately in
+            // emitClassDeserialize/emitRecordDeserialize's per-slot disposal
+            // registration — the successfully-read string itself, not an
+            // exception object, is what leaks there; see the #2378 commit.)
+            emitPendingCheck();
+            return v;
         }
         default:
             return nullptr;
         }
+    }
+
+    // §9.8 v0.228 (issue #1065): a non-owning inline array [N]T — the mirror
+    // of the emitSerializeField branch above. N is compile-time-constant
+    // (arraySizeValue, folded by sema per §15.1), so the reconstruction
+    // materializes element-by-element into a stack alloca and loads the
+    // aggregate back, exactly the pattern LlvmBackend_Assign.cpp's inline-
+    // array-typed call-argument collection-literal path already uses (#1382)
+    // — inline arrays are value types, so no disposal registration is
+    // needed. BeginArray()/EndArray() still bracket the read (consuming the
+    // wire's own count prefix / '['..']' delimiters per stdlib §2.15) even
+    // though the loop itself is driven by the DECLARED size N, not the wire
+    // count: a truncated or malformed wire array is a structural fault the
+    // per-element reads surface as SerializationException (e.g. an
+    // out-of-data primitive read), consistent with §9.8's "a type mismatch
+    // ... raises SerializationException unconditionally".
+    if (fieldTy->kind == K::InlineArray && !fieldTy->arrayOwned &&
+        fieldTy->arrayElement && fieldTy->arraySizeValue >= 0) {
+        llvm::Type* voidTy = llvm::Type::getVoidTy(llvm_);
+        llvm::Type* elemLlvmTy = lowerTypeRef(fieldTy->arrayElement);
+        auto n = static_cast<unsigned>(fieldTy->arraySizeValue);
+        if (elemLlvmTy) {
+            auto* arrLlvmTy = llvm::ArrayType::get(elemLlvmTy, n);
+            auto* beginFn = declareC("bz_binder_begin_array", i32(), {ptrTy()});
+            builder_.CreateCall(beginFn, {derPtr}, "deser.arr.n");
+            llvm::AllocaInst* slot = entryAlloca(arrLlvmTy);
+            builder_.CreateStore(llvm::ConstantAggregateZero::get(arrLlvmTy), slot);
+            for (unsigned i = 0; i < n; ++i) {
+                llvm::Value* elemVal =
+                    emitDeserializeField(fieldTy->arrayElement, derPtr);
+                if (!elemVal) continue;
+                llvm::Value* gep = builder_.CreateGEP(
+                    arrLlvmTy, slot,
+                    {builder_.getInt32(0), builder_.getInt32(i)});
+                builder_.CreateStore(elemVal, gep);
+            }
+            auto* endFn = declareC("bz_binder_end_array", voidTy, {ptrTy()});
+            builder_.CreateCall(endFn, {derPtr});
+            return builder_.CreateLoad(arrLlvmTy, slot, "deser.inlinearr");
+        }
+        return nullptr;
     }
 
     if (fieldTy->kind == K::Named && fieldTy->declaration) {
@@ -1630,7 +1951,20 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
             std::vector<const sema::TypeRef*> ptys(np, nullptr);
             std::vector<std::string> wireNames(np);
             std::vector<bool> skip(np, false);
-            struct SeenEntry { std::size_t pi; llvm::AllocaInst* seenSlot; };
+            // fix #2399 / §9.8 v0.235 + stdlib §2.15 v0.235 ("a duplicate
+            // field name ... raises SerializationException unconditionally";
+            // "missing required fields, duplicates, and type mismatches
+            // remain unconditional errors regardless of the [unknown-field]
+            // setting"): `required` records whether a MISSING occurrence is
+            // tolerated (`serialized optional`) -- a seen-flag is now
+            // allocated for every non-skip payload field regardless, since a
+            // DUPLICATE occurrence is a structural fault even for an
+            // optional payload.
+            struct SeenEntry {
+                std::size_t pi;
+                llvm::AllocaInst* seenSlot;
+                bool required;
+            };
             std::vector<SeenEntry> seenFlags;
 
             for (std::size_t pi = 0; pi < np; ++pi) {
@@ -1645,12 +1979,62 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                 slots[pi] = entryAlloca(et);
                 builder_.CreateStore(llvm::Constant::getNullValue(et), slots[pi]);
                 // §9.8 / §serialized optional: a `serialized optional` payload is
-                // exempt from the required-field check (missing → default(T)).
+                // exempt from the required-field check (missing → default(T)),
+                // but NOT from the duplicate check (fix #2399) -- so a seen-flag
+                // is allocated unconditionally here.
                 bool optional = pf.serialized && pf.serialized->isOptional;
-                if (!optional) {
-                    llvm::AllocaInst* sf = entryAlloca(i8());
-                    builder_.CreateStore(builder_.getInt8(0), sf);
-                    seenFlags.push_back({pi, sf});
+                llvm::AllocaInst* sf = entryAlloca(i8());
+                builder_.CreateStore(builder_.getInt8(0), sf);
+                seenFlags.push_back({pi, sf, !optional});
+            }
+
+            // fix #2398 / §9.8 / §28.3/§28.9: a dedicated scope guarding
+            // already-populated payload slots against a LATER payload
+            // field's read throwing — mirrors #2378's emitClassDeserialize
+            // fix (Bug B) and emitRecordDeserialize's matching fix above.
+            // A choice's payload fields are record-admissible components
+            // (§9.8 "Choice serialization": "every payload field's type is
+            // serialization-eligible and record-admissible ... the same
+            // Deserialize-has-no-owner argument as for class-typed record
+            // fields"), so — exactly as for records — there is no class
+            // half to mirror; only string-typed and nested-record-typed
+            // (one level, via the #1747 emitRecordStringFieldReleases
+            // reuse — see emitRecordDeserialize's matching comment above
+            // for the full rationale and its documented narrow scope)
+            // payload slots are registered. Pushed before any payload is
+            // read; popped WITHOUT disposal once every required payload is
+            // confirmed present (below, just before the case's value is
+            // constructed) — by then each slot's value is about to be
+            // consumed into the constructed choice. Scoped PER CASE (this
+            // block runs once per declared case; only one ever executes at
+            // runtime, but each has its own `slots`), unlike the record/
+            // class fix's single scope for the whole function.
+            disposeStack_.emplace_back();
+            for (std::size_t pi = 0; pi < np; ++pi) {
+                if (skip[pi] || !slots[pi] || !ptys[pi]) continue;
+                const auto* pty = ptys[pi];
+                if (pty->kind == sema::TypeRef::Kind::Primitive &&
+                    pty->primitive == sema::PrimitiveType::String) {
+                    Disposal sd{slots[pi], nullptr};
+                    sd.stringRelease = true;
+                    disposeStack_.back().push_back(sd);
+                } else if (isRecordWithStringFieldsTypeRef(pty)) {
+                    Disposal rd{slots[pi], pty->declaration};
+                    rd.recordStringFields = true;
+                    disposeStack_.back().push_back(rd);
+                } else if (!pty->nullable &&
+                           pty->kind == sema::TypeRef::Kind::Named &&
+                           pty->declaration &&
+                           pty->declaration->kind == ast::TypeDeclKind::Choice &&
+                           choiceHasStringFields(pty->declaration)) {
+                    // fix #2425 / §9.8 / §28.3/§28.9 / §35.4: a choice
+                    // payload field may itself be a value-like CHOICE
+                    // (record-admissible per §9.8, nested at any depth) —
+                    // see the matching branch in emitRecordDeserialize above
+                    // for the full rationale.
+                    Disposal cd{slots[pi], pty->declaration};
+                    cd.choiceStringFields = true;
+                    disposeStack_.back().push_back(cd);
                 }
             }
 
@@ -1672,6 +2056,34 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
             llvm::Value* namePtr = builder_.CreateCall(readNameFn, {derPtr}, "chdes.fname");
             emitPendingCheck();
             builder_.CreateStore(namePtr, namePtrSlot);
+
+            // fix #2404 / §9.8 / §28.9: same OOM-residual null-without-
+            // exception gap as emitRecordDeserialize's matching fix above
+            // (see its comment for the full rationale) -- the ordinary
+            // truncated-input path is already caught by emitPendingCheck()
+            // just above (fix #2403); only a raw malloc/calloc failure
+            // inside bz_binder_read_bz_string can still leave namePtr null
+            // here with no pending exception, and it is dereferenced
+            // unguarded a few lines down. No manual per-slot dispose loop
+            // needed: the #2398 disposeStack_ scope pushed above (before
+            // this payload loop, per case) already registers every
+            // already-filled payload slot for automatic release, swept by
+            // emitThrowBuiltin's emitUnwindDisposals() below.
+            {
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    namePtr, llvm::ConstantPointerNull::get(ptrTy()),
+                    "chdes.fname.isnull");
+                auto* nullBB = llvm::BasicBlock::Create(
+                    llvm_, "chdes.fname.null", currentFn_);
+                auto* liveBB = llvm::BasicBlock::Create(
+                    llvm_, "chdes.fname.live", currentFn_);
+                builder_.CreateCondBr(isNull, nullBB, liveBB);
+                builder_.SetInsertPoint(nullBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+                builder_.SetInsertPoint(liveBB);
+            }
 
             auto* skipBB  = llvm::BasicBlock::Create(llvm_, "chdes.skip",  currentFn_);
             auto* afterBB = llvm::BasicBlock::Create(llvm_, "chdes.after", currentFn_);
@@ -1698,6 +2110,40 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                 builder_.CreateCondBr(isM, rdBB, ndBB);
 
                 builder_.SetInsertPoint(rdBB);
+
+                // fix #2399 / §9.8 v0.235 + stdlib §2.15 v0.235 (quoted at
+                // the seenFlags allocation above): a payload field matched a
+                // SECOND time by the wire (its seen-flag already 1) is a
+                // duplicate field name -- raised BEFORE reading anything for
+                // this occurrence, so the value already sitting in
+                // slots[pi] from the first occurrence is left for the
+                // #2398 per-case disposal scope (pushed above) to release on
+                // the emitThrowBuiltin unwind below -- mirrors
+                // emitClassDeserialize/emitRecordDeserialize's identical fix.
+                {
+                    llvm::AllocaInst* mySeenSlot = nullptr;
+                    for (const auto& se : seenFlags) {
+                        if (se.pi == pi) { mySeenSlot = se.seenSlot; break; }
+                    }
+                    if (mySeenSlot) {
+                        llvm::Value* alreadySeen = builder_.CreateLoad(
+                            i8(), mySeenSlot, "chdes.dup.seen");
+                        llvm::Value* isDup = builder_.CreateICmpNE(
+                            alreadySeen, builder_.getInt8(0), "chdes.dup.isdup");
+                        auto* dupBB = llvm::BasicBlock::Create(
+                            llvm_, "chdes.dup", currentFn_);
+                        auto* freshBB = llvm::BasicBlock::Create(
+                            llvm_, "chdes.fresh", currentFn_);
+                        builder_.CreateCondBr(isDup, dupBB, freshBB);
+
+                        builder_.SetInsertPoint(dupBB);
+                        emitThrowBuiltin("SerializationException");
+                        if (!builder_.GetInsertBlock()->getTerminator())
+                            builder_.CreateUnreachable();
+
+                        builder_.SetInsertPoint(freshBB);
+                    }
+                }
                 llvm::Value* fv = emitDeserializeField(ptys[pi], derPtr);
                 if (fv && slots[pi] && payloadStruct &&
                     pi < payloadStruct->getNumElements() &&
@@ -1740,7 +2186,12 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
 
             // §9.8: a required payload field (present neither in the input nor as
             // `serialized optional`) that was not seen is a structural fault.
+            // fix #2399: seenFlags now also holds entries for OPTIONAL payload
+            // fields (so the dispatch loop's duplicate check above can see
+            // them); skip those here -- missing stays fine for an optional
+            // payload field.
             for (const auto& se : seenFlags) {
+                if (!se.required) continue;
                 llvm::Value* seen = builder_.CreateLoad(i8(), se.seenSlot, "chdes.seen");
                 llvm::Value* miss = builder_.CreateICmpEQ(
                     seen, builder_.getInt8(0), "chdes.nseen");
@@ -1753,6 +2204,14 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                     builder_.CreateUnreachable();
                 builder_.SetInsertPoint(okBB);
             }
+
+            // fix #2398 / §9.8 / §28.3/§28.9: pop the payload-disposal scope
+            // pushed above. Every required payload is now confirmed present
+            // and construction is about to begin, consuming each slot's
+            // value into the constructed choice — nothing in this scope
+            // should be disposed on this (normal) path, so pop it WITHOUT
+            // invoking its disposals (mirrors the record/class fix's pop).
+            disposeStack_.pop_back();
 
             // Build the choice value: tag = ci, payload assembled from the slots.
             llvm::Value* payloadVal = llvm::Constant::getNullValue(payloadTy);
@@ -2571,32 +3030,72 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     }
 
     // fix #668: §9.8 / §2.15: "missing required fields remain unconditional
-    // errors."  For each non-skip, non-optional component allocate an i8 seen-
-    // flag alloca (entry-block init to 0); the flag is set to 1 when the field
-    // is matched in the loop.  After EndObject, any flag still 0 means a
+    // errors."  For each non-skip component allocate an i8 seen-flag alloca
+    // (entry-block init to 0); the flag is set to 1 when the field is matched
+    // in the loop.  After EndObject, any REQUIRED flag still 0 means a
     // required component was absent → raise SerializationException.
     //
     // Nullable T? fields without `serialized optional` are REQUIRED: nullability
     // does not confer optionality.  Only the `serialized optional` clause exempts
     // a field from the missing-field check (§9.8: "serialized optional is the
     // per-field missing-field tolerant-mode opt-in").
+    //
+    // fix #2399 / §9.8 v0.235 ("A missing required component ..., a
+    // **duplicate** field name, a type mismatch, or a name not matching any
+    // enum constant raises SerializationException unconditionally -- these
+    // are structural faults in the input regardless of policy"; stdlib
+    // §2.15 v0.235 Errors: "missing required fields, duplicates, and type
+    // mismatches remain unconditional errors regardless of the [unknown-
+    // field] setting"): a seen-flag is now allocated for EVERY non-skip
+    // component, not just required ones -- a duplicate `serialized optional`
+    // field is equally an unconditional structural fault, so the per-field
+    // dispatch loop below needs a flag to re-check even for an optional
+    // component. `required` gates ONLY the missing-field check further down
+    // (optional: missing is still fine); the duplicate check the dispatch
+    // loop performs applies to every entry here regardless of `required`.
     struct SeenEntry {
         std::size_t compIdx;      // index into comps[]
         std::string declName;     // for the error message
         llvm::AllocaInst* slot;   // i8 flag: 0=unseen, 1=seen
+        bool required;            // false for `serialized optional` components
     };
     std::vector<SeenEntry> seenFlags;
     for (std::size_t i = 0; i < comps.size(); ++i) {
         if (comps[i].isSkip) continue;      // skip excluded from wire
-        if (comps[i].isOptional) continue;  // optional: missing is fine
-        // Required component: allocate a seen-flag, zero in entry block.
+        // Seen-flag for every non-skip component (required or optional):
+        // allocate (hoisted to the entry block, as always) but zero it at the
+        // CURRENT insertion point, not forced into the entry block.
+        //
+        // fix #2399 adversarial self-pass (regression caught by the existing
+        // #2325 `repeated_roundtrip_no_accumulating_leak` test, which calls
+        // `Widget.Deserialize` 50x in a loop around ONE inlined copy of this
+        // function's generated code): unlike namePtrSlot/slots[] below --
+        // which fix #669 deliberately zero-inits in the entry block because
+        // a DIFFERENT code path's disposal sweep can read them before this
+        // invocation's own code has run at all -- a seen-flag is consulted
+        // ONLY by this SAME straight-line invocation's own dispatch loop and
+        // missing-field check, never externally. Forcing its zero-init into
+        // the entry block (as originally written) makes it run ONCE per
+        // FUNCTION rather than once per logical Deserialize call: inside a
+        // loop calling Deserialize repeatedly, the flag set to 1 on
+        // iteration 1 stays 1 forever after, so iteration 2's very first
+        // field read looks like a "duplicate" of iteration 1's already-
+        // consumed-and-freed value -- a false-positive throw whose unwind
+        // then bz_string_release's a STALE (already-freed) slots[] pointer
+        // left over from iteration 1 -> a use-after-free crash (confirmed:
+        // reverting this one hunk while keeping the rest of the #2399 fix
+        // reproduces the crash; restoring it fixes it, exit 42 clean under
+        // ASan). Resetting at the current insertion point instead makes the
+        // flag correctly per-invocation, matching emitRecordDeserialize's
+        // and emitChoiceDeserialize's seenFlags loops, which never had this
+        // bug (they always used a plain builder_.CreateStore here). As a
+        // side effect this also fixes the SAME staleness in fix #668's own
+        // missing-required-field check for a class Deserialize called
+        // repeatedly in a loop -- a latent, pre-existing gap this happens to
+        // repair, not a new behavior change for any single (non-looped) call.
         llvm::AllocaInst* sf = entryAlloca(i8());
-        {
-            llvm::BasicBlock& eb = currentFn_->getEntryBlock();
-            llvm::IRBuilder<> eb_b(&eb, std::next(sf->getIterator()));
-            eb_b.CreateStore(builder_.getInt8(0), sf);
-        }
-        seenFlags.push_back({i, comps[i].declName, sf});
+        builder_.CreateStore(builder_.getInt8(0), sf);
+        seenFlags.push_back({i, comps[i].declName, sf, !comps[i].isOptional});
     }
 
     // §9.8 / #550 leak-safety: the per-iteration field-name string returned by
@@ -2633,6 +3132,127 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         disposeStack_.back().push_back(nd);
     }
 
+    // fix #2378 / §9.8 / §28.3/§28.9: a dedicated scope guarding already-
+    // populated owned-class/string component slots against a LATER field's
+    // read throwing. Pushed here (before any field is read); each class- or
+    // string-typed component's slot is registered into it, once, up front.
+    // Popped WITHOUT disposal once construction begins (below, after the
+    // missing-required-field check), since by then every slot's value is
+    // either about to be consumed into the constructed object or the
+    // function has already unwound past this point entirely.
+    //
+    // fix #2460 (v0.235): this scope is now the SOLE disposal mechanism for
+    // every throw site inside this function (the truncated-field-name errBB
+    // block and the missing-required-field block, both below, used to walk
+    // `comps`/`slots` a second and third time with their OWN manual dispose
+    // loops immediately before their throw — removed; see their own comments
+    // for why duplicating this scope's classification there, slightly
+    // differently each time, produced a real heap-use-after-free on a
+    // graph-mode back-edge slot). Every throw in this function goes through
+    // `emitThrowBuiltin`, which unconditionally calls `emitUnwindDisposals()`
+    // and sweeps this scope (it is armed unconditionally, before any field is
+    // read, regardless of which specific throw site fires later) — so one
+    // correctly-classified registration, not three independently-maintained
+    // copies of the same classification, is what disposes every
+    // already-populated slot on every path out of this loop.
+    //
+    // Without this: a component slot populated by an EARLIER successful
+    // field read (e.g. `First: string` read before `Second: owned Leaf`)
+    // had NO disposal registered anywhere. A LATER field's read that
+    // recurses into ANOTHER emitClassDeserialize/emitDeserializeField
+    // invocation and throws from deep inside (its own
+    // bz_binder_begin_object / field-name-null check, already correctly
+    // pending-checked per the emitDeserializeField fix above) unwinds
+    // straight past this function's own manual disposal loops (which only
+    // run on THIS class's OWN field-name-null / missing-required-field
+    // paths, not a nested recursive throw) — orphaning the already-read
+    // value (the reported #2378 follow-up string leak,
+    // `bz_binder_read_bz_string`/`bz_binder_read_string`).
+    //
+    // fix #2397 / §9.8 / §28.3/§28.9/§28.13 (v0.235): #2378 scoped this
+    // registration to tree mode only (`!isGraphMode`), because a graph-mode
+    // component slot is not uniformly "a plain class instance or a string" —
+    // graph mode's per-field value shapes (mirrored from the ACTUAL dispatch
+    // a few hundred lines below, in the per-field loop over `comps`) each
+    // need a DIFFERENT release, dispatched in the SAME order and on the SAME
+    // predicates that loop uses, so the two decisions stay in lockstep:
+    //   1. Shared<C> identity participant (handledSharedElementClass): the
+    //      slot holds a bz_shared_t* HANDLE (bz_shared_new / bz_shared_clone)
+    //      — released via bz_shared_release (§28.13 / stdlib §2.16's `using
+    //      var` Shared<T> path, reused here via the `sharedHandle` Disposal
+    //      flag). Reusing the generic vtable dispatch would misinterpret the
+    //      handle's layout as a class instance — a wrong-dispatch regression.
+    //   2. owned Weak<C> back-reference (handledWeakElementClass, gated on
+    //      comp.isOwned exactly as the real dispatch requires): the slot
+    //      holds a bz_weak_t* HANDLE (bz_shared_downgrade) — released via
+    //      bz_weak_release (`weakHandle` Disposal flag). Same wrong-dispatch
+    //      hazard as Shared if misrouted through the generic path.
+    //   3. plain-borrow back-edge (comp.isBackEdge — a non-owned class-typed
+    //      field, e.g. `Alias: Slot?`): the slot holds a BORROWED pointer
+    //      resolved via bz_binder_graph_resolve_tag. This component owns
+    //      NOTHING (the object is owned by whichever `owned`/Shared<C>
+    //      component first constructed it), so NO disposal is registered —
+    //      registering the generic vtable dispatch here would premature-free
+    //      a value another live component/handle still references.
+    //   4. owned-class-in-graph-mode (comp.isOwned && a plain Named class,
+    //      not Shared/Weak — e.g. `owned Target: Slot`): the slot holds a
+    //      plain owned class instance from emitClassDeserialize /
+    //      emitPolyClassDeserialize, exactly like a tree-mode owned-class
+    //      component — falls through to the SAME generic-vtable-dispatch
+    //      branch tree mode already used (no graph-mode-specific handling
+    //      needed; it was excluded before only by the blanket `!isGraphMode`
+    //      gate this fix removes).
+    //   A plain string component is likewise no longer excluded in graph
+    //   mode: a graph-shaped class may carry ordinary string fields
+    //   alongside its identity-tagged ones (strings are never
+    //   identity-tagged themselves, §9.8), so it needs the SAME
+    //   `stringRelease` disposal tree mode already registers.
+    // Order matches the real per-field dispatch's own `if`/`else if` chain
+    // (Shared, then owned-Weak, then back-edge, then owned-class) so a
+    // component can never be double-classified.
+    disposeStack_.emplace_back();
+    for (std::size_t i = 0; i < comps.size(); ++i) {
+        if (comps[i].isSkip || !slots[i] || !comps[i].ty) continue;
+        const auto& comp = comps[i];
+        const auto* cty = comp.ty;
+        if (isGraphMode && handledSharedElementClass(cty)) {
+            // Shared<C> identity participant — bz_shared_release, null-
+            // guarded, on unwind only (LlvmBackend_Disposal.cpp's
+            // emitDisposals `it->sharedHandle` branch).
+            Disposal d{slots[i], nullptr};
+            d.unwindOnly = true;
+            d.sharedHandle = true;
+            disposeStack_.back().push_back(d);
+        } else if (isGraphMode && comp.isOwned && handledWeakElementClass(cty)) {
+            // owned Weak<C> back-reference — bz_weak_release, null-guarded,
+            // on unwind only.
+            Disposal d{slots[i], nullptr};
+            d.unwindOnly = true;
+            d.weakHandle = true;
+            disposeStack_.back().push_back(d);
+        } else if (isGraphMode && comp.isBackEdge) {
+            // Plain-borrow back-edge: owns nothing — no disposal registered.
+        } else if (cty->kind == sema::TypeRef::Kind::Named && cty->declaration &&
+                   cty->declaration->kind == ast::TypeDeclKind::Class) {
+            // Tree-mode class component, OR graph mode's owned-class-in-
+            // graph-mode component (§9.8 tier 3): a plain owned class
+            // instance, disposed via the generic vtable dispatch.
+            //
+            // unwindOnly: skipped entirely on normal exit (belt-and-
+            // suspenders — this scope is popped without disposal on the
+            // normal path anyway), null-guarded generic vtable dispatch
+            // on unwind (LlvmBackend_Disposal.cpp's emitDisposals).
+            Disposal cd{slots[i], cty->declaration};
+            cd.unwindOnly = true;
+            disposeStack_.back().push_back(cd);
+        } else if (cty->kind == sema::TypeRef::Kind::Primitive &&
+                   cty->primitive == sema::PrimitiveType::String) {
+            Disposal sd{slots[i], nullptr};
+            sd.stringRelease = true;
+            disposeStack_.back().push_back(sd);
+        }
+    }
+
     // BeginObject → read field count.
     auto* beginFn = declareC("bz_binder_begin_object", i32(), {ptrTy()});
     llvm::Value* fieldCount = builder_.CreateCall(beginFn, {derPtr}, "cdeser.cnt");
@@ -2657,9 +3277,62 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
 
     auto* readNameFn = declareC("bz_binder_read_field_name", ptrTy(), {ptrTy()});
     llvm::Value* namePtr = builder_.CreateCall(readNameFn, {derPtr}, "cdeser.fname");
+    // fix #2403 follow-up / §2.15: bz_binder_read_field_name's binary path can
+    // now raise DIRECTLY (bz_binder_read_bz_string calls bz_ser_throw_at_binary
+    // on truncation as of the #2403 fix, matching every other binary reader) —
+    // check for that pending exception BEFORE the manual null-check-and-throw
+    // block below, mirroring every other read call in this function (e.g.
+    // bz_binder_begin_object above). Without this, the manual block's own
+    // unconditional emitThrowBuiltin() call a few lines down would SUPERSEDE
+    // the #2403 exception with a fresh, message-less one — orphaning/leaking
+    // the first exception object, exactly the #2378 Bug A pattern this
+    // function was already fixed against for every OTHER read in its loop.
+    // The pre-existing disposeStack_ scope pushed above (before this loop
+    // starts) is still active here, so emitPendingCheck()'s unwind still
+    // disposes every already-filled component slot correctly.
+    emitPendingCheck();
 
-    // §9.8 / #550: truncated input — bz_binder_read_field_name returns null.
-    // Dispose any already-allocated owned-class slots, raise SerializationException.
+    // §9.8 / #550: truncated input — bz_binder_read_field_name returns null
+    // WITHOUT a pending exception (reached only for the OOM allocation-failure
+    // paths inside bz_binder_read_bz_string, which still return null silently
+    // — a truncation-caused null is now caught by emitPendingCheck() above).
+    // Raise SerializationException; already-filled slots are disposed by
+    // emitThrowBuiltin's own emitUnwindDisposals() call, which sweeps the
+    // component-disposal scope pushed near the top of this function.
+    //
+    // fix #2460 / §9.8 / §28.3/§28.9/§28.13 (v0.235): this block used to walk
+    // `comps`/`slots` itself and manually dispose+null every non-null class/
+    // string slot BEFORE the throw, so the (#2378-introduced) disposal-scope
+    // sweep inside emitThrowBuiltin would see null and safely no-op. That
+    // manual walk classified a slot as disposable by `ty->kind == Named &&
+    // ty->declaration && Class` alone — true for a genuinely owned class
+    // component AND for a graph-mode plain-borrow BACK-EDGE component (e.g.
+    // `Alias: Slot?`), whose resolved type is a real class TypeSymbol just
+    // like an owned field's. Unlike `Shared<T>`/`Weak<T>` (no `declaration`,
+    // correctly skipped by this same check, if left un-disposed — a leak, not
+    // a crash), a back-edge slot holds a BORROWED pointer to an object an
+    // EARLIER owned/Shared component already registered as ITS OWN slot. This
+    // walk did not exclude it, so disposing both `Target` (owned) and `Alias`
+    // (its back-edge alias, the SAME pointer) double-freed the object —
+    // empirically confirmed as a heap-use-after-free (#2460).
+    //
+    // The fix is not a third exclusion check bolted onto this walk: #2397
+    // (a few dozen lines above, the disposeStack_ scope pushed near the top
+    // of this function) already built the CORRECT per-component dispatch —
+    // Shared<C> -> bz_shared_release, owned Weak<C> -> bz_weak_release,
+    // back-edge -> no disposal (owns nothing), owned-class/string -> the
+    // same mechanisms this walk used — and registers it UNCONDITIONALLY,
+    // before ANY field is read, so it is already armed here regardless of
+    // which slots happen to be populated when this specific throw fires.
+    // Since `emitThrowBuiltin` unconditionally calls `emitUnwindDisposals()`,
+    // that scope's sweep is FULLY SUFFICIENT for this throw site — a second,
+    // manual walk duplicating the same classification (and getting it wrong
+    // for back-edges) added risk without adding coverage. Deleted rather than
+    // patched: three near-identical dispose loops in one function (this one,
+    // the missing-required-field one below, and #2397's own registration) is
+    // the shape that let the back-edge exclusion drift out of sync in the
+    // first place; collapsing to the ONE already-fixed, already-tested
+    // mechanism is the fix, not a fourth parallel patch.
     {
         llvm::Value* isNull = builder_.CreateICmpEQ(
             namePtr, llvm::ConstantPointerNull::get(ptrTy()), "cdeser.nfname");
@@ -2668,48 +3341,10 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         builder_.CreateCondBr(isNull, errBB, contBB);
 
         builder_.SetInsertPoint(errBB);
-        // Dispose already-filled slots (prevent leaks on truncated-input path).
-        // §28.3/§28.5: owned class ptrs must be disposed; §4.6 string ptrs must
-        // be released (bz_string_release); other value types need no cleanup.
-        auto* voidTy2 = llvm::Type::getVoidTy(llvm_);
-        for (std::size_t ci2 = 0; ci2 < comps.size(); ++ci2) {
-            if (comps[ci2].isSkip || !slots[ci2]) continue;
-            if (!comps[ci2].ty) continue;
-            const auto* ty2 = comps[ci2].ty;
-            // Owned class: Dispose + free.
-            if (ty2->kind == sema::TypeRef::Kind::Named) {
-                const TypeSymbol* cTs = ty2->declaration;
-                if (!cTs || cTs->kind != ast::TypeDeclKind::Class) continue;
-                llvm::Value* p = builder_.CreateLoad(ptrTy(), slots[ci2], "cdeser.pslot");
-                llvm::Value* nonNull = builder_.CreateICmpNE(
-                    p, llvm::ConstantPointerNull::get(ptrTy()), "cdeser.pnn");
-                auto* dispBB    = llvm::BasicBlock::Create(llvm_, "cdeser.disp",  currentFn_);
-                auto* skipBB2   = llvm::BasicBlock::Create(llvm_, "cdeser.skipt", currentFn_);
-                builder_.CreateCondBr(nonNull, dispBB, skipBB2);
-                builder_.SetInsertPoint(dispBB);
-                emitDisposeAndReclaim(p);
-                builder_.CreateBr(skipBB2);
-                builder_.SetInsertPoint(skipBB2);
-                continue;
-            }
-            // String: bz_string_release (null-safe per runtime implementation).
-            if (ty2->kind == sema::TypeRef::Kind::Primitive &&
-                ty2->primitive == sema::PrimitiveType::String) {
-                llvm::Value* sp = builder_.CreateLoad(ptrTy(), slots[ci2], "cdeser.sslot");
-                llvm::Value* nonNull = builder_.CreateICmpNE(
-                    sp, llvm::ConstantPointerNull::get(ptrTy()), "cdeser.snn");
-                auto* relBB  = llvm::BasicBlock::Create(llvm_, "cdeser.srel",  currentFn_);
-                auto* skipBB2 = llvm::BasicBlock::Create(llvm_, "cdeser.sskip", currentFn_);
-                builder_.CreateCondBr(nonNull, relBB, skipBB2);
-                builder_.SetInsertPoint(relBB);
-                auto* relFn2 = declareC("bz_string_release", voidTy2, {ptrTy()});
-                builder_.CreateCall(relFn2, {sp});
-                builder_.CreateBr(skipBB2);
-                builder_.SetInsertPoint(skipBB2);
-                continue;
-            }
-        }
-        // Raise SerializationException (sets bz_exc, unwinds, branches to unwindBB).
+        // Raise SerializationException (sets bz_exc, unwinds, branches to
+        // unwindBB — emitUnwindDisposals() along the way disposes every
+        // already-filled component slot correctly, per the #2397/#2460
+        // scope above).
         emitThrowBuiltin("SerializationException");
         // emitThrowBuiltin branches to unwindBB; add unreachable as fallback.
         if (!builder_.GetInsertBlock()->getTerminator())
@@ -2754,6 +3389,47 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
         builder_.CreateCondBr(isMatch, readBB, nextBB);
 
         builder_.SetInsertPoint(readBB);
+
+        // fix #2399 / §9.8 v0.235 + stdlib §2.15 v0.235 (quoted above the
+        // seenFlags allocation): a component matched a SECOND time by the
+        // wire (its seen-flag is already 1) is a duplicate field name -- an
+        // unconditional structural fault, raised BEFORE reading anything for
+        // this occurrence (§9.8: "a duplicate field name ... raises
+        // SerializationException unconditionally"). Without this check the
+        // dispatch below would silently overwrite slots[ci] with the new
+        // value and drop the earlier one, which the disposeStack_ scope
+        // pushed above never gets a chance to release (issue #2399's
+        // reported 73-byte leak: the FIRST value silently orphaned while the
+        // SECOND "wins"). Raising here instead lets that SAME scope's unwind
+        // sweep (emitThrowBuiltin -> emitUnwindDisposals) dispose the
+        // earlier-read value that IS already sitting in slots[ci] -- no
+        // separate manual release needed. namePtrSlot already holds this
+        // iteration's namePtr (stored in contBB above) and is registered for
+        // stringRelease, so it too is released by the same unwind sweep.
+        {
+            llvm::AllocaInst* mySeenSlot = nullptr;
+            for (const auto& se : seenFlags) {
+                if (se.compIdx == ci) { mySeenSlot = se.slot; break; }
+            }
+            if (mySeenSlot) {
+                llvm::Value* alreadySeen = builder_.CreateLoad(
+                    i8(), mySeenSlot, "cdeser.dup.seen");
+                llvm::Value* isDup = builder_.CreateICmpNE(
+                    alreadySeen, builder_.getInt8(0), "cdeser.dup.isdup");
+                auto* dupBB = llvm::BasicBlock::Create(
+                    llvm_, "cdeser.dup", currentFn_);
+                auto* freshBB = llvm::BasicBlock::Create(
+                    llvm_, "cdeser.fresh", currentFn_);
+                builder_.CreateCondBr(isDup, dupBB, freshBB);
+
+                builder_.SetInsertPoint(dupBB);
+                emitThrowBuiltin("SerializationException");
+                if (!builder_.GetInsertBlock()->getTerminator())
+                    builder_.CreateUnreachable();
+
+                builder_.SetInsertPoint(freshBB);
+            }
+        }
         {
             bool isClassComp = (comp.ty &&
                                 comp.ty->kind == sema::TypeRef::Kind::Named &&
@@ -2799,6 +3475,13 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                                               i32(), {ptrTy(), ptrTy()});
                 llvm::Value* marker = builder_.CreateCall(
                     readMarkerFn, {derPtr, tagSlot}, "cdeser.sh.mk");
+                // fix #2396 / §9.8 v0.235 (Bug-A pattern): the JSON path can
+                // raise inside bz_jder_parse_int on a malformed/truncated
+                // $id/$ref tag_id while still returning a "successful" marker
+                // (tag_id left at 0) — propagate the pending exception before
+                // acting on that bogus marker/tag, mirroring
+                // bz_binder_read_case_discriminator's call sites in this file.
+                emitPendingCheck();
                 llvm::Value* tagId =
                     builder_.CreateLoad(i32(), tagSlot, "cdeser.sh.tag");
                 // BZ_SER_INLINE = 0x01, BZ_SER_REF = 0x02 (runtime constants).
@@ -2900,6 +3583,10 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 auto* readMarkerFn = declareC("bz_binder_read_graph_marker",
                                               i32(), {ptrTy(), ptrTy()});
                 builder_.CreateCall(readMarkerFn, {derPtr, wkTagSlot});
+                // fix #2396 / §9.8 v0.235 (Bug-A pattern): see the Shared<C>
+                // branch above — propagate a pending exception from a
+                // malformed/truncated $ref tag_id before resolving it.
+                emitPendingCheck();
                 llvm::Value* wkTag =
                     builder_.CreateLoad(i32(), wkTagSlot, "cdeser.wk.tag");
                 auto* wkResolveFn = declareC("bz_binder_graph_resolve_tag",
@@ -2958,8 +3645,13 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 builder_.CreateStore(builder_.getInt32(0), tagSlot);
                 auto* readMarkerFn = declareC("bz_binder_read_graph_marker",
                                               i32(), {ptrTy(), ptrTy()});
-                // (marker result not checked — trust wire format is REF here)
+                // (marker VALUE not checked beyond this — trust wire format
+                // is REF here — but fix #2396 / §9.8 v0.235: a malformed/
+                // truncated $ref tag_id can leave a pending exception behind
+                // a "successful" marker (tag_id left at 0), so check for
+                // that pending exception before resolving the bogus tag.)
                 builder_.CreateCall(readMarkerFn, {derPtr, tagSlot});
+                emitPendingCheck();
                 llvm::Value* tagId = builder_.CreateLoad(i32(), tagSlot, "cdeser.be.tag");
                 auto* resolveFn = declareC("bz_binder_graph_resolve_tag",
                                            ptrTy(), {ptrTy(), i32()});
@@ -2992,6 +3684,12 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                 auto* readMarkerFn = declareC("bz_binder_read_graph_marker",
                                               i32(), {ptrTy(), ptrTy()});
                 builder_.CreateCall(readMarkerFn, {derPtr, tagSlot});
+                // fix #2396 / §9.8 v0.235 (Bug-A pattern): see the Shared<C>
+                // branch above — a malformed/truncated $id tag_id on this
+                // INLINE path can leave a pending exception behind a
+                // "successful" marker; propagate it before marking the tag
+                // in-progress and recursing into the (now-desynced) stream.
+                emitPendingCheck();
                 llvm::Value* tagId = builder_.CreateLoad(i32(), tagSlot, "cdeser.ot.tag");
                 // Mark the tag as in-progress (cycle sentinel).
                 auto* markFn = declareC("bz_binder_graph_mark_in_progress",
@@ -3071,38 +3769,54 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     // is still 0 means the field was absent → SerializationException.
     // Checked after EndObject so the deserializer has consumed the full object
     // token, but before calloc so no allocation cleanup is needed on this path.
+    // fix #2399: seenFlags now also holds entries for OPTIONAL components (so
+    // the dispatch loop's duplicate check above can see them); skip those
+    // here -- "missing" stays fine for an optional field, only `required`
+    // entries feed this check.
     for (const auto& se : seenFlags) {
+        if (!se.required) continue;
         llvm::Value* seen = builder_.CreateLoad(i8(), se.slot, "cdeser.seen");
         llvm::Value* notSeen = builder_.CreateICmpEQ(seen, builder_.getInt8(0), "cdeser.nseen");
         auto* missBB = llvm::BasicBlock::Create(llvm_, "cdeser.miss", currentFn_);
         auto* okBB   = llvm::BasicBlock::Create(llvm_, "cdeser.ok",   currentFn_);
         builder_.CreateCondBr(notSeen, missBB, okBB);
         builder_.SetInsertPoint(missBB);
-        // Dispose already-read owned-class slots to avoid leaks (§28.3/§28.5).
-        for (std::size_t ci2 = 0; ci2 < comps.size(); ++ci2) {
-            if (comps[ci2].isSkip || !slots[ci2]) continue;
-            if (!comps[ci2].ty) continue;
-            bool isClassSlot =
-                comps[ci2].ty->kind == sema::TypeRef::Kind::Named &&
-                comps[ci2].ty->declaration &&
-                comps[ci2].ty->declaration->kind == ast::TypeDeclKind::Class;
-            if (!isClassSlot) continue;
-            llvm::Value* p = builder_.CreateLoad(ptrTy(), slots[ci2], "cdeser.mslot");
-            llvm::Value* nonNull = builder_.CreateICmpNE(
-                p, llvm::ConstantPointerNull::get(ptrTy()), "cdeser.mnn");
-            auto* dispBB2 = llvm::BasicBlock::Create(llvm_, "cdeser.mdisp", currentFn_);
-            auto* skipBB3 = llvm::BasicBlock::Create(llvm_, "cdeser.mskip", currentFn_);
-            builder_.CreateCondBr(nonNull, dispBB2, skipBB3);
-            builder_.SetInsertPoint(dispBB2);
-            emitDisposeAndReclaim(p);
-            builder_.CreateBr(skipBB3);
-            builder_.SetInsertPoint(skipBB3);
-        }
+        // fix #2460 / §9.8 / §28.3/§28.9/§28.13 (v0.235): this block used to
+        // walk `comps`/`slots` itself and manually dispose+null every
+        // non-null class-typed slot before the throw — see the errBB block
+        // above (a few dozen lines up in this same function) for the full
+        // account of why that classification (`ty->kind == Named &&
+        // ty->declaration && Class`, with no `comp.isBackEdge` exclusion)
+        // double-freed a graph-mode back-edge slot alongside the owned
+        // object it borrows (confirmed heap-use-after-free, #2460). Deleted
+        // for the same reason: emitThrowBuiltin's own emitUnwindDisposals()
+        // call already sweeps the #2397 component-disposal scope pushed near
+        // the top of this function, which classifies every component shape
+        // correctly (including excluding back-edges) and is armed
+        // unconditionally before this check ever runs — a second, separately
+        // maintained walk here added risk without adding coverage.
         emitThrowBuiltin("SerializationException");
         if (!builder_.GetInsertBlock()->getTerminator())
             builder_.CreateUnreachable();
         builder_.SetInsertPoint(okBB);
     }
+
+    // fix #2378 / §9.8 / §28.3/§28.9: pop the component-disposal scope pushed
+    // near the top of this function (guarding already-populated owned-class/
+    // string slots against a later throw during the field loop above). Every
+    // required field is now confirmed present and construction is about to
+    // begin, consuming each slot's value into the constructed object (or
+    // handing off to the already-correct construction-phase cleanup, #2363,
+    // and emitNewPendingCheck's own partial-object disposal) — nothing in
+    // this scope should be disposed on this (normal) path, so pop it WITHOUT
+    // invoking its disposals (mirroring how a `using`/try body scope that
+    // completes normally is handled by its own, different, exit dispatch).
+    // Balances the unconditional disposeStack_.emplace_back() above (that
+    // push is unconditional so the scope exists — possibly empty, for
+    // isGraphMode — regardless; this pop must be unconditional too, or a
+    // graph-mode class would leave disposeStack_ permanently unbalanced for
+    // the rest of the enclosing function).
+    disposeStack_.pop_back();
 
     // Allocate the class instance.
     llvm::Value* sizeofSt = builder_.CreatePtrToInt(
@@ -3110,14 +3824,6 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
                            {builder_.getInt32(1)}),
         i64());
     llvm::Value* obj = builder_.CreateCall(callocFn(), {builder_.getInt64(1), sizeofSt});
-
-    // Run field initializers (emitInstanceInit).
-    {
-        llvm::Value* savedThis = currentThis_;
-        currentThis_ = obj;
-        emitInstanceInit(ts, obj, st);
-        currentThis_ = savedThis;
-    }
 
     // §9.8 v0.136: find the unique constructor whose parameter names match
     // exactly the set of serialized component declared identifiers
@@ -3137,26 +3843,150 @@ llvm::Value* Emitter::emitClassDeserialize(const TypeSymbol* ts,
     for (std::size_t ci = 0; ci < comps.size(); ++ci)
         compByNameLower[toLowerAscii(comps[ci].declName)] = ci;
 
-    sema::ConstructorSymbol* matchedCtor = nullptr;
-    for (Symbol* m : ts->members) {
-        auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
-        if (!cs || cs->isStatic) continue;
-        auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-        if (!cd) continue;
-        // Match: param count == component count AND every param name (lowered)
-        // maps to a distinct component (bijection).
-        if (cd->params.size() != comps.size()) continue;
+    // §9.8 / #2325: the class's PRIMARY constructor (§11.1) is itself a
+    // match candidate — see the parallel sema check
+    // (TypeResolution_Checks.cpp checkSerializationEligibility), which
+    // already validated that exactly one candidate (primary or explicit)
+    // matches whenever this codegen runs. There is no ConstructorSymbol / no
+    // ctorFns_ entry for the primary constructor (SymbolCollection.cpp
+    // creates a ConstructorSymbol only for an explicit ast::ConstructorDecl,
+    // and the primary constructor of a no-explicit-ctor class is not lowered
+    // as a separate callable function at all — see lowerNew's no-explicit-
+    // ctor path, LlvmBackend_Exprs2.cpp), so it cannot be "called" — instead,
+    // mirror lowerNew's own construction order for that case: store each
+    // deserialized component value directly into its primary-ctor-parameter
+    // field slot (transfer, no retain — the deserialized value is a fresh +1
+    // exactly like a literal argument to `new`, LlvmBackend_Exprs2.cpp's
+    // #1605 comment), THEN run field initializers (emitInstanceInit) so that
+    // any explicit field whose initializer reads a primary-ctor parameter
+    // (`Id: int := id;`) — as well as a parameter captured ONLY by a
+    // computed property (`property Id: int => id;`) — observes the correct
+    // value, exactly as ordinary `new ClassName(...)` construction does.
+    bool primaryCtorUsed = false;
+    if (td0g->hasPositionalFields &&
+        td0g->positionalFields.size() == comps.size()) {
         bool allMatch = true;
-        for (const auto& p : cd->params) {
-            if (compByNameLower.find(toLowerAscii(p.name)) ==
+        for (const auto& pf : td0g->positionalFields) {
+            if (compByNameLower.find(toLowerAscii(pf.name)) ==
                     compByNameLower.end()) {
                 allMatch = false;
                 break;
             }
         }
         if (allMatch) {
-            matchedCtor = cs;
-            break;
+            for (const auto& pf : td0g->positionalFields) {
+                // Find pf's own FieldSymbol (posParam == &pf) for its
+                // struct field index — the primary-ctor param's OWN slot,
+                // which may be a different symbol than the component that
+                // supplies its value (e.g. `Id: int := id;`: component
+                // "Id" supplies the value stored into param `id`'s slot).
+                const Symbol* pfs = nullptr;
+                for (const Symbol* mm : ts->members) {
+                    auto* cfs = dynamic_cast<const sema::FieldSymbol*>(mm);
+                    if (cfs && cfs->posParam == &pf) { pfs = cfs; break; }
+                }
+                if (!pfs) continue;
+                auto fit = fieldIndex_.find(pfs);
+                if (fit == fieldIndex_.end()) continue;
+                auto cit = compByNameLower.find(toLowerAscii(pf.name));
+                if (cit == compByNameLower.end()) continue;
+                std::size_t ci = cit->second;
+                if (!comps[ci].ty) continue;
+                llvm::Type* lt = lowerTypeRef(comps[ci].ty);
+                if (!lt) continue;
+                llvm::Value* fv;
+                if (comps[ci].isSkip || !slots[ci])
+                    fv = llvm::Constant::getNullValue(lt);
+                else
+                    fv = builder_.CreateLoad(lt, slots[ci], "cdeser.pcarg");
+                builder_.CreateStore(
+                    fv, builder_.CreateStructGEP(st, obj, fit->second));
+            }
+            primaryCtorUsed = true;
+        }
+    }
+
+    // emitInstanceInit installs ONLY the vtable (LlvmBackend_Setup.cpp) — it
+    // does NOT run field initializers despite the name; those are run by
+    // emitOwnFieldInit, normally invoked from inside a constructor's own
+    // compiled LLVM body (the explicit-ctor path below reaches it that way)
+    // or, for a no-explicit-ctor `new` expression, explicitly at the call
+    // site (LlvmBackend_Exprs2.cpp's `!hasAnyConstructor(t)` branch). The
+    // primary-ctor path above has no ctor function to call, so — mirroring
+    // that no-explicit-ctor `new` site exactly — emitOwnFieldInit must be
+    // called explicitly here too, or an explicit field whose initializer
+    // reads a primary-ctor parameter (`Id: int := id;`) is silently left at
+    // its calloc-zeroed default (verified: this was the #2325 bug — a
+    // Widget2-shaped class round-tripped Id=0 instead of the deserialized
+    // value, because only emitInstanceInit ran, not emitOwnFieldInit).
+    //
+    // fix #2363 / §9.8 v0.234 ("each owned object is constructed by an
+    // ordinary call to its constructor") + §22.9 v0.234 "Owned fields and
+    // exception safety": "An exception during a field initializer (step 2)
+    // triggers disposal of any earlier derived owned fields whose
+    // initializers completed, in reverse declaration order, followed by the
+    // base subobject's Dispose() ... The exception then propagates" and "the
+    // derived instance is never observable". Since §9.8 construction is
+    // specified as an ordinary constructor call, the same exception-safety
+    // guarantee applies here: mirror the no-explicit-ctor `new` site's
+    // throw-safety cleanup (LlvmBackend_Exprs2.cpp's `!hasAnyConstructor(t)`
+    // branch) around this emitOwnFieldInit call, so a throwing own field
+    // initializer disposes the already-populated primary-ctor-param fields
+    // (stored above — §22.9's step-0 capture fields, "whose initialization
+    // completed first") and any earlier own-field initializer's owned value,
+    // plus the base subobject (a no-op today: #2325/#2364 reject base
+    // storage pre-codegen, but mirrored so the cleanup stays exact if that
+    // restriction is ever lifted), then reclaims the instance block, before
+    // re-propagating outward — exactly as an ordinary `new` on this shape
+    // would.
+    {
+        llvm::Value* savedThis = currentThis_;
+        currentThis_ = obj;
+        emitInstanceInit(ts, obj, st);
+        if (primaryCtorUsed) {
+            llvm::BasicBlock* savedUnwind = unwindTarget_;
+            std::size_t savedDepth = unwindScopeDepth_;
+            auto* savedInsert = builder_.GetInsertBlock();
+            llvm::BasicBlock* enclosingUnwind = unwindBB();
+            auto* cleanupBB = llvm::BasicBlock::Create(
+                llvm_, "cdeser.pcfield.cleanup", currentFn_);
+            builder_.SetInsertPoint(cleanupBB);
+            emitOwnedFieldDisposals(ts);
+            emitBaseDisposeChain(ts);
+            builder_.CreateCall(freeFn(), {obj});
+            builder_.CreateBr(enclosingUnwind);
+            builder_.SetInsertPoint(savedInsert);
+            unwindTarget_ = cleanupBB;
+            unwindScopeDepth_ = disposeStack_.size();
+            emitOwnFieldInit(ts, obj, st);
+            unwindTarget_ = savedUnwind;
+            unwindScopeDepth_ = savedDepth;
+        }
+        currentThis_ = savedThis;
+    }
+
+    sema::ConstructorSymbol* matchedCtor = nullptr;
+    if (!primaryCtorUsed) {
+        for (Symbol* m : ts->members) {
+            auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m);
+            if (!cs || cs->isStatic) continue;
+            auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
+            if (!cd) continue;
+            // Match: param count == component count AND every param name
+            // (lowered) maps to a distinct component (bijection).
+            if (cd->params.size() != comps.size()) continue;
+            bool allMatch = true;
+            for (const auto& p : cd->params) {
+                if (compByNameLower.find(toLowerAscii(p.name)) ==
+                        compByNameLower.end()) {
+                    allMatch = false;
+                    break;
+                }
+            }
+            if (allMatch) {
+                matchedCtor = cs;
+                break;
+            }
         }
     }
 

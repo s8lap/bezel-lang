@@ -120,18 +120,18 @@ BEZEL_TEST(codegen_decimal_1829, parse_maxvalue_roundtrips_spec_4_4_9_3) {
         "return 0; ")), 1);
 }
 
-// §4.4 / §9.3 (fix #1829): a value whose digit count exceeds 29 but whose
-// magnitude is brought back into range by a negative exponent must NOT raise
-// — the scale absorbs the dropped integer digits.  10^30 e-3 = 10^27, well
-// within range; Parse yields exactly 10^27.  Before the fix the parser lost
-// the dropped digits' magnitude and returned 10^25 (silently wrong); with the
-// fix the scale consumes them and the value is correct.
-BEZEL_TEST(codegen_decimal_1829, parse_long_integer_with_compensating_exponent_spec_4_4_9_3) {
-    BEZEL_EXPECT_EQ(run(prog(
-        "var d := Decimal.Parse(\"1000000000000000000000000000000e-3\"); "
-        "if d = 1000000000000000000000000000m then return 1; end; "
-        "return 0; ")), 1);
-}
+// RETIRED by fix #2273: parse_long_integer_with_compensating_exponent_spec_4_4_9_3
+// asserted that Decimal.Parse("1000000000000000000000000000000e-3") SUCCEEDS.
+// It pinned an over-admission: stdlib §9.3 admits only "an optional leading
+// sign (+/-) followed by decimal digits with at most one `.`" — no exponent —
+// so that call must raise FormatException, which
+// codegen_decimal_2273.parse_compensating_exponent_rejected_spec_9_3 now
+// asserts.  The behaviour the test was really about — #1829's accounting, in
+// which a scale absorbs the integer digits the mantissa could not hold — is
+// preserved where the exponent form IS legal, the decimal literal grammar of
+// language spec §18.1 / Appendix A:
+// codegen_decimal_2273.literal_exponent_form_still_accepted_spec_18_1 checks
+// the same magnitude as `1000000000000000000000000000000e-3m`.
 
 // ---------------------------------------------------------------------------
 // TryParse path (stdlib §9.3) — returns false wherever Parse would raise.

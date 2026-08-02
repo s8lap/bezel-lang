@@ -122,6 +122,7 @@ void ExprTC::run(const ast::SourceFile& src) {
     importAliases_.clear();
     sourceImports_.clear();
     ambiguousImportNames_.clear();
+    importedExtensions_.clear();
     for (const auto& imp : src.imports) {
         if (!imp || !imp->name) continue;
         std::string dotted;
@@ -175,6 +176,21 @@ void ExprTC::run(const ast::SourceFile& src) {
             // §2.8.1 rule 4: a self-import never exposes a same-named
             // dependency artifact's publics (see the note above run()).
             if (!selfModuleName.empty() && dotted == selfModuleName) continue;
+            // §26.5 step 2 (#735): an imported module's `public extension`
+            // blocks join the extension search set for this file. Unlike a
+            // type, an extension has no name to expose in scope — it is found
+            // only by lookupExtensionMember matching its target type.
+            if (const std::vector<ExtensionSymbol*>* exts =
+                    ctx_.importedExtensionsOf(dotted)) {
+                for (ExtensionSymbol* e : *exts) {
+                    if (!e) continue;
+                    importedExtensions_.push_back(e);
+                    // §26.5 rule 4 (#1307): remember this block's defining
+                    // module for the ambiguity diagnostic (see
+                    // importedExtensionModule_'s declaration).
+                    importedExtensionModule_[e] = dotted;
+                }
+            }
             if (const std::vector<TypeSymbol*>* exported =
                     ctx_.importedTypesOf(dotted)) {
                 for (TypeSymbol* t : *exported) {
@@ -4113,7 +4129,88 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
                                         const ast::Expr& target,
                                         const char* kind) {
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps.decl);
-    if (!pd) return;
+    if (!pd) {
+        // fix #2454 (§22.3/§13.6/§23.3, §2.8.2 clause 1/§2.8.3 rule 4,
+        // v0.235): an IMPORTED PropertySymbol has no ast::PropertyDecl
+        // (`ps.decl` is unconditionally null — ModuleLoader never
+        // reconstructs a body-less imported property's decl), so this
+        // function previously returned immediately for ANY imported
+        // property, skipping BOTH the "no setter" check and the §13.6
+        // setter-visibility check — the ref/out sibling of #2412 (hasSetter)
+        // and #2415 (setter visibility), which fixed the identical gap for
+        // the plain `:=` assignment-target check in the same file. Falls
+        // back to the SAME side tables #2412/#2415/#2461 publish:
+        // `ctx_.importedPropertyHasSetter(ps)`,
+        // `ctx_.importedPropertySetterVisibility(ps)`, and (fix #2461)
+        // `ctx_.importedPropertyHasGetter(ps)`.
+        //
+        // fix #2461 (§22.3/§23, v0.236): the getter-presence check this
+        // branch previously lacked. §22.3: "for `ref`, the getter is called
+        // once to produce the callee's slot value (for `out` no getter call
+        // occurs)" — so a write-only property (setter but NO getter) is a
+        // legal `out` target but NOT a legal `ref` target. Before this bit
+        // existed, a write-only imported property used as `ref` fell through
+        // this check (and the separate ExprTypecheck_Calls.cpp
+        // propertyDeclIsSetOnly READ gate, which is also `pd`-gated) all the
+        // way to a raw LINKER error (undefined `...$propget` symbol — the
+        // exporter never emitted one), rather than a clean §23 rejection.
+        // The LOCAL same-module shape was already correctly rejected, but by
+        // that earlier propertyDeclIsSetOnly gate on the `d.W` member-access
+        // read, which (deliberately per §23) treats ANY non-`:=`-target
+        // access of a write-only property as an illegal read — including the
+        // `d.W` inside `out d.W`, which is why that gate is NOT widened to
+        // imported properties here (it would false-reject the spec-legal
+        // write-only-as-`out` case, see xmod_refout_prop_visibility_2454's
+        // T6). This check instead keys off the `kind` string so `out` is
+        // correctly admitted (§22.3: no getter call for `out`).
+        if (!ctx_.importedPropertyHasSetter(&ps)) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument must be a property "
+                "with an accessible setter — this property has no setter "
+                "(§22.3 / §23.3)");
+            return;
+        }
+        // fix #2461 (§22.3/§23): `ref` additionally requires a getter (the
+        // copy-in calls it once); `out` does not ("for `out` no getter call
+        // occurs"). A write-only imported property (hasSetter && !hasGetter)
+        // as `ref` is therefore rejected here with a clean §22.3/§23 message
+        // instead of the pre-fix raw linker error. The property name is
+        // included to match the LOCAL propertyDeclIsSetOnly gate's message
+        // shape ("property `W` is write-only ...").
+        if (kind[0] == 'r' /* "ref", not "out" */ &&
+            !ctx_.importedPropertyHasGetter(&ps)) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `ref` argument requires a readable property — "
+                            "`") + std::string(ps.name) +
+                "` is write-only (it declares only a `set` accessor) and "
+                "has no getter for the copy-in (§22.3 / §23)");
+            return;
+        }
+        ast::Visibility sv = ctx_.importedPropertySetterVisibility(&ps);
+        TypeSymbol* declaring = ps.parent;
+        bool bad = false;
+        if (sv == ast::Visibility::Private) {
+            bad = true;  // declaring is an imported TypeSymbol; currentType_
+                         // is always a type compiled in THIS module — the
+                         // two can never be the same symbol (mirrors #2415).
+        } else if (sv == ast::Visibility::Protected) {
+            bad = !(currentType_ && isSubtype(currentType_, declaring));
+        } else if (sv == ast::Visibility::Internal) {
+            bad = true;  // the importing module is by definition a
+                         // different module than the declaring one
+                         // (mirrors #2415).
+        }
+        if (bad) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument must be a property "
+                "with an accessible setter — its setter is not accessible "
+                "here (§22.3 / §13.6)");
+        }
+        return;
+    }
     bool hasSetter = true;
     if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
         hasSetter = false;
@@ -4128,6 +4225,64 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
             std::string("a `") + kind + "` argument must be a property "
             "with an accessible setter — this property has no setter "
             "(§22.3 / §23.3)");
+        return;
+    }
+    // fix #2530 (§22.3 / §23, v0.236): the LOCAL-branch twin of the
+    // imported `!pd`-branch's hasGetter check (#2461). §22.3: "for `ref`,
+    // the getter is called once to produce the callee's slot value (for
+    // `out` no getter call occurs)" — so a write-only property (setter but
+    // NO getter) is a legal `out` target but NOT a legal `ref` target. The
+    // earlier propertyDeclIsSetOnly READ gate in ExprTypecheck_Calls.cpp
+    // covers the LOCAL named-property `d.W` read form, but does NOT fire
+    // for an IndexExpr (`d[i]`), and is therefore not widened for ref/out
+    // here (it would false-reject the spec-LEGAL write-only-as-`out`
+    // case). Mirror #2461's `kind == "ref"` guard so `out` is correctly
+    // admitted (§22.3: no getter call for `out`). The indexer coverage
+    // becomes uniform once ExprTypecheck_Exprs.cpp's IndexExpr visit
+    // attaches the resolved PropertySymbol — without that, this branch's
+    // exact message shape only fires for a LOCAL write-only INDEXER and a
+    // LOCAL write-only named PROPERTY reachable via `obj[i]` is still
+    // gated only by the original (IndexedExpr-doesn't-apply) read gate.
+    // hasGetter mirrors propertyDeclIsSetOnly's INVERSE exactly:
+    //   * Expression / Auto bodyKinds always have a getter (auto-derived).
+    //   * Block bodyKind has a getter iff any accessor is a `get` arm
+    //     (the same loop shape the hasSetter block above uses, inverted
+    //     on `acc.isSet`).
+    bool hasGetter = false;
+    if (pd->bodyKind == ast::PropertyBodyKind::Expression ||
+        pd->bodyKind == ast::PropertyBodyKind::Auto) {
+        hasGetter = true;
+    } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+        for (const auto& acc : pd->accessors)
+            if (!acc.isSet) { hasGetter = true; break; }
+    }
+    if (hasGetter == false && kind[0] == 'r' /* "ref", not "out" */) {
+        // §22.3 / §23: a `ref` argument requires a readable property — a
+        // write-only one has no getter for the copy-in. (`out` is correct
+        // here per the `kind` guard above and §22.3: "for `out` no getter
+        // call occurs".) The name-and-parent label mirrors the
+        // propertyDeclIsSetOnly gate's "property `W` is write-only" shape
+        // (ExprTypecheck_Calls.cpp) for the named property case; an INDEXER
+        // has no usable `pd->name` (the parser leaves it empty for the
+        // `property this[i: T]: U` form), so use the indexer label "the
+        // indexer" and the declaring type's name for that case.
+        std::string label;
+        if (pd->isIndexer) {
+            std::string typeName = ps.parent
+                ? std::string(ps.parent->name)
+                : std::string();
+            label = typeName.empty()
+                ? std::string("the indexer")
+                : ("the `" + typeName + "` indexer");
+        } else {
+            label = "`" + std::string(pd->name) + "`";
+        }
+        ctx_.diagnostics().report(
+            Severity::Error, target.span.begin,
+            std::string("a `ref` argument requires a readable property — ")
+            + label +
+            " is write-only (it declares only a `set` accessor) and has no "
+            "getter for the copy-in (§22.3 / §23)");
         return;
     }
     bool isReadonlyAuto = false;
@@ -5595,14 +5750,147 @@ static bool extSignatureUsesFreeVar(
     return false;
 }
 
+// §26.5 rule 4 (#1307): a printable spelling of a receiver-substituted (or
+// declared) extension head from its resolved TypeRef — e.g. "IEnumerable<int>"
+// for a substituted head, or "IEnumerable<T>" for the declared head of a
+// generic block (a free type variable's TypeRef is a null-declaration Named
+// ref whose name IS "T", per namedTypeSimpleName). Extension targets are
+// always Named or a Primitive keyword (§26.2 admits classes, interfaces,
+// records, enums, and primitives only — never an inline-array or function
+// type), so those two TypeRef kinds are all this needs to cover.
+static std::string spellExtHeadTypeRef(const TypeRef* t) {
+    if (!t) return "?";
+    if (t->kind == TypeRef::Kind::Primitive) {
+        using P = PrimitiveType;
+        switch (t->primitive) {
+            case P::Bool:    return "bool";
+            case P::Char:    return "char";
+            case P::String:  return "string";
+            case P::Byte:    return "byte";
+            case P::SByte:   return "sbyte";
+            case P::Short:   return "short";
+            case P::UShort:  return "ushort";
+            case P::Int:     return "int";
+            case P::UInt:    return "uint";
+            case P::Long:    return "long";
+            case P::ULong:   return "ulong";
+            case P::Float:   return "float";
+            case P::Double:  return "double";
+            case P::Decimal: return "decimal";
+            case P::Object:  return "Object";
+            default:         return "?";
+        }
+    }
+    if (t->kind == TypeRef::Kind::Named) {
+        std::string s(namedTypeSimpleName(t));
+        if (s.empty()) s = "?";
+        if (!t->genericArgs.empty()) {
+            s += "<";
+            for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                if (i) s += ", ";
+                s += spellExtHeadTypeRef(t->genericArgs[i]);
+            }
+            s += ">";
+        }
+        return s;
+    }
+    return "?";
+}
+
+// §26.5 rule 4 (#1307): a printable spelling of an AST type node, used for the
+// `where` clause of a rule-4 ambiguity candidate. Read directly from the AST
+// (ExtensionDecl::genericConstraints) rather than a resolved TypeRef, because
+// an imported extension's synthesized AST (ModuleLoader.cpp Pass 4) never
+// reconstructs genericConstraints — module metadata does not currently
+// serialize a block's `where` clause — so spellExtWhereClause below
+// intentionally returns "" for an imported candidate rather than fabricating
+// text; see the diagnostic-site comment for the recorded follow-up.
+static std::string spellExtWhereAstType(const ast::Type& t) {
+    std::string s;
+    if (t.name)
+        for (std::size_t i = 0; i < t.name->parts.size(); ++i) {
+            if (i) s += ".";
+            s += std::string(t.name->parts[i]);
+        }
+    if (s.empty()) s = "?";
+    if (!t.genericArgs.empty()) {
+        s += "<";
+        for (std::size_t i = 0; i < t.genericArgs.size(); ++i) {
+            if (i) s += ", ";
+            s += spellExtWhereAstType(*t.genericArgs[i]);
+        }
+        s += ">";
+    }
+    if (t.nullable) s += "?";
+    return s;
+}
+
+static std::string spellExtWhereClause(
+    const std::vector<ast::GenericConstraint>& gcs) {
+    std::string out;
+    for (std::size_t gi = 0; gi < gcs.size(); ++gi) {
+        const auto& gc = gcs[gi];
+        if (gi) out += " ";
+        out += "where " + std::string(gc.typeParam) + ": ";
+        if (!gc.modifierConstraint.empty()) {
+            out += std::string(gc.modifierConstraint);
+            continue;
+        }
+        for (std::size_t ii = 0; ii < gc.items.size(); ++ii) {
+            if (ii) out += ", ";
+            const auto& item = gc.items[ii];
+            if (item.kind == "type" && item.typeArg)
+                out += spellExtWhereAstType(*item.typeArg);
+            else
+                out += std::string(item.kind);
+        }
+    }
+    return out;
+}
+
 Symbol* ExprTC::lookupExtensionMember(
     const TypeRef* receiver,
     std::string_view name,
-    std::vector<std::pair<std::string, TypeRef*>>* outBinding) {
-    if (!receiver || !ctx_.module()) return nullptr;
-    for (Symbol* child : ctx_.module()->children) {
-        auto* ext = dynamic_cast<ExtensionSymbol*>(child);
-        if (!ext) continue;
+    std::vector<std::pair<std::string, TypeRef*>>* outBinding,
+    SourceLocation loc,
+    bool reportAmbiguity) {
+    if (!receiver) return nullptr;
+    // §26.5 step 2: "the compiler searches the current module AND all imported
+    // modules for extension blocks on x's type". The candidate set is this
+    // file's own module children plus the blocks reconstructed from each
+    // `import`ed dependency artifact (#735) — before that carriage existed, a
+    // cross-module extension call reported a spurious "no member" reject.
+    std::vector<ExtensionSymbol*> candidates;
+    if (ctx_.module()) {
+        for (Symbol* child : ctx_.module()->children)
+            if (auto* e = dynamic_cast<ExtensionSymbol*>(child))
+                candidates.push_back(e);
+    }
+    candidates.insert(candidates.end(), importedExtensions_.begin(),
+                      importedExtensions_.end());
+    // §26.5.1 rule 1 / §26.5 rule 4 (#1307): collect every APPLICABLE
+    // candidate — a name-matching member from a block whose target
+    // structurally matches the receiver — instead of returning on the first
+    // match, so the full candidate set can be ranked by subtype specificity
+    // below rather than resolved by declaration order (the bug this fixes:
+    // the compiler previously took whichever block's ancestor-match loop
+    // reached first, silently re-routing a call whenever declaration order or
+    // imports changed). `ownedAncs` is function-scoped (not per-iteration) so
+    // every candidate's substituted-head TypeRef stays alive through the
+    // ranking step below — a synthesized builtin ancestor (e.g. the
+    // `IEnumerable<int>` wrapper matched for an `Array<int>` receiver) is
+    // owned here, not by the receiver's own tree.
+    struct ExtCandidate {
+        Symbol* member = nullptr;
+        const TypeRef* substHead = nullptr;  // receiver-substituted head, §26.5.1
+        const TypeRef* declaredHead = nullptr;  // unsubstituted declared head
+        ExtensionSymbol* ext = nullptr;
+        const ast::ExtensionDecl* decl = nullptr;
+        std::vector<std::pair<std::string, TypeRef*>> binding;
+    };
+    std::vector<ExtCandidate> found;
+    std::vector<std::unique_ptr<TypeRef>> ownedAncs;
+    for (ExtensionSymbol* ext : candidates) {
         auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext->decl);
         if (!decl || !decl->targetType) continue;
         const TypeRef* target = ctx_.resolvedType(*decl->targetType);
@@ -5660,8 +5948,9 @@ Symbol* ExprTC::lookupExtensionMember(
         }
         // §26.5 (#714): find the ancestor of `receiver` that matches `target`
         // (could be receiver itself if exact match). We need the ancestor both
-        // for the bool match AND for extracting the concrete T-binding.
-        std::vector<std::unique_ptr<TypeRef>> ownedAncs;
+        // for the bool match AND for extracting the concrete T-binding — and,
+        // per §26.5.1 (#1307), it IS the receiver-substituted head the
+        // specificity ranking below compares.
         const TypeRef* matchedAnc = extensionFindMatchingAncestor(
             target, receiver, freeVars, ownedAncs);
         if (!matchedAnc) continue;
@@ -5697,11 +5986,103 @@ Symbol* ExprTC::lookupExtensionMember(
                 // Collect T→concrete mapping positionally from matched ancestor.
                 collectFreeVarBinding(target, matchedAnc, freeVars, binding);
             }
-            if (outBinding) *outBinding = binding;
-            return m;
+            // §26.5 (pre-existing, unchanged by #1307): the first same-named
+            // member within ONE block wins — per-block overload selection by
+            // arity/argument type is a separate, unimplemented gap (member
+            // access is typed independent of the enclosing call's argument
+            // list throughout this front-end), not touched here.
+            found.push_back({m, matchedAnc, target, ext, decl, std::move(binding)});
+            break;
         }
     }
-    return nullptr;
+    if (found.empty()) return nullptr;
+    if (found.size() == 1) {
+        if (outBinding) *outBinding = found[0].binding;
+        return found[0].member;
+    }
+    // §26.5.1 rule 1 (#1307): "An extension on E1 is more specific than one on
+    // E2 when E1 is a subtype of E2 and E2 is not a subtype of E1. The
+    // subtype test is evaluated on the receiver-substituted heads." subtypeOrEq
+    // reuses extensionFindMatchingAncestor itself as the general subtype test:
+    // for two already-CONCRETE (receiver-substituted) heads, "is `sub` an
+    // ancestor-or-self match for `base`" is exactly "is `sub` a subtype-or-
+    // equal of `base`" over the same class/interface/builtin-generic universe
+    // §26.5 step 2 already walks — so running it both directions reproduces
+    // the spec's own "identical substituted heads → neither wins" case for
+    // free (extensionTargetMatchesReceiver's exact-match branch returns true
+    // both ways when the heads are structurally equal).
+    auto subtypeOrEq = [&](const TypeRef* sub, const TypeRef* base) -> bool {
+        return extensionFindMatchingAncestor(
+                   base, sub, std::unordered_set<std::string_view>{},
+                   ownedAncs) != nullptr;
+    };
+    auto moreSpecific = [&](std::size_t i, std::size_t j) {
+        return subtypeOrEq(found[i].substHead, found[j].substHead) &&
+               !subtypeOrEq(found[j].substHead, found[i].substHead);
+    };
+    // The maximal elements of the "more specific" partial order: candidates
+    // no OTHER candidate strictly dominates. §26.5 rule 3 ("most specific
+    // type wins") removes every dominated (less-specific) candidate from
+    // consideration entirely — only a non-unique top tier is ambiguous.
+    std::vector<std::size_t> maximal;
+    for (std::size_t i = 0; i < found.size(); ++i) {
+        bool dominated = false;
+        for (std::size_t j = 0; j < found.size(); ++j) {
+            if (i != j && moreSpecific(j, i)) { dominated = true; break; }
+        }
+        if (!dominated) maximal.push_back(i);
+    }
+    if (maximal.size() == 1) {
+        const ExtCandidate& winner = found[maximal[0]];
+        if (outBinding) *outBinding = winner.binding;
+        return winner.member;
+    }
+    // §26.5 rule 4 (#1307): two or more equally-specific candidates — a
+    // compile error naming each one by "its defining module, its declared
+    // head including any where clause, and its declaration site" (spec's own
+    // wording, since extension blocks are nameless).
+    if (reportAmbiguity) {
+        std::string msg = "ambiguous extension member `" + std::string(name) +
+            "`: " + std::to_string(maximal.size()) +
+            " extensions are equally specific for this receiver — neither is "
+            "a subtype of the other (§26.5 rule 4, §26.5.1); candidates:";
+        for (std::size_t idx : maximal) {
+            const ExtCandidate& c = found[idx];
+            std::string moduleName;
+            if (auto it = importedExtensionModule_.find(c.ext);
+                it != importedExtensionModule_.end())
+                moduleName = it->second;
+            else if (ctx_.module())
+                moduleName = std::string(ctx_.module()->name);
+            std::string head = "extension " + spellExtHeadTypeRef(c.declaredHead);
+            std::string where = c.decl ? spellExtWhereClause(c.decl->genericConstraints)
+                                       : std::string();
+            if (!where.empty()) head += " " + where;
+            std::string site;
+            if (c.decl && c.decl->span.begin.line != 0)
+                site = "declared at line " +
+                       std::to_string(c.decl->span.begin.line) + ", column " +
+                       std::to_string(c.decl->span.begin.column);
+            else
+                // §1307 follow-up: an imported extension's synthesized AST
+                // carries no source span (module metadata doesn't serialize
+                // cross-module positions) — say so rather than print 0:0.
+                site = "declaration site not tracked across module imports";
+            msg += "\n  " + head + " — module `" + moduleName + "`, " + site;
+        }
+        msg += "\nremedies: narrow the import bringing in one of these "
+               "extension blocks; hoist the intended behavior into a "
+               "static-class helper method that takes the receiver as a "
+               "parameter; or, if both blocks are under your control, give "
+               "the colliding members distinct names (§26.5 rule 4).";
+        ctx_.diagnostics().report(Severity::Error, loc, msg);
+    }
+    // Error-recovery (mirrors resolveOverload's OverloadOutcome::Ambiguous
+    // handling, ExprTypecheck_Calls.cpp): return a deterministic candidate so
+    // downstream typing stays best-effort even though compilation fails.
+    const ExtCandidate& fallback = found[maximal[0]];
+    if (outBinding) *outBinding = fallback.binding;
+    return fallback.member;
 }
 
 // §26.5 step 1 (v0.183): see header. Re-runs the same extension search
@@ -5713,7 +6094,14 @@ Symbol* ExprTC::lookupExtensionMember(
 std::string ExprTC::extensionNameBlockedNote(const TypeRef* receiver,
                                              std::string_view name) {
     if (!receiver) return std::string();
-    if (!lookupExtensionMember(receiver, name, nullptr)) return std::string();
+    // §1307: this is a pure existence PROBE ("does any extension match this
+    // receiver/name at all") for the note text below — it must not itself
+    // trigger the §26.5 rule 4 ambiguity diagnostic (the instance-member call
+    // it annotates already failed for its own, unrelated reason; a second,
+    // premature error here would be confusing noise, not new information).
+    if (!lookupExtensionMember(receiver, name, nullptr, SourceLocation{},
+                               /*reportAmbiguity=*/false))
+        return std::string();
     return "; note: an extension member named `" + std::string(name) +
           "` also matches this receiver but was not considered — an "
           "instance member of the same name name-blocks extension lookup "
@@ -5853,47 +6241,90 @@ MethodSymbol* ExprTC::findConstraintStaticOperator(std::string_view paramName,
     MethodSymbol* found = nullptr;          // exact-token witness (preferred)
     MethodSymbol* groupWitness = nullptr;   // complete-group sibling witness
     TypeRef* groupBound = nullptr;
-    forEachConstraintBound(paramName, [&](TypeRef* ctr) -> bool {
-        TypeSymbol* iface = ctr->declaration;
-        if (iface->kind != ast::TypeDeclKind::Interface) return false;
-        // The interface's own type-parameter names (`T` in `INumber<T>`).
-        std::unordered_set<std::string_view> ifaceParams;
-        for (Symbol* gp : iface->genericParams)
-            if (gp) ifaceParams.insert(gp->name);
-        for (Symbol* m : iface->members) {
-            auto* ms = dynamic_cast<MethodSymbol*>(m);
-            if (!ms || !ms->isOperator) continue;
-            bool exact = ms->operatorToken == op;
-            bool group = !exact && sameGroup(op, ms->operatorToken);
-            if (!exact && !group) continue;
-            if (ms->params.size() != 2) continue;
-            // Both parameters must be the recurrence parameter itself so the
-            // substituted signature is (paramName, paramName).
-            bool bothRecur = true;
-            for (Symbol* ps : ms->params) {
-                auto* par = dynamic_cast<ParameterSymbol*>(ps);
-                TypeRef* pt = (par && par->declType)
-                                  ? ctx_.resolvedType(*par->declType)
-                                  : nullptr;
-                if (!pt || pt->kind != TypeRef::Kind::Named ||
-                    pt->declaration || pt->nullable || !pt->astNode ||
-                    !pt->astNode->name ||
-                    pt->astNode->name->parts.size() != 1 ||
-                    !ifaceParams.count(pt->headName())) {
-                    bothRecur = false;
-                    break;
+    // §11.8 (#1425 sub-item 1): `where T: IRich<T>` where `IRich<T>: INumber<T>`
+    // — IRich declares no operators of its own, they live on the ANCESTOR
+    // INumber. forEachConstraintBound yields only the DIRECT bound (IRich<T>);
+    // scanning `iface->members` alone (the pre-fix body) misses every operator
+    // declared on an interface `iface` merely EXTENDS. Fix: from each direct
+    // bound, BFS the interface's own `baseTypes` (populated for an interface's
+    // `: Base<...>` list exactly like a class's, TypeResolution_Names.cpp) to
+    // visit the whole ancestor closure. The "both params are the recurrence
+    // parameter" check below is entirely local to whichever interface in the
+    // closure is being scanned (it tests the OPERATOR's own declared shape,
+    // `static operator +(a: T, b: T)` against THAT interface's own type
+    // parameter) — it needs no generic-argument composition across the chain,
+    // because the caller (the BinaryExpr handler in ExprTypecheck_Exprs.cpp)
+    // re-derives the call-site result type from the ROOT paramName's own
+    // operand type, not from the chain. A visited set guards a diamond
+    // re-visit (`IRich<T>: INumber<T>, IPrintable<T>` both possibly reaching a
+    // common ancestor) against a double report; it can never be a true cycle
+    // (interface inheritance cycles are rejected elsewhere, §12.10).
+    auto scanClosure = [&](TypeSymbol* rootIface, TypeRef* rootBound) -> bool {
+        std::vector<TypeSymbol*> frontier{rootIface};
+        std::unordered_set<TypeSymbol*> visited;
+        std::size_t i = 0;
+        while (i < frontier.size()) {
+            TypeSymbol* iface = frontier[i++];
+            if (!iface || !visited.insert(iface).second) continue;
+            if (iface->kind != ast::TypeDeclKind::Interface) continue;
+            // The interface's own type-parameter names (`T` in `INumber<T>`).
+            std::unordered_set<std::string_view> ifaceParams;
+            for (Symbol* gp : iface->genericParams)
+                if (gp) ifaceParams.insert(gp->name);
+            for (Symbol* m : iface->members) {
+                auto* ms = dynamic_cast<MethodSymbol*>(m);
+                if (!ms || !ms->isOperator) continue;
+                bool exact = ms->operatorToken == op;
+                bool group = !exact && sameGroup(op, ms->operatorToken);
+                if (!exact && !group) continue;
+                if (ms->params.size() != 2) continue;
+                // Both parameters must be the recurrence parameter itself so
+                // the substituted signature is (paramName, paramName).
+                // §2.8.2/§11.8 (#2359 bug 2a): an IMPORTED interface's
+                // operator parameter carries no syntactic `declType` at all
+                // (ModuleLoader::convertParams populates `resolvedDeclType`
+                // instead, since there is no ast::Type to attach) — fall
+                // back to it exactly as the #2294 conformance-check fix
+                // does for imported members elsewhere. Read the bare-
+                // parameter name via the shared alias-transparent
+                // `TypeRef::headName()` (falls back to `importedName` when
+                // `astNode` is null) instead of requiring `astNode`
+                // directly, so an imported bare-type-parameter reference is
+                // recognized rather than unconditionally rejected.
+                bool bothRecur = true;
+                for (Symbol* ps : ms->params) {
+                    auto* par = dynamic_cast<ParameterSymbol*>(ps);
+                    TypeRef* pt = par ? (par->declType
+                                             ? ctx_.resolvedType(*par->declType)
+                                             : par->resolvedDeclType)
+                                       : nullptr;
+                    if (!pt || pt->kind != TypeRef::Kind::Named ||
+                        pt->declaration || pt->nullable ||
+                        pt->headName().empty() ||
+                        !ifaceParams.count(pt->headName())) {
+                        bothRecur = false;
+                        break;
+                    }
                 }
+                if (!bothRecur) continue;
+                if (exact) {
+                    found = ms;
+                    if (outBound) *outBound = rootBound;
+                    return true;  // exact token wins — stop scanning
+                }
+                // Remember the first group sibling; keep scanning for an
+                // exact hit.
+                if (!groupWitness) { groupWitness = ms; groupBound = rootBound; }
             }
-            if (!bothRecur) continue;
-            if (exact) {
-                found = ms;
-                if (outBound) *outBound = ctr;
-                return true;  // exact token wins — stop scanning
-            }
-            // Remember the first group sibling; keep scanning for an exact hit.
-            if (!groupWitness) { groupWitness = ms; groupBound = ctr; }
+            for (TypeSymbol* b : iface->baseTypes)
+                if (b) frontier.push_back(b);
         }
         return false;
+    };
+    forEachConstraintBound(paramName, [&](TypeRef* ctr) -> bool {
+        TypeSymbol* iface = ctr->declaration;
+        if (!iface || iface->kind != ast::TypeDeclKind::Interface) return false;
+        return scanClosure(iface, ctr);
     });
     if (found) return found;
     if (groupWitness && outBound) *outBound = groupBound;
@@ -6524,27 +6955,7 @@ void ExprTC::intersectNarrowingSetsAfterLoop(
     const std::unordered_map<Symbol*, TypeRef*>& entryNarrowings,
     const std::set<std::pair<std::uint32_t, std::uint32_t>>& entryField,
     const LoopEdgeNarrowing& edges) {
-    // §7.4 (v0.214, #2116): the same zero-iteration-path intersection for the
-    // readonly-field facts — a fact established INSIDE the body does not
-    // survive the loop; an entry fact the body invalidated stays dropped.
-    intersectFieldFactsWith(entryField);
-    for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
-        if (entryNull.count(*it))
-            ++it;
-        else
-            it = nullNarrowed_.erase(it);
-    }
-    // §12.7 type-narrowings are only ever established inside nested if/case
-    // guards that already restore the map, so the body's exit map is a subset of
-    // the entry map; intersecting keeps that invariant (and drops any entry
-    // narrowing a top-level reassignment invalidated).
-    for (auto it = narrowings_.begin(); it != narrowings_.end();) {
-        auto e = entryNarrowings.find(it->first);
-        if (e != entryNarrowings.end() && e->second == it->second)
-            ++it;
-        else
-            it = narrowings_.erase(it);
-    }
+    intersectNarrowingSetsWith(entryNull, entryNarrowings, entryField);
     // §7.4 (#2152): fold each break/continue edge snapshot into the
     // intersection. A `break`/`continue` edge state is a possible after-loop
     // state (see the function header); a local the edge left possibly-null is
@@ -6552,21 +6963,37 @@ void ExprTC::intersectNarrowingSetsAfterLoop(
     // member access after the loop is then correctly rejected. The three
     // parallel vectors are pushed together by recordLoopEdgeNarrowing, so they
     // share one length.
-    for (std::size_t i = 0; i < edges.nullEdges.size(); ++i) {
-        intersectFieldFactsWith(edges.fieldEdges[i]);
-        for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
-            if (edges.nullEdges[i].count(*it))
-                ++it;
-            else
-                it = nullNarrowed_.erase(it);
-        }
-        for (auto it = narrowings_.begin(); it != narrowings_.end();) {
-            auto e = edges.typeEdges[i].find(it->first);
-            if (e != edges.typeEdges[i].end() && e->second == it->second)
-                ++it;
-            else
-                it = narrowings_.erase(it);
-        }
+    for (std::size_t i = 0; i < edges.nullEdges.size(); ++i)
+        intersectNarrowingSetsWith(edges.nullEdges[i], edges.typeEdges[i],
+                                   edges.fieldEdges[i]);
+}
+
+// §7.4 (#2258): the one intersection primitive — see the declaration in
+// ExprTypecheck_impl.hpp for why every "restore" of the narrowing sets must be
+// this and never an assignment.
+void ExprTC::intersectNarrowingSetsWith(
+    const std::unordered_set<Symbol*>& otherNull,
+    const std::unordered_map<Symbol*, TypeRef*>& otherNarrowings,
+    const std::set<std::pair<std::uint32_t, std::uint32_t>>& otherField) {
+    // §7.4 (v0.214, #2116): the readonly-field facts join the same way — a fact
+    // established inside the joined region does not survive it; a fact the
+    // region invalidated stays dropped.
+    intersectFieldFactsWith(otherField);
+    for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
+        if (otherNull.count(*it))
+            ++it;
+        else
+            it = nullNarrowed_.erase(it);
+    }
+    // §12.7 type-narrowings are keyed by symbol AND narrowed type: an entry
+    // whose narrowed type differs from the snapshot's is not the same fact, so
+    // it does not survive the join.
+    for (auto it = narrowings_.begin(); it != narrowings_.end();) {
+        auto e = otherNarrowings.find(it->first);
+        if (e != otherNarrowings.end() && e->second == it->second)
+            ++it;
+        else
+            it = narrowings_.erase(it);
     }
 }
 
@@ -10157,6 +10584,107 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                         "here (§13.6)");
                                 }
                             }
+                        } else {
+                            // fix #2412 (§23.3, §2.8.2/§2.8.3 rule 4,
+                            // v0.235): an IMPORTED PropertySymbol has no
+                            // ast::PropertyDecl (`ps->decl` is unconditionally
+                            // null — ModuleLoader never reconstructs a
+                            // body-less imported property's decl), so the
+                            // `pd`-gated check above silently skipped every
+                            // imported property, accepting a write to a
+                            // getter-only imported property that the
+                            // identical same-module shape correctly rejects
+                            // (confirmed asymmetry — a #2374-family instance).
+                            // Fall back to the hasSetter side table #2400
+                            // publishes from MetaMember::hasSetter, which is
+                            // false both for a genuinely getter-only property
+                            // (expression-bodied or block-getter-only) and
+                            // for a readonly auto-property (mirrors
+                            // ModuleMetadataBuilder.cpp's export-time
+                            // computation) — either way, no assignment is
+                            // ever valid on it from outside its declaring
+                            // module, so one message covers both source
+                            // shapes the same way the local `!hasSetter`
+                            // branch's message already does.
+                            if (!ctx_.importedPropertyHasSetter(ps)) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, as->span.begin,
+                                    "cannot assign to read-only property `" +
+                                    propName +
+                                    "` — it has no setter (§23.3)");
+                            } else {
+                                // fix #2415 (§13.6, §23.3, §2.8.2 clause 1 /
+                                // §2.8.3 rule 4, v0.235): the setter EXISTS
+                                // (hasSetter above), but its VISIBILITY was
+                                // never enforced across the module boundary —
+                                // a `private set` / `protected set` /
+                                // `internal set` imported property was
+                                // writable from anywhere through the import,
+                                // even though the identical same-module shape
+                                // is correctly rejected (§13.6: "A property or
+                                // indexer's `get` or `set` may carry its own
+                                // visibility, which must not be *less*
+                                // restrictive than the property's overall
+                                // visibility"). `ctx_.
+                                // importedPropertySetterVisibility(ps)`
+                                // publishes MetaMember::setterVisibility
+                                // (#2415), the ALREADY-RESOLVED effective
+                                // visibility computed at export time by
+                                // mirroring the `sv` computation just above
+                                // verbatim.
+                                //
+                                // Applying the §13.1 access levels across a
+                                // module boundary:
+                                //   - Private ("the declaring class only"):
+                                //     always inaccessible here — `declaring`
+                                //     is the imported TypeSymbol reconstructed
+                                //     by ModuleLoader, and `currentType_` is
+                                //     always a type compiled in THIS
+                                //     (importing) module, so the two can never
+                                //     be the same symbol — unconditional
+                                //     reject.
+                                //   - Protected ("the declaring class and all
+                                //     classes derived from it", §13.1 — no
+                                //     module qualifier): reuse `isSubtype`,
+                                //     which already walks `baseTypes` through
+                                //     a reconstructed imported base (proven by
+                                //     #2400's inherited-setter itable tests),
+                                //     so a LOCAL subclass of the imported
+                                //     declaring type is still accepted.
+                                //   - Internal ("code in the same module",
+                                //     §13.1): the importing module is BY
+                                //     DEFINITION a different module than the
+                                //     declaring one, so this is also an
+                                //     unconditional reject — mirroring how
+                                //     the local check's `ctx_.isImported(ps)`
+                                //     is unconditionally true for every ps
+                                //     that reaches this `else` branch at all.
+                                //   - Public / None (no restriction, or the
+                                //     property's own — already-checked —
+                                //     visibility with no accessor override):
+                                //     no further restriction.
+                                ast::Visibility sv =
+                                    ctx_.importedPropertySetterVisibility(ps);
+                                TypeSymbol* declaring = ps->parent;
+                                bool bad = false;
+                                if (sv == ast::Visibility::Private) {
+                                    bad = true;
+                                } else if (sv == ast::Visibility::Protected) {
+                                    bad = !(currentType_ &&
+                                            isSubtype(currentType_,
+                                                      declaring));
+                                } else if (sv == ast::Visibility::Internal) {
+                                    bad = true;
+                                }
+                                if (bad) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, as->span.begin,
+                                        "cannot assign to property `" +
+                                        propName +
+                                        "` — its setter is not accessible "
+                                        "here (§13.6)");
+                                }
+                            }
                         }
                 }
             }
@@ -11258,6 +11786,27 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
         auto caseRunningField = fieldNarrowed_;
         auto caseEntryNull = nullNarrowed_;
         auto caseRunningNull = caseEntryNull;
+        // §7.4 (#2258): fold THIS arm's exit state into the running
+        // intersections. Named (not inlined at the loop tail) because one arm
+        // path — the choice-destructure arm below — `continue`s past the tail,
+        // and skipping the fold there loses that arm's DROPS: the after-case
+        // state would claim a fact the arm invalidated (`s := null;` inside a
+        // `Some(var v) =>` arm), a silent ACCEPT of a null dereference.
+        auto foldArmExitIntoRunning = [&] {
+            for (auto it = caseRunningField.begin();
+                 it != caseRunningField.end();) {
+                if (fieldNarrowed_.count(*it)) ++it;
+                else it = caseRunningField.erase(it);
+            }
+            // §7.4 #2164: the same running-intersection discipline for the
+            // LOCAL set — every later arm starts from entry ∩ earlier-arm
+            // exits, and the after-case state is the same intersection.
+            for (auto it = caseRunningNull.begin();
+                 it != caseRunningNull.end();) {
+                if (nullNarrowed_.count(*it)) ++it;
+                else it = caseRunningNull.erase(it);
+            }
+        };
         for (const auto& arm : cs->arms) {
             fieldNarrowed_ = caseRunningField;  // §7.4 #2116: per-arm base
             nullNarrowed_ = caseRunningNull;    // §7.4 #2164: per-arm base
@@ -11618,6 +12167,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         for (const auto& bs : arm.stmts)
                             if (bs) visitStmt(*bs);
                         currentScope_ = saveScope;
+                        // §7.4 (#2258): this path leaves the arm loop early, so
+                        // fold the arm's exit HERE — the loop-tail fold never
+                        // runs for it, and a fact this arm DROPPED would be
+                        // resurrected in the after-case state.
+                        foldArmExitIntoRunning();
                         continue;  // skip the record-destructure path
                     }
                 }
@@ -11854,6 +12408,26 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // intersection below #2116/#2164 is unaffected — only
                 // this arm's BODY sees the condition's true-branch
                 // facts, the exit intersection is unchanged).
+                //
+                // fix #2258 / §7.4: the un-seeding below is an
+                // INTERSECTION, never an assignment. Restoring the arm's
+                // ENTRY snapshot resurrected every fact the arm's BODY
+                // legitimately invalidated (`x := null;`, a `ref`/`out`
+                // argument, a call on a mutably-captured local — §7.4
+                // "How narrowing is invalidated"), and because this
+                // restore ran BEFORE the #2116/#2164 fold, the fold then
+                // intersected `caseRunning*` with itself (a no-op) and
+                // the arm's REAL exit state was discarded: a null flowed
+                // into a slot the checker believed non-null (silent
+                // ACCEPT, SIGSEGV). The intersection keeps the arm's
+                // DROPS and still discards what the arm CONDITION seeded
+                // (absent from the entry snapshot), so the fold below —
+                // whose input is now armEntry ∩ armExit, and
+                // armEntry ⊆ caseRunning* — computes exactly the
+                // intended caseRunning* ∩ armExit. This branch is the
+                // one every NON-binding, NON-destructuring arm takes
+                // (constant, `_` discard, enum-constant, relational,
+                // alt, and scrutinee-less boolean arms).
                 auto armEntryNarrow = narrowings_;
                 auto armEntryNull = nullNarrowed_;
                 auto armEntryField = fieldNarrowed_;
@@ -11869,24 +12443,12 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 if (arm.guard) visitExpr(*arm.guard);
                 if (arm.exprBody) visitExpr(*arm.exprBody);
                 for (const auto& bs : arm.stmts) if (bs) visitStmt(*bs);
-                narrowings_ = armEntryNarrow;
-                nullNarrowed_ = armEntryNull;
-                fieldNarrowed_ = armEntryField;
+                intersectNarrowingSetsWith(armEntryNull, armEntryNarrow,
+                                           armEntryField);  // §7.4 #2258
             }
-            // §7.4 #2116: fold this arm's exit into the running intersection.
-            for (auto it = caseRunningField.begin();
-                 it != caseRunningField.end();) {
-                if (fieldNarrowed_.count(*it)) ++it;
-                else it = caseRunningField.erase(it);
-            }
-            // §7.4 #2164: the same running-intersection discipline for the
-            // LOCAL set — every later arm starts from entry ∩ earlier-arm
-            // exits, and the after-case state is the same intersection.
-            for (auto it = caseRunningNull.begin();
-                 it != caseRunningNull.end();) {
-                if (nullNarrowed_.count(*it)) ++it;
-                else it = caseRunningNull.erase(it);
-            }
+            // §7.4 #2116/#2164/#2258: fold this arm's exit into the running
+            // intersections (see the lambda).
+            foldArmExitIntoRunning();
         }
         fieldNarrowed_ = std::move(caseRunningField);  // §7.4 #2116
         nullNarrowed_ = std::move(caseRunningNull);    // §7.4 #2164
@@ -11899,6 +12461,25 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
 bool typecheckExpressions(const ast::SourceFile& src, SemaContext& ctx) {
     ExprTC tc(ctx);
     tc.run(src);
+    // §9.8 / #2325: the class half of serialization-eligibility checking
+    // needs FieldSymbol::posParamBodyRef/posParamInitRef, which the walk
+    // above just finished computing (ExprTypecheck_Exprs.cpp) — see
+    // checkClassSerializationEligibilityLate's declaration comment
+    // (TypeResolution_impl.hpp) for the full rationale. Run it here, inside
+    // typecheckExpressions() itself, rather than as a separate call the
+    // driver must remember to sequence after this function: resolveTypes()
+    // and typecheckExpressions() are called together from many independent
+    // pipeline constructions across the driver AND the test harness (fresh
+    // SemaContext + collectSymbols + resolveTypes + typecheckExpressions,
+    // repeated ad hoc in dozens of call sites) — a separately-invoked pass
+    // would need every one of those threaded through by hand, and a single
+    // missed call site would silently readmit an ineligible class (verified:
+    // this happened — the codegen_serialization_t2_classes negative tests,
+    // which go through the test harness's OWN independent pipeline rather
+    // than Driver::compileFile, regressed when this was a separate call).
+    // Folding it into typecheckExpressions() itself means every existing and
+    // future caller gets it for free, with no separate wiring.
+    checkClassSerializationEligibilityLate(src, ctx);
     return !ctx.diagnostics().hasErrors();
 }
 

@@ -32,6 +32,15 @@
 //   (e) CONTROL: class property via constraint still works → 42
 //   (f) CONTROL: virtual method via class constraint still works → 99
 //   (g) CONTROL: record METHOD via constraint (702dede) still works → 7
+//
+// §9.1/§9.4/§11.2/§23.3 (#2416): every `IArea` below in (c)/(d) is declared
+// `readonly` — Square/Rect's `Area` is a getter-only expression-bodied
+// property and none of these tests ever write through the interface, so
+// (mirroring control (e)'s pre-existing #2413 note below) `readonly` is the
+// accurate declaration. Before #2416, checkAbstractImplementations skipped
+// records entirely, so this getter-only-vs-read-write mismatch on a RECORD
+// was never checked (#2413 only ever checked classes) — the identical
+// null-itable-setter-slot SIGSEGV shape, just unreached for this type kind.
 
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
@@ -128,7 +137,7 @@ BEZEL_TEST(constraint_dispatch_gaps, r1_1_abstract_class_nonvirtual_method_spec_
 BEZEL_TEST(constraint_dispatch_gaps, r1_2_record_property_via_interface_constraint_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IArea  property Area: int; end IArea; "
+        "interface IArea  readonly property Area: int; end IArea; "
         "record Square(side: int) : IArea "
         "  public property Area: int => side * side; "
         "end Square; "
@@ -149,7 +158,7 @@ BEZEL_TEST(constraint_dispatch_gaps, r1_2_record_property_via_interface_constrai
 BEZEL_TEST(constraint_dispatch_gaps, r1_2_record_property_interface_constraint_expr_body_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IArea  property Area: int; end IArea; "
+        "interface IArea  readonly property Area: int; end IArea; "
         "record Rect(w: int, h: int) : IArea "
         "  public property Area: int => w * h; "
         "end Rect; "
@@ -170,7 +179,7 @@ BEZEL_TEST(constraint_dispatch_gaps, r1_2_record_property_interface_constraint_e
 BEZEL_TEST(constraint_dispatch_gaps, r1_2_record_property_in_arithmetic_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IArea  property Area: int; end IArea; "
+        "interface IArea  readonly property Area: int; end IArea; "
         "record Square(side: int) : IArea "
         "  public property Area: int => side * side; "
         "end Square; "
@@ -193,7 +202,11 @@ BEZEL_TEST(constraint_dispatch_gaps, r1_2_record_property_in_arithmetic_spec_14_
 BEZEL_TEST(constraint_dispatch_gaps, control_class_property_via_constraint_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface ICode  property Code: int; end ICode; "
+        // §11.2/§23.3 (#2413): Tag's `Code` is getter-only and this test
+        // never writes through the interface, so ICode's obligation is
+        // declared `readonly` — a getter-only implementation of a
+        // read-write interface property is now a compile error (#2413).
+        "interface ICode  readonly property Code: int; end ICode; "
         "class Tag : ICode "
         "  public _c: int := 0; "
         "  public constructor(c: int) _c := c; end constructor; "

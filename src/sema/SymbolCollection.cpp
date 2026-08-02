@@ -23,6 +23,31 @@ std::string_view moduleSymbolName(const ast::QualifiedName* qn) {
     return qn->parts.back();
 }
 
+// #1488 / §2.1 / §2.8.3 rule 3: the module's FULL dotted name
+// ("BankingApp.Transactions"), as opposed to moduleSymbolName's leaf-only
+// symbol name above. This is the module-identity component every TypeSymbol
+// carries in TypeSymbol::moduleName, so codegen can qualify emitted symbol
+// names and two modules' same-named public types never collide at link
+// time. Mirrors ModuleMetadataBuilder::moduleNameFor's identical
+// reconstruction (needed there for the exported interface's module
+// identity) — duplicated in miniature here rather than shared, since
+// SymbolCollection (sema/) runs before and has no dependency on the
+// module/ layer.
+std::string moduleDottedName(const ModuleSymbol* mod) {
+    if (!mod) return {};
+    if (auto* decl = dynamic_cast<const ast::ModuleDecl*>(mod->decl)) {
+        if (decl->name && !decl->name->parts.empty()) {
+            std::string out;
+            for (std::size_t i = 0; i < decl->name->parts.size(); ++i) {
+                if (i) out += '.';
+                out += std::string(decl->name->parts[i]);
+            }
+            return out;
+        }
+    }
+    return std::string(mod->name);
+}
+
 // §3.4 (#1081): the PascalCase primitive-alias library type names are RESERVED —
 // a user type (class/record/enum/interface/type alias) may not be declared with
 // one of these names. Each names a compiler-known primitive value type (or
@@ -96,6 +121,12 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->modifiers = fd->modifiers;
         sym->parent = &parent;
         sym->decl = fd;
+        // fix #2418: mirror the TypeSymbol precedent (SymbolCollection.cpp,
+        // collectTypeDecl) — every ast::Member subtype inherits `span` from
+        // ast::Node, so its own decl node's span is a real, available
+        // location. Without this, every diagnostic keyed on
+        // FieldSymbol::declLoc reported 0:0.
+        sym->declLoc = fd->span.begin;
         sym->scope = parent.memberScope;  // field lives in type's member scope
         return sym;
     }
@@ -106,6 +137,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->modifiers = md->modifiers;
         sym->parent = &parent;
         sym->decl = md;
+        sym->declLoc = md->span.begin;  // fix #2418
         sym->scope = scope;
         sym->genericParams =
             collectGenericParams(md->genericParams, ctx, scope);
@@ -118,6 +150,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->visibility = od->visibility;
         sym->parent = &parent;
         sym->decl = od;
+        sym->declLoc = od->span.begin;  // fix #2418
         sym->scope = scope;
         sym->params = collectParams(od->params, ctx, scope);
         sym->isOperator = true;
@@ -133,6 +166,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->visibility = cd->visibility;
         sym->parent = &parent;
         sym->decl = cd;
+        sym->declLoc = cd->span.begin;  // fix #2418
         sym->scope = scope;
         sym->isStatic = cd->isStatic;
         sym->params = collectParams(cd->params, ctx, scope);
@@ -143,6 +177,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->name = ".dtor";
         sym->parent = &parent;
         sym->decl = dd;
+        sym->declLoc = dd->span.begin;  // fix #2418
         sym->scope = scope;
         return sym;
     }
@@ -153,6 +188,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->modifiers = pd->modifiers;
         sym->parent = &parent;
         sym->decl = pd;
+        sym->declLoc = pd->span.begin;  // fix #2418
         sym->scope = scope;
         sym->isIndexer = pd->isIndexer;
         if (pd->isIndexer) {
@@ -167,6 +203,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->visibility = ed->visibility;
         sym->parent = &parent;
         sym->decl = ed;
+        sym->declLoc = ed->span.begin;  // fix #2418
         sym->scope = parent.memberScope;
         return sym;
     }
@@ -176,6 +213,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         sym->visibility = cd->visibility;
         sym->parent = &parent;
         sym->decl = cd;
+        sym->declLoc = cd->span.begin;  // fix #2418
         sym->scope = parent.memberScope;
         sym->isStatic = cd->isStatic;
         return sym;
@@ -185,6 +223,7 @@ Symbol* collectMember(const ast::Member& m, TypeSymbol& parent,
         wrapper->name = nt->decl ? nt->decl->name : std::string_view();
         wrapper->parent = &parent;
         wrapper->decl = nt;
+        wrapper->declLoc = nt->span.begin;  // fix #2418
         wrapper->scope = parent.memberScope;
         if (nt->decl) {
             wrapper->visibility = nt->decl->visibility;
@@ -218,6 +257,18 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
     sym->visibility = td.visibility;
     sym->modifiers = td.modifiers;
     sym->decl = &td;
+    // #1488: the declaring (local, current-compilation) module's full dotted
+    // name — see TypeSymbol::moduleName. collectTypeDecl runs for both
+    // top-level and nested type declarations, and ctx.module() is already set
+    // by collectSymbols before either kind is collected.
+    sym->moduleName = moduleDottedName(ctx.module());
+    // fix #1761: copy the AST declaration's source location onto the symbol
+    // so diagnostics keyed on t->declLoc / m->declLoc point at the actual
+    // declaration site rather than reporting 0:0. The parser now stamps
+    // `td.span.begin` for top-level type decls (see Parser_Decls.cpp's
+    // parseTypeOrInterfaceDecl); for other node types that already had their
+    // span set this propagates that location to the symbol.
+    sym->declLoc = td.span.begin;
     sym->scope = parentScope;
     // Each type opens a fresh scope for its members + generic params. Save
     // it on the symbol so nested-member collection can use it as the
@@ -248,6 +299,13 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
             fs->visibility = ast::Visibility::Public;
             fs->parent = sym;
             fs->decl = &td;
+            // fix #2482 (follow-up to #2418): ast::Param now carries its own
+            // source location (stamped by the parser at the field's first
+            // token), so point at the member's own line rather than the
+            // enclosing type's. The type-fallback remains a safety net for a
+            // decl whose loc was not populated (default 0:0:0 — e.g. a
+            // synthesized prelude decl built without going through the parser).
+            fs->declLoc = (pf.loc.line != 0) ? pf.loc : sym->declLoc;
             fs->posParam = &pf;
             fs->scope = sym->memberScope;
             sym->members.push_back(fs);
@@ -258,6 +316,10 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
         auto* esym = ctx.makeSymbol<EnumConstantSymbol>();
         esym->name = ec.name;
         esym->parent = sym;
+        // fix #2482 (follow-up to #2418): ast::EnumConstant now carries its
+        // own source location (stamped at the constant's name token); fall
+        // back to the enclosing TypeDecl's location only when unpopulated.
+        esym->declLoc = (ec.loc.line != 0) ? ec.loc : sym->declLoc;
         esym->scope = sym->memberScope;
         sym->members.push_back(esym);
     }
@@ -270,6 +332,10 @@ TypeSymbol* collectTypeDecl(const ast::TypeDecl& td, SemaContext& ctx,
         csym->name = cc.name;
         csym->parent = sym;
         csym->caseDecl = &cc;
+        // fix #2482 (follow-up to #2418): ast::ChoiceCase now carries its
+        // own source location (stamped at the case's name token); fall back
+        // to the enclosing TypeDecl's location only when unpopulated.
+        csym->declLoc = (cc.loc.line != 0) ? cc.loc : sym->declLoc;
         csym->scope = sym->memberScope;
         sym->members.push_back(csym);
     }
@@ -285,6 +351,7 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
         auto* sym = ctx.makeSymbol<TypeAliasSymbol>();
         sym->name = alias->name;
         sym->decl = alias;
+        sym->declLoc = alias->span.begin;  // fix #2418: TypeAlias : TopDecl : Node
         sym->scope = parentScope;
         const ScopeId aliasScope = ctx.newScope();
         sym->genericParams =
@@ -297,6 +364,7 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
         // the symbol key (lookups never find an extension by name —
         // extensions resolve via target type during typecheck).
         sym->decl = ext;
+        sym->declLoc = ext->span.begin;  // fix #2418: ExtensionDecl : TopDecl : Node
         sym->scope = parentScope;
         const ScopeId extScope = ctx.newScope();
         // We need a dummy TypeSymbol-shape parent for member collection;
@@ -328,6 +396,7 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
         sym->library = xb->library;
         sym->convention = xb->convention;
         sym->decl = xb;
+        sym->declLoc = xb->span.begin;  // fix #2418: ExternBlock : TopDecl : Node
         sym->scope = parentScope;
         const ScopeId xbScope = ctx.newScope();
         for (const auto& d : xb->methods) {
@@ -337,6 +406,11 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
             dsym->scope = xbScope;
             dsym->params = collectParams(d.params, ctx, xbScope);
             dsym->externDecl = &d;
+            // fix #2482 (follow-up to #2418): ast::ExternDecl now carries
+            // its own source location (stamped at the decl's first token);
+            // fall back to the enclosing ExternBlock's location only when
+            // unpopulated.
+            dsym->declLoc = (d.loc.line != 0) ? d.loc : sym->declLoc;
             sym->decls.push_back(dsym);
         }
         return sym;
@@ -581,14 +655,19 @@ bool isAutoEqualityBearingBodyRecord(const TypeSymbol* rec,
 // not include disqualifiers (§9.3 applies §9.2's membership and disqualifier
 // rules to the full storage set: positional fields + body auto-properties).
 // Imported positional records (no ast::TypeDecl — only hasPositionalFields flag)
-// are conservatively treated as equality-bearing: individual field types are not
-// available across module boundaries (see the §3.6 rule-2 per-instantiation
-// discipline; this function is the LOCAL record side, not the cross-module side).
+// are conservatively treated as equality-bearing for the positional-field
+// admissibility check (individual field types are not fully inspectable cross-
+// module; see the §3.6 rule-2 per-instantiation discipline). For the
+// body-member disqualifier scan, an imported record's FieldSymbol IS marked as
+// positional vs body via the importer setting `posParam` from the metadata's
+// `isPositional` bit (#2516), so the SAME member-walk the local path does
+// below applies verbatim — including the body-field disqualifier (#2516's
+// finding: a pre-fix unconditional `return true` for the import case
+// false-accepted `=`/`<>` on imported combined-form records whose exporter
+// already rejects them).
 bool isPositionalRecordEqualityBearing(const TypeSymbol* rec,
                                         const SemaContext& ctx) {
     if (!rec) return false;
-    // Imported positional record: no ast::TypeDecl to inspect → conservative.
-    if (!dynamic_cast<const ast::TypeDecl*>(rec->decl)) return true;
     for (const Symbol* m : rec->members) {
         if (auto* fs = dynamic_cast<const FieldSymbol*>(m)) {
             if (fs->posParam) {

@@ -1,6 +1,7 @@
 #include "module/ModuleLoader.hpp"
 
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -255,6 +256,16 @@ struct Loader {
             // no syntactic ast::Type to attach), via resolvedDeclType — the
             // field identifier resolution / codegen reads when declType is null.
             p->resolvedDeclType = convert(mp.type);
+            // §22.4 / §12.1 (#2392): reconstruct the `when true`/`when false`
+            // out-nullability postcondition from MetaParam::outNullWhen, the
+            // same way resolvedDeclType is reconstructed just above. Without
+            // this, an imported base parameter's outNullPostcond stayed stuck
+            // at its default None regardless of what the exporting module
+            // declared, so checkOverrideSignatureMatch's exact-match
+            // comparison (§12.1) false-rejected any correct override that
+            // faithfully repeated the base's `when` clause.
+            p->outNullPostcond =
+                static_cast<ast::OutNullWhen>(mp.outNullWhen);
             out.push_back(p);
         }
         return out;
@@ -286,6 +297,11 @@ struct Loader {
         t->modifiers = intern(td.modifiers);
         t->scope = parent.memberScope;
         t->memberScope = ctx.newScope();
+        // #1488: a nested type declares in the same module as its enclosing
+        // type (§11.6 — nesting is not a separate module), so it inherits the
+        // parent's already-populated moduleName rather than needing its own
+        // MetaModule lookup.
+        t->moduleName = parent.moduleName;
         // §9.2 (issue #501): propagate positional-record flag.
         t->hasPositionalFields = td.hasPositionalFields;
         t->invariantContracts = toContractRecords(td.invariants);
@@ -334,6 +350,32 @@ struct Loader {
                 // resolution / codegen can read it (see returnTypeOf below).
                 returnTypes_[m] = convert(mm.type);
                 returnOwned_[m] = mm.returnOwned;
+                // fix #2391 (§14.2/§2.8.2, v0.236): capture the per-generic-
+                // parameter constraint payload that the metadata builder
+                // (ModuleMetadataBuilder::convertGenericParams, #1579/v0.182)
+                // already exports on each MetaGenericParam, but that
+                // `convertGenericParams` above (the import-side reconstructor)
+                // silently drops — GenericParamSymbol carries only name/variance.
+                // Without this side table, an override of an imported generic
+                // base method skips the §14.2 constraint-restatement check
+                // (checkOverrideSignatureMatch had no `bDecl` and no fallback),
+                // so a mismatched-constraint override compiled clean. Aligned
+                // positionally with `m->genericParams`.
+                if (!mm.genericParams.empty()) {
+                    std::vector<sema::ImportedGenericConstraint> gcs;
+                    gcs.reserve(mm.genericParams.size());
+                    for (const MetaGenericParam& mg : mm.genericParams) {
+                        sema::ImportedGenericConstraint c;
+                        c.typeParam = ctx.internString(mg.name);
+                        for (const std::string& sc : mg.specialConstraints)
+                            c.specialConstraints.push_back(
+                                ctx.internString(sc));
+                        for (const MetaType& ct : mg.constraintTypes)
+                            c.constraintTypes.push_back(convert(ct));
+                        gcs.push_back(std::move(c));
+                    }
+                    methodGenericConstraints_[m] = std::move(gcs);
+                }
                 applyBehavior(m);
                 return m;
             }
@@ -354,6 +396,23 @@ struct Loader {
                 // non-foldable initializer (`new Array()`, `DateTime.Now`) is not
                 // carried (valueText empty) — see ModuleMetadataBuilder.
                 if (!mm.valueText.empty()) constValues_[f] = mm.valueText;
+                // fix #2516 (§9.2/§9.3/§2.8.3 rule 4): a positional-record
+                // field is reconstructed with a synthetic ast::Param whose
+                // `type` is null, so `fs->posParam != nullptr` distinguishes
+                // it from a body field at the sema layer (mirrors the LOCAL
+                // path at SymbolCollection.cpp:295-313, which points posParam
+                // at a real td.positionalFields[i]). `storageComponentType`'s
+                // existing `if (fs->posParam && fs->posParam->type)` gate
+                // returns false for the synthetic case (posParam->type is
+                // null) and falls through to `ctx.importedMemberType(m)` —
+                // the importer's `fieldTypes_` side table — so no downstream
+                // consumer dereferences the synthetic Param. The Param is
+                // owned by the SemaContext's `importedSymbols_` arena so it
+                // lives at least as long as the FieldSymbol.
+                if (mm.isPositional) {
+                    auto* p = ctx.makeImportedParam();
+                    f->posParam = p;
+                }
                 applyBehavior(f);
                 return f;
             }
@@ -429,6 +488,13 @@ struct Loader {
                 //     external by declareImportedPropertyGetters in the importer.
                 // The resolved property TYPE rides fieldTypes_ (same side table
                 // used for fields/consts) so ctx.importedMemberType() can read it.
+                //   - the SETTER (fix #2400): non-virtual — a call to
+                //     bz$<Class>$<Prop>$propset, emitted as ExternalLinkage by
+                //     emitExportedPropertySetters and declared as an external
+                //     by declareImportedPropertySetters. Whether such a call
+                //     is even attempted depends on mm.hasSetter (below) — an
+                //     imported property with no setter must never resolve one,
+                //     the same way propertyHasSetter's LOCAL check does.
                 auto* p = ctx.makeImportedSymbol<sema::PropertySymbol>();
                 p->name = ctx.internString(mm.name);
                 p->visibility = fromMetaVisibility(mm.visibility);
@@ -437,6 +503,51 @@ struct Loader {
                 p->scope = parent.memberScope;
                 p->isIndexer = false;
                 fieldTypes_[p] = convert(mm.type);
+                // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): MetaMember::hasSetter,
+                // published to ctx.importedPropertyHasSetter() below. See the
+                // field's comment in ModuleMetadata.hpp for why this cannot be
+                // derived from `p->modifiers` alone.
+                propHasSetter_[p] = mm.hasSetter;
+                // fix #2461 (§22.3/§23): MetaMember::hasGetter, published to
+                // ctx.importedPropertyHasGetter() below — the getter-presence
+                // twin of hasSetter, needed so checkRefOutPropertyOperand can
+                // reject a write-only imported property used as a `ref`
+                // argument (§22.3: ref's copy-in calls the getter) with a
+                // clean diagnostic instead of falling through to a raw linker
+                // error (undefined `...$propget`).
+                propHasGetter_[p] = mm.hasGetter;
+                // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4):
+                // MetaMember::setterVisibility, published to
+                // ctx.importedPropertySetterVisibility() below — the
+                // setter's EFFECTIVE visibility (`private set` etc.), needed
+                // because an imported PropertySymbol has no ast::PropertyDecl
+                // to read `pd->accessors[i].visibility` from at the
+                // cross-module assignment site.
+                propSetterVisibility_[p] = fromMetaVisibility(mm.setterVisibility);
+                // fix #2478 (§9.2/§22.8): MetaMember::isAutoProperty,
+                // published to ctx.importedPropertyIsAutoStorage() below —
+                // whether this Property is a real instance-storage member
+                // (backed by compiler-generated storage, §9.2) rather than a
+                // computed (expression/block-bodied) property. Needed
+                // because `collectInstanceStorage`/`collectRecordStorage`
+                // (LlvmBackend_impl.hpp) must know this to lay out an
+                // imported type's storage correctly — the decl-dependent
+                // `sema::isAutoPropertySymbol` always returns false here
+                // (no ast::PropertyDecl crosses the boundary).
+                propIsAutoStorage_[p] = mm.isAutoProperty;
+                // fix #2467 (§9.2/§2.5, v0.235): mirror the Field case's
+                // constValues_ carriage above — an auto-property's
+                // constant-foldable initializer (ModuleMetadataBuilder.cpp's
+                // new Property-branch `out.valueText`) is folded at RECORD
+                // construction by buildRecordValue's decl-null fallback
+                // (LlvmBackend_Exprs2.cpp), the same `ctx_.importedConstValue`
+                // / `foldImportedConstText` path §22.12/§22.8 FINDING [3]/[7]
+                // already provide. No consumer exists on the CLASS side (a
+                // class replays field/auto-property initializers via the
+                // exported `bz$<Type>$init` function, #2452) — this entry
+                // simply rides unread for a class's PropertySymbol, exactly
+                // as the pre-existing Field-side carriage already does.
+                if (!mm.valueText.empty()) constValues_[p] = mm.valueText;
                 applyBehavior(p);
                 return p;
             }
@@ -458,7 +569,112 @@ struct Loader {
                 applyBehavior(nts);
                 return nts;
             }
-            // Indexer / Event are part of the schema but deferred.
+            case MetaMemberKind::Indexer: {
+                // §22.10 / §23.4 (issue #2414): reconstruct an indexer
+                // PropertySymbol so that cross-module `obj[i]` resolves to a
+                // real symbol instead of falling through member/type
+                // resolution and reading garbage (confirmed: 252 instead of
+                // 3). Mirrors the Property case above but additionally
+                // reconstructs `indexerParams` from `mm.params` (the
+                // exporter's `convertParams(prop->indexerParams, ctx)`
+                // counterpart, ModuleMetadataBuilder.cpp) and sets
+                // `isIndexer = true` so `PropertySymbol::isIndexer`-gated
+                // logic (sema's overload selection, codegen's
+                // findIndexer/selectIndexer/lowerIndexerGet/-Set) recognizes
+                // it as an indexer rather than a named property. As with
+                // Property, there is no ast::PropertyDecl to reconstruct — a
+                // decl-null fallback is added at each consuming site (sema
+                // candidate matching/typing; codegen non-virtual class-direct
+                // dispatch) rather than inventing a synthetic AST node.
+                auto* p = ctx.makeImportedSymbol<sema::PropertySymbol>();
+                p->name = ctx.internString(mm.name);
+                p->visibility = fromMetaVisibility(mm.visibility);
+                p->modifiers = intern(mm.modifiers);
+                p->parent = &parent;
+                p->scope = parent.memberScope;
+                p->isIndexer = true;
+                p->indexerParams = convertParams(mm.params, scope);
+                fieldTypes_[p] = convert(mm.type);
+                // fix #2400's bit, reused for indexers per its own field
+                // comment in ModuleMetadata.hpp ("Ignored for every kind but
+                // Property/Indexer").
+                propHasSetter_[p] = mm.hasSetter;
+                // fix #2461's bit, reused for indexers per its own field
+                // comment in ModuleMetadata.hpp — a write-only (`set`-only)
+                // indexer is equally illegal as a `ref` target under §22.3.
+                propHasGetter_[p] = mm.hasGetter;
+                // fix #2415's bit, reused for indexers per its own field
+                // comment in ModuleMetadata.hpp ("Ignored for every kind but
+                // Property/Indexer").
+                propSetterVisibility_[p] = fromMetaVisibility(mm.setterVisibility);
+                // fix #2478's bit: an indexer is never "auto" (the exporter's
+                // own `out.isAutoProperty` computation excludes
+                // `prop->isIndexer` unconditionally), so this is always
+                // false here — set for consistency with hasSetter/
+                // setterVisibility above, not because an indexer can occupy
+                // a storage slot.
+                propIsAutoStorage_[p] = mm.isAutoProperty;
+                applyBehavior(p);
+                return p;
+            }
+            case MetaMemberKind::Event: {
+                // §11.2 / §24 (issue #2407): reconstruct an EventSymbol for
+                // an imported type's `event` member. §24 (v0.235) retires the
+                // `event` member kind ("the word `event` remains reserved...
+                // an `event` declaration is a reserved-word error") in favor
+                // of the IEvent<T>/EventSource<T> stdlib §6.5 pattern — but
+                // the parser has not yet caught up to that retirement (still
+                // accepts `event` declarations, Parser_Decls.cpp), and the
+                // compiler implements the legacy member kind end-to-end for
+                // LOCAL members (parse/sema/codegen) and, since #2401, mirrors
+                // imported-INTERFACE event itable indices. Reconstructing the
+                // symbol here completes that already-committed legacy surface
+                // for cross-module parity; it does not resolve #2407's own
+                // flagged design question (complete the legacy surface vs.
+                // implement the retirement) — that remains open, per CLAUDE.md
+                // rule 4, for explicit human direction.
+                //
+                // SCOPE (see xmod_event_import_2407_test.cpp's file header for
+                // the full account, and #2421 for the filed follow-up): this
+                // symbol reconstruction alone does NOT make cross-module
+                // Subscribe/Raise work end-to-end. TWO further decl-null
+                // gates block it, both requiring a NEW metadata bit this fix
+                // does not add (a wrong guess would risk an itable/struct-
+                // layout mismatch between exporter and importer — the exact
+                // #2406-style hazard #2420 already caught elsewhere in this
+                // same session):
+                //   1. collectInstanceStorage (LlvmBackend_impl.hpp) needs
+                //      `dynamic_cast<ast::EventDecl>(es->decl)` to even ADD
+                //      the event's backing-field slot to instance storage —
+                //      unconditionally null for an imported EventSymbol, so
+                //      the reconstructed event still gets NO fieldIndex_
+                //      entry, exactly as before this fix (this fix does not
+                //      change that outcome, only whether the SYMBOL exists).
+                //   2. #2401's ifaceEventIndex_ mirror (LlvmBackend_Setup.cpp)
+                //      needs the same `ed`/`!ed->isAsync` check to reserve an
+                //      itable slot — also unconditionally null.
+                // Both need an `isStatic`/`isAsync` metadata bit
+                // (EventSymbol::modifiers is always empty even for a LOCAL
+                // event — SymbolCollection.cpp's EventDecl case never copies
+                // it — so neither is recoverable from `mm.modifiers` either).
+                auto* e = ctx.makeImportedSymbol<sema::EventSymbol>();
+                e->name = ctx.internString(mm.name);
+                e->visibility = fromMetaVisibility(mm.visibility);
+                e->modifiers = intern(mm.modifiers);
+                e->parent = &parent;
+                e->scope = parent.memberScope;
+                fieldTypes_[e] = convert(mm.type);  // §24 payload type
+                // fix #2421 (§24/§2.8.2): record the wire-carried static/
+                // async classification bits so the codegen event-dispatch
+                // path's eventIsStatic/eventIsAsync helpers classify this
+                // imported event IDENTICALLY to the exporter (avoiding an
+                // itable/struct-layout mismatch). Published to the SemaContext
+                // side table below; see MetaMember::isEventStatic/isEventAsync.
+                eventIsStatic_[e] = mm.isEventStatic;
+                eventIsAsync_[e] = mm.isEventAsync;
+                applyBehavior(e);
+                return e;
+            }
             default:
                 return nullptr;
         }
@@ -470,6 +686,40 @@ struct Loader {
     std::unordered_map<sema::MethodSymbol*, sema::TypeRef*> returnTypes_;
     std::unordered_map<sema::MethodSymbol*, bool> returnOwned_;
     std::unordered_map<const sema::MemberSymbol*, sema::TypeRef*> fieldTypes_;
+    // fix #2391 (§14.2/§2.8.2, v0.236): imported generic base method's
+    // per-parameter constraint payload, from MetaMember::genericParams (the
+    // builder's `convertGenericParams` has carried `constraintTypes`/
+    // `specialConstraints` per param since #1579/v0.182). Published to
+    // ctx.setImportedGenericConstraints() below so
+    // checkOverrideSignatureMatch's §14.2 override-restatement leg can verify
+    // an override against an imported generic base. Positionally aligned with
+    // the method's `MethodSymbol::genericParams`.
+    std::unordered_map<const sema::MethodSymbol*,
+                       std::vector<sema::ImportedGenericConstraint>>
+        methodGenericConstraints_;
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): imported property setter presence,
+    // from MetaMember::hasSetter — published to
+    // ctx.setImportedPropertyHasSetter() below.
+    std::unordered_map<const sema::MemberSymbol*, bool> propHasSetter_;
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): imported
+    // property/indexer setter EFFECTIVE visibility, from
+    // MetaMember::setterVisibility — published to
+    // ctx.setImportedPropertySetterVisibility() below.
+    std::unordered_map<const sema::MemberSymbol*, ast::Visibility>
+        propSetterVisibility_;
+    // fix #2478 (§9.2/§22.8): imported property AUTO-storage classification,
+    // from MetaMember::isAutoProperty — published to
+    // ctx.setImportedPropertyIsAutoStorage() below.
+    std::unordered_map<const sema::MemberSymbol*, bool> propIsAutoStorage_;
+    // fix #2461 (§22.3/§23): imported property/indexer getter presence, from
+    // MetaMember::hasGetter — published to ctx.setImportedPropertyHasGetter()
+    // below.
+    std::unordered_map<const sema::MemberSymbol*, bool> propHasGetter_;
+    // fix #2421 (§24/§2.8.2): imported event static/async classification,
+    // from MetaMember::isEventStatic/isEventAsync — published to
+    // ctx.setImportedEventIsStatic/Async() below.
+    std::unordered_map<const sema::MemberSymbol*, bool> eventIsStatic_;
+    std::unordered_map<const sema::MemberSymbol*, bool> eventIsAsync_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const sema::MemberSymbol*, std::string> constValues_;
 };
@@ -695,9 +945,18 @@ static bool metaMemberProducesSymbol(const MetaMember& mm) {
         case MetaMemberKind::EnumConstant:
         case MetaMemberKind::Constructor:
         case MetaMemberKind::Property:
+        // fix #2414/#2407: convertMember now reconstructs a symbol for these
+        // two kinds too (see its Indexer/Event cases) — this predicate MUST
+        // track convertMember's real return-null/non-null behavior exactly,
+        // since every call site here sync-walks td.members against
+        // importedType.members position-by-position (see the sites' own
+        // comments) and a stale `false` here would desync that walk by one
+        // for any type with a reconstructed indexer or event.
+        case MetaMemberKind::Indexer:
+        case MetaMemberKind::Event:
             return true;
         default:
-            return false;  // Indexer (3), Event (5), and any future default
+            return false;  // any future member kind convertMember defers
     }
 }
 
@@ -787,9 +1046,11 @@ static std::string buildMethodStub(const MetaMember& mm) {
 static std::string buildSyntheticClassSource(
     const MetaTypeDecl& td, const std::string& ctorBodyText) {
     std::string src = "module _662c_reparsed_;\n";
-    // Class header with visibility and generic params.
+    // Record constructors must be reconstructed as records: buildRecordValue
+    // binds `this` to the by-value storage and inlines this declaration.
     src += metaVisibilityToKeyword(td.visibility);
-    src += " class ";
+    src += " ";
+    src += (td.kind == MetaTypeDeclKind::Record ? "record " : "class ");
     src += td.name;
     if (!td.genericParams.empty()) {
         src += "<";
@@ -834,6 +1095,13 @@ static std::string buildSyntheticClassSource(
 // build remapped entries in the MAIN context (mainCtx):
 //   fresh IdentifierExpr* → fresh FieldSymbol   →  mainCtx[same expr*] = importedFieldSym
 //   fresh IdentifierExpr* → fresh ParamSymbol   →  mainCtx[same expr*] = importedParamSym
+//   fresh IdentifierExpr* → fresh LocalSymbol   →  mainCtx[same expr*] = SAME freshSym
+//     (#2290 bug 1: a `var`/`using var` LOCAL declared inside the ctor body has
+//     no imported counterpart to translate to — it is private to this body — so
+//     it is registered by IDENTITY. This only works if `freshSym` (and the
+//     TypeRefs it and the body's expressions carry) stay alive through codegen;
+//     see the ownImportedAuxiliary keep-alive below, mirroring #783's
+//     parseAndAttachMethodBody.)
 // Attaches the re-parsed ast::ConstructorDecl to `importedCs->decl` and keeps
 // the fresh SourceFile alive via mainCtx.ownImportedAst().
 // Returns false if parsing or sema failed (caller should leave decl=null).
@@ -852,22 +1120,30 @@ static bool parseAndAttachCtorBody(
     auto sf = freshParser.parseCompilationUnit();
     if (!sf || freshDiag.hasErrors()) return false;
 
-    // Run the three sema passes in a fresh SemaContext.
-    DiagnosticEngine semaDiag;
-    sema::SemaContext freshCtx(semaDiag);
+    // §14/#662c / #2290: the fresh context AND its diagnostics must OUTLIVE
+    // this function, exactly as in #783's parseAndAttachMethodBody — codegen
+    // monomorphizes the ctor body per instantiation and, for a LOCAL variable
+    // declared inside the body (#2290 bug 1), the exprSymbol registered below
+    // for its references IS the fresh LocalSymbol itself (there is no imported
+    // symbol to translate to), so the fresh arena that owns it cannot be torn
+    // down on return. Heap-allocate both; SemaContext holds a
+    // DiagnosticEngine&, so the engine is owned first (destroyed last).
+    auto semaDiag = std::make_shared<DiagnosticEngine>();
+    auto freshCtxPtr = std::make_shared<sema::SemaContext>(*semaDiag);
+    sema::SemaContext& freshCtx = *freshCtxPtr;
     sema::collectSymbols(*sf, freshCtx);
-    if (semaDiag.hasErrors()) return false;
+    if (semaDiag->hasErrors()) return false;
     sema::resolveTypes(*sf, freshCtx);
-    if (semaDiag.hasErrors()) return false;
+    if (semaDiag->hasErrors()) return false;
     sema::typecheckExpressions(*sf, freshCtx);
     // Note: sema may emit errors for unsupported constructs (e.g. `base(...)`
     // chain on unknown base); tolerate those — we only need the exprSymbols.
     // A hard parse failure is caught above; sema errors here are usually
     // benign for the subset we're interested in (field assign + param refs).
-    // Note: sema may emit errors for unsupported constructs (e.g. `base(...)`
-    // chain on unknown base); tolerate those — we only need the exprSymbols.
-    // A hard parse failure is caught above; sema errors here are usually
-    // benign for the subset we're interested in (field assign + param refs).
+    // NOT tolerated: #710/#2290 sibling-type references (a call/`new` naming a
+    // type this synthetic reconstruction never declared) remain a silent-wrong-
+    // value risk this function does not attempt to fix — see #2290 bug 2 and
+    // #710 for the (XL, declaration-rewriting) follow-up.
 
     // Locate the fresh TypeSymbol and ConstructorSymbol in the fresh module.
     sema::TypeSymbol* freshType = nullptr;
@@ -949,10 +1225,34 @@ static bool parseAndAttachCtorBody(
             auto it = importedMethods.find(freshMethodSigKey(freshMs));
             if (it != importedMethods.end())
                 mainCtx.setExprSymbol(expr, it->second);
+        } else if (dynamic_cast<sema::LocalSymbol*>(freshSym)) {
+            // §2290 bug 1: a LOCAL variable declared inside the ctor body
+            // (`var x := …;` / `using var x := …;`) has no counterpart in
+            // importedType's members — it is private to this body. Register the
+            // fresh LocalSymbol itself under mainCtx (kept alive below), so
+            // codegen's `ctx_.exprSymbol(expr)` finds the SAME symbol pointer at
+            // both the local's declaration (inlineCtorBody processes the
+            // attached ast::ConstructorDecl directly) and every later reference,
+            // instead of finding nothing and silently reading a default value.
+            mainCtx.setExprSymbol(expr, freshSym);
         }
         // Other symbols (TypeSymbol for type refs, etc.) are not remapped;
         // they are not needed by inlineCtorBody / implicitFieldAddr.
     }
+
+    // §2290 bug 1 / #783 precedent: copy the body's resolved-type and
+    // expr-type entries from the fresh context into mainCtx so codegen's
+    // per-instantiation monomorphization finds a type for LOCAL declarations
+    // and expressions the field/param/method remaps above don't cover (e.g. a
+    // local's declared/inferred type, or a `new OwningBuffer<int>(...)`
+    // sub-expression). The TypeRef* values point into the fresh context's
+    // arena, kept alive via ownImportedAuxiliary below; the AST-node keys are
+    // the re-parsed nodes, kept alive via ownImportedAst. Copying the whole map
+    // is harmless — the keys are unique to the fresh AST.
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        if (expr && ref) mainCtx.setExprType(expr, ref);
 
     // Attach the parsed ConstructorDecl and keep the AST alive.
     // Keep the backing source string alive too: all string_view fields in the
@@ -961,6 +1261,13 @@ static bool parseAndAttachCtorBody(
     importedCs->decl = parsedCd;
     mainCtx.ownImportedSource(std::move(source));
     mainCtx.ownImportedAst(std::move(sf));
+    // Keep the fresh context + diagnostics alive (#2290 bug 1: the LocalSymbol
+    // entries registered above point into freshCtx's arena). importedAuxiliary_
+    // destroys in REVERSE insertion order, and SemaContext holds a
+    // DiagnosticEngine&, so push the engine FIRST (destroyed last) and the
+    // context SECOND (destroyed first) — context-then-engine, never dangling.
+    mainCtx.ownImportedAuxiliary(semaDiag);
+    mainCtx.ownImportedAuxiliary(freshCtxPtr);
     return true;
 }
 
@@ -1295,6 +1602,305 @@ static bool parseAndAttachMethodBody(
     return true;
 }
 
+// §2.8.2 / §22.12 / §22.13 (#2351): build a synthetic class source for
+// re-parsing an imported generic class's static field INITIALIZER
+// expression(s). Shape mirrors buildSyntheticMethodSource: every field is
+// (re)declared with its type, and — for whichever field(s) carry their own
+// fieldInitText (every static field of this class the exporter carried one
+// for, not just the one field this call is reconstructing right now: a
+// sibling static field the initializer references then type-checks against
+// its REAL initializer rather than a bare, potentially
+// `readonly`-without-assignment stub; no DEFINITE-ASSIGNMENT pass runs over
+// this reduced 3-pass pipeline, so a still-bare sibling would not itself
+// fault, but embedding the real text is more faithful and costs nothing
+// extra since the text is already on hand) — the `:=` initializer text is
+// appended too. Every method is a signature-only stub (self-call
+// resolution, e.g. `Hits: int := ComputeInitial();`).
+static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td,
+                                                 const std::string& moduleName) {
+    std::string src = "module _2351_reparsed_field_;\n";
+    // §2.8.2 / #2375: `import` the exporting module so its PUBLIC sibling
+    // types — already loaded into the importer's mainCtx — are visible to
+    // resolveTypes/typecheckExpressions here. parseAndAttachFieldInit
+    // registers those siblings into this fresh context under `moduleName`;
+    // the `import` is what engages Resolver's imports path (§2.2) to expose
+    // them by bare name. This closes #2351's sibling-type coverage gap: a
+    // static field whose declared type OR initializer references a public
+    // co-declared type (e.g. `public static readonly Res: Box := new
+    // Box(42);`) now reconstructs instead of being rejected. Internal
+    // siblings are not in the exported metadata (§13.2: only `public`
+    // top-level types are exported), so they remain unresolvable here and
+    // the import still correctly rejects — the #2351 self-pass (a)
+    // guarantee is preserved.
+    if (!moduleName.empty()) src += "import " + moduleName + ";\n";
+    src += metaVisibilityToKeyword(td.visibility);
+    src += " class ";
+    src += td.name;
+    if (!td.genericParams.empty()) {
+        src += "<";
+        for (std::size_t i = 0; i < td.genericParams.size(); ++i) {
+            if (i) src += ", ";
+            if (!td.genericParams[i].variance.empty() &&
+                td.genericParams[i].variance != "none")
+                src += td.genericParams[i].variance + " ";
+            src += td.genericParams[i].name;
+        }
+        src += ">";
+    }
+    src += "\n";
+    // Fields: any field carrying its own fieldInitText gets its real
+    // initializer; every other field is a bare type re-declaration (name
+    // resolution only — see comment above).
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Field) continue;
+        src += "  " + metaVisibilityToKeyword(mm.visibility);
+        for (const std::string& mod : mm.modifiers) src += " " + mod;
+        src += " " + mm.name + " : " + metaTypeToSourceText(mm.type);
+        if (!mm.fieldInitText.empty()) src += " := " + mm.fieldInitText;
+        src += ";\n";
+    }
+    // Method stubs, for any self-call the initializer makes.
+    for (const MetaMember& mm : td.members) {
+        if (mm.kind != MetaMemberKind::Method) continue;
+        if (mm.isOperator) continue;
+        std::string stub = buildMethodStub(mm);
+        if (!stub.empty()) src += stub + "\n";
+    }
+    src += "end " + td.name + ";\n";
+    return src;
+}
+
+// §2.8.2 / §22.12 / §22.13 (#2351): parse `target.fieldInitText` for a static
+// field of an imported generic class, run the three sema passes in a FRESH
+// SemaContext, remap the initializer's exprSymbols (field / self-method)
+// into mainCtx, and attach the re-parsed ast::FieldDecl (whose `initializer`
+// is now a live AST) to the imported FieldSymbol's `decl` slot — mirroring
+// ConstructorSymbol::decl / MethodSymbol::decl for the ctor/method-body
+// precedents. After this, codegen's genericInstSfinitFn (LlvmBackend_Setup.
+// cpp) finds `dynamic_cast<const ast::FieldDecl*>(fs->decl)` non-null and
+// lowers+stores the initializer exactly as it already does for a LOCALLY-
+// declared generic's own field — no codegen change needed.
+//
+// §2.8.2's "no restrictions beyond visibility... must reject the export, or
+// the import, with a diagnostic naming the shape; it must not alter the
+// instantiation's semantics" governs the failure path: unlike the ctor-body
+// path (tolerant of benign sema errors) and the method-body path (silently
+// declines to attach, falling back to the pre-existing degraded behavior),
+// an unattached static field initializer has NO fallback — genericInstSfinitFn
+// leaves the shared per-instantiation cell at its zero-init forever, which
+// IS an altered instantiation semantics (§2.8.2 clause 2: "an external
+// instantiation behaves identically to a same-module instantiation"). So a
+// parse/sema failure here is reported as a hard diagnostic into the
+// IMPORTING compilation's own DiagnosticEngine (mainCtx.diagnostics()) —
+// causing that build to fail cleanly, naming the field and module, rather
+// than silently shipping a static field that always reads zero/default.
+//
+// This is scoped to the reconstruction step itself. It does NOT extend to
+// genericInstSfinitFn's own pre-existing, separately-tracked skips
+// (collection-literal / inline-array initializers, and a T-DEPENDENT
+// initializer whose value type doesn't match the instantiation's field
+// type, per #1513's "KNOWN GAP" comment and issue #803) — those remain
+// silent zero-inits, an already-recorded limitation this fix does not
+// widen or narrow.
+//
+// Coverage note (#2375, §2.8.2): the synthetic source declares only the
+// type being reconstructed, BUT buildSyntheticFieldInitSource also emits
+// `import <moduleName>;` and parseAndAttachFieldInit registers the
+// exporting module's already-imported PUBLIC sibling types into the fresh
+// context — so a PUBLIC sibling-type reference (in the field's declared
+// type or in its initializer) now resolves to the real imported
+// TypeSymbol and reconstructs. An INTERNAL sibling-type reference still
+// fails resolveTypes and rejects via the path below — the CORRECT outcome
+// per §2.8.2 (internal types are not in the exported metadata, §13.2, so
+// they genuinely do not exist across the module boundary) and the
+// #2351 self-pass (a) pin. The ctor-body path's identical "synthetic
+// source omits sibling/base types" limitation (#710 / #2290 bug 2) is a
+// separate, harder shape (a ctor body can reach arbitrary members, not
+// just type names) and remains tracked there.
+static bool parseAndAttachFieldInit(
+    const MetaTypeDecl& td,
+    const std::string& moduleName,
+    const MetaMember& target,
+    sema::FieldSymbol* importedFs,
+    const sema::TypeSymbol& importedType,
+    sema::SemaContext& mainCtx) {
+    std::string source = buildSyntheticFieldInitSource(td, moduleName);
+
+    auto reject = [&](const char* reason) {
+        mainCtx.diagnostics().report(
+            Severity::Error, SourceLocation{},
+            "cannot import static field '" + td.name + "." + target.name +
+                "' from module '" + moduleName +
+                "': its initializer could not be reconstructed across the "
+                "module boundary (" + reason +
+                "); per spec §2.8.2 the import is rejected rather "
+                "than silently observing an uninitialized value");
+    };
+
+    DiagnosticEngine freshDiag;
+    Lexer freshLex(source, freshDiag);
+    Parser freshParser(freshLex, freshDiag);
+    auto sf = freshParser.parseCompilationUnit();
+    if (!sf || freshDiag.hasErrors()) {
+        reject("the initializer text failed to re-parse");
+        return false;
+    }
+
+    // Fresh context/diagnostics must OUTLIVE this function on success — see
+    // the ctor/method-body precedents' identical keep-alive discipline.
+    auto semaDiag = std::make_shared<DiagnosticEngine>();
+    auto freshCtxPtr = std::make_shared<sema::SemaContext>(*semaDiag);
+    sema::SemaContext& freshCtx = *freshCtxPtr;
+    sema::collectSymbols(*sf, freshCtx);
+    if (semaDiag->hasErrors()) {
+        reject("symbol collection failed on the reconstructed declaration");
+        return false;
+    }
+    // §2.8.2 / #2375: register the exporting module's PUBLIC sibling types
+    // (already imported into mainCtx under `moduleName`) into this fresh
+    // context so the `import <moduleName>;` line emitted above resolves a
+    // sibling-type reference in the reconstructed initializer / field type
+    // to the REAL imported TypeSymbol — no stub declaration and no remap:
+    // the reconstructed TypeRefs/exprTypes point directly at the imported
+    // symbols, which is exactly what codegen consumes. The reconstructed
+    // type itself (td.name) is skipped so its synthetic declaration stays
+    // authoritative for any self-reference (preserving pre-#2375 behavior).
+    // Internal siblings are absent from mainCtx's imported registry (only
+    // publics are exported, §13.2), so they still correctly fail
+    // resolveTypes and reject — matching the #2351 self-pass (a) pin.
+    if (const std::vector<sema::TypeSymbol*>* siblings =
+            mainCtx.importedTypesOf(moduleName)) {
+        for (sema::TypeSymbol* sib : *siblings) {
+            if (!sib || sib->name.empty()) continue;
+            if (sib->name == td.name) continue;
+            freshCtx.registerImportedType(moduleName, sib);
+        }
+    }
+    sema::resolveTypes(*sf, freshCtx);
+    if (semaDiag->hasErrors()) {
+        reject("a referenced type did not resolve inside the module "
+               "boundary");
+        return false;
+    }
+    sema::typecheckExpressions(*sf, freshCtx);
+    // §14.1/#783 SOUNDNESS GATE, applied here for the same reason: a static
+    // field's value is exactly the class of "silently wrong" risk a method's
+    // return value is (§2.8.2/#2351 doc comment above) — require a fully
+    // clean typecheck of the WHOLE synthetic class (every field's carried
+    // initializer, not just `target`'s), since a sibling's ill-typed
+    // initializer would leave the module resolvable but ill-formed.
+    if (semaDiag->hasErrors()) {
+        reject("the initializer references a name not visible across the "
+               "module boundary");
+        return false;
+    }
+
+    sema::TypeSymbol* freshType = nullptr;
+    if (freshCtx.module()) {
+        for (sema::Symbol* child : freshCtx.module()->children) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(child);
+            if (ts && std::string(ts->name) == td.name) { freshType = ts; break; }
+        }
+    }
+    if (!freshType) {
+        reject("the reconstructed type could not be located");
+        return false;
+    }
+
+    sema::FieldSymbol* freshFs = nullptr;
+    for (sema::Symbol* m : freshType->members) {
+        auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+        if (fs && std::string(fs->name) == target.name) { freshFs = fs; break; }
+    }
+    if (!freshFs) {
+        reject("the reconstructed field could not be located");
+        return false;
+    }
+
+    auto* parsedFd = dynamic_cast<const ast::FieldDecl*>(freshFs->decl);
+    if (!parsedFd || !parsedFd->initializer) {
+        reject("the reconstructed declaration carries no initializer");
+        return false;
+    }
+
+    // Field remap map (every field of the class, so a sibling reference in
+    // `target`'s initializer binds to the REAL imported FieldSymbol).
+    std::unordered_map<std::string_view, sema::Symbol*> importedFields;
+    for (sema::Symbol* m : importedType.members) {
+        if (dynamic_cast<sema::FieldSymbol*>(m) && !m->name.empty())
+            importedFields[m->name] = m;
+    }
+
+    // Self-method remap map (signature-keyed, as in the ctor/method paths).
+    std::unordered_map<std::string, sema::Symbol*> importedMethods;
+    {
+        std::size_t importedIdx = 0;
+        for (const MetaMember& mmItem : td.members) {
+            if (!metaMemberProducesSymbol(mmItem)) continue;
+            if (importedIdx >= importedType.members.size()) break;
+            sema::Symbol* sym = importedType.members[importedIdx++];
+            if (mmItem.kind == MetaMemberKind::Method && !mmItem.isOperator)
+                importedMethods[metaMemberSigKey(mmItem.name, mmItem.params)] =
+                    sym;
+        }
+    }
+
+    for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
+        if (!expr || !freshSym) continue;
+        if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
+            auto it = importedFields.find(freshSym->name);
+            if (it != importedFields.end()) {
+                mainCtx.setExprSymbol(expr, it->second);  // self-field → imported
+                continue;
+            }
+            // #2375: not a self-field — a SIBLING type's field (e.g.
+            // `Box.DefaultSize` in the reconstructed initializer). The
+            // sibling was registered as the REAL imported TypeSymbol, so
+            // freshSym already IS the imported FieldSymbol — copy it as-is.
+            // Skipping it (the pre-#2375 behavior for any non-self symbol)
+            // left codegen with no symbol for the reference and it silently
+            // read zero.
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (auto* fms = dynamic_cast<sema::MethodSymbol*>(freshSym)) {
+            auto it = importedMethods.find(freshMethodSigKey(fms));
+            if (it != importedMethods.end()) {
+                mainCtx.setExprSymbol(expr, it->second);  // self-method → imported
+                continue;
+            }
+            // #2375: a sibling type's method — already the imported symbol.
+            // (A self-operator is unreachable here: buildSyntheticFieldInitSource
+            // emits no operator stubs, so an operator reference never resolves
+            // in freshCtx.)
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else {
+            // No ParameterSymbol/LocalSymbol case: a field initializer is not a
+            // body — it has no parameters, and per §22.8/§22.13 a field
+            // initializer expression admits no local declarations either.
+            // Any other symbol here is a sibling reference (a TypeSymbol or
+            // ConstructorSymbol) that already resolves to the real imported
+            // symbol — copy it as-is (#2375).
+            mainCtx.setExprSymbol(expr, freshSym);
+        }
+    }
+
+    // Copy resolved-type / expr-type entries so codegen's lowerExpr finds a
+    // type for every sub-expression of the initializer (e.g. `new
+    // AtomicInteger<int>(0)`'s constructed-type node).
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        if (expr && ref) mainCtx.setExprType(expr, ref);
+
+    // Attach: importedFs->decl now points at a live ast::FieldDecl whose
+    // `initializer` genericInstSfinitFn's existing loop lowers and stores.
+    importedFs->decl = parsedFd;
+    mainCtx.ownImportedSource(std::move(source));
+    mainCtx.ownImportedAst(std::move(sf));
+    mainCtx.ownImportedAuxiliary(semaDiag);
+    mainCtx.ownImportedAuxiliary(freshCtxPtr);
+    return true;
+}
+
 }  // namespace
 
 void stripContractFacts(MetaMember& member) {
@@ -1371,6 +1977,14 @@ static void loadMetadataPass1(
         // TypeSymbol::hasPositionalFields (no ast::TypeDecl exists for imported types).
         t->hasPositionalFields = td.hasPositionalFields;
         t->invariantContracts = toContractRecords(td.invariants);
+        // #1488 / §2.8.3 rule 3: this type's declaring-module identity, as
+        // reconstructed from the dependency's own metadata — the far side of
+        // the pairing with SymbolCollection::collectTypeDecl's local
+        // population. Both sides read `md.moduleName`'s equivalent (the local
+        // side via the ModuleDecl, this side directly from the artifact), so
+        // an importer's external symbol declarations and the exporter's
+        // definitions always agree.
+        t->moduleName = md.moduleName;
         localTypes[td.name] = t;
         created.push_back(t);
         ctx.registerImportedType(md.moduleName, t);
@@ -1412,8 +2026,10 @@ static void loadMetadataPass2(
     for (std::size_t i = 0; i < md.types.size(); ++i) {
         const MetaTypeDecl& td = md.types[i];
         sema::TypeSymbol* t = created[i];
-        // Only generic classes carry exported bodies.
-        if (t->kind != ast::TypeDeclKind::Class || td.genericParams.empty())
+        // Only generic classes and records carry exported constructor bodies.
+        if ((t->kind != ast::TypeDeclKind::Class &&
+             t->kind != ast::TypeDeclKind::Record) ||
+            (t->kind == ast::TypeDeclKind::Class && td.genericParams.empty()))
             continue;
 
         // Ctor bodies: find each Constructor member with non-empty ctorBodyText.
@@ -1489,10 +2105,93 @@ static void loadMetadataPass2(
                 parseAndAttachMethodBody(td, mm, importedMs, *t, ctx);
         }
 
+        // §2.8.2 / §22.12 / §22.13 (#2351): static field initializers — find
+        // each Field member with a non-empty fieldInitText and attach the
+        // re-parsed ast::FieldDecl to the matching imported FieldSymbol, so
+        // codegen's genericInstSfinitFn can lower+store the initializer into
+        // the #1513 shared per-instantiation cell. Fields are never
+        // overloaded (§22.6 is a method/constructor/indexer concept), so a
+        // name match is sufficient — no signature-key matching needed.
+        for (const MetaMember& mm : td.members) {
+            if (mm.kind != MetaMemberKind::Field || mm.fieldInitText.empty())
+                continue;
+            sema::FieldSymbol* importedFs = nullptr;
+            for (sema::Symbol* m : t->members) {
+                auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+                if (fs && std::string(fs->name) == mm.name) {
+                    importedFs = fs;
+                    break;
+                }
+            }
+            if (importedFs)
+                parseAndAttachFieldInit(td, md.moduleName, mm, importedFs, *t,
+                                        ctx);
+        }
+
         // Dtor body: the dtorBodyText is on the MetaTypeDecl itself.
         if (!td.dtorBodyText.empty()) {
             parseAndAttachDtorBody(td, td.dtorBodyText, *t, ctx);
         }
+    }
+
+    // §26 / §2.5 (#735) — Pass 4: reconstruct exported EXTENSION blocks. An
+    // extension member belongs to no type, so it cannot ride the TypeSymbol
+    // path: the importer needs a live `ast::ExtensionDecl` because
+    // ExprTC::lookupExtensionMember matches on its `targetType` (§26.5 step 2)
+    // and codegen's functionName / extensionThisType recover the exported
+    // `bz$ext$<T>$<M>` symbol and its receiver ABI from the same node. So
+    // synthesize a minimal AST: one ExtensionDecl per block, whose targetType is
+    // a Named ast::Type with the block's head spelled from the metadata and the
+    // resolved TypeRef registered directly. No re-parse and no fresh
+    // SemaContext are needed (unlike the #662c/#783 generic BODY paths) — an
+    // extension head is a plain type name, and the body never crosses the
+    // boundary: the call links against the exporter's emitted symbol.
+    if (!md.extensions.empty()) {
+        auto synth = std::make_unique<ast::SourceFile>();
+        for (const MetaExtension& me : md.extensions) {
+            auto decl = std::make_unique<ast::ExtensionDecl>();
+            decl->visibility = fromMetaVisibility(me.visibility);
+            auto targetTy = std::make_unique<ast::Type>();
+            targetTy->kind = ast::TypeKind::Named;
+            targetTy->name = std::make_unique<ast::QualifiedName>();
+            // The spelled head must be the SAME last segment the exporter
+            // mangled `bz$ext$<T>$<M>` with (Emitter::functionName reads
+            // targetType->name->parts.back()), so a class/record/enum head uses
+            // the type's own name and a §26.2 primitive head its keyword.
+            targetTy->name->parts.push_back(
+                ctx.internString(metaTypeToSourceText(me.target)));
+            decl->targetType = std::move(targetTy);
+            ctx.setResolvedType(decl->targetType.get(), loader.convert(me.target));
+
+            auto* extSym = ctx.makeImportedSymbol<sema::ExtensionSymbol>();
+            extSym->decl = decl.get();
+            extSym->scope = sema::kModuleScope;
+            for (const MetaMember& mm : me.members) {
+                if (mm.kind != MetaMemberKind::Method) continue;
+                const sema::ScopeId scope = ctx.newScope();
+                auto* ms = ctx.makeImportedSymbol<sema::MethodSymbol>();
+                ms->name = ctx.internString(mm.name);
+                ms->visibility = fromMetaVisibility(mm.visibility);
+                ms->modifiers = loader.intern(mm.modifiers);
+                // §26.1: an extension method has no `parent` TypeSymbol — that
+                // null parent is exactly how codegen distinguishes it, together
+                // with `extensionDecl`.
+                ms->parent = nullptr;
+                ms->scope = scope;
+                ms->params = loader.convertParams(mm.params, scope);
+                ms->extensionDecl = decl.get();
+                ms->isPure = mm.isPure;
+                ms->contractRecords = toContractRecords(mm.contracts);
+                loader.returnTypes_[ms] = loader.convert(mm.type);
+                loader.returnOwned_[ms] = mm.returnOwned;
+                extSym->members.push_back(ms);
+            }
+            ctx.registerImportedExtension(md.moduleName, extSym);
+            synth->topDecls.push_back(std::move(decl));
+        }
+        // The synthetic AST must outlive sema + codegen (every symbol above
+        // points into it), so hand it to the context's imported-AST arena.
+        ctx.ownImportedAst(std::move(synth));
     }
 
     // Publish the loader's member-type side tables into the SemaContext so the
@@ -1502,6 +2201,46 @@ static void loadMetadataPass2(
         ctx.setImportedReturnType(m, ret, loader.returnOwned_[m]);
     for (auto& [m, ty] : loader.fieldTypes_)
         ctx.setImportedMemberType(m, ty);
+    // fix #2391 (§14.2/§2.8.2, v0.236): publish imported generic base
+    // methods' per-parameter constraint payload so checkOverrideSignatureMatch
+    // can verify an override's restated clause set against an imported base.
+    for (auto& [m, gcs] : loader.methodGenericConstraints_)
+        ctx.setImportedGenericConstraints(m, std::move(gcs));
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 4): publish imported property setter
+    // presence so declareImportedPropertySetters (LlvmBackend_Setup.cpp) can
+    // tell a genuinely settable imported property from a getter-only one.
+    for (auto& [m, hs] : loader.propHasSetter_)
+        ctx.setImportedPropertyHasSetter(m, hs);
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): publish the
+    // imported property/indexer setter's EFFECTIVE visibility so the `:=`
+    // assignment-target check (ExprTypecheck.cpp) can enforce §13.6 across a
+    // module boundary the same way it already does locally.
+    for (auto& [m, sv] : loader.propSetterVisibility_)
+        ctx.setImportedPropertySetterVisibility(m, sv);
+    // fix #2478 (§9.2/§22.8): publish imported property AUTO-storage
+    // classification so collectInstanceStorage/collectRecordStorage's
+    // isAutoPropertyStorage fallback (LlvmBackend_impl.hpp) can lay out an
+    // imported type's storage correctly.
+    for (auto& [m, isAuto] : loader.propIsAutoStorage_)
+        ctx.setImportedPropertyIsAutoStorage(m, isAuto);
+    // fix #2461 (§22.3/§23): publish imported property/indexer getter
+    // presence so checkRefOutPropertyOperand (ExprTypecheck.cpp) can reject a
+    // write-only imported property used as a `ref` argument with a clean
+    // §22.3/§23 diagnostic (instead of falling through to a raw linker
+    // error on the undefined `...$propget` symbol).
+    for (auto& [m, hg] : loader.propHasGetter_)
+        ctx.setImportedPropertyHasGetter(m, hg);
+    // fix #2421 (§24/§2.8.2): publish imported event static/async
+    // classification so the codegen event-dispatch path's eventIsStatic/
+    // eventIsAsync helpers (LlvmBackend_impl.hpp) can classify an imported
+    // event IDENTICALLY to the exporter — collectInstanceStorage/
+    // emitOwnFieldInit/ctor-cleanup (isStatic) and the ifaceEventIndex_
+    // mirror + itab$C$I build (isAsync), avoiding an itable/struct-layout
+    // mismatch.
+    for (auto& [m, st] : loader.eventIsStatic_)
+        ctx.setImportedEventIsStatic(m, st);
+    for (auto& [m, asy] : loader.eventIsAsync_)
+        ctx.setImportedEventIsAsync(m, asy);
     // §22.12 (issue #328 FINDING [3] BUG A): publish imported const values so
     // codegen can fold an imported `const` read without a storage symbol.
     for (auto& [m, val] : loader.constValues_)

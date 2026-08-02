@@ -161,3 +161,34 @@ BEZEL_TEST(codegen_cg29b, mixed_field_record_equality) {
         "  return (if eq = 1 and neq = 0 then 1 else 0); "
         "end Main; end C;"), 1);
 }
+
+// §9.2 / §8.3 / §35.2 (fix #2497): `this = other` (and `this <> other`) inside
+// a record INSTANCE method must dispatch the auto-generated structural record
+// equality, not abort the compiler. `this` in a value-type instance method
+// lowers to a POINTER to the receiver storage (CG9; §35.2 states the choice
+// form — "this in a choice instance method is a borrow of the receiver value"
+// — and the record form follows the same receiver-ptr convention, see #575's
+// lowerWith). Before the fix, the bare-`this` operand was a pointer while the
+// by-value `other` operand was a struct, so the struct-equality dispatch
+// (which keys on isStructTy()) skipped it and fell through to a raw ICmpEQ
+// over mismatched operand types (ptr vs struct) — aborting in the LLVM IR
+// verifier (ICmpInst::AssertOK operand-type-mismatch). The fix loads the
+// receiver struct through the pointer before the equality dispatch. This test
+// proves the VALUE: equal receivers compare true, a field mismatch compares
+// false, and the result is symmetric (this on the right via the second call).
+BEZEL_TEST(codegen_cg29b, this_eq_other_in_record_instance_method_2497) {
+    BEZEL_EXPECT_EQ(run(
+        "module M; record Pt(X: int, Y: int) "
+        "  public method SelfEq(other: Pt): bool => this = other; "
+        "end Pt; "
+        "class C public static method Main(): int "
+        "  var a := new Pt(1, 2); var b := new Pt(1, 2); "
+        "  var c := new Pt(1, 9); var d := new Pt(3, 2); "
+        "  var pass := 0; "
+        "  if a.SelfEq(b) then pass := pass + 1; end if; "      // equal → true
+        "  if not a.SelfEq(c) then pass := pass + 1; end if; "   // Y differs → false
+        "  if not a.SelfEq(d) then pass := pass + 1; end if; "   // X differs → false
+        "  if b.SelfEq(a) then pass := pass + 1; end if; "       // symmetric → true
+        "  return (if pass = 4 then 1 else 0); "
+        "end Main; end C;"), 1);
+}

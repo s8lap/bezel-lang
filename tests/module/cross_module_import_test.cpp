@@ -43,6 +43,7 @@
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
 #include "support/Diagnostic.hpp"
+#include "support/aot_support.hpp"  // #2290: aot_detail::spawnCaptured/hasSanitizerReport
 #include "test_harness.hpp"
 
 namespace bezel::module {
@@ -172,6 +173,54 @@ BEZEL_TEST(cross_module_import, wrong_arg_type_rejected_spec_5_1) {
         "  public static method Main(): int => Calc.Square(\"hi\"); "  // string!=int
         "end Program;");
     BEZEL_EXPECT_TRUE(r->hadErrors);
+}
+
+// fix #2418 (⚠ imported-symbol decision): an imported member is reconstructed
+// from the dependency's `.bezel.meta` (ModuleLoader.cpp's
+// `ctx.makeImportedSymbol<...>()` call sites), NOT from an
+// ast::Member-derived decl node — there is no local AST to read a `span`
+// from (the #2374 defect class: "imported symbols have no astNode"), and
+// SourceLocation carries no filename, so stamping one from a *re-parsed*
+// dependency-source-text location (as ModuleLoader lazily does for a body it
+// re-parses for cross-module inlining) would silently mislabel the position
+// against the IMPORTING file — worse than 0:0, not better. #2418's
+// SymbolCollection.cpp / Parser_Decls.cpp fix deliberately does not touch
+// ModuleLoader.cpp: an imported member's declLoc stays the SourceLocation
+// default (unset / 0:0), exactly as before the fix. Pinned here so that
+// invariant doesn't silently drift.
+BEZEL_TEST(cross_module_import, imported_member_decl_loc_stays_unset_2418) {
+    ModuleMetadata dep = buildMetaFor(
+        "module MathLib; "
+        "public class Calc "
+        "  public _cached: int; "
+        "  public static method Square(n: int): int => n * n; "
+        "end Calc;");
+    auto r = runImporter(
+        dep,
+        "module App; "
+        "import MathLib; "
+        "public class Program "
+        "  public static method Main(): int => Calc.Square(6); "
+        "end Program;");
+    BEZEL_EXPECT_TRUE(!r->hadErrors);
+    sema::TypeSymbol* calc = r->ctx->lookupImportedTypeByName("Calc");
+    BEZEL_EXPECT_TRUE(calc != nullptr);
+    if (!calc) return;
+    // The imported TYPE itself: also unset (no local ast::TypeDecl either).
+    BEZEL_EXPECT_EQ(calc->declLoc.line, std::uint32_t(0));
+    BEZEL_EXPECT_EQ(calc->declLoc.column, std::uint32_t(0));
+    bool sawField = false, sawMethod = false;
+    for (sema::Symbol* m : calc->members) {
+        if (dynamic_cast<sema::FieldSymbol*>(m)) {
+            sawField = true;
+            BEZEL_EXPECT_EQ(m->declLoc.line, std::uint32_t(0));
+        } else if (dynamic_cast<sema::MethodSymbol*>(m)) {
+            sawMethod = true;
+            BEZEL_EXPECT_EQ(m->declLoc.line, std::uint32_t(0));
+        }
+    }
+    BEZEL_EXPECT_TRUE(sawField);
+    BEZEL_EXPECT_TRUE(sawMethod);
 }
 
 // fix #795 / §2.5 / §11.3 / §12.1: a call to a member that does NOT exist on an
@@ -509,6 +558,74 @@ struct TempFile {
 void writeSource(const std::string& path, const std::string& src) {
     std::ofstream out(path);
     out << src;
+}
+
+// #2290 / #710: run a two-module (A-imports-B) executable under generated-code
+// AddressSanitizer/LeakSanitizer — the cross-module counterpart of
+// support/aot_support.hpp's runAotChecked, which only compiles a single module.
+// Compiles `aSrc` to a dependency object (plain, no sanitizer — see
+// bezelc's own "--sanitize=address applies to the executable build" rule),
+// then compiles+links `bSrc` against it with `opts.sanitizeAddress = true`, then
+// runs the executable with LeakSanitizer on and inspects both the exit status
+// and the captured ASan/LSan report text (aot_detail::hasSanitizerReport) — a
+// leak, double-free, or use-after-free in the imported ctor body's owned local
+// (inlined into B's IR by inlineCtorBody, §14.1) fails the assertion the same
+// way runAotChecked's single-module oracle does. Returns exit code, or -1 on
+// any build/run failure (caller inspects `*sawSanitizerReport`/`*built ok`).
+struct CrossModuleAsanResult {
+    bool builtOk = false;
+    bool ran = false;
+    bool sanitizerFired = false;
+    int exitCode = -1;
+    std::string sanitizerText;
+};
+
+CrossModuleAsanResult runCrossModuleChecked(const std::string& aSource,
+                                            const std::string& bSource) {
+    namespace aot_detail = bezel::test::aot_detail;
+    CrossModuleAsanResult result;
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2290_asan_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+    TempFile sanOut((dir / (stem + ".san.txt")).string());
+    TempFile stdOut((dir / (stem + ".out.txt")).string());
+
+    writeSource(aSrc.path, aSource);
+    writeSource(bSrc.path, bSource);
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    if (!ra.success) return result;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+
+    codegen::CodegenOptions opts;
+    opts.sanitizeAddress = true;
+    bezel::CompileResult rb =
+        driver.compileFile(bSrc.path, bExe.path, deps, opts);
+    if (!rb.success) return result;
+    result.builtOk = true;
+
+    bool timedOut = false;
+    int status = aot_detail::spawnCaptured(
+        {bExe.path}, stdOut.path, sanOut.path, aot_detail::aotTimeoutSec(),
+        timedOut, {{"ASAN_OPTIONS", "detect_leaks=1:exitcode=99:abort_on_error=0"}});
+    if (timedOut) return result;
+
+    std::string sanText = aot_detail::slurp(sanOut.path);
+    bool crashed = WIFSIGNALED(status);
+    result.exitCode = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    result.ran = WIFEXITED(status);
+    result.sanitizerFired = crashed || aot_detail::hasSanitizerReport(sanText);
+    result.sanitizerText = std::move(sanText);
+    return result;
 }
 
 }  // namespace
@@ -3171,6 +3288,219 @@ BEZEL_TEST(cross_module_import,
 }
 
 // ---------------------------------------------------------------------------
+// §14 / #662c / #2290 (bug 1): imported generic-class ctor body — a LOCAL
+// VARIABLE declared inside the reconstructed ctor body
+// ---------------------------------------------------------------------------
+// Root cause (issue #2290 bug 1): parseAndAttachCtorBody's fresh-context->
+// mainCtx remap loop (ModuleLoader.cpp) handled only FieldSymbol, ParameterSymbol
+// and MethodSymbol — a `var`/`using var` LOCAL declared inside the ctor body has
+// no imported counterpart to translate to, so its exprSymbol entries were never
+// registered in mainCtx, and the fresh SemaContext that owned the LocalSymbol was
+// destroyed on return (only the AST/source were kept alive). codegen's
+// `ctx_.exprSymbol()` lookup on a later reference then found nothing, silently
+// reading the type's default value instead of the local's actual value — a
+// return of `0` where the spec-correct answer is nonzero, with NO diagnostic.
+// Fix (ModuleLoader.cpp parseAndAttachCtorBody): register each fresh LocalSymbol
+// under mainCtx BY IDENTITY (mirroring #783's parseAndAttachMethodBody), and keep
+// the fresh SemaContext + DiagnosticEngine alive via mainCtx.ownImportedAuxiliary
+// (shared_ptr, engine-then-context per #783's precedent) so the registered
+// pointers stay valid through codegen; also copies resolvedTypes/exprTypes for
+// the same reason. Cross-TYPE references (issue #2290 bug 2 / #710's own ask —
+// a call/`new` naming a SIBLING type) are NOT addressed by this fix; see #710.
+// ---------------------------------------------------------------------------
+
+// (31) §14/#2290 bug 1: a plain (non-owned) local inside the ctor body must be
+// read correctly, not silently default to 0. Exact repro from #2290 bug 1.
+BEZEL_TEST(cross_module_import,
+           imported_generic_ctor_body_local_var_read_native_spec_14_2290) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2290_localvar_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Gen2290Lib; "
+        "public class Wrapper<T> "
+        "  public val: T; "
+        "  public len: int := 0; "
+        "  public constructor(v: T) "
+        "    var x := 5; "
+        "    len := x; "
+        "    val := v; "
+        "  end constructor; "
+        "end Wrapper;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import Gen2290Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var w := new Wrapper<int>(7); "
+        "    return w.len; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    // Before the fix: silently reads 0 (the local's read is dropped). After: 5.
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 5);
+}
+
+// (32) §14/#2290 bug 1 / §28.9 / #710: an OWNED local of a non-trivial-dispose
+// STDLIB type (`OwningBuffer<int>`, stdlib §4.14 — "both [class- and value-typed
+// T] are non-trivial-dispose... the user must discharge the buffer") declared
+// inside the ctor body — this is #710's own "owned local in the ctor body" ask,
+// for the subset that does NOT need a sibling-type stub (OwningBuffer is always
+// in scope; no #428-sized declaration-rewriting foundation required). Verifies
+// BOTH the value read through the local AND — the actual point of an "owned"
+// local — that its disposal fires under ASan/LSan with no leak, double-free, or
+// use-after-free, in the IMPORTING module's program.
+BEZEL_TEST(cross_module_import,
+           imported_generic_ctor_body_owned_local_disposed_once_spec_14_28_9_2290) {
+    std::string aSource =
+        "module Gen2290BufLib; "
+        "public class Wrapper<T> "
+        "  public val: T; "
+        "  public len: int := 0; "
+        "  public constructor(v: T) "
+        "    using var buf := new OwningBuffer<int>(4); "
+        "    buf[0] := 42; "
+        "    len := buf[0]; "
+        "    val := v; "
+        "  end constructor; "
+        "end Wrapper;";
+    std::string bSource =
+        "module App; "
+        "import Gen2290BufLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var w := new Wrapper<int>(1); "
+        "    return w.len; "
+        "  end Main; "
+        "end Program;";
+
+    CrossModuleAsanResult r = runCrossModuleChecked(aSource, bSource);
+    BEZEL_EXPECT_TRUE(r.builtOk);
+    if (!r.builtOk) return;
+    BEZEL_EXPECT_TRUE(!r.sanitizerFired);
+    if (r.sanitizerFired) return;  // report already captured in r.sanitizerText
+    BEZEL_EXPECT_TRUE(r.ran);
+    // Before the fix: buf[0]'s read is dropped, len reads 0. After: 42, and the
+    // OwningBuffer's allocation is disposed exactly once (no LSan leak report,
+    // no ASan double-free/UAF report) at the `using var` scope end.
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// (33) Adversarial self-pass (b): TWO instantiations of the same imported
+// generic class, each with its OWN owned local in its ctor body, both disposed
+// correctly — the per-instantiation inline emission (#14.1) must not share or
+// double-dispose the local's storage across instantiations.
+BEZEL_TEST(cross_module_import,
+           imported_generic_ctor_body_owned_local_two_instantiations_spec_14_2290) {
+    std::string aSource =
+        "module Gen2290Buf2Lib; "
+        "public class Wrapper<T> "
+        "  public val: T; "
+        "  public len: int := 0; "
+        "  public constructor(v: T) "
+        "    using var buf := new OwningBuffer<int>(4); "
+        "    buf[0] := 42; "
+        "    len := buf[0]; "
+        "    val := v; "
+        "  end constructor; "
+        "end Wrapper;";
+    std::string bSource =
+        "module App; "
+        "import Gen2290Buf2Lib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    using var w1 := new Wrapper<int>(1); "
+        "    using var w2 := new Wrapper<string>(\"hi\"); "
+        "    return w1.len + w2.len; "
+        "  end Main; "
+        "end Program;";
+
+    CrossModuleAsanResult r = runCrossModuleChecked(aSource, bSource);
+    BEZEL_EXPECT_TRUE(r.builtOk);
+    if (!r.builtOk) return;
+    BEZEL_EXPECT_TRUE(!r.sanitizerFired);
+    if (r.sanitizerFired) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 84);  // 42 + 42, both instantiations disposed once
+}
+
+// (34) Adversarial self-pass (a): the IMPORTING module declares its OWN local
+// variable with the SAME NAME ("buf") as the ctor body's reconstructed local.
+// Since the fix remaps by fresh-Symbol-pointer IDENTITY (not by name lookup
+// against mainCtx), the two `buf`s must not collide or alias.
+BEZEL_TEST(cross_module_import,
+           imported_generic_ctor_body_local_name_collision_spec_14_2290) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2290_collide_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Gen2290ColLib; "
+        "public class Wrapper<T> "
+        "  public val: T; "
+        "  public len: int := 0; "
+        "  public constructor(v: T) "
+        "    var buf := 5; "
+        "    len := buf; "
+        "    val := v; "
+        "  end constructor; "
+        "end Wrapper;");
+    writeSource(bSrc.path,
+        "module App; "
+        "import Gen2290ColLib; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var buf := 999; "
+        "    using var w := new Wrapper<int>(1); "
+        "    return w.len + buf; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    // Wrapper<int>(1).len == 5 (own body's `buf`) + the caller's own `buf` == 999
+    // → 1004, masked to WEXITSTATUS's 0..255 range: 1004 % 256 == 236.
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 1004 % 256);
+}
+
+// ---------------------------------------------------------------------------
 // §14 / #662c / #695: imported generic-class ctor/dtor body self-method calls
 // ---------------------------------------------------------------------------
 // Root cause: private methods were not exported in the generic-class metadata,
@@ -3775,6 +4105,140 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_TRUE(!r->hadErrors);
 }
 
+// (27) §2.5 / §14 (fix #711, half 1 — SYMBOL OWNERSHIP): the DEFINING module
+// owns `bz$<Type>$ctor`; the importer must only ever DECLARE it.
+//
+// A local primary-constructor class `D(v: int) : Box<int>(v)` deriving an
+// IMPORTED GENERIC class makes codegen declare the base ctor
+// (emitImplicitBase → declareImportedCtor) while lowering `new D(7)` inside
+// Main — i.e. during the METHOD-body loop, so the entry is already in
+// `ctorFns_` when the constructor-body loop runs. That loop (unlike the
+// disposer loop beside it) did not skip IMPORTED constructors, and an imported
+// GENERIC class's ConstructorSymbol carries a re-parsed `decl` (#662
+// Foundation C), so `emitConstructorBody` emitted a SECOND definition of the
+// exporter's template symbol.
+//
+// WITHOUT the fix this test fails at the LINK step (`rb.success == false`):
+//   /usr/bin/ld: a.o: in function `bz$Box$ctor':
+//   multiple definition of `bz$Box$ctor'; b.o: first defined here
+// WITH the fix the importer emits only the external declaration, the call
+// binds to the exporter's definition, and the program returns `item` = 7.
+// This shape is NOT covered by the §14/#711 sema gate above (that gate fires
+// on `new ImportedGeneric<...>`; here the constructed type `D` is local).
+BEZEL_TEST(cross_module_import,
+           imported_generic_ctor_not_redefined_importer_side_spec_2_5_711) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bz711dup_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Bz711CtorLib; "
+        "public class Box<T> "
+        "  public item: T; "
+        "  public constructor(v: T) item := v; end constructor; "
+        "end Box;");
+    writeSource(bSrc.path,
+        "module App711A; import Bz711CtorLib; "
+        "public class D(v: int) : Box<int>(v) end D; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var d := new D(7); "
+        "    return d.item; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    // Before the fix this is where it broke: the linker rejected the duplicate
+    // `bz$Box$ctor` definition.
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 7);  // the imported base ctor stored 7 into `item`
+}
+
+// (28) §12 / §14.1 / §2.5 (fix #711, half 2 — INHERITED BASE FIELD LAYOUT):
+// a LOCAL generic class `D<T>` deriving an IMPORTED generic base `Box<T>` must
+// read/write the inherited `item: T` through the SPECIALIZED base layout.
+//
+// computeAncestorGenericSubst (the §585 base-chain walk that binds an
+// ancestor's generic params to the derived instantiation's concrete arguments)
+// read the parameter NAMES exclusively from `ast::TypeDecl`. An IMPORTED type
+// has no AST declaration — its parameter names live on the TypeSymbol
+// (ModuleLoader::convertGenericParams) — so the walk bailed on the first
+// `dynamic_cast` and left no substitution. `classStruct(Box)` then produced the
+// T→i32 TEMPLATE layout, and the inherited `item` was stored/read as an i32.
+//
+// WITHOUT the fix this test fails at COMPILE (`rb.success == false`) with an
+// IR-verifier report — the `ptr`-typed string field is GEP'd as i32:
+//   GEP base pointer is not a vector or a vector of pointers
+//     %13 = getelementptr inbounds nuw %bz.string, i32 %12, 0, 1
+// WITH the fix the ancestor substitution resolves T→string, the base subobject
+// is laid out with a `ptr` slot, and Main returns "hello".Length + 7 = 12.
+// This shape is NOT covered by the §14/#711 sema gate (the constructed type
+// `D<string>` is local, not imported).
+BEZEL_TEST(cross_module_import,
+           local_generic_derives_imported_generic_base_field_spec_12_14_711) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bz711anc_" + std::to_string(std::rand());
+    TempFile aSrc((dir / (stem + "_a.bzl")).string());
+    TempFile aObj((dir / (stem + "_a.o")).string());
+    TempFile bSrc((dir / (stem + "_b.bzl")).string());
+    TempFile bExe((dir / (stem + "_b")).string());
+
+    writeSource(aSrc.path,
+        "module Bz711BaseLib; "
+        "public class Box<T> "
+        "  public item: T; "
+        "end Box;");
+    writeSource(bSrc.path,
+        "module App711B; import Bz711BaseLib; "
+        "public class D<T> : Box<T> "
+        "  public tag: int := 0; "
+        "  public constructor(v: T, t: int) item := v; tag := t; end constructor; "
+        "end D; "
+        "class Program "
+        "  public static method Main(): int "
+        "    using var d := new D<string>(\"hello\", 7); "
+        "    return d.item.Length + d.tag; "
+        "  end Main; "
+        "end Program;");
+
+    bezel::Driver driver;
+    bezel::CompileResult ra = driver.compileObject(aSrc.path, aObj.path);
+    BEZEL_EXPECT_TRUE(ra.success);
+    if (!ra.success) return;
+
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj.path;
+    d.objectPath = aObj.path;
+    deps.push_back(d);
+    // Before the fix this is where it broke: IR verification rejected the
+    // i32-typed GEP into the inherited string field.
+    bezel::CompileResult rb = driver.compileFile(bSrc.path, bExe.path, deps);
+    BEZEL_EXPECT_TRUE(rb.success);
+    if (!rb.success) return;
+
+    int status = std::system(bExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 12);  // "hello".Length (5) + tag (7)
+}
+
 // §22.3 / issue #1221: a `ref` or `out` parameter of an IMPORTED method must be
 // passed by ADDRESS at the call site (not by loaded value). Before the fix the
 // else-branch (for ms->decl not an ast::MethodDecl) called lowerExpr for every
@@ -4079,5 +4543,774 @@ BEZEL_TEST(cross_module_import,
     BEZEL_EXPECT_EQ(code, 0);
 }
 
+
+// ---------------------------------------------------------------------------
+// #1513 / §2.8.3 rule 4 / §2.8.4 rule 5: a generic type's static state must be
+// exactly ONE copy process-wide, even when TWO SEPARATE importing modules each
+// independently monomorphize the SAME instantiation in their OWN compilation
+// (§2.8.2 definition-site visibility: an imported generic's body is carried in
+// the interface and re-monomorphized per consumer). Before the fix, the per-
+// instantiation static-field global (LlvmBackend_Setup.cpp's staticFieldGlobal
+// generic-instantiation branch) was InternalLinkage — "each importing module
+// owns its own instance" — so two importers of the SAME instantiation held
+// two DISTINCT, never-synchronized storage cells: a write through one
+// importer was invisible to a read through the other.
+//
+// This test isolates the STATE-SHARING half of the bug from the (separately
+// tracked, harder) VALUE-INITIALIZATION half: `Reg<T>.Value` is written
+// directly by GW1 (a plain assignment, fully resolved within GW1's own
+// compilation — no imported AST/initializer-text round-trip needed) and read
+// back by GW2. Before the fix this returns 0 (GW2's own private, never-
+// written copy); after the fix it returns 42 (the SAME shared cell GW1 wrote).
+// ---------------------------------------------------------------------------
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_state_shared_across_two_importers_spec_1513) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_1513_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile w1Src((dir / (stem + "_w1.bzl")).string());
+    TempFile w1Obj((dir / (stem + "_w1.o")).string());
+    TempFile w2Src((dir / (stem + "_w2.bzl")).string());
+    TempFile w2Obj((dir / (stem + "_w2.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+
+    // Module Base1513: Reg<T> with a mutable static int (T-independent — the
+    // field's type doesn't mention T at all, isolating this test from the
+    // #709/#1513 T-independent-initializer scope limit).
+    writeSource(baseSrc.path,
+        "module Base1513; "
+        "public class Reg<T> "
+        "  public static Value: int := 0; "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    // Module W1_1513: writes Reg<int>.Value.
+    writeSource(w1Src.path,
+        "module W1_1513; "
+        "import Base1513; "
+        "public class W1 "
+        "  public static method Set(v: int) "
+        "    Reg<int>.Value := v; "
+        "  end Set; "
+        "end W1;");
+    std::vector<bezel::Dependency> depsBase;
+    {
+        bezel::Dependency d;
+        d.metadataPath = baseObj.path;
+        d.objectPath   = baseObj.path;
+        depsBase.push_back(d);
+    }
+    bezel::CompileResult rW1 =
+        driver.compileObject(w1Src.path, w1Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW1.success);
+    if (!rW1.success) return;
+
+    // Module W2_1513: reads Reg<int>.Value — a SEPARATE compilation from W1,
+    // each independently monomorphizing Reg<int>.
+    writeSource(w2Src.path,
+        "module W2_1513; "
+        "import Base1513; "
+        "public class W2 "
+        "  public static method Get(): int "
+        "    return Reg<int>.Value; "
+        "  end Get; "
+        "end W2;");
+    bezel::CompileResult rW2 =
+        driver.compileObject(w2Src.path, w2Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW2.success);
+    if (!rW2.success) return;
+
+    // App: imports W1 + W2 (+ transitively Base1513), sets via W1, reads via
+    // W2. §2.8.3 rule 4: ONE Reg<int> instantiation program-wide → W2 must
+    // observe W1's write.
+    writeSource(appSrc.path,
+        "module App1513; "
+        "import W1_1513; "
+        "import W2_1513; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    W1.Set(42); "
+        "    return W2.Get(); "
+        "  end Main; "
+        "end Program;");
+    std::vector<bezel::Dependency> depsApp;
+    {
+        bezel::Dependency dBase, dW1, dW2;
+        dBase.metadataPath = baseObj.path; dBase.objectPath = baseObj.path;
+        dW1.metadataPath   = w1Obj.path;   dW1.objectPath   = w1Obj.path;
+        dW2.metadataPath   = w2Obj.path;   dW2.objectPath   = w2Obj.path;
+        depsApp.push_back(dBase);
+        depsApp.push_back(dW1);
+        depsApp.push_back(dW2);
+    }
+    bezel::CompileResult rApp =
+        driver.compileFile(appSrc.path, appExe.path, depsApp);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+
+    int status = std::system(appExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    // §2.8.3 rule 4 / §2.8.4 rule 5: 42 — W2 observes the SAME storage W1
+    // wrote. Pre-fix: 0 (W2's own private, never-written InternalLinkage copy).
+    BEZEL_EXPECT_EQ(code, 42);
+}
+
+// #1513 same-module CONTROL: Reg<T>, W1, W2, and Program all declared in ONE
+// compilation. The generic-instantiation redirect (staticFieldGlobal) and the
+// new per-instantiation ensureinit/sfinit machinery (LlvmBackend_Setup.cpp,
+// genericInstEnsureInitFn/genericInstSfinitFn) engage here too — this pins
+// that the #1513 fix does not regress the baseline same-module case (which
+// worked before the fix via the OLD per-instantiation-global creation path).
+BEZEL_TEST(cross_module_import,
+           generic_static_state_shared_same_module_control_spec_1513) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_1513_ctrl_" + std::to_string(std::rand());
+    TempFile src((dir / (stem + ".bzl")).string());
+    TempFile exe((dir / stem).string());
+
+    writeSource(src.path,
+        "module Ctrl1513; "
+        "public class Reg<T> "
+        "  public static Value: int := 0; "
+        "end Reg; "
+        "public class W1 "
+        "  public static method Set(v: int) "
+        "    Reg<int>.Value := v; "
+        "  end Set; "
+        "end W1; "
+        "public class W2 "
+        "  public static method Get(): int "
+        "    return Reg<int>.Value; "
+        "  end Get; "
+        "end W2; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    W1.Set(42); "
+        "    return W2.Get(); "
+        "  end Main; "
+        "end Program;");
+    bezel::Driver driver;
+    bezel::CompileResult r = driver.compileFile(src.path, exe.path);
+    BEZEL_EXPECT_TRUE(r.success);
+    if (!r.success) return;
+
+    int status = std::system(exe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 42);
+}
+
+// #1513 self-pass (b): a generic instantiation's static state must be
+// initialized EXACTLY ONCE process-wide even when TWO SEPARATE importers each
+// independently build (and, post-fix, LinkOnceODR-merge into one) the guard/
+// sfinit/ensureinit machinery for the SAME instantiation. If the shared STATE
+// global were merged but each importer's GUARD flag were NOT — the "one state
+// copy, two init flags" failure mode named in the fix's own review — a second
+// importer's independent (uninitialized, flag=0) guard could re-run its own
+// copy of sfinit against the ALREADY-initialized shared state, clobbering a
+// value another domain/read may already be relying on. Exercise via TWO
+// distinct instantiations (Reg<int>, Reg<string>) each touched by a DIFFERENT
+// importer, both summed by App — a double-init of either would still net the
+// same additive result here only if the increments are idempotent, so this
+// specifically checks the addresses/values are internally consistent across
+// three artifacts (Base + 2 importers), not just two.
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_two_instantiations_two_importers_spec_1513) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_1513_multi_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile w1Src((dir / (stem + "_w1.bzl")).string());
+    TempFile w1Obj((dir / (stem + "_w1.o")).string());
+    TempFile w2Src((dir / (stem + "_w2.bzl")).string());
+    TempFile w2Obj((dir / (stem + "_w2.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+
+    writeSource(baseSrc.path,
+        "module Base1513M; "
+        "public class Reg<T> "
+        "  public static Value: int := 0; "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    // W1 touches BOTH Reg<int> (sets 10) and Reg<string> (sets 100).
+    writeSource(w1Src.path,
+        "module W1_1513M; "
+        "import Base1513M; "
+        "public class W1 "
+        "  public static method SetInt() "
+        "    Reg<int>.Value := 10; "
+        "  end SetInt; "
+        "  public static method SetString() "
+        "    Reg<string>.Value := 100; "
+        "  end SetString; "
+        "end W1;");
+    std::vector<bezel::Dependency> depsBase;
+    {
+        bezel::Dependency d;
+        d.metadataPath = baseObj.path;
+        d.objectPath   = baseObj.path;
+        depsBase.push_back(d);
+    }
+    bezel::CompileResult rW1 =
+        driver.compileObject(w1Src.path, w1Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW1.success);
+    if (!rW1.success) return;
+
+    // W2 reads BOTH — a SEPARATE compilation, independently monomorphizing
+    // both Reg<int> and Reg<string>.
+    writeSource(w2Src.path,
+        "module W2_1513M; "
+        "import Base1513M; "
+        "public class W2 "
+        "  public static method GetInt(): int "
+        "    return Reg<int>.Value; "
+        "  end GetInt; "
+        "  public static method GetString(): int "
+        "    return Reg<string>.Value; "
+        "  end GetString; "
+        "end W2;");
+    bezel::CompileResult rW2 =
+        driver.compileObject(w2Src.path, w2Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW2.success);
+    if (!rW2.success) return;
+
+    writeSource(appSrc.path,
+        "module App1513M; "
+        "import W1_1513M; "
+        "import W2_1513M; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    W1.SetInt(); "
+        "    W1.SetString(); "
+        "    return W2.GetInt() + W2.GetString(); "
+        "  end Main; "
+        "end Program;");
+    std::vector<bezel::Dependency> depsApp;
+    {
+        bezel::Dependency dBase, dW1, dW2;
+        dBase.metadataPath = baseObj.path; dBase.objectPath = baseObj.path;
+        dW1.metadataPath   = w1Obj.path;   dW1.objectPath   = w1Obj.path;
+        dW2.metadataPath   = w2Obj.path;   dW2.objectPath   = w2Obj.path;
+        depsApp.push_back(dBase);
+        depsApp.push_back(dW1);
+        depsApp.push_back(dW2);
+    }
+    bezel::CompileResult rApp =
+        driver.compileFile(appSrc.path, appExe.path, depsApp);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+
+    int status = std::system(appExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    // §22.12 "each distinct instantiation has its own static state": Reg<int>
+    // and Reg<string> are DISTINCT instantiations (10 and 100, independent) —
+    // 110 total. A collision between the two instantiations' per-instantiation
+    // globals (a mangle/key bug) would produce 100+100=200 or 10+10=20 instead.
+    BEZEL_EXPECT_EQ(code, 110);
+}
+
+// ---------------------------------------------------------------------------
+// #2351 / §2.8.2 clause 2 / §22.12 rule 1 / §22.13: an imported generic
+// type's STATIC FIELD INITIALIZER must actually run on the importing side,
+// not just share storage (#1513's own fix). #1513's OWN repro shape — a
+// `static readonly` field with a NON-TRIVIAL initializer (`new
+// AtomicInteger<int>(0)`), touched through two SEPARATE consumer artifacts —
+// returned 0/0 before this fix (FieldSymbol::decl stayed null for the
+// imported field, so genericInstSfinitFn's `dynamic_cast<const
+// ast::FieldDecl*>(fs2->decl)` was always null and the store was skipped).
+// This test is the "spec-cited regression test" for #2351: two SEPARATE
+// importers each call Increment() once — 1 then 2, matching the same-module
+// baseline (generic_static_state_shared_same_module_control_spec_1513-style)
+// rather than the pre-fix 0/0.
+// ---------------------------------------------------------------------------
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_field_initializer_runs_once_across_two_importers_spec_1513_2351) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2351_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile w1Src((dir / (stem + "_w1.bzl")).string());
+    TempFile w1Obj((dir / (stem + "_w1.o")).string());
+    TempFile w2Src((dir / (stem + "_w2.bzl")).string());
+    TempFile w2Obj((dir / (stem + "_w2.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+
+    // Module Base2351: Reg<T> with a NON-TRIVIAL static initializer —
+    // `new AtomicInteger<int>(0)` — T-independent (AtomicInteger's own type
+    // argument is the fixed `int`, not T; the T-dependent case is the
+    // separately-tracked #803 scope note genericInstSfinitFn's own comments
+    // name, not this issue's job) and a compiler-intrinsic type (stdlib
+    // §6.4), so it needs no `import` in the synthetic reconstruction.
+    writeSource(baseSrc.path,
+        "module Base2351; "
+        "public class Reg<T> "
+        "  public static readonly Hits: AtomicInteger<int> := "
+        "new AtomicInteger<int>(0); "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    // W1_2351: touches Reg<int>.Hits once.
+    writeSource(w1Src.path,
+        "module W1_2351; "
+        "import Base2351; "
+        "public class W1 "
+        "  public static method Bump(): int "
+        "    return Reg<int>.Hits.Increment(); "
+        "  end Bump; "
+        "end W1;");
+    std::vector<bezel::Dependency> depsBase;
+    {
+        bezel::Dependency d;
+        d.metadataPath = baseObj.path;
+        d.objectPath   = baseObj.path;
+        depsBase.push_back(d);
+    }
+    bezel::CompileResult rW1 =
+        driver.compileObject(w1Src.path, w1Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW1.success);
+    if (!rW1.success) return;
+
+    // W2_2351: touches Reg<int>.Hits once — a SEPARATE compilation from W1,
+    // each independently monomorphizing Reg<int> and independently
+    // reconstructing the field's initializer text (this fix's mechanism).
+    writeSource(w2Src.path,
+        "module W2_2351; "
+        "import Base2351; "
+        "public class W2 "
+        "  public static method Bump(): int "
+        "    return Reg<int>.Hits.Increment(); "
+        "  end Bump; "
+        "end W2;");
+    bezel::CompileResult rW2 =
+        driver.compileObject(w2Src.path, w2Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW2.success);
+    if (!rW2.success) return;
+
+    // App: imports W1 + W2 (+ transitively Base2351), bumps via W1 then W2.
+    writeSource(appSrc.path,
+        "module App2351; "
+        "import W1_2351; "
+        "import W2_2351; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var a := W1.Bump(); "
+        "    var b := W2.Bump(); "
+        "    return a * 10 + b; "
+        "  end Main; "
+        "end Program;");
+    std::vector<bezel::Dependency> depsApp;
+    {
+        bezel::Dependency dBase, dW1, dW2;
+        dBase.metadataPath = baseObj.path; dBase.objectPath = baseObj.path;
+        dW1.metadataPath   = w1Obj.path;   dW1.objectPath   = w1Obj.path;
+        dW2.metadataPath   = w2Obj.path;   dW2.objectPath   = w2Obj.path;
+        depsApp.push_back(dBase);
+        depsApp.push_back(dW1);
+        depsApp.push_back(dW2);
+    }
+    bezel::CompileResult rApp =
+        driver.compileFile(appSrc.path, appExe.path, depsApp);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+
+    int status = std::system(appExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    // 1 then 2 (a=1, b=2 -> 12): the SAME shared AtomicInteger cell
+    // (#1513's LinkOnceODR fix), genuinely INITIALIZED (this fix) exactly
+    // once before either Increment() call. Pre-fix: 0/0 (Hits stayed at its
+    // zero-init default — a null AtomicInteger<int> reference — since the
+    // initializer never ran on the importing side); a double-init bug would
+    // instead produce 1 then 1 (a fresh AtomicInteger(0) re-constructed and
+    // re-stored between the two touches, resetting the count).
+    BEZEL_EXPECT_EQ(code, 12);
+}
+
+// #2351 self-pass (a) / §2.8.2 "no restrictions beyond visibility... must
+// reject the export, or the import, with a diagnostic naming the shape; it
+// must not alter the instantiation's semantics": a static field initializer
+// that references a name NOT visible inside the importer's synthetic
+// reconstruction (an INTERNAL sibling type's method, carried nowhere near
+// Reg<T>'s own metadata — a different failure surface than #710/#2290 bug 2's
+// ctor-body sibling-type gap, but the same root limitation: the synthetic
+// class declares only the type being reconstructed) must fail CLEANLY with a
+// diagnostic naming the field, not silently leave `Hits` at its zero-init
+// default (the pre-#2351 behavior for EVERY shape, correct or not).
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_field_init_unresolvable_reference_rejected_spec_2351) {
+    ModuleMetadata dep = buildMetaFor(
+        "module Base2351NV; "
+        "internal class Helper2351NV "
+        "  internal static method Seed(): int "
+        "    return 7; "
+        "  end Seed; "
+        "end Helper2351NV; "
+        "public class Reg<T> "
+        "  public static readonly Hits: AtomicInteger<int> := "
+        "new AtomicInteger<int>(Helper2351NV.Seed()); "
+        "end Reg;");
+    auto r = runImporter(
+        dep,
+        "module W1_2351NV; "
+        "import Base2351NV; "
+        "public class W1 "
+        "  public static method Bump(): int "
+        "    return Reg<int>.Hits.Increment(); "
+        "  end Bump; "
+        "end W1;");
+    BEZEL_EXPECT_TRUE(r->hadErrors);
+    bool foundDiag = false;
+    for (const Diagnostic& d : r->diags.diagnostics()) {
+        if (d.message.find("cannot import static field") != std::string::npos &&
+            d.message.find("Hits") != std::string::npos) {
+            foundDiag = true;
+            break;
+        }
+    }
+    BEZEL_EXPECT_TRUE(foundDiag);
+}
+
+// #2375 / §2.8.2 (follow-up to #2351): a static field initializer of an
+// imported generic class that references a PUBLIC SIBLING TYPE — another
+// type declared in the same exporting module — must RECONSTRUCT (and run)
+// on the importing side, not be rejected. Before #2375,
+// buildSyntheticFieldInitSource declared only the type being reconstructed,
+// so the sibling-type reference failed resolveTypes and the import was
+// rejected with "a referenced type did not resolve inside the module
+// boundary" even for the simplest `new Box(42)` shape (the field's own
+// type being the sibling). #2375 makes parseAndAttachFieldInit register
+// the exporting module's already-imported PUBLIC sibling TypeSymbols into
+// the fresh reconstruction context (and emit `import <moduleName>;` in the
+// synthetic source), so the reference resolves to the REAL imported symbol
+// and the initializer runs.
+//
+// This test is the spec-cited regression test for #2375: a two-module
+// setup (Base2375 declares `public class Box` + `public class Reg<T>` with
+// `public static readonly Res: Box := new Box(42);`; App2375 imports Base
+// and reads `Reg<int>.Res.Tag`). Pre-fix: rejected ("cannot import static
+// field 'Reg.Res'..."). Post-fix: compiles + runs + returns 42 (the
+// sibling-type initializer `new Box(42)` ran on the importing side and
+// stored a Box whose Tag is 42).
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_field_init_sibling_type_reconstructs_spec_2375_2_8_2) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2375_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+
+    // Module Base2375: a PUBLIC sibling class `Box` (the type referenced by
+    // the static field) + a generic `Reg<T>` whose static readonly field's
+    // TYPE and INITIALIZER both reference that sibling. T-independent
+    // (the #803 T-dependent scope is separately tracked) and the sibling
+    // is a plain user-defined class — exactly the shape #2351's tests
+    // deliberately avoided (they used compiler-intrinsic AtomicInteger<int>
+    // which needs no import in the synthetic reconstruction).
+    writeSource(baseSrc.path,
+        "module Base2375; "
+        "public class Box "
+        "  public Tag: int; "
+        "  public constructor(tag: int) "
+        "    Tag := tag; "
+        "  end constructor; "
+        "end Box; "
+        "public class Reg<T> "
+        "  public static readonly Res: Box := new Box(42); "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    // App2375: imports Base2375 and reads the sibling-typed static field.
+    writeSource(appSrc.path,
+        "module App2375; "
+        "import Base2375; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var b := Reg<int>.Res; "
+        "    return b.Tag; "
+        "  end Main; "
+        "end Program;");
+    std::vector<bezel::Dependency> depsApp;
+    {
+        bezel::Dependency d;
+        d.metadataPath = baseObj.path;
+        d.objectPath   = baseObj.path;
+        depsApp.push_back(d);
+    }
+    bezel::CompileResult rApp =
+        driver.compileFile(appSrc.path, appExe.path, depsApp);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+
+    int status = std::system(appExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    // 42: the sibling-type initializer `new Box(42)` ran on the importing
+    // side (the field's declared type `Box` AND the constructor argument
+    // both crossed the module boundary via the now-resolved sibling).
+    // Pre-fix: the import was rejected outright (BEZEL_EXPECT_TRUE(rApp.success)
+    // above would fail with "cannot import static field 'Reg.Res'...").
+    BEZEL_EXPECT_EQ(code, 42);
+}
+
+// #2375 (sibling-MEMBER reference): the second half of the fix — once the
+// sibling TYPE resolves, an initializer sub-expression that reads a STATIC
+// MEMBER of that sibling (`new Box(Box.DefaultSize)`) must resolve the
+// member reference to the REAL imported FieldSymbol and read its value,
+// not silently read zero. The expr-symbol remap loop in
+// parseAndAttachFieldInit previously copied ONLY self-fields/self-methods
+// into mainCtx; a sibling-member reference resolved in the fresh context to
+// the real imported symbol but was never copied to mainCtx, so codegen had
+// no symbol for the read and the arg evaluated to zero (silent miscompile:
+// Box.DefaultSize, declared `:= 77`, read as 0 → Box.Tag came out 0). The
+// fix copies such non-self symbols as-is (the fresh symbol already IS the
+// imported one). This test pins that: `Reg<int>.Seed.Tag` must be 77, the
+// sibling's own static readonly value, same as the same-module baseline.
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_field_init_sibling_member_ref_resolves_spec_2375_2_8_2) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2375m_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+
+    // Module Base2375M: sibling `Box` carries its OWN public static
+    // readonly `DefaultSize := 77`, and `Reg<T>.Seed`'s initializer reads
+    // that sibling static as the constructor argument — a sibling-MEMBER
+    // reference, not just a sibling-TYPE reference.
+    writeSource(baseSrc.path,
+        "module Base2375M; "
+        "public class Box "
+        "  public static readonly DefaultSize: int := 77; "
+        "  public Tag: int; "
+        "  public constructor(tag: int) "
+        "    Tag := tag; "
+        "  end constructor; "
+        "end Box; "
+        "public class Reg<T> "
+        "  public static readonly Seed: Box := new Box(Box.DefaultSize); "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    writeSource(appSrc.path,
+        "module App2375M; "
+        "import Base2375M; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var b := Reg<int>.Seed; "
+        "    return b.Tag; "
+        "  end Main; "
+        "end Program;");
+    std::vector<bezel::Dependency> depsApp;
+    {
+        bezel::Dependency d;
+        d.metadataPath = baseObj.path;
+        d.objectPath   = baseObj.path;
+        depsApp.push_back(d);
+    }
+    bezel::CompileResult rApp =
+        driver.compileFile(appSrc.path, appExe.path, depsApp);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+
+    int status = std::system(appExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    // 77: the sibling static `Box.DefaultSize` was read correctly inside the
+    // reconstructed initializer (the expr-symbol copy fix), so the Box was
+    // constructed with Tag=77. Pre-fix this returned 0 (silent miscompile:
+    // the sibling-member reference had no symbol in mainCtx). With only the
+    // sibling-TYPE half of #2375 and not the expr-symbol copy, this same
+    // binary returns 0 — pinning the second half of the fix.
+    BEZEL_EXPECT_EQ(code, 77);
+}
+
+// #2525 / §2.8.2: an imported RECORD constructor in a generic static-field
+// initializer must be reconstructed with its body and lowered by value. Before
+// the fix, sema reconstructed `new Point(73, 2)` but buildRecordValue found an
+// imported ConstructorSymbol with no decl and returned null.
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_field_init_record_ctor_spec_2525_2_8_2) {
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2525_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+
+    writeSource(baseSrc.path,
+        "module Base2525; "
+        "public record Point "
+        "  public X: int; public Y: int; "
+        "  public constructor(a: int, b: int) "
+        "    X := a; Y := b; "
+        "  end constructor; "
+        "end Point; "
+        "public class Reg<T> "
+        "  public static readonly Origin: Point := new Point(73, 2); "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    writeSource(appSrc.path,
+        "module App2525; import Base2525; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var p := Reg<int>.Origin; return p.X; "
+        "  end Main; end Program;");
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency dep;
+    dep.metadataPath = baseObj.path;
+    dep.objectPath = baseObj.path;
+    deps.push_back(dep);
+    bezel::CompileResult rApp = driver.compileFile(appSrc.path, appExe.path, deps);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+    int status = std::system(appExe.path.c_str());
+    int code = (status != -1 && WIFEXITED(status)) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 73);
+}
+
+// #2351 self-pass (c) / §22.13 "Disposal of static owned fields": an `owned`
+// static field's exit disposal must run EXACTLY ONCE process-wide even when
+// TWO SEPARATE importers each independently reconstruct the field's
+// initializer and register it for exit disposal (genericInstSfinitFn's
+// `bz_register_static_owned` call, reachable for an imported generic field
+// only via this fix — it was dead code for that case before, since fd/
+// initExpr were always null). Mirrors #2290/#710's runCrossModuleChecked
+// ASan/LSan technique, extended to THREE artifacts (Base + two importers).
+// A double-dispose (once per importer) would abort under ASan
+// (heap-corruption / double-free); a never-registered dispose would report
+// an LSan leak. Neither fires -> exactly once.
+BEZEL_TEST(cross_module_import,
+           imported_generic_static_owned_field_disposed_once_across_two_importers_spec_2351_22_13) {
+    namespace aot_detail = bezel::test::aot_detail;
+    auto dir = std::filesystem::temp_directory_path();
+    std::string stem = "bezel_2351_owned_asan_" + std::to_string(std::rand());
+    TempFile baseSrc((dir / (stem + "_base.bzl")).string());
+    TempFile baseObj((dir / (stem + "_base.o")).string());
+    TempFile w1Src((dir / (stem + "_w1.bzl")).string());
+    TempFile w1Obj((dir / (stem + "_w1.o")).string());
+    TempFile w2Src((dir / (stem + "_w2.bzl")).string());
+    TempFile w2Obj((dir / (stem + "_w2.o")).string());
+    TempFile appSrc((dir / (stem + "_app.bzl")).string());
+    TempFile appExe((dir / (stem + "_app")).string());
+    TempFile sanOut((dir / (stem + ".san.txt")).string());
+    TempFile stdOut((dir / (stem + ".out.txt")).string());
+
+    writeSource(baseSrc.path,
+        "module Base2351Owned; "
+        "public class Reg<T> "
+        "  public static owned readonly Hits: AtomicInteger<int> := "
+        "new AtomicInteger<int>(0); "
+        "end Reg;");
+    bezel::Driver driver;
+    bezel::CompileResult rBase = driver.compileObject(baseSrc.path, baseObj.path);
+    BEZEL_EXPECT_TRUE(rBase.success);
+    if (!rBase.success) return;
+
+    writeSource(w1Src.path,
+        "module W1_2351Owned; "
+        "import Base2351Owned; "
+        "public class W1 "
+        "  public static method Bump(): int "
+        "    return Reg<int>.Hits.Increment(); "
+        "  end Bump; "
+        "end W1;");
+    std::vector<bezel::Dependency> depsBase;
+    {
+        bezel::Dependency d;
+        d.metadataPath = baseObj.path;
+        d.objectPath   = baseObj.path;
+        depsBase.push_back(d);
+    }
+    bezel::CompileResult rW1 =
+        driver.compileObject(w1Src.path, w1Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW1.success);
+    if (!rW1.success) return;
+
+    writeSource(w2Src.path,
+        "module W2_2351Owned; "
+        "import Base2351Owned; "
+        "public class W2 "
+        "  public static method Bump(): int "
+        "    return Reg<int>.Hits.Increment(); "
+        "  end Bump; "
+        "end W2;");
+    bezel::CompileResult rW2 =
+        driver.compileObject(w2Src.path, w2Obj.path, depsBase);
+    BEZEL_EXPECT_TRUE(rW2.success);
+    if (!rW2.success) return;
+
+    writeSource(appSrc.path,
+        "module App2351Owned; "
+        "import W1_2351Owned; "
+        "import W2_2351Owned; "
+        "public class Program "
+        "  public static method Main(): int "
+        "    var a := W1.Bump(); "
+        "    var b := W2.Bump(); "
+        "    return a * 10 + b; "
+        "  end Main; "
+        "end Program;");
+    std::vector<bezel::Dependency> depsApp;
+    {
+        bezel::Dependency dBase, dW1, dW2;
+        dBase.metadataPath = baseObj.path; dBase.objectPath = baseObj.path;
+        dW1.metadataPath   = w1Obj.path;   dW1.objectPath   = w1Obj.path;
+        dW2.metadataPath   = w2Obj.path;   dW2.objectPath   = w2Obj.path;
+        depsApp.push_back(dBase);
+        depsApp.push_back(dW1);
+        depsApp.push_back(dW2);
+    }
+    // §2.6's own "--sanitize=address applies to the executable build" rule —
+    // only the FINAL link is instrumented; the ASan RUNTIME's allocator
+    // interposition (malloc/free/calloc) still catches a leak or double-free
+    // from the dependency objects' pre-compiled code, exactly as
+    // runCrossModuleChecked (#2290/#710) relies on.
+    codegen::CodegenOptions opts;
+    opts.sanitizeAddress = true;
+    bezel::CompileResult rApp =
+        driver.compileFile(appSrc.path, appExe.path, depsApp, opts);
+    BEZEL_EXPECT_TRUE(rApp.success);
+    if (!rApp.success) return;
+
+    bool timedOut = false;
+    int status = aot_detail::spawnCaptured(
+        {appExe.path}, stdOut.path, sanOut.path, aot_detail::aotTimeoutSec(),
+        timedOut, {{"ASAN_OPTIONS", "detect_leaks=1:exitcode=99:abort_on_error=0"}});
+    BEZEL_EXPECT_TRUE(!timedOut);
+    if (timedOut) return;
+
+    std::string sanText = aot_detail::slurp(sanOut.path);
+    bool crashed = WIFSIGNALED(status);
+    bool sanitizerFired = crashed || aot_detail::hasSanitizerReport(sanText);
+    // CLAUDE.md trap (iii): LeakSanitizer forces exitcode=99 on a leak/error
+    // (set explicitly above) rather than letting Main's own return value
+    // through, so check the sanitizer verdict FIRST, independent of the
+    // masked exit code.
+    BEZEL_EXPECT_TRUE(!sanitizerFired);
+    int code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    BEZEL_EXPECT_EQ(code, 12);  // same 1-then-2 baseline as the plain test
+}
 
 }  // namespace bezel::module

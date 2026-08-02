@@ -678,6 +678,77 @@ llvm::Value* Emitter::emitRemoveElementEquality(llvm::Value* el,
 }
 
 
+// stdlib §4.10 / §8.3 (#837 / #1474; extracted for #1070): dedup-insert one
+// element into an ARRAY-BACKED `Set<T>` / `OwningSet<T>`.
+//
+// A class-or-interface element has no generic-dict backing (genericBackingType
+// declines every class), so `new Set<C>()` / `new OwningSet<C>()` allocate a
+// bz_array_t and every membership operation is a linear §8.3-equality scan.
+// This scans `setArr` for an element EQUAL to `item` per that contract (a user
+// `Equals` override is honoured, else reference identity — emitRemoveElement-
+// Equality); on a duplicate it calls `dupDisposer` (non-null only for the
+// OWNING family, whose §4.10 contract disposes the rejected element — the
+// caller relinquished ownership) and does NOT append; otherwise it appends via
+// bz_array_add. `item` is stored by value into the backing, so the array is the
+// sole remaining owner of an appended element.
+//
+// Shared by `OwningSet<T>.Add` / `.UnionWith` (the call path) and by the
+// §15.4 collection-literal materializer, so a literal-built set is bit-for-bit
+// what `new` + `.Add` builds. Returns false only on an internal
+// emitRemoveElementEquality failure (malformed comparison IR).
+bool Emitter::emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
+                                       const sema::TypeRef* elemRef,
+                                       llvm::Function* dupDisposer,
+                                       int64_t esz) {
+    if (!setArr || !item) return false;
+    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+    llvm::Value* arrLen = builder_.CreateCall(lenFn, {setArr}, "sa.len");
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "sa.c", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sa.b", currentFn_);
+    auto* nextBB = llvm::BasicBlock::Create(llvm_, "sa.n", currentFn_);
+    auto* dupBB  = llvm::BasicBlock::Create(llvm_, "sa.dup", currentFn_);
+    auto* newBB  = llvm::BasicBlock::Create(llvm_, "sa.new", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "sa.end", currentFn_);
+    auto* idxSlot = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+    builder_.CreateBr(condBB);
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* curIdx = builder_.CreateLoad(i64(), idxSlot, "sa.i");
+    builder_.CreateCondBr(
+        builder_.CreateICmpSLT(curIdx, arrLen), bodyBB, newBB);
+    builder_.SetInsertPoint(bodyBB);
+    auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                           {ptrTy(), i64(), i64()});
+    llvm::Value* ep = builder_.CreateCall(
+        ptrFn, {setArr, curIdx, builder_.getInt64(esz)}, "sa.ep");
+    llvm::Value* existing = builder_.CreateLoad(ptrTy(), ep, "sa.ex");
+    llvm::Value* same = emitRemoveElementEquality(
+        existing, item, elemRef, /*elemIsClass=*/true);
+    if (!same) return false;
+    builder_.CreateCondBr(same, dupBB, nextBB);
+    builder_.SetInsertPoint(nextBB);
+    builder_.CreateStore(
+        builder_.CreateAdd(curIdx, builder_.getInt64(1)), idxSlot);
+    builder_.CreateBr(condBB);
+    // duplicate: dispose the passed item (§4.10), do not append.
+    builder_.SetInsertPoint(dupBB);
+    if (dupDisposer) builder_.CreateCall(dupDisposer, {item});
+    builder_.CreateBr(endBB);
+    // new: append.
+    builder_.SetInsertPoint(newBB);
+    {
+        llvm::AllocaInst* slot = entryAlloca(item->getType());
+        builder_.CreateStore(item, slot);
+        auto* addFn = declareC("bz_array_add",
+            llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+        builder_.CreateCall(addFn, {setArr, slot, builder_.getInt64(esz)});
+    }
+    builder_.CreateBr(endBB);
+    builder_.SetInsertPoint(endBB);
+    return true;
+}
+
+
 llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -685,6 +756,24 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     const auto& m = ma->member;
 
     auto* recvTy = ctx_.exprType(*ma->target);
+    // stdlib §5 (#755, supersedes #1296): an `IGrouping<TKey, T>` receiver.
+    // `IGrouping : IEnumerable<T>` (stdlib §5:3076), so every §5 eager terminal
+    // (Sum/Min/Max/Average/Any/All/Aggregate/Count(pred)/First/Last/Single/
+    // ElementAt/*OrNull/Contains/IndexOf) resolves on it — but its runtime value
+    // is a bz_grouping_t*, which none of the receiver shapes below recognized, so
+    // the calls fell through to the generic dispatch and read the grouping as an
+    // EMPTY sequence (Sum → 0, Any → false, Min/Max → 0). #1296 patched a subset
+    // by hand in a separate slot; that duplicate reproduced none of the array
+    // path's spec-mandated faults (Single with no arity check, ElementAt with no
+    // bounds check — #2265) and never covered the selector/predicate forms.
+    //
+    // The grouping's members are a fully-materialized `bz_array_t*` the GROUPING
+    // owns (bz_grouping_elements). Restate the receiver as that `Array<T>` — type
+    // AND value — and the entire array-receiver lowering below applies verbatim,
+    // faults included. `lazyTempArr` deliberately stays null for this shape: the
+    // array is the grouping's, not a snapshot this call may free.
+    const sema::TypeRef* igroupingElemRef = iGroupingElemTypeRef(recvTy);
+    if (igroupingElemRef) recvTy = elementArrayTypeRef(igroupingElemRef);
     // fix #853 / stdlib §4.1–§4.3: a BORROWING list-interface receiver
     // (IReadOnlyList<T> / IList<T>) is implemented only by the array-backed
     // Array<T>, so its runtime value is the same bz_array_t* as the concrete
@@ -951,6 +1040,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     llvm::ConstantPointerNull::get(ptrTy()), addr);
             }
         }
+    } else if (igroupingElemRef) {
+        // stdlib §5 (#755): the receiver TYPE was restated as `Array<T>` above;
+        // restate the VALUE to match — the grouping's element array. This is a
+        // BORROW: the grouping owns the array and frees it in bz_grouping_free,
+        // so no lazyTempArr is registered and nothing here frees it.
+        llvm::Value* grp = lowerExpr(*ma->target);
+        if (!grp) return nullptr;
+        auto* elemsFn = declareC("bz_grouping_elements", ptrTy(), {ptrTy()});
+        recv = builder_.CreateCall(elemsFn, {grp}, "igrp.elems");
     } else {
         recv = lowerExpr(*ma->target);
     }
@@ -1018,6 +1116,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
     // own retain. Idempotent guards mean a non-materializer receiver is a no-op.
     auto freeFreshInputTemp = [&]() {
         if (lazyTempArr) return;  // the lazy-terminal path frees via freeLazyTemp
+        // stdlib §5 (#755): `recv` is an IGrouping's element array — the GROUPING
+        // owns it (bz_grouping_free), and `ma->target` is the grouping, not a
+        // fresh array materializer. Never reclaim it here.
+        if (igroupingElemRef) return;
         // #1004: a builtin fresh-array materializer receiver (ToArray/Sorted/
         // Reversed). #1006(b): generalized along the `owned` axis — an UNBOUND
         // `owned`-returning USER method call used as the chained receiver (e.g.
@@ -3558,55 +3660,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // reuse the exact same per-element semantics when draining `other`.
         // Returns false only on an internal emitRemoveElementEquality failure
         // (malformed comparison IR) — callers propagate that as `return nullptr`.
+        // fix #1070: the body moved to the shared member helper
+        // emitArrayBackedSetInsert so the §15.4 collection-literal materializer
+        // builds a class-element set with the IDENTICAL dedup/dispose semantics.
         auto emitSetDedupInsert = [&](llvm::Value* item) -> bool {
-            auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
-            llvm::Value* arrLen = builder_.CreateCall(lenFn, {recv}, "sa.len");
-            auto* condBB = llvm::BasicBlock::Create(llvm_, "sa.c", currentFn_);
-            auto* bodyBB = llvm::BasicBlock::Create(llvm_, "sa.b", currentFn_);
-            auto* nextBB = llvm::BasicBlock::Create(llvm_, "sa.n", currentFn_);
-            auto* dupBB  = llvm::BasicBlock::Create(llvm_, "sa.dup", currentFn_);
-            auto* newBB  = llvm::BasicBlock::Create(llvm_, "sa.new", currentFn_);
-            auto* endBB  = llvm::BasicBlock::Create(llvm_, "sa.end", currentFn_);
-            auto* idxSlot = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlot);
-            builder_.CreateBr(condBB);
-            builder_.SetInsertPoint(condBB);
-            llvm::Value* curIdx = builder_.CreateLoad(i64(), idxSlot, "sa.i");
-            builder_.CreateCondBr(
-                builder_.CreateICmpSLT(curIdx, arrLen), bodyBB, newBB);
-            builder_.SetInsertPoint(bodyBB);
-            auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
-                                   {ptrTy(), i64(), i64()});
-            llvm::Value* ep = builder_.CreateCall(
-                ptrFn, {recv, curIdx, builder_.getInt64(esz)}, "sa.ep");
-            llvm::Value* existing =
-                builder_.CreateLoad(ptrTy(), ep, "sa.ex");
-            llvm::Value* same = emitRemoveElementEquality(
-                existing, item, recvTy->genericArgs[0], /*elemIsClass=*/true);
-            if (!same) return false;
-            builder_.CreateCondBr(same, dupBB, nextBB);
-            builder_.SetInsertPoint(nextBB);
-            builder_.CreateStore(
-                builder_.CreateAdd(curIdx, builder_.getInt64(1)), idxSlot);
-            builder_.CreateBr(condBB);
-            // duplicate: dispose the passed item (§4.10), do not append.
-            builder_.SetInsertPoint(dupBB);
-            if (arrElemPol.disposerThunk)
-                builder_.CreateCall(arrElemPol.disposerThunk, {item});
-            builder_.CreateBr(endBB);
-            // new: append.
-            builder_.SetInsertPoint(newBB);
-            {
-                llvm::AllocaInst* slot = entryAlloca(item->getType());
-                builder_.CreateStore(item, slot);
-                auto* addFn = declareC("bz_array_add",
-                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
-                builder_.CreateCall(addFn,
-                    {recv, slot, builder_.getInt64(esz)});
-            }
-            builder_.CreateBr(endBB);
-            builder_.SetInsertPoint(endBB);
-            return true;
+            return emitArrayBackedSetInsert(recv, item, arrElemRef,
+                                            arrElemPol.disposerThunk, esz);
         };
         // isOwnedSetRecv: this call's receiver is exactly an OwningSet<T> (class
         // T). Gates the set-specific .Add/.UnionWith dedup handlers below —
@@ -6291,6 +6350,25 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         llvm::Value* closure = lowerEventHandlerClosure(
                             call.args[0].value.get(), /*payload=*/nullptr);
                         if (!closure) return nullptr;
+                        // fix #2334 / §28.14 / §28.9: lowerEventHandlerClosure
+                        // -> lowerLambda just populated
+                        // lastLambdaCapturedCells_ for any cellFreeEligible_
+                        // captures IFF the argument is a lambda LITERAL on a
+                        // `using var`/`await using var` TaskScope receiver
+                        // (collectCellFreeEligible's TaskScope.Spawn special
+                        // case, mirroring the IIFE arm's own consume call —
+                        // LlvmBackend_Calls2.cpp). A method-reference argument
+                        // does not go through lowerLambda and would leave the
+                        // vector stale/empty from whatever lambda last ran
+                        // elsewhere in this function — guard on the AST shape
+                        // here, exactly like the IIFE arm, so this never
+                        // consumes an unrelated lambda's cells. Consuming is a
+                        // harmless no-op when the pre-scan did not flag
+                        // anything (an ordinary capture-free Spawn lambda, or
+                        // one whose receiver isn't a using-var local).
+                        if (dynamic_cast<const ast::LambdaExpr*>(
+                                call.args[0].value.get()))
+                            consumeLastLambdaCapturedCells();
                         llvm::Value* ioeVt =
                             llvm::ConstantPointerNull::get(ptrTy());
                         {   auto vit = builtinVtable_.find(
@@ -8037,13 +8115,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 // Disposal: the using-var / scope-end path on the LOCAL
                 // bound by the await (`using var arr := await wa;`) calls
                 // bz_array_free on the array at scope end — that is the
-                // canonical owner. We deliberately do NOT attach a
-                // result_disposer here, because every awaiting call site
-                // binds the result to a local whose using-var disposal
-                // is already responsible for the array; an attached
-                // disposer would double-free at the task's bz_task_free.
-                // (A discarded `await w;` leaves the array un-owned —
-                // a pre-existing leak, not enlarged by this fix.)
+                // implementation's current owner. We deliberately do NOT
+                // attach a result_disposer here: an attached disposer
+                // double-frees that local, and use-after-frees the unbound
+                // temporary form `using var rs := await Task.WhenAll([…]);`
+                // (the task dies at end of statement while `rs` still points
+                // at its array). Both measured under #2278.
+                //
+                // #2278 (open): the shapes where NO awaiting binding takes the
+                // array — a discarded `await w;`, and a plain `var rs := await
+                // w;` — therefore LEAK the aggregate `Array<T>`, and the same
+                // hole exists for any user `async` method returning
+                // `Task<Array<T>>`. It is not specific to WhenAll; #1830's
+                // literal-element fallback merely routed the #1616 inline-
+                // literal shape into it. The fix is a coordinated one — attach
+                // a container disposer at every Pattern A collection-result
+                // mint AND make the awaiting binding a §30.5 borrow-pin
+                // (usingVarSourceIsBorrow) so exactly one reclaim survives.
             } else {
                 auto* whenAllFn = declareC("bz_task_when_all", ptrTy(), {ptrTy()});
                 result = builder_.CreateCall(whenAllFn, {arr}, "task.when_all");
@@ -9169,6 +9257,93 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         builder_.CreateCall(fn, {sw});
                         return nullptr;
                     }
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // stdlib §7.1/§7.2 / issue #645: FileStream instance methods.
+    // Receiver's exprType name-part is "FileStream" (a bz_filestream_t*).
+    // ---------------------------------------------------------------------------
+    {
+        if (auto* ma2 = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get())) {
+            if (ma2->target &&
+                ctx_.exprType(*ma2->target) &&
+                builtinTypeName(ctx_.exprType(*ma2->target)) == "FileStream") {
+                llvm::Value* fs = lowerExpr(*ma2->target);
+                if (!fs) return nullptr;
+                const auto& mname = ma2->member;
+                // Lower an int-typed argument to i32.
+                auto argI32 = [&](size_t i) -> llvm::Value* {
+                    if (i >= call.args.size() || !call.args[i].value) return nullptr;
+                    llvm::Value* v = lowerExpr(*call.args[i].value);
+                    if (!v || !v->getType()->isIntegerTy()) return nullptr;
+                    if (v->getType()->isIntegerTy(32)) return v;
+                    return v->getType()->getIntegerBitWidth() < 32
+                        ? builder_.CreateSExt(v, i32())
+                        : builder_.CreateTrunc(v, i32());
+                };
+                // per stdlib §7.1: Read(buffer, offset, count): int and
+                // Write(buffer, offset, count). The runtime validates the
+                // window [offset, offset+count) against the buffer's Count and
+                // reports an out-of-range window as -1 WITHOUT performing any
+                // I/O; §7.1 makes that IndexOutOfRangeException.
+                if ((mname == "Read" || mname == "Write") &&
+                    call.args.size() == 3) {
+                    llvm::Value* buf = call.args[0].value
+                        ? lowerExpr(*call.args[0].value) : nullptr;
+                    llvm::Value* off = argI32(1);
+                    llvm::Value* cnt = argI32(2);
+                    if (!buf || !off || !cnt) return nullptr;
+                    if (mname == "Read") {
+                        auto* fn = declareC("bz_filestream_read", i64(),
+                                            {ptrTy(), ptrTy(), i32(), i32()});
+                        llvm::Value* n =
+                            builder_.CreateCall(fn, {fs, buf, off, cnt}, "fs.read");
+                        emitGuardThrow(
+                            builder_.CreateICmpSLT(n, builder_.getInt64(0), "fs.read.oor"),
+                            "IndexOutOfRangeException");
+                        return builder_.CreateTrunc(n, i32(), "fs.read.n");
+                    }
+                    auto* fn = declareC("bz_filestream_write", i32(),
+                                        {ptrTy(), ptrTy(), i32(), i32()});
+                    llvm::Value* st =
+                        builder_.CreateCall(fn, {fs, buf, off, cnt}, "fs.write");
+                    // Only the -1 (window) status raises. The -2 short/failed
+                    // write is swallowed for now: §7.1's "write the entire
+                    // window or raise" needs the §7.5 IOException surface the
+                    // whole §7 runtime still lacks (#2286, the same deferral
+                    // §7.3 already records).
+                    emitGuardThrow(
+                        builder_.CreateICmpEQ(st, builder_.getInt32(-1), "fs.write.oor"),
+                        "IndexOutOfRangeException");
+                    return nullptr;
+                }
+                if (mname == "Flush" && call.args.empty()) {
+                    auto* fn = declareC("bz_filestream_flush",
+                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                    builder_.CreateCall(fn, {fs});
+                    return nullptr;
+                }
+                // per stdlib §7.1: Seek(offset: long, origin: SeekOrigin): long.
+                if (mname == "Seek" && call.args.size() == 2 &&
+                    call.args[0].value && call.args[1].value) {
+                    llvm::Value* off = lowerExpr(*call.args[0].value);
+                    llvm::Value* org = lowerExpr(*call.args[1].value);
+                    if (!off || !org) return nullptr;
+                    if (!off->getType()->isIntegerTy(64))
+                        off = builder_.CreateSExt(off, i64());
+                    if (!org->getType()->isIntegerTy(32))
+                        org = builder_.CreateZExt(org, i32());
+                    auto* fn = declareC("bz_filestream_seek", i64(),
+                                        {ptrTy(), i64(), i32()});
+                    return builder_.CreateCall(fn, {fs, off, org}, "fs.seek");
+                }
+                // per stdlib §7.1: ReadAll(): owned Array<byte>.
+                if (mname == "ReadAll" && call.args.empty()) {
+                    auto* fn = declareC("bz_filestream_read_all", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(fn, {fs}, "fs.readall");
                 }
             }
         }

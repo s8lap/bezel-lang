@@ -541,18 +541,56 @@ extern "C" int32_t bz_decimal_to_int32(const bz_decimal_t* a, void* ove_vtable) 
     return (int32_t)v;
 }
 
-// Parse from C string (null-terminated).
-// per fix #521 / §6.4: FormatException (malformed) stored via fe_vtable;
-// OverflowException (out-of-range) stored via ove_vtable.  Either may be
-// nullptr (used during compile-time initialisation where no vtable exists).
-// On failure bz_exc is set and the function returns without writing *out.
-extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
-                                       void* ove_vtable, void* fe_vtable) {
-    if (!s) { bz_set_exc(fe_vtable); return; }  // FormatException — null input
+// A code-point sequence to parse (fix #2273).  The parser reads by INDEX over
+// an explicit length, never by scanning for a NUL: the former `char buf[64]`
+// copies in bz_decimal_parse / bz_decimal_try_parse truncated any input past 63
+// bytes and parsed the prefix, returning a wrong value with no exception (e.g.
+// leading zeros past 63 characters) — the silent-truncation class fix #1829 set
+// out to close.  `width` is a `string`'s implementation-defined storage width
+// (language spec §4.6: 1, 2, or 4 bytes per code point); reading through it
+// keeps the parser correct for any width instead of byte-scanning a wide
+// string's first bytes, and makes an embedded NUL an ordinary non-digit
+// (FormatException) rather than a silent end-of-input.
+struct dec_src {
+    const void* data;
+    int64_t     len;
+    uint8_t     width;
+};
+static inline uint32_t dec_src_at(const dec_src& s, int64_t i) {
+    if (s.width == 2) return ((const uint16_t*)s.data)[i];
+    if (s.width == 4) return ((const uint32_t*)s.data)[i];
+    return ((const uint8_t*)s.data)[i];
+}
+
+// The shared decimal parse engine.  `allow_exp` selects which of the project's
+// TWO decimal grammars applies — they differ, and the difference is normative:
+//
+//   true  — the decimal LITERAL grammar (language spec §18.1 and Appendix A:
+//           `FloatLiteral ::= DigitGroup "." DigitGroup Exponent? FloatSuffix?
+//                           | DigitGroup Exponent FloatSuffix?`), which admits
+//           scientific notation (`1.23e2m`).  Used by the compile-time literal
+//           folder (src/codegen/LlvmBackend_Exprs.cpp, src/sema/
+//           ExprTypecheck_Exprs.cpp) and by bz_decimal_from_double, whose
+//           "%.15g" rendering emits exponent form.
+//   false — the stdlib §9.3 `Decimal.Parse` grammar: "an optional leading sign
+//           (+/-) followed by decimal digits with at most one `.`" — NO
+//           exponent.  Used by Decimal.Parse/TryParse and, by §2.3's "same
+//           contract as the §9 per-type Parse family", Convert.ToDecimal/
+//           TryToDecimal.
+//
+// FormatException (malformed) is stored via fe_vtable, OverflowException
+// (out-of-range) via ove_vtable; either may be null (compile-time folding has
+// no vtables).  On failure bz_exc is set and *out is not written.
+static void dec_parse_src(const dec_src& src, bz_decimal_t* out,
+                          void* ove_vtable, void* fe_vtable, bool allow_exp) {
+    int64_t i = 0;
     // Skip optional sign.
     int neg = 0;
-    if (*s == '-') { neg = 1; ++s; }
-    else if (*s == '+') { ++s; }
+    if (i < src.len) {
+        uint32_t c0 = dec_src_at(src, 0);
+        if (c0 == '-') { neg = 1; ++i; }
+        else if (c0 == '+') { ++i; }
+    }
     // Collect digits, find decimal point.
     __uint128_t m = 0;
     uint32_t sc = 0;
@@ -563,22 +601,48 @@ extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
     // the stored mantissa loses; it must be absorbed by scale (a '.' fraction
     // or a negative exponent) or the value is out of range — settled below.
     uint32_t dropped_int = 0;
-    for (; *s; ++s) {
-        if (*s == '.') { in_frac = true; continue; }
-        if (*s == 'e' || *s == 'E') {
-            // Scientific notation: parse exponent.
-            ++s;
+    for (; i < src.len; ++i) {
+        uint32_t c = dec_src_at(src, i);
+        if (c == '.') {
+            // §9.3 (fix #2273): "at most one `.`".  Pre-fix a second '.' merely
+            // re-entered the fraction, so Parse("1.2.3") returned 1.23 while
+            // TryParse's separate validator rejected it — a direct violation of
+            // §9.3's "TryParse returns false in every case where Parse would
+            // raise" in the *other* direction.
+            if (in_frac) { bz_set_exc(fe_vtable); return; }
+            in_frac = true;
+            continue;
+        }
+        if (c == 'e' || c == 'E') {
+            // Scientific notation — admitted for literals, declined for §9.3.
+            if (!allow_exp) { bz_set_exc(fe_vtable); return; }
+            ++i;
             int exp_neg = 0;
-            if (*s == '-') { exp_neg = 1; ++s; }
-            else if (*s == '+') ++s;
+            if (i < src.len) {
+                uint32_t sgn = dec_src_at(src, i);
+                if (sgn == '-') { exp_neg = 1; ++i; }
+                else if (sgn == '+') { ++i; }
+            }
             int exp = 0;
-            for (; *s >= '0' && *s <= '9'; ++s) exp = exp * 10 + (*s - '0');
+            bool exp_digit = false;
+            for (; i < src.len; ++i) {
+                uint32_t d = dec_src_at(src, i);
+                // Any non-digit here (including trailing junk after the
+                // exponent) is malformed; pre-fix the loop simply stopped and
+                // the remainder of the string was ignored.
+                if (d < '0' || d > '9') { bz_set_exc(fe_vtable); return; }
+                exp_digit = true;
+                // Saturate: |exp| >= 1000 is out of range for any mantissa, and
+                // accumulating it unbounded is signed-overflow UB.
+                if (exp < 1000) exp = exp * 10 + (int)(d - '0');
+            }
+            if (!exp_digit) { bz_set_exc(fe_vtable); return; }
             if (exp_neg) sc += (uint32_t)exp;
             else {
                 if ((int)sc - exp < 0) {
                     // Multiply by 10^(exp-sc): shift mantissa left.
                     int shift = exp - (int)sc;
-                    for (int i = 0; i < shift && i < 29; ++i) {
+                    for (int k = 0; k < shift; ++k) {
                         if (m > kMax96 / 10) {
                             // §6.4: OverflowException — mantissa too large for decimal range.
                             bz_set_exc(ove_vtable);
@@ -593,22 +657,29 @@ extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
             }
             break;
         }
-        if (*s < '0' || *s > '9') {
+        if (c < '0' || c > '9') {
             // FormatException — unexpected character in decimal string.
             bz_set_exc(fe_vtable);
             return;
         }
         any_digit = true;
-        if (in_frac) ++sc;
         if (m <= kMax96 / 10) {
-            m = m * 10 + (uint32_t)(*s - '0');
+            m = m * 10 + (uint32_t)(c - '0');
+            // §4.4 / §9.3 (fix #2273): the scale counts the fractional digits
+            // the mantissa actually HOLDS.  Pre-fix `++sc` ran before this
+            // guard, so a fractional digit that was dropped still divided the
+            // result by 10 — Parse("12.3456789012345678901234567890") returned
+            // 1.2345678901234567890123456789, silently 10x too small — and the
+            // inflated scale then absorbed dropped integer digits the value
+            // could not actually pay for, defeating the #1829 range check.
+            if (in_frac) ++sc;
         } else if (!in_frac) {
             // §4.4 / §9.3 (fix #1829): the 96-bit mantissa is full and this
             // digit is in the integer part, so it cannot be stored.  Count it:
             // it is a factor of 10 in the magnitude that must be paid for by
             // scale or reported as out of range.  (Fractional digits beyond
-            // the 29th significant are dropped with no magnitude change — a
-            // precision loss dec_store's rounding already governs.)
+            // the 29th significant are dropped: they change neither the
+            // magnitude nor the scale, only the precision.)
             ++dropped_int;
         }
     }
@@ -619,12 +690,15 @@ extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
     }
     // §4.4 / §9.3 (fix #1829): settle dropped integer-part digits against the
     // accumulated scale.  Each dropped digit is a factor of 10 in the magnitude
-    // the stored mantissa lost; the scale (fractional digits + any negative
-    // exponent) absorbs it by the same factor, so consuming `dropped_int` from
-    // the scale reconstructs the magnitude exactly (the dropped digits become
-    // fractional and are rounded by dec_store).  If the scale cannot absorb
-    // them, the value's magnitude exceeds `decimal.MaxValue` — raise
-    // OverflowException, never silently truncate.
+    // the stored mantissa lost; the scale (stored fractional digits + any
+    // negative exponent) absorbs it by the same factor, so consuming
+    // `dropped_int` from the scale reconstructs the magnitude exactly (the
+    // dropped digits become fractional and are rounded by dec_store).  If the
+    // scale cannot absorb them, the value's magnitude exceeds
+    // `decimal.MaxValue` — raise OverflowException, never silently truncate.
+    // With #2273's scale accounting this test is sound: a digit is dropped only
+    // once m > kMax96/10, so a residual factor of 10 puts the value above
+    // kMax96 = MaxValue's mantissa.
     if (dropped_int > 0) {
         if (dropped_int > sc) {
             // §6.4: OverflowException — magnitude beyond decimal's range.
@@ -636,9 +710,26 @@ extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
     dec_store(out, m, sc, neg, ove_vtable);
 }
 
-// Parse from bz_string* (stdlib §9.3 Decimal.Parse).
+// Parse from C string (null-terminated) — the LITERAL-grammar entry (§18.1).
+// per fix #521 / §6.4: FormatException (malformed) stored via fe_vtable;
+// OverflowException (out-of-range) stored via ove_vtable.  Either may be
+// nullptr (used during compile-time initialisation where no vtable exists).
+// On failure bz_exc is set and the function returns without writing *out.
+extern "C" void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
+                                       void* ove_vtable, void* fe_vtable) {
+    if (!s) { bz_set_exc(fe_vtable); return; }  // FormatException — null input
+    dec_src src{ s, (int64_t)strlen(s), 1 };
+    dec_parse_src(src, out, ove_vtable, fe_vtable, /*allow_exp=*/true);
+}
+
+// Parse from bz_string* (stdlib §9.3 Decimal.Parse; §2.3 Convert.ToDecimal).
+// The layout is bezel_runtime_internal.hpp's bz_string_hdr — { char* data,
+// int64_t len, uint8_t width, int64_t rc } — whose `width` is language spec
+// §4.6's implementation-defined per-string storage width.
 // per fix #521: raises FormatException (malformed) or OverflowException
 // (out-of-range) via bz_exc; codegen calls emitPendingCheck() after this call.
+// per fix #2273: parses the string's full length (no 63-byte truncation) under
+// §9.3's grammar, which does not admit an exponent.
 extern "C" void bz_decimal_parse(const void* str, bz_decimal_t* out,
                                   void* ove_vtable, void* fe_vtable) {
     if (!str) {
@@ -646,65 +737,46 @@ extern "C" void bz_decimal_parse(const void* str, bz_decimal_t* out,
         bz_set_exc(fe_vtable);
         return;
     }
-    // bz_string layout: { char* data, int64_t len, uint8_t width, int64_t rc }
-    struct BzStr { char* data; int64_t len; uint8_t width; int64_t rc; };
-    const auto* bs = (const BzStr*)str;
-    // Copy to null-terminated buffer.
-    char buf[64];
-    int64_t n = bs->len < 63 ? bs->len : 63;
-    for (int64_t i = 0; i < n; ++i) buf[i] = bs->data[i];
-    buf[n] = '\0';
-    bz_decimal_parse_cstr(buf, out, ove_vtable, fe_vtable);
+    const auto* bs = (const bz_string_hdr*)str;
+    if (bs->len <= 0 || !bs->data) {
+        // Empty (or malformed) string — no digits, FormatException per §9.3.
+        bz_set_exc(fe_vtable);
+        return;
+    }
+    dec_src src{ bs->data, bs->len, bs->width };
+    dec_parse_src(src, out, ove_vtable, fe_vtable, /*allow_exp=*/false);
 }
 
 // TryParse — returns 0 on failure (no throw), 1 on success.
-// per fix #521: pre-validates the string shape, then calls bz_decimal_parse_cstr
-// with a sentinel OverflowException vtable (fix #1829) so an out-of-range value
-// is observed via bz_exc and reported as failure — never silently truncated.
-// Mirrors .NET Decimal.TryParse: overflow returns 0, no exception raised.
+// stdlib §9.3: "TryParse returns false in every case where Parse would raise";
+// stdlib §2.3 (Convert.TryToDecimal, same runtime entry): "the `out` parameter
+// receives the default value".
+// per fix #2273: runs the PARSER itself behind sentinel vtables rather than a
+// second, hand-maintained shape validator.  The duplicated validator had
+// already drifted from the parser in both directions — it rejected "1.2.3"
+// that Parse accepted, and admitted the exponent form §9.3 forbids — so the
+// §9.3 contract can only be guaranteed structurally, by sharing one grammar.
 extern "C" int32_t bz_decimal_try_parse(const void* str, bz_decimal_t* out) {
-    // We need a way to catch failures. Use setjmp/longjmp? That's complex.
-    // Instead, validate the string manually before parsing.
+    // §2.3: the out slot receives default(decimal) = 0m on failure.  Pre-fix
+    // the failure paths returned without writing it, and codegen stores the
+    // (undef) slot into the caller's variable unconditionally.
+    out->lo32 = 0; out->mid32 = 0; out->hi32 = 0; out->flags = 0;
     if (!str) return 0;
-    struct BzStr { char* data; int64_t len; uint8_t width; int64_t rc; };
-    const auto* bs = (const BzStr*)str;
-    char buf[64];
-    int64_t n = bs->len < 63 ? bs->len : 63;
-    for (int64_t i = 0; i < n; ++i) buf[i] = bs->data[i];
-    buf[n] = '\0';
-    const char* s = buf;
-    if (*s == '-' || *s == '+') ++s;
-    if (!*s) return 0;
-    bool has_digit = false, has_dot = false;
-    for (; *s; ++s) {
-        if (*s == '.') { if (has_dot) return 0; has_dot = true; continue; }
-        if (*s == 'e' || *s == 'E') {
-            ++s;
-            if (*s == '-' || *s == '+') ++s;
-            if (!*s) return 0;
-            for (; *s; ++s) if (*s < '0' || *s > '9') return 0;
-            break;
-        }
-        if (*s < '0' || *s > '9') return 0;
-        has_digit = true;
-    }
-    if (!has_digit) return 0;
-    // Pass a non-null sentinel OverflowException vtable so that an out-of-range
-    // value sets bz_exc (per §9.3: TryParse returns false wherever Parse would
-    // raise; fix #1829 — a null vtable silently swallowed the overflow via the
-    // bz_set_exc null-no-op and returned success with a truncated value).  The
-    // string's shape was validated above, so only OverflowException can fire
-    // here and fe_vtable stays null.
-    unsigned char sentinelOve = 0;
+    // Non-null sentinel vtables so every failure the parser can report —
+    // FormatException and OverflowException alike — is observable here as a
+    // bz_exc store (fix #1829: a null vtable silently swallowed the overflow
+    // via bz_set_exc's null no-op and returned success with a truncated value).
+    unsigned char sentinel = 0;
     extern thread_local void* bz_exc;
     void* prev_exc = bz_exc;
     bz_exc = nullptr;
-    bz_decimal_parse_cstr(buf, out, &sentinelOve, nullptr);
+    bz_decimal_parse(str, out, &sentinel, &sentinel);
     if (bz_exc) {
-        // Overflow during parse — return 0 (no exception raised).  Discard the
-        // internally set exc and restore the caller's exception state.
+        // Malformed or out of range — return 0 (no exception raised).  Discard
+        // the internally set exc and restore the caller's exception state.
         free(bz_exc);
         bz_exc = prev_exc;
+        out->lo32 = 0; out->mid32 = 0; out->hi32 = 0; out->flags = 0;
         return 0;
     }
     bz_exc = prev_exc;
@@ -768,8 +840,8 @@ extern "C" void* bz_decimal_to_string(const bz_decimal_t* a) {
     return hdr;
 }
 
-// Round(digits) — rounds to `digits` decimal places (banker's rounding not
-// required; we use half-up as .NET's Decimal.Round default).
+// Round(digits) — rounds to `digits` decimal places using banker's rounding
+// (round-half-to-even), per stdlib §9.3 ("matching Math.Round (§2.2)").
 extern "C" void bz_decimal_round(const bz_decimal_t* a, int32_t digits,
                                   bz_decimal_t* out) {
     if (digits < 0) digits = 0;
@@ -777,10 +849,49 @@ extern "C" void bz_decimal_round(const bz_decimal_t* a, int32_t digits,
     if ((uint32_t)digits >= s) { *out = *a; return; }
     __uint128_t m = dec_mantissa(a);
     uint32_t remove = s - (uint32_t)digits;
+    // Drop the lowest `remove` decimal places one at a time. The rounding
+    // decision is made on the FIRST dropped digit (the digit at position
+    // `digits`, immediately after the kept range), not on the LOWEST dropped
+    // digit — that is the i == 0 iteration in this loop, which is the units
+    // digit, several positions below the relevant one whenever remove > 1.
+    // For example, 0.9651m.Round(2) drops two places; the relevant digit is
+    // the 3rd decimal place ("5"), not the 4th ("1").  Per §9.3 banker's
+    // rounding:
+    //   • first-dropped < 5       → round down (no change to mantissa)
+    //   • first-dropped > 5       → round up   (mantissa += 1)
+    //   • first-dropped == 5 AND any later-dropped non-zero (strictly greater
+    //     than the midpoint, e.g. 0.9651) → round up
+    //   • first-dropped == 5 AND all later-dropped zero (exact midpoint, e.g.
+    //     0.9650) → round to even: round up if the kept digit is odd, no
+    //     change if it is even. 0.9650m.Round(2) keeps 96 (even) → 0.96m;
+    //     0.9750m.Round(2) keeps 97 (odd)  → 0.98m.
+    // Carry propagation (e.g. 0.9999m.Round(1) → 1m, 0.9950m.Round(2) → 1m
+    // when the kept digit is odd) is handled by dec_store (trailing-zero
+    // strip + max-96-bit reduction).
+    bool dropNonZero = false;  // any later-dropped (lower-place) digit > 0
     for (uint32_t i = 0; i < remove; ++i) {
         __uint128_t rem = m % 10;
         m /= 10;
-        if (i == 0 && rem >= 5) m += 1;
+        if (i == remove - 1) {
+            // First dropped digit — make the rounding decision.
+            if (rem > 5) {
+                m += 1;  // per §9.3
+            } else if (rem < 5) {
+                /* round down — no change */     // per §9.3
+            } else {
+                // rem == 5: banker's rounding.
+                if (dropNonZero) {
+                    m += 1;  // > midpoint → round up
+                } else if (m % 2 != 0) {
+                    m += 1;  // exact midpoint, kept digit odd → round up
+                }
+                // else: exact midpoint, kept digit even → round down
+            }
+        } else {
+            // Subsequent dropped digit (lower place). Track whether the
+            // dropped value exceeds an exact midpoint.
+            if (rem != 0) dropNonZero = true;
+        }
     }
     // Rounding only reduces mantissa magnitude; result always fits in 96 bits.
     dec_store(out, m, (uint32_t)digits, dec_sign(a), nullptr);

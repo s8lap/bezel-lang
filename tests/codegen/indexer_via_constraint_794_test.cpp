@@ -25,9 +25,17 @@ int run(const std::string& prog) {
     auto r = runAot(prog);
     return r.ran ? r.exitCode : -999;
 }
+// fix #2417 (§11.2/§23.4, v0.235): `readonly` — every use of `iface` below
+// (`class_arg_getter`, `record_arg_getter`, `two_instantiations`) implements
+// with a getter-only expression-bodied indexer and only ever reads through
+// the interface; a read-write obligation here is the getter-only-satisfying-
+// read-write shape #2417's accessor-set conformance check now rejects at
+// compile time. `setter_through_constraint` below needs (and keeps) its own
+// separate, genuinely read-write `IBox` interface, since `Cell` provides a
+// real setter and the test exercises it.
 const char* iface =
     "module M; "
-    "interface IIndexable property [i: int]: int; end IIndexable; ";
+    "interface IIndexable readonly property [i: int]: int; end IIndexable; ";
 }  // namespace
 
 // §14.2 / §23.4: the canonical #794 repro — a CLASS argument indexed through a

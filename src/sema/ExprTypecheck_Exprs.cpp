@@ -858,6 +858,22 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         ctx_.setExprType(
                             &e, substituteMemberType(rt, nullptr, fs->parent));
                     }
+                } else if (ctx_.isImported(fs)) {
+                    // fix #2532 (§2.7/§2.8.2): an IMPORTED field inherited
+                    // from an imported base and reached via a BARE identifier
+                    // (`field := v;`, implicit this) has no ast::FieldDecl
+                    // (the loader's makeImportedSymbol carries no AST), so its
+                    // type rides the importedMemberType side table — the
+                    // FieldSymbol sibling of the #2504 property fix in the
+                    // adjacent branch, with the IDENTICAL heap-corruption
+                    // repro under ASan (confirmed live: SEGV in
+                    // bz_string_release, double-free-shaped). The
+                    // resolveMemberAccess path (explicit `this.field` /
+                    // `h.field`) already publishes the type this way; the
+                    // bare-identifier path simply missed it.
+                    if (TypeRef* rt = ctx_.importedMemberType(fs))
+                        ctx_.setExprType(&e,
+                            substituteMemberType(rt, nullptr, fs->parent));
                 }
             } else if (auto* ps = dynamic_cast<PropertySymbol*>(sym)) {
                 // §12.1 / §23: implicit `this.<auto-property>` form: a bare
@@ -879,6 +895,25 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 ctx_.setExprType(&e, rt);
                             }
                         }
+                    } else if (ctx_.isImported(ps)) {
+                        // fix #2504 (§23/§2.8.2): an IMPORTED auto-property
+                        // inherited from an imported base and reached via a
+                        // BARE identifier (`Name := v;`, implicit this) has no
+                        // ast::PropertyDecl (the module loader's
+                        // makeImportedSymbol carries no AST), so its type rides
+                        // the importedMemberType side table — mirroring the
+                        // MemberAccess path (resolveMemberAccess's imported-
+                        // Property branch, i.e. the `this.Name` form that
+                        // already works). Without this the bare-identifier
+                        // assignment target carries no exprType, so codegen's
+                        // isStringExprType/isStringFieldLvalue bail at their
+                        // first check and lowerStringFieldStore is skipped →
+                        // the setter stores the string pointer without
+                        // retain/release → heap corruption (double-free in
+                        // bz_string_release, confirmed under ASan).
+                        if (TypeRef* rt = ctx_.importedMemberType(ps))
+                            ctx_.setExprType(&e,
+                                substituteMemberType(rt, nullptr, ps->parent));
                     }
                 }
             }
@@ -1712,15 +1747,52 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         argTys.push_back(idxArg.value
                                              ? ctx_.exprType(*idxArg.value)
                                              : nullptr);
+                    // fix #2414 (§23.4 / §2.8.2 clause 1, v0.235): an IMPORTED
+                    // indexer's candidate has no ast::PropertyDecl (mirrors
+                    // Property's own #503 limitation — ModuleLoader.cpp's
+                    // Indexer case reconstructs `indexerParams` as
+                    // ParameterSymbols carrying `resolvedDeclType` instead of
+                    // an AST node). Read a candidate's k-th index-parameter
+                    // type and its arity through either source uniformly, so
+                    // the overload-matching logic below works unchanged for a
+                    // local OR an imported candidate — without this, every
+                    // imported indexer candidate had `cpd == nullptr` and was
+                    // skipped outright, `anyIndexer` still true (set before
+                    // the decl check) but neither `ps` nor `arityOnly` ever
+                    // assigned, falling into the "no overload matches"
+                    // rejection below for a perfectly well-typed access
+                    // (confirmed: `no indexer overload matches the 1
+                    // argument (§23.4)` for the issue's own 1-arg repro).
+                    auto candParamCount =
+                        [](const PropertySymbol* cand) -> std::size_t {
+                        if (auto* cpd = dynamic_cast<const ast::PropertyDecl*>(
+                                cand->decl))
+                            return cpd->indexerParams.size();
+                        return cand->indexerParams.size();
+                    };
+                    auto candParamResolvedType =
+                        [this](const PropertySymbol* cand,
+                              std::size_t k) -> const TypeRef* {
+                        if (auto* cpd = dynamic_cast<const ast::PropertyDecl*>(
+                                cand->decl)) {
+                            return (k < cpd->indexerParams.size() &&
+                                    cpd->indexerParams[k].type)
+                                       ? ctx_.resolvedType(
+                                             *cpd->indexerParams[k].type)
+                                       : nullptr;
+                        }
+                        if (k < cand->indexerParams.size()) {
+                            if (auto* p = dynamic_cast<ParameterSymbol*>(
+                                    cand->indexerParams[k]))
+                                return p->resolvedDeclType;
+                        }
+                        return nullptr;
+                    };
                     auto allParamsMatch =
-                        [&](const ast::PropertyDecl* cpd) -> bool {
+                        [&](const PropertySymbol* cand) -> bool {
                         for (std::size_t k = 0; k < nargs; ++k) {
                             const TypeRef* a = argTys[k];
-                            const TypeRef* p =
-                                cpd->indexerParams[k].type
-                                    ? ctx_.resolvedType(
-                                          *cpd->indexerParams[k].type)
-                                    : nullptr;
+                            const TypeRef* p = candParamResolvedType(cand, k);
                             if (!p || !a || p->kind != a->kind) return false;
                             if (p->kind == TypeRef::Kind::Primitive) {
                                 if (p->primitive != a->primitive) return false;
@@ -1743,12 +1815,9 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             auto* cand = dynamic_cast<PropertySymbol*>(m);
                             if (!cand || !cand->isIndexer) continue;
                             anyIndexer = true;
-                            auto* cpd = dynamic_cast<const ast::PropertyDecl*>(
-                                cand->decl);
-                            if (!cpd || cpd->indexerParams.size() != nargs)
-                                continue;
+                            if (candParamCount(cand) != nargs) continue;
                             if (!arityOnly) arityOnly = cand;
-                            if (allParamsMatch(cpd)) { ps = cand; break; }
+                            if (allParamsMatch(cand)) { ps = cand; break; }
                         }
                         for (TypeSymbol* b : t->baseTypes)
                             if (b) frontier.push_back(b);
@@ -1758,24 +1827,148 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // exactly as the single-indexer path always did).
                     if (!ps) ps = arityOnly;
                     if (ps && ps->isIndexer) {
-                        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(
-                                ps->decl)) {
-                            if (pd->type) {
-                                if (auto* rt = ctx_.resolvedType(*pd->type))
-                                    ctx_.setExprType(
-                                        &e, substituteMemberType(
-                                                rt, ix->target.get(),
-                                                ps->parent));
-                            }
-                            // per §7.4 (v0.182, #1593): a user-defined indexer
-                            // access `obj[i]` invokes an "accessor" (get/set)
-                            // that can run user code — invalidate a mutably-
-                            // captured local's narrowing exactly as a named-
-                            // property access or a call does (#1566). Indexers
-                            // are never auto, so any user indexer qualifies.
-                            if (propertyAccessRunsUserCode(pd))
-                                invalidateCapturedNarrowings();
+                        auto* pd = dynamic_cast<const ast::PropertyDecl*>(
+                            ps->decl);
+                        TypeRef* rt = nullptr;
+                        // fix #2414: an imported indexer's declared element
+                        // type rides `ctx_.importedMemberType` (the same
+                        // side table Property reads, ModuleLoader.cpp
+                        // `fieldTypes_`), mirroring the param-type fallback
+                        // above — there is no `pd->type` to resolve.
+                        if (pd) {
+                            if (pd->type) rt = ctx_.resolvedType(*pd->type);
+                        } else {
+                            rt = ctx_.importedMemberType(ps);
                         }
+                        if (rt)
+                            ctx_.setExprType(
+                                &e, substituteMemberType(
+                                        rt, ix->target.get(), ps->parent));
+                        // fix #2530 (§22.3 / §23, v0.236): attach the resolved
+                        // indexer PropertySymbol to the IndexExpr. The ref/out
+                        // operand pass (`checkRefOutOperandCategory`,
+                        // ExprTypecheck.cpp) dispatches `obj[i]` through the
+                        // exact `exprSymbol(target)` -> PropertySymbol ->
+                        // `checkRefOutPropertyOperand` site that the named-
+                        // member `obj.P` path already uses, but the indexer
+                        // branch was missing this attachment — so a
+                        // write-only indexer as `ref` fell through to codegen
+                        // with no write-only gate (#2461's hasGetter bit is
+                        // published for indexers too, but the IndexExpr
+                        // operand path never consulted it). Without this,
+                        // LOCAL write-only indexer-as-`ref` ICEs at
+                        // "lowerExpr returned null ... #1386" in
+                        // `buildOrderedArgs` (lowerIndexerGet's no-getter path
+                        // returns null) and IMPORTED write-only indexer-as-`ref`
+                        // emits a call to the externally-declared-but-undefined
+                        // `bz$<Class>$idxget$<arity>` stub → "undefined
+                        // reference" linker error. With the attachment, both
+                        // shapes reach `checkRefOutPropertyOperand`, whose
+                        // imported (!pd) branch (already covers #2461) and
+                        // whose local branch (this commit's hasGetter twin)
+                        // reject write-only-as-`ref` with a clean §22.3/§23
+                        // message. `kind == "ref"` is enforced downstream of
+                        // this check, so `out` (where §22.3: "no getter call
+                        // occurs") is correctly admitted — issue's case 3.
+                        // Set ONLY for the user-defined indexer branch (an
+                        // Array<T>/OwningDictionary<>/etc. collection returns
+                        // no PropertySymbol here, and the inline-array path is
+                        // a GEP-load with no slot semantics to gate).
+                        ctx_.setExprSymbol(&e, ps);
+                        // fix #2543 (§23, v0.236): reject a BARE READ of a
+                        // write-only (set-only block) INDEXER. Symmetric to
+                        // `propertyDeclIsSetOnly`'s read-of-write-only gate
+                        // for the named-property case (ExprTypecheck_Calls.cpp
+                        // ~line 14327), which deliberately excludes
+                        // `pd->isIndexer` because IndexExpr reaches this site,
+                        // not a MemberAccessExpr. The local branch mirrors
+                        // #2530's ref/out operand check shape:
+                        //   - Expression / Auto bodyKinds always have a getter.
+                        //   - Block bodyKind has a getter iff any accessor is
+                        //     a `get` arm (loop on `!acc.isSet`, mirroring the
+                        //     hasSetter loop in checkRefOutPropertyOperand).
+                        // The IMPORTED case (no `pd`) consults
+                        // `ctx_.importedPropertyHasGetter` — published by
+                        // #2461 for indexers too — so an imported set-only
+                        // indexer is rejected with the same diagnostic. The
+                        // plain `:=` assignment target is exempted (a write
+                        // dispatches to the setter and is the LEGAL escape
+                        // hatch, exactly like `c.Val := 7` for #1192); a
+                        // `ref`/`out` argument operand is exempted (the
+                        // ref/out operand pass `checkRefOutPropertyOperand`
+                        // #2530 is the specialized gate and correctly
+                        // rejects `ref` and admits `out` per §22.3); a
+                        // compound `+=` is NOT exempted because it reads
+                        // first. Without this gate, a bare READ of a
+                        // write-only indexer silently degraded to a zero-
+                        // initialized value via the #2434 fallback at codegen.
+                        if (&e != plainSetAssignTargetNode_ &&
+                            &e != refOutArgTargetNode_) {
+                            bool idxHasGetter = false;
+                            if (pd) {
+                                if (pd->bodyKind == ast::PropertyBodyKind::
+                                        Expression ||
+                                    pd->bodyKind == ast::PropertyBodyKind::
+                                        Auto) {
+                                    idxHasGetter = true;
+                                } else if (pd->bodyKind ==
+                                           ast::PropertyBodyKind::Block) {
+                                    for (const auto& acc : pd->accessors)
+                                        if (!acc.isSet) {
+                                            idxHasGetter = true;
+                                            break;
+                                        }
+                                }
+                            } else {
+                                // imported: rely on the published
+                                // importedPropertyHasGetter bit (default
+                                // `true` for stale-dep compatibility — see
+                                // #2461's rationale in SemaContext.hpp).
+                                idxHasGetter =
+                                    ctx_.importedPropertyHasGetter(ps);
+                            }
+                            if (!idxHasGetter) {
+                                // Mirror the propertyDeclIsSetOnly NAMED-
+                                // property message shape ("property `W` is
+                                // write-only ...") so a user greps for the
+                                // same substring. An INDEXER has no usable
+                                // `pd->name` (the parser leaves it empty for
+                                // the `property this[i: T]: U` form, and
+                                // `ps->name` is the metadata handle ".this"
+                                // for the IMPORTED case — neither makes a
+                                // useful human label), so use "the
+                                // `<DeclaringType>` indexer" mirroring
+                                // #2530's indexer label in
+                                // checkRefOutPropertyOperand.
+                                std::string typeName = ps->parent
+                                    ? std::string(ps->parent->name)
+                                    : std::string();
+                                std::string label = typeName.empty()
+                                    ? std::string("the indexer")
+                                    : ("the `" + typeName + "` indexer");
+                                ctx_.diagnostics().report(
+                                    Severity::Error, e.span.begin,
+                                    std::string("a read of a write-only "
+                                                "indexer is not allowed — ")
+                                    + label +
+                                    " is write-only (it declares only a "
+                                    "`set` accessor) and cannot be read "
+                                    "(§23)");
+                            }
+                        }
+                        // per §7.4 (v0.182, #1593): a user-defined indexer
+                        // access `obj[i]` invokes an "accessor" (get/set)
+                        // that can run user code — invalidate a mutably-
+                        // captured local's narrowing exactly as a named-
+                        // property access or a call does (#1566). Indexers
+                        // are never auto, so any user indexer qualifies. An
+                        // imported indexer (no `pd` to ask
+                        // propertyAccessRunsUserCode about) is conservatively
+                        // treated as running user code too — the safe
+                        // default (it forgoes a narrowing optimization it
+                        // might have kept, never keeps one it shouldn't).
+                        if (pd ? propertyAccessRunsUserCode(pd) : true)
+                            invalidateCapturedNarrowings();
                     } else if (anyIndexer && nargs > 0) {
                         // §23.4: the receiver declares indexer(s) but none has
                         // the argument count — e.g. `g[i, j]` against a
@@ -2892,12 +3085,18 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
         // Resolution to the concrete type's operator (or the primitive
         // intrinsic op) happens at instantiation in codegen.
         {
+            // §2.8.2/§11.8 (#2359 bug 2b): the SAME imported-TypeRef gap as
+            // bug 2a — `total`'s exprType (from `var total := T.Zero();`,
+            // resolved through an imported constraint interface) carries no
+            // `astNode`. Read the bare-parameter name via `headName()`
+            // (alias-transparent, falls back to `importedName`) instead of
+            // requiring `astNode` directly, so `total + x` is recognized as
+            // a type-parameter-typed BinaryExpr for a cross-module `T`.
             auto typeParamNameOf = [&](const ast::Expr* e) -> std::string_view {
                 if (!e) return {};
                 const TypeRef* t = ctx_.exprType(*e);
                 if (!t || t->kind != TypeRef::Kind::Named || t->declaration ||
-                    t->nullable || !t->astNode || !t->astNode->name ||
-                    t->astNode->name->parts.size() != 1)
+                    t->nullable || t->headName().empty())
                     return {};
                 std::string_view n = t->headName();
                 return isInScopeTypeParam(n) ? n : std::string_view{};
@@ -2917,6 +3116,14 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
                             iop->decl)) {
                         if (od->returnType)
                             resTy = ctx_.resolvedType(*od->returnType);
+                    } else if (ctx_.isImported(iop)) {
+                        // §2.5/§11.8 (#2359 bug 2b): the constraint interface
+                        // itself is imported, so `iop` (its static operator
+                        // member) carries no AST at all (`decl == nullptr`)
+                        // — mirror the `isImported(opm)` fallback above for
+                        // the NAMED-type operator case: read the loader's
+                        // stashed resolved return type keyed on the symbol.
+                        resTy = ctx_.importedReturnType(iop);
                     }
                     if (resTy && resTy->kind == TypeRef::Kind::Named &&
                         !resTy->declaration) {
@@ -3736,7 +3943,7 @@ ExprTC::moveThroughInterfaceSlotName(const ast::Expr& operand) const {
 // `move span[i]` cannot transfer ownership. The borrowing spans view a
 // non-owning source — `ArraySpan<T>` / `ReadOnlyArraySpan<T>` view a borrowing
 // `Array<T>`, and the read-only spans (`ReadOnlySpan<T>`, `IReadOnlySpan<T>`,
-// `ReadOnlyStringSpan`, `ReadOnlyAsciiByteSpan`) view a borrowed string / buffer
+// `ReadOnlyStringSpan`) view a borrowed string / buffer
 // — so their slots hold borrows with nothing to move out. (The OWNING `Span<T>`
 // over an `OwningBuffer` is intentionally NOT matched.) Returns the span type
 // name when `operand` is `span[i]` over such a span, else the empty string.
@@ -3757,7 +3964,7 @@ ExprTC::moveThroughBorrowingSpanSlotName(const ast::Expr& operand) const {
         name = tt->headName();
     if (name == "ArraySpan" || name == "ReadOnlyArraySpan" ||
         name == "ReadOnlySpan" || name == "IReadOnlySpan" ||
-        name == "ReadOnlyStringSpan" || name == "ReadOnlyAsciiByteSpan")
+        name == "ReadOnlyStringSpan")
         return std::string(name);
     return {};
 }
@@ -4213,9 +4420,20 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             auto savedField = fieldNarrowed_;
             collectNarrowings(be->left.get(), /*forTrueBranch=*/true);
             visitExpr(*be->right);
-            nullNarrowed_ = std::move(savedNull);
-            narrowings_ = std::move(savedNarrow);
-            fieldNarrowed_ = std::move(savedField);
+            // fix #2258 / §7.4: un-seed the left operand's true-facts by
+            // INTERSECTING with the saved state, never by assigning it. The
+            // right operand's visit can legitimately INVALIDATE a fact that
+            // held at entry — a `ref`/`out` argument erases it (the #1188
+            // argument-invalidation path in the CallExpr handler below), and a
+            // call or `await` drops the mutably-captured locals' facts
+            // (invalidateCapturedNarrowings) — all per §7.4 "How narrowing is
+            // invalidated". Assigning the entry snapshot back RESURRECTED
+            // those facts, so `if s = null then return 0; end; var b: bool :=
+            // true and C.Clear(ref s);` left `s` narrowed and the following
+            // `s.Length` compiled to a null dereference (silent ACCEPT,
+            // SIGSEGV). The intersection keeps the drop and still discards the
+            // left operand's seeded facts (absent from the snapshot).
+            intersectNarrowingSetsWith(savedNull, savedNarrow, savedField);
         } else if (be->right) {
             visitExpr(*be->right);
         }
@@ -4900,7 +5118,23 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                             currentLiteralWideningHint_ = prt->primitive;
                     }
                 }
+                // fix #2543 (§23, v0.236): exempt a `ref`/`out` argument
+                // operand from the bare-read-of-write-only-indexer gate
+                // (IndexExpr visit). The ref/out operand pass
+                // `checkRefOutPropertyOperand` (#2530) is the specialized
+                // gate and correctly rejects `ref` and admits `out`;
+                // without this exemption an `out d[i]` against a
+                // write-only indexer would be wrongly rejected here.
+                const ast::Expr* savedRefOut = refOutArgTargetNode_;
+                refOutArgTargetNode_ =
+                    (a.modifier == "ref" || a.modifier == "out" ||
+                     a.modifier == "out var" ||
+                     a.modifier == "out using var" ||
+                     a.modifier == "out owned var")
+                        ? a.value.get()
+                        : nullptr;
                 visitExpr(*a.value);
+                refOutArgTargetNode_ = savedRefOut;
                 // per §22.12 rule 5 (v0.180, #1542): the handler argument
                 // (arg 0) of a `<static event>.Subscribe(...)` / `.Add(...)`
                 // call must be capture-free — a non-capturing lambda or a
@@ -5053,13 +5287,35 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         ctorDecl->params[posn].type) {
                         lsym->declType = ctx_.resolvedType(
                             *ctorDecl->params[posn].type);
-                        // out params are nullable refs — strip nullable (the
-                        // variable holds the non-nullable value), as for methods.
-                        if (lsym->declType && lsym->declType->nullable) {
-                            TypeRef* nn = ctx_.makeTypeRef(*lsym->declType);
-                            nn->nullable = false;
-                            lsym->declType = nn;
-                        }
+                        // §22.4 / §7.9 (#2409, mirroring #1597's CallExpr
+                        // fix): record whether a read of this inline
+                        // constructor out var on a path where the `new` call
+                        // did not run is a definite-assignment error — true
+                        // only for a NON-nullable reference-typed out param
+                        // (no default). Captured from the DECLARED type
+                        // BEFORE any nullable-strip, exactly as the
+                        // method-call path (~line 4357) does.
+                        lsym->outVarNeedsDefiniteAssignment =
+                            isNonNullableReferenceType(lsym->declType);
+                        // §22.4 / §7.9 (#2409, mirroring #1597): do NOT strip
+                        // the out-param's declared nullability — see the
+                        // CallExpr case's #1597 comment (~line 4359) for the
+                        // full rationale, which applies identically here: a
+                        // nullable ctor `out` param (`T?`) must produce a
+                        // `T?` inline recipient so §7.4's nullable-member-
+                        // access rule and §22.4's `when true`/`when false`
+                        // narrowing have a nullable type to narrow from. This
+                        // block used to unconditionally clear `nullable`
+                        // here (the pre-#1597 CallExpr behavior, never
+                        // updated when constructor out-vars gained this
+                        // same inline form, #968/#1305) — harmless for
+                        // codegen's pointer lowering but wrong for the type
+                        // checker, which then treated the recipient as
+                        // provably non-null forever after and silently
+                        // widened past the constructor's declared `T?`
+                        // signature. A non-nullable out param's declType
+                        // already has `nullable == false`, so removing the
+                        // strip is a no-op for that case.
                     }
                     currentScope_->names[id->name] = lsym;
                 }
@@ -5076,11 +5332,55 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         ctorDecl->params[posn].type) {
                         lsym->declType = ctx_.resolvedType(
                             *ctorDecl->params[posn].type);
-                        if (lsym->declType && lsym->declType->nullable) {
-                            TypeRef* nn = ctx_.makeTypeRef(*lsym->declType);
-                            nn->nullable = false;
-                            lsym->declType = nn;
-                        }
+                        // §22.4 / §7.9 (#2409, mirroring #1597's CallExpr
+                        // `out owned var` fix): do NOT strip the declared
+                        // nullability — same reasoning as the plain `out var`
+                        // case just above. Deliberately NOT setting
+                        // `outVarNeedsDefiniteAssignment` here, matching
+                        // #1597's own CallExpr `out owned var` block exactly
+                        // (~line 4408 above): DefiniteAssignment.cpp's
+                        // `visitCallArg` only consults that flag when
+                        // `a.modifier == "out var"` literally, never for
+                        // `out owned var` — per its own comment, the owning
+                        // inline forms carry a per-path disposal obligation
+                        // handled by the OWNERSHIP pass instead, and are
+                        // deliberately not DA-tracked here.
+                    }
+                    currentScope_->names[id->name] = lsym;
+                }
+            }
+            // §22.4 (v0.235, #2430): `out using var x` at a CONSTRUCTOR call
+            // site declares x inline — the constructor analogue of the
+            // `out owned var` block just above (parallel to how that block
+            // parallels plain `out var`). §22.4 states the accepted call-site
+            // forms for an `out owned` parameter are "`out using var x` (a
+            // scope-bound owned local) and `out owned var x`" — both were
+            // already handled for a METHOD call (ExprTypecheck_Exprs.cpp
+            // ~line 4643), but this NewExpr argument-registration loop had a
+            // block for `out var` (#968) and `out owned var` (#1305/#2409)
+            // and no block at all for `out using var`, so `n` in
+            // `new Widget(s, out using var n)` was never registered as a
+            // local: every later reference to it failed the ordinary
+            // unresolved-identifier check. Mirrors the `out owned var` block
+            // immediately above (declType from the matching `out owned`
+            // ctor formal, no generic-substitution / builtin-receiver
+            // derivation — a constructor call is never a builtin Try*
+            // method, so that machinery in the CallExpr sibling does not
+            // apply here, matching this NewExpr path's existing scope for
+            // its `out owned var` sibling).
+            if (a.modifier == "out using var" && a.value && currentScope_) {
+                if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                   a.value.get())) {
+                    auto* lsym = ctx_.makeSymbol<LocalSymbol>();
+                    lsym->name = id->name;
+                    lsym->decl = id;
+                    if (ctorDecl && posn < ctorDecl->params.size() &&
+                        ctorDecl->params[posn].type) {
+                        lsym->declType = ctx_.resolvedType(
+                            *ctorDecl->params[posn].type);
+                        // per §22.4 / §7.9: do NOT strip the declared
+                        // nullability — same reasoning as the `out var` /
+                        // `out owned var` blocks above.
                     }
                     currentScope_->names[id->name] = lsym;
                 }
@@ -5144,7 +5444,22 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     hintPrim == PrimitiveType::UInt)
                     currentLiteralWideningHint_ = hintPrim;
             }
+            // fix #2543 (§23, v0.236): exempt a `ref`/`out` constructor
+            // argument operand from the bare-read-of-write-only-indexer
+            // gate (IndexExpr visit). Same exemption as the CallExpr arg
+            // visit above — the ref/out operand pass
+            // `checkRefOutPropertyOperand` (#2530) is the specialized gate
+            // for that position.
+            const ast::Expr* savedRefOutNew = refOutArgTargetNode_;
+            refOutArgTargetNode_ =
+                (a.modifier == "ref" || a.modifier == "out" ||
+                 a.modifier == "out var" ||
+                 a.modifier == "out using var" ||
+                 a.modifier == "out owned var")
+                    ? a.value.get()
+                    : nullptr;
             if (a.value) visitExpr(*a.value);
+            refOutArgTargetNode_ = savedRefOutNew;
             currentLiteralWideningHint_ = savedNewHint;
             // §22.3 (v0.184, #1682): validate a bare `ref`/`out` constructor
             // argument's operand category (a no-op for every other
@@ -5163,28 +5478,58 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // narrows its own branches exactly as an if-STATEMENT condition
         // narrows its controlled block (per §7.4 v0.210 first bullet,
         // "in an `if`/`elif` condition … of the §20 conditional atom,
-        // each condition narrowing its own branches"). Save the entry
-        // narrowings, push true-branch facts before thenValue, false-
-        // branch facts before elseValue, restore after — mirroring the
-        // IfStmt save/restore in ExprTypecheck.cpp around the two
-        // bodies. The post-`if` expression state is irrelevant (a
-        // conditional atom yields one of the two branch values, with no
-        // following statements on either path); the entry state is what
-        // any enclosing context resumes with.
+        // each condition narrowing its own branches"). Each branch is
+        // seeded from the ENTRY state plus its own polarity's facts (the
+        // other branch did not execute on this path), mirroring the
+        // IfStmt walk in ExprTypecheck.cpp.
+        //
+        // fix #2258 / §7.4: the after-atom state is `entry ∩ thenExit ∩
+        // elseExit`, NOT the entry snapshot. The #2105 landing justified
+        // assigning the entry state back with "the post-`if` expression
+        // state is irrelevant (a conditional atom yields one of the two
+        // branch values, with no following statements on either path)" —
+        // which is false: a branch VALUE can be a call, and execution
+        // continues after the atom. A branch that invalidated a fact
+        // (§7.4 "How narrowing is invalidated": a `ref`/`out` argument,
+        // a call/`await` on a mutably-captured local) had that fact
+        // RESURRECTED, so `if s = null then return 0; end; var n: int :=
+        // (if c then C.ClearI(ref s) else 0); return s.Length;` was a
+        // silent ACCEPT that SIGSEGV'd. Exactly one branch runs, so a
+        // fact survives the atom only if it survived BOTH — the same
+        // all-paths join the IfStmt walk computes over its fall-through
+        // exits. Intersecting with `entry` additionally un-seeds what the
+        // CONDITION established for a branch (it holds only inside that
+        // branch).
         auto entryNarrowings = narrowings_;
         auto entryNullNarrowed = nullNarrowed_;
         auto entryFieldNarrowed = fieldNarrowed_;
         // §28.3 A7 (v0.209, #2080): an if-expression BRANCH is a marked-
         // transfer admission position — announce the exact child node.
         const ast::Expr* savedSlot = markedArmSlot_;
+        bool haveThenExit = false;
+        std::unordered_set<Symbol*> thenExitNull;
+        std::unordered_map<Symbol*, TypeRef*> thenExitNarrowings;
+        std::set<std::pair<std::uint32_t, std::uint32_t>> thenExitField;
         if (ce->thenValue) {
+            // §12.7 (#2258): reset the TYPE narrowings per branch too — the
+            // three sets are one state. Without this the `then` branch's
+            // `b is Derived` fact was still live while the `else` VALUE was
+            // checked, so `(if b is Derived then 1 else b.M())` resolved `M`
+            // against `Derived` and compiled a wrong-typed dispatch on the
+            // path where the test FAILED (probe-confirmed silent ACCEPT).
+            narrowings_ = entryNarrowings;
             nullNarrowed_ = entryNullNarrowed;
             fieldNarrowed_ = entryFieldNarrowed;
             collectNarrowings(ce->condition.get(), /*forTrueBranch=*/true);
             markedArmSlot_ = ce->thenValue.get();
             visitExpr(*ce->thenValue);
+            thenExitNull = nullNarrowed_;
+            thenExitNarrowings = narrowings_;
+            thenExitField = fieldNarrowed_;
+            haveThenExit = true;
         }
         if (ce->elseValue) {
+            narrowings_ = entryNarrowings;
             nullNarrowed_ = entryNullNarrowed;
             fieldNarrowed_ = entryFieldNarrowed;
             collectNarrowings(ce->condition.get(), /*forTrueBranch=*/false);
@@ -5192,9 +5537,14 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             visitExpr(*ce->elseValue);
         }
         markedArmSlot_ = savedSlot;
-        narrowings_ = entryNarrowings;
-        nullNarrowed_ = entryNullNarrowed;
-        fieldNarrowed_ = entryFieldNarrowed;
+        // The live sets hold the else branch's exit (or, for a branch-less
+        // malformed atom, the entry state); fold in the entry snapshot and the
+        // then branch's exit. // per §7.4 (#2258)
+        intersectNarrowingSetsWith(entryNullNarrowed, entryNarrowings,
+                                   entryFieldNarrowed);
+        if (haveThenExit)
+            intersectNarrowingSetsWith(thenExitNull, thenExitNarrowings,
+                                       thenExitField);
     } else if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(&e)) {
         if (te->operand) visitExpr(*te->operand);
     } else if (auto* th = dynamic_cast<const ast::ThrowExpr*>(&e)) {
@@ -5835,6 +6185,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // expression-case arm's `do … end` body can contain early-exit `if`
         // statements that establish facts.
         auto caseRunningField = fieldNarrowed_;
+        // §7.4 (#2258): fold THIS arm's exit into the running intersection.
+        // Named (not inlined at the loop tail) because one arm path — the
+        // choice-destructure arm below — `continue`s past the tail, and
+        // skipping the fold there loses that arm's DROPS.
+        auto foldArmExitIntoRunning = [&] {
+            for (auto it = caseRunningField.begin();
+                 it != caseRunningField.end();) {
+                if (fieldNarrowed_.count(*it)) ++it;
+                else it = caseRunningField.erase(it);
+            }
+        };
         for (const auto& arm : ce->arms) {
             fieldNarrowed_ = caseRunningField;  // §7.4 #2116: per-arm base
             // §19 / §A (#727): in a SCRUTINEE-LESS `case`, an arm's pattern is a
@@ -6238,6 +6599,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                         for (const auto& bs : arm.stmts)
                             if (bs) visitStmt(*bs);
                         currentScope_ = saveScope;
+                        // §7.4 (#2258): this path leaves the arm loop early,
+                        // so fold the arm's exit HERE — the loop-tail fold
+                        // never runs for it, and a fact this arm DROPPED
+                        // would be resurrected in the after-case state.
+                        foldArmExitIntoRunning();
                         continue;  // skip the record-destructure path
                     }
                 }
@@ -6497,6 +6863,18 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // for this arm's condition, restore on exit. Mirrors
                 // the IfStmt save/restore in ExprTypecheck.cpp and the
                 // §20 conditional atom save/restore above (#2105).
+                //
+                // fix #2258 / §7.4: the un-seeding below is an
+                // INTERSECTION, never an assignment — restoring the
+                // arm's ENTRY snapshot resurrected every fact the arm
+                // legitimately invalidated (a `ref`/`out` argument in
+                // the arm's result expression, a call on a mutably-
+                // captured local; §7.4 "How narrowing is invalidated"),
+                // and since it ran BEFORE the #2116 fold the fold saw
+                // the resurrected state instead of the arm's real exit.
+                // The intersection keeps the DROPS and still discards
+                // what the arm CONDITION seeded. Same reasoning and
+                // same wording as the CaseStmt counterpart.
                 auto armEntryNarrow = narrowings_;
                 auto armEntryNull = nullNarrowed_;
                 auto armEntryField = fieldNarrowed_;
@@ -6520,16 +6898,12 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     markedArmSlot_ = savedMtSlot;
                 }
                 for (const auto& s : arm.stmts) if (s) visitStmt(*s);
-                narrowings_ = armEntryNarrow;
-                nullNarrowed_ = armEntryNull;
-                fieldNarrowed_ = armEntryField;
+                intersectNarrowingSetsWith(armEntryNull, armEntryNarrow,
+                                           armEntryField);  // §7.4 #2258
             }
-            // §7.4 #2116: fold this arm's exit into the running intersection.
-            for (auto it = caseRunningField.begin();
-                 it != caseRunningField.end();) {
-                if (fieldNarrowed_.count(*it)) ++it;
-                else it = caseRunningField.erase(it);
-            }
+            // §7.4 #2116/#2258: fold this arm's exit into the running
+            // intersection (see the lambda).
+            foldArmExitIntoRunning();
         }
         fieldNarrowed_ = std::move(caseRunningField);  // §7.4 #2116
         currentScope_ = preArmEnumScope;  // §10.6 (#772): pop the enum scope

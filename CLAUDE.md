@@ -103,7 +103,7 @@ checks against `__GNUC__`. The build is expected to be configurable
 with `cmake -DCMAKE_CXX_COMPILER=clang++ ...` or to set the compiler
 explicitly in the root CMakeLists.txt.
 
-### Build & test speed (the build is dominated by the large `bezel_tests` target)
+### Build & test speed (the build is dominated by the test suite)
 
 (This file states sizes qualitatively on purpose — exact counts like the test
 total or TU count drift every run, so they are not hardcoded here. For a live
@@ -120,10 +120,29 @@ the build cage's memory budget: pass `-j16` (or use `cmake --build --preset
 default`, which sets jobs); the bundled scripts default to `-j16`. A clean build
 is ~2 min and a one-file edit→relink is ~1–2s.
 
-**Run the test suite in parallel**, not as the raw binary — the single binary is
+**The suite is several per-area binaries, not one.** `tests/CMakeLists.txt`
+splits the test sources along the existing `tests/<area>/` directories into
+`build/tests/bezel_tests_{codegen,ownership,sema,frontend,module,support}`, so a
+test-only edit relinks only its own area and a lane can build+run just its area
+(`scripts/agent_check.sh --area sema <filter>`). **`bezel_tests` is still the
+target name** (`cmake --build build --target bezel_tests` builds them all), so
+build commands are unchanged; anything that needs a *path* reads the
+CMake-generated manifest `build/tests/test_binaries.txt`
+(`<group> <TAB> <path> <TAB> <#sources>`) — never hardcode a binary path, and
+never enumerate the areas by hand. Two configure-time FATAL_ERROR invariants
+guarantee the split is a true partition (every discovered `tests/**/*.cpp` is in
+exactly one binary; a `tests/<newdir>/` no group claims is a hard error), so the
+union of the binaries is exactly the whole suite.
+
+**Run the test suite in parallel**, not as a raw binary — a single binary is
 serial gtest (several minutes). Use `tests/run_parallel.sh 16` (or `cmake --build
-build --target check`): it shards `bezel_tests` across cores (each shard a
-separate process via `BEZEL_SHARD_*`), running the whole suite in ~2 min. Tests
+build --target check`): it slices EVERY test binary across cores (each shard a
+separate process via `BEZEL_SHARD_*`) and feeds the slices through one queue
+whose width is that first argument — so the argument is the *concurrency* cap
+(the resource knob the ASan gate lowers to 8), not a per-binary shard count.
+Accounting is per binary: each one's `ran` must equal its own registry total and
+every one of its shards must have printed a completion summary, so a dropped or
+crashed slice in any binary still fails loudly. Tests
 drive the *real* `bezelc` AOT path (fork-isolated `Driver::compileFile` + clang
 link + native exec) — the strict oracle. The sharded `--full` run (`scripts/gate.sh`)
 is **authoritative** (#1861): every test is process-isolated (a fork'd compile +
@@ -132,8 +151,11 @@ structurally impossible and the always-on serial pass was retired. The sharded
 runner *can* over-report under fork/link contention — but that shows up as a
 whole-suite timeout, not a real failure; to disambiguate, re-run the specific
 suspect test(s) in isolation with `BEZEL_TEST_FILTER=<name>` (a single-process
-run), NOT a full serial pass. (The binary silently ignores `--gtest_filter`;
-`BEZEL_TEST_FILTER` is the substring selector.) See `tests/README.md` for the
+run), NOT a full serial pass. (The binaries silently ignore `--gtest_filter`;
+`BEZEL_TEST_FILTER` is the substring selector. `BEZEL_TEST_ENUMERATE=1` lists
+what a process *would* run, one `suite.name` per line, without running it — that
+is how tooling finds which area binary holds a filter, and how the partition is
+proved.) See `tests/README.md` for the
 harness (`runAot` / `runAotChecked` / lit+FileCheck) and how to write a test;
 `BEZEL_AOT_LINK_TOKENS` caps concurrent compiles when several agents run the
 suite at once. (The former in-process JIT harness — a *lenient* oracle that
@@ -168,7 +190,13 @@ you cannot get it wrong — it reconfigures (so a *new* test `.cpp` is picked up
 foreground — no background waiter to stall on), removes the stale binary first,
 and runs ONLY your targeted filter:
 `scripts/agent_check.sh <filter> [filter2 …]` (substring on gtest suite-or-name,
-NOT the file basename). For a single `.bzl`: `scripts/agent_check.sh --probe
+NOT the file basename). You do **not** need to know which area binary holds your
+test — it enumerates the binaries (~30 ms each) and runs exactly the ones that
+match, so a filter spanning two areas runs in both. Add `--area <group>` (e.g.
+`--area sema`) to restrict the *build* as well: after a `src/` change that is
+the difference between relinking one ~50 MB binary and all ~600 MB of them,
+which matters on this I/O-contended box. For a single `.bzl`:
+`scripts/agent_check.sh --probe
 FILE.bzl` (or `--probe --asan FILE.bzl` for memory/disposal fixes, with a hang
 timeout); all probe output goes to the scratch dir, never the repo root. It
 REFUSES an empty filter and `--gtest_filter` (the binary silently ignores that

@@ -17,7 +17,6 @@ namespace bezel::ownership {
 // The statement/flow-walking definitions live in Ownership.cpp alongside
 // the public checkOwnership entry point.
 
-namespace {
 // §28.8.1 (#1125): the operand of a `move` may be a force-unwrap of a nullable
 // owned field/local — `move _slot!` / `move this._slot!`. The null-forgiving
 // `!` is a postfix PostfixBangExpr wrapping the field/local reference. The spec
@@ -28,6 +27,14 @@ namespace {
 // so the move-recognition below sees the field/local identifier. (Undiagnosed,
 // the field stays moved-from with no restoration check, and the owner's
 // auto-disposer re-disposes the moved-out object → double-free / SIGSEGV.)
+//
+// #2518: hoisted out of the anonymous namespace so the `checkOwnedFieldReturn`
+// arms in Ownership.cpp (a separately-compiled TU) can thread it through the
+// §28.6 bullet 2 / §28.8.1 field-read test — `return _f!` through an `owned`
+// return and `return move _f!` through a non-`owned` return are the force-
+// unwrap twins of #2368 / #1005 and must be classified identically to their
+// bare forms (the `!` does not make `_f` a `move`, and `move _f!` is still a
+// `move` of the underlying owned field). Declared in Ownership_impl.hpp.
 const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e) {
     // The null-forgiving `!` is a postfix operator → PostfixBangExpr (§A.7),
     // not a prefix UnaryExpr.
@@ -35,6 +42,8 @@ const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e) {
         if (b->operand) return b->operand.get();
     return e;
 }
+
+namespace {
 
 // §22.10 (#1627): resolve the parameter list that a `new T(args)` call binds to,
 // for the owned-argument / call-site-marker checks in the NewExpr handlers.
@@ -189,19 +198,48 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             // operand-category rule — see recordMovesInArgs' twin call.
             checkRefOutOwnedOperand(a);
             // §28.8 / §28.13: is this argument position an owned sink? A ctor
-            // `owned` (or `out owned`) formal, or the implicit owned parameter
-            // of `new Shared<T>(value)` at position 0. The `owned`/`move`/borrow
+            // `owned` formal, or the implicit owned parameter of
+            // `new Shared<T>(value)` at position 0. The `owned`/`move`/borrow
             // classification below is identical to the method-call path
             // (recordMovesInArgs); the call-site `owned` marker (§22.3, v0.169)
             // is layered on top of the SAME classification.
+            //
+            // #2436: deliberately does NOT include `"out owned"` here — an
+            // `out owned` ctor formal is the owned-OUT direction (the argument
+            // RECEIVES ownership, marked Owned by markOutOwnedArgs below, not
+            // an owned-IN sink that CONSUMES the caller's argument), exactly
+            // as recordMovesInArgs's `userOwned` check (this function's
+            // method-call analogue, ~line 339-341) already documents: "an
+            // `out owned` formal is the owned-OUT direction ... NOT an owned-IN
+            // sink; only a plain `owned` formal consumes the argument here."
+            // This ctor-specific classifier had DIVERGED from that documented
+            // rule (a #2429 copy/paste-era bug, not something #2429 itself
+            // introduced deliberately): including `"out owned"` made THIS loop
+            // route a fresh `out owned var n` recipient identifier through
+            // `markMovedByName` (below) as if `n` were an existing owned value
+            // being MOVED INTO the constructor. On a first straight-line
+            // occurrence this was silently harmless (`n` is not yet in
+            // `states_`, so `markMovedByName`'s `lookupState` finds nothing and
+            // no-ops) — but on a for/while loop's second logical iteration,
+            // where the SAME inline recipient symbol re-enters this call with
+            // its PRIOR iteration's discharged (Disposed) state already
+            // present in `states_` (see the markOutOwnedArgsCore fix above),
+            // this misclassification reported a spurious "cannot move from
+            // disposed local `n`" — a second, independent defect compounding
+            // the same false-reject repro #2436 files under the ctor form.
+            // Excluding `"out owned"` here restores the method-call path's
+            // (correct) behavior: the identifier falls through to the plain
+            // `recordMovesIn(*a.value)` tail below, a no-op for a bare
+            // identifier (recordMovesIn has no IdentifierExpr arm) — out-owned
+            // marking is handled exclusively by `markOutOwnedArgs(ne->args,
+            // ctorParams)` at the end of this function. // per §28.8, §28.3, #2436
             // §22.5 (v0.184, #1973): key off the BOUND ctor parameter (named-arg
             // binding), not the source position — see boundParamIndex.
             const std::size_t boundPos =
                 ctorParams ? boundParamIndex(ne->args, pos, *ctorParams) : pos;
             const bool ctorOwnedSink =
                 ctorParams && boundPos < ctorParams->size() &&
-                ((*ctorParams)[boundPos].modifier == "owned" ||
-                 (*ctorParams)[boundPos].modifier == "out owned");
+                (*ctorParams)[boundPos].modifier == "owned";
             const bool ownedSink =
                 ctorOwnedSink || (isSharedNew && pos == 0);
             // §22.3 (v0.169, #1348): the `owned` marker is only valid on an
@@ -271,6 +309,19 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             recordMovesIn(*a.value);
             ++pos;
         }
+        // §28.3 / §22.4 (v0.235, issue #2429): mirror recordMovesInArgs'
+        // final `markOutOwnedArgs(args, callee)` call — after the owned-IN
+        // consume walk above, model the caller-side owned-OUT transfer for
+        // the ctor's `out owned` formal(s): the recipient RECEIVES ownership
+        // and becomes Owned, arming the §28.3 affine auto-drop / must-use
+        // warning end-of-scope check (Ownership.cpp) exactly as a method
+        // call's `out owned var` recipient already does. Without this call
+        // the recipient's LocalSymbol never enters `states_`, so it is
+        // invisible to that scan: no warning, no scope-end disposal — a
+        // silent leak (root cause of #2429; found during #2411's adversarial
+        // self-pass). Uses the ctorParams-taking overload since a NewExpr
+        // has no "callee" Expr to resolve a parameter list from.
+        markOutOwnedArgs(ne->args, ctorParams);
         return;
     }
 }
@@ -1294,6 +1345,25 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // diverted to markDisposedByName for a precise double-dispose message
         // via skipCalleeReadForDispose below. Poison to suppress cascades
         // (and the redundant scope-end leak diagnostic).
+        // #2439 sweep: as with markMovedByName below (see that function's
+        // comment for the full mechanism), do NOT poison the record while
+        // suppressDiag_ (the O3b fixpoint phase) is still iterating. This
+        // branch's own guard (`state == Owned`) makes the failure mode even
+        // more direct than markMovedByName's: the VERY FIRST suppressed-pass
+        // evaluation of a loop-carried maybe-consumed read poisons the
+        // record, and since checkRead has no Poisoned-reviving fallthrough
+        // (unlike the pre-fix markMovedByName, it correctly leaves a
+        // Poisoned record alone on every later visit — no oscillation), the
+        // state simply STAYS Poisoned through convergence and into the final
+        // (unsuppressed, diagnosing) pass — where this branch's own
+        // `state == Owned` guard then permanently refuses to re-fire,
+        // because poisoning already overwrote the very fact (Owned +
+        // maybeConsumed) it needs to observe to report for real. Confirmed
+        // via a probe mirroring the issue's own repro with the consuming
+        // operation swapped for an unmarked (borrowing) read: `if i = 0 then
+        // Sink.Take(move n); end; Reader.Peek(n);` inside a loop compiled
+        // clean with zero diagnostics even after the markMovedByName fix
+        // below, silently accepting a borrow of what may be freed memory.
         if (st->maybeConsumed &&
             st->state == OwnershipState::Owned) {
             report(
@@ -1303,7 +1373,7 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
                 "not be read here (maybe-consumed join, §28.3) — equalize the "
                 "branches before the merge, or confine every use of `" +
                 std::string(id->name) + "` to a single branch");
-            st->state = OwnershipState::Poisoned;
+            if (!suppressDiag_) st->state = OwnershipState::Poisoned;
             return;
         }
         // §28.3 (#1883): the OWNED ⊓ DISPOSED join — one branch disposed
@@ -1324,6 +1394,14 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // is the proper discharge on the still-owned path and a no-op
         // on the disposed path, and rejecting it would over-reject that
         // valid program. // per §28.3, §28.2
+        // #2439 sweep: identical shape/fix rationale to the maybeConsumed
+        // branch just above — a loop-carried `disposedOnSomePath` fact is
+        // permanently destroyed by poisoning during the suppressed fixpoint
+        // phase (the `state == Owned` guard then never re-fires on the
+        // final pass). Confirmed via a probe: `if i = 0 then n.Dispose();
+        // end; Reader.Peek(n);` inside a loop compiled clean with zero
+        // diagnostics, silently accepting a read on the disposed-branch
+        // path every iteration after the first.
         if (st->disposedOnSomePath &&
             st->state == OwnershipState::Owned) {
             report(
@@ -1334,7 +1412,7 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
                 "/ §28.2 — confine every read of `" +
                 std::string(id->name) + "` to a single branch, or "
                 "reassign it after the discharge to clear the obligation)");
-            st->state = OwnershipState::Poisoned;
+            if (!suppressDiag_) st->state = OwnershipState::Poisoned;
             return;
         }
         if (st->state == OwnershipState::MovedFrom) {
@@ -1399,8 +1477,39 @@ void MethodOwnership::checkRead(const ast::Expr& e, bool selfTarget) {
         // Treat the callee as a member-access-target for discharge
         // tolerance (so `x.M(x)` doesn't flag x).
         if (call->callee) checkRead(*call->callee, true);
+        std::size_t pos = 0;
         for (const auto& a : call->args) {
-            if (a.value) checkRead(*a.value, false);
+            if (!a.value) { ++pos; continue; }
+            // §28.3 / §28.11 (#860 / #892, #2436): an `out owned var` argument
+            // is a WRITE target — the call DEPOSITS a fresh owned value into
+            // the local; it does not read whatever `n` happened to be tracked
+            // as before this call. Skip the read-check for it, mirroring
+            // handleDischarge's identical carve-out for the bare-statement
+            // call form (this file, ~line 792-804: "an `out owned` arg is a
+            // WRITE target ... Skip read-checking it (a stale Disposed state
+            // from a prior loop iteration would otherwise produce a spurious
+            // use-after-dispose warning)"). checkRead walks the WHOLE
+            // initializer/RHS expression BEFORE recordMovesIn/markOutOwnedArgs
+            // runs (handleLocalDecl calls checkRead first, then classifies the
+            // state later), so on a for/while loop's second logical iteration
+            // — where the recipient's PRIOR-iteration Disposed/MovedFrom state
+            // is still the one carried into this block's entry state (the O3b
+            // loop back-edge's union-key meet) — this blanket recursion read
+            // that STALE state and reported a spurious use-after-dispose
+            // warning on a value that is about to be freshly re-minted by
+            // THIS call. This was invisible on the FIRST occurrence (the
+            // recipient is not yet in `states_` at all, so `checkRead`'s
+            // IdentifierExpr arm early-returns) and invisible on the
+            // bare-statement call form (handleDischarge already carves it
+            // out) — only the LocalDecl-initializer / assignment-RHS forms
+            // (which route through THIS function, per recordMovesInArgs' own
+            // comment) were exposed. // per §28.3, §28.11, #2436
+            if (a.modifier == "out owned var" ||  // per §22.4 / v0.160
+                builtinOutOwnedArg(call->callee.get(), pos)) {
+                ++pos; continue;
+            }
+            checkRead(*a.value, false);
+            ++pos;
         }
         return;
     }
@@ -2598,10 +2707,10 @@ namespace {
 // (§9.7 transitivity: "another borrow-bearing record … (transitivity)" applied
 // to the span views, which are borrow-bearing records without a user TypeDecl).
 // Name-head resolution mirrors builtinTypeRefNameHead (declaration name, else
-// use-site syntactic head, else imported name). The string-backed spans
-// (ReadOnlyStringSpan / ReadOnlyAsciiByteSpan) view a runtime-managed `string`
-// and are deliberately NOT here (§9.7); CancellationToken (§30.8) is a value
-// builtin and likewise not a span. // per §9.7, §4.14, §4.15
+// use-site syntactic head, else imported name). The string-backed span
+// ReadOnlyStringSpan views a runtime-managed `string` and is deliberately NOT
+// here (§9.7); CancellationToken (§30.8) is a value builtin and likewise not a
+// span. // per §9.7, §4.14, §4.15
 bool isBuiltinSpanTypeRef(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
     const std::string_view n =
@@ -4365,11 +4474,71 @@ bool MethodOwnership::checkBorrowStoreEscape(const ast::AssignmentStmt& as) {
     // `isNullSourceChoiceExpr` (#2209) for the same reason the record branch
     // uses `isNullSourceRecordExpr`: an `Opt.None` / `Choice.Empty` / explicit
     // `Borrowed(null)` payload admits the storage. Two distinct diagnostics
-    // so the message names the carrier kind. // per §9.7, §35.4
-    if (dest == Dest::Field) {
+    // so the message names the carrier kind.
+    //
+    // §9.7 / §4.14 / §4.15 (issue #1251): the builtin SPAN face. `Span<T>`,
+    // `ReadOnlySpan<T>` (stdlib §4.14) and `ArraySpan<T>`,
+    // `ReadOnlyArraySpan<T>` (stdlib §4.15) are declared in the stdlib as
+    // records over a class-typed backing store (`Buffer: OwningBuffer<T>` /
+    // `Source: Array<T>`), so they are borrow-bearing records by §9.7's own
+    // definition — indeed §9.7 names one as the CANONICAL case of this very
+    // bullet ("may be consumed through access paths with no per-access
+    // disposed-flag check (a span's buffer window is the canonical case)").
+    // But a builtin span has no user Record TypeDecl, so `isBorrowBearing
+    // Record` — which requires one — never classified it and a BARE span RHS
+    // slipped through this leg entirely: `class Box public f: ArraySpan<int>;`
+    // with `box.f := buf.AsSpan();` compiled clean and SEGV'd at runtime once
+    // the backing buffer was disposed. `isBorrowBearingRecordOrSpan` is the
+    // predicate that already names the builtin spans for the §30.1 async and
+    // §9.7 return-escape legs; using it here closes the field-store leg with
+    // the same authority. (A record that merely CONTAINS a span field was
+    // already covered — recordFieldIsBorrowCarrying classifies a span field,
+    // #2127; this is the bare-span RHS.)
+    //
+    // No null-source exemption applies on the span leg: §9.7's exception is
+    // "every borrow component `null`", and a span's backing-store field is
+    // non-nullable (stdlib §4.14/§4.15) — there is no null-source span. (The
+    // recognizer agrees: isNullSourceRecordExpr requires a `new Rec(...)` of
+    // a user Record TypeDecl, which a builtin span never has.) A separate
+    // diagnostic names the span and its backing store so the remedy is the
+    // concrete one, matching the span/record split the §9.7 return-escape
+    // wording already draws. // per §9.7, §4.14, §4.15
+    //
+    // §9.7 / §9.1 (issue #1251): the whole leg is scoped by
+    // `storeTargetIsClassField` to a CLASS (or interface) instance field. The
+    // bullet's own words are "an instance field of a **class**", and its
+    // premise is that a class instance's lifetime is not bounded by any borrow
+    // source's scope. A RECORD's own component is a different thing: the record
+    // is a value, reached only through itself, and §9.7's transitivity clause
+    // makes a borrow-carrying record component exactly what defines a
+    // borrow-bearing record. Without the scope, a borrow-bearing BODY record
+    // was unconstructible — its constructor's `v := x;` (a bare implicit-`this`
+    // field write) was rejected, while §9.1's synthesized primary constructor
+    // for the identical positional record was free to do the same store.
+    if (dest == Dest::Field && storeTargetIsClassField(*as.target)) {
         const sema::TypeRef* rhsType = ctx_.exprType(*as.value);
         const bool rhsIsRecord = isBorrowBearingRecord(rhsType);
-        const bool rhsIsChoice = !rhsIsRecord && isBorrowBearingChoice(rhsType);
+        const bool rhsIsSpan =
+            !rhsIsRecord && isBorrowBearingRecordOrSpan(rhsType);
+        const bool rhsIsChoice =
+            !rhsIsRecord && !rhsIsSpan && isBorrowBearingChoice(rhsType);
+        if (rhsIsSpan) {
+            report(
+                Severity::Error, as.span.begin,
+                std::string(
+                    "a span may not be stored in an instance field of a "
+                    "class — a span (§4.14/§4.15) is a borrow-bearing record "
+                    "over its backing Array / OwningBuffer, and a class "
+                    "instance's lifetime is not bounded by that backing "
+                    "store's scope; a span's buffer window is read with no "
+                    "per-access disposed-flag check, so the checked-mode "
+                    "trust regime that covers a direct class-typed borrow "
+                    "field does not apply here (§9.7; store the backing "
+                    "store instead — e.g. an `owned OwningBuffer<T>` or "
+                    "`owned Array<T>` field — and re-derive the span with "
+                    "`AsSpan()` at the use site)"));
+            return true;
+        }
         if ((rhsIsRecord && !isNullSourceRecordExpr(*as.value)) ||
             (rhsIsChoice && !isNullSourceChoiceExpr(*as.value))) {
             report(
@@ -5215,6 +5384,21 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
     // not an error. The scope-end per-path auto-drop is the ONLY disposal a
     // maybe-consumed local still permits (and that runs only on the still-
     // owned branch). Poison to suppress the redundant scope-end leak diagnostic.
+    // #2439 sweep: identical shape/fix rationale to markMovedByName's own
+    // maybeConsumed branch below — poisoning here as an unconditional side
+    // effect of reporting, during the O3b fixpoint's suppressed phase, can
+    // corrupt a loop-carried maybe-consumed fact before the final
+    // (unsuppressed) pass gets a chance to observe it and report for real,
+    // and this function's own fallthrough (`st->state =
+    // OwnershipState::Disposed` a few lines below, with no explicit
+    // Poisoned-state branch) would silently "revive" a poisoned record on a
+    // later pass exactly as markMovedByName's did — see that function's
+    // comment for the fully-traced mechanism. Not mechanically reproduced
+    // as a live silent-accept for THIS specific call site (every shape
+    // tried converged correctly before the final pass), but the code shape
+    // is identical to the confirmed markMovedByName defect, so the same
+    // defensive gate is applied here rather than leaving a known-fragile
+    // sibling unfixed.
     if (st->maybeConsumed) {
         report(
             Severity::Error, loc,
@@ -5223,7 +5407,7 @@ void MethodOwnership::markDisposedByName(std::string_view name, SourceLocation l
             "(maybe-consumed join, §28.3) — disposing it here would "
             "double-dispose on the consuming branch; confine the disposal "
             "to a single branch or equalize the branches before the merge");
-        st->state = OwnershipState::Poisoned;
+        if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
     st->state = OwnershipState::Disposed;
@@ -5857,6 +6041,49 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
     // `move`/`owned`-transfer/`using var` adoption would transfer a stale
     // reference (a use-after-free / double-consume). The spec lists consume
     // alongside read and borrow as the uses a maybe-consumed join forbids.
+    //
+    // #2439 fix: do NOT poison the record while suppressDiag_ (the O3b
+    // fixpoint phase, see the field's doc comment in Ownership_impl.hpp) is
+    // still iterating. For a LOOP-carried maybe-consumed local — e.g. an
+    // owned local declared before the loop and unconditionally `move`d into
+    // a sink on every iteration — this same call re-executes once per
+    // fixpoint pass with the SAME Owned+maybeConsumed entry state, because
+    // the loop's back edge feeds this block's own exit state into the next
+    // pass's header entry (joinInto's union-key meet, `Ownership_Checks.cpp`
+    // ownedDischargedSplit). Poisoning here during the suppressed phase
+    // corrupts that back-edge value: on the NEXT pass, the header's meet of
+    // the pre-loop Owned edge against this block's now-Poisoned exit no
+    // longer matches ownedDischargedSplit (Poisoned is neither Disposed nor
+    // MovedFrom), so it falls through joinInto's generic "other mismatches"
+    // catch-all and the header's entry collapses to bare Poisoned — which
+    // this function (having no explicit Poisoned branch, by design: see
+    // OwnershipState::Poisoned's "suppress cascades" contract) does not
+    // recognize, so it falls through to the plain-move path below and
+    // silently "revives" the poisoned local into a fresh MovedFrom. That
+    // oscillates every pass (Owned+maybeConsumed -> Poisoned -> revived
+    // MovedFrom -> Owned+maybeConsumed -> ...) until the fixpoint's
+    // maxPasses backstop cuts it off at whatever parity it lands on, so the
+    // FINAL (unsuppressed, diagnosing) pass's own entry state for this
+    // block is corrupted noise instead of the converged Owned+maybeConsumed
+    // fact — and since the final pass's own maybeConsumed check needs that
+    // fact to fire, the diagnostic silently never prints while codegen still
+    // emits the double-free (confirmed via AddressSanitizer, issue #2439:
+    // an ordinary owned local moved into an owned-sink call inside an
+    // ordinary loop body was accepted with zero diagnostics and was a
+    // genuine heap-use-after-free at runtime).
+    //
+    // Leaving the record untouched during the suppressed phase keeps the
+    // loop fixpoint's per-pass entry/exit states IDENTICAL to what they were
+    // on the previous pass once the back-edge fact has propagated once, so
+    // the fixpoint genuinely stabilizes on the correct Owned+maybeConsumed
+    // value (matching the O3b fixpoint's own contract: "diagnostics
+    // suppressed [until] a single final pass ... over the STABILIZED entry
+    // states emits each diagnostic exactly once" — Ownership_impl.hpp). The
+    // final pass then observes that same stabilized fact fresh, unsuppressed,
+    // and both reports the error for real and poisons for real — exactly the
+    // established "poison after diagnosing" pattern this function already
+    // uses for every other branch, just deferred to the pass that actually
+    // gets to keep its diagnostic.
     if (st->maybeConsumed) {
         report(
             Severity::Error, loc,
@@ -5864,7 +6091,7 @@ void MethodOwnership::markMovedByName(std::string_view name, SourceLocation loc)
             "`: it may have already been consumed on another branch "
             "(maybe-consumed join, §28.3) — confine the consume to a single "
             "branch or equalize the branches before the merge");
-        st->state = OwnershipState::Poisoned;
+        if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
     // §28.3 (v0.180) consume-site freeze: this is the central consume of an owned
@@ -6347,6 +6574,25 @@ void MethodOwnership::markOutOwnedArgs(
                 params = &md->params;
         }
     }
+    markOutOwnedArgsCore(args, params, callee);
+}
+
+// §28.3 / §22.4 (issue #2429): the constructor-call overload — see the
+// header for why a NewExpr call has no "callee" Expr to resolve `params`
+// from and instead takes the already-resolved constructor parameter list
+// directly (recordMovesIn's NewExpr branch resolves it via
+// resolveCtorParams into `ctorParams`).
+void MethodOwnership::markOutOwnedArgs(
+        const std::vector<ast::CallArgument>& args,
+        const std::vector<ast::Param>* params) {
+    markOutOwnedArgsCore(args, params, /*callee=*/nullptr);
+}
+
+// §28.3 / §28.11 / §22.4 (issue #860, #2429): shared core. See the header.
+void MethodOwnership::markOutOwnedArgsCore(
+        const std::vector<ast::CallArgument>& args,
+        const std::vector<ast::Param>* params,
+        const ast::Expr* callee) {
     std::size_t pos = 0;
     for (const auto& a : args) {
         if (!a.value) { ++pos; continue; }
@@ -6389,15 +6635,46 @@ void MethodOwnership::markOutOwnedArgs(
                 // `everOwnedPlainLocals_` so the end-of-method discharge check
                 // catches it even if its enclosing block exits before the method
                 // return. per §22.4, §28.3
+                //
+                // #2436: this seed is UNCONDITIONAL — every visit re-establishes
+                // Owned, mirroring handleLocalDecl's unconditional
+                // `states_[lsym] = lo;` (Ownership.cpp ~line 4360) and
+                // seedOwnedIterVar's per-iteration reseed of a for-loop's owned
+                // iteration variable (Ownership.cpp ~line 2288). The prior
+                // "only if states_ lacks an entry" guard was correct for a
+                // straight-line call site but false-rejected the idiomatic
+                // pattern of declaring-and-fully-discharging this SAME inline
+                // recipient on every loop iteration: `states_` is reset from
+                // computeEntry() at the start of every block visit, and O3b's
+                // loop back-edge / zero-trip-skip merge is a UNION-KEY meet
+                // (joinInto's unionKeys branch) that carries a symbol present on
+                // only one incoming edge through VERBATIM — so a recipient
+                // symbol discharged (Disposed) at the end of iteration N is
+                // carried, unchanged, into the entry state of the block that
+                // re-declares it for iteration N+1 (the declaring call sits
+                // inside the loop body, or — for the while-condition
+                // `TryPop(out owned var item)` idiom, §28.3/#892 — inside the
+                // loop-header block itself, both revisited every iteration via
+                // the back edge). The stale "not absent" guard then read that
+                // carried-forward Disposed/MovedFrom state as "already seeded"
+                // and skipped the reseed, so iteration N+1 inherited iteration
+                // N's terminal state instead of a fresh Owned value — reported
+                // as "already moved out" (ctor form) or "used after dispose"
+                // (method-call form), even though the call mints a genuinely
+                // NEW value every time control reaches it — exactly like an
+                // ordinary `var w := new Widget();` inside a loop body, which
+                // handleLocalDecl already resets unconditionally on every
+                // visit. Removing the guard makes the two forms consistent: the
+                // inline `out owned var` recipient is a fresh binding at its
+                // declaring call site, on every iteration, no different from a
+                // ordinary LocalDecl. per §22.4, §28.3, #2436
                 if (a.modifier == "out owned var") {
                     if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
-                        if (states_.find(sym) == states_.end()) {
-                            LocalOwnership lo;
-                            lo.state = OwnershipState::Owned;
-                            lo.obligationOrigin = id;
-                            states_[sym] = lo;
-                            everOwnedPlainLocals_.insert(sym);
-                        }
+                        LocalOwnership lo;
+                        lo.state = OwnershipState::Owned;
+                        lo.obligationOrigin = id;
+                        states_[sym] = lo;
+                        everOwnedPlainLocals_.insert(sym);
                     }
                 } else {
                     // Pre-declared local (plain `out x`) or `out using var x`
@@ -7348,6 +7625,36 @@ bool MethodOwnership::targetIsOwnedField(const ast::Expr& target) const {
     return exprIsOwnedFieldRead(target);
 }
 
+// §9.7 / §9.1 (issue #1251): see the header for the rule. Reads the declaring
+// type of the member the target names — sema attaches the FieldSymbol /
+// PropertySymbol to both the `obj.f` member-access form and the bare
+// implicit-`this` identifier form — and answers "is this storage owned by a
+// class (or interface) instance?". A record's component answers false; so does
+// a choice's. An unresolvable target answers true, keeping the conservative
+// rejection for a shape this structural check cannot classify. // per §9.7
+bool MethodOwnership::storeTargetIsClassField(const ast::Expr& target) const {
+    const sema::TypeSymbol* owner = nullptr;
+    if (auto* ms = dynamic_cast<sema::MemberSymbol*>(ctx_.exprSymbol(target)))
+        owner = ms->parent;
+    if (!owner) {
+        // Fallback for a member access whose member symbol sema did not attach
+        // (e.g. an inherited or interface-dispatched member): classify by the
+        // RECEIVER's static type instead. `this.f` / `obj.f` / `C.f` all carry
+        // a resolved receiver type; anything else stays unclassified.
+        if (const auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
+            if (ma->target) {
+                const sema::TypeRef* rt = ctx_.exprType(*ma->target);
+                if (rt && rt->kind == sema::TypeRef::Kind::Named)
+                    owner = rt->declaration;
+            }
+        }
+    }
+    if (!owner) return true;  // unclassified → keep the rejection
+    return owner->kind == ast::TypeDeclKind::Class ||
+           owner->kind == ast::TypeDeclKind::Interface;
+}
+
 // #1020 / §28.6 (v0.153): a non-`owned` (borrow) field target. See the header.
 bool MethodOwnership::targetIsNonOwnedField(const ast::Expr& target) const {
     // Only a member access `obj.f` or a bare identifier resolving to a field
@@ -7395,7 +7702,8 @@ void MethodOwnership::checkGetterFreshOwnedReturn(const ast::Expr& e) {
 // initializer (producerState == Borrowed) is the legitimate back-reference
 // store and is not flagged. The diagnostic wording matches the constructor-body
 // counterpart so the two positions read identically. // per §28.6
-void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd) {
+void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd,
+                                            const ast::TypeDecl* enclosingType) {
     if (!fd.initializer) return;
     // Scope: INSTANCE fields only. A STATIC field follows the §22.13 static-init
     // model (its initializer runs at first-use, its value lives for the program
@@ -7421,12 +7729,47 @@ void MethodOwnership::checkFieldInitializer(const ast::FieldDecl& fd) {
     // a borrow-typed `local`) is rejected, with the same null-source
     // exception the record leg uses (an `Opt.None` payload-free case, or an
     // `Opt.Some(null)` with the borrow-carrying payload null, is admitted).
-    {
+    //
+    // §9.7 / §4.14 / §4.15 (issue #1251): the builtin SPAN face, in lockstep
+    // with checkBorrowStoreEscape's assignment-site leg — a field declared
+    // `f: ArraySpan<int> := …` is the same §9.7 instance-field store at the
+    // initializer position, and the same `isBorrowBearingRecord` gap let it
+    // through. No null-source exemption on the span leg (a span's backing-store
+    // field is non-nullable).
+    //
+    // §9.7 / §9.1 (issue #1251): the whole leg is scoped to a CLASS (or
+    // interface) declaring type, in lockstep with the assignment site's
+    // `storeTargetIsClassField` — §9.7's bullet says "an instance field of a
+    // **class**", and a RECORD's own borrow-carrying component is exactly what
+    // §9.7's transitivity clause defines as making the record borrow-bearing.
+    // A null `enclosingType` keeps the leg enabled (conservative). // per §9.7
+    const bool enclosingIsClass =
+        !enclosingType || enclosingType->kind == ast::TypeDeclKind::Class ||
+        enclosingType->kind == ast::TypeDeclKind::Interface;
+    if (enclosingIsClass) {
         const sema::TypeRef* fieldType =
             fd.type ? ctx_.resolvedType(*fd.type) : nullptr;
         const bool initIsRecord = isBorrowBearingRecord(fieldType);
+        const bool initIsSpan =
+            !initIsRecord && isBorrowBearingRecordOrSpan(fieldType);
         const bool initIsChoice =
-            !initIsRecord && isBorrowBearingChoice(fieldType);
+            !initIsRecord && !initIsSpan && isBorrowBearingChoice(fieldType);
+        if (initIsSpan) {
+            report(
+                Severity::Error, fd.initializer->span.begin,
+                std::string("a span may not be stored in the instance field `") +
+                std::string(fd.name) +
+                "` — a span (§4.14/§4.15) is a borrow-bearing record over its "
+                "backing Array / OwningBuffer, and a class instance's lifetime "
+                "is not bounded by that backing store's scope; a span's buffer "
+                "window is read with no per-access disposed-flag check, so the "
+                "checked-mode trust regime that covers a direct class-typed "
+                "borrow field does not apply here (§9.7; store the backing "
+                "store instead — e.g. an `owned OwningBuffer<T>` or `owned "
+                "Array<T>` field — and re-derive the span with `AsSpan()` at "
+                "the use site)");
+            return;
+        }
         if ((initIsRecord && !isNullSourceRecordExpr(*fd.initializer)) ||
             (initIsChoice && !isNullSourceChoiceExpr(*fd.initializer))) {
             report(
@@ -8569,6 +8912,31 @@ bool MethodOwnership::isDeferredActivationCallResult(
            head == "Task" || head == "OwningTask";
 }
 
+// §28.14 *Call-bounded × deferred activation* (v0.196): shared single-part-
+// head navigation over an AST type node — true when `t` is a Named type whose
+// head is an iterator/async-iterator interface or a Task-family type (the
+// deferred-activation shapes that can appear as a WRITTEN return type). Used by
+// returnTypeIsDeferredActivation (the enclosing method's declared return) and
+// lambdaReturnTypeIsDeferredActivation (a lambda's own ascribed `: Type`).
+// Null `t` (no ascription) returns false — the inferred case is handled by the
+// caller via isDeferredActivationCallResult on the body. Nullable `t?` returns
+// false: the deferred-activation announcement is the caller's re-establishment
+// against its own arguments, but a nullable return type permits a null result
+// the caller does not establish against, so the frame-residence carve-out does
+// not apply — same shape `isDeferredActivationCallResult` rejects via the
+// `rt->nullable` check on the call result's `TypeRef`. // per §28.14, §28.3 v0.196
+static bool isDeferredActivationTypeNode(const ast::Type* t) {
+    if (!t || t->kind != ast::TypeKind::Named || t->nullable || !t->name ||
+        t->name->parts.size() != 1)
+        return false;
+    std::string_view head = t->name->parts.front();
+    return head == "IEnumerable" || head == "IEnumerator" ||
+           head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
+           head == "IOwningEnumerable" || head == "IOwningEnumerator" ||
+           head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator" ||
+           head == "Task" || head == "OwningTask";
+}
+
 // §28.14 *Call-bounded × deferred activation* (v0.196): the declared-return-type
 // sibling of isDeferredActivationCallResult, used by the call-bounded frame-
 // residence check. Read directly from the AST return-type node's single-part
@@ -8576,15 +8944,21 @@ bool MethodOwnership::isDeferredActivationCallResult(
 // a frame RETURNED under one of these types is the announced frame residence,
 // not an escape of the callback it carries. // per §28.14, §28.3 v0.196
 bool MethodOwnership::returnTypeIsDeferredActivation() const {
-    if (!returnType_ || returnType_->kind != ast::TypeKind::Named ||
-        !returnType_->name || returnType_->name->parts.size() != 1)
-        return false;
-    std::string_view head = returnType_->name->parts.front();
-    return head == "IEnumerable" || head == "IEnumerator" ||
-           head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
-           head == "IOwningEnumerable" || head == "IOwningEnumerator" ||
-           head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator" ||
-           head == "Task" || head == "OwningTask";
+    return isDeferredActivationTypeNode(returnType_);
+}
+
+// #2343 (§28.14 v0.196): the per-lambda sibling of the above. A lambda's
+// expr-body `=> E` is an implicit return of `E`; the frame-residence carve-out
+// at that sink needs the LAMBDA's return type, not the enclosing method's. An
+// ascribed `: Type` reads that AST node (same navigation); an INFERRED return
+// type equals the exprBody's resolved type, so the announcement composes
+// exactly when the body is a frame (isDeferredActivationCallResult). The latter
+// is the spec's "expressible neighbor" idiom — `lambda(f) => xs.Where(f)` —
+// which must stay admitted. // per §28.14, v0.196, #2343
+bool MethodOwnership::lambdaReturnTypeIsDeferredActivation(
+    const ast::LambdaExpr& lam, const ast::Expr& exprBody) const {
+    if (lam.retType) return isDeferredActivationTypeNode(lam.retType.get());
+    return isDeferredActivationCallResult(exprBody);
 }
 
 // #1526 (§28.3): true when `arg` is a plain-argument "unbound owned
@@ -8697,10 +9071,27 @@ bool MethodOwnership::localIsOwnedObligation(const sema::LocalSymbol* ls) const 
 // provenance-row scope (T2 lambda literal + T3 method reference).
 void MethodOwnership::deferredActivationCaptureSources(
     const ast::Expr& arg, std::vector<CapSource>& out) {
+    // #2527 (§28.3 v0.196, sibling of #2342 §28.14): record the FORWARDED
+    // lambda's own params (+ nested lambdas' params within it) so the
+    // reduction gate below skips ONLY those (they are internal to the
+    // forwarded closure, not captures) WITHOUT skipping params of an
+    // ENCLOSING LAMBDA (which ARE captures — the #2527 residual from the
+    // methodParamSet_-only gate that #2342 just fixed in
+    // checkScopedAdmission). Populated by `scopedCollectCaptures` via the
+    // transient `scopedLambdaInternalSink_` (the #2342 mechanism, reused
+    // here for the §28.3 path) so the many other `scopedCollectCaptures`
+    // call sites are unaffected.
+    std::unordered_set<sema::Symbol*> forwardedInternalParams;
     std::vector<const ast::IdentifierExpr*> rawIds;
     if (const auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg)) {
-        // FIRST provenance row (T2): a lambda LITERAL — enumerate its captures.
+        // FIRST provenance row (T2): a lambda LITERAL — enumerate its
+        // captures. The sink records the forwarded lambda's params (and any
+        // nested lambdas' params — `scopedCollectCaptures` recurses into
+        // LambdaExpr cases via `scopedCaptureWalkExpr`) so the gate below
+        // classifies enclosing-lambda params as real captures.
+        scopedLambdaInternalSink_ = &forwardedInternalParams;
         scopedCollectCaptures(*lam, rawIds);
+        scopedLambdaInternalSink_ = nullptr;
     } else if (const auto* mref =
                    dynamic_cast<const ast::MemberAccessExpr*>(&arg)) {
         // METHOD-REFERENCE provenance row (T3, §28.3, v0.196): a method
@@ -8768,9 +9159,22 @@ void MethodOwnership::deferredActivationCaptureSources(
         sema::Symbol* sym = ctx_.exprSymbol(*id);
         if (!sym || !seen.insert(sym).second) continue;
         if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
-            // A lambda-internal parameter is not a capture of the enclosing
-            // frame (checkScopedAdmission's methodParamSet_ gate).
-            if (!methodParamSet_.count(sym)) continue;
+            // #2527 (§28.3, sibling of #2342 §28.14): skip ONLY params
+            // internal to the FORWARDED lambda (its own params + those of
+            // any lambda nested within it — recorded in
+            // `forwardedInternalParams` during collection above). Params
+            // of the enclosing METHOD (methodParamSet_) or an ENCLOSING
+            // LAMBDA are REAL captures and must be classified below. The
+            // prior gate was `if (!methodParamSet_.count(sym)) continue;`,
+            // which treated EVERY lambda's parameters as lambda-internal —
+            // correct for the forwarded lambda's own params (also not in
+            // methodParamSet_) but WRONG for an enclosing lambda's params
+            // (the #2527 residual from #2342's pre-fix state): an inner
+            // closure capturing an outer lambda's `owned` parameter and
+            // forwarded to a deferred-activation frame was silently
+            // classified as non-owned-obligation, so the carried-source
+            // reject (the loop below) never fired.
+            if (forwardedInternalParams.count(sym)) continue;
             // An enclosing `owned` parameter is a live owned obligation this
             // method discharges at exit; a plain (borrow) parameter outlives
             // the method and the caller re-establishes the frame's constraint
@@ -9656,13 +10060,18 @@ void MethodOwnership::recordAwaitOperandConsume(
     }
     // §28.3 (#1626): awaiting a maybe-consumed task local is a consume of a
     // value that may already have been consumed on another branch — reject.
+    //
+    // #2439 sweep: same shape/fix as markMovedByName's own maybeConsumed
+    // branch (see its comment for the full mechanism) — defer the Poisoned
+    // transition to the final, unsuppressed pass so a loop-carried
+    // maybe-consumed task local's fact survives the O3b fixpoint intact.
     if (st->maybeConsumed) {
         report(
             Severity::Error, loc,
             std::string("cannot await `") + std::string(id->name) +
             "`: it may have already been consumed on another branch "
             "(maybe-consumed join, §28.3)");
-        st->state = OwnershipState::Poisoned;
+        if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
     // Mark the PLAIN owned task local consumed by the await's implicit disposal
@@ -10027,9 +10436,8 @@ bool MethodOwnership::isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const
     if (!rt) return false;
     // Builtin span *views* carry a borrow of their backing Array / OwningBuffer
     // (a reference type) but have no user Record TypeDecl, so isBorrowBearing
-    // Record misses them. The string-backed spans (ReadOnlyStringSpan /
-    // ReadOnlyAsciiByteSpan) view a runtime-managed `string` and are NOT
-    // borrow-bearing (§9.7); CancellationToken (§30.8) is a value builtin and
+    // Record misses them. The string-backed span ReadOnlyStringSpan views a
+    // runtime-managed `string` and is NOT borrow-bearing (§9.7); CancellationToken (§30.8) is a value builtin and
     // is likewise not in this list — its exemption is the single enumerated
     // stdlib carve-out. // per §30.1, §4.14, §4.15
     const std::string_view n = builtinTypeRefNameHead(rt);
@@ -11390,6 +11798,20 @@ MethodOwnership::ScopedBound MethodOwnership::scopedBoundingLocal(
 void MethodOwnership::scopedCollectCaptures(
     const ast::LambdaExpr& lam,
     std::vector<const ast::IdentifierExpr*>& out) {
+    // #2342 (§28.14): record this lambda's OWN params as internal to the
+    // forwarded closure when collecting for `checkScopedAdmission` (sink
+    // non-null). `scopedCaptureWalkExpr`'s LambdaExpr case recurses back
+    // here for each nested lambda, so all transitively-nested lambda params
+    // are recorded too — the forwarded closure's entire internal param
+    // subtree. The reduction gate then skips exactly those (not captures)
+    // while KEEPING params of an enclosing lambda or the method (which ARE
+    // captures — the prior methodParamSet_-only gate wrongly skipped them).
+    // Null everywhere else so the other call sites are unaffected.
+    if (scopedLambdaInternalSink_) {
+        if (const std::vector<sema::Symbol*>* syms = ctx_.lambdaParams(&lam)) {
+            for (sema::Symbol* s : *syms) scopedLambdaInternalSink_->insert(s);
+        }
+    }
     if (lam.exprBody) scopedCaptureWalkExpr(*lam.exprBody, out);
     for (const auto& bs : lam.stmts)
         if (bs) scopedCaptureWalkStmt(*bs, out);
@@ -11603,6 +12025,15 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
                                            const ast::Expr* eventTarget) {
     // Classify the argument form and enumerate its captures.
     std::vector<const ast::IdentifierExpr*> rawIds;
+    // #2342 (§28.14): while collecting captures below, record the FORWARDED
+    // lambda's own params (+ nested lambdas' params) into this set so the
+    // reduction gate can skip them (they are internal to the forwarded
+    // closure, not captures) WITHOUT skipping params of an enclosing lambda
+    // (which ARE captures — the residual from #1432's methodParamSet_-only
+    // gate). Populated only by the lambda-argument branches below via
+    // `scopedLambdaInternalSink_`; empty for the class-borrow / identifier /
+    // method-reference / null forms.
+    std::unordered_set<sema::Symbol*> forwardedInternalParams;
     // §28.14 (v0.180, #1439/#1545) "scoped construction": a class/interface-
     // typed `scoped` argument is a passive BORROW, not a function value —
     // it has exactly ONE source (not an enumerated capture set). Reduce it
@@ -11634,7 +12065,11 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
         }
         rawIds.push_back(root);
     } else if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&arg)) {
+        // #2342: record this forwarded lambda's own/nested params so the
+        // reduction gate skips them while keeping enclosing-lambda params.
+        scopedLambdaInternalSink_ = &forwardedInternalParams;
         scopedCollectCaptures(*lam, rawIds);
+        scopedLambdaInternalSink_ = nullptr;
     } else if (dynamic_cast<const ast::NullLiteralExpr*>(&arg)) {
         return;  // clearing a nullable scoped position — nothing captured
     } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&arg)) {
@@ -11679,7 +12114,11 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
         auto lit = scopedLambdaLocalInit_.find(sym);
         if (lit != scopedLambdaLocalInit_.end() &&
             scopedAssignedSyms_.count(sym) == 0) {
+            // #2342: same as the direct-lambda branch — record the local's
+            // lambda-literal's own/nested params for the reduction gate.
+            scopedLambdaInternalSink_ = &forwardedInternalParams;
             scopedCollectCaptures(*lit->second, rawIds);
+            scopedLambdaInternalSink_ = nullptr;
         } else {
             report(Severity::Error, arg.span.begin,
                    std::string("the captures of the function value `") +
@@ -11752,7 +12191,21 @@ void MethodOwnership::checkScopedAdmission(const ast::Expr& callNode,
             return;
         }
         if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
-            if (!methodParamSet_.count(sym)) continue;  // lambda-internal param
+            // #2342 (§28.14): skip ONLY params internal to the FORWARDED
+            // lambda (its own params + those of any lambda nested within
+            // it — recorded in forwardedInternalParams during capture
+            // collection). Params of the enclosing METHOD (methodParamSet_)
+            // or an enclosing LAMBDA are REAL captures and must be
+            // classified below. The prior gate was
+            // `if (!methodParamSet_.count(sym)) continue;`, which treated
+            // EVERY lambda's parameters as lambda-internal — correct for
+            // the forwarded lambda's own params (also not in
+            // methodParamSet_) but WRONG for an enclosing lambda's params
+            // (the #2342 residual from #1432): a nested closure capturing
+            // the outer lambda's own function-typed parameter, forwarded
+            // to a `scoped` position, was silently admitted because the
+            // gate skipped the capture before the call-bounded check ran.
+            if (forwardedInternalParams.count(sym)) continue;
             // §28.14 v0.177 (#1419): a closure CAPTURING a call-bounded
             // function-typed parameter cannot enter storage-bounded
             // admission — the stored closure would extend the callback past
@@ -12572,9 +13025,45 @@ void MethodOwnership::reportCallBounded(SourceLocation loc,
                std::string(sink));
 }
 
+void MethodOwnership::seedLambdaCallBoundedParams(const ast::LambdaExpr& lam) {
+    // §A.7 / §21.7: sema records each lambda's own parameter symbol list
+    // (position-for-position with lam.params) via ctx_.setLambdaParams during
+    // expression type-checking; look it up rather than re-deriving symbols —
+    // this is the same ParameterSymbol* that an IdentifierExpr referencing
+    // the parameter inside the body resolves to (ctx_.exprSymbol), which is
+    // what callBoundedSourceOf/callBoundedParams_ key on. // per §28.14, #1432
+    const std::vector<sema::Symbol*>* syms = ctx_.lambdaParams(&lam);
+    if (!syms) return;
+    for (sema::Symbol* sym : *syms) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+        // A destructuring lambda parameter (§27.4) carries no `modifier` and
+        // resolves to a record type, never a function type — falls through
+        // fnTyped below naturally; no special case needed.
+        if (!ps || !ps->modifier.empty()) continue;
+        // Mirrors run()'s fnTyped test above verbatim (the ParameterSymbol
+        // shape is identical: an explicit annotation lives in `declType`, a
+        // context-inferred type — event-handler payload, #829 positional
+        // inference — lives in `resolvedDeclType`).
+        const sema::TypeRef* rt = ps->declType
+                                       ? ctx_.resolvedType(*ps->declType)
+                                       : ps->resolvedDeclType;
+        const bool fnTyped =
+            (rt && rt->kind == sema::TypeRef::Kind::Function) ||
+            (ps->declType && ps->declType->kind == ast::TypeKind::Function);
+        if (fnTyped) callBoundedParams_.insert(sym);
+    }
+}
+
 void MethodOwnership::callBoundedScan(
     const std::vector<std::unique_ptr<ast::Stmt>>& body) {
-    if (callBoundedParams_.empty()) return;
+    // #1432: previously gated on `callBoundedParams_.empty()` — sound when
+    // the ONLY source of call-bounded parameters was the enclosing method's/
+    // constructor's own formals (seeded into callBoundedParams_ before this
+    // call). Now that a LAMBDA's own plain function-typed parameters are
+    // seeded lazily as the walk descends into each LambdaExpr
+    // (seedLambdaCallBoundedParams), a method with NO function-typed formal
+    // of its own can still contain a lambda that has one — the walk must
+    // always run so that descent reaches the lambda. // per §28.14, v0.177
     for (const auto& s : body)
         if (s) callBoundedWalkStmt(*s);
 }
@@ -12907,11 +13396,53 @@ void MethodOwnership::callBoundedWalkExpr(const ast::Expr& e) {
         return;
     }
     if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(&e)) {
-        // Walk the lambda BODY: a store that executes when the closure runs
-        // (`() => do _f := f; end`) is still a store of the call-bounded
+        // #1432 (§28.14 v0.177): the lambda is a user-authored callee too —
+        // its OWN plain function-typed parameters are call-bounded within
+        // its own body, exactly as an enclosing method's/constructor's
+        // formals are (run()'s seeding). Without this, a lambda could
+        // launder a callback past the check a method formal gets:
+        // `var sink := lambda(cb: () -> ()) => do _f := cb; end;`. Seeded
+        // for the REST of the method's §28.14 pre-passes (not popped after
+        // this lambda's own body walk): `scopedPreScan`'s deferred
+        // `checkScopedAdmission` queue runs AFTER this whole walk finishes
+        // (run()'s call order is `callBoundedScan(body); scopedPreScan(body);
+        // …`), so a lambda's own parameter forwarded to a `scoped` position
+        // from inside that SAME lambda's body must still be classified
+        // call-bounded when that later admission check runs. This is sound:
+        // each lambda occurrence mints its own distinct ParameterSymbol* (no
+        // two lambdas — sibling or nested — ever share one), so leaving an
+        // entry resident cannot make an unrelated identifier in a different
+        // lambda (or the enclosing method) resolve to it. // per §28.14, #1432
+        seedLambdaCallBoundedParams(*lam);
+        // #2343 (§28.14 v0.177, twin of #1432's ReturnStmt handler): a lambda's
+        // EXPRESSION body `=> E` is an implicit RETURN of `E` (§27.3), so the
+        // exprBody is a return sink exactly as `do return E; end` is — and a
+        // call-bounded parameter (or a closure capturing one) returned through
+        // `=> g` escapes the callback exactly as `return g;` does. The prior
+        // `callBoundedWalkExpr(*lam->exprBody)` walked the body only
+        // STRUCTURALLY (a top-level identifier `g` hit no sink), so the
+        // expr-body twin of the block-body return was silently admitted.
+        // Mirror the callBoundedWalkStmt `ReturnStmt` case: if the exprBody
+        // resolves via callBoundedSourceOf to a call-bounded source, apply the
+        // §28.14 *Call-bounded × deferred activation* (v0.196) frame-residence
+        // carve-out — using lambdaReturnTypeIsDeferredActivation (the LAMBDA's
+        // own return type, not the enclosing method's returnType_) — else
+        // report; otherwise descend structurally as before.
+        if (lam->exprBody) {
+            if (sema::ParameterSymbol* src =
+                    callBoundedSourceOf(*lam->exprBody)) {
+                if (!(isDeferredActivationCallResult(*lam->exprBody) &&
+                      lambdaReturnTypeIsDeferredActivation(*lam, *lam->exprBody)))
+                    reportCallBounded(lam->exprBody->span.begin, src->name,
+                                      "returned");
+            } else {
+                callBoundedWalkExpr(*lam->exprBody);
+            }
+        }
+        // Walk the lambda BLOCK body: a store that executes when the closure
+        // runs (`() => do _f := f; end`) is still a store of the call-bounded
         // value. The lambda VALUE's own escape is judged at its use sites
         // via callBoundedSourceOf.
-        if (lam->exprBody) callBoundedWalkExpr(*lam->exprBody);
         for (const auto& bs : lam->stmts)
             if (bs) callBoundedWalkStmt(*bs);
         return;
@@ -12927,6 +13458,632 @@ void MethodOwnership::callBoundedWalkExpr(const ast::Expr& e) {
         return;
     }
     // Literals / identifiers / typeof / nameof / default / unit: no sinks.
+}
+
+// -- §28.14 v0.179 (#1527): call-bounded × task-abandonment -----------------
+
+bool MethodOwnership::callBoundedTaskInvocation(const ast::CallExpr& ce,
+                                                std::string_view* paramNameOut) {
+    if (!ce.callee) return false;
+    sema::ParameterSymbol* src = callBoundedSourceOf(*ce.callee);
+    if (!src) return false;
+    if (!callResultIsAsyncTask(ce)) return false;
+    if (paramNameOut) *paramNameOut = src->name;
+    return true;
+}
+
+void MethodOwnership::checkCallBoundedTaskSettlement(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    if (callBoundedParams_.empty() && callBoundedAlias_.empty()) return;
+
+    // One outstanding "must be awaited to settlement" obligation minted by
+    // invoking a call-bounded callback. `key` is the identity the item is
+    // tracked under — a bound LocalSymbol*, or the minting CallExpr* itself
+    // for an invocation never bound to a local. `collKey`, when non-null, is
+    // the LocalSymbol* of a purely-local collection this item now lives
+    // inside (added via `.Add(...)`) — discharged only by `await
+    // Task.WhenAll(<that collection>)`, not a direct `await`.
+    struct Item {
+        const void* key = nullptr;
+        const void* collKey = nullptr;
+        std::string_view paramName;
+        SourceLocation loc;
+    };
+    using Set = std::vector<Item>;
+
+    auto reportUnsettled = [&](const Item& it, std::string_view when) {
+        report(Severity::Error, it.loc,
+               std::string("the task minted by invoking call-bounded "
+                          "parameter `") +
+                   std::string(it.paramName) +
+                   "` here is not awaited to settlement " +
+                   std::string(when) +
+                   " (§28.14, v0.179) — await it directly, or accumulate it "
+                   "in a purely-local collection and `await "
+                   "Task.WhenAll(...)`");
+    };
+    auto reportSink = [&](SourceLocation loc, std::string_view paramName,
+                         std::string_view sink) {
+        report(Severity::Error, loc,
+               std::string("the task minted by invoking call-bounded "
+                          "parameter `") +
+                   std::string(paramName) + "` is " + std::string(sink) +
+                   ", not awaited to settlement — abandoning it lets the "
+                   "callback's caller-sourced captures outlive the call "
+                   "through the still-running frame (§28.14, v0.179)");
+    };
+
+    // Finds an OPEN STANDALONE entry (collKey == nullptr) whose key matches
+    // `sym`; -1 when absent.
+    auto findStandalone = [](const Set& open, const void* sym) -> long {
+        if (!sym) return -1;
+        for (std::size_t i = 0; i < open.size(); ++i)
+            if (open[i].collKey == nullptr && open[i].key == sym)
+                return static_cast<long>(i);
+        return -1;
+    };
+
+    // True when `e` is `Task.WhenAll(<ident>)`; resolves the aggregated
+    // collection's LocalSymbol* — recognized only for the named-purely-
+    // local-collection idiom, §28.14's own "purely local collection" text.
+    auto whenAllCollection =
+        [&](const ast::Expr& e) -> sema::LocalSymbol* {
+        auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
+        if (!ce || ce->args.size() != 1 || !ce->args[0].value) return nullptr;
+        auto* ma =
+            dynamic_cast<const ast::MemberAccessExpr*>(ce->callee.get());
+        if (!ma || ma->member != "WhenAll" || !ma->target) return nullptr;
+        auto* tid =
+            dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!tid || tid->name != "Task") return nullptr;
+        auto* aid =
+            dynamic_cast<const ast::IdentifierExpr*>(ce->args[0].value.get());
+        if (!aid) return nullptr;
+        return dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*aid));
+    };
+
+    // Recognizes + records a "fresh producer" appearing at `e` (a bare
+    // invocation used inline, e.g. `pending.Add(cb())` / `return cb();`).
+    // For a SYNCHRONOUS callee this is where the §28.14 v0.179 (2)
+    // synchronous-callee rejection fires — centralized here so every call
+    // site below (LocalDecl init, assignment RHS, return/discard value,
+    // fan-out add, bare statement, await operand) gets it uniformly without
+    // separate sync-specific logic; no Item is produced in that case (the
+    // violation is already diagnosed, so nothing needs further tracking).
+    auto asProducer = [&](const ast::Expr& e, Item& out) -> bool {
+        auto* ce = dynamic_cast<const ast::CallExpr*>(&e);
+        std::string_view pn;
+        if (!ce || !callBoundedTaskInvocation(*ce, &pn)) return false;
+        if (!isAsync_) {
+            report(Severity::Error, ce->span.begin,
+                   std::string("invoking call-bounded parameter `") +
+                       std::string(pn) +
+                       "`'s callback here mints a task, but a synchronous "
+                       "callee has no position to await it to settlement — "
+                       "declare `" +
+                       std::string(pn) +
+                       "` `scoped` or make this method/constructor `async` "
+                       "(§28.14, v0.179)");
+            return false;
+        }
+        out = Item{ce, nullptr, pn, ce->span.begin};
+        return true;
+    };
+
+    // Discharges the referent of an `await` operand: an inline invocation
+    // (never became pending), a bare identifier naming an open standalone
+    // item, or `Task.WhenAll(<purely-local collection>)` (discharges every
+    // fan-out member of that collection).
+    auto dischargeAwaitOperand = [&](const ast::Expr& operand, Set& open) {
+        Item ignored;
+        if (auto* ce = dynamic_cast<const ast::CallExpr*>(&operand);
+            ce && asProducer(operand, ignored)) {
+            return;  // inline `await cb()` — settled on the spot
+        }
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&operand)) {
+            long idx = findStandalone(open, ctx_.exprSymbol(*id));
+            if (idx >= 0) open.erase(open.begin() + idx);
+            return;
+        }
+        if (sema::LocalSymbol* coll = whenAllCollection(operand)) {
+            open.erase(
+                std::remove_if(open.begin(), open.end(),
+                               [&](const Item& it) {
+                                   return it.collKey ==
+                                          static_cast<const void*>(coll);
+                               }),
+                open.end());
+        }
+    };
+
+    // A value-position expression that might create a new pending item
+    // (bound under `bindKey`), discharge one via an inline `await`, or seed
+    // a collection literal's fan-out members. Used for LocalDecl
+    // initializers and assignment RHS values.
+    auto processValueExpr = [&](const ast::Expr& e, Set& open,
+                               const void* bindKey) {
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e)) {
+            if (un->op == "await" && un->operand) {
+                dischargeAwaitOperand(*un->operand, open);
+                return;
+            }
+        }
+        Item it;
+        if (asProducer(e, it)) {
+            if (bindKey) it.key = bindKey;
+            open.push_back(it);
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(&e)) {
+            for (const auto& el : cl->elements) {
+                if (!el) continue;
+                Item eit;
+                if (asProducer(*el, eit)) {
+                    eit.collKey = bindKey;
+                    open.push_back(eit);
+                }
+            }
+        }
+        // Any other shape: not a recognized producer/discharge — an existing
+        // open item referenced some other way stays open, caught later
+        // (conservative: never silently clears an obligation).
+    };
+
+    // `<purely-local collection>.Add(...)`-shaped fan-out (the §28.14
+    // "purely local collection" exemption). True when the call was
+    // recognized as such (whether or not an argument actually matched —
+    // still claims the call so the generic bare-invocation-drop check below
+    // does not ALSO fire for the receiver-qualified call form).
+    auto processFanoutAdd = [&](const ast::CallExpr& ce, Set& open) -> bool {
+        if (!builtinCollectionStoreCallee(ce.callee.get())) return false;
+        auto* ma =
+            dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+        if (!ma || !ma->target) return false;
+        if (exprReachableBeyondCall(*ma->target)) return false;
+        auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+        if (!tid) return false;
+        sema::LocalSymbol* coll =
+            dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*tid));
+        if (!coll) return false;
+        for (const auto& a : ce.args) {
+            if (!a.value) continue;
+            Item it;
+            if (asProducer(*a.value, it)) {
+                it.collKey = coll;
+                open.push_back(it);
+                continue;
+            }
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
+                long idx = findStandalone(open, ctx_.exprSymbol(*id));
+                if (idx >= 0) open[idx].collKey = coll;
+            }
+        }
+        return true;
+    };
+
+    std::function<void(const ast::Stmt&, Set&, bool&)> scanOne;
+    std::function<void(const std::vector<std::unique_ptr<ast::Stmt>>&, Set&,
+                       bool&)>
+        scan;
+
+    scan = [&](const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+              Set& open, bool& terminated) {
+        for (const auto& sp : stmts) {
+            if (!sp) continue;
+            if (terminated) break;
+            scanOne(*sp, open, terminated);
+        }
+    };
+
+    // Reports + discards any STANDALONE item still open at the end of an
+    // ISOLATED body scan (a loop body / try-catch arm run standalone with a
+    // copy of the entry state — see the WhileStmt/ForStmt/TryStmt handling
+    // below) that is NOT also present in `entry` — i.e. genuinely
+    // introduced within the isolated body and abandoned there, with no
+    // further chance to resolve within this same run (a standalone item's
+    // bound LOCAL is itself scoped to the body — e.g. a fresh per-iteration
+    // loop-body local — so it cannot be referenced afterward either way).
+    // Fan-out (collKey-tagged) items are deliberately excluded here: they
+    // live in a collection declared OUTSIDE the body (the loop/try
+    // construct as a whole), so a NEW one is not "abandoned" merely because
+    // this body's own scan ends — mergeNewCollItems (below) carries it
+    // forward instead.
+    auto reportNewlyAbandoned = [&](const Set& afterState, const Set& entry,
+                                   std::string_view when) {
+        for (const auto& it : afterState) {
+            if (it.collKey) continue;
+            bool preexisting = false;
+            for (const auto& e2 : entry)
+                if (e2.key == it.key && e2.collKey == it.collKey) {
+                    preexisting = true;
+                    break;
+                }
+            if (!preexisting) reportUnsettled(it, when);
+        }
+    };
+
+    // Merges every NEW (not present in `entry`) collKey-tagged item found in
+    // `afterState` into `target` (de-duplicated). A fan-out `.Add(...)` and
+    // the task it registers are atomic within one statement — no partial-
+    // completion state exists — so a member added ANYWHERE reachable from
+    // this construct (a loop body that may or may not have run, a try body
+    // or catch arm an exception may have unwound through afterward) is safe
+    // to carry forward unconditionally: either it was added (a real,
+    // still-owed member the eventual `Task.WhenAll` must still cover) or it
+    // wasn't (nothing to carry). This is the fan-out counterpart of a
+    // standalone item's conservative "revert to entry" — DISCHARGING an
+    // item is what an uncertain trip count / exception path cannot certify;
+    // ADDING one has no equivalent uncertainty.
+    auto mergeNewCollItems = [&](Set& target, const Set& entry,
+                                const Set& afterState) {
+        for (const auto& it : afterState) {
+            if (!it.collKey) continue;
+            bool preexisting = false;
+            for (const auto& e2 : entry)
+                if (e2.key == it.key && e2.collKey == it.collKey) {
+                    preexisting = true;
+                    break;
+                }
+            if (preexisting) continue;
+            bool already = false;
+            for (const auto& t : target)
+                if (t.key == it.key && t.collKey == it.collKey) {
+                    already = true;
+                    break;
+                }
+            if (!already) target.push_back(it);
+        }
+    };
+
+    scanOne = [&](const ast::Stmt& s, Set& open, bool& terminated) {
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
+            if (ld->initializer) {
+                sema::LocalSymbol* ls = findLocalSymbol(*ld);
+                processValueExpr(*ld->initializer, open, ls);
+            }
+            return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(&s)) {
+            if (as->op != ":=" || !as->target) return;
+            // A FIELD may be referenced bare (no `this.` qualifier) and so
+            // also parses as an IdentifierExpr — resolve the target's SYMBOL
+            // and require it to be a LocalSymbol specifically before taking
+            // the "reassigning a local" path below; a field (or anything
+            // else) falls through to the generic store-sink handling exactly
+            // like a MemberAccessExpr target would (mirrors the EXISTING
+            // §28.14 sink check's own fieldTarget test, which the same
+            // bare-identifier-may-be-a-field ambiguity applies to).
+            sema::LocalSymbol* targetLocal = nullptr;
+            if (auto* tid =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+                targetLocal =
+                    dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*tid));
+            if (targetLocal) {
+                long idx = findStandalone(open, targetLocal);
+                bool selfAwait = false;
+                if (as->value)
+                    if (auto* un =
+                            dynamic_cast<const ast::UnaryExpr*>(as->value.get()))
+                        selfAwait = un->op == "await";
+                if (idx >= 0 && !selfAwait) {
+                    // Reassigning a still-open local without ever awaiting
+                    // it — the spec's named "binding it and dropping it"
+                    // sink, in the reassignment spelling.
+                    reportSink(as->span.begin, open[idx].paramName,
+                              "dropped by reassignment before being awaited "
+                              "to settlement");
+                    open.erase(open.begin() + idx);
+                }
+                if (as->value) processValueExpr(*as->value, open, targetLocal);
+                return;
+            }
+            // Non-identifier target (field / indexer / out-ref write): a
+            // fresh producer or a currently-open item stored there is the
+            // "stored" sink.
+            if (!as->value) return;
+            Item it;
+            if (asProducer(*as->value, it)) {
+                reportSink(as->span.begin, it.paramName,
+                          "stored (it must be awaited to settlement before "
+                          "the callee returns)");
+                return;
+            }
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->value.get())) {
+                long idx = findStandalone(open, ctx_.exprSymbol(*id));
+                if (idx >= 0) {
+                    reportSink(as->span.begin, open[idx].paramName,
+                              "stored (it must be awaited to settlement "
+                              "before the callee returns)");
+                    open.erase(open.begin() + idx);
+                }
+            }
+            return;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(&s)) {
+            if (rs->value) {
+                Item it;
+                if (asProducer(*rs->value, it)) {
+                    reportSink(rs->value->span.begin, it.paramName,
+                              "returned");
+                } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                               rs->value.get())) {
+                    long idx = findStandalone(open, ctx_.exprSymbol(*id));
+                    if (idx >= 0) {
+                        reportSink(rs->value->span.begin, open[idx].paramName,
+                                  "returned");
+                        open.erase(open.begin() + idx);
+                    }
+                }
+            }
+            for (const auto& it : open) reportUnsettled(it, "before this return");
+            open.clear();
+            terminated = true;
+            return;
+        }
+        if (dynamic_cast<const ast::ThrowStmt*>(&s)) {
+            // Mirrors sema::DefiniteAssignment's own out-param precedent: a
+            // throw is not a normal-`return` exit path this obligation is
+            // checked against — declined explicitly, not silently.
+            // // per CLAUDE.md rule 4
+            terminated = true;
+            return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(&s)) {
+            if (!ds->value) return;
+            Item it;
+            if (asProducer(*ds->value, it)) {
+                reportSink(ds->value->span.begin, it.paramName,
+                          "discarded (`_ := …`) without being awaited");
+                return;
+            }
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(ds->value.get())) {
+                long idx = findStandalone(open, ctx_.exprSymbol(*id));
+                if (idx >= 0) {
+                    reportSink(ds->value->span.begin, open[idx].paramName,
+                              "discarded (`_ := …`) without being awaited");
+                    open.erase(open.begin() + idx);
+                }
+            }
+            return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+            if (!es->expr) return;
+            if (auto* un = dynamic_cast<const ast::UnaryExpr*>(es->expr.get())) {
+                if (un->op == "await" && un->operand) {
+                    dischargeAwaitOperand(*un->operand, open);
+                    return;
+                }
+            }
+            if (auto* ce = dynamic_cast<const ast::CallExpr*>(es->expr.get())) {
+                if (auto* ma =
+                        dynamic_cast<const ast::MemberAccessExpr*>(
+                            ce->callee.get())) {
+                    if (auto* ttid = dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get());
+                        ttid && ttid->name == "Task" &&
+                        ma->member == "FireAndForget" && !ce->args.empty() &&
+                        ce->args[0].value) {
+                        Item it;
+                        if (asProducer(*ce->args[0].value, it)) {
+                            reportSink(ce->span.begin, it.paramName,
+                                      "passed to `Task.FireAndForget`");
+                            return;
+                        }
+                        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                                ce->args[0].value.get())) {
+                            long idx =
+                                findStandalone(open, ctx_.exprSymbol(*id));
+                            if (idx >= 0) {
+                                reportSink(ce->span.begin,
+                                          open[idx].paramName,
+                                          "passed to `Task.FireAndForget`");
+                                open.erase(open.begin() + idx);
+                                return;
+                            }
+                        }
+                    }
+                }
+                if (processFanoutAdd(*ce, open)) return;
+                Item it;
+                if (asProducer(*ce, it)) {
+                    reportSink(ce->span.begin, it.paramName,
+                              "dropped without being awaited");
+                    return;
+                }
+            }
+            return;
+        }
+        if (auto* ifs = dynamic_cast<const ast::IfStmt*>(&s)) {
+            std::vector<Set> outs;
+            std::vector<bool> term;
+            Set b0 = open;
+            bool t0 = false;
+            scan(ifs->ifBranch.body, b0, t0);
+            outs.push_back(std::move(b0));
+            term.push_back(t0);
+            for (const auto& el : ifs->elifBranches) {
+                Set be = open;
+                bool te = false;
+                scan(el.body, be, te);
+                outs.push_back(std::move(be));
+                term.push_back(te);
+            }
+            if (ifs->hasElse) {
+                Set be = open;
+                bool te = false;
+                scan(ifs->elseBody, be, te);
+                outs.push_back(std::move(be));
+                term.push_back(te);
+            } else {
+                outs.push_back(open);  // guard-false fallthrough
+                term.push_back(false);
+            }
+            // Union over the LIVE branches: an item is still owed after the
+            // join if ANY live branch left it open (the mirror-image of
+            // DefiniteAssignment's intersection — a NOT-yet-discharged fact
+            // must survive if even one live path failed to discharge it).
+            Set merged;
+            bool anyLive = false;
+            for (std::size_t i = 0; i < outs.size(); ++i) {
+                if (term[i]) continue;
+                anyLive = true;
+                for (const auto& it : outs[i]) {
+                    bool dup = false;
+                    for (const auto& m : merged)
+                        if (m.key == it.key && m.collKey == it.collKey) {
+                            dup = true;
+                            break;
+                        }
+                    if (!dup) merged.push_back(it);
+                }
+            }
+            open = anyLive ? std::move(merged) : Set{};
+            bool allTerm = !term.empty();
+            for (bool t : term) allTerm = allTerm && t;
+            terminated = allTerm;
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(&s)) {
+            Set entry = open;
+            Set bodyState = open;
+            bool bt = false;
+            scan(ws->body, bodyState, bt);
+            // Standalone items revert to entry — the loop may run zero
+            // times, so a discharge reachable only inside the body is not
+            // reliable (mirrors DefiniteAssignment's own while/for
+            // treatment). Fan-out collection members propagate through: an
+            // `.Add` either ran (a real, still-owed member) or didn't
+            // (nothing to owe) — no "unreliable add" exists the way an
+            // unreliable discharge does.
+            reportNewlyAbandoned(bodyState, entry, "before this loop body ends");
+            // Standalone items revert to entry UNCONDITIONALLY (kept as-is,
+            // ignoring bodyState — the loop's uncertain trip count cannot
+            // certify a discharge reachable only inside the body); fan-out
+            // items carry entry's own members forward too (the SAME "might
+            // not run" concern applies to a discharge of a PRE-EXISTING
+            // collection member reachable only inside the body) plus any
+            // NEW members the body itself registered.
+            Set result = entry;
+            mergeNewCollItems(result, entry, bodyState);
+            open = std::move(result);
+            terminated = false;  // the loop may not execute
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(&s)) {
+            Set entry = open;
+            Set bodyState = open;
+            bool bt = false;
+            scan(fs->body, bodyState, bt);
+            reportNewlyAbandoned(bodyState, entry, "before this loop body ends");
+            Set result = entry;
+            mergeNewCollItems(result, entry, bodyState);
+            open = std::move(result);
+            terminated = false;
+            return;
+        }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(&s)) {
+            scan(db->body, open, terminated);
+            return;
+        }
+        if (auto* trys = dynamic_cast<const ast::TryStmt*>(&s)) {
+            Set entry = open;
+            Set tryState = entry;
+            bool tt = false;
+            scan(trys->body, tryState, tt);
+            reportNewlyAbandoned(tryState, entry,
+                                "before this try body ends (an exception "
+                                "may abort it at any point)");
+            std::vector<Set> armStates;
+            for (const auto& arm : trys->catches) {
+                if (!arm.body) continue;
+                Set armState = entry;
+                bool at = false;
+                scanOne(*arm.body, armState, at);
+                reportNewlyAbandoned(armState, entry,
+                                    "before this catch arm ends");
+                armStates.push_back(std::move(armState));
+            }
+            Set result;
+            if (trys->hasFinally) {
+                Set finState = entry;
+                bool ft = false;
+                scan(trys->finallyBody, finState, ft);
+                // `finally` always runs regardless of the try/catch outcome
+                // — the one place inside this construct where discharging
+                // an INHERITED obligation is reliable.
+                result = std::move(finState);
+                terminated = ft;
+            } else {
+                // try/catch alone cannot be relied on to discharge an
+                // inherited obligation (an exception may skip any given
+                // statement) — the entry state passes through unchanged.
+                result = entry;
+                terminated = false;
+            }
+            // A fan-out `.Add(...)` reachable ANYWHERE in the try body or a
+            // catch arm registers atomically (see mergeNewCollItems) — carry
+            // any NEW member forward past the whole construct regardless of
+            // which path was taken, exactly as the loop-body treatment does.
+            mergeNewCollItems(result, entry, tryState);
+            for (const auto& as2 : armStates) mergeNewCollItems(result, entry, as2);
+            open = std::move(result);
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(&s)) {
+            std::vector<Set> outs;
+            std::vector<bool> term;
+            for (const auto& arm : cs->arms) {
+                Set as2 = open;
+                bool ta = false;
+                if (arm.bodyKind == ast::CaseArmBodyKind::Expression) {
+                    if (arm.exprBody) {
+                        Item it;
+                        if (asProducer(*arm.exprBody, it)) as2.push_back(it);
+                    }
+                } else {
+                    for (const auto& bs : arm.stmts)
+                        if (bs) scanOne(*bs, as2, ta);
+                }
+                outs.push_back(std::move(as2));
+                term.push_back(ta);
+            }
+            // No statically-proven exhaustiveness analysis here (mirrors
+            // DefiniteAssignment's own conservative CaseStmt posture) — the
+            // "no arm matched" fallthrough always joins as an extra live
+            // branch.
+            outs.push_back(open);
+            term.push_back(false);
+            Set merged;
+            bool anyLive = false;
+            for (std::size_t i = 0; i < outs.size(); ++i) {
+                if (term[i]) continue;
+                anyLive = true;
+                for (const auto& it : outs[i]) {
+                    bool dup = false;
+                    for (const auto& m : merged)
+                        if (m.key == it.key && m.collKey == it.collKey) {
+                            dup = true;
+                            break;
+                        }
+                    if (!dup) merged.push_back(it);
+                }
+            }
+            open = anyLive ? std::move(merged) : Set{};
+            terminated = false;
+            return;
+        }
+        // Break / Continue / IncrementStmt / LocalConstDecl: no producer,
+        // discharge, or sink shape recognized here.
+    };
+
+    Set top;
+    bool terminated = false;
+    scan(body, top, terminated);
+    for (const auto& it : top)
+        reportUnsettled(it, "before this method/constructor returns");
 }
 
 // -- stdlib §6.10: TaskScope consumption ------------------------------------
@@ -13300,6 +14457,12 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
     }
     // §28.3 (#1626): a maybe-consumed binding may not be consumed again
     // (same text as markMovedByName's arm — the K7.4 loop back-edge pin).
+    //
+    // #2439 sweep: same shape/fix as markMovedByName's own maybeConsumed
+    // branch (see its comment for the full mechanism) — defer the Poisoned
+    // transition to the final, unsuppressed pass so a loop-carried
+    // maybe-consumed fact survives the O3b fixpoint intact for this marked-
+    // arm-transfer consume too.
     if (st->maybeConsumed) {
         report(
             Severity::Error, mt.span.begin,
@@ -13307,7 +14470,7 @@ void MethodOwnership::handleMarkedArmTransfer(const ast::MarkedTransferExpr& mt)
             "`: it may have already been consumed on another branch "
             "(maybe-consumed join, §28.3) — confine the consume to a single "
             "branch or equalize the branches before the merge");
-        st->state = OwnershipState::Poisoned;
+        if (!suppressDiag_) st->state = OwnershipState::Poisoned;
         return;
     }
     if (!ld || !classValued) {

@@ -186,7 +186,14 @@ BEZEL_TEST(task_family_borrow_return_lambda_positions_1926,
     auto r = runAot(
         "module M; import System.Threading; "
         "class C "
-        "  public static f: () -> Task<int> := lambda() => Producer(); "
+        // §22.12 rule 2 (#1393, v0.221): a MUTABLE static of function type is
+        // now a residual compile error (rule 2 governs only mutable
+        // statics — not this test's concern, which is the ownership check
+        // on the lambda BODY, unaffected by the field's mutability). Marked
+        // `readonly` — set once here and never reassigned — to opt out of
+        // rule 2 entirely and keep the ownership behavior under test
+        // isolated from the (otherwise unrelated) mutability ceremony.
+        "  public static readonly f: () -> Task<int> := lambda() => Producer(); "
         "  public static async method Producer(): Task<int> return 7; "
         "  end Producer; "
         "  public static async method Main(): Task<int> "

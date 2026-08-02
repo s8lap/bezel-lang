@@ -404,6 +404,65 @@ BEZEL_TEST(codegen_521_stdlib, round_to_2_places_spec_9_3) {
         "return 0; ")), 1);
 }
 
+// fix #2229: Round must look at the FIRST dropped digit (the digit at position
+// `digits`), not the LOWEST dropped digit. 0.9651m rounded to 2 places has
+// dropped "51" (> half) → must round up to 0.97m. Previously the runtime
+// inspected i==0 (the units digit "1") and returned 0.96m.
+BEZEL_TEST(codegen_521_stdlib, round_multi_drop_looks_at_first_dropped_digit_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 0.9651m; "
+        "var r := d.Round(2); "
+        "if r = 0.97m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// fix #2232: Round with remove > 1 and an EXACT midpoint (first dropped
+// digit == 5, all later dropped == 0) must use banker's rounding (round-half-
+// to-even) per stdlib §9.3. 0.9650m.Round(2): kept mantissa = 96 (even), so
+// round DOWN to 0.96m. The mirror case 0.9750m.Round(2): kept mantissa = 97
+// (odd), so round UP to 0.98m. The previous half-up implementation agreed with
+// the odd case (0.9750 → 0.98) but disagreed with the even case (0.9650 → 0.97
+// instead of 0.96), violating §9.3's "matching Math.Round (§2.2)" contract
+// (Math.Round uses banker's rounding).
+BEZEL_TEST(codegen_521_stdlib, round_exact_midpoint_even_kept_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 0.9650m; "
+        "var r := d.Round(2); "
+        "if r = 0.96m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// fix #2232: companion to the even-kept test above — kept mantissa = 97 (odd)
+// must round UP at the exact midpoint 0.9750 → 0.98. This is the round-half-
+// to-even "round to odd when the kept digit is odd" arm.
+BEZEL_TEST(codegen_521_stdlib, round_exact_midpoint_odd_kept_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 0.9750m; "
+        "var r := d.Round(2); "
+        "if r = 0.98m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// fix #2229: Round with remove > 1 and the relevant dropped digit just below
+// half must round DOWN. 0.9649m → 0.96m.
+BEZEL_TEST(codegen_521_stdlib, round_multi_drop_below_half_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 0.9649m; "
+        "var r := d.Round(2); "
+        "if r = 0.96m then return 1; end; "
+        "return 0; ")), 1);
+}
+
+// fix #2229: Round with a tail of 9s propagates the carry into the next place.
+// 0.9999m.Round(1) → 1m.
+BEZEL_TEST(codegen_521_stdlib, round_carry_propagation_spec_9_3) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var d := 0.9999m; "
+        "var r := d.Round(1); "
+        "if r = 1m then return 1; end; "
+        "return 0; ")), 1);
+}
+
 // ---------------------------------------------------------------------------
 // 521_consts: stdlib §9.3 — Decimal.Zero and Decimal.One static constants.
 // ---------------------------------------------------------------------------
@@ -497,13 +556,21 @@ BEZEL_TEST(codegen_521_overflow, min_minus_one_raises_overflow_spec_6_4) {
 }
 
 // §6.4 / §9.3: Decimal.Parse on an out-of-range string raises OverflowException.
-// The value "1e29" (10^29) exceeds MaxValue (≈7.9e28), so Parse must raise
+// The value 10^29 exceeds MaxValue (≈7.9e28), so Parse must raise
 // OverflowException rather than FormatException (the string is well-formed).
+// fix #2273: the value was spelled "1e29" here, which §9.3's grammar — "an
+// optional leading sign (+/-) followed by decimal digits with at most one `.`"
+// — does not admit, so that spelling now raises FormatException and no longer
+// tests what this case is about.  Spelled in digits, the test's intent (an
+// out-of-range MAGNITUDE raises OverflowException) is unchanged and now also
+// exercises #1829's dropped-integer-digit accounting.  The §9.3 rejection of
+// the exponent spelling is covered by
+// codegen_decimal_2273.parse_exponent_form_rejected_spec_9_3.
 BEZEL_TEST(codegen_521_overflow, parse_out_of_range_raises_overflow_spec_6_4_9_3) {
     BEZEL_EXPECT_EQ(run(prog(
         "var r := 0; "
         "try "
-        "  var _ := Decimal.Parse(\"1e29\"); "
+        "  var _ := Decimal.Parse(\"100000000000000000000000000000\"); "
         "catch OverflowException => r := 1; "
         "end; "
         "return r; ")), 1);

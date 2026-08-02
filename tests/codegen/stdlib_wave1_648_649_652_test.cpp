@@ -208,6 +208,18 @@ BEZEL_TEST(codegen_stdlib_648_datetime_tryparse, invalid_input_returns_false) {
         "return (if ok then 0 else 1); ")), 1);
 }
 
+// stdlib §2.5 / #2230: TryParse rejects impossible calendar dates instead of
+// allowing timegm to normalize them into a different month.
+BEZEL_TEST(codegen_stdlib_648_datetime_tryparse, invalid_calendar_dates_return_false) {
+    BEZEL_EXPECT_EQ(run(prog(
+        "var result: DateTime; "
+        "if DateTime.TryParse(\"2023-02-29\", out result) then return 1; end; "
+        "if DateTime.TryParse(\"2024-02-30\", out result) then return 2; end; "
+        "if DateTime.TryParse(\"2024-04-31\", out result) then return 3; end; "
+        "if not DateTime.TryParse(\"2024-02-29\", out result) then return 4; end; "
+        "return 0; ")), 0);
+}
+
 // ---------------------------------------------------------------------------
 // §9.6 / #649 — string.IndexOf(value: string, start: int): int
 // The 2-arg overload must respect the start offset.

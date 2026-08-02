@@ -96,6 +96,22 @@ private:
     std::unordered_set<std::string> sourceImports_;
     // §2.2 v0.164 / #1365: bare names ambiguous due to import collision.
     std::unordered_set<std::string> ambiguousImportNames_;
+    // §26.5 step 2 / §2.5 (#735): the extension blocks reconstructed from the
+    // modules this source file `import`s — §26.5 requires the search to cover
+    // "the current module AND all imported modules". Populated in run() from
+    // SemaContext::importedExtensionsOf for each explicit import (so an
+    // artifact loaded but not imported stays invisible, matching the
+    // imported-TYPE gating), and searched by lookupExtensionMember alongside
+    // the current module's own ExtensionSymbols.
+    std::vector<ExtensionSymbol*> importedExtensions_;
+    // §26.5 rule 4 (#1307): the defining module (dotted name) of each entry in
+    // `importedExtensions_`, captured at the same population site — an
+    // ExtensionSymbol carries no module-name field of its own (unlike a
+    // TypeSymbol registered under ctx_.importedTypesOf), so the ambiguity
+    // diagnostic's "defining module" fact for an imported candidate has
+    // nowhere else to come from. A local (current-module) candidate's module
+    // is ctx_.module()->name; this map covers only the imported ones.
+    std::unordered_map<ExtensionSymbol*, std::string> importedExtensionModule_;
     // §2.7 v0.164 / #1365: maps a MemberAccessExpr* → dotted module name when
     // that expression resolves to a partial module-name prefix in expression
     // position (e.g. `BankingApp.Transactions` in `BankingApp.Transactions.Calc`).
@@ -417,6 +433,20 @@ private:
     // read, a compound-assignment target, an intermediate `.x` in a chain, an
     // RHS) is a read and must be rejected.
     const ast::Expr* plainSetAssignTargetNode_ = nullptr;
+
+    // fix #2543 (§23, v0.236): mirror of `plainSetAssignTargetNode_` for
+    // `ref`/`out` call/constructor argument operands. The bare-read-of-
+    // write-only-indexer gate (ExprTypecheck_Exprs.cpp user-defined-indexer
+    // visit) must NOT fire when the IndexExpr is the operand of a `ref`/`out`
+    // argument: that operand position has its OWN specialized check in
+    // `checkRefOutPropertyOperand` (#2530), which correctly rejects `ref`
+    // and admits `out`. Without this exemption, an `out d[i]` against a
+    // write-only indexer would be incorrectly rejected here BEFORE the
+    // (correct) ref/out operand pass even runs. Saved/restored around each
+    // CallArgument/NewExpr-arg visit. A `nullptr` (default) means the
+    // current IndexExpr is NOT a ref/out operand and the gate fires
+    // normally for write-only indexers.
+    const ast::Expr* refOutArgTargetNode_ = nullptr;
 
     // fix #829 / §A.7: when a lambda's expected type is a known function type
     // `(T1, …, Tn) -> R` (a typed-local initializer, an assignment RHS, or a
@@ -1137,10 +1167,22 @@ private:
     // §26.5 (#714): when a generic-extension method is found (extension has
     // free type variables), the inferred binding (e.g. T → int) is written into
     // `outBinding` so the caller can record it for typeCall and codegen.
+    // §26.5.1 rule 1 / §26.5 rule 4 (#1307): when more than one candidate
+    // block is applicable (matches `receiver` and declares `name`), the
+    // candidates are ranked by subtype specificity on their receiver-
+    // substituted heads; a unique most-specific candidate wins, and a tie
+    // among two or more equally-specific candidates is a compile error naming
+    // each one (defining module, declared head incl. `where` clause,
+    // declaration site) — `loc` is the diagnostic's location (the call site)
+    // and `reportAmbiguity` lets a pure existence PROBE (see
+    // extensionNameBlockedNote) suppress the diagnostic, since a probe must
+    // not itself cause the ambiguity error it is only checking for.
     Symbol* lookupExtensionMember(
         const TypeRef* receiver,
         std::string_view name,
-        std::vector<std::pair<std::string, TypeRef*>>* outBinding = nullptr);
+        std::vector<std::pair<std::string, TypeRef*>>* outBinding = nullptr,
+        SourceLocation loc = SourceLocation{},
+        bool reportAmbiguity = true);
 
     // §26.5 step 1 (v0.183): when an instance member of `name` name-blocks
     // extension lookup for `receiver` and the committed instance call then
@@ -1347,6 +1389,23 @@ private:
     // `valueType` to the simple variable `sym` — a non-null value makes it
     // known-non-null; a (possibly-)null value clears that knowledge.
     void narrowOnAssignment(Symbol* sym, const TypeRef* valueType);
+
+    // §7.4 (#2258): reduce the three live narrowing sets to their INTERSECTION
+    // with one snapshot — the single primitive every all-paths join and every
+    // "un-seed what this construct established" restore is built from. Keeping
+    // the current sets' DROPS is the point: a restore written as an ASSIGNMENT
+    // (`nullNarrowed_ = saved;`) RESURRECTS a fact the visited sub-expression
+    // legitimately invalidated per §7.4 "How narrowing is invalidated" (a
+    // `ref`/`out` argument, a call/`await` on a mutably-captured local), which
+    // is a silent compile-ACCEPT of a null dereference. An intersection keeps
+    // the drop and still discards whatever the construct itself SEEDED (absent
+    // from the snapshot). Pure set/map algebra over integer keys and pointer
+    // identity — order-independent, so it is deterministic across shard
+    // processes (#2116).
+    void intersectNarrowingSetsWith(
+        const std::unordered_set<Symbol*>& otherNull,
+        const std::unordered_map<Symbol*, TypeRef*>& otherNarrowings,
+        const std::set<std::pair<std::uint32_t, std::uint32_t>>& otherField);
 
     // §7.4 (issue #2118): after a loop body (which may execute ZERO times),
     // reduce the current narrowing state to the intersection of what holds on

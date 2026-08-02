@@ -589,6 +589,40 @@ private:
         return CondState{assigned_, assigned_};
     }
 
+    // §7.5 / §22.3 / §22.4 (v0.235, #2345): per-path definite-assignment
+    // treatment for a null-conditional call `recv?.M(args)`, mirroring
+    // evalCond's and/or short-circuit modeling. §7.5: "if any segment of a
+    // chain is null, the remainder is not evaluated" — so when `recv` is
+    // null, `M`'s argument list (and any `out` assignment it would produce)
+    // never runs, exactly parallel to `and`'s unevaluated right operand when
+    // the left is false. `afterFalse` is therefore the state where the
+    // receiver was null and nothing beyond it evaluated; `afterTrue` is the
+    // state where the receiver was non-null and the call's arguments ran.
+    // The receiver expression `ncm.target` itself is evaluated
+    // unconditionally (only the member access and the call's arguments are
+    // the "remainder" §7.5 skips) — and if `ncm.target` is itself a further
+    // null-conditional node (a chained `a?.b?.c(...)`), visitExpr recurses
+    // into this same machinery for it, self-contained: it merges its own
+    // split to the safe/conservative intersection before returning here, so
+    // a nested `?.`-call's own out-var hazard is independently protected at
+    // ITS OWN call site (see the chained-access self-pass test). The general
+    // visitExpr entry point (below) merges the returned CondState to the
+    // conservative intersection for ordinary (non-short-circuit-composed)
+    // use — exactly as evalCond's and/or callers do.
+    CondState evalNullCondCallArgs(const ast::CallExpr& ce,
+                                   const ast::NullCondMemberExpr& ncm) {
+        if (ncm.target) visitExpr(*ncm.target);
+        // afterFalse: receiver null — the args (and any inline `out var`
+        // declaration among them) are never evaluated.
+        auto afterSkip = assigned_;
+        // afterTrue: receiver non-null — the call's arguments run exactly as
+        // an ordinary call's (existing visitCallArg semantics, unchanged).
+        for (const auto& a : ce.args) visitCallArg(a);
+        CondState r{/*afterTrue=*/assigned_, /*afterFalse=*/afterSkip};
+        assigned_ = intersectSets(r.afterTrue, r.afterFalse);
+        return r;
+    }
+
     // True when `e` is a short-circuit boolean operator whose operands must be
     // evaluated path-sensitively (§22.4).
     static bool isShortCircuitExpr(const ast::Expr& e) {
@@ -1224,6 +1258,22 @@ private:
                     }
                 }
             }
+            // §7.5 / §22.4 (v0.235, #2345): `recv?.M(args)` — the callee is a
+            // NullCondMemberExpr. Give this the same per-path short-circuit
+            // treatment evalCond already gives and/or (see
+            // evalNullCondCallArgs): the args — and any `out` assignment
+            // they produce — run only on the receiver-non-null continuation.
+            // Previously this fell through to the generic handling below,
+            // which visited the callee (a no-op read of the receiver chain)
+            // and then walked every argument via visitCallArg UNCONDITIONALLY
+            // — marking an inline `out var` recipient "assigned" on the
+            // straight-line path regardless of whether the call was actually
+            // reachable only conditionally (the gap #2345 tracks).
+            if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(
+                    ce->callee.get())) {
+                (void)evalNullCondCallArgs(*ce, *ncm);
+                return;
+            }
             if (ce->callee) visitExpr(*ce->callee);
             for (const auto& a : ce->args) {
                 visitCallArg(a);
@@ -1249,8 +1299,33 @@ private:
             return;
         }
         if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+            // §22.4 / §7.9 (v0.235, #2409): route each constructor argument
+            // through visitCallArg, exactly as the CallExpr case below does
+            // for a method call's arguments — an inline `out var`/`out owned
+            // var` recipient of a constructor call is a pure WRITE (marks
+            // `assigned_`, and — when `inlineOutVarNeedsDA` says the
+            // recipient is a non-nullable reference type — `declared_`, so a
+            // later read on a path where the `new` call did not run is
+            // diagnosed), not a plain read of a not-yet-declared name. Before
+            // this fix every constructor argument (including an `out var`
+            // recipient's own declaring occurrence) fell through to a bare
+            // `visitExpr`, whose IdentifierExpr leaf case is `checkRead` —
+            // never `assigned_.insert`/`declared_.insert` — so a ctor
+            // out-var's name was NEVER registered with this pass at all: a
+            // later read on a short-circuit-skipped path (`flag and new
+            // T(..., out var n).ok`) silently passed DA (n not in
+            // `declared_`, so `checkRead` is a no-op) instead of being
+            // rejected per §22.4's "a read of a non-nullable-reference-typed
+            // out variable [on a path where the call may not have run] is a
+            // compile error" — confirmed live as a SEGFAULT (garbage-pointer
+            // comparison), not a diagnostic, before this fix. This mirrors
+            // #2409's sema-registration fix (ExprTypecheck_Exprs.cpp's
+            // NewExpr `out var` handling, which now sets
+            // `outVarNeedsDefiniteAssignment`) — that fix alone left this gap
+            // live, because `inlineOutVarNeedsDA` is only ever consulted from
+            // inside `visitCallArg`, which the NewExpr case never called.
             for (const auto& a : ne->args) {
-                if (a.value) visitExpr(*a.value);
+                visitCallArg(a);
             }
             return;
         }

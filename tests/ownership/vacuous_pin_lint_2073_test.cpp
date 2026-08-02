@@ -989,4 +989,192 @@ BEZEL_TEST(vacuous_pin_lint_2073,
     }
 }
 
+// ============================================================================
+// rework 4 (#2385, #2451) — the iteration-protocol sentinel family
+// (IEnumerable<T>/IEnumerator<T>/IOwningEnumerable<T>/IOwningEnumerator<T>
+// and the async counterparts) is declaration-less (TypeResolution_Names.cpp:
+// "declaration stays null (no user TypeDecl)"), same representation as the
+// Channel<T>/EventSource<T> builtins above — so isBorrowableType's
+// null-declaration fallthrough classified every one of them "not borrowable",
+// and before this rework `rhsIsDisposableClassType`'s Path-2 allow-list did
+// not recognize the family either, so Case A's inert-RHS guard wrongly fired.
+// Spec §29.1 (v0.235): "`GetEnumerator()` returns `owned IEnumerator<T>`: the
+// caller takes ownership of the enumerator and must dispose it" —
+// unconditional, independent of whether the implementation is a compiler-
+// generated `yield return` iterator (#2385) or a hand-written two-class
+// implementation reached through `wrapUserClassAsIEnumerable` (#2451).
+// FAILS WITHOUT THE REWORK (mechanically confirmed: reverting just the
+// `rhsIsDisposableClassType` head-name arm reproduces the inert-RHS warning
+// on every case below).
+// // per §28.10, §29.1, stdlib §4.12/§4.13, #2385, #2451
+// ============================================================================
+
+// #2385 repro (compiler-generated iterator): `src.GetEnumerator()` on a
+// named `IEnumerable<int>` local backed by a `yield return` iterator method.
+// The result type is the declaration-less `IEnumerator<int>` sentinel; a
+// `using var` over it is the canonical §29.1 pattern, not vacuous.
+BEZEL_TEST(vacuous_pin_lint_2073,
+           manual_getenumerator_compiler_iterator_no_warn_spec_29_1_2385) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public static method Gen(): IEnumerable<int> "
+        "    yield return 1; yield return 2; yield return 3; "
+        "  end Gen; "
+        "  public static method M(): int "
+        "    var src := C.Gen(); "
+        "    using var e1 := src.GetEnumerator(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "e1"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "e1"));
+}
+
+// #2451 repro (hand-written two-class implementation, wrapUserClassAsIEnumerable):
+// a manual `.GetEnumerator()` call on a user class implementing `IEnumerable<T>`
+// returns a genuine, freshly-`calloc`'d wrapper with its own `Dispose()`
+// (hardened by #2389/#2424/#2440); `using var` over it must not warn.
+BEZEL_TEST(vacuous_pin_lint_2073,
+           manual_getenumerator_user_class_no_warn_spec_29_1_2451) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class IntRangeEnum: IEnumerator<int> "
+        "  private lo: int; private hi: int; private cur: int; "
+        "  public constructor(lo: int, hi: int) "
+        "    this.lo:=lo; this.hi:=hi; cur:=lo-1; "
+        "  end constructor; "
+        "  public method MoveNext(): bool cur:=cur+1; return cur<=hi; end MoveNext; "
+        "  public property Current: int get => cur; end Current; "
+        "end IntRangeEnum; "
+        "class IntRange: IEnumerable<int> "
+        "  private lo: int; private hi: int; "
+        "  public constructor(lo: int, hi: int) this.lo:=lo; this.hi:=hi; end constructor; "
+        "  public method GetEnumerator(): IEnumerator<int> "
+        "    return new IntRangeEnum(lo, hi); "
+        "  end GetEnumerator; "
+        "end IntRange; "
+        "class C "
+        "  public static method M(): int "
+        "    using var s := new IntRange(1, 3); "
+        "    using var e1 := s.GetEnumerator(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "e1"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "e1"));
+}
+
+// #2451's broader claim: the misfire is not specific to a `GetEnumerator()`
+// call result — ANY `using var` whose static RHS type is the sentinel family
+// is affected, e.g. an `Array<T>` coerced to `IEnumerable<T>`. Coercing a
+// borrowing collection into the interface allocates a fresh vtable-backed
+// wrapper (codegen's `wrappedHere`/`isSyncIterEnum` path, LlvmBackend_Setup.cpp)
+// that genuinely owns disposal of the wrapper frame (it borrows the array —
+// exactly-once, does not double-free it).
+BEZEL_TEST(vacuous_pin_lint_2073,
+           array_wrapped_ienumerable_local_no_warn_spec_29_1_2451) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public static method M(): int "
+        "    using var a := new Array<int>(); "
+        "    a.Add(1); a.Add(2); "
+        "    using var seq: IEnumerable<int> := a; "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "seq"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "seq"));
+}
+
+// IOwningEnumerator<T> — stdlib §4.13 (`: IDisposable where T: class`), reached
+// via `OwningArray<T>.Drain().GetOwningEnumerator()`. Same sentinel shape,
+// owning-family counterpart of the borrowing `IEnumerator<T>` case above.
+BEZEL_TEST(vacuous_pin_lint_2073,
+           owning_enumerator_using_var_no_warn_spec_29_1_2451) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class Cell public constructor() end constructor; "
+        "destructor end destructor; end Cell; "
+        "class C "
+        "  public static method M(): int "
+        "    using var arr := new OwningArray<Cell>(); "
+        "    arr.Add(new Cell()); "
+        "    using var d := arr.Drain(); "
+        "    using var e := d.GetOwningEnumerator(); "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "e"));
+    BEZEL_EXPECT_FALSE(hasVacuousBorrowPinWarning(r, "e"));
+}
+
+// Positive-direction proof: excluding the sentinel family from Case A
+// (inert-RHS) does not silence the lint for it entirely — Case B (vacuous
+// borrow-pin) becomes REACHABLE for it instead, and correctly fires when the
+// specific RHS genuinely is a vacuous pin. `this._seq` is a FIELD READ
+// (§28.10 "using var initialized from a borrow": "a method call without an
+// owned return … an indexer access, a field read, or an unmarked read of a
+// named owned binding" is a borrow), and its root (`this`) already outlives
+// this method's scope, so the pin extends nothing — the SAME diagnosis Case B
+// gives for an ordinary declared-class field (this_field_pin_is_vacuous_
+// spec_28_10 above). Before this rework this shape was swallowed by Case A's
+// wrong "inert" message instead of Case B's correct "pins a source that
+// already outlives this scope" one; mechanically confirmed via
+// `agent_check.sh --probe` that Case B's message fires post-fix.
+BEZEL_TEST(vacuous_pin_lint_2073,
+           owned_field_of_sentinel_type_borrow_pin_still_warns_spec_28_10_2451) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  private owned _seq: IEnumerable<int> := C.Gen(); "
+        "  public static method Gen(): IEnumerable<int> "
+        "    yield return 1; yield return 2; "
+        "  end Gen; "
+        "  public method N(): int "
+        "    using var x := this._seq; "
+        "    return 0; "
+        "  end N; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_FALSE(hasInertRhsWarning(r, "x"));
+    BEZEL_EXPECT_TRUE(hasVacuousBorrowPinWarning(r, "x"));
+    BEZEL_EXPECT_EQ(countVacuousBorrowPinWarnings(r, "x"), 1);
+}
+
+// Positive-direction proof: the rework must NOT mask a genuinely inert RHS.
+// `IList<int>` is a DIFFERENT declaration-less sentinel family (the
+// array-backed, unwrapped protocol per iterator_native_test.cpp's
+// `ilist_local_unwrapped_control`) that is deliberately excluded from
+// `rhsIsDisposableClassType` — only the eight iteration-protocol names were
+// added. A `using var` pinning a borrowing `Array<int>` through `IList<int>`
+// remains genuinely vacuous (no fresh wrapper is allocated for IList) and
+// must still warn, proving the fix is scoped to the exact head-name set, not
+// a blanket "any interface" carve-out.
+BEZEL_TEST(vacuous_pin_lint_2073,
+           ilist_sentinel_still_warns_spec_28_10_2451) {
+    auto r = parseAndCheckOwnership(
+        "module M; "
+        "class C "
+        "  public static method M(): int "
+        "    using var a := new Array<int>(); "
+        "    using var seq: IList<int> := a; "
+        "    return 0; "
+        "  end M; "
+        "  public static method Main(): int return 0; end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasInertRhsWarning(r, "seq"));
+}
+
 }  // namespace

@@ -8,9 +8,15 @@
 
 
 void* bz_array_alloc(int64_t elem_size, int64_t initial_cap) {
+    // §31.4: both allocations terminate on failure. The `data` check in
+    // particular is load-bearing — the pre-existing code set `capacity` whether
+    // or not the buffer materialized, so an OOM here handed back a header
+    // claiming capacity over a NULL buffer and the first add wrote through it.
     auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
+    if (!arr) bz_alloc_fail("Array<T> header");
     if (initial_cap > 0) {
         arr->data = calloc((size_t)initial_cap, (size_t)elem_size);
+        if (!arr->data) bz_alloc_fail("Array<T> backing store");
         arr->capacity = initial_cap;
     }
     return arr;
@@ -38,10 +44,22 @@ void* bz_array_alloc_count_n(int64_t elem_size, int64_t n) {
     return arr;
 }
 
+// fix #1762 finding R5: realloc-into-same-pointer leaks on failure — the
+// canonical anti-pattern `p = realloc(p, n)` overwrites `p` with NULL, losing
+// the only pointer to the original block. Use a tmp pointer.
+//
+// "collection growth" is named verbatim in §31.4's allocation-failure list, so
+// a failed growth TERMINATES. That is also the only safe option here: this
+// function returns void and its callers write immediately afterwards, so any
+// non-terminating failure posture (silently not growing) would leave them
+// writing past a buffer that was never grown — a heap-buffer-overflow, which
+// is strictly worse than the NULL-deref crash the tmp-pointer change removed.
 static void bz_array_grow(bz_array_t* arr, int64_t elem_size, int64_t min_cap) {
     int64_t new_cap = arr->capacity < 4 ? 4 : arr->capacity * 2;
     if (new_cap < min_cap) new_cap = min_cap;
-    arr->data = realloc(arr->data, (size_t)(new_cap * elem_size));
+    void* tmp = realloc(arr->data, (size_t)(new_cap * elem_size));
+    if (!tmp) bz_alloc_fail("collection growth (Array<T> backing store)");
+    arr->data = tmp;
     // Zero new entries for safety
     if (new_cap > arr->capacity) {
         memset((char*)arr->data + arr->capacity * elem_size, 0,
@@ -366,7 +384,12 @@ static uint32_t fnv1a(const char* s, int64_t len) {
 static void dict_order_append(bz_dict_t* d, int64_t slot) {
     if (d->order_count == d->order_cap) {
         int64_t new_cap = d->order_cap < 8 ? 8 : d->order_cap * 2;
-        d->order = (int64_t*)realloc(d->order, (size_t)new_cap * sizeof(int64_t));
+        // fix #1762 finding R5: same realloc anti-pattern as bz_array_grow, and
+        // the same §31.4 posture — the write below is unconditional, so a
+        // non-terminating failure would append past the un-grown buffer.
+        int64_t* tmp = (int64_t*)realloc(d->order, (size_t)new_cap * sizeof(int64_t));
+        if (!tmp) bz_alloc_fail("collection growth (Dictionary insertion-order array)");
+        d->order = tmp;
         d->order_cap = new_cap;
     }
     d->order[d->order_count++] = slot;
@@ -401,13 +424,19 @@ static void dict_rehash(bz_dict_t* d) {
     int64_t old_cap = d->capacity;
     bz_entry_t* old = d->buckets;
     int64_t new_cap = old_cap < 8 ? 8 : old_cap * 2;
+    // §31.4: a failed rehash allocation terminates. Checking here is what makes
+    // #2239's ctor hardening actually reachable — without it, `capacity` is
+    // advanced past a NULL `buckets` and the very next insert writes through
+    // NULL, which is the crash #2239 set out to remove.
     d->buckets = (bz_entry_t*)calloc((size_t)new_cap, sizeof(bz_entry_t));
+    if (!d->buckets) bz_alloc_fail("collection growth (Dictionary bucket array)");
     d->capacity = new_cap;
     d->count = 0;
 
     // issue #622 / stdlib §4.8: build a translation table old_slot → new_slot
     // so we can compact and remap the order array after re-inserting all entries.
     int64_t* slot_map = (int64_t*)malloc((size_t)old_cap * sizeof(int64_t));
+    if (!slot_map) bz_alloc_fail("collection growth (Dictionary rehash slot map)");
     for (int64_t i = 0; i < old_cap; i++) slot_map[i] = -1;
 
     for (int64_t i = 0; i < old_cap; i++) {
@@ -441,10 +470,23 @@ static void dict_rehash(bz_dict_t* d) {
     free(slot_map);
 }
 
+// fix #2239 / stdlib §4.8 / spec §31.4: OOM-harden the string-key Dictionary
+// ctor. Pre-fix called calloc(1, sizeof(bz_dict_t)) and calloc(8,
+// sizeof(bz_entry_t)) without null-checking; a failed buckets allocation left
+// d->buckets == nullptr and the first bz_dict_set_str dereferenced
+// d->buckets[ins].key = ... to SIGSEGV.
+//
+// Returning NULL (the first cut of this fix) did not remove that crash — it
+// moved it one line, to bz_dict_set_str's unchecked `d->count` read, because
+// neither the codegen ctor site nor any bz_dict_* entry point checks for a
+// null handle. §31.4 requires termination anyway, so terminate at the
+// allocation itself, where the report can name what failed.
 void* bz_dict_alloc(void) {
     auto* d = (bz_dict_t*)calloc(1, sizeof(bz_dict_t));
+    if (!d) bz_alloc_fail("Dictionary<K,V> header");
     d->capacity = 8;
     d->buckets = (bz_entry_t*)calloc(8, sizeof(bz_entry_t));
+    if (!d->buckets) bz_alloc_fail("Dictionary<K,V> bucket array");
     // issue #622: order array starts null; lazily grown on first insert.
     // order_count and order_cap are zero from calloc.
     return d;
@@ -648,12 +690,17 @@ static int64_t dict_find_gen(bz_dict_t* d, const void* k, uint32_t h) {
     return -1; // table full (shouldn't happen with load factor management)
 }
 
+// fix #2239 / stdlib §4.8 / spec §31.4: OOM-harden the generic-key Dictionary
+// ctor. Mirrors bz_dict_alloc above — terminate at the failed allocation rather
+// than handing back a handle no caller null-checks.
 void* bz_dict_alloc_generic(int64_t key_size,
                               uint64_t (*hash)(const void* key),
                               bool     (*eq)(const void* a, const void* b)) {
     auto* d = (bz_dict_t*)calloc(1, sizeof(bz_dict_t));
+    if (!d) bz_alloc_fail("Dictionary<K,V> header");
     d->capacity = 8;
     d->buckets = (bz_entry_t*)calloc(8, sizeof(bz_entry_t));
+    if (!d->buckets) bz_alloc_fail("Dictionary<K,V> bucket array");
     d->key_size = key_size > 0 ? key_size : 1;
     d->hash_fn = hash;
     d->eq_fn = eq;
@@ -1039,15 +1086,21 @@ void bz_sort_kv_gen(void** keys, void** values, int64_t n,
 // in ascending lexicographic string order (§9.6).
 void bz_sort_kv_str(char** keys, int64_t* lens, void** values, int64_t n) {
     if (n <= 1 || !keys) return;
+    // fix #1762 finding R1 + spec §31.4: every scratch allocation here
+    // terminates on failure. Returning early (the pre-fix and first-fix
+    // behaviour) leaves the caller's keys/values SILENTLY UNSORTED — a wrong
+    // answer with no diagnostic, which is the outcome §31.4 exists to prevent.
     int64_t* idx = (int64_t*)malloc((size_t)n * sizeof(int64_t));
-    if (!idx) return;
+    if (!idx) bz_alloc_fail("sort scratch (index array)");
     for (int64_t i = 0; i < n; i++) idx[i] = i;
     BzKVSortCtxStr ctx = {keys};
     qsort_r(idx, (size_t)n, sizeof(int64_t), bz_kv_idx_cmp_str, &ctx);
     char**   ks = (char**)malloc((size_t)n * sizeof(char*));
+    if (!ks) bz_alloc_fail("sort scratch (key array)");
     int64_t* ls = lens   ? (int64_t*)malloc((size_t)n * sizeof(int64_t)) : nullptr;
+    if (lens && !ls) bz_alloc_fail("sort scratch (length array)");
     void**   vs = values ? (void**)malloc((size_t)n * sizeof(void*)) : nullptr;
-    if (!ks) { free(idx); return; }
+    if (values && !vs) bz_alloc_fail("sort scratch (value array)");
     for (int64_t i = 0; i < n; i++) {
         ks[i] = keys[idx[i]];
         if (ls) ls[i] = lens[idx[i]];
@@ -1613,8 +1666,16 @@ static uint64_t xorshift128_next(uint64_t* s) {
     return t + r;
 }
 
+// per stdlib §2.7: Random(seed) ctor — allocate an xorshift128+ state.
+// fix #2238 / stdlib §2.7 / spec §31.4: OOM-harden the malloc. The pre-fix code
+// wrote through `r` without a null check after malloc(sizeof(bz_rng_t)),
+// SIGSEGVing on the next store. Returning NULL instead did not help: every
+// consumer (bz_random_next_int / next_double / next_bytes) dereferences the
+// handle unchecked, so the crash simply moved one call later. §31.4 requires
+// termination — do it here, where the report can say what failed.
 void* bz_random_alloc(int64_t seed) {
     auto* r = (bz_rng_t*)malloc(sizeof(bz_rng_t));
+    if (!r) bz_alloc_fail("Random state");
     r->state[0] = (uint64_t)seed ^ 0xdeadbeef12345678ULL;
     r->state[1] = (uint64_t)seed * 6364136223846793005ULL + 1442695040888963407ULL;
     if (r->state[0] == 0) r->state[0] = 1;
@@ -1841,6 +1902,17 @@ struct bz_lazy_t {
     // borrowing bz_lazy_from_array / element-borrowing bz_lazy_from_owned_array
     // paths) leaves the slots untouched. Disjoint from own_closure/seen/sorted.
     int32_t arr_is_groupings;
+    // #2544 (stdlib §4.8/§4.12; spec §29.1, v0.236): when the owned ARRAY
+    // (own_arr == 1) is a FRESH materialisation of a string-keyed
+    // Dictionary<string,V> from the Calls3 LINQ source path
+    // (lowerToLazyLinqSource Dictionary case), each slot is a {bz_string*, V}
+    // STRUCT whose Key field is a +1 rebuilt string (initStringRc -> rc=1).
+    // bz_lazy_dispose must walk the array and bz_string_release each Key at
+    // struct offset 0 BEFORE bz_array_free. Set only by
+    // bz_lazy_from_owned_str_dict_array; 0 (the plain bz_lazy_from_array /
+    // bz_lazy_from_owned_array / bz_lazy_from_owned_grouping_array paths)
+    // leaves the slots untouched. Disjoint from arr_is_groupings.
+    int32_t arr_str_keys;
 };
 
 // Advance the upstream enumerator and return a pointer to its current element,
@@ -1855,6 +1927,7 @@ static const void* bz_lazy_up_next(bz_lazy_t* up) {
 
 extern "C" void bz_closure_release(void* c);  // defined below; released on dispose
 extern "C" void bz_groupby_free_groups(void* groups_arr);  // defined below (#1914)
+static void bz_lazy_release_str_dict_keys(void* arr, int64_t esz);  // #2544, defined below
 
 static int32_t bz_lazy_movenext(bz_lazy_t* e);
 static void*   bz_lazy_current(bz_lazy_t* e) { return e->cur; }
@@ -1897,8 +1970,14 @@ static void    bz_lazy_dispose(bz_lazy_t* e) {
     // this lazy source also owns each grouping — free them (element array + key
     // data + group object) BEFORE the outer array. bz_groupby_free_groups runs
     // exactly once (dispose is once per enumerator), so no double-free.
+    // #2544: when the owned array is a fresh Dictionary<string,V> materialisation
+    // (arr_str_keys), each slot is a {bz_string*, V} struct and the Key at offset
+    // 0 is a +1 rebuilt string — walk the array and bz_string_release each Key
+    // BEFORE bz_array_free. bz_string_release is null-safe; the array element
+    // disposer is null because the {K, V} struct layout is fixed (not pointer-elem).
     if (e->own_arr && e->arr) {
         if (e->arr_is_groupings) bz_groupby_free_groups(e->arr);
+        if (e->arr_str_keys) bz_lazy_release_str_dict_keys(e->arr, e->esz);
         bz_array_free(e->arr, nullptr);
     }
     // #422 / §28.9 / §28.3: release the operator's closure ONLY when it was an
@@ -1964,6 +2043,42 @@ extern "C" void* bz_lazy_from_owned_grouping_array(void* arr, int64_t esz) {
     e->arr = arr;
     e->own_arr = 1;
     e->arr_is_groupings = 1;
+    return e;
+}
+
+// #2544 (stdlib §4.8/§4.12; spec §29.1, v0.236): walk a fresh Dictionary<string,V>
+// materialisation ({bz_string*, V} struct array) and bz_string_release each Key
+// at struct offset 0. Used by bz_lazy_dispose when arr_str_keys is set. The Key
+// strings were +1 rebuilt by codegen's lowerToLazyLinqSource Dictionary case
+// (initStringRc → rc=1) and would otherwise leak — bz_array_free's element
+// disposer is `void(*)(void*)` cast on each slot, which is for pointer-element
+// arrays only, never reaching the rebuilt string at struct offset 0. The array's
+// element stride is `esz` bytes ({bz_string*, V} struct, normally 16 on 64-bit
+// with 8-byte align). bz_string_release is null-safe per §8.6.
+static void bz_lazy_release_str_dict_keys(void* arr, int64_t esz) {
+    if (!arr || esz <= 0) return;
+    int64_t n = bz_array_len(arr);
+    for (int64_t i = 0; i < n; i++) {
+        char* slot = (char*)bz_array_ptr_at(arr, i, esz);
+        if (slot) bz_string_release(*(void**)slot);
+    }
+}
+
+// #2544 (stdlib §4.8/§4.12; spec §29.1, v0.236): wrap a FRESH
+// Dictionary<string,V> materialisation (bz_array_t* of {bz_string*, V} structs)
+// as a lazy ARRAY source that OWNS the array AND each rebuilt string Key
+// (own_arr := 1, arr_str_keys := 1 → bz_lazy_dispose walks the array and
+// bz_string_release each Key at offset 0 before bz_array_free). Sibling of
+// bz_lazy_from_owned_grouping_array (#1914). Used by the Calls3 LINQ source
+// path (lowerToLazyLinqSource Dictionary case) when the dictionary is
+// string-keyed. The Values are copied by value into the slot — NOT retrained
+// copies — so they need no disposal here; the source dictionary still owns
+// its values.
+extern "C" void* bz_lazy_from_owned_str_dict_array(void* arr, int64_t esz) {
+    auto* e = bz_lazy_new(BZ_LAZY_ARRAY, esz);
+    e->arr = arr;
+    e->own_arr = 1;
+    e->arr_str_keys = 1;
     return e;
 }
 

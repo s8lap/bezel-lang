@@ -1,8 +1,8 @@
 #pragma once
 
 // Source positions used by every later phase. Not itself a compilation phase;
-// this is shared infrastructure the lexer attaches to tokens (§1 defines source
-// text as a sequence of characters) and that diagnostics point at.
+// this is shared infrastructure the lexer attaches to tokens (§1.1 defines a
+// source file as UTF-8-encoded Unicode code points) and diagnostics point at.
 
 #include <cstdint>
 

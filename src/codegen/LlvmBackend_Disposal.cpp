@@ -25,6 +25,9 @@
 namespace bezel::codegen {
 
 
+// §28.4: at most one destructor per class. Returns the AST DestructorDecl for
+// `ts` (or nullptr if none — emitDisposerBody then skips the destructor-body
+// step and runs only owned-field disposal + base-chain Dispose).
 const ast::DestructorDecl* Emitter::findDestructor(const sema::TypeSymbol* ts) {
     for (const sema::Symbol* m : ts->members) {
         if (dynamic_cast<const sema::DestructorSymbol*>(m)) {
@@ -198,6 +201,41 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
                 builder_.CreateLoad(ptrTy(), emitExcSlot(), "postdtor.exc");
             llvm::Value* isNew = builder_.CreateICmpNE(
                 excNow, llvm::ConstantPointerNull::get(ptrTy()));
+            // fix #2358 / §28.4 + §31.2 (finally-supersession discipline, cited
+            // by §28.4's "the later exception supersedes the earlier one"
+            // multi-value-cleanup-pass rule): when the destructor body ITSELF
+            // threw (isNew) while an exception was ALREADY propagating at this
+            // disposal's entry (parkedDtorExc non-null AT RUNTIME — an
+            // "exception-path discharge", §28.3), the new exception supersedes
+            // the parked one. Per §31.2, "the superseded exception is disposed
+            // by the runtime exactly once, as if its handling had completed" —
+            // dispose+reclaim it HERE, exactly as emitPendingCheckIf /
+            // emitNewPendingCheck already do for the sibling finally/catch-guard
+            // supersede (#1216/#1149), including the #1288/§30.9 deferred-fault
+            // clear so a superseded task-owned fault's single-dispose invariant
+            // still holds. Without this, parkedDtorExc was silently dropped on
+            // the floor by the select below — losing the original exception's
+            // disposal and leaking its object (the reported #2358 48-byte leak).
+            // Gated on BOTH conditions at runtime (not just isNew) so the
+            // ordinary non-unwind throwing-destructor path (parkedDtorExc ==
+            // null here — no exception was in flight) takes the plain-select
+            // path unchanged: freeing a null parkedDtorExc would be wrong.
+            llvm::Value* hadPending = builder_.CreateICmpNE(
+                parkedDtorExc, llvm::ConstantPointerNull::get(ptrTy()));
+            llvm::Value* supersedes = builder_.CreateAnd(isNew, hadPending);
+            auto* supersedeBB =
+                llvm::BasicBlock::Create(llvm_, "dtor.supersede", currentFn_);
+            auto* restoreBB =
+                llvm::BasicBlock::Create(llvm_, "dtor.restore", currentFn_);
+            builder_.CreateCondBr(supersedes, supersedeBB, restoreBB);
+            builder_.SetInsertPoint(supersedeBB);
+            builder_.CreateCall(
+                declareC("bz_clear_exc_deferred", llvm::Type::getVoidTy(llvm_),
+                         {ptrTy()}),
+                {parkedDtorExc});
+            emitDisposeAndReclaim(parkedDtorExc);
+            builder_.CreateBr(restoreBB);
+            builder_.SetInsertPoint(restoreBB);
             llvm::Value* restored =
                 builder_.CreateSelect(isNew, excNow, parkedDtorExc);
             builder_.CreateStore(restored, emitExcSlot());
@@ -502,6 +540,12 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // (error_obj prelude + per-T result_disposer + fire-and-forget
             // [_checked]) is the using-var task disposal protocol, dispatched
             // in the iteration loop below via emitOwnedTaskDisposal.
+            //
+            // #2260: the `owned` test lives INSIDE taskFamilyTypeFromField
+            // (LlvmBackend_Setup.cpp), so this arm — like every sibling above —
+            // fires only for an OWNING slot. A NON-`owned` Task-family field is
+            // a spec-legal BORROW (§28.5 / §22.12 rule 2(ii)) whose owner is
+            // elsewhere; disposing it here was a double free.
             OwnedField of{fs, nullptr};
             of.taskField = true;
             owned.push_back(of);
@@ -1330,6 +1374,47 @@ llvm::BasicBlock* Emitter::newArgUnwindCleanup(llvm::Value* obj) {
 }
 
 
+llvm::BasicBlock* Emitter::closureArgUnwindCleanup(
+    const std::vector<llvm::Value*>& closures) {
+    // fix #1073 / §28.3 "Exception-path discharge" / §28.9: the EXCEPTION-edge
+    // half of the §28.14 call-bounded closure ARGUMENT-PASS release
+    // (LlvmBackend_Calls2.cpp). The producer's +1 on an inline-closure argument
+    // is dropped after the call on the normal edge; when the callee (or an
+    // operation emitted inside emitMethodCall, e.g. a static-init guard)
+    // PROPAGATES instead, `emitPendingCheck` branches away before that release
+    // and the cell + env would leak on the caught/propagate path. Install this
+    // block as `unwindTarget_` for the duration of emitMethodCall so every
+    // unwind edge it emits drops those same temporaries on the way out.
+    //
+    // EXACTLY-ONCE. The block's only predecessors are the unwind edges emitted
+    // WHILE it is installed; each of them is a `CreateCondBr` whose other side
+    // is the `call.cont` continuation carrying the normal-path release. The two
+    // are therefore mutually exclusive on any concrete execution: an exception
+    // edge branches out of the expression for good (it ends in a branch to the
+    // enclosing catch/propagate boundary and never rejoins `cont`), and the
+    // normal edge is only reachable when no pending exception fired. Nested
+    // `try` lowering inside an inlined callee body saves/restores
+    // `unwindTarget_` around its own catch dispatch, so a HANDLED throw resumes
+    // on the normal edge and reaches the post-call release exactly as it would
+    // without this block.
+    //
+    // Capturing `unwindBB()` BEFORE the caller overrides `unwindTarget_`
+    // preserves the enclosing catch/propagate boundary; the pending check has
+    // already run emitUnwindDisposals() for the enclosing scopes, so this
+    // cleanup only adds the missing closure releases (mirrors
+    // newArgUnwindCleanup above). // per §28.14, §28.3, §28.9
+    auto* savedInsert = builder_.GetInsertBlock();
+    llvm::BasicBlock* enclosingUnwind = unwindBB();
+    auto* cleanupBB =
+        llvm::BasicBlock::Create(llvm_, "clarg.throw.cleanup", currentFn_);
+    builder_.SetInsertPoint(cleanupBB);
+    for (llvm::Value* cl : closures) emitClosureRelease(cl);  // null-safe
+    builder_.CreateBr(enclosingUnwind);
+    if (savedInsert) builder_.SetInsertPoint(savedInsert);
+    return cleanupBB;
+}
+
+
 void Emitter::emitDynamicDispose(llvm::Value* obj) {
     // §28.2 / §28.4: dispatch the object's PUBLIC, idempotent Dispose through
     // its vtable (slot 2, CG35-itable) — which runs the destructor body, owned-field
@@ -1379,12 +1464,55 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
         declareC("bz_obj_identity_hash_forget",
                  llvm::Type::getVoidTy(llvm_), {ptrTy()}),
         {obj});
+    // §31.4/#811/#1389: reclaim the CauseChain snapshot HERE, at the terminal
+    // reclaim site, immediately before the block itself is freed — NOT inside
+    // the shared vtable Dispose (bz$exDisposeMsg, setupBuiltinExceptions). The
+    // shared disposer releases Message/ParamName this same release-and-null
+    // way, and freeing CauseChain there looks like the same idiom, but it is
+    // NOT safe there: a still-borrowed (not-yet-reclaimed) exception's
+    // CauseChain can be READ after ITS Dispose has already dispatched on some
+    // path (e.g. `throw new X(msg, ex)` inside `ex`'s own catch arm reads
+    // `ex.CauseChain` — bz_exc_causechain_link's `nested` argument — to build
+    // the new snapshot). Freeing CauseChain from the shared disposer produced
+    // a use-after-free there (diagnosed via gdb: bz_exc_causechain_link
+    // reading a `nested` pointer into an already-freed/reused block) across
+    // the several non-single-site exception disposal paths (catch-arm
+    // dispose, scope-end dispose, async fault propagation). THIS site is
+    // different: by ownership discipline it runs EXACTLY ONCE per object,
+    // strictly after every live borrow/read of it has concluded (the true end
+    // of the object's life) — it cannot race a still-in-flight CauseChain
+    // read, so it is safe to free here.
+    //
+    // Gate: `bz_exc_reclaim_causechain` checks obj's vtable against the same
+    // built-in-exception vtable table bz_unhandled_exception gates on (only a
+    // built-in exception type installs bz$exDisposeMsg / carries the
+    // CauseChain slot at BZ_EXC_CAUSE_OFFSET); a no-op for every other class.
+    //
+    // Scope: this covers every reclaim that funnels through this function —
+    // catch-arm dispose, using-var / owned-field scope-end dispose, and a
+    // faulted task's scope-end fault-exception dispose. It deliberately does
+    // NOT cover the handful of pure-runtime "vtable-Dispose-then-free" sites
+    // that bypass codegen entirely (bz_dispose_class_obj —
+    // Task.FireAndForget's abandoned-task continuation and the
+    // WhenAll/WhenAllOwned aggregate fault/result cleanup — and
+    // bz_domain_spawn's DomainFaultedException wrap-and-dispose of the
+    // original fault): those run in bezel_runtime_concurrency.cpp with no
+    // access to the codegen-built vtable table this gate needs. Filed as a
+    // follow-up (see the issue tracker) rather than fixed silently here.
+    builder_.CreateCall(
+        declareC("bz_exc_reclaim_causechain", llvm::Type::getVoidTy(llvm_),
+                 {ptrTy(), ptrTy()}),
+        {obj, builtinExcVtableTablePtr()});
     // §28.2 v0.134 / issue #601: in checked disposal mode the block is
     // quarantined (not freed) after disposal so that the per-instance disposed
     // flag at slot 1 (or 2) remains readable when a subsequent member-entry
     // guard loads it. This is a deliberate memory leak in checked (debug)
     // builds; the spec explicitly endorses deferred reclamation here. In
     // unchecked (release) mode the block is freed immediately as before.
+    // (The CauseChain reclaim above runs unconditionally, ahead of this
+    // branch, matching checked disposal's own deliberate-leak posture for
+    // everything else the block owns — only the block header itself is kept
+    // readable for the disposed-flag guard.)
     if (!checkedDisposal_)
         builder_.CreateCall(freeFn(), {obj});
 }
@@ -1671,6 +1799,171 @@ void Emitter::emitValueLikeChoiceActiveCaseStrRelease(
 }
 
 
+// fix #2425 / §9.8 / §28.9 / §35.4 v0.235: does value-like choice `ts` own,
+// directly or transitively (through a non-nullable nested-record or
+// nested-choice payload field), at least one `string`? See the declaration
+// in LlvmBackend_impl.hpp for the full termination argument (§35.1's choice
+// self-containment check makes the record+choice value-type graph a finite
+// DAG). GENERIC choices are excluded (returns false unconditionally): a
+// generic choice's payload struct layout is per-instantiation
+// (choiceStruct's #2047 specialization), and neither this classifier nor
+// emitChoiceStringFieldReleases_impl below installs a RecordSubstGuard for
+// a NESTED generic choice/record reached mid-recursion — the same narrow,
+// documented scope #2405's record recursion already has (it does not
+// thread generic substitution through nested levels either). A generic
+// value-like choice component/payload is therefore a residual gap, not a
+// new one this fix introduces — filed if found in a live shape (none of
+// this issue's own repros are generic).
+bool Emitter::choiceHasStringFields(const sema::TypeSymbol* ts) {
+    if (!ts || ts->kind != ast::TypeDeclKind::Choice) return false;
+    if (!ts->genericParams.empty()) return false;
+    for (const sema::ChoiceCaseSymbol* cc : choiceCasesOf(ts)) {
+        if (!cc || !cc->caseDecl) continue;
+        for (const ast::Param& pf : cc->caseDecl->payload) {
+            if (!pf.type) continue;
+            const sema::TypeRef* ft = ctx_.resolvedType(*pf.type);
+            if (!ft) continue;
+            if (ft->kind == sema::TypeRef::Kind::Primitive &&
+                ft->primitive == sema::PrimitiveType::String)
+                return true;
+            if (ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
+                !ft->declaration)
+                continue;
+            if (ft->declaration->kind == ast::TypeDeclKind::Record &&
+                recordHasStringFields(ft->declaration))
+                return true;
+            if (ft->declaration->kind == ast::TypeDeclKind::Choice &&
+                choiceHasStringFields(ft->declaration))
+                return true;
+        }
+    }
+    return false;
+}
+
+
+// fix #2425 / §9.8 / §28.3 / §28.9 / §35.4 v0.235: release the ACTIVE case's
+// `string`-owning payload(s) of value-like choice `choiceTy` at struct
+// ADDRESS `choiceAddr`, recursing into a non-nullable nested-record or
+// nested-choice payload field to ARBITRARY depth. This is the choice-side
+// counterpart to emitRecordStringFieldReleases_impl's #2405 arbitrary-depth
+// recursion, and the address-based (GEP, not load+extractvalue) analog of
+// #2115's emitValueLikeChoiceActiveCaseStrRelease above — that function is
+// VALUE-based (loads the whole struct once, ExtractValue per field) and
+// stops at ONE level (direct string payload fields only); this one is
+// ADDRESS-based so a nested record/choice payload's OWN storage can be
+// reached by a further GEP off the same base, exactly as
+// emitRecordStringFieldReleases_impl reaches a nested record. The two
+// functions are NOT merged: this one is used only by the #2398/#2425
+// deserialize disposal-scope registration (LlvmBackend_Serialization.cpp),
+// which already holds an ADDRESS (an alloca'd component/payload slot); the
+// #2115 mechanism is used by the scope-end LOCAL release
+// (LlvmBackend_Setup.cpp), which arms off a VALUE-level escape analysis
+// unrelated to this one. See choiceHasStringFields just above for the
+// termination argument and the (documented, narrow) generic exclusion this
+// function shares via that gate.
+//
+// A NULLABLE nested-record/nested-choice payload field is excluded, matching
+// emitRecordStringFieldReleases_impl's own exclusion: it lowers to a
+// `{i8, T}` wrapper struct, not the bare layout this walker assumes.
+void Emitter::emitChoiceStringFieldReleases_impl(
+        llvm::Value* choiceAddr, const sema::TypeSymbol* choiceTy) {
+    if (!choiceAddr || !choiceTy || choiceTy->kind != ast::TypeDeclKind::Choice)
+        return;
+    if (!choiceHasStringFields(choiceTy)) return;  // also excludes generics
+    auto cases = choiceCasesOf(choiceTy);
+    if (cases.empty()) return;
+    llvm::StructType* st = choiceStruct(choiceTy);
+    if (!st) return;
+    llvm::Value* tagAddr =
+        builder_.CreateStructGEP(st, choiceAddr, 0, "chsfr.tag.addr");
+    llvm::Value* tag = builder_.CreateLoad(i32(), tagAddr, "chsfr.tag");
+    auto* joinBB = llvm::BasicBlock::Create(llvm_, "chsfr.join", currentFn_);
+    auto* switchBB = llvm::BasicBlock::Create(llvm_, "chsfr.switch", currentFn_);
+    builder_.CreateBr(switchBB);
+    builder_.SetInsertPoint(switchBB);
+    auto* sw = builder_.CreateSwitch(
+        tag, joinBB, static_cast<unsigned>(cases.size()));
+    for (std::size_t i = 0; i < cases.size(); ++i) {
+        const sema::ChoiceCaseSymbol* cc = cases[i];
+        if (!cc || !cc->caseDecl) continue;
+        // Does THIS case own a string, directly or transitively? Skip the
+        // arm entirely (collapses to the join) if not — mirrors #2115's own
+        // per-case caseHasStringPayload guard.
+        bool caseOwnsString = false;
+        for (const ast::Param& pf : cc->caseDecl->payload) {
+            if (!pf.type) continue;
+            const sema::TypeRef* ft = ctx_.resolvedType(*pf.type);
+            if (!ft) continue;
+            if (ft->kind == sema::TypeRef::Kind::Primitive &&
+                ft->primitive == sema::PrimitiveType::String) {
+                caseOwnsString = true;
+                break;
+            }
+            if (ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
+                !ft->declaration)
+                continue;
+            if ((ft->declaration->kind == ast::TypeDeclKind::Record &&
+                 recordHasStringFields(ft->declaration)) ||
+                (ft->declaration->kind == ast::TypeDeclKind::Choice &&
+                 choiceHasStringFields(ft->declaration))) {
+                caseOwnsString = true;
+                break;
+            }
+        }
+        if (!caseOwnsString) continue;
+        auto* armBB = llvm::BasicBlock::Create(llvm_, "chsfr.arm", currentFn_);
+        sw->addCase(llvm::ConstantInt::get(llvm::Type::getInt32Ty(llvm_), i),
+                    armBB);
+        builder_.SetInsertPoint(armBB);
+        // GEP into the case's payload slot (field 1+i) — embedded inline in
+        // the SAME outer struct, exactly like a record's nested-record
+        // member (§35.1: a choice's case payloads are value-typed storage).
+        llvm::Value* payloadAddr = builder_.CreateStructGEP(
+            st, choiceAddr, 1 + (unsigned)i, "chsfr.case.addr");
+        llvm::Type* payloadTy = st->getElementType(1 + (unsigned)i);
+        auto* payloadStruct = llvm::dyn_cast<llvm::StructType>(payloadTy);
+        for (std::size_t j = 0; j < cc->caseDecl->payload.size(); ++j) {
+            const ast::Param& pf = cc->caseDecl->payload[j];
+            if (!pf.type) continue;
+            const sema::TypeRef* ft = ctx_.resolvedType(*pf.type);
+            if (!ft || !payloadStruct || j >= payloadStruct->getNumElements())
+                continue;
+            if (ft->kind == sema::TypeRef::Kind::Primitive &&
+                ft->primitive == sema::PrimitiveType::String) {
+                llvm::Value* fAddr = builder_.CreateStructGEP(
+                    payloadStruct, payloadAddr, (unsigned)j, "chsfr.str.addr");
+                llvm::Value* fVal =
+                    builder_.CreateLoad(ptrTy(), fAddr, "chsfr.str.val");
+                emitStringRelease(fVal);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), fAddr);
+                continue;
+            }
+            if (ft->nullable || ft->kind != sema::TypeRef::Kind::Named ||
+                !ft->declaration)
+                continue;
+            if (ft->declaration->kind == ast::TypeDeclKind::Record &&
+                recordHasStringFields(ft->declaration)) {
+                llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                    payloadStruct, payloadAddr, (unsigned)j,
+                    "chsfr.nested.rec.addr");
+                emitRecordStringFieldReleases_impl(nestedAddr, ft->declaration);
+                continue;
+            }
+            if (ft->declaration->kind == ast::TypeDeclKind::Choice &&
+                choiceHasStringFields(ft->declaration)) {
+                llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                    payloadStruct, payloadAddr, (unsigned)j,
+                    "chsfr.nested.ch.addr");
+                emitChoiceStringFieldReleases_impl(nestedAddr, ft->declaration);
+            }
+        }
+        builder_.CreateBr(joinBB);
+    }
+    builder_.SetInsertPoint(joinBB);
+}
+
+
 void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
                                           llvm::Value* recvPtr,
                                           const sema::TypeRef* resultTy,
@@ -1797,7 +2090,25 @@ llvm::Function* Emitter::elementDisposerThunk() {
     // block. This thunk is the element-dispose path that does NOT route through
     // emitDynamicDispose (it is invoked per live element by bz_array_free), so
     // the free must be emitted here too. obj is non-null in this block.
-    b.CreateCall(freeFn(), {obj});
+    //
+    // §28.2 v0.134 / issue #601 / #2514: mirror emitDisposeAndReclaim's
+    // checked-disposal quarantine — in checked mode the block is NOT freed
+    // after its Dispose runs, so the per-instance disposed flag (set by the
+    // vtable Dispose call above) stays readable for a later member-entry /
+    // field-access guard. This thunk is ALSO the per-T result_disposer attached
+    // to a Pattern A `Task<T:class>` at production
+    // (asyncPatternAResultDisposer_ → patternAResultDisposerFor → this thunk),
+    // so without the gate a stale borrow of a disposed task's result — the
+    // §28.7/§30.5/§30.10 drop-on-overwrite shape — reads FREED heap before the
+    // flag guard fires (a heap-use-after-free under ASan, #2173/#2514). Gating
+    // the free keeps the quarantined block's flag valid, making the stale read
+    // deterministically raise DisposedAccessException (§31.4) instead. The
+    // owning-collection element path is made sound the same way (each element
+    // is quarantined alongside the already-quarantined header,
+    // bz_array_mark_disposed). `checkedDisposal_` is fixed for the whole
+    // module compile, so baking the branch into the cached thunk is correct.
+    if (!checkedDisposal_)
+        b.CreateCall(freeFn(), {obj});
     b.CreateBr(retBB);
     b.SetInsertPoint(retBB);
     b.CreateRetVoid();
@@ -2416,21 +2727,42 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // fix #1747 / §28.9 / §9.7 / §28.3: a plain `var` RECORD local bound
         // from a record-returning CALL (`var p := Mk()`), proven non-escaping
         // by the conservative escape walk (StringEscapeWalker with
-        // recordFieldReleaseMode — see LlvmBackend_Setup.cpp). The callee
-        // minted the +1 each string field owns (buildRecordValue's
-        // currentReturnIsRecord_ retain after `return new P(...)`, the
-        // narrow scope the prior lane decline pinned); at scope end — on
+        // recordFieldReleaseMode — see LlvmBackend_Setup.cpp). fix #2448 /
+        // §9.7 (v0.235): no callee-side retain mints this +1 — #2453 removed
+        // the never-wired `emitRecordStringFieldRetains`/`currentReturnIsRecord_`
+        // this comment used to credit with that mint (grep-confirmed dead:
+        // neither was ever called/set). The actual soundness mechanism is
+        // `recordCallResultReleaseEligible_` only admitting a local whose
+        // initializer is PROVABLY a fresh, alias-free construction
+        // (isFreshRecordConstructionOfExactType /
+        // isProvablyFreshRecordFactoryMethod, LlvmBackend_Setup.cpp): each
+        // string field's value already carries whatever +1/borrow state it
+        // had AT CONSTRUCTION (a by-value return is a bit-copy that touches
+        // no refcount), and that eligibility proof is what establishes this
+        // local as the value's sole owner. At scope end — on
         // BOTH the normal and unwind exit (the fields die either way; a
         // given exit goes one way only, so each is released exactly once)
         // — every string field is bz_string_release'd and the slot nulled.
         // The local was proven non-escaping, so no alias survives the scope
         // (no UAF) and each field owns exactly one +1 (no double-free).
         // bz_string_release is null-/sentinel-safe so a literal field is a
-        // no-op (the callee didn't retain it; release stays a no-op too).
-        // `slot` is the record's struct alloca; `cls` is the record
+        // no-op. `slot` is the record's struct alloca; `cls` is the record
         // TypeSymbol used to GEP each string storage member.
         if (it->recordStringFields) {
             emitRecordStringFieldReleases(it->slot, it->cls);
+            continue;
+        }
+        // fix #2425 / §9.8 / §28.3/§28.9 / §35.4: the choice-side counterpart
+        // just above — an already-populated deserialize component/payload
+        // slot whose type is a value-like choice owning a string (directly
+        // or through a nested record/choice payload), guarded against a
+        // LATER sibling's read throwing. Runs on BOTH the normal and unwind
+        // exit for the same reason `recordStringFields` does (the #2398/
+        // #2425 registration is popped WITHOUT disposal once every required
+        // component is confirmed present, so this only ever fires on the
+        // throw path this scope exists to guard).
+        if (it->choiceStringFields) {
+            emitChoiceStringFieldReleases(it->slot, it->cls);
             continue;
         }
         // #429 / §27.5: a boxed capture cell (shared heap allocation from
@@ -2447,7 +2779,16 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // BOTH normal and unwind paths: the cell has no live external references
         // at this point (all lambdas referencing it are non-escaping and have
         // been released), so freeing on either path is safe.
+        //
+        // fix #2334: EXCEPT when skipCellFreeOnUnwind is set — the TaskScope.
+        // Spawn special case's "non-escaping" proof depends on the bounding
+        // `using var`'s disposal being quiescent, which holds only on the
+        // properly-awaited NORMAL edge (see Disposal::skipCellFreeOnUnwind's
+        // declaration for the full argument and the #1422 non-blocking-
+        // zombie-drain citation). Skip the free on the unwind edge for such
+        // an entry — the cell leaks there instead of a use-after-free.
         if (it->boxedCellFree) {
+            if (isUnwind && it->skipCellFreeOnUnwind) continue;
             llvm::Value* cell =
                 builder_.CreateLoad(ptrTy(), it->slot, "cell.ptr");
             builder_.CreateCall(freeFn(), {cell});
@@ -2831,6 +3172,29 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             auto* fn = declareC("bz_stopwatch_free",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
             builder_.CreateCall(fn, {sw});
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // stdlib §7.2 / issue #645: a `using var` FileStream. Dispose via
+        // bz_filestream_dispose — flushes buffered writes, closes the OS handle
+        // and frees the handle object. Null-guarded like the sites above: an
+        // explicit `fs.Dispose()` earlier in the scope nulls the slot, and a
+        // failed open stores null, so the guard is what makes both cases a
+        // no-op rather than a second dispose.
+        if (it->fileStream) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* fs = builder_.CreateLoad(ptrTy(), addr);
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                fs, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "fs.dispose", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "fs.cont",    currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            auto* fn = declareC("bz_filestream_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            builder_.CreateCall(fn, {fs});
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;
@@ -3656,9 +4020,12 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
     // entry is registered ONLY where boxedCellFree was suppressed (mutually
     // exclusive with boxedCellFree) and deduped per slot, so the cell is freed
     // exactly once across both the normal and the unwind exit (a given exit goes
-    // one way only). Fires on both paths, symmetric with boxedCellFree.
+    // one way only). Fires on both paths, symmetric with boxedCellFree —
+    // EXCEPT skipCellFreeOnUnwind entries (fix #2334; see boxedCellFree's own
+    // handling above and Disposal::skipCellFreeOnUnwind's declaration).
     for (const auto& d : scope) {
         if (!d.boxedCellFreeDeferred) continue;
+        if (isUnwind && d.skipCellFreeOnUnwind) continue;
         llvm::Value* cell =
             builder_.CreateLoad(ptrTy(), d.slot, "cell.deferred.ptr");
         builder_.CreateCall(freeFn(), {cell});

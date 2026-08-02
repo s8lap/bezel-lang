@@ -28,11 +28,34 @@ constexpr std::array<std::string_view, 6> kOwningCollectionHeads = {
 };
 
 // §28.3 / §5.11: the owning collections plus the owning wrappers.
-constexpr std::array<std::string_view, 12> kOwningTypeHeads = {
+// §28.6 / §28.3 (v0.221, #1787 ruling; #2369): all FOUR owning iterable-
+// interface heads (`IOwningEnumerable`, `IOwningEnumerator`,
+// `IOwningAsyncEnumerable`, `IOwningAsyncEnumerator`) are members — "the
+// owning heads take no unmarked instance/extension spelling at all", so
+// `checkBorrowReturnedThroughOwningType` must inspect a borrow returned
+// through any of the four (previously only `IOwningEnumerable` was listed,
+// letting the three sibling heads sail past the §28.6 return-shape check).
+constexpr std::array<std::string_view, 15> kOwningTypeHeads = {
     "OwningArray", "OwningDictionary", "OwningSet",
     "OwningStack", "OwningQueue",      "OwningLinkedList",
     "Shared",      "Weak",             "ChannelSender",
     "OwningTask",  "IOwningEnumerable", "CancellationTokenSource",
+    // #2369: the three remaining owning iterable-interface heads.
+    "IOwningEnumerator", "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
+};
+
+// §28.6 / §28.3 (v0.221, #1787 ruling; #2369): the OWNING iterable-interface
+// heads — the four consumer-disposed, non-idempotent deferred-activation
+// interfaces whose receiver-owned-field bare-read carve-out §28.6 bullet 1
+// EXPLICITLY excludes ("The same method-return exclusion applies to a field
+// typed at an owning iterable-interface head"). `checkBorrowReturnedThrough
+// OwningType`'s `deferredActivationOwningHead` gate (the #1660 carve-out
+// removal) consults this set; it overlaps `kIterableInterfaceHeads` (the
+// full 8-member iterator-convention family) and `kOwningTypeHeads` (these
+// four are the owning iterable subset of that owning-head set).
+constexpr std::array<std::string_view, 4> kOwningIterableInterfaceHeads = {
+    "IOwningEnumerable", "IOwningEnumerator",
+    "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
 };
 
 // §28.3 / §29.3 / §30.7 (v0.201, #2048 / proposal 0048): the iterable and
@@ -90,7 +113,7 @@ constexpr std::array<std::string_view, 2> kLinkedListNames = {
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
 // (imported-only) are NOT here — they stay as explicit deltas at the sites.
-constexpr std::array<std::string_view, 64> kHeapPointerReferenceBuiltins = {
+constexpr std::array<std::string_view, 65> kHeapPointerReferenceBuiltins = {
     // §4 collections (SortedSet: stdlib §4.18/#1426 — bz_dict_t* rep, both paths)
     "Array", "OwningArray", "Dictionary", "OwningDictionary",
     "SortedDictionary", "SortedSet", "Stack", "OwningStack", "Queue", "OwningQueue",
@@ -102,6 +125,11 @@ constexpr std::array<std::string_view, 64> kHeapPointerReferenceBuiltins = {
     // dispatch and returns ptr, so the type must lower to ptr here too, or the
     // function return type (i32 fallback) mismatches the ptr operand.
     "Stopwatch",
+    // stdlib §7.2 (#645): FileStream is a heap-allocated bz_filestream_t* —
+    // same reason as Stopwatch above: the type must lower to ptr on both rep
+    // paths or the `new FileStream(...)` result (a ptr) mismatches the
+    // fallback i32 lowering of the declared type.
+    "FileStream",
     // §29 iteration / collection interfaces
     "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
     "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
@@ -177,19 +205,19 @@ constexpr std::array<BuiltinExceptionEdge, 29> kBuiltinExceptionHierarchy = {{
 
 bool isOwningPrefixedName(std::string_view head) {
     return head.rfind("Owning", 0) == 0;
-}
+}  // per §5.11 / #1372 — Owning* prefix test (consolidates the 16 codegen rfind sites)
 
 bool isOwningCollectionHead(std::string_view head) {
     return contains(kOwningCollectionHeads, head);
-}
+}  // per §28.6 / §5.11 (#1008 Part C) — element-owning collection heads
 
 bool isOwningTypeHead(std::string_view head) {
     return contains(kOwningTypeHeads, head);
-}
+}  // per §28.3 / §5.11 — owning-type heads (collections + wrappers)
 
 bool isTaskFamilyHead(std::string_view head) {
     return contains(kTaskFamilyHeads, head);
-}
+}  // per §28.3 v0.190 (SB-01) — Task-family heads; `Task` here only transfers ownership under !isAsync_
 
 // §28.3 / §29.3 / §30.7 (v0.201, #2048 / proposal 0048): the iterable or
 // enumerator interface heads — the iterator convention's announced caller-
@@ -200,30 +228,41 @@ bool isIterableInterfaceHead(std::string_view head) {
     return contains(kIterableInterfaceHeads, head);
 }
 
+// §28.6 / §28.3 (v0.221, #1787 ruling; #2369): the OWNING iterable-interface
+// heads — the four consumer-disposed, non-idempotent deferred-activation
+// interfaces whose receiver-owned-field bare-read carve-out §28.6 bullet 1
+// explicitly excludes. Consulted by `checkBorrowReturnedThroughOwningType`'s
+// `deferredActivationOwningHead` gate (the #1660 carve-out removal, extended
+// to all four owning iterable heads). // per §28.6, §28.3
+bool isOwningIterableInterfaceHead(std::string_view head) {
+    return contains(kOwningIterableInterfaceHeads, head);
+}
+
 bool isArrayBackedCollectionName(std::string_view n) {
     return contains(kArrayBackedCollections, n);
-}
+}  // per §4.4–§4.7 / §4.14 — bz_array_t*-backed collection names
 
 bool isDictionaryName(std::string_view n) {
     return contains(kDictionaryNames, n);
-}
+}  // per §4.8 / §4.17 — bz_dict_t*-backed K-indexed collection names
 
 bool isLinkedListName(std::string_view n) {
     return contains(kLinkedListNames, n);
-}
+}  // per §4.6 / §4.7 — bz_llist_t*-backed linked-list names
 
 bool isHeapPointerReferenceBuiltin(std::string_view n) {
     return contains(kHeapPointerReferenceBuiltins, n);
-}
+}  // per §4 / §6 / §29 / §30 / §2.14–§2.15 — heap-pointer reference builtins shared by the two codegen rep paths
 
 std::string_view builtinExceptionParentOf(std::string_view name) {
     for (const auto& edge : kBuiltinExceptionHierarchy)
         if (edge.name == name) return edge.parent;
     return {};
-}
+}  // per §31.4 / #1621 — built-in exception parent lookup (the only access from sema)
 
 // #1936 / §19.5 / §31: membership test over the same hierarchy table (the root
 // `Exception` is present as an edge with an empty parent, so it is recognized).
+// per §19.5 / §31 / #1936.
 bool isBuiltinExceptionName(std::string_view name) {
     for (const auto& edge : kBuiltinExceptionHierarchy)
         if (edge.name == name) return true;

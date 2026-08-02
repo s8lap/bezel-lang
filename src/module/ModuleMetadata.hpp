@@ -129,6 +129,77 @@ inline constexpr std::uint32_t kMetadataMagic = 0x644D7A42; // 'B','z','M','d' L
 // soundness-relevant field. `isExecutable` is NOT folded into semanticHash:
 // artifact kind is a build property, not part of the public-INTERFACE content
 // that staleness detection tracks.
+//
+// §26 EXTENSION CARRIAGE (#735, additive within v7): `ModuleMetadata::
+// extensions` carries exported `public extension T` blocks as a 6th trailing
+// top-level count scalar plus one EXTENSION_BLOCK subblock each, after the
+// constants. NO bump: the rule above is that a bump is reserved for a change
+// that makes an old reader MISINTERPRET an existing field, and this only ADDS
+// a trailing scalar and trailing subblocks. A reader predating the field stops
+// after the constants and never sees them — it then reports the pre-#735 clean
+// `no member` reject for a cross-module extension call, never a wrong value. A
+// module with no exported extension produces byte-identical metadata to before
+// (the 6th scalar is only emitted when there is at least one, mirroring the
+// #783 methodBodyText precedent).
+//
+// §2.8.2 / §22.12 / §22.13 (#2351, additive within v7): MetaMember::
+// fieldInitText — for a STATIC Field member of a GENERIC class, the
+// initializer EXPRESSION source text (span-extracted from `FieldDecl::
+// initializer`, not the whole declaration — an Expr carries its own span).
+// Mirrors ctorBodyText/methodBodyText exactly: a SECOND trailing REC_STRING
+// in MEMBER_BLOCK after valueText for Field members (valueText itself is
+// reserved for an INSTANCE field's constant-foldable initializer, §22.8, and
+// stays empty for a static field — see ModuleMetadataBuilder), emitted ONLY
+// when non-empty, so a module with no generic-class static-field initializer
+// produces byte-identical metadata to before. Closes the gap #1513's own
+// fix left open: before this, an imported generic type's static field
+// reached codegen with `FieldSymbol::decl == nullptr` (ModuleLoader never
+// reconstructed one for an imported field), so genericInstSfinitFn's
+// `dynamic_cast<const ast::FieldDecl*>(fs2->decl)` was always null and the
+// field's initializer never ran on the importing side — §2.8.2 clause 2
+// ("an external instantiation behaves identically to a same-module
+// instantiation") was violated silently (the shared LinkOnceODR cell #1513
+// wired up stayed zero forever). No bump: purely additive, same rule as
+// methodBodyText.
+//
+// §22.4 / §12.1 (#2392, additive within v7): MetaParam::outNullWhen — the
+// `when true`/`when false` out-nullability postcondition (0/1/2 mirroring
+// ast::OutNullWhen), a SECOND scalar appended to PARAM_BLOCK's existing
+// REC_SCALARS record (previously just `[hasDefault]`). No bump: the rule
+// above is that a bump is reserved for a change that makes an OLD reader
+// misinterpret an EXISTING field; this only adds a trailing scalar a v<=7
+// reader's `sc.size() < 1` check still accepts (it never looks past index 0),
+// and a v8+ reader given a pre-#2392 blob (only 1 scalar present) reads the
+// missing second scalar as 0/None — the same value every such blob's
+// parameters implicitly had before this field existed, so no blob is
+// misread. Before this field, ModuleLoader::convertParams built every
+// imported ParameterSymbol with outNullPostcond stuck at its default None
+// regardless of the exporting module's actual declaration, so
+// checkOverrideSignatureMatch's exact-match comparison
+// (dp->outNullPostcond != bp->outNullPostcond, §12.1) false-rejected any
+// correct override of an imported base method/indexer whose base parameter
+// declared `when true`/`when false` — recompiling the base module against
+// this field picks the fix up for existing dependents (§2.8.5 disclaims ABI
+// stability across recompilation; this project's model is recompile-the-
+// world, so a stale pre-#2392 dependency artifact keeps the old false-reject
+// behavior until its own module is recompiled, same as any other additive
+// field in this schema).
+//
+// §22.3 / §23 (#2461, additive within v7): MetaMember::hasGetter — the
+// getter-presence twin of #2400's hasSetter (an 11th scalar). A 14th
+// trailing scalar in MEMBER_BLOCK's REC_SCALARS. NO bump: the rule above is
+// that a bump is reserved for a change that makes an OLD reader misinterpret
+// an EXISTING field, and this only ADDS a trailing scalar — a pre-#2461
+// reader's `sc.size() < 8` gate never looks past index 7, so it is
+// unaffected. A v7+ reader given a pre-#2461 blob (at most 13 scalars) reads
+// the missing 14th scalar as the field's default `true` (NOT `false` like
+// hasSetter — see the hasGetter field comment for why the opposite default is
+// load-bearing: a false default would false-reject a legitimate `ref` to a
+// read-write property from a stale dependency). Closes the message-quality
+// gap where a write-only imported property used as a `ref` argument fell
+// through sema to a raw linker error (undefined `...$propget`) instead of a
+// clean §22.3/§23 rejection; see checkRefOutPropertyOperand's `!pd` branch
+// (ExprTypecheck.cpp) for the consuming side.
 inline constexpr std::uint32_t kSchemaVersion = 7;
 
 // --- Type representation (decoupled mirror of sema::TypeRef) ----------------
@@ -248,6 +319,16 @@ struct MetaParam {
     MetaType type;
     bool hasDefault = false;
     std::string defaultText; // §22.5 textual default; empty when !hasDefault
+    // §22.4 (v0.183, #1585) / §12.1 (v0.235, #2392): the `when true`/`when
+    // false` out-nullability postcondition, mirroring ast::OutNullWhen
+    // (0 = None, 1 = WhenTrue, 2 = WhenFalse). §12.1 requires an override to
+    // match this exactly, so ModuleLoader::convertParams must be able to
+    // reconstruct sema::ParameterSymbol::outNullPostcond for an IMPORTED base
+    // method's parameter — without this field the reconstructed parameter
+    // always read None regardless of what the exporting module declared,
+    // producing a false reject of a correct override (issue #2392). Absent
+    // (reads as 0/None) on a pre-#2392 blob — see the kSchemaVersion comment.
+    std::uint8_t outNullWhen = 0;
 
     bool operator==(const MetaParam&) const;
 };
@@ -346,10 +427,239 @@ struct MetaMember {
     // members (caps[1] is null), and a v4 reader rejects a v5 blob outright.
     std::string methodBodyText;       // §14.1/#783: method source text for generics
 
+    // §2.8.2 / §22.12 / §22.13 (#2351): for a STATIC Field member of a GENERIC
+    // class, the initializer EXPRESSION source text (see the schema-header
+    // comment above kSchemaVersion for the full rationale). Empty for a
+    // non-generic type's static field (it initializes in the declaring
+    // module's own compilation and needs no cross-module replay), for an
+    // instance field (which uses valueText instead), and for a static field
+    // with no initializer.
+    std::string fieldInitText;        // §2.8.2/#2351: static field init text
+
     // §22.15 / §2.8.2: whether this member is declared pure. It is kept as
     // an explicit bit in addition to the general modifier list so consumers
     // need not infer behavioral metadata from spelling conventions.
     bool isPure = false;
+
+    // §23 / §2.8.2/§2.8.3 rule 4 (fix #2400, additive within v7 — same rule as
+    // #2392's outNullWhen above): for a Property (or Indexer) member, whether
+    // it declares a setter. Needed because — unlike a field's "readonly"
+    // modifier — a property's
+    // setter-presence is NOT always recoverable from `modifiers`: an
+    // expression-bodied property (`P: T => e;`) or a get-only block form is
+    // getter-only by its SHAPE, not by a `readonly` modifier (writing
+    // `readonly` on either is itself a compile error per §23.2 — "read-onlyness
+    // is already expressed by the shape"), and the importer never reconstructs
+    // an ast::PropertyDecl to recover that shape from (ModuleLoader.cpp's
+    // Property case: "the getter BODY is not reconstructed here"). Without
+    // this bit, an importer cannot distinguish a genuinely settable imported
+    // property from a getter-only one, and unconditionally assuming "settable"
+    // installs a dangling reference to a setter export symbol the exporter
+    // never emitted (confirmed by probe: a getter-only base property
+    // satisfying a read-write LOCAL interface obligation produced an itable
+    // relocation to an undefined `...$propset` symbol — a link error). Ignored
+    // for every kind but Property/Indexer. A v7-or-earlier blob has no 11th
+    // scalar; the reader defaults this to `false` (degrades to "no
+    // cross-module setter for this property" — the pre-#2400 behavior — rather
+    // than risking an unresolved symbol against an old library that has not
+    // been recompiled).
+    bool hasSetter = false;
+
+    // §13.6 / §23.3 / §2.8.2 clause 1 / §2.8.3 rule 4 (fix #2415, additive
+    // within v7 — same shape as hasSetter above): for a Property (or
+    // Indexer) member, the setter accessor's EFFECTIVE visibility. §13.6:
+    // "A property or indexer's `get` or `set` may carry its own visibility,
+    // which must not be *less* restrictive than the property's overall
+    // visibility... An accessor without explicit visibility inherits the
+    // property's overall visibility." A settable property's `hasSetter` bit
+    // alone only recovers WHETHER a setter exists, not WHO may call it — a
+    // `private set` / `protected set` / `internal set` on an imported
+    // property was silently unenforceable at the cross-module assignment
+    // site (no ast::PropertyDecl to read `pd->accessors[i].visibility` /
+    // `pd->autoAccessorVis` from, and no side-table equivalent existed), so
+    // `d.Name := 999` on a `private set` imported property compiled clean —
+    // a visibility bypass. This field carries the ALREADY-RESOLVED effective
+    // visibility (the accessor override when present, else the property's
+    // own declared visibility — mirroring ExprTypecheck.cpp's local `sv`
+    // computation exactly, so the exporter and the local same-module check
+    // agree by construction). Ignored for every kind but Property/Indexer,
+    // and meaningless when `hasSetter` is false (no setter to restrict). A
+    // v7-or-earlier blob (predating this fix) has no 12th scalar; the reader
+    // defaults this to `MetaVisibility::Private` — the SAFE direction is to
+    // reject a cross-module write to a settable property of unknown setter
+    // visibility rather than silently permit it (§2.8.2 clause 1: an
+    // implementation that cannot carry a shape "must reject... it must not
+    // alter the instantiation's semantics"), exactly mirroring why
+    // hasSetter's own missing-scalar default is `false` rather than `true`.
+    MetaVisibility setterVisibility = MetaVisibility::Public;
+
+    // §9.2 / §22.8 (fix #2478, additive within v7 — same shape as hasSetter/
+    // setterVisibility above): for a Property member, whether it is declared
+    // in AUTO form (`property X: T := v;` / `property X: T;` — backing
+    // storage, no user getter/setter body) as opposed to an expression-
+    // bodied or block-accessor (computed) property. An auto-property is a
+    // real INSTANCE STORAGE member — it occupies a struct slot exactly like
+    // a field (§9.2's "auto-property PropertySymbol, backed by compiler-
+    // generated storage like a field") — but the importer has no
+    // ast::PropertyDecl to derive this from (ModuleLoader.cpp's Property
+    // case never reconstructs one), and `sema::isAutoPropertySymbol`/
+    // `Emitter::isAutoProperty` are DECL-DEPENDENT (`dynamic_cast<const
+    // ast::PropertyDecl*>(ps->decl)`), so they always return `false` for an
+    // imported PropertySymbol regardless of the exporter's real shape.
+    // Confirmed as a live memory-safety hazard (not merely inferred):
+    // `collectInstanceStorage`/`collectRecordStorage`
+    // (LlvmBackend_impl.hpp) call the decl-dependent predicate to decide
+    // whether a member occupies a layout slot, so an imported class/record
+    // with a PUBLIC auto-property was under-counted — a locally-declared
+    // derived class's own field then collided with the physical offset the
+    // exporter's own compiled getter/setter/init functions use for a LATER
+    // member, aliasing two logically-independent fields onto the same slot
+    // (the same failure class #2456 fixed for a PRIVATE plain field, here
+    // triggered by ANY-visibility auto-property instead). This bit closes
+    // ONLY that storage-layout gap (`collectInstanceStorage`/
+    // `collectRecordStorage`'s new `isAutoPropertyStorage` fallback,
+    // LlvmBackend_impl.hpp) — the many OTHER call sites of
+    // `isAutoPropertySymbol`/`isAutoProperty` (definite assignment,
+    // ownership/disposal, sendability, serialization eligibility, pattern
+    // destructuring — audited during #2478's investigation, ~30 sites) are
+    // NOT touched by this fix and remain separately filed follow-up work;
+    // widening every consumer at once risked mixing at least three
+    // different failure directions (silent wrong data, spurious rejects,
+    // and a double-free-adjacent disposal miscount) into one unreviewed
+    // change.
+    //
+    // Computed once by the exporter mirroring `sema::isAutoPropertySymbol`'s
+    // own predicate (Auto bodyKind, non-static). Since fix #2523
+    // (§12.1/§12.5, v0.236, sibling of #2478), the bit is also set for
+    // INDEXERS in Auto body form (e.g. `abstract property [i]: T;`, the
+    // §12.5 abstract shorthand — get-only) — the wire bit's predicate is
+    // the SEMANTIC "Auto shorthand shape" check, no longer the pure-storage
+    // check #2478 originally framed it as. The importer-side
+    // `ctx_.importedPropertyIsAutoStorage(base)` now correctly reports
+    // "is the base in §12.5 shorthand form" for the abstract-indexer
+    // override check (`checkPropertyOverrideSignatureMatch`,
+    // TypeResolution_Checks.cpp ~2680). Storage consumers are UNAFFECTED
+    // because `LlvmBackend_impl.hpp`'s `isAutoPropertyStorage` helper still
+    // filters `ps->isIndexer` explicitly before consulting this side table
+    // (line ~3599), so an imported Auto-body indexer never appears in
+    // `collectInstanceStorage`/`collectRecordStorage`. The
+    // `sema::isAutoPropertySymbol` predicate itself is deliberately LEFT
+    // UNCHANGED (still excludes indexers) — its many call sites (definite
+    // assignment, record equality, ARC, the codegen `isAutoProperty`
+    // consumers) treat the predicate as "real storage member", which an
+    // indexer isn't; only this wire-bit repurposes it. A pre-#2478 blob has
+    // no 13th scalar; the reader defaults this to `false` — the SAME
+    // (already-broken, not newly-regressed) "not storage" / "not shorthand"
+    // behavior an old dependency exhibits today, exactly mirroring
+    // hasSetter's own missing-scalar default reasoning: a stale
+    // (not-yet-recompiled) dependency keeps its pre-fix behavior until
+    // recompiled, rather than the reader guessing.
+    bool isAutoProperty = false;
+
+    // §22.3 / §23 (fix #2461, additive within v7 — the getter-presence
+    // TWIN of hasSetter above): for a Property (or Indexer) member, whether
+    // it declares a getter. §22.3 "`ref` and `out` argument locations":
+    // "for `ref`, the getter is called once to produce the callee's slot
+    // value (for `out` no getter call occurs)" — so a write-only property
+    // (hasSetter && !hasGetter) is a legal `out` target but NOT a legal
+    // `ref` target (the copy-in has no getter to call). checkRefOutProperty
+    // Operand (ExprTypecheck.cpp) enforces exactly that distinction for an
+    // IMPORTED property — but it could not before this bit existed: an
+    // imported PropertySymbol has no ast::PropertyDecl (ModuleLoader never
+    // reconstructs one), so the getter-presence could not be recovered,
+    // and a write-only imported property used as `ref` fell through sema
+    // to a raw LINKER error (undefined `...$propget` symbol — the exporter
+    // never emitted one), rather than a clean §23 rejection. The LOCAL
+    // same-module shape was already correctly rejected, but by a SEPARATE
+    // earlier check (ExprTypecheck_Calls.cpp's propertyDeclIsSetOnly gate
+    // on the `d.W` member-access READ), which is also `pd`-gated and so
+    // also does not cover an imported property. This bit is computed by
+    // mirroring that propertyDeclIsSetOnly predicate's INVERSE exactly
+    // (Expression/Auto bodyKinds always have a getter; a Block bodyKind
+    // has a getter iff any accessor is a `get` arm), so the wire-carried
+    // classification and the local-decl classification agree by
+    // construction. Ignored for every kind but Property/Indexer.
+    //
+    // MISSING-SCALAR DEFAULT IS `true` — the OPPOSITE direction from
+    // hasSetter (which defaults `false` to reject-conservative). The
+    // asymmetry is deliberate and load-bearing: a false `hasSetter`
+    // REJECTS a cross-module write (the safe direction — refuses rather
+    // than risking an unresolved `...$propset` symbol); but a false
+    // `hasGetter` would REJECT a cross-module `ref` READ, which would
+    // FALSE-REJECT a legitimate read-write property from a stale
+    // (pre-#2461, 13-scalar) dependency — a regression that breaks
+    // working code. Defaulting `true` instead preserves the pre-#2461
+    // behavior for a stale dependency exactly (a write-only property as
+    // `ref` stays the pre-existing linker error — still rejected, just
+    // confusingly; a read-write property as `ref` stays a clean accept),
+    // and only a dependency RECOMPILED with #2461 gets the clean §23
+    // diagnostic for its write-only properties. This is the same
+    // "a stale dependency keeps its pre-fix behavior until recompiled"
+    // model every other additive scalar in this schema follows
+    // (§2.8.5 disclaims ABI stability across recompilation); it does NOT
+    // violate §2.8.2 clause 1's "must reject" because no semantics are
+    // silently altered — the stale write-only-as-ref was already rejected
+    // (at link time), not silently accepted.
+    bool hasGetter = true;
+
+    // §24 / §2.8.2 (fix #2421, additive within v7 — same shape as
+    // hasSetter/hasGetter/isAutoProperty above): for an Event member, the two
+    // ast::EventDecl classification bits the codegen event-dispatch path needs
+    // to mirror the exporter's struct/itable layout exactly. An imported
+    // EventSymbol has NO ast::EventDecl (ModuleLoader.cpp's Event case
+    // reconstructs the symbol without one — mirrors Property/Indexer's own
+    // #503/#2414 limitation), and SymbolCollection.cpp's EventDecl case never
+    // copies these onto EventSymbol::modifiers either (so even a LOCAL event
+    // recovers them only via es->decl). Two separate codegen consumers
+    // decl-null-gate on these bits and silently dropped an imported event
+    // before this field existed (filed as #2421, found one layer past #2407's
+    // symbol reconstruction):
+    //   - collectInstanceStorage / emitOwnFieldInit / ctor-cleanup
+    //     (LlvmBackend_impl.hpp / LlvmBackend_Setup.cpp) need `!isStatic` to
+    //     give a DIRECTLY-typed imported event (or an imported-base event) its
+    //     per-instance backing-field slot — without it fieldIndex_ gets no
+    //     entry and the EventSource lives at no offset.
+    //   - the ifaceEventIndex_ index/mirror AND the itab$C$I BUILD loops
+    //     (LlvmBackend_Setup.cpp declareVtables / Pass D / record-box itable)
+    //     need `!isAsync` to reserve a per-class EventSource-accessor itable
+    //     slot for an IMPORTED interface's sync event (§24.7: only a sync event
+    //     is an itable member; an async event is not). Both the INDEX lookup
+    //     (eventSourcePtr) and the itable ARRAY build must classify identically
+    //     or the importer reserves a slot the exporter's real itable layout
+    //     does not have (or vice versa) — an itable/struct-layout MISMATCH
+    //     between the two compilations, the exact hazard #2420/#2406 caught
+    //     elsewhere. A wrong guess is therefore not just an imprecision; this
+    //     wire bit is the only way the importer can recover the exporter's real
+    //     classification. Ignored for every kind but Event. A pre-#2421 blob
+    //     has no 15th/16th MEMBER_BLOCK scalar; the reader defaults BOTH to
+    //     `false` — the classification a plain instance sync `event E: T;`
+    //     (the common case) carries, so a stale not-yet-recompiled dependency
+    //     keeps its already-broken pre-fix behavior (the imported event was
+    //     silently no-op before #2421 regardless) rather than guessing
+    //     `static`/`async` and risking the layout mismatch.
+    bool isEventStatic = false;
+    bool isEventAsync = false;
+
+    // §9.2 / §9.3 / §2.8.3 rule 4 (fix #2516, additive within v7): for a Field
+    // member, whether it is a §9.1 positional-record field (`record R(x: int)
+    // ... end`'s `x`) rather than a body field (`record R(x: int) private _y:
+    // int := 0; end`'s `_y`). The exporter distinguishes the two by
+    // `fs->posParam != nullptr` on the local FieldSymbol (§9.1,
+    // ModuleMetadataBuilder.cpp's convertMember positional branch) — that
+    // distinction was NOT carried across the wire before this fix, so an
+    // importer reconstructing a combined-form record's TypeSymbol created
+    // FieldSymbols with `posParam == nullptr` for BOTH positional and body
+    // fields and the §9.2 auto-equality classifier
+    // (`isPositionalRecordEqualityBearing`) had to conservatively treat every
+    // imported FieldSymbol as a positional field (false-accept of `=`/`<>` on
+    // imported combined-form records whose exporter already rejects them,
+    // #2516's finding). A pre-#2516 blob has no 17th scalar; this defaults to
+    // `false` — the SAME "treat as positional" classification a stale
+    // not-yet-recompiled dependency already exhibits today (its body fields
+    // are silently considered positional, so the pre-fix false-accept holds
+    // for the dependency until recompiled — §2.8.5 disclaims ABI stability
+    // across recompilation). Ignored for every kind but Field.
+    bool isPositional = false;
 
     // §22.16 / §2.8.2: clauses in declaration order. For a `when` form from
     // §22.4 the builder emits the equivalent static-ensures record here.
@@ -439,6 +749,32 @@ struct MetaFunction {
     bool operator==(const MetaFunction&) const;
 };
 
+// §26 (#735): an exported `public extension T` block. Extensions are
+// statically dispatched receiver-directed members (§26.5): the exporter emits
+// each extension method as an ExternalLinkage `bz$ext$<T>$<M>` symbol, so the
+// importer needs only the block's TARGET type and its methods' SIGNATURES to
+// resolve `x.M()` (§26.5 step 2 — "the compiler searches the current module and
+// all imported modules for extension blocks on x's type") and emit the call.
+// No body text crosses the boundary (unlike the generic-class #662c/#783 paths).
+//
+// SCOPE (decline-with-reasons, CLAUDE.md §4): the builder exports only the
+// shapes whose cross-module dispatch is exactly the exported symbol —
+// a `public` block on a NON-generic target with no `where` clause, carrying
+// `public` NON-generic methods. A generic extension head (`extension Bag<T>`,
+// or a generic extension method `Map<U>`) would need importer-side
+// monomorphization of the body (the §14.1/#783 machinery) because the exported
+// symbol was compiled against the exporter's placeholder layout; an extension
+// PROPERTY has no exported accessor symbol at all (§26.1 properties are
+// inlined at the use site). Those shapes are not exported, so the importer
+// keeps its existing clean "no member" reject rather than mis-dispatching.
+struct MetaExtension {
+    MetaType target;                  // §26.1 the extended type
+    MetaVisibility visibility = MetaVisibility::Public;
+    std::vector<MetaMember> members;  // §26.3 methods (this increment)
+
+    bool operator==(const MetaExtension&) const;
+};
+
 // A public top-level constant (§11 const at module scope).
 struct MetaConstant {
     std::string name;
@@ -457,6 +793,10 @@ struct ModuleMetadata {
     std::vector<MetaTypeDecl> types;
     std::vector<MetaFunction> functions;
     std::vector<MetaConstant> constants;
+    // §26 / §2.5 (#735): exported extension blocks. Rides as a 6th top-level
+    // count scalar plus one trailing EXTENSION_BLOCK each, so a blob with no
+    // exported extensions is byte-identical to a pre-#735 one.
+    std::vector<MetaExtension> extensions;
 
     // §2.8.4 rule 1 / rule 4 (issue #1733, schema v6): the artifact's KIND.
     // true = this artifact was emitted as an EXECUTABLE build (it carries a

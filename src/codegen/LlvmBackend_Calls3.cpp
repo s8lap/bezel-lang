@@ -70,6 +70,63 @@ bool Emitter::isVtableBackedIEnumerableType(const sema::TypeRef* rt) {
     return n == "IEnumerable" || n == "IOwningEnumerable";
 }
 
+// stdlib §5 (#755): the ELEMENT TypeRef of an `IGrouping<TKey, T>` receiver —
+// genericArgs[1]. `IGrouping<TKey, T> : IEnumerable<T>` (stdlib §5 line 3076),
+// so the §5 LINQ surface resolves on it by inheritance; but unlike every other
+// enumerable receiver the compiler recognises, its ELEMENT type is the SECOND
+// generic argument (the first is the key). Every consumer that reads
+// `recvTy->genericArgs[0]` for an element type would therefore read TKey.
+//
+// IGrouping is a compiler-known builtin (common/BuiltinRegistry.cpp) with no
+// user declaration; its TypeRef reaches codegen in three shapes — a
+// declaration-less astNode (inferred/annotated local), a builtin TypeSymbol
+// whose `decl` is null, or an `importedName` set by ModuleLoader — matching
+// the recognizers already used at the GroupBy sites in LlvmBackend_Calls.cpp
+// and LlvmBackend_ElementPolicy.cpp.
+const sema::TypeRef* Emitter::iGroupingElemTypeRef(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return nullptr;
+    std::string_view hn;
+    if (rt->declaration) {
+        if (rt->declaration->decl) return nullptr;  // a real user type
+        hn = rt->declaration->name;
+    } else if (rt->astNode && rt->astNode->name &&
+               !rt->astNode->name->parts.empty()) {
+        hn = rt->headName();
+    } else if (!rt->importedName.empty()) {
+        hn = rt->importedName;
+    } else {
+        return nullptr;
+    }
+    if (hn != "IGrouping") return nullptr;
+    if (rt->genericArgs.size() < 2 || !rt->genericArgs[1]) return nullptr;
+    return rt->genericArgs[1];
+}
+
+// stdlib §5 (#755) / §4.4: a synthesized `Array<T>` TypeRef over `elem`. An
+// `IGrouping<TKey, T>`'s members live in a concrete `bz_array_t*` the grouping
+// owns; restating the receiver TYPE as that element array lets the whole
+// array-receiver lowering — every §5 terminal together with its spec-mandated
+// faults (`Single()` → InvalidOperationException unless exactly one,
+// `ElementAt(i)` → IndexOutOfRangeException, `First`/`Last` → empty fault) —
+// apply verbatim, instead of a hand-rolled per-name duplicate that reproduced
+// none of them (#2265). Construction mirrors builtinByteArrayTypeRef.
+sema::TypeRef* Emitter::elementArrayTypeRef(const sema::TypeRef* elem) {
+    static const ast::Type* kArrayAstNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("Array");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    auto* tr = ctx_.makeTypeRef();
+    tr->kind = sema::TypeRef::Kind::Named;
+    tr->declaration = nullptr;
+    tr->astNode = kArrayAstNode;
+    tr->genericArgs.push_back(const_cast<sema::TypeRef*>(elem));
+    return tr;
+}
+
 // issue #343 / §8.3: trampoline matching the runtime's generic-dict hash fn
 // pointer `uint64_t(const void* key)`. The runtime stores raw record bytes; we
 // reinterpret the byte pointer as a record-struct pointer, load the value, and
@@ -620,7 +677,8 @@ llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
                                                    int64_t innerEsz,
                                                    bool innerIsLazy,
                                                    bool rangeInner,
-                                                   bool rangeInnerIsChar) {
+                                                   bool rangeInnerIsChar,
+                                                   bool groupingInner) {
     auto* fty = llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false);
     auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
                                       "bz$linq$flatsel", module_.get());
@@ -675,6 +733,17 @@ llvm::Function* Emitter::buildSelectManyTrampoline(llvm::Type* elemTy,
         // and yield only a garbage prefix (the WRONG_VALUE behind the IR_FAIL).
         inner = coll;
     } else {
+        // stdlib §5 (#755, finding [20]): an `IGrouping<TKey, U>` result is a
+        // bz_grouping_t*, whose FIRST field is the element bz_array_t* — read it
+        // out before wrapping. Wrapping the grouping itself made bz_lazy read
+        // { void* elements; int64 key_esz; … } as an array header, so the yielded
+        // count was the KEY's byte size (4 per group for an int key) rather than
+        // the group's element count. The wrap stays borrowing: the grouping owns
+        // this array and frees it in bz_grouping_free.
+        if (groupingInner) {
+            auto* elemsFn = declareC("bz_grouping_elements", ptrTy(), {ptrTy()});
+            coll = builder_.CreateCall(elemsFn, {coll}, "fs.grp.elems");
+        }
         // Wrap the returned Array<U> as a lazy enumerator (the runtime drains it).
         auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
         inner = builder_.CreateCall(wrapFn,
@@ -1021,6 +1090,31 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
     }
     llvm::Value* recv = lowerExpr(recvExpr);
     if (!recv) return nullptr;
+    // stdlib §5 (#755): an `IGrouping<TKey, T>` source. `IGrouping : IEnumerable<T>`
+    // (stdlib §5 line 3076), so a grouping is a legal LINQ receiver and a legal
+    // `for` source (spec §29.2) — but its runtime value is a `bz_grouping_t*`,
+    // not a bz_array_t*/bz_lazy_t*, so every enumerable consumer previously read
+    // the grouping struct as whatever shape it expected and saw an EMPTY (or
+    // garbage) sequence. Its members are a concrete, fully-materialized
+    // `bz_array_t*` reachable via bz_grouping_elements; wrap THAT as a lazy ARRAY
+    // source. The wrap is BORROWING (bz_lazy_from_array): the grouping owns its
+    // element array and frees it in bz_grouping_free, so an owning wrap would
+    // double-free. Element type is genericArgs[1] (genericArgs[0] is TKey).
+    if (const sema::TypeRef* grpElem = iGroupingElemTypeRef(recvTy)) {
+        elemRef = const_cast<sema::TypeRef*>(grpElem);
+        llvm::Type* et = lowerTypeRef(grpElem);
+        if (!et) et = i32();
+        int64_t esz = lazyElemSize(et, module_->getDataLayout());
+        auto* elemsFn = declareC("bz_grouping_elements", ptrTy(), {ptrTy()});
+        llvm::Value* arr =
+            builder_.CreateCall(elemsFn, {recv}, "igrp.elems");
+        // Deliberately NOT surfaced through outRecvArr: that out-param exists so
+        // a consuming caller can reclaim an UNBOUND fresh-materializer array, and
+        // the grouping's array has an owner (the grouping).
+        auto* wrapFn = declareC("bz_lazy_from_array", ptrTy(), {ptrTy(), i64()});
+        return builder_.CreateCall(wrapFn, {arr, builder_.getInt64(esz)},
+                                   "lazy.igrp");
+    }
     // fix #1220 (residual) / stdlib §4.8 / §5: Dictionary<K,V> LINQ source.
     // Materialize the dictionary's entries into a fresh owned bz_array_t of
     // {K,V} structs (same layout as lowerDictEntryFor), then wrap it as an
@@ -1231,8 +1325,23 @@ llvm::Value* Emitter::lowerToLazyEnumerator(const ast::Expr& recvExpr,
                 builder_.CreateCall(freeFn, {lensArr});
             builder_.CreateCall(freeFn, {valsArr});
 
-            auto* ownFn =
-                declareC("bz_lazy_from_owned_array", ptrTy(), {ptrTy(), i64()});
+            // #2544 (stdlib §4.8/§4.12; spec §29.1, v0.236): for string-keyed
+            // dictionaries the rebuilt bz_string keys at struct offset 0 are
+            // +1 ref-counted producers (initStringRc → rc=1) and need
+            // bz_string_release when the lazy source is disposed. The plain
+            // bz_lazy_from_owned_array calls bz_array_free(arr, null) — a null
+            // element disposer that never reaches the string at struct offset 0
+            // (it is for pointer-element arrays only). bz_lazy_from_owned_str_dict_array
+            // is the sibling of bz_lazy_from_owned_grouping_array (#1914) and
+            // sets arr_str_keys := 1 so bz_lazy_dispose walks the array and
+            // releases each Key before freeing the array. Non-string-keyed
+            // dictionaries (int/record/enum keys) keep the plain wrapper — their
+            // keys are inline bytes with no heap ownership, so the null-disposer
+            // free is correct.
+            const char* ownName = isStringKey
+                ? "bz_lazy_from_owned_str_dict_array"
+                : "bz_lazy_from_owned_array";
+            auto* ownFn = declareC(ownName, ptrTy(), {ptrTy(), i64()});
             return builder_.CreateCall(ownFn,
                 {arr, builder_.getInt64(esz)}, "lazy.dict");
         }
@@ -1401,8 +1510,20 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
     bool dictRecv = isDictTypeName(recvTy) &&
                     recvTy && recvTy->genericArgs.size() >= 2 &&
                     recvTy->genericArgs[0] && recvTy->genericArgs[1];
+    // stdlib §5 (#755): `IGrouping<TKey, T> : IEnumerable<T>` — a grouping is a
+    // legal receiver for the whole §5 operator surface. lowerToLazyEnumerator
+    // wraps its (grouping-owned) element array as a borrowing lazy ARRAY source,
+    // so every operator below composes uniformly. In particular `g.ToArray()`
+    // now takes the ordinary materialize path and returns a FRESH copy, as
+    // stdlib §5:3070 declares (`ToArray(): owned Array<T>`) — the #1296
+    // hand-rolled lowering returned the grouping's OWN array, which the caller's
+    // `using var` then freed alongside bz_grouping_free (a double free, #2265).
+    // Note recvTy is used ONLY in this gate; everything below reads the element
+    // type from lowerToLazyEnumerator's `elemRef` out-param, which is the
+    // grouping's genericArgs[1].
+    bool igrpRecv = iGroupingElemTypeRef(recvTy) != nullptr;
     if (!collRecv && !lazyRecv && !llRecv && !rangeRecv && !vtRecv && !strRecv &&
-        !dictRecv)
+        !dictRecv && !igrpRecv)
         return nullptr;
 
     // Element LLVM type for the receiver's element TypeRef.
@@ -1675,8 +1796,25 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
                  m == "OfType");
     if (!isOp) return nullptr;
 
+    // stdlib §5 (#755) / #1914: `X.GroupBy(k).SelectMany(lambda(g) => g)` — the
+    // one composed shape that provably FLATTENS the groups away: the pipeline's
+    // elements are T values copied out of each grouping's element array, so no
+    // grouping POINTER can survive into the result and the fresh groups
+    // temporary (which nothing else owns — it leaked) can be owned by the source
+    // lazy and reclaimed at pipeline dispose. Every other operator may surface a
+    // grouping downstream (`.Where(…).First()` returns one), where owning here
+    // would use-after-free — those keep the borrowing default.
+    bool ownSrcGroupings = false;
+    if (m == "SelectMany" && call.args.size() == 1 && call.args[0].value)
+        if (auto* smLamTy = ctx_.exprType(*call.args[0].value))
+            if (smLamTy->kind == sema::TypeRef::Kind::Function &&
+                smLamTy->funcReturn)
+                ownSrcGroupings =
+                    iGroupingElemTypeRef(smLamTy->funcReturn) != nullptr;
+
     sema::TypeRef* elemRef = nullptr;
-    llvm::Value* src = lowerToLazyEnumerator(*ma->target, elemRef);
+    llvm::Value* src = lowerToLazyEnumerator(*ma->target, elemRef,
+                                             ownSrcGroupings);
     if (!src) return nullptr;
     llvm::Type* elemTy = elemLlvmOf(elemRef);
 
@@ -1857,8 +1995,24 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
             retSemaType->genericArgs[0] &&
             retSemaType->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
             retSemaType->genericArgs[0]->primitive == sema::PrimitiveType::Char;
+        // stdlib §5 (#755, finding [20]): the selector returns an
+        // `IGrouping<TKey, U>` (`GroupBy(k).SelectMany(lambda(g) => g)`). Two
+        // corrections: the inner ELEMENT type is genericArgs[1], not [0] (the
+        // block above read TKey), and the returned pointer is a bz_grouping_t*,
+        // not a bz_array_t* — read the grouping's element array in the
+        // trampoline. Without the second the grouping struct was wrapped AS an
+        // array header whose count field lands on `key_esz`, so every group
+        // yielded key_esz elements regardless of its size (4 per group for an
+        // int key — the reported symptom).
+        const sema::TypeRef* grpInnerElem = iGroupingElemTypeRef(retSemaType);
+        bool groupingInner = grpInnerElem != nullptr;
+        if (groupingInner) {
+            if (auto* t = lowerTypeRef(grpInnerElem)) innerElemTy = t;
+            innerEsz = lazyElemSize(innerElemTy, module_->getDataLayout());
+        }
         llvm::Function* tramp = buildSelectManyTrampoline(
-            elemTy, innerEsz, innerIsLazy, rangeInner, rangeInnerIsChar);
+            elemTy, innerEsz, innerIsLazy, rangeInner, rangeInnerIsChar,
+            groupingInner);
         auto* smFn = declareC("bz_lazy_selectmany", ptrTy(),
                               {ptrTy(), i64(), ptrTy(), ptrTy()});
         llvm::Value* e = builder_.CreateCall(smFn,
@@ -2519,12 +2673,22 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         return nullptr;
     std::string_view rcn = recvTy->headName();
 
-    // §3.3 (#883): ReadOnlyStringSpan instance methods (call form). The struct is
-    // {string-ptr, i32 start, i32 length}; Length/IsEmpty are field reads and
-    // Slice reconstructs a sub-view. The indexer is handled in
-    // lowerCollectionIndexerGet (loadCodePoint); the search methods
-    // (IndexOf/Contains/StartsWith/EndsWith/SequenceEqual) are deferred — sema
-    // rejects them, so they never reach here.
+    // §3.3 (#883, #971 item 1): ReadOnlyStringSpan instance methods (call form).
+    // The struct is {string-ptr, i32 start, i32 length}; Length/IsEmpty are field
+    // reads and Slice reconstructs a sub-view. The indexer is handled in
+    // lowerCollectionIndexerGet (loadCodePoint).
+    //
+    // The search/compare family lowers to the bz_strspan_* runtime helpers, which
+    // take each operand as an explicit (source string, start, len) CODE-POINT
+    // triple and compare code point by code point — so the operands' storage
+    // widths (§4.6 adaptive 1/2/4 bytes) are irrelevant and may differ. That is
+    // the whole reason a span over a string cannot reuse the buffer-backed span
+    // machinery (§3.3 "Why a separate type from ReadOnlySpan<char>").
+    //
+    // §3.3 defines the `string` overloads as "equivalent to calling the
+    // ReadOnlyStringSpan overload after value.AsSpan()", so a string operand is
+    // passed as the triple (ptr, 0, its code-point length) — the same call, no
+    // allocation, no separate runtime entry point.
     if (rcn == "ReadOnlyStringSpan") {
         llvm::Value* spanVal = lowerExpr(*ma->target);
         if (!spanVal) return nullptr;
@@ -2540,25 +2704,123 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         if (m == "Length" && call.args.empty()) return fLen();
         if (m == "IsEmpty" && call.args.empty())
             return builder_.CreateICmpEQ(fLen(), builder_.getInt32(0), "ss.empty");
-        if (m == "Slice" && call.args.size() == 2 &&
-            call.args[0].value && call.args[1].value) {
+        // §3.3: Slice(start, length), and — since v0.195 — Slice(start), which is
+        // `Slice(start, Length - start)`. The one-arg form previously fell out of
+        // this branch to `return nullptr`, leaving the result local undefined
+        // (an accept-trap: it compiled and produced garbage at run time).
+        if (m == "Slice" && (call.args.size() == 1 || call.args.size() == 2) &&
+            call.args[0].value &&
+            (call.args.size() == 1 || call.args[1].value)) {
             llvm::Value* st = lowerExpr(*call.args[0].value);
-            llvm::Value* sl = lowerExpr(*call.args[1].value);
-            if (!st || !sl) return nullptr;
+            if (!st) return nullptr;
             if (!st->getType()->isIntegerTy(32))
                 st = builder_.CreateTrunc(st, i32());
-            if (!sl->getType()->isIntegerTy(32))
-                sl = builder_.CreateTrunc(sl, i32());
             llvm::Value* b = fBase();
             llvm::Value* L = fLen();
             emitGuardThrow(builder_.CreateOr(
                 builder_.CreateICmpSLT(st, builder_.getInt32(0)),
                 builder_.CreateICmpSGT(st, L)), "IndexOutOfRangeException");
             llvm::Value* avail = builder_.CreateSub(L, st);
-            emitGuardThrow(builder_.CreateOr(
-                builder_.CreateICmpSLT(sl, builder_.getInt32(0)),
-                builder_.CreateICmpSGT(sl, avail)), "IndexOutOfRangeException");
+            llvm::Value* sl = avail;   // v0.195 one-arg form: to the end
+            if (call.args.size() == 2) {
+                sl = lowerExpr(*call.args[1].value);
+                if (!sl) return nullptr;
+                if (!sl->getType()->isIntegerTy(32))
+                    sl = builder_.CreateTrunc(sl, i32());
+                emitGuardThrow(builder_.CreateOr(
+                    builder_.CreateICmpSLT(sl, builder_.getInt32(0)),
+                    builder_.CreateICmpSGT(sl, avail)), "IndexOutOfRangeException");
+            }
             return buildArraySpan(fSrc(), builder_.CreateAdd(b, st), sl);
+        }
+        // §3.3 Materialization: ToString() → a fresh string holding the span's
+        // code points. bz_str_substring already slices a source string by
+        // code-point index at the narrowest storage width that fits the result,
+        // which is exactly this operation; it mints at rc := 1, and
+        // isPlusOneStringProducer records that so the consumer transfers rather
+        // than retains. (§3.3 permits returning the source itself when the span
+        // covers all of it; always materializing is the simpler correct choice.)
+        if (m == "ToString" && call.args.empty()) {
+            auto* fn = declareC("bz_str_substring", ptrTy(), {ptrTy(), i64(), i64()});
+            return builder_.CreateCall(
+                fn, {fSrc(), builder_.CreateSExt(fBase(), i64(), "ss.ts.st"),
+                     builder_.CreateSExt(fLen(), i64(), "ss.ts.len")},
+                "ss.tostr");
+        }
+        // The search/compare family. Sema has already rejected every operand
+        // shape §3.3 does not declare, so exactly one of the three cases below
+        // applies to a well-typed call.
+        if ((m == "IndexOf" || m == "Contains" || m == "StartsWith" ||
+             m == "EndsWith" || m == "SequenceEqual") &&
+            call.args.size() == 1 && call.args[0].value) {
+            const auto* at = ctx_.exprType(*call.args[0].value);
+            bool argIsChar = at && at->kind == sema::TypeRef::Kind::Primitive &&
+                             at->primitive == sema::PrimitiveType::Char;
+            bool argIsString = at && at->kind == sema::TypeRef::Kind::Primitive &&
+                               at->primitive == sema::PrimitiveType::String;
+            llvm::Value* selfSrc = fSrc();
+            llvm::Value* selfSt  = builder_.CreateSExt(fBase(), i64(), "ss.q.st");
+            llvm::Value* selfLen = builder_.CreateSExt(fLen(), i64(), "ss.q.len");
+            // §3.3: IndexOf(char) / Contains(char) — the code-point scan. These
+            // are the ONLY two methods with a char overload.
+            if (argIsChar) {
+                llvm::Value* cp = lowerExpr(*call.args[0].value);
+                if (!cp) return nullptr;
+                if (!cp->getType()->isIntegerTy(32))
+                    cp = builder_.CreateZExtOrTrunc(cp, i32());
+                auto* fn = declareC("bz_strspan_indexof_cp", i32(),
+                                    {ptrTy(), i64(), i64(), i32()});
+                llvm::Value* idx = builder_.CreateCall(
+                    fn, {selfSrc, selfSt, selfLen, cp}, "ss.iofc");
+                if (m == "Contains")
+                    return builder_.CreateICmpSGE(idx, builder_.getInt32(0),
+                                                  "ss.hasc");
+                return idx;
+            }
+            // The needle's (source, start, len) triple: a string operand is the
+            // whole string (start 0), a span operand is its own sub-range.
+            llvm::Value* nSrc = nullptr;
+            llvm::Value* nSt  = nullptr;
+            llvm::Value* nLen = nullptr;
+            if (argIsString) {
+                nSrc = lowerExpr(*call.args[0].value);
+                if (!nSrc) return nullptr;
+                nSt  = builder_.getInt64(0);
+                // -1 = the BZ_STRSPAN_WHOLE sentinel: "the whole string",
+                // resolved inside the runtime helper AFTER its null guard.
+                // Reading the length here instead (loadStringLen) would
+                // dereference the operand, and the builtin string-method surface
+                // still admits an un-narrowed `string?` argument — the sibling
+                // `"h".IndexOf(nullString)` compiles today and returns -1 rather
+                // than faulting, so this family must not fault either.
+                nLen = builder_.getInt64(-1);
+            } else {
+                llvm::Value* nv = lowerExpr(*call.args[0].value);
+                if (!nv || !nv->getType()->isStructTy()) return nullptr;
+                auto* nSlot = entryAlloca(spanSt);
+                builder_.CreateStore(nv, nSlot);
+                nSrc = builder_.CreateLoad(ptrTy(),
+                    builder_.CreateStructGEP(spanSt, nSlot, 0), "ss.n.src");
+                nSt = builder_.CreateSExt(builder_.CreateLoad(i32(),
+                    builder_.CreateStructGEP(spanSt, nSlot, 1)), i64(), "ss.n.st");
+                nLen = builder_.CreateSExt(builder_.CreateLoad(i32(),
+                    builder_.CreateStructGEP(spanSt, nSlot, 2)), i64(), "ss.n.len");
+            }
+            auto callSpanFn = [&](const char* name) {
+                auto* fn = declareC(name, i32(),
+                                    {ptrTy(), i64(), i64(), ptrTy(), i64(), i64()});
+                return builder_.CreateCall(
+                    fn, {selfSrc, selfSt, selfLen, nSrc, nSt, nLen}, "ss.q");
+            };
+            // §3.3: Contains(value) is defined as IndexOf(value) >= 0.
+            if (m == "IndexOf") return callSpanFn("bz_strspan_indexof");
+            if (m == "Contains")
+                return builder_.CreateICmpSGE(callSpanFn("bz_strspan_indexof"),
+                                              builder_.getInt32(0), "ss.has");
+            const char* fnName = m == "StartsWith" ? "bz_strspan_startswith"
+                               : m == "EndsWith"   ? "bz_strspan_endswith"
+                                                   : "bz_strspan_seqequal";
+            return builder_.CreateTrunc(callSpanFn(fnName), i1(), "ss.qb");
         }
         return nullptr;
     }

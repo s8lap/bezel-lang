@@ -55,6 +55,14 @@ namespace bezel::ownership {
 //     try/finally, so it is not reported as leaked on that edge.
 using BlockState = std::unordered_map<sema::Symbol*, LocalOwnership>;
 
+// §28.8.1 (#1125) / §28.6 bullet 2 (#2518): if `e` is a leading force-unwrap
+// `x!` (PostfixBangExpr), return its operand `x`; otherwise return `e`
+// unchanged. Lets the §28.6 / §28.8.1 field-read recognizers see through the
+// null-forgiving `!` so the force-unwrap spellings (`return _f!`, `move _f!`)
+// are classified identically to their bare forms. Defined in
+// Ownership_Checks.cpp; shared by both Ownership.cpp and Ownership_Checks.cpp.
+const ast::Expr* lookThroughForceUnwrap(const ast::Expr* e);
+
 // §28.8.1 (#867): the per-block dataflow lattice for the field-restoration
 // check. A `move` of an owned field leaves the field moved-from; the field
 // must be RESTORED (reassigned a value, incl. `null` for a nullable owned
@@ -97,6 +105,16 @@ struct GenericReturnContext {
     const std::vector<ast::GenericParam>* enclosingParams = nullptr;
     const std::vector<ast::GenericConstraint>* methodConstraints = nullptr;
     const std::vector<ast::GenericConstraint>* enclosingConstraints = nullptr;
+    // §28.3 v0.235 (#1666, #2381): for a method declared inside an EXTENSION
+    // block, the block-level type parameters ride the target type's generic
+    // argument list (an `ExtensionDecl` carries no `genericParams` vector), so
+    // they are collected here as synthetic `GenericParam`s and `enclosingParams`
+    // is pointed at this vector — letting `computeBareReturnContext` recognize a
+    // bare-`T` return that names the extension-block-level parameter (the v0.235
+    // iteration-variable ruling's must-reject shape is an extension method on
+    // `IEnumerable<T>`). Empty for type-member and static methods. Owns the
+    // `string_view` names (they point into the AST, which outlive the pass).
+    std::vector<ast::GenericParam> extensionEnclosingParams;
     // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S10; #1885): true when
     // this method IMPLEMENTS or OVERRIDES a generic declaration whose declared
     // return type is a bare type parameter (`class VChooser: IChooser<C> ...
@@ -202,7 +220,16 @@ public:
     // `owned`-field path. checkAutoPropertyInitializer covers an auto-property's
     // generated backing field, which has no `owned` declaration form (§23.1).
     // Both checks exempt static storage (§22.13), and are NARROW checks only.
-    void checkFieldInitializer(const ast::FieldDecl& fd);
+    //
+    // `enclosingKind` (issue #1251) is the kind of the type that DECLARES `fd`.
+    // §9.7's storage bullet is scoped to "an instance field of a **class**", so
+    // the borrow-bearing record / span / choice leg must not fire on a RECORD's
+    // own component initializer — a record component of borrow-bearing type is
+    // exactly what §9.7's transitivity clause contemplates as legal. Null (the
+    // default) keeps the leg enabled, the conservative reading for a caller
+    // that cannot name the declaring type. // per §9.7
+    void checkFieldInitializer(const ast::FieldDecl& fd,
+                               const ast::TypeDecl* enclosingType = nullptr);
     void checkAutoPropertyInitializer(const ast::PropertyDecl& pd);
 
     // §28.3 SB01-B (v0.190, #1919/#1926): the callee-side borrow-return
@@ -973,6 +1000,18 @@ private:
     // parameter return of a value the caller cannot own (a fresh owned value or a
     // borrow of an owned local / `using var` / `owned` parameter). // per §28.3
     void reportBareTypeParamOwnedReturn(const ast::Expr& e);
+    // §28.3 v0.235 (#1666, #2381): returns the ForStmt whose iteration variable
+    // `e` is, when that loop's source is statically an INTERFACE-TYPED
+    // enumeration (`IEnumerable<T>` / `IAsyncEnumerable<T>`) — the v0.235 ruling's
+    // must-reject shape (the element's backing is unprovable, so the variable's
+    // source is conservatively the loop's implicit enumerator, a scope-bound
+    // local). Returns null for a non-iteration-variable expression, an iteration
+    // variable over a CONCRETE collection (Array<T> …, collection-backed, the
+    // chain element slot → collection → receiver, admitted), a range/span/
+    // inline-array/string source, or the owning heads (IOwningEnumerable/…, which
+    // seed the iteration variable OWNED and are rejected by the owned-local arm).
+    // // per §28.3, §29.1, §29.2 v0.235
+    const ast::ForStmt* borrowedIterVarFromInterfaceSource(const ast::Expr& e);
 
     // §28.3 / §28.6 (v0.180 #1547; role changed v0.196 #1815): true when `e` is
     // a bare identifier or member access resolving to a STATIC field or property
@@ -1325,6 +1364,25 @@ private:
     // check (issue #402) can skip a borrow source #386 has already flagged and
     // avoid a duplicate diagnostic for the same store. // per §28.3
     bool checkBorrowStoreEscape(const ast::AssignmentStmt& as);
+
+    // §9.7 (issue #1251): true when an assignment TARGET classified as a field
+    // write names storage owned by a CLASS or INTERFACE instance, as opposed to
+    // a component of a RECORD value. §9.7's storage bullet is scoped to "an
+    // instance field of a **class**" — a class instance's lifetime is not
+    // bounded by any borrow source's scope, which is the whole premise of the
+    // rejection. A record is a VALUE: its components are reached only through
+    // the record value itself, which is subject to §9.7's rules at its own use
+    // sites, and §9.7's transitivity clause explicitly contemplates a record
+    // whose field is borrow-carrying (that is what MAKES it borrow-bearing).
+    // Rejecting a record's own component store would make a borrow-bearing body
+    // record unconstructible — `record SpanBox public v: ArraySpan<int>;
+    // constructor(x: ArraySpan<int>) v := x; end constructor;` — which the
+    // equivalent positional form (§9.1's synthesized primary constructor) is
+    // free to do. Resolves the target's member symbol (sema attaches it to both
+    // `obj.f` and the bare implicit-`this` form) and reads its declaring type's
+    // kind; an unresolvable target keeps the rejection, the conservative
+    // reading. // per §9.7, §9.1
+    bool storeTargetIsClassField(const ast::Expr& target) const;
 
     // §28.11 "Storing a borrow" (v0.180, #1539) — the borrowing-collection
     // store rule. Storing a class-typed borrow into a BORROWING collection
@@ -1723,8 +1781,8 @@ private:
     // predicate above misses it). The stdlib-certified `CancellationToken`
     // (§30.8, the single enumerated exception) is a value builtin with no
     // Record decl and is not in the span list, so it is correctly NOT flagged;
-    // likewise the string-backed spans `ReadOnlyStringSpan` /
-    // `ReadOnlyAsciiByteSpan` (string is runtime-managed, §9.7). // per §30.1
+    // likewise the string-backed span `ReadOnlyStringSpan` (string is
+    // runtime-managed, §9.7). // per §30.1
     bool isBorrowBearingRecordOrSpan(const sema::TypeRef* rt) const;
 
     // §35.4 / §9.7 (v0.220, #2180): true when `rt` is a BORROW-BEARING choice
@@ -2327,6 +2385,33 @@ private:
     void markOutOwnedArgs(const std::vector<ast::CallArgument>& args,
                           const ast::Expr* callee);
 
+    // §28.3 / §22.4 (issue #2429): the constructor-call overload. A `new
+    // T(...)` call has no "callee" Expr in the CallExpr sense — its
+    // parameter list is resolved via resolveCtorParams (recordMovesIn's
+    // NewExpr branch already does this into `ctorParams`) rather than via
+    // `ctx_.exprSymbol(*callee)` + MethodSymbol. This overload takes the
+    // resolved parameter list directly and shares markOutOwnedArgsCore with
+    // the callee-based overload above, so a constructor's `out owned`
+    // recipient is marked Owned by the SAME logic a method call's is —
+    // fixing #2429's root cause (recordMovesIn's NewExpr branch never
+    // called any out-owned-marking equivalent, so a constructor's `out
+    // owned var` recipient never entered the ownership dataflow's `states_`
+    // and was invisible to the §28.3 affine auto-drop / must-use-warning
+    // end-of-scope check — a silent leak, no diagnostic at all).
+    // // per §28.3, §22.4
+    void markOutOwnedArgs(const std::vector<ast::CallArgument>& args,
+                          const std::vector<ast::Param>* params);
+
+    // Shared implementation for both markOutOwnedArgs overloads above.
+    // `callee` is threaded through only for builtinOutOwnedArg's dispatch
+    // (which requires a MemberAccessExpr callee); the constructor overload
+    // passes nullptr, so builtinOutOwnedArg(nullptr, pos) correctly returns
+    // false for every arg — no builtin type is constructed via `new` with an
+    // out-owned recipient. // per §28.3, §28.11, §22.4, issue #2429
+    void markOutOwnedArgsCore(const std::vector<ast::CallArgument>& args,
+                              const std::vector<ast::Param>* params,
+                              const ast::Expr* callee);
+
     // §28.3 / §28.11 (#1466, #1407): scan an if/elif CONDITION expression for
     // PRE-DECLARED out-owned recipients (`if coll.TryX(out item) then …`) — a
     // bare `out item` argument at an `out owned` position (userOutOwned /
@@ -2598,6 +2683,20 @@ private:
     // // per §28.14, §28.3 v0.196
     bool returnTypeIsDeferredActivation() const;
 
+    // #2343 (§28.14 *Call-bounded × deferred activation*, v0.196): per-lambda
+    // sibling of returnTypeIsDeferredActivation, for the lambda's OWN `=>`
+    // expression body. The frame-residence carve-out at an expr-body implicit
+    // return needs the LAMBDA's return type (what ITS caller sees and
+    // re-establishes against), not the enclosing method's returnType_. A lambda
+    // with an explicit return-type ascription (lam->retType) reads that AST
+    // node with the same head-name navigation as returnTypeIsDeferredActivation;
+    // a lambda with an INFERRED return type has it equal to the exprBody's
+    // resolved type, so isDeferredActivationCallResult(exprBody) alone is the
+    // equivalent announcement (the inferred return type composes iff the body
+    // is a frame). // per §28.14, v0.196, #2343
+    bool lambdaReturnTypeIsDeferredActivation(
+        const ast::LambdaExpr& lam, const ast::Expr& exprBody) const;
+
     // True when `arg` is a plain-argument "unbound owned temporary" per the
     // §28.3 Producers table: a bare `new T(...)` or call already classified
     // Owned by producerState, OR a call to a STATIC method (no receiver)
@@ -2827,6 +2926,15 @@ private:
     // The enclosing method's own parameter symbols — distinguishes a real
     // capture of a method parameter from a lambda-internal parameter.
     std::unordered_set<sema::Symbol*> methodParamSet_;
+    // #2342 (§28.14): when non-null, `scopedCollectCaptures` records each
+    // visited lambda's OWN parameter symbols into the pointed-to set. Set
+    // transiently by `checkScopedAdmission` while collecting the captures of
+    // the FORWARDED lambda (its own params + those of any lambda nested
+    // within it are NOT captures — they are internal to the forwarded
+    // closure; params of an enclosing lambda or the method ARE captures).
+    // Null outside that one collection so the many other `scopedCollectCaptures`
+    // call sites are unaffected. // per §28.14, #2342
+    std::unordered_set<sema::Symbol*>* scopedLambdaInternalSink_ = nullptr;
     // §28.3 v0.196 (#1910): the enclosing method's ordered parameter symbol
     // list (matches md->params position-for-position). Used by
     // checkInstanceBorrowReturn to map a ParameterSymbol* back to its
@@ -3058,6 +3166,21 @@ private:
     void callBoundedScan(const std::vector<std::unique_ptr<ast::Stmt>>& body);
     void callBoundedWalkStmt(const ast::Stmt& s);
     void callBoundedWalkExpr(const ast::Expr& e);
+    // #1432 (§28.14 v0.177): a LAMBDA is a user-authored callee too — its OWN
+    // plain function-typed parameters are call-bounded within its own body,
+    // exactly as an enclosing method's/constructor's formals are (the seeding
+    // in run() above). Called from callBoundedWalkExpr's LambdaExpr case
+    // before descending into the body; inserts each eligible parameter symbol
+    // (looked up via ctx_.lambdaParams, position-for-position with
+    // lam.params) into callBoundedParams_. NOT popped after the body walk:
+    // scopedPreScan's deferred checkScopedAdmission queue runs AFTER the
+    // whole callBoundedScan walk finishes and must still see a lambda's own
+    // parameter as call-bounded if it is forwarded to a `scoped` position
+    // from inside that same lambda's body. Sound because each lambda
+    // occurrence mints its own distinct ParameterSymbol* — no two lambdas
+    // (sibling or nested) ever share one, so a resident entry cannot make an
+    // unrelated identifier resolve to it. // per §28.14, v0.177, #1432
+    void seedLambdaCallBoundedParams(const ast::LambdaExpr& lam);
     // The call-bounded parameter `e` denotes or transitively carries (bare
     // identifier, carrier local, capturing lambda, conditional, collection
     // literal, postfix-bang), or null.
@@ -3086,6 +3209,47 @@ private:
     bool verifiedCallBoundedFormalAt(const ast::Expr* callee,
                                      const ast::NewExpr* ne,
                                      std::size_t argPos);
+
+    // -- §28.14 v0.179 (#1527): call-bounded × TASK-ABANDONMENT escape sink --
+    //
+    // A call-bounded callback's OWN signature may itself return a Task-family
+    // value (`() -> Task`, `(int) -> Task<T>`, …). INVOKING it mints a task
+    // that "inherits the call bound" (§28.14 v0.179, Appendix C.6): a
+    // synchronous callee has no consuming position for the returned task (no
+    // `await`), so the invocation itself is rejected — declare the parameter
+    // `scoped` or make the callee `async`. An async callee must await the
+    // minted task to settlement, on every normal-exit path, before it
+    // returns — directly, or by accumulating it in a purely-local collection
+    // fully discharged by an aggregation-helper await (`await
+    // Task.WhenAll(pending)`); returning it, storing it, passing it to
+    // `Task.FireAndForget`, or binding it and dropping it undisposed-to-
+    // settlement is the same escape sink the other §28.14 sinks are.
+    //
+    // Runs as its own structural pre-pass AFTER callBoundedScan (needs the
+    // completed callBoundedAlias_ map for the local-rebinding idiom `var g :=
+    // f; …`). Deliberately does NOT descend into a nested LambdaExpr's own
+    // body (mirrors checkTaskScopeConsumption's own scope): a lambda's
+    // async-ness may differ from the enclosing callable's, and #1432 already
+    // scoped the call-bounded machinery's lambda interactions narrowly —
+    // extending task-settlement tracking across that boundary is left to a
+    // follow-up issue if evidence demands it. Likewise recognizes the
+    // invocation only at a fixed set of STATEMENT-level positions (a
+    // LocalDecl initializer, an assignment RHS, a return/discard value, a
+    // fan-out `.Add(...)` argument, a bare expression-statement, an `await`
+    // operand) — a task-returning invocation reached only through some OTHER
+    // nested expression position (an argument to an unrelated call, a
+    // chained member access, …) is not specifically recognized; a deliberate,
+    // recorded "provable subset" scope, the same posture v1 admission bound
+    // #3 already states for this section. // per §28.14 v0.179, Appendix C.6
+    void checkCallBoundedTaskSettlement(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+    // True + resolves the invoked call-bounded parameter's name when `ce`
+    // invokes THIS callable's own call-bounded parameter (or a local alias,
+    // §28.14 v0.177's carrier machinery) — the CALLEE position, not an
+    // argument — AND `ce`'s result type is Task-family
+    // (`callResultIsAsyncTask`) — the §28.14 v0.179 (2) invocation shape.
+    bool callBoundedTaskInvocation(const ast::CallExpr& ce,
+                                   std::string_view* paramNameOut);
 
     // -- stdlib §6.10 (v0.175, #808): TaskScope consumption rules ------------
     // TaskScope may only be consumed by `await using`; a plain `using var`, an

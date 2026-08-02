@@ -102,7 +102,11 @@ BEZEL_TEST(codegen_bug481, abstract_property_via_base_reference_int) {
 BEZEL_TEST(codegen_bug481, interface_property_int) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IShape property Size: int; end IShape; "
+        // §11.2/§23.3 (#2413): Square's `Size` is getter-only and this test
+        // never writes through the interface, so IShape's obligation is
+        // declared `readonly` — a getter-only implementation of a
+        // read-write interface property is now a compile error (#2413).
+        "interface IShape readonly property Size: int; end IShape; "
         "class Square : IShape public property Size: int => 9; "
         "  destructor end destructor; end Square; "
         "class C "
@@ -118,7 +122,10 @@ BEZEL_TEST(codegen_bug481, interface_property_int) {
 BEZEL_TEST(codegen_bug481, interface_property_string) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface INamed property Name: string; end INamed; "
+        // §11.2/§23.3 (#2413): Widget's `Name` is getter-only and this test
+        // never writes through the interface (see interface_property_int
+        // above).
+        "interface INamed readonly property Name: string; end INamed; "
         "class Widget : INamed public property Name: string => \"W\"; "
         "  destructor end destructor; end Widget; "
         "class C "
@@ -279,7 +286,10 @@ BEZEL_TEST(codegen_bug481, interface_property_setter) {
 BEZEL_TEST(codegen_bug481, interface_property_via_abstract_base) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface ISized property Size: int; end ISized; "
+        // §11.2/§23.3 (#2413): Tile's `Size` override is getter-only and
+        // this test never writes through the interface (see
+        // interface_property_int above).
+        "interface ISized readonly property Size: int; end ISized; "
         "abstract class Shape : ISized "
         "  public abstract property Size: int; "
         "end Shape; "

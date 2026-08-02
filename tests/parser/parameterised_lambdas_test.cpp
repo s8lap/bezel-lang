@@ -95,6 +95,16 @@ BEZEL_TEST(parser_lambda, out_owned_param_modifier) {
         std::string("(lambda(out owned r: Resource) => r)"));
 }
 
+// A.7 FuncParamMods (v0.228, #2344): `scoped` is a contextual lambda-param
+// modifier (lexed as Identifier), the last of the FuncParamMods set to be
+// wired into the lambda-param path after ref/owned/out-owned. Mirrors the
+// method-param modifier path (§22.3 / A.4).
+BEZEL_TEST(parser_lambda, scoped_param_modifier) {
+    BEZEL_EXPECT_EQ(
+        exprFromStmt("lambda(scoped cb: () -> ()) => 1"),
+        std::string("(lambda(scoped cb: () -> ()) => 1)"));
+}
+
 BEZEL_TEST(parser_lambda, block_body_with_params) {
     BEZEL_EXPECT_EQ(
         exprFromStmt("lambda(x: int) => do return x; end"),

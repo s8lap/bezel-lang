@@ -11,6 +11,10 @@ static const int64_t POSIX_EPOCH_TICKS = 621355968000000000LL;
 static const int64_t TICKS_PER_SECOND  = 10000000LL;
 static const int64_t TICKS_PER_MS      = 10000LL;
 
+// per stdlib §2.5: DateTime.Now — current local DateTime as .NET ticks.
+// Reads CLOCK_REALTIME (which is UTC); the local-zone offset is applied by the
+// codegen wrapper / caller, not here. Intercept point per stdlib §2.5.
+
 int64_t bz_datetime_now_ticks(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -19,9 +23,16 @@ int64_t bz_datetime_now_ticks(void) {
          + (int64_t)ts.tv_nsec / 100;
 }
 
+// per stdlib §2.5: DateTime.UtcNow — current UTC DateTime as .NET ticks.
+// CLOCK_REALTIME is already UTC, so this delegates to NowTicks. Intercept point.
+
 int64_t bz_datetime_utcnow_ticks(void) {
     return bz_datetime_now_ticks(); // CLOCK_REALTIME is UTC
 }
+
+// per stdlib §2.5: Ticks property / FromTicks helper — decompose a tick value
+// into its (year, month, day, hour, minute, second, millisecond) components.
+// Underlies every DateTime scalar property accessor (Year/Month/Day/...) below.
 
 void bz_datetime_ticks_to_parts(int64_t ticks,
                                  int32_t* year,  int32_t* month,  int32_t* day,
@@ -39,6 +50,11 @@ void bz_datetime_ticks_to_parts(int64_t ticks,
     if (second) *second = tm_info->tm_sec;
     if (ms)     *ms     = (int32_t)(rem_ticks / TICKS_PER_MS);
 }
+
+// per stdlib §2.5: DateTime(year, month, day, ...) / FromTicks — compose a
+// tick value from components. The constructor's ArgumentOutOfRangeException
+// obligation (per stdlib §2.5 / #648) is enforced by the codegen caller, not
+// here; this helper is a pure inverse of ticks_to_parts.
 
 int64_t bz_datetime_parts_to_ticks(int32_t year, int32_t month,  int32_t day,
                                     int32_t hour, int32_t minute, int32_t second,
@@ -206,7 +222,15 @@ extern "C" int32_t bz_datetime_try_parse(const void* str_p, int64_t* out_ticks) 
     if (mo < 1 || mo > 12) return 0;
     if (pos >= len || s[pos] != '-') return 0; pos++;
     int32_t dy = parse_int_fixed(s, len, &pos, 2);
-    if (dy < 1 || dy > 31) return 0;
+    if (dy < 1) return 0;
+    // per stdlib §2.5 / #2230: reject impossible calendar dates instead of
+    // allowing timegm to normalize them into a different month (for example,
+    // 2023-02-29 -> 2023-03-01). TryParse must return false on invalid input.
+    static const int32_t days_in_month[] =
+        {0, 31,28,31,30,31,30,31,31,30,31,30,31};
+    bool leap = (yr % 4 == 0) && (yr % 100 != 0 || yr % 400 == 0);
+    int32_t max_day = (mo == 2 && leap) ? 29 : days_in_month[mo];
+    if (dy > max_day) return 0;
 
     int32_t hr = 0, mn = 0, sc = 0, ms = 0;
 
@@ -359,7 +383,14 @@ extern "C" void* bz_decimal_to_string_fmt(const bz_decimal_t* a,
             for (int64_t i = 1; i < flen; ++i) {
                 if (fmt[i] < '0' || fmt[i] > '9') return nullptr;  // bad tail
                 count = count * 10 + (fmt[i] - '0');
-                if (count > 29) return nullptr;  // out of range
+                // per §2.18 / §9.3 v0.195: decimal scale is 0..28, so the count
+                // tail of F/Fn, E/En, P/Pn must reject n > 28 (otherwise the
+                // resulting string is not roundtrippable through Parse — the
+                // call would silently produce a string whose fractional-digit
+                // count exceeds the decimal invariant, raising OverflowException
+                // when the user re-parses it). The off-by-one previously accepted
+                // 29.
+                if (count > 28) return nullptr;  // out of range
             }
         }
     }
@@ -568,6 +599,8 @@ void* bz_make_string(const char* buf, int64_t len) {
     return sh;
 }
 
+// per stdlib §2.18 (R format / no-format ToString()): double round-trip.
+// Search 1..17 — IEEE 754 double's exact-decimal precision is 17 digits.
 extern "C" void* bz_double_to_string_r(double v) {
     char buf[64];
     int n = 0;
@@ -579,6 +612,8 @@ extern "C" void* bz_double_to_string_r(double v) {
     return bz_make_string(buf, n);
 }
 
+// per stdlib §2.18 (R format / no-format ToString()): float round-trip.
+// Search 1..9 — IEEE 754 float's exact-decimal precision is 9 digits.
 extern "C" void* bz_float_to_string_r(float v) {
     char buf[64];
     int n = 0;
@@ -787,18 +822,18 @@ static int64_t bz_sw_running_ns(const bz_stopwatch_t* sw) {
 
 extern "C" {
 
-// new Stopwatch() — allocate and zero-initialise.
+// per stdlib §8.1: Stopwatch() — allocate and zero-initialise.
 void* bz_stopwatch_alloc(void) {
     auto* sw = (bz_stopwatch_t*)calloc(1, sizeof(bz_stopwatch_t));
     return sw;
 }
 
-// Stopwatch.Dispose() — free the heap object (no IDisposable semantics needed).
+// per stdlib §8.1: Stopwatch.Dispose() — free the heap object.
 void bz_stopwatch_free(void* swp) {
     free(swp);
 }
 
-// Stopwatch.Start() — begin (or resume) timing.
+// per stdlib §8.1: Stopwatch.Start() — begin (or resume) timing.
 void bz_stopwatch_start(void* swp) {
     auto* sw = (bz_stopwatch_t*)swp;
     if (!sw || sw->running) return;  // idempotent: already running → no-op
@@ -806,7 +841,7 @@ void bz_stopwatch_start(void* swp) {
     sw->running = 1;
 }
 
-// Stopwatch.Stop() — pause timing; accumulate elapsed.
+// per stdlib §8.1: Stopwatch.Stop() — pause timing; accumulate elapsed.
 void bz_stopwatch_stop(void* swp) {
     auto* sw = (bz_stopwatch_t*)swp;
     if (!sw || !sw->running) return;  // idempotent: already stopped → no-op
@@ -814,7 +849,7 @@ void bz_stopwatch_stop(void* swp) {
     sw->running = 0;
 }
 
-// Stopwatch.Reset() — stop (if running) and zero elapsed.
+// per stdlib §8.1: Stopwatch.Reset() — stop (if running) and zero elapsed.
 void bz_stopwatch_reset(void* swp) {
     auto* sw = (bz_stopwatch_t*)swp;
     if (!sw) return;
@@ -824,7 +859,7 @@ void bz_stopwatch_reset(void* swp) {
     sw->start_ts.tv_nsec = 0;
 }
 
-// Stopwatch.Restart() — reset and start immediately.
+// per stdlib §8.1: Stopwatch.Restart() — reset and start immediately.
 void bz_stopwatch_restart(void* swp) {
     auto* sw = (bz_stopwatch_t*)swp;
     if (!sw) return;
@@ -833,14 +868,14 @@ void bz_stopwatch_restart(void* swp) {
     sw->running = 1;
 }
 
-// Stopwatch.IsRunning — returns 1 (true) or 0 (false).
+// per stdlib §8.1: Stopwatch.IsRunning — returns 1 (true) or 0 (false).
 int32_t bz_stopwatch_is_running(void* swp) {
     auto* sw = (bz_stopwatch_t*)swp;
     if (!sw) return 0;
     return sw->running;
 }
 
-// Stopwatch.ElapsedMilliseconds — total elapsed as i64 milliseconds.
+// per stdlib §8.1: Stopwatch.ElapsedMilliseconds — total elapsed as i64 ms.
 int64_t bz_stopwatch_elapsed_ms(void* swp) {
     auto* sw = (bz_stopwatch_t*)swp;
     if (!sw) return 0;
@@ -849,7 +884,7 @@ int64_t bz_stopwatch_elapsed_ms(void* swp) {
     return ns / (int64_t)1000000;
 }
 
-// Stopwatch.Elapsed — total elapsed as TimeSpan (i64, 100-ns ticks).
+// per stdlib §8.1: Stopwatch.Elapsed (TimeSpan) — total elapsed as i64 ticks.
 int64_t bz_stopwatch_elapsed_ticks(void* swp) {
     auto* sw = (bz_stopwatch_t*)swp;
     if (!sw) return 0;

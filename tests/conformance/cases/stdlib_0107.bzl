@@ -35,12 +35,6 @@ public class String: IEnumerable<char>, IComparable<string>, IEquatable<string> 
   public method AsSpan(start: int, length: int): ReadOnlyStringSpan;
   public method AsSpan(r: Range<int>): ReadOnlyStringSpan; // parallels [r: Range<int>]: string
 
-  // ASCII byte views (v0.106)
-  // Throws InvalidOperationException if `not IsAscii`.
-  public method AsAsciiByteSpan(): ReadOnlyAsciiByteSpan;
-  // Returns false (and out value default) if `not IsAscii`.
-  public method TryAsAsciiByteSpan(out value: ReadOnlyAsciiByteSpan): bool;
-
   // Modification (returns a new string; original unchanged)
   public method Trim(): string;
   public method Trim(chars: IEnumerable<char>): string;

@@ -58,7 +58,11 @@ int run(const std::string& prog) {
 BEZEL_TEST(ref_return_generic_490, constraint_property_string_inferred_local_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IName  property Name: string; end IName; "
+        // §11.2/§23.3 (#2413): P's `Name` is getter-only and this test never
+        // writes through the interface, so IName's obligation is declared
+        // `readonly` — a getter-only implementation of a read-write
+        // interface property is now a compile error (#2413).
+        "interface IName  readonly property Name: string; end IName; "
         "class P : IName "
         "  public _n: string; "
         "  public constructor(n: string) _n := n; end constructor; "
@@ -120,7 +124,11 @@ BEZEL_TEST(ref_return_generic_490, constraint_property_class_ref_inferred_local_
         "  public property Size: int => _sz; "
         "  destructor end destructor; "
         "end Inner; "
-        "interface IHasInner  property GetInner: Inner; end IHasInner; "
+        // §11.2/§23.3 (#2413): Outer's `GetInner` is getter-only and this
+        // test never writes through the interface, so IHasInner's
+        // obligation is declared `readonly` (see
+        // constraint_property_string_inferred_local_spec_14_2 above).
+        "interface IHasInner  readonly property GetInner: Inner; end IHasInner; "
         // `_inner` holds a freshly-produced `new Inner(...)`, so the field must
         // be `owned` (§28.5) — a non-`owned` field cannot own the value and it
         // would leak. Being `owned`, the field is disposed by the generated
@@ -155,7 +163,9 @@ BEZEL_TEST(ref_return_generic_490, constraint_property_class_ref_inferred_local_
 BEZEL_TEST(ref_return_generic_490, annotated_string_local_still_works_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IName  property Name: string; end IName; "
+        // §11.2/§23.3 (#2413): see constraint_property_string_inferred_local_spec_14_2
+        // above for why this interface property is declared `readonly`.
+        "interface IName  readonly property Name: string; end IName; "
         "class P : IName "
         "  public _n: string; "
         "  public constructor(n: string) _n := n; end constructor; "
@@ -183,7 +193,10 @@ BEZEL_TEST(ref_return_generic_490, annotated_string_local_still_works_spec_14_2)
 BEZEL_TEST(ref_return_generic_490, constraint_property_int_inferred_local_control_spec_14_2) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface ICount  property Count: int; end ICount; "
+        // §11.2/§23.3 (#2413): Counter's `Count` is getter-only and this
+        // test never writes through the interface (see
+        // constraint_property_string_inferred_local_spec_14_2 above).
+        "interface ICount  readonly property Count: int; end ICount; "
         "class Counter : ICount "
         "  public _c: int := 0; "
         "  public constructor(c: int) _c := c; end constructor; "

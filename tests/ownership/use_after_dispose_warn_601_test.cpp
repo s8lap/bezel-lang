@@ -14,7 +14,8 @@
 //
 //   1. Straight-line use-after-dispose → WARNS.
 //   2. Member-call use-after-dispose → WARNS.
-//   3. Dispose in one if-branch only → does NOT warn (no domination).
+//   3. Dispose in one if-branch only → does NOT warn (no domination) — but the
+//      post-join use is a hard K7.4 error (see the cell; updated for #2270).
 //   4. Dispose in both branches then use → WARNS (join point is dominated).
 //   5. Use before dispose → does NOT warn (correct program order).
 //   6. Reassignment after dispose then use → does NOT warn (reinitialises).
@@ -101,23 +102,37 @@ BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_method_call_warns) {
 }
 
 
-// ── Case 3: dispose in only one if-branch → no domination, no warning ──────
+// ── Case 3: dispose in only one if-branch → not the §28.2 warning; the
+//    stricter K7.4 conditional-kill ERROR ────────────────────────────────────
 
-// §28.2 v0.131: the warning fires only when Dispose() dominates the use on
-// EVERY path.  If x is disposed only on the `then` branch, the `else`/
-// fall-through path leaves x live at the join — the Dispose does NOT dominate
-// the post-if use site.  No warning.
-BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_one_branch_no_warn) {
-    // x.Dispose() only in the then branch; use after the if. The
-    // ownership meet of Disposed (then) ⊓ Owned (fall-through) is Owned
-    // (the discharge obligation is retained on the fall-through edge per
-    // §28.6), so the state at the use site is not Disposed → no warning.
+// §28.2 (v0.228) states the domination warning and its conditional counterpart
+// in consecutive sentences: the compiler "must emit a compile-time warning when
+// a local variable is used (read, borrowed from, or consumed) after an explicit
+// Dispose() call ... that dominates the use site on every path", and then "A
+// *conditional* kill is treated more strictly: at a join of an
+// explicitly-disposed path with a still-owned path the variable is
+// **maybe-consumed** and a later use is a compile error (§28.3)."
+//
+// So for a one-branch dispose the §28.2 domination WARNING is still correctly
+// absent — Dispose does not dominate the post-if use — but the use is not
+// clean either: it is the K7.4 maybe-consumed error. This cell pins both
+// halves, which is what keeps the two diagnostics from being confused.
+//
+// (#2270 / d2ecf82: this cell previously asserted the program was error-free,
+// under the v0.180-era reading that a post-join Dispose was the proper
+// discharge on the owned path and an idempotent no-op on the disposed path.
+// See maybe_consumed_join_1626_test.cpp's header for why that reading is stale.
+// The one-branch dispose WITHOUT a post-join use is the accepted shape —
+// §28.3 per-path auto-drop, branch_disposal_test.cpp.)
+BEZEL_TEST(own_use_after_dispose_warn_601, spec_28_2_one_branch_conditional_kill_errors) {
     auto r = parseAndCheckOwnership(wrapBranch(
         "var x := new T(); "
         "if cond then x.Dispose(); end; "
-        "x.Dispose();"));  // final Dispose is the proper discharge
+        "x.Dispose();"));
+    // Not the domination warning: the then-branch Dispose does not dominate.
     BEZEL_EXPECT_FALSE(hasUseAfterDisposeWarning(r));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    // But the conditional kill makes the post-join use a hard error.
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 

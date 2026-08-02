@@ -42,6 +42,7 @@ enum BlockID : unsigned {
     PARAM_BLOCK = 14,   // one MetaParam
     METATYPE_BLOCK = 15, // one MetaType (a signature type, possibly nested)
     CONTRACT_BLOCK = 16, // one MetaContractRecord (§22.16 / #2054)
+    EXTENSION_BLOCK = 17, // one MetaExtension (§26 / #735)
     // 17.. reserved for future additive subblocks (a reader skips unknown ids)
     UNKNOWN_FUTURE_BLOCK = 99, // test-only: a subblock id this reader skips
 };
@@ -112,6 +113,11 @@ void hashParam(std::uint64_t& h, const MetaParam& p) {
     hashType(h, p.type);
     hashBool(h, p.hasDefault);
     hashStr(h, p.defaultText);
+    // §22.4 / §12.1 (#2392): part of the parameter's signature identity —
+    // §2.8.3 rule 3 requires every embedded description of a type/member to
+    // agree, and a differing postcondition is exactly the kind of signature
+    // disagreement that rule flags as staleness.
+    hashByte(h, p.outNullWhen);
 }
 
 void hashContract(std::uint64_t& h, const MetaContractRecord& c) {
@@ -130,6 +136,48 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     hashU64(h, m.modifiers.size());
     for (const std::string& s : m.modifiers) hashStr(h, s);
     hashBool(h, m.isPure);
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 3): hasSetter is part of a Property's
+    // signature identity — a library changing a property from getter-only to
+    // read-write (or vice versa) changes the cross-module contract exactly
+    // the way #2392's outNullWhen does for a postcondition, so it must fold
+    // into the semantic hash or a consumer's staleness check cannot see the
+    // change (§2.8.3 rule 3: staleness is an error, not a negotiation).
+    hashBool(h, m.hasSetter);
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): the setter's
+    // EFFECTIVE visibility is also part of the Property's signature
+    // identity — a library tightening `set` to `private set` (or
+    // loosening it) changes the cross-module contract, so it must fold
+    // into the semantic hash the same way hasSetter does above.
+    hashByte(h, static_cast<std::uint8_t>(m.setterVisibility));
+    // fix #2478 (§9.2/§22.8): isAutoProperty is part of a Property's
+    // signature identity for LAYOUT purposes — a library changing a
+    // property from auto-storage form to computed form (or vice versa)
+    // changes the cross-module storage contract, so it must fold into the
+    // semantic hash the same way hasSetter/setterVisibility do above.
+    hashBool(h, m.isAutoProperty);
+    // fix #2461 (§22.3/§23): hasGetter is part of a Property's signature
+    // identity — a library changing a property from write-only to read-write
+    // (or vice versa) changes whether a cross-module `ref` argument is
+    // legal (§22.3: ref calls the getter for the copy-in), so it must fold
+    // into the semantic hash the same way hasSetter does above, or a
+    // consumer's staleness check cannot see the change (§2.8.3 rule 3).
+    hashBool(h, m.hasGetter);
+    // fix #2421 (§24/§2.8.2): an Event's static/async classification is
+    // part of its signature identity — a library flipping either bit changes
+    // the event's struct slot presence (static vs. instance) or itable slot
+    // presence (sync vs. async), reshaping the cross-module layout contract,
+    // so it must fold into the semantic hash the same way hasSetter/
+    // isAutoProperty do above (§2.8.3 rule 3 staleness detection).
+    hashBool(h, m.isEventStatic);
+    hashBool(h, m.isEventAsync);
+    // fix #2516 (§9.2/§2.8.3 rule 3): isPositional is part of a Field's
+    // signature identity — a library changing a field from positional to
+    // body (or vice versa) changes the cross-module contract (positional
+    // fields are §9.2 record-equality-bearing; body fields are not), so it
+    // must fold into the semantic hash the same way hasSetter/
+    // isAutoProperty/hasGetter/isEventStatic/isEventAsync do above, or a
+    // consumer's staleness check cannot see the change (§2.8.3 rule 3).
+    hashBool(h, m.isPositional);
     hashU64(h, m.contracts.size());
     for (const MetaContractRecord& c : m.contracts) hashContract(h, c);
     hashType(h, m.type);
@@ -148,6 +196,9 @@ void hashMember(std::uint64_t& h, const MetaMember& m) {
     // classes — part of the cross-module interface (a body change must mark
     // dependents stale, since the importer monomorphizes it per instantiation).
     hashStr(h, m.methodBodyText);
+    // §2.8.2 / #2351: static field initializer source text for generic
+    // classes — same staleness reasoning as ctorBodyText/methodBodyText.
+    hashStr(h, m.fieldInitText);
     // §11.3 (issue #502): hash nested type when present.
     hashBool(h, m.nestedType != nullptr);
     if (m.nestedType) hashTypeDecl(h, *m.nestedType);
@@ -211,7 +262,19 @@ std::uint64_t semanticHash(const ModuleMetadata& md) {
         hashType(h, c.type);
         hashStr(h, c.valueText);
     }
-    hashBool(h, md.contractRecordsCarried);
+    // §26 (#735): exported extension blocks are public interface — adding,
+    // removing, or re-signing an extension member must mark dependents stale.
+    // Folded LAST and only when non-empty so a module with no exported
+    // extension hashes exactly as it did before the field existed.
+    if (!md.extensions.empty()) {
+        hashU64(h, md.extensions.size());
+        for (const MetaExtension& ext : md.extensions) {
+            hashType(h, ext.target);
+            hashByte(h, static_cast<std::uint8_t>(ext.visibility));
+            hashU64(h, ext.members.size());
+            for (const MetaMember& m : ext.members) hashMember(h, m);
+        }
+    }
     return h;
 }
 
@@ -240,7 +303,8 @@ bool MetaGenericParam::operator==(const MetaGenericParam& o) const {
 
 bool MetaParam::operator==(const MetaParam& o) const {
     return name == o.name && modifier == o.modifier && type == o.type &&
-           hasDefault == o.hasDefault && defaultText == o.defaultText;
+           hasDefault == o.hasDefault && defaultText == o.defaultText &&
+           outNullWhen == o.outNullWhen;
 }
 
 // §11.3 / §9.2 (issue #501 / #502): MetaMember copy — needed because
@@ -251,7 +315,12 @@ MetaMember::MetaMember(const MetaMember& o)
     : kind(o.kind), name(o.name), visibility(o.visibility),
       modifiers(o.modifiers), type(o.type), valueText(o.valueText),
       ctorBodyText(o.ctorBodyText), methodBodyText(o.methodBodyText),
-      isPure(o.isPure), contracts(o.contracts),
+      fieldInitText(o.fieldInitText),
+      isPure(o.isPure), hasSetter(o.hasSetter),
+      setterVisibility(o.setterVisibility), isAutoProperty(o.isAutoProperty),
+      hasGetter(o.hasGetter), isEventStatic(o.isEventStatic),
+      isEventAsync(o.isEventAsync), isPositional(o.isPositional),
+      contracts(o.contracts),
       genericParams(o.genericParams), params(o.params),
       isOperator(o.isOperator), returnOwned(o.returnOwned),
       hasEnumValue(o.hasEnumValue), enumValue(o.enumValue) {
@@ -264,7 +333,13 @@ MetaMember& MetaMember::operator=(const MetaMember& o) {
         kind = o.kind; name = o.name; visibility = o.visibility;
         modifiers = o.modifiers; type = o.type; valueText = o.valueText;
         ctorBodyText = o.ctorBodyText; methodBodyText = o.methodBodyText;
-        isPure = o.isPure; contracts = o.contracts;
+        fieldInitText = o.fieldInitText;
+        isPure = o.isPure; hasSetter = o.hasSetter;
+        setterVisibility = o.setterVisibility;
+        isAutoProperty = o.isAutoProperty; hasGetter = o.hasGetter;
+        isEventStatic = o.isEventStatic; isEventAsync = o.isEventAsync;
+        isPositional = o.isPositional;
+        contracts = o.contracts;
         genericParams = o.genericParams; params = o.params;
         isOperator = o.isOperator; returnOwned = o.returnOwned;
         hasEnumValue = o.hasEnumValue; enumValue = o.enumValue;
@@ -281,12 +356,41 @@ bool MetaMember::operator==(const MetaMember& o) const {
         (nestedType && o.nestedType && *nestedType == *o.nestedType);
     return kind == o.kind && name == o.name && visibility == o.visibility &&
            modifiers == o.modifiers && type == o.type &&
-           isPure == o.isPure && contracts == o.contracts &&
+           isPure == o.isPure &&
+           // fix #2400 (§23/§2.8.2/§2.8.3 rule 3): hasSetter is part of a
+           // Property's signature identity — see the hashMember comment
+           // above for why it must compare unequal when it differs (a
+           // getter-only vs. read-write property are NOT the same member,
+           // structurally or semantically).
+           hasSetter == o.hasSetter &&
+           // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4): the
+           // setter's effective visibility is part of the Property's
+           // signature identity — see the hashMember comment above.
+           setterVisibility == o.setterVisibility &&
+           // fix #2478 (§9.2/§22.8): auto vs. computed form is part of the
+           // Property's signature identity for layout purposes — see the
+           // hashMember comment above.
+           isAutoProperty == o.isAutoProperty &&
+           // fix #2461 (§22.3/§23): getter presence is part of the Property's
+           // signature identity — see the hashMember comment above.
+           hasGetter == o.hasGetter &&
+           // fix #2421 (§24/§2.8.2): an Event's static/async
+           // classification is part of its signature identity — a static vs.
+           // instance event or a sync vs. async event have DIFFERENT struct
+           // and itable layouts, so two events that differ on either bit are
+           // NOT the same member (see the hashMember comment above).
+           isEventStatic == o.isEventStatic &&
+           isEventAsync == o.isEventAsync &&
+           // fix #2516 (§9.2/§2.8.3 rule 3): isPositional is part of a
+           // Field's signature identity — see the hashMember comment above.
+           isPositional == o.isPositional &&
+           contracts == o.contracts &&
            genericParams == o.genericParams && params == o.params &&
            isOperator == o.isOperator && returnOwned == o.returnOwned &&
            hasEnumValue == o.hasEnumValue && enumValue == o.enumValue &&
            valueText == o.valueText && ctorBodyText == o.ctorBodyText &&
            methodBodyText == o.methodBodyText &&
+           fieldInitText == o.fieldInitText &&
            nestedEq;
 }
 
@@ -312,10 +416,15 @@ bool MetaConstant::operator==(const MetaConstant& o) const {
            valueText == o.valueText;
 }
 
+bool MetaExtension::operator==(const MetaExtension& o) const {
+    return target == o.target && visibility == o.visibility &&
+           members == o.members;
+}
+
 bool ModuleMetadata::operator==(const ModuleMetadata& o) const {
     return moduleName == o.moduleName && exports == o.exports &&
            types == o.types && functions == o.functions &&
-           constants == o.constants &&
+           constants == o.constants && extensions == o.extensions &&  // §26/#735
            isExecutable == o.isExecutable &&
            contractRecordsCarried == o.contractRecordsCarried;  // §2.8.6 (#2054)
 }
@@ -376,7 +485,13 @@ void emitGeneric(llvm::BitstreamWriter& w, const MetaGenericParam& g) {
 
 void emitParam(llvm::BitstreamWriter& w, const MetaParam& p) {
     w.EnterSubblock(PARAM_BLOCK, 4);
-    llvm::SmallVector<std::uint64_t, 1> sc{p.hasDefault ? 1u : 0u};
+    // §2392: outNullWhen is a 2nd, additive trailing scalar (see the
+    // kSchemaVersion comment in ModuleMetadata.hpp) — old readers only
+    // consult sc[0] and ignore the rest.
+    llvm::SmallVector<std::uint64_t, 2> sc{
+        p.hasDefault ? 1u : 0u,
+        static_cast<std::uint64_t>(p.outNullWhen),
+    };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, p.name);
     emitString(w, p.modifier);
@@ -403,7 +518,37 @@ void emitTypeDecl(llvm::BitstreamWriter& w, const MetaTypeDecl& ty);  // fwd
 
 void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     w.EnterSubblock(MEMBER_BLOCK, 4);
-    llvm::SmallVector<std::uint64_t, 10> sc{
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 4, additive within v7): hasSetter is
+    // an 11th trailing scalar, same additive shape as isPure (the 10th) and
+    // #2392's PARAM_BLOCK outNullWhen — a pre-#2400 reader's `sc.size() < 8`
+    // gate never looks past index 7, so it is unaffected; see the hasSetter
+    // field comment in ModuleMetadata.hpp for the full rationale.
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4, additive within
+    // v7): setterVisibility is a 12th trailing scalar, same additive shape —
+    // a pre-#2415 reader's `sc.size() < 8` gate never looks past index 7, so
+    // it too is unaffected; see the setterVisibility field comment in
+    // ModuleMetadata.hpp for the full rationale.
+    // fix #2478 (§9.2/§22.8, additive within v7): isAutoProperty is a 13th
+    // trailing scalar, same additive shape — a pre-#2478 reader's
+    // `sc.size() < 8` gate never looks past index 7, so it too is
+    // unaffected; see the isAutoProperty field comment in ModuleMetadata.hpp
+    // for the full rationale.
+    // fix #2461 (§22.3/§23, additive within v7): hasGetter is a 14th
+    // trailing scalar, same additive shape — a pre-#2461 reader's
+    // `sc.size() < 8` gate never looks past index 7, so it too is
+    // unaffected; see the hasGetter field comment in ModuleMetadata.hpp for
+    // why the missing-scalar default is `true` (not `false` like hasSetter).
+    // fix #2421 (§24/§2.8.2, additive within v7): isEventStatic/
+    // isEventAsync are 15th/16th trailing scalars, same additive shape — a
+    // pre-#2421 reader's `sc.size() < 8` gate never looks past index 7, so it
+    // too is unaffected; see the field comments in ModuleMetadata.hpp for why
+    // the missing-scalar default is `false` for both (the common instance-
+    // sync event classification).
+    // fix #2516 (§9.2/§9.3/§2.8.3 rule 4, additive within v7): isPositional
+    // is a 17th trailing scalar — same additive shape; a pre-#2516 reader's
+    // `sc.size() < 8` gate never looks past index 7, so it too is unaffected.
+    // See the isPositional field comment in ModuleMetadata.hpp.
+    llvm::SmallVector<std::uint64_t, 17> sc{
         static_cast<std::uint64_t>(m.kind),
         static_cast<std::uint64_t>(m.visibility),
         m.isOperator ? 1u : 0u,
@@ -414,6 +559,13 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
         m.params.size(),
         m.contracts.size(),
         m.isPure ? 1u : 0u,
+        m.hasSetter ? 1u : 0u,
+        static_cast<std::uint64_t>(m.setterVisibility),
+        m.isAutoProperty ? 1u : 0u,
+        m.hasGetter ? 1u : 0u,
+        m.isEventStatic ? 1u : 0u,
+        m.isEventAsync ? 1u : 0u,
+        m.isPositional ? 1u : 0u,
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitString(w, m.name);
@@ -441,6 +593,14 @@ void emitMember(llvm::BitstreamWriter& w, const MetaMember& m) {
     // Method members; a v4 reader rejects v5 outright).
     if (m.kind == MetaMemberKind::Method && !m.methodBodyText.empty())
         emitString(w, m.methodBodyText);
+    // §2.8.2 / #2351 (schema v7 additive): for a Field member of a generic
+    // class with a carryable static initializer, a second trailing
+    // REC_STRING carries the initializer EXPRESSION source text. Emitted
+    // ONLY when non-empty, mirroring methodBodyText's own additive shape —
+    // a module with no generic-class static-field initializer produces
+    // byte-identical metadata to before this fix.
+    if (m.kind == MetaMemberKind::Field && !m.fieldInitText.empty())
+        emitString(w, m.fieldInitText);
     // §11.3 (schema v4, issue #502): when kind == NestedType, emit the nested
     // type's full declaration as an embedded TYPE_BLOCK. The trailing
     // finishBlockImpl in readMemberBody skips it for v3 readers (they never
@@ -501,6 +661,20 @@ void emitFunction(llvm::BitstreamWriter& w, const MetaFunction& fn) {
     w.ExitBlock();
 }
 
+// §26 (#735): one exported extension block. Shape mirrors emitTypeDecl (scalars,
+// then the target type, then the members) so the reader is symmetric.
+void emitExtension(llvm::BitstreamWriter& w, const MetaExtension& ext) {
+    w.EnterSubblock(EXTENSION_BLOCK, 4);
+    llvm::SmallVector<std::uint64_t, 2> sc{
+        static_cast<std::uint64_t>(ext.visibility),
+        ext.members.size(),
+    };
+    w.EmitRecord(REC_SCALARS, sc);
+    emitType(w, ext.target);
+    for (const MetaMember& m : ext.members) emitMember(w, m);
+    w.ExitBlock();
+}
+
 void emitConstant(llvm::BitstreamWriter& w, const MetaConstant& c) {
     w.EnterSubblock(CONST_BLOCK, 4);
     llvm::SmallVector<std::uint64_t, 1> sc{
@@ -557,15 +731,21 @@ std::vector<std::uint8_t> serializeImpl(const ModuleMetadata& md,
             // makes it reject one); a v6 reader reads the flag, and a v<=5 BLOB
             // read by a v6 reader has only three scalars → isExecutable = false
             // (library), preserving back-compat for existing library artifacts.
-            llvm::SmallVector<std::uint64_t, 5> counts{
+            llvm::SmallVector<std::uint64_t, 6> counts{
                 md.types.size(), md.functions.size(), md.constants.size(),
                 md.isExecutable ? 1u : 0u,
                 md.contractRecordsCarried ? 1u : 0u};
+            // §26 (#735, additive): the extension count rides as a 6th scalar,
+            // emitted ONLY when there is at least one exported extension, so a
+            // module without extensions produces byte-identical metadata to
+            // before the field existed (an absent 6th scalar reads as 0).
+            if (!md.extensions.empty()) counts.push_back(md.extensions.size());
             w.EmitRecord(REC_SCALARS, counts);
         }
         for (const MetaTypeDecl& ty : md.types) emitTypeDecl(w, ty);
         for (const MetaFunction& fn : md.functions) emitFunction(w, fn);
         for (const MetaConstant& c : md.constants) emitConstant(w, c);
+        for (const MetaExtension& ext : md.extensions) emitExtension(w, ext);
 
         w.ExitBlock();
     }
@@ -805,9 +985,13 @@ bool readGeneric(Reader& r, MetaGenericParam& g) {
 }
 
 bool readParamBody(Reader& r, MetaParam& p) {
-    llvm::SmallVector<std::uint64_t, 1> sc;
+    llvm::SmallVector<std::uint64_t, 2> sc;
     if (!expectScalars(r, sc) || sc.empty()) return false;
     p.hasDefault = sc[0] != 0;
+    // §2392: outNullWhen is a 2nd, additive trailing scalar — absent (a
+    // pre-#2392 blob) reads as 0/None, matching every such blob's implicit
+    // value before this field existed.
+    p.outNullWhen = sc.size() >= 2 ? static_cast<std::uint8_t>(sc[1]) : 0;
     if (!expectString(r, p.name)) return false;
     if (!expectString(r, p.modifier)) return false;
     if (!expectString(r, p.defaultText)) return false;
@@ -853,6 +1037,48 @@ bool readMemberBody(Reader& r, MetaMember& m) {
     std::uint64_t nParams = sc[7];
     std::uint64_t nContracts = sc.size() >= 9 ? sc[8] : 0;
     m.isPure = sc.size() >= 10 && sc[9] != 0;
+    // fix #2400 (§23/§2.8.2/§2.8.3 rule 4, additive within v7): 11th scalar.
+    // A pre-#2400 blob has at most 10 scalars; hasSetter defaults to false —
+    // see the field's comment in ModuleMetadata.hpp for why "no setter" is
+    // the safe default for an old, not-yet-recompiled dependency.
+    m.hasSetter = sc.size() >= 11 && sc[10] != 0;
+    // fix #2415 (§13.6/§23.3/§2.8.2 clause 1/§2.8.3 rule 4, additive within
+    // v7): 12th scalar. A pre-#2415 blob has at most 11 scalars;
+    // setterVisibility defaults to `Private` — the reject-conservative
+    // direction (see the field's comment in ModuleMetadata.hpp) — rather
+    // than `Public`, which would silently reopen the exact bypass this fix
+    // closes for any dependency compiled before it.
+    m.setterVisibility = sc.size() >= 12
+        ? static_cast<MetaVisibility>(sc[11])
+        : MetaVisibility::Private;
+    // fix #2478 (§9.2/§22.8, additive within v7): 13th scalar. A pre-#2478
+    // blob has at most 12 scalars; isAutoProperty defaults to `false` — the
+    // SAME "not storage" behavior a stale dependency already exhibits today
+    // (see the field's comment in ModuleMetadata.hpp).
+    m.isAutoProperty = sc.size() >= 13 && sc[12] != 0;
+    // fix #2461 (§22.3/§23, additive within v7): 14th scalar. A pre-#2461
+    // blob has at most 13 scalars; hasGetter defaults to `true` — NOT `false`
+    // like hasSetter above, because a false default would FALSE-REJECT a
+    // legitimate `ref` argument to a read-write property from a stale
+    // dependency (see the field's comment in ModuleMetadata.hpp for the full
+    // rationale). `true` preserves the pre-#2461 behavior for a stale
+    // dependency (write-only-as-ref stays the pre-existing linker error;
+    // read-write-as-ref stays a clean accept).
+    m.hasGetter = sc.size() < 14 || sc[13] != 0;
+    // fix #2421 (§24/§2.8.2, additive within v7): 15th/16th scalars. A
+    // pre-#2421 blob has at most 14 scalars; both default to `false` — the
+    // classification a plain instance sync `event E: T;` (the common case)
+    // carries, so a stale not-yet-recompiled dependency keeps its already-
+    // broken pre-fix behavior (the imported event silently no-op'd before
+    // #2421 regardless) rather than guessing static/async and risking an
+    // itable/struct-layout mismatch (see the field comments in
+    // ModuleMetadata.hpp).
+    m.isEventStatic = sc.size() >= 15 && sc[14] != 0;
+    m.isEventAsync = sc.size() >= 16 && sc[15] != 0;
+    // fix #2516 (§9.2/§9.3/§2.8.3 rule 4, additive within v7): 17th scalar.
+    // A pre-#2516 blob has at most 16 scalars; isPositional defaults to `false`
+    // — see the field comment in ModuleMetadata.hpp.
+    m.isPositional = sc.size() >= 17 && sc[16] != 0;
     if (!expectString(r, m.name)) return false;
     if (!readStringList(r, m.modifiers)) return false;
     if (!readType(r, m.type)) return false;
@@ -927,6 +1153,10 @@ bool readMemberBody(Reader& r, MetaMember& m) {
         // present) is the generic method body source text.
         else if (m.kind == MetaMemberKind::Method)
             caps[1] = &m.methodBodyText;
+        // §2.8.2 / #2351: a Field member's second trailing REC_STRING (when
+        // present) is the static field's initializer EXPRESSION source text.
+        else if (m.kind == MetaMemberKind::Field)
+            caps[1] = &m.fieldInitText;
         int capIdx = 0;
         while (true) {
             unsigned id = 0;
@@ -1051,6 +1281,25 @@ bool readConstant(Reader& r, MetaConstant& c) {
     return readConstantBody(r, c);
 }
 
+// §26 (#735): the inverse of emitExtension.
+bool readExtensionBody(Reader& r, MetaExtension& ext) {
+    llvm::SmallVector<std::uint64_t, 2> sc;
+    if (!expectScalars(r, sc) || sc.size() < 2) return false;
+    ext.visibility = static_cast<MetaVisibility>(sc[0]);
+    std::uint64_t nMembers = sc[1];
+    if (!readType(r, ext.target)) return false;
+    ext.members.resize(nMembers);
+    for (std::uint64_t i = 0; i < nMembers; ++i) {
+        if (!readMember(r, ext.members[i])) return false;
+    }
+    return finishBlock(r);
+}
+
+bool readExtension(Reader& r, MetaExtension& ext) {
+    if (!enterSubblock(r, EXTENSION_BLOCK)) return false;
+    return readExtensionBody(r, ext);
+}
+
 // Validate magic + read the header record. Positions the cursor inside the
 // MODULE_BLOCK, just after the header record. Reports the schema version + hash
 // via out-params. Returns false on bad magic / newer schema / malformed input.
@@ -1121,6 +1370,14 @@ std::optional<ModuleMetadata> deserialize(
     md.constants.resize(counts[2]);
     for (std::uint64_t i = 0; i < counts[2]; ++i) {
         if (!readConstant(r, md.constants[i])) return std::nullopt;
+    }
+    // §26 (#735): the optional 6th scalar is the exported-extension count.
+    // Absent (every pre-#735 blob, and any module with no exported extension)
+    // → 0, so nothing is read and the decode ends exactly as it did before.
+    const std::uint64_t nExtensions = counts.size() >= 6 ? counts[5] : 0;
+    md.extensions.resize(nExtensions);
+    for (std::uint64_t i = 0; i < nExtensions; ++i) {
+        if (!readExtension(r, md.extensions[i])) return std::nullopt;
     }
     return md;
 }

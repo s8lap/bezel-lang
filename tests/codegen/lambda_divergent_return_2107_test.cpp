@@ -15,6 +15,7 @@
 #include "test_harness.hpp"
 
 using bezel::test::runAot;
+using bezel::test::runAotChecked;
 using bezel::test::runAotOut;
 
 namespace {
@@ -138,5 +139,43 @@ BEZEL_TEST(lambda_divergent_2107, spec_27_3_divergent_under_reassign_target) {
         "  if a = \"A\" then return 0; end; "
         "  return 3; "
         "end Main; end C;"), 0);
+}
+
+// §27.3 / §28.9 (#2515, ASan regression): the same divergent-under-method-
+// return-target shape as the cell above, but driven through runAotChecked so
+// generated-code AddressSanitizer is forced ON for this cell regardless of the
+// suite-wide flag.  Pre-#2515 the enclosing method's return-type node (`() ->
+// Animal`, a Function kind) LEAKED into the block-bodied lambda's ReturnStmt
+// lowering (currentReturnTypeNode_ was not saved/restored in lowerLambda), so
+// emitReturn's closure-return-retain branch fired emitClosureRetain on the
+// returned CLASS instance (a captured Dog) — writing 8 bytes at offset 16 of a
+// 16-byte object, a heap-buffer-overflow that surfaced as a double-free under
+// ASan.  The fix saves/restores currentReturnTypeNode_ in lowerLambda and nulls
+// it for the lambda body (a lambda's `return` is an internal transfer to the
+// trampoline, not a method-contract return that mints +1 against a declared
+// return-type node).  Fails (sanitizer double-free → r.ran == false) without
+// the fix; passes (ASan/LSan-clean AND g().Kind() == 1) with it.
+BEZEL_TEST(lambda_divergent_2107, spec_27_3_divergent_owned_capture_asan_2515) {
+    auto r = runAotChecked(
+        "module M; "
+        "class Animal public virtual method Kind(): int return 0; end Kind; end Animal; "
+        "class Dog : Animal public override method Kind(): int return 1; end Kind; end Dog; "
+        "class Cat : Animal public override method Kind(): int return 2; end Kind; end Cat; "
+        "class C "
+        "  public static method Make(d: Dog, c: Cat, b: bool): () -> Animal "
+        "    return lambda() => do "
+        "      if b then return d; end; "
+        "      return c; "
+        "    end; "
+        "  end Make; "
+        "  public static method Main(): int "
+        "    using var d := new Dog(); "
+        "    using var c := new Cat(); "
+        "    var g := Make(d, c, true); "
+        "    return g().Kind(); "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);        // ASan/LSan-clean (no double-free, no leak)
+    BEZEL_EXPECT_EQ(r.exitCode, 1);  // g().Kind() == Dog.Kind == 1
 }
 

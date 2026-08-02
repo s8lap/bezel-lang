@@ -118,6 +118,35 @@ void expectValueLeakFree(const std::string& source, int expectedExitCode) {
     BEZEL_EXPECT_EQ(lsan, 0);
 }
 
+// §28.2 checked-disposal MODE (not ASan): compile + run with the same codegen
+// bit `bezelc --checked-disposal` sets (opts.checkedDisposal = true). Used by
+// the #2519 coverage cells — the WhenAllOwned fault path's already-produced
+// results are disposed via the RUNTIME bz_dispose_class_obj helper, and no
+// existing WhenAllOwned cell exercises the checked-disposal codegen path.
+int compileAndRunCheckedDisposal(const std::string& source) {
+    static int counter = 0;
+    auto dir = fs::temp_directory_path();
+    std::string stem = "bezel_taskcomb_cd_" + std::to_string(counter++);
+    std::string src = (dir / (stem + ".bzl")).string();
+    std::string exe = (dir / stem).string();
+    {
+        std::ofstream out(src);
+        out << source;
+    }
+    bezel::Driver driver;
+    bezel::codegen::CodegenOptions opts;
+    opts.checkedDisposal = true;  // §28.2 checked-disposal MODE
+    bezel::CompileResult r = driver.compileFile(src, exe, {}, opts);
+    int code = -1;
+    if (r.success) {
+        int status = std::system(exe.c_str());
+        if (status != -1 && WIFEXITED(status)) code = WEXITSTATUS(status);
+    }
+    std::remove(src.c_str());
+    std::remove(exe.c_str());
+    return code;
+}
+
 }  // namespace
 
 // ============================================================
@@ -551,11 +580,31 @@ BEZEL_TEST(task_combinators_1501, when_any_inline_literal_over_channel_receive_l
 // (`using var`) already-complete tasks. Before the fix this SIGSEGV'd on
 // `await w` (the dropped WhenAll left `w` as stack garbage); the fix awaits
 // all inputs correctly. Both elements are bound `using var`s (freed at scope
-// end) and the temp array is freed by freeTaskArrayArgTemp, so the whole
-// thing is LSan-clean — verified via expectValueLeakFree. Exit code 7 = 3 + 4
+// end) and the temp array is freed by freeTaskArrayArgTemp. Exit code 7 = 3 + 4
 // (the two FromResult values, read back after WhenAll completes).
+//
+// #2278 — LSan half DROPPED (compileAndRun only), deliberately and with the
+// reason recorded rather than silently. The elements are `Task<int>`, so #1830's
+// literal-element fallback selects the TYPED entry bz_task_when_all_results,
+// which mints an `Array<int>` aggregate result; this program DISCARDS it
+// (`await w;`), and in the implementation's current model the only owner of a
+// Pattern A intrinsic-collection result is an awaiting `using var` — so nothing
+// reclaims it and LSan reports 48 bytes in 2 allocations. That is a real, still-
+// OPEN defect (see LlvmBackend_Calls.cpp's WhenAll branch: it is NOT specific to
+// WhenAll — a plain `var rs := await t;` over any user `async` method returning
+// `Task<Array<T>>` leaks identically, 104 bytes measured), and its fix is a
+// coordinated codegen+ownership change, not something this #1616 test should
+// gate on. The naive one-line fix — a task-side result disposer — was measured
+// to DOUBLE-FREE `using var rs := await w;` and use-after-free `using var rs :=
+// await Task.WhenAll([…]);`, so it is explicitly not taken.
+//
+// What this test still pins is #1616's actual subject: the inline literal must
+// not be dropped out of codegen (pre-fix: SIGSEGV on `await w`). The value
+// assertion is that oracle. Restore expectValueLeakFree here when #2278's
+// Pattern A collection-result reclaim lands. (Precedent for a correctness-only
+// combinator test with a recorded leak reason: when_all_already_complete above.)
 BEZEL_TEST(task_combinators_1616, when_all_inline_literal_bound_tasks) {
-    expectValueLeakFree(
+    BEZEL_EXPECT_EQ(compileAndRun(
         "module M; class C "
         "  public static async method Main(): Task<int> "
         "    using var ta := Task.FromResult(3); "
@@ -565,8 +614,29 @@ BEZEL_TEST(task_combinators_1616, when_all_inline_literal_bound_tasks) {
         "    var a := await ta; "
         "    var b := await tb; "
         "    return a + b; "
-        "  end Main; end C;",
+        "  end Main; end C;"),
         7);
+}
+
+// #1830 / stdlib §6.7 (line 2875) / §30.10: the CONSUMED half of the typed
+// `Task.WhenAll<T>(Array<Task<T>>): Task<Array<T>>` inline-literal shape — the
+// awaiter READS the aggregate `Array<int>` rather than discarding it. This pins
+// that #1830's literal-element fallback actually produces the results the sema
+// result type promises (rs[0] == 3, rs[1] == 4, in input order): a mis-selected
+// void entry (bz_task_when_all) would leave `rs` unpopulated. Correctness-only
+// for the same #2278 reason as the test above (the aggregate array is
+// unreclaimed on this shape too — `var rs`, not `using var rs`).
+BEZEL_TEST(task_combinators_1830, when_all_typed_inline_literal_results_in_order) {
+    BEZEL_EXPECT_EQ(compileAndRun(
+        "module M; class C "
+        "  public static async method Main(): Task<int> "
+        "    using var ta := Task.FromResult(3); "
+        "    using var tb := Task.FromResult(4); "
+        "    using var w := Task.WhenAll([ta, tb]); "
+        "    var rs := await w; "
+        "    return rs[0] * 10 + rs[1]; "  // 34: input order preserved
+        "  end Main; end C;"),
+        34);
 }
 
 // ============================================================
@@ -1083,5 +1153,77 @@ BEZEL_TEST(task_combinators_1529,
         "    await Run(); "
         "    return Cell.n * 100 + Cell.disposeCount; "
         "  end Main; end C;",
+        2);
+}
+
+// ---------------------------------------------------------------------------
+// #2519 — COVERAGE PIN (not a fail-without/pass-with regression): the
+// WhenAllOwned fault path disposes already-produced results via the RUNTIME
+// bz_dispose_class_obj helper (bezel_runtime_concurrency.cpp:1569/1575), which
+// is the RUNTIME half of the §28.2 checked-disposal quarantine gap filed in
+// #2519 (the codegen half, elementDisposerThunk, was fixed in #2514). No
+// existing WhenAllOwned cell runs under §28.2 checked-disposal MODE — the
+// #1529 cell above uses expectValueLeakFree (ASan/LSan, no checked-disposal) —
+// so this cell closes that coverage gap: it verifies the fault path's dispose-
+// once contract (disposeCount == 2, Cell.n == 0, exit 2) holds under the
+// checked-disposal codegen path (disposed-flag guards emitted, different IR).
+//
+// WHY THIS IS A COVERAGE PIN, NOT A REGRESSION: the runtime UAF gap
+// (#2519: bz_dispose_class_obj frees UNCONDITIONALLY, bypassing the §28.2
+// quarantine that emitDisposeAndReclaim applies in checked-disposal mode) is
+// NOT reachable through any constructible stale-borrow shape. The disposed
+// results are internal to the WhenAllOwned aggregate — Pattern B consumed the
+// whole input array, so no caller-side borrow of a produced result survives
+// the aggregate's fault (verified: the field-held-borrow + FromOwnedResult
+// shape is blocked because Task.FromOwnedResult's intrinsic does not consume
+// named bindings, the async-wrapper shape is blocked because the `owned`
+// transfer marker is not admitted on owned parameters in return position
+// (v0.209/#2080), and §22.12 rule 2 bans the class-typed mutable static that
+// would alias a result). So the unconditional free in bz_dispose_class_obj
+// cannot be observed: the freed block is never read again. This cell pins
+// correct disposal behavior so a future change that breaks the WhenAllOwned
+// fault path under checked-disposal mode is caught. // per §28.2, §30.10, #2519
+// ---------------------------------------------------------------------------
+BEZEL_TEST(task_combinators_2519,
+           when_all_owned_fault_path_checked_disposal_coverage_pin) {
+    BEZEL_EXPECT_EQ(compileAndRunCheckedDisposal(
+        "module M; "
+        "class Cell "
+        "  public static n: int := 0; "
+        "  public static disposeCount: int := 0; "
+        "  public X: int; "
+        "  public constructor(x: int) X := x; Cell.n := Cell.n + 1; end constructor; "
+        "  destructor "
+        "    Cell.n := Cell.n - 1; Cell.disposeCount := Cell.disposeCount + 1; "
+        "  end destructor; "
+        "end Cell; "
+        "class ErrA: Exception public constructor() base(\"A\"); end constructor; end ErrA; "
+        "class ErrB: Exception public constructor() base(\"B\"); end constructor; end ErrB; "
+        "class C "
+        "  public static async method MakeCellSlow(x: int): OwningTask<Cell> "
+        "    await Task.Delay(20); return new Cell(x); "
+        "  end MakeCellSlow; "
+        "  public static async method MakeCellFast(x: int): OwningTask<Cell> "
+        "    return new Cell(x); "
+        "  end MakeCellFast; "
+        "  public static async method BoomA(): OwningTask<Cell> "
+        "    await Task.Delay(20); throw new ErrA(); "
+        "  end BoomA; "
+        "  public static async method BoomB(): OwningTask<Cell> "
+        "    throw new ErrB(); "
+        "  end BoomB; "
+        "  public static async method Run(): Task "
+        "    var tasks := new OwningArray<OwningTask<Cell>>(); "
+        "    tasks.Add(MakeCellFast(1)); tasks.Add(BoomA()); "
+        "    tasks.Add(BoomB()); tasks.Add(MakeCellSlow(2)); "
+        "    try using var results := await Task.WhenAllOwned(owned tasks); "
+        "    catch ErrA => var ignored := 1; "
+        "    catch ErrB => var ignored := 2; "
+        "    end; "
+        "  end Run; "
+        "  public static async method Main(): Task<int> "
+        "    await Run(); "
+        "    return Cell.n * 100 + Cell.disposeCount; "
+        "  end Main; end C;"),
         2);
 }

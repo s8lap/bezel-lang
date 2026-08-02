@@ -48,7 +48,13 @@ int run(const std::string& program) {
 BEZEL_TEST(codegen_blockform_property_itable, record_blockgetter_via_interface) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IFoo  property Val: int; end IFoo; "
+        // §9.1/§9.4/§11.2/§23.3 (#2416): R's `Val` is a getter-only block-form
+        // property and this test never writes through the interface, so
+        // IFoo's obligation is declared `readonly` — mirrors the identical
+        // #2413 fix already applied to the CLASS cases in this file below
+        // (class_blockgetter_via_interface / class_arrow_getter_via_interface_control),
+        // now extended to records (#2413 itself only ever checked classes).
+        "interface IFoo  readonly property Val: int; end IFoo; "
         "record R(X: int) : IFoo "
         "  public property Val: int "
         "    get => do return X; end; "
@@ -67,7 +73,13 @@ BEZEL_TEST(codegen_blockform_property_itable, record_blockgetter_via_interface) 
 BEZEL_TEST(codegen_blockform_property_itable, class_blockgetter_via_interface) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface IBar  property Val: int; end IBar; "
+        // §11.2/§23.3 (#2413): Impl's `Val` is a getter-only block-form
+        // property (no `set` arm) and this test never writes through the
+        // interface, so IBar's obligation is declared `readonly` — a
+        // getter-only implementation of a read-write interface property is
+        // now a compile error (#2413's own fix), and `readonly` is the
+        // accurate declaration of what this test actually exercises.
+        "interface IBar  readonly property Val: int; end IBar; "
         "class Impl : IBar "
         "  protected _v: int := 7; "
         "  public property Val: int "
@@ -89,7 +101,9 @@ BEZEL_TEST(codegen_blockform_property_itable, class_blockgetter_via_interface) {
 BEZEL_TEST(codegen_blockform_property_itable, record_blockgetter_multi_stmt_via_interface) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface ICalc  property Result: int; end ICalc; "
+        // §9.1/§9.4/§11.2/§23.3 (#2416): Pair's `Result` is getter-only and
+        // never written through the interface — see the #2416 note above.
+        "interface ICalc  readonly property Result: int; end ICalc; "
         "record Pair(A: int, B: int) : ICalc "
         "  public property Result: int "
         "    get => do "
@@ -140,7 +154,9 @@ BEZEL_TEST(codegen_blockform_property_itable, record_block_setter_via_interface)
 BEZEL_TEST(codegen_blockform_property_itable, record_arrow_getter_via_interface_control) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface INum  property Num: int; end INum; "
+        // §9.1/§9.4/§11.2/§23.3 (#2416): Wrap's `Num` is getter-only
+        // (expression-bodied) and never written through the interface.
+        "interface INum  readonly property Num: int; end INum; "
         "record Wrap(V: int) : INum "
         "  public property Num: int => V; "
         "end Wrap; "
@@ -158,7 +174,11 @@ BEZEL_TEST(codegen_blockform_property_itable, record_arrow_getter_via_interface_
 BEZEL_TEST(codegen_blockform_property_itable, class_arrow_getter_via_interface_control) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface ITag  property Tag: int; end ITag; "
+        // §11.2/§23.3 (#2413): Tagged's `Tag` is getter-only (expression-
+        // bodied) and this test never writes through the interface, so
+        // ITag's obligation is declared `readonly` (see the identical note
+        // on class_blockgetter_via_interface above).
+        "interface ITag  readonly property Tag: int; end ITag; "
         "class Tagged : ITag "
         "  public property Tag: int => 55; "
         "  destructor end destructor; "
@@ -213,7 +233,9 @@ BEZEL_TEST(codegen_blockform_property_itable, class_blockgetter_direct_control) 
 BEZEL_TEST(codegen_blockform_property_itable, interface_only_property_no_methods) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "interface ISize  property W: int; property H: int; end ISize; "
+        // §9.1/§9.4/§11.2/§23.3 (#2416): Rect's `W`/`H` are both getter-only
+        // (expression-bodied) and neither is ever written through ISize.
+        "interface ISize  readonly property W: int; readonly property H: int; end ISize; "
         "record Rect(Width: int, Height: int) : ISize "
         "  public property W: int => Width; "
         "  public property H: int => Height; "

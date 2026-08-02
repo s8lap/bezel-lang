@@ -222,13 +222,16 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// §28.6 / §28.3: an `owned OwningArray<Cell>` return transfers CONTAINER
-// ownership of the field to the caller — explicit, dispose-once safe. Admitted
-// (the `returnOwned_` early-return at the top of
-// `checkBorrowReturnedThroughOwningType` keeps the carve-out removal from
-// affecting this case).
+// §28.6 bullet 2 / §28.8.1 (#2368, v0.236): a BARE read of an owned field
+// through an `owned` return is REJECTED — the spec's only transfer-to-caller
+// form is `return move _f;`. Pre-#2368 this compiled (the `returnOwned_`
+// early-return at the top of `checkOwnedFieldReturn` blanket-exempted the
+// `owned`-return path); the bare read leaves the field un-moved-from (the
+// holder's destructor still disposes it) while the caller now owns the value
+// and disposes it too — a double-free (the terminal-move-without-restoration
+// shape §28.8.1 rejects). The cell flips from ACCEPTED to REJECTED with #2368.
 BEZEL_TEST(owning_collection_borrow_return_1760,
-           owned_owning_array_return_via_receiver_field_accepted) {
+           owned_owning_array_return_via_receiver_field_rejected_2368) {
     auto r = parseAndCheckOwnership(mod(
         "class Holder "
         "  public owned _items: OwningArray<Cell>; "
@@ -236,7 +239,7 @@ BEZEL_TEST(owning_collection_borrow_return_1760,
         "  destructor end destructor; "
         "  public method Take(): owned OwningArray<Cell> => _items; "
         "end Holder;"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
 }
 
 // ===========================================================================

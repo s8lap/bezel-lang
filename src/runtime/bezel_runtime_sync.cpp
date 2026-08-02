@@ -62,8 +62,10 @@ static void mutex_core_release(bz_mutex_t* m) {
 
 extern "C" {
 
-// bz_mutex_new — allocate a new non-recursive POSIX mutex.  core_refs = 1
+// §6.2: Mutex — allocate a new non-recursive POSIX mutex.  core_refs = 1
 // (the Mutex object's reference).  Returns bz_mutex_t* (opaque to Bezel code).
+// The non-recursive choice (PTHREAD_MUTEX_ERRORCHECK) is the documented
+// stdlib §6.2 choice — see the file-header note.
 void* bz_mutex_new(void) {
     auto* m = new bz_mutex_t();
     pthread_mutexattr_t attr;
@@ -77,9 +79,9 @@ void* bz_mutex_new(void) {
     return m;
 }
 
-// bz_mutex_acquire — block until the mutex is available; return an owned bz_lock_t*.
-// The lock struct acquires a core ref (+1) so the mutex core stays alive even if
-// the Mutex object is disposed before the Lock is released.
+// §6.2: Mutex.Acquire — block until the mutex is available; return an owned
+// bz_lock_t*. The lock struct acquires a core ref (+1) so the mutex core
+// stays alive even if the Mutex object is disposed before the Lock is released.
 void* bz_mutex_acquire(void* mp) {
     auto* m = (bz_mutex_t*)mp;
     pthread_mutex_lock(&m->mtx);  // blocking; non-recursive → always enters if not held
@@ -88,11 +90,12 @@ void* bz_mutex_acquire(void* mp) {
     return lk;
 }
 
-// bz_mutex_try_acquire — attempt to acquire with a millisecond timeout.
-// Returns an owned bz_lock_t* on success, or null on timeout / already-held.
-// Uses pthread_mutex_timedlock with CLOCK_REALTIME (per POSIX timedlock).
-// An EDEADLK (same-thread re-lock on ERRORCHECK mutex) maps to the timeout
-// null path — enabling the TryAcquire-while-held test shape from the note.
+// §6.2: Mutex.TryAcquire(timeout_ms) — attempt to acquire with a millisecond
+// timeout. Returns an owned bz_lock_t* on success, or null on timeout /
+// already-held. Uses pthread_mutex_timedlock with CLOCK_REALTIME (per POSIX
+// timedlock). An EDEADLK (same-thread re-lock on ERRORCHECK mutex) maps to
+// the timeout null path — enabling the TryAcquire-while-held test shape
+// from the file-header note.
 void* bz_mutex_try_acquire(void* mp, int64_t timeout_ms) {
     auto* m = (bz_mutex_t*)mp;
     int rc;
@@ -119,8 +122,8 @@ void* bz_mutex_try_acquire(void* mp, int64_t timeout_ms) {
     return lk;
 }
 
-// bz_lock_release — release the held lock.  Idempotent per §28.2: the first
-// call releases the pthread_mutex; subsequent calls are no-ops.
+// §6.2: Lock.Dispose — release the held lock.  Idempotent per §28.2: the
+// first call releases the pthread_mutex; subsequent calls are no-ops.
 // Called by the Lock's disposer (scope exit / explicit Dispose()).
 void bz_lock_release(void* lkp) {
     if (!lkp) return;
@@ -136,13 +139,15 @@ void bz_lock_release(void* lkp) {
     mutex_core_release(m);
 }
 
-// bz_mutex_dispose — dispose the Mutex object.  Marks disposed (for idempotency)
-// and releases the Mutex object's core ref.  The pthread_mutex is destroyed only
-// when the last Lock is also released (via mutex_core_release → core_refs → 0).
-// Idempotent: calling twice is a no-op on the second call.
-// fix #706: exchange(true) is atomic — concurrent Dispose calls from two domains
-// cannot both proceed to core_release (only the first caller, which sees false,
-// drops the core ref; the second sees true and returns immediately).
+// §6.2: Mutex.Dispose — dispose the Mutex object.  Marks disposed (for
+// idempotency) and releases the Mutex object's core ref.  The pthread_mutex
+// is destroyed only when the last Lock is also released (via
+// mutex_core_release → core_refs → 0). Idempotent: calling twice is a no-op
+// on the second call.
+// fix #706: exchange(true) is atomic — concurrent Dispose calls from two
+// domains cannot both proceed to core_release (only the first caller, which
+// sees false, drops the core ref; the second sees true and returns
+// immediately).
 void bz_mutex_dispose(void* mp) {
     if (!mp) return;
     auto* m = (bz_mutex_t*)mp;
@@ -487,7 +492,7 @@ static bz_task_t* semaphore_make_faulted_task(void* oce_vtable) {
 
 extern "C" {
 
-// bz_semaphore_new — allocate a new counting semaphore.  core_refs = 1.
+// §6.3: Semaphore — allocate a new counting semaphore.  core_refs = 1.
 // initialCount: the initial permit count (must be >= 0).
 // maxCount: advisory upper bound (stored; not enforced in this slice — see
 // comment on bz_semaphore_t.maxCount above).
@@ -560,9 +565,9 @@ void bz_semaphore_token_release(void* tokp) {
     semaphore_core_release(s);
 }
 
-// bz_semaphore_dispose — dispose the Semaphore object.  Marks disposed (for
-// idempotency) and releases the Semaphore object's core ref.  The sem_t is
-// destroyed only when the last SemaphoreToken is also released (via
+// §6.3: Semaphore.Dispose — dispose the Semaphore object.  Marks disposed
+// (for idempotency) and releases the Semaphore object's core ref.  The sem_t
+// is destroyed only when the last SemaphoreToken is also released (via
 // semaphore_core_release → core_refs → 0).  Idempotent: second call is no-op.
 // fix #706: exchange(true) is atomic — concurrent Dispose from two domains
 // cannot both proceed to semaphore_core_release.
@@ -762,7 +767,8 @@ static void atomic_core_release(bz_atomic_t* a) {
 
 extern "C" {
 
-// bz_atomic_new — allocate a new atomic cell; core_refs = 1.
+// §6.4: Atomic<T> / AtomicInteger<T> — allocate a new atomic cell;
+// core_refs = 1.
 void* bz_atomic_new(int cell_size, uint64_t initial) {
     if (cell_size <= 0 || cell_size > 8) cell_size = 4;  // defensive
     auto* a = new bz_atomic_t();
@@ -783,7 +789,7 @@ void* bz_atomic_new(int cell_size, uint64_t initial) {
     return a;
 }
 
-// bz_atomic_dispose — idempotent dispose (§28.2); drops the core ref.
+// §6.4: Atomic.Dispose — idempotent dispose (§28.2); drops the core ref.
 // fix #706: exchange(true) is atomic — concurrent Dispose from two domains
 // cannot both proceed to atomic_core_release.
 void bz_atomic_dispose(void* ptr) {

@@ -1,5 +1,5 @@
 // RUN: %bezelc -c -o %t.o %s
-// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
+// RUN: %bezelc -c %s 2>&1 | FileCheck %s
 //
 // Regression for issue #1826 (spec §30.5 / §17.13, v0.196).
 //
@@ -18,8 +18,13 @@
 // `DiscardStmt` case, so the await fell off the `consuming` set and the
 // Pattern B site check rejected the program.
 //
-// Clean-compile ACCEPT control: bezelc -c must exit zero and emit no
-// diagnostics.
+// ACCEPT-WITH-WARNING control: bezelc -c must exit zero (the program is
+// legal), but it DOES emit a diagnostic — the `Cell.n` counter field below
+// is a mutable static of primitive type, which §22.12 rule 2 form (iii)
+// (#1393 warned-admission ruling, v0.221) admits only with a
+// declaration-site warning; unrelated to this test's own #1826 subject
+// (the discard-disposal timing), so only pinned here to keep the ACCEPT
+// assertion accurate rather than silently stale.
 
 module M;
 import System.Threading;
@@ -41,5 +46,5 @@ class C
   end Main;
 end C;
 
-// NODIAG-NOT: error
-// NODIAG-NOT: §
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static field `n` has type `int` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
+// CHECK-SAME: (§22.12 rule 2, v0.221, #1393)

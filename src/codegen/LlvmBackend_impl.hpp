@@ -259,37 +259,108 @@ public:
         // is safe; it has no dependency on methodFns_, vtables_, or any other
         // codegen state that declareVtables or declareFunctions populates.
         computeEnumValues();  // CG30 — moved before declareVtables (fix #510)
-        declareVtables();  // CG17: after functions exist (needs fn ptrs)
-        // §2.5 / §22.9 (issue #503): emit ExternalLinkage getter stubs for
-        // non-virtual public properties (exporter side). After declareVtables so
-        // propGetSlot_ is populated; virtual properties are skipped.
-        emitExportedPropertyGetters();
-        // §2.5 / §22.9 (issue #503): declare external getter stubs for imported
-        // non-virtual property getters (importer side). After declareVtables
-        // so propGetSlot_ correctly reflects which imported properties are virtual.
-        if (ctx_.hasImports()) declareImportedPropertyGetters();
-        setupBoxDescriptors();  // §8.6: after descArray_/vtable globals exist
-        declareExterns();  // CG26
-        // #429 (box RETURN + FIELD-STORE category) / §8.6 / §28.9: before any
-        // method bodies are lowered, determine:
+        // #429 (box RETURN + FIELD-STORE category) / §8.6 / §28.9, reordered
+        // here by fix #2500 (§23.3/§28.9): determine, BEFORE any caller of
+        // ensurePropertyAccessorFn runs —
         //   (a) which locally-compiled methods always return boxable value
         //       sources (boxReturnMethods_) — callers of these treat the result
         //       as a +1 box producer and may release it at scope end;
         //   (b) which Object/interface-typed CLASS fields ONLY receive boxable
         //       value stores across the entire class (boxStorageFields_) —
         //       emitDisposerCore releases these fields via bz_box_release.
-        // Both analyses must run BEFORE the method body loop so that per-body
-        // collectBoxReleaseEligible (which calls isPlusOneBoxProducer, which
-        // calls isUserMethodBoxReturnCall) sees a populated boxReturnMethods_,
-        // and the disposer (emitted after all method bodies) sees a fully-
-        // populated boxStorageFields_.
+        // Both analyses depend only on ctx_ (sema, resolved before codegen),
+        // fieldIndex_ (declareStructs above), and methodFns_/ctorFns_
+        // (declareFunctions above) — none on vtables or late codegen state — so
+        // moving them here (before declareVtables/emitExportedPropertySetters,
+        // the two earliest ensurePropertyAccessorFn callers) is sound. This is
+        // required so that ensurePropertyAccessorFn's auto-SETTER body can
+        // consult isBoxStorageMember to decide whether to retain/release a
+        // box-typed backing field (the box twin of #2490's string/closure ARC):
+        // the body is built ONCE on first request and memoized, and before this
+        // reorder both first-call sites ran ahead of collectBoxStorageFields,
+        // leaving boxStorageFields_ empty at the point the setter body needed
+        // it (the ordering hazard #2500 documents). The analyses STILL satisfy
+        // their original "before the method body loop" obligation (that loop is
+        // well below), so collectBoxReleaseEligible's isPlusOneBoxProducer ->
+        // isUserMethodBoxReturnCall continues to see a populated
+        // boxReturnMethods_, and the disposer (emitted after all method bodies)
+        // sees a fully-populated boxStorageFields_.
         collectBoxReturnMethods();
         collectBoxStorageFields();
+        declareVtables();  // CG17: after functions exist (needs fn ptrs)
+        // §2.5 / §22.9 (issue #503): emit ExternalLinkage getter stubs for
+        // non-virtual public properties (exporter side). After declareVtables so
+        // propGetSlot_ is populated; virtual properties are skipped.
+        emitExportedPropertyGetters();
+        // fix #2400: the SETTER twin — emit ExternalLinkage setter stubs for
+        // non-virtual public properties WITH a setter (exporter side). Same
+        // ordering requirement as the getter call above (propSetSlot_ populated).
+        emitExportedPropertySetters();
+        // fix #2414: the INDEXER analogs of the two calls immediately above —
+        // same ordering requirement (propGetSlot_/propSetSlot_ populated by
+        // declareVtables, which also runs buildVtable's isVirtualIndexer gate).
+        // Gated on `!isMainModule_` (§33.1/§33.6: a main-module executable is
+        // never itself an importable artifact, so nothing can ever call a
+        // cross-module indexer-accessor symbol emitted for one) — UNLIKE
+        // emitExportedPropertyGetters/-Setters just above, which run
+        // unconditionally. This gate is deliberate, not just an optimization:
+        // probing this fix live turned up is_transitive_generic_2192's
+        // `is_transitive2_reified_int_matches_2192_14_1` — a single-module,
+        // no-indexer, no-import executable-build test — flipping from a
+        // reproducible PASS to a reproducible FAIL whenever
+        // emitExportedIndexerGetters/-Setters were called unconditionally
+        // (bisected: commenting out just these two calls fixed it; the two
+        // functions' own loops provably never entered their `isIndexer`
+        // branch for that program, ruled out by both a stderr trace and a
+        // file-write trace that logged zero indexer members across every
+        // class it visited — yet the *mere execution* of the enclosing
+        // no-op-outcome loop, even wrapped in nothing but dynamic_casts and
+        // a vector walk, changed the unrelated test's result). That is the
+        // signature of a pre-existing, latent memory-safety bug elsewhere in
+        // the reified-generic descriptor/`is`-check machinery being exposed
+        // by an incidental codegen-layout shift, not a logic error in the
+        // code added here — filed as its own issue (see this fix's PR/commit
+        // description) since chasing the root cause is a separate, larger
+        // undertaking. Restricting these two calls to library builds
+        // (already semantically correct — see above) happens to sidestep
+        // the trigger entirely: this exact executable-build program takes
+        // isMainModule_ == true, so the calls below never fire for it, while
+        // every #2414 cross-module test (which compiles the exporting side
+        // with `-c` / `compileObject`, isMainModule_ == false) is unaffected.
+        if (!isMainModule_) {
+            emitExportedIndexerGetters();
+            emitExportedIndexerSetters();
+        }
+        // fix #2387 / fix #2400 / fix #2414: declareImportedPropertyGetters /
+        // declareImportedPropertySetters / declareImportedIndexerGetters /
+        // declareImportedIndexerSetters (importer-side external getter/setter
+        // stubs) now run INSIDE declareVtables() itself, between the buildVtable
+        // loops and Pass D — see the call site there for why.
+        setupBoxDescriptors();  // §8.6: after descArray_/vtable globals exist
+        declareExterns();  // CG26
+        // collectBoxReturnMethods()/collectBoxStorageFields() now run BEFORE
+        // declareVtables() (see the call site just above computeEnumValues) so
+        // that ensurePropertyAccessorFn — invoked from declareVtables (Pass D)
+        // and emitExportedPropertySetters — sees a populated boxStorageFields_
+        // for the auto-setter body's box-ARC branch (fix #2500).
         for (auto& [sym, fn] : methodFns_) {
             emitFunctionBody(sym, fn);
         }
         emittingGenericTemplateBody_ = false;  // #817: don't leak into ctors/etc.
         for (auto& [sym, fn] : ctorFns_) {
+            // §2.5 / §14 (issue #328 item 1, fix #711): an IMPORTED class's
+            // ctorFns_ entry is an EXTERNAL declaration — the DEFINING module
+            // owns `bz$<Type>$ctor` and emitted its body there. Skip it, exactly
+            // as the disposer loop below skips imported disposers. Without this,
+            // an imported GENERIC class whose ctor body was exported (#662
+            // Foundation C, so `cs->decl != nullptr`) had a second definition of
+            // the template symbol emitted importer-side by declareImportedCtor +
+            // this loop → `multiple definition of bz$Container$ctor` at link.
+            // That standalone copy is also DEAD: every use of an imported
+            // generic ctor goes through the per-instantiation inline path
+            // (lowerNew / emitChainCall → inlineCtorBody with genericSubst_
+            // active), never a call to the unspecialized template symbol.
+            if (ctx_.isImported(sym)) continue;
             emitConstructorBody(sym, fn);
         }
         for (auto& e : staticCtors_) {
@@ -463,6 +534,13 @@ private:
         // by this (non-escaping) lambda — drives an element-dispose-through-cell
         // disposal next to the boxedCellFree. 0 otherwise.
         unsigned inlineArrayN = 0;
+        // fix #2334 / §28.14 / §28.9: true when `key`'s ONLY route into
+        // cellFreeEligible_ includes the TaskScope.Spawn special case
+        // (unwindUnsafeCellFree_ pre-scan result) — propagated onto the
+        // Disposal::skipCellFreeOnUnwind entries consumeLastLambdaCapturedCells
+        // registers, so the cell-free is skipped on the unwind edge (see that
+        // flag's declaration for the full soundness argument).
+        bool unwindUnsafe = false;
     };
     std::vector<LastCellEntry> lastLambdaCapturedCells_;
     // §27.5 / §28.9 (#969): block-nesting depth (== disposeStack_.size()) of each
@@ -566,6 +644,57 @@ private:
     // from staticCtors_ in declareStaticInitializers.
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> sfinitFnOf_;
     std::unordered_map<const sema::TypeSymbol*, llvm::Function*> cctorFnOf_;
+
+    // #1513 / §2.8.3 rule 4 / §22.12 rule 1: cross-module per-INSTANTIATION lazy
+    // static init for a generic class's static state — the generic-instantiation
+    // counterpart of the ensureInitFns_/initStateGV_ family above, keyed by
+    // (generic TypeSymbol*, recursive type-arg mangle) instead of by type alone.
+    // A generic's static state is per-instantiation (§22.12: "each distinct
+    // instantiation has its own static state"), and — the specific gap #1513
+    // closes — one instantiation (e.g. `Reg<int>`) may be independently
+    // monomorphized by SEVERAL importing modules' separate compilations
+    // (§2.8.2's definition-site visibility re-monomorphizes carried generic
+    // bodies at each consumer). The guard, its state, and the state it guards
+    // are all named "<declaring-module>.<Class>$<mangle>$..." (mangledTypeName
+    // + the SAME typeArgMangle genericInstStaticGlobals_ already uses) and
+    // linked LinkOnceODR, so every consumer's independently-compiled, byte-
+    // identical copy converges on ONE runtime definition, ONE state cell, and
+    // ONE execution — §2.8.4 rule 5's "one copy per process" applied to
+    // generic-instantiation state. (Deliberately mirrors, rather than reuses,
+    // the per-type FSM in emitEnsureInitFns/emitStaticConstructorBody: those
+    // functions assume a LOCAL, single-compilation-unit type and are not
+    // parameterized by instantiation; duplicating the (proven) pattern here
+    // keeps that delicate, heavily-fixed per-type path untouched.)
+    using GenericInstKey = std::pair<const sema::TypeSymbol*, std::string>;
+    // The type-argument substitution for one instantiation, recorded the first
+    // time ANY of its static fields is touched (staticFieldGlobal's redirect)
+    // and reused when genericInstSfinitFn later needs to lower a SIBLING
+    // field's initializer under the same substitution.
+    struct GenericInstArgs {
+        std::vector<llvm::Type*> substTypes;
+        std::vector<const void*> substIds;
+        std::vector<const sema::TypeRef*> substSemaTys;
+    };
+    std::map<GenericInstKey, GenericInstArgs> genericInstArgsOf_;
+    std::map<GenericInstKey, llvm::Function*> genericInstSfinitFns_;
+    std::map<GenericInstKey, llvm::Function*> genericInstEnsureInitFns_;
+    std::map<GenericInstKey, llvm::GlobalVariable*> genericInstInitStateGV_;
+    std::map<GenericInstKey, llvm::GlobalVariable*> genericInstInitExcGV_;
+    // #1513 / #1391 / §22.12 rule 1: per-instantiation owner-thread global —
+    // the per-instantiation counterpart of initOwnerGV_ above, recorded by
+    // whichever thread's CAS wins the 0(uninit)->1(in-progress) claim in
+    // genericInstEnsureInitFn, so a same-thread re-entrant touch (proceed) can
+    // be told apart from a genuine cross-domain touch (block via
+    // bz_static_init_wait) exactly as emitEnsureInitFns does for the per-type
+    // case.
+    std::map<GenericInstKey, llvm::GlobalVariable*> genericInstInitOwnerGV_;
+    // Reverse lookup: a per-instantiation static-field global (as returned by
+    // staticFieldGlobal) to the (type, typeArgMangle) key that owns it, so a
+    // static-access call site can find/build the right ensureinit function
+    // without re-deriving the generic-instantiation key from the AST a second
+    // time (staticFieldGlobal's own Path A / Path B logic already computed it).
+    std::unordered_map<llvm::GlobalVariable*, GenericInstKey>
+        genericInstGlobalKeyOf_;
 
     // CG11: enclosing-loop branch targets for `break`/`continue` (§A.6).
     // `continue` jumps to `continueTarget` (the loop's condition block),
@@ -739,6 +868,19 @@ private:
         // double-free). `slot` is the record's struct alloca; `cls` is the
         // record TypeSymbol (used to GEP each string storage member).
         bool recordStringFields = false;
+        // fix #2425 / §9.8 / §28.3 / §28.9 / §35.4 v0.235: an ALREADY-
+        // POPULATED deserialize component/payload slot (#2398 disposal
+        // scope, LlvmBackend_Serialization.cpp) whose declared type is a
+        // value-like CHOICE that owns a string somewhere reachable from its
+        // active case (directly, or through a nested record/choice
+        // payload). Guards the slot against a LATER sibling's read
+        // throwing, the choice-side counterpart of `recordStringFields`
+        // just above — released via emitChoiceStringFieldReleases, a
+        // separate tag-switched walker (the choice struct's `$case`-tagged
+        // variant layout differs from a record's plain field sequence, so
+        // it cannot reuse `emitRecordStringFieldReleases` verbatim). `slot`
+        // is the choice's struct alloca; `cls` is the choice TypeSymbol.
+        bool choiceStringFields = false;
         // §2.15 / issue #550: a `using var` bound to a BinarySerializer or
         // BinaryDeserializer.  These are opaque heap handles with no user
         // TypeSymbol and no vtable.  At scope end they are freed via
@@ -762,6 +904,13 @@ private:
         // TypeSymbol, so classOfLocal returns null and the class-disposal path
         // misses it. At scope end it is freed via bz_stopwatch_free.
         bool stopwatch = false;
+        // stdlib §7.2 / issue #645: a `using var` bound to a FileStream. The
+        // stream is a heap handle (bz_filestream_t*) with no user TypeSymbol,
+        // so classOfLocal returns null and the class-disposal path misses it.
+        // At scope end it is disposed via bz_filestream_dispose, which is what
+        // realizes §7.2's flush-on-dispose contract on EVERY exit edge,
+        // exceptions included.
+        bool fileStream = false;
         // §28.13 / stdlib §2.16 (#603): a `using var` bound to a Shared<T>
         // handle. At scope end it is released via bz_shared_release (decrements
         // strong count; at 0 disposes the value then frees the control block if
@@ -964,6 +1113,30 @@ private:
         // escaping env holds the cell past scope exit → no UAF). `slot` is the
         // cell-holder ptr-alloca; the cell ptr may be null (free(null) no-op).
         bool boxedCellFreeDeferred = false;
+        // fix #2334 / §28.14 / §28.9: applies to `boxedCellFree` /
+        // `boxedCellFreeDeferred` ONLY. `boxedCellFree`'s "fires on BOTH
+        // normal and unwind paths" soundness argument (above) rests on every
+        // capturing lambda being PROVABLY non-escaping BY SCOPE END on
+        // EITHER exit edge — true for the ordinary IIFE / `var f := lambda`
+        // forms, where the closure's own release is registered in the SAME
+        // disposeStack_ scope and fires on both edges symmetrically. The
+        // collectCellFreeEligible TaskScope.Spawn special case (LlvmBackend_
+        // Setup.cpp) is different: its "non-escaping by scope end" argument
+        // depends on the bounding `using var`'s disposal being QUIESCENT —
+        // true for the properly-awaited NORMAL edge, but NOT for the unwind
+        // edge, where TaskScope.DisposeAsync is a documented (#1422)
+        // NON-BLOCKING zombie drain that returns before children finish (the
+        // synchronous-fallback path noted in taskscope_asan_808_test.cpp /
+        // taskscope_behavior_610_test.cpp's exception_edge_drain_is_
+        // nonblocking_zombie_1422). Freeing the cell on the unwind edge in
+        // that shape is a genuine use-after-free: a still-running child can
+        // read the cell after it is freed (confirmed by ASan — the adversarial
+        // regression test in taskscope_asan_2334_test.cpp derives from the
+        // actual crash this flag fixes). Set true only for cellFreeEligible_
+        // captures the pre-scan additionally flagged unwindUnsafeCellFree_;
+        // emitDisposals skips the free on the unwind edge for such an entry,
+        // leaving the ordinary conservative leak instead of freeing early.
+        bool skipCellFreeOnUnwind = false;
         // §15.3 / §15.1.1 (#747): a move-only OWNING inline-array local
         // ([N owned]T? / [N owned]T) whose ownership is NOT transferred out of
         // the local anywhere in the body (per the inlineOwnedArrayTransferred_
@@ -1502,6 +1675,23 @@ private:
     std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
         indexerSetterFns_;
 
+    // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): the
+    // indexer analogs of importedPropGetterFns_/importedPropSetterFns_ below
+    // — an EXTERNAL `bz$<Class>$idxget$<arity>`/`$idxset$<arity>` function
+    // declared by declareImportedIndexerGetters/-Setters for a NON-VIRTUAL,
+    // non-interface imported indexer (the exporter's twin,
+    // emitExportedIndexerGetters/-Setters, wraps the existing
+    // ensureIndexerGetterFn/-SetterFn body builders with ExternalLinkage).
+    // Consulted by lowerIndexerGet/lowerIndexerSet's decl-null fallback —
+    // an imported PropertySymbol has no ast::PropertyDecl (`ps->decl` is
+    // always null, mirroring Property's own #503 limitation), so the usual
+    // inline-body / itable-fill paths (which all read `pd`) cannot resolve
+    // it directly.
+    std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
+        importedIndexerGetterFns_;
+    std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
+        importedIndexerSetterFns_;
+
     // §29.2 (#552): expression-form property getter thunks generated by
     // ensureExprGetterThunk. Keyed by PropertySymbol so the thunk is shared
     // across all call sites that call the same getter.
@@ -1671,6 +1861,16 @@ private:
     // (`bz$<Class>$<Prop>$propget`). Populated by declareImportedPropertyGetters.
     std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
         importedPropGetterFns_;
+    // fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): the SETTER twin of
+    // importedPropGetterFns_ — no equivalent existed before this fix, which is
+    // why a settable property inherited from an imported base class had no
+    // cross-module ABI surface at all (only a getter stub was ever declared).
+    // Keyed by the imported PropertySymbol; the value is an ExternalLinkage
+    // `void(ptr this, T value)` declaration linking against the exporter's
+    // setter function (`bz$<Class>$<Prop>$propset`). Populated by
+    // declareImportedPropertySetters.
+    std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
+        importedPropSetterFns_;
     // CG35-itable (§13 / §12): per-interface itable dispatch. For each
     // interface method `ms`, ifaceMethodIndex_[ms] is its 0-based position in
     // the interface's non-static method declaration order. This index is used
@@ -1700,6 +1900,23 @@ private:
         ifacePropertyGetIndex_;
     std::unordered_map<const sema::PropertySymbol*, unsigned>
         ifacePropertySetIndex_;
+    // fix #2506 (§23.3/§28.9, v0.236): TOTAL number of fn-ptr slots in every
+    // itable built for this interface — the running `idx` value at the end of
+    // the methods+events+properties indexing loop above (methods + sync events +
+    // one getter per property + one setter per settable property). Every
+    // itable$C$I / itable$box$R$I appends ONE trailing "owner-kind" flag word at
+    // exactly this index (non-null = CLASS-backed retaining setter, null =
+    // box/record-backed plain-store setter), which lowerVirtualPropertySet's
+    // itable branch reads to decide whether to ARGUMENT-PASS release a +1
+    // producer: the call site cannot see the concrete runtime receiver's kind
+    // from `ps->parent` (always the Interface), but the flag travels INSIDE the
+    // itable bytes the concrete type's own module produced, so it is sound
+    // cross-module regardless of vtable/descriptor linkage. Captured for both
+    // local and imported interfaces (the import mirror below runs the identical
+    // indexing loop). Method-only box itables (prim/span/value-builtin) omit
+    // the flag: their interfaces declare no settable property, so a setter
+    // dispatch never indexes into them and the absence is never observed.
+    std::unordered_map<const sema::TypeSymbol*, unsigned> ifaceItabSlotCount_;
     // Per (class × interface): the itab$C$I global (array of fn ptrs in
     // interface declaration order). Key: (cls, iface).
     std::map<std::pair<const sema::TypeSymbol*, const sema::TypeSymbol*>,
@@ -1875,7 +2092,10 @@ private:
     // vtable slot so `base[i]` and `this[i]` dispatch to the most-derived getter
     // — the indexer analog of isVirtualProperty (the non-indexer guard there
     // deliberately excludes indexers, which historically had no slot).
-    bool isVirtualIndexer(const sema::PropertySymbol* ps) {
+    // #2449: marked `const` (pure predicate over `ps`, no Emitter state
+    // touched) so the const `findIndexer`/`indexerCandidateWireable` below
+    // can call it.
+    bool isVirtualIndexer(const sema::PropertySymbol* ps) const {
         if (!ps || !ps->isIndexer) return false;
         for (auto mod : ps->modifiers) {
             if (mod == "static") return false;
@@ -1885,14 +2105,67 @@ private:
         return ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface;
     }
 
+    // #2449 (§11.2/§23.4, v0.235): can `ps` actually be installed as an
+    // interface-indexer itable slot? A LOCAL indexer (real `ast::PropertyDecl`)
+    // always can — `ensureIndexerGetterFn`/`-SetterFn` build its body from
+    // the AST. An IMPORTED indexer (`ps->decl == nullptr` — ModuleLoader
+    // reconstructs no AST, mirrors Property's #503 limitation) can ONLY
+    // through #2414's non-virtual external-stub ABI
+    // (`declareImportedIndexerGetters`/`-Setters`,
+    // `bz$<Class>$idxget$<arity>`/`$idxset$<arity>`) — those two functions
+    // themselves skip a VIRTUAL or interface-declared indexer (dispatches
+    // through a vtable/itable slot instead, not this direct-call ABI), so
+    // this predicate excludes the identical shape rather than reporting a
+    // candidate that would silently find no entry in
+    // importedIndexerGetterFns_/-SetterFns_ (see `indexerItableAccessor`,
+    // LlvmBackend_Setup.cpp, which resolves the actual function once a
+    // candidate passes this gate). `findIndexer` (LlvmBackend_Assign.cpp)
+    // is the sole caller.
+    bool indexerCandidateWireable(const sema::PropertySymbol* ps) const {
+        if (!ps) return false;
+        if (dynamic_cast<const ast::PropertyDecl*>(ps->decl)) return true;
+        if (ps->decl) return false;  // defensive: not a PropertyDecl either
+        return !isVirtualIndexer(ps);
+    }
+
     // #481 / §23: does this property declare a setter? An auto-property without
     // a `readonly`/`private set` restriction has both; an expression-bodied or
     // block getter-only property has only a getter. Checked off the PropertyDecl
     // so it matches across base/override (the override must match the base's
     // accessor set per §12.1).
-    static bool propertyHasSetter(const sema::PropertySymbol* ps) {
+    //
+    // fix #2406 (§23 / §11.2 / §2.8.2 / §2.8.3 rule 4, v0.235): `ps->decl` is
+    // unconditionally null for an IMPORTED PropertySymbol (ModuleLoader never
+    // reconstructs an ast::PropertyDecl for a body-less imported declaration).
+    // Called on an IMPORTED INTERFACE's own PropertySymbol (to decide whether
+    // declareVtables's Pass 0/its import-mirror should reserve an itable
+    // setter slot at all, and whether Pass D should attempt to fill one),
+    // this used to unconditionally return `false`, so NO setter slot was ever
+    // reserved for a read-write property declared on an imported interface —
+    // `b.Name := v` through such a reference silently no-op'd even when the
+    // implementing class and its setter were entirely local (#2400's own
+    // declareImportedPropertySetters comment flags this exact gate as "filed
+    // separately" — this is that follow-up).
+    //
+    // Fall back to `ctx_.importedPropertyHasSetter(ps)` — the MetaMember::
+    // hasSetter bit #2400 added (ModuleMetadata.hpp) and already threads
+    // builder -> loader -> this same SemaContext side table for its own
+    // (non-interface, direct cross-module set) shape. `ps->modifiers` alone is
+    // NOT sufficient here: on a BLOCK-form property, `readonly` is a compile
+    // error whether or not a `set` arm is present (Bezel_Language_Spec.md
+    // §22.3/§23.1, v0.235 — "on a block form declaring a setter it is
+    // contradictory and likewise an error", and equally an error on a
+    // get-only block form since the shape already expresses read-onlyness),
+    // so a get-only block-form interface property and a read-write auto-form
+    // interface property are INDISTINGUISHABLE by modifiers alone — a naive
+    // "no `readonly`" fallback would wrongly reserve a setter slot for the
+    // former, and Pass D would fill it with ConstantPointerNull (no real
+    // setter exists to find), planting the #2387 null-itable-slot SIGSEGV
+    // shape on any write attempt. The real hasSetter bit (computed at EXPORT
+    // time from the actual PropertyDecl shape) has no such ambiguity.
+    bool propertyHasSetter(const sema::PropertySymbol* ps) {
         auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-        if (!pd) return false;
+        if (!pd) return ctx_.importedPropertyHasSetter(ps);
         if (pd->bodyKind == ast::PropertyBodyKind::Expression) return false;
         if (pd->bodyKind == ast::PropertyBodyKind::Auto) {
             // Auto-property: read-write unless readonly. (Auto-properties are
@@ -2321,6 +2594,45 @@ private:
     // (null-/sentinel-safe), and null the slot so a re-read sees a defined
     // null (matching the boxRelease / closureRelease / stringRelease
     // semantics). Used by the recordStringFields scope-end Disposal.
+    //
+    // fix #2405 / §9.7 / §28.9: RECURSE into a non-nullable nested-record
+    // storage member so a string owned two-or-more levels deep is also
+    // released, not just the outer record's OWN direct string fields (the
+    // #1747 one-level scope this helper originally had). A nested record
+    // is embedded INLINE (records are value types, §9), so its storage sits
+    // at a GEP off the SAME outer struct address `recAddr` -- no load/
+    // indirection needed to reach it, exactly like reaching a direct string
+    // field's slot. The recursion is guaranteed to terminate: sema rejects
+    // a record that transitively contains itself by value at the
+    // declaration site (TypeResolution_Checks.cpp's recordValueContainsSelf,
+    // "` cannot recursively contain itself by value" §9), so the nested-
+    // record type graph reachable from any `ts` is a finite DAG -- no cycle
+    // guard is needed, mirroring emitStructEquality's identical unconditional
+    // recursion into nested-record fields for `=`/`<>` (LlvmBackend_Layout.cpp).
+    // A NULLABLE nested-record field (`P?`) is excluded here, matching
+    // isRecordWithStringFieldsTypeRef's own PRE-EXISTING top-level
+    // exclusion (unchanged by this fix): it lowers to a {i8, P} wrapper
+    // struct, not the bare record layout this walker (and
+    // recordHasStringFields, below) assume.
+    //
+    // fix #2425 / §9.8 / §28.9 / §35.4 v0.235: a record component may also
+    // be a value-like CHOICE (§9.8 record-admissibility: "a value-like
+    // serialization-eligible choice" is a record-admissible component type,
+    // matching §9.2's admission of value-like choices as equality
+    // components). Recurse into a non-nullable choice-typed storage member
+    // exactly as into a nested record: the choice struct is likewise
+    // embedded INLINE (§35.1 — a choice is a value type regardless of its
+    // §35.4 classification), so a GEP off this SAME outer struct address
+    // reaches it, and the recursion terminates for the same reason (§35.1's
+    // choice self-containment check, TypeResolution_Checks.cpp's
+    // checkChoiceSelfContainment/recordValueContainsSelf, rejects a choice
+    // that transitively contains itself through value-typed payloads — the
+    // combined record+choice value-type graph reachable from any
+    // declaration is a finite DAG regardless of which kind starts the
+    // walk). The actual per-case, tag-switched release lives in
+    // emitChoiceStringFieldReleases_impl (LlvmBackend_Disposal.cpp) — the
+    // choice-side counterpart this comment's prior revision (#2405) noted
+    // was missing.
     void emitRecordStringFieldReleases_impl(llvm::Value* recAddr,
                                             const sema::TypeSymbol* ts) {
         if (!recAddr || !ts || ts->kind != ast::TypeDeclKind::Record) return;
@@ -2329,49 +2641,39 @@ private:
         std::vector<const sema::Symbol*> storage;
         collectRecordStorage(ts, storage);
         for (const sema::Symbol* m : storage) {
-            if (!isStringStorageMember(m)) continue;
             auto idxIt = fieldIndex_.find(m);
             if (idxIt == fieldIndex_.end()) continue;
-            llvm::Value* addr =
-                builder_.CreateStructGEP(st, recAddr, idxIt->second,
-                                          "recstrf.addr");
-            llvm::Value* val =
-                builder_.CreateLoad(ptrTy(), addr, "recstrf.val");
-            emitStringRelease(val);
-            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
-        }
-    }
-
-    // fix #1747 / §28.9: GEP every string storage member of record VALUE
-    // `recVal` (a struct SSA value), load the field's current string
-    // pointer, and bz_string_retain (null-/sentinel-safe). Used on the
-    // callee side immediately after `return new P(...)` builds the value
-    // — the retain mints the +1 the returned record carries to the
-    // caller, balancing the caller's scope-end recordStringFields
-    // disposal. A literal field is a sentinel and its retain is a no-op
-    // (bz_string_retain is null-/sentinel-safe). `recVal` is a struct
-    // VALUE; we spill it to a temp because CreateStructGEP wants a
-    // pointer and we don't have one for an SSA value.
-    void emitRecordStringFieldRetains_impl(llvm::Value* recVal,
-                                           const sema::TypeSymbol* ts) {
-        if (!recVal || !ts || ts->kind != ast::TypeDeclKind::Record) return;
-        llvm::StructType* st = recordStruct(ts);
-        if (!st) return;
-        // Spill the SSA value to a temp slot so each GEP can address it.
-        llvm::AllocaInst* tmp = entryAlloca(st);
-        builder_.CreateStore(recVal, tmp);
-        std::vector<const sema::Symbol*> storage;
-        collectRecordStorage(ts, storage);
-        for (const sema::Symbol* m : storage) {
-            if (!isStringStorageMember(m)) continue;
-            auto idxIt = fieldIndex_.find(m);
-            if (idxIt == fieldIndex_.end()) continue;
-            llvm::Value* addr =
-                builder_.CreateStructGEP(st, tmp, idxIt->second,
-                                          "recstrr.addr");
-            llvm::Value* val =
-                builder_.CreateLoad(ptrTy(), addr, "recstrr.val");
-            emitStringRetain(val);
+            if (isStringStorageMember(m)) {
+                llvm::Value* addr =
+                    builder_.CreateStructGEP(st, recAddr, idxIt->second,
+                                              "recstrf.addr");
+                llvm::Value* val =
+                    builder_.CreateLoad(ptrTy(), addr, "recstrf.val");
+                emitStringRelease(val);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), addr);
+                continue;
+            }
+            const sema::TypeRef* mty = recordMemberType(m);
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
+                mty->declaration->kind == ast::TypeDeclKind::Record &&
+                recordHasStringFields(mty->declaration)) {
+                llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                    st, recAddr, idxIt->second, "recstrf.nested.addr");
+                emitRecordStringFieldReleases_impl(nestedAddr, mty->declaration);
+                continue;
+            }
+            // fix #2425: a nested value-like CHOICE component (see the
+            // function comment above).
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
+                mty->declaration->kind == ast::TypeDeclKind::Choice &&
+                choiceHasStringFields(mty->declaration)) {
+                llvm::Value* nestedAddr = builder_.CreateStructGEP(
+                    st, recAddr, idxIt->second, "recstrf.nested.ch.addr");
+                emitChoiceStringFieldReleases_impl(nestedAddr, mty->declaration);
+            }
         }
     }
 
@@ -2543,6 +2845,13 @@ private:
     llvm::Value* emitChoiceEquality(llvm::Value* l, llvm::Value* r,
                                     const sema::TypeSymbol* choiceTy);
     llvm::Value* emitChoiceHashCode(llvm::Value* val,
+                                    const sema::TypeSymbol* choiceTy);
+    // §35.7 (#2479): "TypeName.CaseName(field1: value1, …)" / "TypeName.
+    // CaseName" over the choice struct's active case, mirroring
+    // emitChoiceEquality/emitChoiceHashCode's tag-switch shape. Callers must
+    // confirm auto-equality-bearing (sema::isAutoEqualityBearingChoice)
+    // first — this function does not re-check it.
+    llvm::Value* emitChoiceToString(llvm::Value* val,
                                     const sema::TypeSymbol* choiceTy);
     // §8.5: enum ToString → the type's qualified name (the spec default for
     // enums; member-name formatting is left to user code via Type.EnumNames).
@@ -2793,6 +3102,27 @@ private:
     // unified by isNullableValueTy below. Defined in LlvmBackend_Layout.cpp
     // (needs the record-declaration kind check, like isNullableEnumTy).
     bool isNullableRecordTy(const sema::TypeRef* rt);
+    // fix #2447 / §35.9 / §7.2: is rt a NULLABLE CHOICE (a nullable Named
+    // TypeRef whose declaration is a choice)? "`C?` is the ordinary
+    // nullable value type (§7.2)" (§35.9, "Nullable `C?`") — a choice's
+    // classification (value-like/borrow-bearing/owning, §35.4) does not
+    // change this: the WRAPPER `C?` is always the tagged {i8 hasValue; T}
+    // struct, exactly like a nullable record. Before this fix, no
+    // predicate recognized a nullable choice as a nullable value type at
+    // all — lowerTypeRef's `isNullableValueTy` gate returned false, so a
+    // `Wrap?` field fell through to the LATER Named/Choice branch, which
+    // returns the BARE (non-nullable) choiceStruct regardless of
+    // `rt->nullable`, contradicting its own comment ("the nullable `C?`
+    // wraps this struct in nullableValueStructTy's `{ i8 hasValue,
+    // <choice struct> }`") — no such wrap ever happened. This produced a
+    // choice-typed value with no null representation, which crashed
+    // (an ICmp i32-vs-i8 type-mismatch assertion) the first time code
+    // tried to test its (non-existent) hasValue tag — confirmed via
+    // serializing a record with a `Wrap?` component. This predicate is
+    // the choice analogue of isNullableRecordTy; the two are unified by
+    // isNullableValueTy below. Defined in LlvmBackend_Layout.cpp (needs
+    // the choice-declaration kind check, like isNullableRecordTy).
+    bool isNullableChoiceTy(const sema::TypeRef* rt);
     // per §2.5–§2.6 / issue #1954: is rt a NULLABLE VALUE-BUILTIN (a nullable
     // Named TypeRef naming DateTime/TimeSpan/DateOnly/TimeOnly/Guid)? These are
     // scalar/struct value types whose decl kind is Class (or declaration-less), so
@@ -2806,15 +3136,18 @@ private:
     // valueBuiltinName); the four unify under isNullableValueTy below.
     bool isNullableValueBuiltinTy(const sema::TypeRef* rt);
     // A nullable VALUE type — a value primitive (isNullablePrimTy), an enum
-    // (isNullableEnumTy), a record (isNullableRecordTy), or a value-builtin
+    // (isNullableEnumTy), a record (isNullableRecordTy), a CHOICE
+    // (isNullableChoiceTy, fix #2447), or a value-builtin
     // (isNullableValueBuiltinTy, #1954). All lower to the tagged {i8 hasValue; T
     // value} struct; the only difference is T (the primitive's LLVM type, i32 for
-    // an enum, the bare record struct, or the value-builtin's lowering — i64 for
-    // DateTime/TimeSpan, i32 for DateOnly/TimeOnly, {i64,i64} for Guid). All
-    // null/wrap/value-semantics sites key off this combined predicate.
+    // an enum, the bare record struct, the bare choice struct, or the
+    // value-builtin's lowering — i64 for DateTime/TimeSpan, i32 for
+    // DateOnly/TimeOnly, {i64,i64} for Guid). All null/wrap/value-semantics
+    // sites key off this combined predicate.
     bool isNullableValueTy(const sema::TypeRef* rt) {
         return isNullablePrimTy(rt) || isNullableEnumTy(rt) ||
-               isNullableRecordTy(rt) || isNullableValueBuiltinTy(rt);
+               isNullableRecordTy(rt) || isNullableChoiceTy(rt) ||
+               isNullableValueBuiltinTy(rt);
     }
     // The tagged struct for a nullable value type (prim, enum, or record). For
     // an enum the value slot is the underlying integer (i32 — CG44); for a record
@@ -3077,14 +3410,30 @@ private:
                                              bool srcUnsigned = false,
                                              bool sourceIsNullableRef = false);
 
-    // §22.10 / §23.4: find the indexer PropertySymbol on a TypeSymbol, if any.
-    // When `argTy` is non-null, select the OVERLOAD (#774) whose first
-    // parameter type matches the index argument's type, falling back to the
-    // first indexer found (single-indexer types, and index types that match no
-    // overload exactly, keep their existing behavior).
+    // §11.2 / §23.4 (#2437/#2442, v0.235): the indexer PropertySymbol on `ts`
+    // — or an inherited base class — whose FULL parameter list (arity AND
+    // every parameter type, §23.4: "Indexers may be overloaded by parameter
+    // type list") matches interface indexer `ifaceIdx`'s. Replaces the prior
+    // first-parameter-only match (#774), which was arity-blind: it matched a
+    // `[i:int,j:int]` obligation against a narrower `[i:int]` overload
+    // whenever the two shared a first parameter type (#2437, confirmed:
+    // silently installed the wrong getter). Also now walks `baseClassOf`
+    // (#2442), mirroring `classPropertyByName`'s identical walk for named
+    // properties — a class satisfying the obligation only through an
+    // inherited indexer is a valid candidate. A candidate is considered only
+    // if it carries a genuine LOCAL `ast::PropertyDecl`: `ensureIndexerGetterFn`/
+    // `-SetterFn` require one unconditionally, so an indexer reached only
+    // through an IMPORTED base class cannot be wired into the itable today —
+    // selecting one here would report a match this function's own callers
+    // then silently fail to install (see the .cpp definition). Returns null
+    // when no member, own or inherited, matches — never a partial/best-
+    // effort candidate (no more "fall back to the first indexer found"):
+    // `checkAbstractImplementations` (sema, TypeResolution_Checks.cpp)
+    // mirrors this exact selection, so null here always corresponds to a
+    // compile-time reject, never a silently-wrong itable install.
     const sema::PropertySymbol* findIndexer(
         const sema::TypeSymbol* ts,
-        const sema::TypeRef* argTy = nullptr) const;
+        const sema::PropertySymbol* ifaceIdx) const;
 
     // §23.4 (#1172): select the indexer OVERLOAD for the access `ix` by its
     // FULL parameter list — the candidate's parameter count must equal the
@@ -3094,9 +3443,11 @@ private:
     // per-argument coercion at the call site). Candidates are gathered over the
     // receiver type and its base types (an inherited indexer is a valid
     // candidate), mirroring the sema selector in ExprTypecheck_Exprs.cpp.
-    // Returns null when no candidate's arity matches. Unlike findIndexer (which
-    // keys only on the first parameter, #774), this never drops or mis-binds
-    // later index arguments.
+    // Returns null when no candidate's arity matches. Unlike findIndexer
+    // (matched against a fixed interface indexer's DECLARED parameter list
+    // for §11.2 conformance, with no implicit-conversion fallback), this
+    // selects against a real call site's ARGUMENT expressions and accepts an
+    // arity-only match for implicit conversion at the call.
     const sema::PropertySymbol* selectIndexer(
         const sema::TypeSymbol* ts, const ast::IndexExpr& ix) const;
 
@@ -3113,8 +3464,17 @@ private:
     llvm::Value* lowerIndexerGet(const ast::IndexExpr& ix);
 
     // §22.10: emit the setter of an indexer property via inline body.
-    // Returns true if the setter was handled.
-    bool lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val);
+    // Returns true if the setter was handled. `valueExpr` is the original
+    // (pre-lowering) RHS expression on `as->value.get()` — used to gate the
+    // paired call-site retain (#2540) so only the named-local RHS shapes the
+    // walker armed for scope-end release get the balancing +1 on the
+    // record-backed itable path (mirrors #2535's lowerVirtualPropertySet
+    // `ifaceNamedLocalEligible` gate). nullptr is a safe no-op (no retain
+    // emitted) — used by the ref-arg write-back path
+    // (emitAccessorRefArgWriteBacks) where the value arrives pre-loaded and
+    // has no associated source expression the walker could have armed.
+    bool lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
+                         const ast::Expr* valueExpr = nullptr);
 
     // §20 / §23.4: compound assignment `a[i] OP= v` through a user-defined
     // indexer — evaluates the receiver and each index param ONCE, calls the
@@ -3209,6 +3569,84 @@ private:
         return false;
     }
 
+    // fix #2478 (§9.2/§22.8): isAutoProperty above is DECL-DEPENDENT
+    // (`dynamic_cast<const ast::PropertyDecl*>(ps->decl)`) — it always
+    // returns `false` for an IMPORTED PropertySymbol (`ps->decl` is null for
+    // every imported symbol, ModuleLoader.cpp never reconstructs an
+    // ast::PropertyDecl). This was a confirmed live memory-safety hazard:
+    // `collectInstanceStorage`/`collectRecordStorage` below call
+    // `isAutoProperty` to decide whether a member occupies a struct slot, so
+    // an imported class/record with a PUBLIC (or now-#2456/#2468-visible
+    // private) auto-property was silently under-counted — a locally-declared
+    // derived class's own field then collided with the physical offset the
+    // exporter's own compiled functions use for a LATER member (confirmed:
+    // a derived class's own private field read back the BASE auto-property's
+    // sibling field's value instead of its own, 122 instead of the correct
+    // 66 in the discovering repro). This helper is the STORAGE-LAYOUT-ONLY
+    // fallback: try the local (decl-based) predicate first (unchanged
+    // behavior for every LOCAL declaration); when that is false AND the
+    // symbol is an imported (decl-null) Property, consult the wire-carried
+    // classification (`ctx_.importedPropertyIsAutoStorage`, set from
+    // MetaMember::isAutoProperty by ModuleLoader.cpp) instead of silently
+    // treating it as "not storage".
+    //
+    // SCOPE (CLAUDE.md rule 4 — deliberately narrow, not a blanket fix):
+    // `sema::isAutoPropertySymbol`/`isAutoProperty`/`isStaticAutoProperty`
+    // have roughly thirty OTHER call sites (definite assignment, ownership/
+    // disposal ARC, sendability, serialization eligibility, pattern
+    // destructuring, the for-in "named vs. computed source" disposal test)
+    // audited during #2478's investigation — each has its own failure
+    // direction (some silent-wrong-data, some spurious-reject, at least one
+    // disposal-miscount/double-free-adjacent) and its own regression-test
+    // burden. Only the two STORAGE-LAYOUT call sites that directly cause the
+    // confirmed struct-offset collision (`collectInstanceStorage`,
+    // `collectRecordStorage`, immediately below) are widened here; the rest
+    // remain open, filed as a follow-up (see #2478's tracking comment).
+    bool isAutoPropertyStorage(const sema::Symbol* m) {
+        if (isAutoProperty(m)) return true;
+        auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
+        if (!ps || ps->isIndexer || ps->decl != nullptr) return false;
+        return ctx_.importedPropertyIsAutoStorage(ps);
+    }
+
+    // fix #2421 (§24/§2.8.2/§2.8.3 rule 4, v0.236): the EventSymbol
+    // classification bits the event-dispatch path recovers from
+    // `ast::EventDecl` in the LOCAL path (collectInstanceStorage /
+    // emitOwnFieldInit / ctor-cleanup need isStatic; the ifaceEventIndex_
+    // index + itab$C$I BUILD loops need isAsync) are decl-dependent
+    // (`dynamic_cast<const ast::EventDecl*>(es->decl)`), so they always
+    // returned false for an IMPORTED EventSymbol (no decl crosses the module
+    // boundary — ModuleLoader.cpp's Event case reconstructs the symbol
+    // without one). An imported event was therefore silently DROPPED by every
+    // one of those consumers: no fieldIndex_ slot, no itable index, no itable
+    // entry — so cross-module Subscribe/Raise resolved to nothing and the
+    // handler never fired (filed as #2421, one layer past #2407's symbol
+    // reconstruction). These helpers mirror isAutoPropertyStorage's shape
+    // exactly: try the local decl-based bit first (unchanged for every LOCAL
+    // event); when the decl is null (an imported event), consult the wire-
+    // carried classification (ctx_.importedEventIsStatic/Async, set from
+    // MetaMember::isEventStatic/isEventAsync by ModuleLoader.cpp) instead of
+    // silently treating it as a non-event. A WRONG guess on either bit is a
+    // real hazard, not just an imprecision — it would reserve an importer-
+    // side itable/struct slot the exporter's real layout does not have (or
+    // vice versa), an itable/struct-layout MISMATCH between the two
+    // compilations (the exact class #2420/#2406 caught elsewhere) — so the
+    // wire bit is the sole safe source of truth for an imported event.
+    bool eventIsStatic(const sema::EventSymbol* es) {
+        if (!es) return false;
+        if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl))
+            return ed->isStatic;
+        if (es->decl != nullptr) return false;  // non-EventDecl decl
+        return ctx_.importedEventIsStatic(es);
+    }
+    bool eventIsAsync(const sema::EventSymbol* es) {
+        if (!es) return false;
+        if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl))
+            return ed->isAsync;
+        if (es->decl != nullptr) return false;  // non-EventDecl decl
+        return ctx_.importedEventIsAsync(es);
+    }
+
     // CG33b: the arrow-getter expression of a computed property, or null
     // (auto-properties, indexers, and block/explicit-accessor getters
     // are not arrow getters).
@@ -3253,7 +3691,19 @@ private:
     // SETTER through the vtable/itable with the already-lowered value `v`.
     // Returns true when it handled the assignment; false to fall through to the
     // static setter path.
-    bool lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v);
+    //
+    // fix #2490 (§23.3/§4.6/§27.5/§28.9, v0.236): `valueExpr` is the SOURCE
+    // ast::Expr `v` was lowered from, when the caller has one (nullptr at the
+    // `ref`/`out` accessor write-back call site, whose `v` is a reload of an
+    // existing slot, never a fresh producer). See the .cpp definition for why
+    // this is needed — the callee (the generated setter body) now always
+    // retains its incoming borrow (§23.3), so a caller-side +1 producer
+    // passed DIRECTLY as the argument (no local binding of its own) needs the
+    // SAME post-call release the #429 ARGUMENT-PASS call-argument release
+    // already gives an ordinary method call (LlvmBackend_Calls2.cpp), or it
+    // leaks.
+    bool lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
+                                 const ast::Expr* valueExpr = nullptr);
 
     // §23.4: emit (or retrieve cached) a standalone LLVM function for a
     // BLOCK-form indexer getter body (`property [i: …]: T get => do…end;`).
@@ -3278,10 +3728,20 @@ private:
     llvm::Function* ensureIndexerSetterFn(const sema::TypeSymbol* cls,
                                           const sema::PropertySymbol* ps);
 
-    // #730: the class `cls`'s concrete indexer that implements the interface
-    // indexer `ifaceIdx` (matched by first index-param type via findIndexer).
+    // #730/#2437/#2442/#2449: the class `cls`'s (or an inherited local OR
+    // imported base's) concrete indexer that implements the interface
+    // indexer `ifaceIdx`, matched by FULL parameter list via findIndexer.
     const sema::PropertySymbol* classIndexerImplementing(
         const sema::TypeSymbol* cls, const sema::PropertySymbol* ifaceIdx);
+
+    // fix #2449 (§11.2/§23.4, v0.235): the itable-slot function for
+    // classIndexerImplementing's result `iimpl` — LOCAL (own or inherited
+    // from a local base) via ensureIndexerGetterFn/-SetterFn, IMPORTED
+    // (inherited from an imported base) via the importedIndexerGetterFns_/
+    // -SetterFns_ cross-module ABI stub. See the .cpp definition.
+    llvm::Function* indexerItableAccessor(const sema::TypeSymbol* ts,
+                                          const sema::PropertySymbol* iimpl,
+                                          bool isSet);
 
     // §22.9: the block-form setter accessor of the property `target` names,
     // or null (auto-properties have backing storage and use the normal
@@ -3301,6 +3761,31 @@ private:
     // the compound-assignment read-modify-write path. Returns false when
     // `target` is not a block-setter property.
     bool lowerPropertySetValue(const ast::Expr& target, llvm::Value* v);
+
+    // fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): a DIRECT
+    // (non-itable, non-virtual) cross-module property SET — `importedObj.Prop
+    // := v` for a plain property declared or inherited on an imported class,
+    // accessed through the imported class's own type (not through an
+    // interface reference, which dispatches via lowerVirtualPropertySet
+    // instead). computedSetterOf returns nullptr for this shape (the imported
+    // PropertySymbol has no ast::PropertyDecl), so lowerPropertySet /
+    // lowerPropertyCompound bail before reaching lowerPropertySetValue; tried
+    // as a fallback AFTER lowerPropertySet fails. Calls the external setter
+    // stub (`bz$<Class>$<Prop>$propset`) declared by
+    // declareImportedPropertySetters — the direct-set twin of the imported-
+    // property getter fallback in LlvmBackend_Exprs.cpp (~4283-4300, issue
+    // #503). Returns false (so the caller's existing fallthrough is
+    // unaffected) when `target` is not an imported property with a declared
+    // setter stub.
+    bool lowerImportedPropertySet(const ast::Expr& target,
+                                  const ast::Expr& value);
+    // fix #2490 (§23.3/§4.6/§27.5/§28.9, v0.236): `valueExpr` (default
+    // nullptr for the `ref`/`out` write-back call site) is the source
+    // ast::Expr `v` was lowered from — see lowerVirtualPropertySet's comment
+    // just above for why a caller-side post-call release is needed now that
+    // the callee always retains.
+    bool lowerImportedPropertySetValue(const ast::Expr& target, llvm::Value* v,
+                                       const ast::Expr* valueExpr = nullptr);
 
     // §22.9: compound assignment `obj.P OP= rhs` on a block-form property —
     // a read-modify-write: read the current value through the getter, apply
@@ -3330,16 +3815,23 @@ private:
         for (const sema::Symbol* m : t->members) {
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
             if (fs && !isStaticField(fs)) { out.push_back(m); continue; }
-            if (isAutoProperty(m)) out.push_back(m);
+            // fix #2478 (§9.2/§22.8): isAutoPropertyStorage (not the bare
+            // decl-dependent isAutoProperty) so an IMPORTED auto-property
+            // occupies its correct storage slot — see that helper's comment
+            // for the confirmed memory-safety hazard this closes.
+            if (isAutoPropertyStorage(m)) out.push_back(m);
             // per §24.1 / §24.5 (#1176): each INSTANCE event declaration (sync
             // or async) gets a compiler-generated owned backing field of type
             // EventSource<T> / AsyncEventSource<T>, laid out as a plain `ptr`
             // slot. Static events (static-init backed) are handled separately in
             // the staticEventGlobals_ path and must not appear here.
             if (auto* es = dynamic_cast<const sema::EventSymbol*>(m)) {
-                if (auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl)) {
-                    if (!ed->isStatic) out.push_back(m);
-                }
+                // fix #2421 (§24/§2.8.2): eventIsStatic, not the bare
+                // decl-dependent `ed->isStatic` — an IMPORTED (decl-null) event
+                // was silently dropped here before, giving it no fieldIndex_
+                // slot so a directly-typed/imported-base event's EventSource
+                // lived at no offset.
+                if (!eventIsStatic(es)) out.push_back(m);
             }
         }
     }
@@ -3431,7 +3923,12 @@ private:
         for (const sema::Symbol* m : t->members) {
             auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
             if (fs && !isStaticField(fs)) { out.push_back(m); continue; }
-            if (sema::isAutoPropertySymbol(m)) out.push_back(m);
+            // fix #2478 (§9.2/§22.8): isAutoPropertyStorage (not the bare
+            // decl-dependent sema::isAutoPropertySymbol) so an IMPORTED
+            // record's auto-property occupies its correct storage slot —
+            // see that helper's comment (near isAutoProperty above) for the
+            // confirmed memory-safety hazard this closes.
+            if (isAutoPropertyStorage(m)) out.push_back(m);
         }
     }
 
@@ -3492,6 +3989,29 @@ private:
     // §33: the entry-point method's LLVM function is named `main`; every
     // other static method gets a mangled, collision-free name.
     std::string functionName(sema::MethodSymbol* ms);
+
+    // #1488 / §2.8.3 rule 3: the module-qualified mangling name for a type —
+    // "<declaring-module>.<TypeName>" — used as the `<Class>` component
+    // everywhere a "bz$"/"vt$"/"td$"/... symbol name is built from a
+    // sema::TypeSymbol. Two modules exporting a same-named public type (e.g.
+    // both declaring `public class Tx`) previously mangled identically
+    // ("bz$Tx$Hello" from both), which the linker rejected as a multiple
+    // definition (issue #1488) and which — even before the link step — made
+    // one compilation's OWN two external declarations of the same bare name
+    // collide (LLVM auto-uniquifying the second as "bz$Tx$Hello.1", a symbol
+    // that exists nowhere). Qualifying by the declaring module — carried on
+    // every TypeSymbol as `moduleName`, populated identically for a local
+    // declaration (SymbolCollection) and an imported one (ModuleLoader) so
+    // the exporter's definition and every importer's external declaration
+    // agree — makes every such symbol program-wide unique, matching
+    // §2.8.3 rule 3's identity ("declaring module name, ... qualified type
+    // name, and generic arity"). `ts` is never null at a genuine call site;
+    // the guard only covers a defensive/degenerate caller.
+    static std::string mangledTypeName(const sema::TypeSymbol* ts) {
+        if (!ts) return "";
+        if (ts->moduleName.empty()) return std::string(ts->name);
+        return ts->moduleName + "." + std::string(ts->name);
+    }
 
     // §26 (#433): is `ms` an extension method (declared in an `extension`
     // block)? Such a method has no `parent` TypeSymbol; its receiver type is
@@ -3640,6 +4160,98 @@ private:
     // stored in importedPropGetterFns_ for use by the property-access lowering.
     void declareImportedPropertyGetters();
 
+    // fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): the SETTER twin of
+    // emitExportedPropertyGetters — emit a named ExternalLinkage setter function
+    // `bz$<Class>$<Prop>$propset(ptr %this, T value) -> void` for every PUBLIC,
+    // non-virtual, non-indexer property WITH A SETTER on every PUBLIC, non-generic
+    // LOCAL class. No setter-side equivalent existed before this fix (confirmed
+    // empirically: `nm` on a compiled library object with a settable property
+    // showed `...$propget` but no `...$propset` symbol at all), so cross-module
+    // SETTING of a non-virtual imported property had no ABI surface whatsoever —
+    // independent of interfaces/itables. Mirrors emitExportedPropertyGetters
+    // exactly, including relying on ensurePropertyAccessorFn's own body-presence
+    // check (rather than a separate "hasSetter" filter here) to skip getter-only
+    // properties: it returns nullptr for those and the incomplete declaration is
+    // erased.
+    void emitExportedPropertySetters();
+
+    // fix #2400: the SETTER twin of declareImportedPropertyGetters — declare
+    // EXTERNAL setter stubs for every imported PropertySymbol that is not
+    // virtual (not in propSetSlot_), not an interface member (those dispatch
+    // through the itable), and actually HAS a setter per the imported
+    // MetaMember::hasSetter bit (ctx_.importedPropertyHasSetter — a new
+    // metadata field this fix adds; see its comment in ModuleMetadata.hpp).
+    // Unlike declareImportedPropertyGetters, this CANNOT declare unconditionally
+    // for every eligible property: Pass D's itable-building loop
+    // (LlvmBackend_Setup.cpp) calls ensurePropertyAccessorFn(ts, impl,
+    // isSet=true) for every property a LOCAL interface declares read-write,
+    // regardless of whether the concrete implementing property actually has a
+    // setter (no accessor-set matching check exists there — a separate,
+    // pre-existing gap) — a getter-only imported base property satisfying such
+    // an obligation would otherwise get a REAL relocation installed into the
+    // itable to a setter symbol the exporter never emitted, an unresolved-
+    // symbol link error at BUILD time regardless of whether the program ever
+    // writes through that slot (confirmed: this exact shape is in the
+    // pre-existing #2387/#2380 test fixtures). The stubs are stored in
+    // importedPropSetterFns_ for use by both the itable-slot fallback
+    // (ensurePropertyAccessorFn) and the direct (non-itable) property-set
+    // lowering path. MUST be called from the SAME call site as
+    // declareImportedPropertyGetters (inside declareVtables, after
+    // propSetSlot_ is populated by the buildVtable loops, before Pass D) —
+    // #2387 already discovered that calling this after declareVtables() returns
+    // leaves the map empty during Pass D, silently defeating the fallback.
+    void declareImportedPropertySetters();
+
+    // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): the
+    // INDEXER analog of emitExportedPropertyGetters — emit a named
+    // ExternalLinkage getter function `bz$<Class>$idxget$<arity>(ptr %this,
+    // idx...) -> T` for every PUBLIC, non-virtual, non-interface indexer on
+    // every PUBLIC, non-generic LOCAL class, so the importer has a stable
+    // cross-module symbol to call. Reuses ensureIndexerGetterFn (already
+    // exists for the itable-fill path) for the actual body — this just wraps
+    // it with ExternalLinkage, exactly as emitExportedPropertyGetters wraps
+    // ensurePropertyAccessorFn. Keyed by CLASS + ARITY, not the full
+    // index-parameter type signature (a documented simplification — see
+    // xmod_indexer_import_2414_test.cpp's file header): two indexer
+    // overloads of the SAME arity on one class would collide on this symbol;
+    // no spec example needs that shape, so it is left as a known limitation
+    // rather than built out here. Virtual/interface indexers already
+    // dispatch through the vtable/itable slot machinery (#1080/#730) and are
+    // excluded, matching emitExportedPropertyGetters's own exclusion.
+    void emitExportedIndexerGetters();
+
+    // fix #2414: the SETTER twin of emitExportedIndexerGetters immediately
+    // above — `bz$<Class>$idxset$<arity>(ptr %this, idx..., T value) ->
+    // void`, wrapping ensureIndexerSetterFn. Skipped (no wrapper emitted)
+    // when the class's indexer has no setter, mirroring
+    // emitExportedPropertySetters's reliance on the inner builder's own
+    // body-presence check.
+    void emitExportedIndexerSetters();
+
+    // fix #2414: the INDEXER analog of declareImportedPropertyGetters —
+    // declare an EXTERNAL `bz$<Class>$idxget$<arity>` stub for every
+    // imported PropertySymbol with isIndexer=true that is not virtual (not
+    // in propGetSlot_) and not an interface member (those dispatch through
+    // the itable — out of scope for this fix, see the test file's "SCOPE"
+    // note). Stored in importedIndexerGetterFns_ for lowerIndexerGet's
+    // decl-null fallback. Must run at the SAME call site as
+    // declareImportedPropertyGetters (inside declareVtables, after
+    // propGetSlot_ is populated, before Pass D) — #2387's ordering lesson
+    // applies identically here.
+    void declareImportedIndexerGetters();
+
+    // fix #2414: the SETTER twin — declare an EXTERNAL
+    // `bz$<Class>$idxset$<arity>` stub for every eligible imported indexer
+    // that ALSO has a setter per the reconstructed MetaMember::hasSetter bit
+    // (ctx_.importedPropertyHasSetter, reused from #2400 — see
+    // ModuleLoader.cpp's Indexer case, which publishes it through the same
+    // propHasSetter_ side table Property uses). Gating on the real bit
+    // (rather than declaring unconditionally) mirrors #2400's own documented
+    // reasoning: an unconditionally-declared external symbol the exporter
+    // never emitted (a getter-only indexer) would be an unresolved-symbol
+    // link error if ever referenced.
+    void declareImportedIndexerSetters();
+
     // CG17: assign vtable slots for a class, base-first. Slot 0 is Dispose
     // (handled at emit time); virtual methods take slots 1+. An override
     // reuses the base method's slot (matched by name — overloaded virtuals
@@ -3725,9 +4337,22 @@ private:
     // (mirrors how #1085 keys method-overload slots by arity).
     std::string indexerSlotKey(const sema::PropertySymbol* ps) {
         std::string key(ps->name);  // ".this"
-        // Key off the AST index-parameter type spellings (the same source
-        // lowerIndexerGet uses); the sema ParameterSymbols' resolvedDeclType is
-        // not reliably populated when buildVtable runs.
+        // fix #2545 (§23.4 / §12.1 / §2.8.2 clause 1, v0.236): an abstract
+        // IMPORTED indexer has no ast::PropertyDecl (ModuleLoader's Indexer
+        // case reconstructs `indexerParams` as ParameterSymbols with
+        // `resolvedDeclType`), but the key MUST still include the index-param
+        // TYPE spellings — otherwise the abstract base's key (just ".this")
+        // does NOT match the derived class's override key (".this#int."), and
+        // `buildVtable` invokes the existing assignSlot override reuse exactly
+        // once (key match) so the override gets a NEW slot (slot 8) instead of
+        // reusing the base's (slot 6). The vtable then has BOTH slots — the
+        // base's abstract slot is null (no body), and the override is at a
+        // different offset. The cross-module dispatch through the base slot
+        // lands on null, segfaulting the abstract-typed `b[i]` call. Read
+        // the parameter types from the reconstructed side tables (the same
+        // mirror of #2414's `indexerParamType` fallback) when the AST is
+        // absent, so the abstract base and the concrete derived class's
+        // overrides share the same key across the chain.
         if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
             for (const auto& p : pd->indexerParams) {
                 key += "#";
@@ -3736,6 +4361,57 @@ private:
                         key += std::string(part);
                         key += ".";
                     }
+                } else {
+                    key += "?";
+                }
+            }
+        } else {
+            for (sema::Symbol* p : ps->indexerParams) {
+                key += "#";
+                auto* pps = dynamic_cast<sema::ParameterSymbol*>(p);
+                sema::TypeRef* tr = pps ? pps->resolvedDeclType : nullptr;
+                if (!tr) {
+                    key += "?";
+                } else if (tr->kind == sema::TypeRef::Kind::Primitive) {
+                    // #2545: an imported indexer parameter's type is
+                    // reconstructed as a Primitive TypeRef (no AST, no
+                    // imports). Map the PrimitiveType enum to the same
+                    // lowercase spelling the local AST `parts` iteration
+                    // produces above (the source-keyed spelling — case
+                    // matters, e.g. "int" vs "Int"), so the abstract base's
+                    // key matches the derived class's override key.
+                    switch (tr->primitive) {
+                        case sema::PrimitiveType::Bool:    key += "bool";    break;
+                        case sema::PrimitiveType::Char:    key += "char";    break;
+                        case sema::PrimitiveType::String:  key += "string";  break;
+                        case sema::PrimitiveType::Byte:    key += "byte";    break;
+                        case sema::PrimitiveType::SByte:   key += "sbyte";   break;
+                        case sema::PrimitiveType::Short:   key += "short";   break;
+                        case sema::PrimitiveType::UShort:  key += "ushort";  break;
+                        case sema::PrimitiveType::Int:     key += "int";     break;
+                        case sema::PrimitiveType::UInt:    key += "uint";    break;
+                        case sema::PrimitiveType::Long:    key += "long";    break;
+                        case sema::PrimitiveType::ULong:   key += "ulong";   break;
+                        case sema::PrimitiveType::Float:   key += "float";   break;
+                        case sema::PrimitiveType::Double:  key += "double";  break;
+                        case sema::PrimitiveType::Decimal: key += "decimal"; break;
+                        case sema::PrimitiveType::Object:  key += "Object";  break;
+                        default:                           key += "?";       break;
+                    }
+                    key += ".";
+                } else if (!tr->headName().empty()) {
+                    // headName() returns the alias-transparent head for a
+                    // Named type (the underlying builtin head for an alias,
+                    // the use-site syntactic head for a local Named type, the
+                    // metadata importedName for an imported type). The local
+                    // AST path above iterates over parts with "." separators;
+                    // for an imported/abstracted key this single-head
+                    // shorthand is enough (the override's key, computed
+                    // locally with the same shape, ends in the same head).
+                    for (auto part : tr->headName()) {
+                        key += part;
+                    }
+                    key += ".";
                 } else {
                     key += "?";
                 }
@@ -3798,8 +4474,12 @@ private:
             for (sema::Symbol* m : t->members) {
                 auto* es = dynamic_cast<sema::EventSymbol*>(m);
                 if (!es || es->name != name) continue;
-                auto* ed = dynamic_cast<const ast::EventDecl*>(es->decl);
-                if (ed && !ed->isStatic && !ed->isAsync &&
+                // fix #2421 (§24/§2.8.2): eventIsStatic/eventIsAsync, not
+                // the bare decl-dependent bits — an event inherited from an
+                // IMPORTED base (decl-null) was silently never resolved here,
+                // so the implementing class's itable got a null accessor for a
+                // sync imported-base event the exporter did lay out.
+                if (!eventIsStatic(es) && !eventIsAsync(es) &&
                     fieldIndex_.count(es))
                     return es;
             }
@@ -4451,6 +5131,26 @@ private:
     };
     ArrEnumMachinery ensureArrayEnumMachinery(llvm::Type* elemTy);
 
+    // #2471 (stdlib §4.11; language spec §29.1, agreeing with #2472's
+    // for-loop fix): the REVERSE-order twin of ensureArrayEnumMachinery /
+    // wrapArrayAsIEnumerable, for Stack<T>/OwningStack<T>'s explicit
+    // `.GetEnumerator()` call. Same 4-field struct layout { vtable, arr,
+    // idx, esz } and the same Dispose/Current bodies, but MoveNext COUNTS
+    // DOWN (`idx--; return idx >= 0`) instead of up, and the "before-first"
+    // sentinel is `bz_array_len(arr)` (a RUNTIME value fetched fresh on
+    // every wrap/clone) instead of the forward machinery's fixed `-1` —
+    // reverse iteration's starting point depends on the collection's
+    // current length, which the constant sentinel has no way to express.
+    // A distinct name prefix ("stackenum."/"bz$stackenum$..." vs
+    // "arrenum."/"bz$arrenum$...") keeps this cache fully separate from the
+    // forward machinery even though the struct shape is identical — the two
+    // must never be interchanged (a forward-cursor MoveNext on a
+    // reverse-initialized struct, or vice versa, would silently read
+    // out-of-bounds or terminate immediately).
+    ArrEnumMachinery ensureStackEnumMachinery(llvm::Type* elemTy);
+    llvm::Value* wrapStackAsIEnumerator(llvm::Value* arr,
+                                        const sema::TypeRef* iEnumTy);
+
     // §29 / §12.9 (#1850): wrap an array-backed collection whose ELEMENTS are
     // themselves array-backed collections viewed covariantly as IEnumerable<T>
     // (`Array<Array<Dog>>` → `IEnumerable<IEnumerable<Dog>>`). The plain
@@ -4504,10 +5204,23 @@ private:
     // it exactly once, after the call, on both the normal and unwind edges — the
     // callee never disposes a borrowed arg), so the drained array is leak-free
     // and never double-freed.
+    //
+    // fix #1069 / stdlib §4.10: a `Set<T>` / `OwningSet<T>` source is handled
+    // here too. A CLASS-element set is bz_array_t-backed and its backing IS the
+    // dense element array, so it takes the plain (BORROWING) array enumerator; a
+    // DICT-backed set (value/record/string element) is a hash table with no dense
+    // element array, so it is snapshotted (bz_lazy_from_set → bz_lazy_to_array)
+    // into a fresh array behind an OWNING enumerator. `outOwningWrap`, when
+    // non-null, reports whether the returned value is such an OWNING enumerator
+    // the CALLER must dispose exactly once (true for both the lazy-pipeline drain
+    // and the dict-backed-set snapshot). A RETURN site can ignore it — the caller
+    // owns a returned enumerator by construction (#1916); the ARGUMENT site must
+    // consult it and register the scope-end iterEnumDispose (#1923).
     llvm::Value* wrapAsIEnumerableForTarget(llvm::Value* v,
                                             const sema::TypeRef* targetTy,
                                             const ast::Expr* srcExpr,
-                                            bool ownLazyPipeline = false);
+                                            bool ownLazyPipeline = false,
+                                            bool* outOwningWrap = nullptr);
 
     // #1916 / #1911 / stdlib §5 / §29.11: drain a lazy LINQ pipeline (bz_lazy_t*)
     // once into a fresh owned Array<T> (bz_lazy_to_array also disposes the
@@ -4566,6 +5279,67 @@ private:
     llvm::Value* wrapLinkedListAsIEnumerable(llvm::Value* list,
                                              const sema::TypeRef* iEnumTy);
 
+    // #2471 (stdlib §4.8/§4.12; language spec §29.1, v0.236): wrap a
+    // Dictionary<K,V>'s entries as a vtable-backed IEnumerable<DictionaryEntry<K,V>>.
+    // Dictionary is hash-backed (bz_dict_t*) with a DictionaryEntry<K,V> Current
+    // type, so (unlike Array/Stack/Queue) its entries are not stored as a dense
+    // element array — they must be materialised. Snapshots the live keys +
+    // values via bz_dict_keys_*/bz_dict_values_*, decodes each pair into a
+    // {K, V} struct (matching lowerDictEntryFor's layout, including the
+    // record-box and nullable-value shapes), appends each to a fresh owned
+    // bz_array_t, frees the snapshot buffers, and wraps the result via
+    // wrapOwnedArrayAsIEnumerable. The returned IEnumerable is OWNING — the
+    // caller's slot-1 Dispose frees the materialised snapshot exactly once; the
+    // SOURCE dictionary is untouched (no entry retained/released/disposed), so
+    // an owning dictionary still disposes each value at its own binder's scope
+    // end. `iEnumTy` is the call's result type — `IEnumerable<DictionaryEntry<K,V>>`
+    // whose genericArgs[0] gives the entry element type/stride.
+    llvm::Value* wrapDictionaryAsIEnumerable(
+        llvm::Value* dict, const sema::TypeRef* iEnumTy);
+
+    // fix #2522 (stdlib §4.8/§4.12; language spec §29.1, v0.236): the
+    // string-keyed sibling of wrapOwnedArrayAsIEnumerable, used by
+    // wrapDictionaryAsIEnumerable when the rebuilt DictionaryEntry<K,V>
+    // array's K field (offset 0) holds a ref-counted bz_string*. The plain
+    // owning Dispose (`bz_array_free(arr, null)`) cannot reach struct-
+    // embedded string pointers — bz_array_free's element-disposer is
+    // `void(*)(void*)` and treats each slot as a pointer. This wrapper's
+    // Dispose walks arr->count slots via bz_array_ptr_at, calls
+    // bz_string_release on the string at each struct offset 0, then frees
+    // the array (null disposer) and the wrapper struct. MoveNext/Current
+    // are reused from the plain array-enum machinery (they don't touch
+    // element ownership). `entryStTy`/`esz` describe the materialised
+    // {K, V} struct layout used to size the slot walk.
+    llvm::Value* wrapDictionaryEntryArrayAsIEnumerable(
+        llvm::Value* arr,
+        const sema::TypeRef* iEnumTy,
+        llvm::StructType* entryStTy,
+        int64_t esz);
+
+    // fix #2546 (stdlib §4.17/§4.18; language spec §29.1, v0.236):
+    // SortedDictionary<K,V>.GetEnumerator() — snapshot+sort+wrap. Same
+    // materialisation as wrapDictionaryAsIEnumerable, but with a sort step
+    // after the snapshot so the entries iterate in ascending key order
+    // (matching the for-loop path's #1426 promise). String keys use
+    // bz_sort_kv_str (strncmp per §9.6); generic keys use bz_sort_kv_gen
+    // with a per-element-type comparator built by buildSortedKeyComparator.
+    // Lives in LlvmBackend_Calls2.cpp (not LlvmBackend_Assign.cpp) to avoid
+    // the lane-D file-disjoint restriction; the wrap helper is identical
+    // in spirit to wrapDictionaryAsIEnumerable but with the sort interleaved.
+    llvm::Value* wrapSortedDictionaryAsIEnumerable(
+        llvm::Value* dict, const sema::TypeRef* iEnumTy);
+
+    // fix #2546 (stdlib §4.18; language spec §29.1, v0.236):
+    // SortedSet<T>.GetEnumerator() — snapshot+sort+wrap. Same key-snapshot
+    // pattern as wrapDictionaryAsIEnumerable (no values), but with a sort
+    // step so the elements iterate in ascending order. Returns the same
+    // OWNING-vtable-backed wrapper shape as wrapOwnedArrayAsIEnumerable,
+    // so the same slot-4-getenumerator + slot-1-dispose dance in the
+    // dispatch applies.
+    llvm::Value* wrapSortedSetAsIEnumerable(
+        llvm::Value* set, const sema::TypeRef* iEnumTy);
+
+
     // §29.2 (#552): wrap a user-class instance (implementing IEnumerable<T>)
     // in a type-specific vtable-backed enumerator compatible with the iterator
     // state machine protocol ([0]=td, [1]=Dispose, [2]=MoveNext→i1,
@@ -4575,9 +5349,24 @@ private:
     // expected, so that lowerIEnumerableBuiltinFor's vtable dispatch works
     // uniformly for all IEnumerable<T> sources. Returns src unchanged on
     // resolution failure (GetEnumerator or enumerator-class not found).
+    //
+    // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): `ownsSrc` tells the
+    // generated wrapper whether ITS OWN scope-end disposal is `src`'s ONLY
+    // disposer (a genuinely unnamed temporary — `var s: IEnumerable<int> :=
+    // new IntRange(...);`) as opposed to a NAMED, independently-owned source
+    // that disposes itself at its own scope end (freeing it here too would
+    // double-free). This is call-SITE data, not a per-(enumerator class)
+    // constant — the SAME cached wrapper function (keyed on the (source,
+    // enumerator) class pair, see the .cpp) may be reached from both a
+    // temporary and a named call site across a program, so it is threaded
+    // through as a stored runtime flag on the wrapper instance, not baked
+    // into the shared IR function. Defaults to `false` (preserves the
+    // pre-#2424 behavior — never dispose `src`) for every call site that has
+    // not been individually analyzed for named-vs-temporary ownership.
     llvm::Value* wrapUserClassAsIEnumerable(llvm::Value* src,
                                             const sema::TypeSymbol* srcTs,
-                                            const sema::TypeRef* iEnumTy);
+                                            const sema::TypeRef* iEnumTy,
+                                            bool ownsSrc = false);
 
     // §29.2 (#552): generate (or reuse) a standalone thunk function for an
     // expression-form property getter (`property P: T => expr` or
@@ -4861,6 +5650,19 @@ private:
     // buildOrderedArgs, #993/#1918) BEFORE branching here to free `obj`.
     llvm::BasicBlock* newArgUnwindCleanup(llvm::Value* obj);
 
+    // fix #1073 / §28.14 / §28.3 "Exception-path discharge" / §28.9: the
+    // EXCEPTION-edge half of the call-bounded closure ARGUMENT-PASS release.
+    // Builds a cleanup block that drops the producer's +1 on each inline-closure
+    // argument and then continues to the CURRENT enclosing unwind (`unwindBB()`,
+    // captured before the caller overrides `unwindTarget_`). `lowerCall`
+    // installs it as `unwindTarget_` ONLY across `emitMethodCall` and restores
+    // the previous target immediately after, so its predecessors are exactly the
+    // unwind edges of that call — disjoint from the normal-path release emitted
+    // in the pending check's `cont` block. See the definition for the
+    // exactly-once argument.
+    llvm::BasicBlock* closureArgUnwindCleanup(
+        const std::vector<llvm::Value*>& closures);
+
     // §28.2 / §28.4: dispatch an object's PUBLIC idempotent Dispose through its
     // vtable (slot 1) — runs the destructor + owned fields + base chain at most
     // once. Does NOT free the block. `obj` must be non-null. Used as the dispatch
@@ -5065,6 +5867,19 @@ private:
     llvm::Value* emitRemoveElementEquality(llvm::Value* el, llvm::Value* target,
                                            const sema::TypeRef* elemTy,
                                            bool elemIsClass);
+
+    // stdlib §4.10 / §8.3 (#837 / #1474 / #1070): dedup-insert `item` into the
+    // ARRAY-BACKED `Set<T>`/`OwningSet<T>` whose bz_array_t backing is `setArr`
+    // (a class/interface element T — genericBackingType declines those, so the
+    // set is a linear-scan array, not a hash table). A duplicate (per the §8.3
+    // equality of `elemRef`) is passed to `dupDisposer` when non-null (the
+    // OWNING family disposes the rejected element, §4.10) and not appended;
+    // otherwise `item` is appended via bz_array_add. Shared by the `.Add` /
+    // `.UnionWith` call paths and the §15.4 literal materializer. Returns false
+    // only on an internal emitRemoveElementEquality failure.
+    bool emitArrayBackedSetInsert(llvm::Value* setArr, llvm::Value* item,
+                                  const sema::TypeRef* elemRef,
+                                  llvm::Function* dupDisposer, int64_t esz);
 
     // §28.4 step 3: chain to the base class's Dispose. baseTypes[0] is
     // conventionally the base class when it resolves to one.
@@ -5580,14 +6395,90 @@ private:
     // Such a field holds a runtime-managed reference whose +1 must be
     // released when the record value dies (§28.9, §9.7 — a record has no
     // disposer, so the discipline falls on the caller / disposal walker).
+    //
+    // fix #2405 / §9.7 / §28.9: RECURSES into a non-nullable nested-record
+    // storage member — a string owned two-or-more levels deep still needs
+    // releasing, matching emitRecordStringFieldReleases_impl's mirrored
+    // recursion (see its comment for the termination argument: sema rejects
+    // a record that transitively contains itself by value, §9, so this walk
+    // is over a finite DAG). This is the SHARED classifier both the
+    // deserialize disposal-scope registration (#2398/#2405,
+    // LlvmBackend_Serialization.cpp) and the #1747 record-call-result
+    // scope-end release (LlvmBackend_Setup.cpp) key off of via
+    // isRecordWithStringFieldsTypeRef below — recursing here is required
+    // for BOTH sites' matching release walk to ever recurse past one level
+    // (each site's own release walker calls this same function to decide
+    // whether to descend into a nested-record member), and is safe for the
+    // #1747 site: a record value's fields carry whatever +1 was minted at
+    // ITS OWN construction (no separate per-level retain step exists to
+    // fall out of sync with — #1747's own landed commit message: "no extra
+    // +1 mint is needed ... the record VALUE carries its fields' +1
+    // references to the caller" — a fact that holds compositionally at any
+    // nesting depth, since a by-value struct copy/embed never touches a
+    // refcount).
+    // fix #2425 / §9.8 / §35.4 v0.235: ALSO recurses into a non-nullable
+    // CHOICE-typed storage member — a record component may itself be a
+    // value-like choice (§9.8's record-admissibility clause), whose own
+    // payload fields (in any declared case) may own a string directly or
+    // transitively through a further nested record/choice payload. This is
+    // the choice-side mirror of the #2405 nested-record recursion just
+    // above; see choiceHasStringFields (LlvmBackend_Disposal.cpp) for the
+    // choice-side termination argument (§35.1 self-containment).
     bool recordHasStringFields(const sema::TypeSymbol* ts) {
         if (!ts || ts->kind != ast::TypeDeclKind::Record) return false;
         std::vector<const sema::Symbol*> storage;
         collectRecordStorage(ts, storage);
         for (const sema::Symbol* m : storage) {
             if (isStringStorageMember(m)) return true;
+            const sema::TypeRef* mty = recordMemberType(m);
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
+                mty->declaration->kind == ast::TypeDeclKind::Record &&
+                recordHasStringFields(mty->declaration))
+                return true;
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::Named && mty->declaration &&
+                mty->declaration->kind == ast::TypeDeclKind::Choice &&
+                choiceHasStringFields(mty->declaration))
+                return true;
         }
         return false;
+    }
+
+    // fix #2425 / §9.8 / §28.9 / §35.4 v0.235: does value-like choice `ts`
+    // own, directly (a `string` payload field in some declared case) or
+    // transitively (through a non-nullable nested-record or nested-choice
+    // payload field), at least one `string`? Mirrors recordHasStringFields's
+    // mutual recursion just above. Termination: §35.1's choice
+    // self-containment check (TypeResolution_Checks.cpp's
+    // checkChoiceSelfContainment, which reuses recordValueContainsSelf —
+    // "a choice cannot recursively contain itself by value through its case
+    // payloads") rejects a choice/record graph cycle at DECLARATION time
+    // exactly as §9 rejects a self-containing record, so the combined
+    // record+choice value-type graph reachable from any record or choice
+    // declaration is a finite DAG regardless of which kind starts the walk
+    // — the same basis emitStructEquality and the #2405 record recursion
+    // rely on. Defined in LlvmBackend_Disposal.cpp, next to the release
+    // walker it gates. Declared here so recordHasStringFields (above) and
+    // emitRecordStringFieldReleases_impl (above) can call it.
+    bool choiceHasStringFields(const sema::TypeSymbol* ts);
+
+    // fix #2425 / §9.8 / §28.3 / §28.9 / §35.4 v0.235: release the ACTIVE
+    // case's `string`-owning payload(s) of value-like choice `choiceTy` at
+    // struct ADDRESS `choiceAddr`, recursing into a non-nullable nested
+    // record/choice payload field to ARBITRARY depth — the choice-side
+    // counterpart to emitRecordStringFieldReleases/_impl. Defined in
+    // LlvmBackend_Disposal.cpp. Used by the #2398/#2425 deserialize
+    // disposal-scope registration (LlvmBackend_Serialization.cpp); NOT the
+    // same mechanism as #2115's emitValueLikeChoiceActiveCaseStrRelease
+    // (a separate, VALUE-based, one-level walker for the scope-end LOCAL
+    // release, LlvmBackend_Setup.cpp/_Disposal.cpp) — see the #2425/#2428
+    // lane report for which mechanism covers which shape.
+    void emitChoiceStringFieldReleases_impl(llvm::Value* choiceAddr,
+                                            const sema::TypeSymbol* choiceTy);
+    void emitChoiceStringFieldReleases(llvm::Value* choiceAddr,
+                                       const sema::TypeSymbol* choiceTy) {
+        emitChoiceStringFieldReleases_impl(choiceAddr, choiceTy);
     }
 
     // fix #1747 / §28.9 / §9.7 / §28.3: is `tr` a (non-nullable) record
@@ -5606,48 +6497,139 @@ private:
     // of record `ts` at the struct ADDRESS `recAddr`. For each string
     // field: GEP the slot, load the string pointer, bz_string_release (null-
     // safe / sentinel-no-op), null the slot. Used by the recordStringFields
-    // scope-end Disposal to balance the callee-minted +1.
+    // scope-end Disposal.
+    //
+    // fix #2448 / §9.7 / §28.9 (v0.235): this release is balanced NOT by a
+    // callee-side retain (no such retain runs — see #2453, which removed
+    // the never-wired `emitRecordStringFieldRetains`/`_impl` and the
+    // never-set `currentReturnIsRecord_` flag that #1747-era comments here
+    // used to credit with minting that +1) but by
+    // `recordCallResultReleaseEligible_` only admitting a local whose
+    // initializer is PROVABLY a fresh, alias-free construction
+    // (`isFreshRecordConstructionOfExactType` / `isProvablyFreshRecordFactoryMethod`,
+    // LlvmBackend_Setup.cpp): each string field's value already carries
+    // whatever +1/borrow state it had AT CONSTRUCTION (a by-value return is
+    // a bit-copy that touches no refcount), and the eligibility walk proves
+    // that state is exclusively this local's to release — no separate mint
+    // step is needed or exists.
     void emitRecordStringFieldReleases(llvm::Value* recAddr,
                                        const sema::TypeSymbol* ts) {
         emitRecordStringFieldReleases_impl(recAddr, ts);
     }
 
-    // fix #1747 / §28.9: retain each string storage member of record VALUE
-    // `recVal` (a struct SSA value — spilled to a temp, GEP + load +
-    // bz_string_retain). Used on the callee side after `return new P(...)`
-    // to mint the +1 the returned record carries out to the caller. The
-    // retained +1 is what the caller's scope-end recordStringFields
-    // Disposal balances. A literal field is a sentinel — its retain is a
-    // no-op (bz_string_retain is null-/sentinel-safe).
-    void emitRecordStringFieldRetains(llvm::Value* recVal,
-                                      const sema::TypeSymbol* ts) {
-        emitRecordStringFieldRetains_impl(recVal, ts);
-    }
-
-    // fix #1747 / §28.9 / §9.7 / §28.3: set while lowering the operand of
-    // a ReturnStmt whose declared return type is a record with string
-    // fields. Detected as a NewExpr of the matching record — read here to
-    // retain each string field after construction, transferring one +1 out
-    // of the callee to the caller.
-    bool currentReturnIsRecord_ = false;
-
     // fix #1747 / §28.9 / §9.7 / §28.3: the set of plain `var` RECORD
     // LocalDecl nodes whose declared type owns at least one `string` field,
     // whose initializer is a CALL returning that record (`var p := Mk()`),
-    // and which the conservative escape walk proved never to escape. The
-    // callee mints the +1 each string field owns (the narrow NewExpr
-    // return path's emitRecordStringFieldRetains), so the caller's scope-
-    // end recordStringFields Disposal balances it (no double-free, no
-    // UAF). A NewExpr-init local, a copy (`var q := p`), a with-copy, a
-    // by-value-argument, a collection/field store, or a nullable result
-    // keeps the prior safe-leak behaviour — the walker over-approximates
-    // and the eligibility is intentionally narrow.
+    // and which the conservative escape walk proved never to escape.
+    //
+    // fix #2448 / §9.7 / §28.9 (v0.235): ALSO now requires the CALLEE be
+    // isProvablyFreshRecordFactoryMethod-eligible (see that function). The
+    // ORIGINAL #1747 gate admitted ANY CallExpr returning a record-with-
+    // string-fields type, reasoning (per its own comment, since corrected)
+    // that the callee always "mints the +1" on return — but no such mint
+    // ever existed (see the #2448 discovery note above): a record's string
+    // field carries whatever +1/borrow state it had AT CONSTRUCTION,
+    // unchanged by a by-value return (a bit-copy touches no refcount). That
+    // is sound ONLY when the callee's return value is a fresh, alias-free
+    // construction (isFreshRecordConstructionOfExactType) — NOT when it is
+    // a BORROWED value already reachable from a longer-lived binding (a
+    // plain field read, `return this.f;`, empirically confirmed as a
+    // heap-use-after-free: the caller's scope-end release frees a string
+    // the field's owner still references). A NewExpr-init local, a copy
+    // (`var q := p`), a with-copy, a by-value-argument, a collection/field
+    // store, or a nullable result keeps the prior safe-leak behaviour — the
+    // walker over-approximates and the eligibility is intentionally narrow.
     std::unordered_set<const void*> recordCallResultReleaseEligible_;
     llvm::Function* recordCallResultReleaseEligibleFn_ = nullptr;
 
     // fix #1747: walk the function body, classifying each plain-`var`
     // record-call-result LocalDecl by escape verdict.
     void collectRecordCallResultReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
+    // fix #2448 / §9.7 / §28.9 (v0.235): is `expr` a provably fresh, alias-
+    // free construction of EXACTLY record type `recTs`? See the definition
+    // (LlvmBackend_Setup.cpp) for the full rationale.
+    bool isFreshRecordConstructionOfExactType(
+        const ast::Expr* expr, const sema::TypeSymbol* recTs) const;
+
+    // fix #2448 / §9.7 / §28.9 (v0.235): is MethodSymbol `ms` provably a
+    // "fresh record factory" for record `recTs`? Consulted by
+    // collectRecordCallResultReleaseEligible to close the #2448 use-after-
+    // free (a caller-side gate blind to the callee's own body). See the
+    // definition (LlvmBackend_Setup.cpp) for the full rationale and its
+    // deliberately narrow scope.
+    bool isProvablyFreshRecordFactoryMethod(
+        const sema::MethodSymbol* ms, const sema::TypeSymbol* recTs) const;
+
+    // fix #2428 / §9.8 / §28.9 / §35.4, generalized by fix #2448 / §9.7: is
+    // `call` a call to SOME type's own SYNTHESIZED `Deserialize` factory?
+    // Returns the resolved TypeSymbol (Record or Choice) when recognized,
+    // null otherwise. Shared recognition logic behind both
+    // isSynthesizedValueLikeChoiceDeserializeCall (choice-kind check) and
+    // isSynthesizedRecordDeserializeCall (record-kind check) below. See the
+    // definition (LlvmBackend_Setup.cpp) for the full rationale.
+    const sema::TypeSymbol* resolveSynthesizedDeserializeCallTarget(
+        const ast::CallExpr* call) const;
+
+    // fix #2448 / §9.7 / §28.9 (v0.235): is `call` a call to record
+    // `recTs`'s own synthesized `Deserialize` factory? An UNCONDITIONALLY
+    // sound alternative to isProvablyFreshRecordFactoryMethod — a
+    // synthesized Deserialize's body is codegen-emitted directly
+    // (emitRecordDeserialize), never a user ast::MethodDecl, so
+    // isProvablyFreshRecordFactoryMethod's AST-body walk can never admit
+    // it; without this alternative, `var back := Root.Deserialize(d);`
+    // would silently lose the release coverage the PRIOR (unsound) #1747
+    // gate happened to also provide for this exact shape. See the
+    // definition (LlvmBackend_Setup.cpp) for the full rationale.
+    bool isSynthesizedRecordDeserializeCall(
+        const ast::CallExpr* call, const sema::TypeSymbol* recTs) const;
+
+    // fix #2428 / §9.8 / §28.9 / §35.4: is `call` a call to a value-like
+    // choice type's own SYNTHESIZED `Deserialize(d: IDeserializer)` factory
+    // — the ONE call shape admitted for the #2428 call-result release below
+    // (deliberately narrower than #1747's own "any CallExpr returning the
+    // type" gate — mirroring that general gate was found, during this
+    // issue's own scoping, to be UNSOUND even for records: a callee that
+    // returns a BORROWED value rather than a fresh construction has no
+    // genuine +1 for the caller to release; a heap-use-after-free,
+    // empirically confirmed and filed as #2448, not fixed here). A
+    // SYNTHESIZED Deserialize is provably always a fresh construction — it
+    // is compiler-generated, so there is no user body that could instead
+    // return a borrowed field/param — so admitting ONLY this shape keeps
+    // the release sound without a whole-callee-body analysis. Structurally
+    // mirrors the EXACT recognition LlvmBackend_Serialization.cpp's own
+    // call-site dispatch uses to route `Type.Deserialize(d)` to
+    // emitChoiceDeserialize (methodName=="Deserialize", one arg, callee
+    // target is an IdentifierExpr naming a TypeSymbol, the type declares
+    // IDeserializable, and has no hand-written "Deserialize" method — a
+    // hand-written Deserialize suppresses synthesis, §9.8, and need not be
+    // fresh-construction-shaped). Defined in LlvmBackend_Setup.cpp, next to
+    // its sole caller (collectValueLikeChoiceCallResultReleaseEligible).
+    // GENERIC choices are excluded (ts->genericParams must be empty),
+    // matching #2425's own documented generic decline.
+    bool isSynthesizedValueLikeChoiceDeserializeCall(
+        const ast::CallExpr* call) const;
+
+    // fix #2428 / §9.8 / §28.9 / §35.4: the set of plain `var` VALUE-LIKE
+    // CHOICE LocalDecl nodes whose initializer is a call recognized by
+    // isSynthesizedValueLikeChoiceDeserializeCall, whose resolved type
+    // (declared or inferred) is that SAME non-nullable, non-generic choice
+    // with at least one string reachable from its active case
+    // (choiceHasStringFields, #2425), and which the conservative escape
+    // walk proved never to escape. Consulted in lowerLocalDecl
+    // (LlvmBackend_Setup.cpp), mirroring recordCallResultReleaseEligible_
+    // exactly. Released via the SAME choiceStringFields Disposal / arbitrary-
+    // depth emitChoiceStringFieldReleases walker #2425 built for the
+    // deserialize disposal scope — reused here rather than a third ad hoc
+    // mechanism, per #2425's own filed recommendation ("one shared...
+    // walker... rather than two parallel ad hoc mechanisms").
+    std::unordered_set<const void*> valueLikeChoiceCallResultReleaseEligible_;
+    llvm::Function* valueLikeChoiceCallResultReleaseEligibleFn_ = nullptr;
+
+    // fix #2428: walk the function body, classifying each plain-`var`
+    // value-like-choice call-result LocalDecl by escape verdict.
+    void collectValueLikeChoiceCallResultReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
     // #429: is the resolved TypeRef `rt` a (non-nullable) `string`? Used to
@@ -5788,6 +6770,40 @@ private:
     // each param into a new alloca recorded in `paramSlots_`. Kind-agnostic.
     void emitFrameCaptureRestores(const StateMachineFrame& frame,
                                   llvm::Value* self);
+
+    // §29.8 / §30.1 (#973a): per state-machine FUNCTION, the frame pointer its
+    // captures were restored from and the capture-field index of each `owned`
+    // PARAMETER in it. Together they let a discharge lowered inside a
+    // state-machine body write the runtime moved-from flag —
+    // nullStateMachineOwnedParamCapture stores null into the FRAME slot, not
+    // just the restored alloca — so the frame's null-guarded terminal-state
+    // disposal skips a parameter the body moved out on this path.
+    //
+    // Keyed by `llvm::Function*` rather than held as three scalars ON PURPOSE:
+    // emitting a body can recursively emit ANOTHER function (a lazily
+    // monomorphized generic callee, a nested async lambda), and that inner
+    // emission calls emitFrameCaptureRestores too. Scalars would be clobbered
+    // and the OUTER body's later adoption would silently skip its frame null —
+    // a missed moved-from flag is a DOUBLE FREE, not a leak. A per-function map
+    // survives any nesting depth, and the lookup keys on the function being
+    // emitted right now, so a write can only ever land in its own frame. The
+    // Emitter is constructed per module, so the map never outlives the
+    // `llvm::Function*`s it keys on.
+    struct SmFrameCaptures {
+        llvm::Value* self = nullptr;
+        llvm::StructType* structTy = nullptr;
+        std::unordered_map<const sema::Symbol*, unsigned> ownedParamField;
+    };
+    std::unordered_map<const llvm::Function*, SmFrameCaptures> smFrameCaptures_;
+
+    // §29.8 / §30.1 (#973a): null the FRAME capture slot of the `owned`
+    // state-machine parameter named by the bare identifier `src`, if any. A
+    // no-op outside a state-machine body, for a non-parameter/borrow source,
+    // and for a parameter that is not a frame capture. Called beside the #1978
+    // `nullTransferredOwnedLocalSlot` at the marked-adoption lowering — the one
+    // discharge form common::stateMachineOwnedParamIsFrameNullable admits — so
+    // `admitted ⟹ frame slot nulled` is exact.
+    void nullStateMachineOwnedParamCapture(const ast::Expr* src);
 
     // Emit the resume dispatch: a `done` block (returns the kind's "exhausted"
     // value via `emitDone`), N+1 state blocks (entry + one per suspend point),
@@ -6272,6 +7288,52 @@ private:
     // type without lazy static state (generic types, types with no static init).
     void emitEnsureStaticInit(const sema::TypeSymbol* owner);
 
+    // #1513 / §2.8.3 rule 4 / §22.12 rule 1: get-or-create the shared,
+    // LinkOnceODR, per-instantiation static-field global for `fs` under the
+    // substitution described by (substTypes, substIds, substSemaTys,
+    // typeArgMangle) — the SAME redirect condition/key staticFieldGlobal's
+    // generic branch already computes. Factored out so genericInstSfinitFn can
+    // materialize a SIBLING field's per-instantiation global (one instantiation
+    // has ONE ensureinit covering every static field of that instantiation,
+    // mirroring the per-type design where one ensureinit covers a whole type).
+    llvm::GlobalVariable* getOrCreateGenericInstStaticGlobal(
+        const sema::FieldSymbol* fs,
+        const std::vector<llvm::Type*>& substTypes,
+        const std::vector<const void*>& substIds,
+        const std::vector<const sema::TypeRef*>& substSemaTys,
+        const std::string& typeArgMangle);
+
+    // #1513: lazily build (once per instantiation, LinkOnceODR) the "sfinit"
+    // function that stores every one of `ts`'s non-constant static field
+    // initializers into instantiation `typeArgMangle`'s per-instantiation
+    // globals. T-independent initializers only (mirrors the #709 loop's
+    // limitation in emitStaticConstructorBody — an initializer whose VALUE
+    // depends on the instantiation's type argument needs per-instantiation
+    // lowering that is not yet supported, tracked as a follow-up exactly like
+    // the existing local-generic limitation).
+    llvm::Function* genericInstSfinitFn(const sema::TypeSymbol* ts,
+                                        const std::string& typeArgMangle);
+
+    // #1513 / #1391: lazily build (once per instantiation, LinkOnceODR) the
+    // ensureinit function for generic type `ts`'s instantiation
+    // `typeArgMangle` — the generic-instantiation counterpart of
+    // emitEnsureInitFns's per-type functions, at FULL parity with that
+    // function's #1391 hardening: an atomic cmpxchg for the uninit->
+    // in-progress claim, same-thread owner-tracking for the re-entrancy
+    // backstop, and genuine cross-domain blocking (bz_static_init_wait/
+    // notify) — required because this guard's state is LinkOnceODR (shared
+    // across domains for real), so a racing double-init is reachable here
+    // exactly as it is for the per-type case.
+    llvm::Function* genericInstEnsureInitFn(const sema::TypeSymbol* ts,
+                                            const std::string& typeArgMangle);
+
+    // #1513: emit a call to the per-instantiation ensureinit for `key` (looked
+    // up via genericInstGlobalKeyOf_ from a global staticFieldGlobal returned),
+    // then route a possible TypeInitializationException through the current
+    // unwind target — the generic-instantiation counterpart of
+    // emitEnsureStaticInit(TypeSymbol*).
+    void emitEnsureGenericInstStaticInit(const GenericInstKey& key);
+
     // #1553 / §22.13 (v0.181): the ordinal of `fs` among its type's non-constant
     // static-field initializers in textual declaration order (the sequence sfinit
     // stores, and initProgress counts). Returns -1 for a field sfinit does not
@@ -6333,13 +7395,31 @@ private:
     // initFns_.
     llvm::Function* declareImportedInit(const sema::TypeSymbol* ts);
 
+    // fix #2452 (§22.8 step 1-2 / §2.5 / §2.8.2-§2.8.3, v0.235): run an
+    // IMPORTED, no-explicit-ctor base's own construction sequence (its own
+    // base chain + its own field initializers) via the already-exported
+    // `bz$<Base>$init`, instead of `emitOwnFieldInit(base, …)` — which walks
+    // `ast::FieldDecl`/`PropertyDecl` initializers off each member's `decl`,
+    // always null for an imported symbol (the #2374-class gap), so it
+    // silently no-ops for every one of `base`'s fields. Undoes `bz$<Base>
+    // $init`'s own vtable-install side effect (save/restore around the call)
+    // so it does not clobber the most-derived vtable the `new` site already
+    // installed. Returns true if it handled construction (caller should NOT
+    // also call emitOwnFieldInit); false if `base` is not an eligible
+    // imported no-ctor class (caller falls back to the local path).
+    bool emitImportedBaseFieldInit(const sema::TypeSymbol* base,
+                                   llvm::Value* obj);
+
     // CG16: if `s` is a leading constructor chain call (`base(...)` or
     // `this(...)` as an ExpressionStmt-of-CallExpr), return the call and
     // set `isThis`; else null.
     const ast::CallExpr* chainCallOf(const ast::Stmt& s, bool& isThis);
 
     // CG16: the base class (baseTypes[0] when it is a class), else null.
-    const sema::TypeSymbol* baseClassOf(const sema::TypeSymbol* t);
+    // #2442 (v0.235): marked `const` (pure read of `t->baseTypes`, no
+    // Emitter state touched) so the const `findIndexer` below can call it to
+    // walk a class's base chain.
+    const sema::TypeSymbol* baseClassOf(const sema::TypeSymbol* t) const;
 
     // CG16: a non-static ctor of `cls` taking `n` parameters (excluding
     // `exclude`). Overload resolution is by arity only for now.
@@ -7070,6 +8150,16 @@ private:
     // closureReleaseEligibleFn_): a lambda/thunk body lowered mid-function
     // is NOT analyzed; its cells continue to leak (never double-freed).
     llvm::Function* cellFreeEligibleFn_ = nullptr;
+    // fix #2334 / §28.14 / §28.9: the subset of cellFreeEligible_ whose ONLY
+    // eligibility route includes the TaskScope.Spawn special case
+    // (collectCellFreeEligible) — see Disposal::skipCellFreeOnUnwind for the
+    // full soundness argument for why such a cell's free must be skipped on
+    // the unwind edge specifically (TaskScope.DisposeAsync's unwind path is a
+    // documented (#1422) non-blocking zombie drain, so a captured local's
+    // quiescence guarantee does not hold there). Computed alongside
+    // cellFreeEligible_ by the same pre-scan; consulted by lowerLambda when
+    // populating lastLambdaCapturedCells_.
+    std::unordered_set<const void*> unwindUnsafeCellFree_;
     // Compute cellFreeEligible_ for a block body (see the .cpp).
     void collectCellFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
@@ -7401,6 +8491,14 @@ private:
     llvm::Value* materializeHeapSetLiteral(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* setTy);
 
+    // fix #1070 / #1069 / stdlib §4.10 / §15.4: the CLASS/INTERFACE-element half
+    // of materializeHeapSetLiteral — such a set has no generic-dict backing, so
+    // it is a bz_array_t built with the same bz_array_alloc `new Set<C>()` emits
+    // and the same dedup insertion `.Add` emits (emitArrayBackedSetInsert).
+    // Returns a `ptr` to the bz_array_t, or null for a non-class element.
+    llvm::Value* materializeArrayBackedSetLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* setTy);
+
     // per §4.6/§4.7: the resolved LinkedList<T>/OwningLinkedList<T> TypeRef of
     // a local, or null if the local is not a linked list.
     const sema::TypeRef* linkedListTypeOfLocal(const ast::LocalDecl* ld);
@@ -7527,6 +8625,14 @@ private:
     // each char (i32 code point) in order. For ASCII/UTF-8 strings this
     // iterates bytes; full Unicode code-point iteration deferred.
     bool lowerStringFor(const ast::ForStmt& fs);
+    // §3.3 / §29.2 / #971 item 2: `for var c in sp do … end` over a
+    // ReadOnlyStringSpan — iterates code points over the span's [start, start+len)
+    // sub-range of the source string. Same lowering shape as lowerStringFor but
+    // the source pointer and the length come from the {ptr, i32 start, i32 length}
+    // span struct (field 0 is the source, field 1 is the start offset, field 2
+    // is the code-point length). The span itself is a stateless view, so no
+    // disposal scope is needed for the iterable.
+    bool lowerStringSpanFor(const ast::ForStmt& fs);
 
     // §29.2: `for var x in obj` over a user-defined IEnumerable<T> type,
     // or over a runtime Array<T>/collection when the iterable's type has
@@ -7552,6 +8658,20 @@ private:
     bool lowerIEnumerableBuiltinFor(const ast::ForStmt& fs);
 
     bool lowerIEnumerableFor(const ast::ForStmt& fs);
+
+    // fix #2553 (stdlib §4.18, v0.236): `for var x in <SortedSet<T>>` — route
+    // through wrapSortedSetAsIEnumerable (the same sorted-snapshot wrap the
+    // explicit `.GetEnumerator()` call site uses via #2550/#2546) and dispatch
+    // MoveNext/Current via the wrapper's slot-4 enumerator's vtable, so the
+    // for-in order matches the §4.18 ascending-iteration contract. The
+    // stdlib-synthesised SortedSet.GetEnumerator iterates the dict's internal
+    // order[] insertion-order array; lowerIEnumerableFor's direct
+    // `emitMethodCall(getEnumSym, ...)` therefore yields insertion order on
+    // non-trivial inserts — the two §4.18 surfaces (`using var e := s.GetEnumerator()`
+    // vs `for var x in s`) were inconsistent on the same receiver before this
+    // helper made them agree.
+    bool lowerIEnumerableForSortedSet(const ast::ForStmt& fs,
+                                      const sema::TypeRef* iterTy);
 
     // stdlib §5: `for var x in <lazy LINQ pipeline>` — when the iterable is a
     // deferred LINQ operator call (or a chain of them), iterate the resulting
@@ -8002,6 +9122,25 @@ private:
     static bool argsCanFill(const std::vector<ast::Param>& params,
                             const std::vector<ast::CallArgument>& args);
 
+    // #1302 / §22.3 (v0.228) "**`ref` local and field targets alias; accessor
+    // targets bracket.**": a `ref`/`out` argument naming an **indexer slot or
+    // property** is NOT an alias — it is **copy-in / copy-out** under §17.6's
+    // evaluate-once discipline: "the receiver and every index expression are
+    // evaluated exactly once, in §22.5's call-site textual order; for `ref`,
+    // the getter is called once to produce the callee's slot value (for `out`
+    // no getter call occurs); on **normal return** the setter is called once
+    // with the slot's final value." One record per such argument.
+    struct AccessorRefArg {
+        const ast::Expr* target = nullptr;   // the lvalue (`a[i]`, `o.P`)
+        llvm::AllocaInst* slot = nullptr;    // the callee's copy-in/out slot
+        llvm::Type* valueTy = nullptr;       // the LOCATION's value type
+        // The receiver and index subexpressions, lowered ONCE at copy-in and
+        // pinned in exprValueOverride_ so the getter here and the setter in
+        // the write-back reuse those values instead of re-running a
+        // side-effecting subexpression. Erased when the record is flushed.
+        std::vector<const ast::Expr*> pins;
+    };
+
     // §22.4/§22.7: lower the call arguments into parameter order, honoring
     // named arguments and default values. Provided arguments are evaluated
     // in source order; defaults afterward in parameter order. Appends to
@@ -8018,11 +9157,54 @@ private:
     // the transferred value on the transfer/post-transfer edge, disposes the live
     // one on the sibling-throw edge). Paired with UnwindIneligibleWalker no longer
     // tainting that exact argument shape (LlvmBackend_Setup.cpp).
+    // #1302 / §22.3 ("`ref` local and field targets alias; accessor targets
+    // bracket"): when `accessorRefArgs` is non-null, a `ref`/`out` argument
+    // naming an ACCESSOR-mediated location — an indexer slot or a property,
+    // both admitted §22.3 storage categories — is bracketed copy-in /
+    // copy-out instead of aliased, and one record per such argument is
+    // appended for the caller to flush with emitAccessorRefArgWriteBacks
+    // after the call returns normally. When it is null (the constructor /
+    // record paths, which have no post-call flush point) the behavior is
+    // unchanged: `lvalueAddr` returns null for those locations and the
+    // caller's existing #1386 diagnostic fires.
     bool buildOrderedArgs(const std::vector<ast::Param>& params,
                           const std::vector<ast::CallArgument>& args,
                           std::vector<llvm::Value*>& out,
                           std::vector<const ast::Expr*>* outExprs = nullptr,
-                          bool nullTransferredOwned = false);
+                          bool nullTransferredOwned = false,
+                          std::vector<AccessorRefArg>* accessorRefArgs = nullptr);
+
+    // #1302 / §22.3: emit the copy-IN half of an accessor-mediated `ref`/`out`
+    // argument and record what the copy-OUT half needs. `target` is the
+    // argument's lvalue expression (`a[i]`, `d[k]`, `o.P`), `isOut` selects
+    // the `out` variant (no getter call — §22.3). Returns the address of the
+    // callee's slot, or null when `target` is not an accessor-mediated
+    // location this bracket can drive (the caller then falls through to its
+    // existing #1386 diagnostic).
+    //
+    // fix #2462 (§22.3/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): `paramTy` is
+    // the callee's declared parameter type, ALREADY LOWERED — was formerly
+    // `const ast::Param&`, but the two IMPORTED-callee call sites this fix
+    // adds (LlvmBackend_Calls2.cpp) have no `ast::Param` at all (an imported
+    // method's own AST is never reconstructed — #1221's same limitation
+    // #2400/#2412/#2415 hit elsewhere). `paramTy` is used only to WIDEN the
+    // slot when the callee's declared width exceeds the target's own type
+    // (the #2266 slot-clobber shape); §22.3's "exact referent type" rule
+    // means the common case has `paramTy == valueTy` anyway, so a caller
+    // that cannot cheaply recover the callee's declared type may pass
+    // `nullptr` — `valueTy` (from the target's own exprType) alone still
+    // drives the slot's primary type, so this degrades the #2266 widening
+    // refinement only, not ordinary correctness.
+    llvm::Value* emitAccessorRefArgCopyIn(const ast::Expr& target,
+                                          llvm::Type* paramTy, bool isOut,
+                                          std::vector<AccessorRefArg>& sink);
+
+    // #1302 / §22.3: emit the copy-OUT half — "on **normal return** the setter
+    // is called once with the slot's final value", in argument textual order.
+    // `emit` is false on the exception edge, where "no write-back occurs";
+    // either way the pinned receiver/index values are released. Clears `recs`.
+    void emitAccessorRefArgWriteBacks(std::vector<AccessorRefArg>& recs,
+                                      bool emit);
 
     // #1955 / §28.3: null the caller's slot for a call ARGUMENT that transferred
     // a bare owned LOCAL / owned PARAMETER's ownership to an owned recipient at a
@@ -8297,12 +9479,24 @@ private:
     // #1414 stage 4: const-qualified (pure reads of genericSubstSemaTy_) so the
     // `const` isFreshOwnedClassProducer wrapper can inject it as the shared
     // ownership-facts core's TypeParamResolver hook.
+    // §2.8.2/§11.8 (#2359 bug 2c): a bare type-parameter TypeRef resolved
+    // through an IMPORTED constraint interface (e.g. `T.Zero()`'s return,
+    // or a constraint-static-operator operand, when the interface itself
+    // came from a dependency artifact) carries no `astNode` at all — same
+    // gap as bugs 2a/2b/2d (ModuleLoader's metadata-built TypeRef has only
+    // `importedName`). The old `astNode`-only guard left the param
+    // unresolved for exactly this shape, so the redirect below in
+    // lowerBinary saw `concrete == lt` (unsubstituted) and fell through to
+    // the primitive/placeholder intrinsic path — emitting a raw pointer
+    // `add` on two class-typed operands (malformed IR). Read the name via
+    // the shared alias-transparent `TypeRef::headName()` (falls back to
+    // `importedName`) instead, matching the fix shape used at the sema
+    // sites.
     const sema::TypeRef* resolveTypeParamRef(const sema::TypeRef* ty) const {
         if (!ty || ty->kind != sema::TypeRef::Kind::Named || ty->declaration ||
-            genericSubstSemaTy_.empty() || !ty->astNode || !ty->astNode->name ||
-            ty->astNode->name->parts.size() != 1)
+            genericSubstSemaTy_.empty() || ty->headName().empty())
             return ty;
-        auto it = genericSubstSemaTy_.find(ty->astNode->name->parts[0]);
+        auto it = genericSubstSemaTy_.find(ty->headName());
         if (it != genericSubstSemaTy_.end() && it->second) return it->second;
         return ty;
     }
@@ -8377,15 +9571,23 @@ private:
     // (Add*/Remove*/Find/Count/First/Last/etc.) and LinkedListNode<T> property
     // accesses (.Value/.Next/.Previous) via the bz_llist_* runtime.
     llvm::Value* tryLowerLinkedListInstanceCall(const ast::CallExpr& call);
-    // #1296: a value-reading terminal operator (.Sum / .First / .Last / .Max /
-    // .Min / .Single / .ElementAt / .ToArray / *OrNull) on an IGrouping
-    // receiver. Extracts the element array via bz_grouping_elements and runs
-    // the terminal on that bz_array_t* (the IGrouping's elements field). Called
-    // from lowerCall before the normal method-symbol dispatch so the call does
-    // not fall through to a generic dispatch that treats the IGrouping as
-    // empty (Sum → 0, First → throw, ToArray → []). stdlib §5 / spec §28.9 /
-    // §29.11.
-    llvm::Value* tryLowerIGroupingTerminalCall(const ast::CallExpr& call);
+    // stdlib §5 (#755, supersedes the #1296 hand-rolled terminal set): the
+    // ELEMENT TypeRef of an `IGrouping<TKey, T>` — genericArgs[1] (genericArgs[0]
+    // is TKey). Returns null when `rt` is not an IGrouping. IGrouping is a
+    // compiler-known builtin (common/BuiltinRegistry) with no user declaration,
+    // and its TypeRef reaches codegen in three shapes — a declaration-less
+    // astNode (annotated/inferred local), a builtin TypeSymbol whose `decl` is
+    // null, or an `importedName` (cross-module metadata) — so all three are
+    // recognized here.
+    static const sema::TypeRef* iGroupingElemTypeRef(const sema::TypeRef* rt);
+
+    // stdlib §5 (#755) / §4.4: a synthesized `Array<T>` TypeRef over `elem`.
+    // `IGrouping<TKey, T>`'s elements are a concrete `bz_array_t*` the grouping
+    // owns (bz_grouping_elements), so the array-receiver lowerings — every §5
+    // terminal, with their spec-mandated bounds/arity faults — apply verbatim
+    // once the receiver TYPE is restated as the element array's. Mirrors
+    // builtinByteArrayTypeRef / builtinTaskArrayTypeRef in construction.
+    sema::TypeRef* elementArrayTypeRef(const sema::TypeRef* elem);
 
     // §4.15 (#549): lower Array<T>.AsSpan()/AsReadOnlySpan() and
     // ArraySpan<T>/ReadOnlyArraySpan<T> instance method calls
@@ -8505,11 +9707,19 @@ private:
     // `rangeInnerIsChar` (§16.3, v0.183, #1586): true when `rangeInner` and the
     // selector's Range<T> result has T = char — the emitted bz_lazy_from_range
     // call flags the enumerator to step across the UTF-16 surrogate gap.
+    // `groupingInner` (stdlib §5, #755): true when the selector returns an
+    // `IGrouping<TKey, U>` (`GroupBy(k).SelectMany(lambda(g) => g)`) — the
+    // returned pointer is a `bz_grouping_t*`, not a `bz_array_t*`, so the
+    // trampoline reads the grouping's element array (bz_grouping_elements)
+    // before wrapping. Without it the grouping struct was read AS an array
+    // header, whose second field is `key_esz` — every group then yielded
+    // key_esz elements regardless of its size (issue #755 finding [20]).
     llvm::Function* buildSelectManyTrampoline(llvm::Type* elemTy,
                                               int64_t innerEsz,
                                               bool innerIsLazy = false,
                                               bool rangeInner = false,
-                                              bool rangeInnerIsChar = false);
+                                              bool rangeInnerIsChar = false,
+                                              bool groupingInner = false);
 
     // stdlib §5 Zip: a combine trampoline `void(closure, a, b, out)`. Loads the
     // left element (`aTy`) and right element (`bTy`), calls the closure
@@ -8568,6 +9778,31 @@ private:
     // ensures lvalueAddr() finds the slot regardless of which code path handles
     // the call. Must be called at the start of lowerCall.
     void ensureOutVarSlots(const ast::CallExpr& call);
+
+    // §22.4 / §7.9 (v0.235, #2395; extended #2402): recursively pre-create
+    // (and, via ensureOutVarSlots / ensureCtorOutVarSlots,
+    // §7.9-default-zero-initialize) the slot for every inline `out var` call
+    // OR constructor call found inside `e` — called from lowerShortCircuit
+    // BEFORE its conditional branch is emitted, mirroring the placement
+    // lowerNullCondCall already uses for `?.` (#2345): entryAlloca hoists the
+    // ALLOCA to the function entry regardless of insertion point, but the
+    // zero-STORE ensureOutVarSlots/ensureCtorOutVarSlots emits lands wherever
+    // the builder currently is — inside `and`/`or`'s conditionally-reached
+    // RHS block if called from there, which does not dominate the skip path.
+    // Calling this first, while still in the block that dominates both the
+    // skip and the taken path, fixes that. Bounded to the shapes a
+    // short-circuit skip can directly wrap — nested `and`/`or`, `not`, a
+    // call (and its callee) combined with a further operator
+    // (`recv?.M(out var x) = true`), a `new T(out var x)` constructor call,
+    // and a member access on one (`new T(out var x).field`, #2402's own
+    // repro shape) — the same scope DefiniteAssignment.cpp's
+    // evalCond/evalNullCondCallArgs track (its leaf case falls through to the
+    // general visitExpr walker, which recurses into MemberAccessExpr/NewExpr
+    // exactly as this does); a call nested in a lambda/conditional-expression
+    // body is out of scope for both (§22.4 does not extend inline out-var
+    // path-sensitivity there; see #2395's own PR notes for the discovery
+    // boundary).
+    void hoistSkippableOutVarSlots(const ast::Expr& e);
 
     // §28.3 / §28.11 / §22.4 (#1466): is the argument at `pos` in `call` a
     // genuine `out owned` transfer position — a USER method whose formal at
@@ -8668,6 +9903,10 @@ private:
     // §6.4 / #647: `atom.Value := v` — seq-cst store into an Atomic<T> or
     // AtomicInteger<T> cell via bz_atomic_store.  Returns true when handled.
     bool tryLowerAtomicValueSet(const ast::AssignmentStmt& as);
+    // stdlib §7.1 / #645: `fs.Position := n` on a FileStream receiver — an
+    // absolute seek. Same shape/reason as tryLowerAtomicValueSet: the builtin
+    // has no user PropertyDecl, so without this the write is silently dropped.
+    bool tryLowerFileStreamPositionSet(const ast::AssignmentStmt& as);
 
     // per §2.11 / §24.4: true when `e`'s static type is the built-in
     // `Subscription` (stdlib §2.11), or — for an inferred local bound to a

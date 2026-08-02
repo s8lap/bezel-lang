@@ -32,7 +32,10 @@ BUILD_DIR="${BUILD_DIR:-build}"
 # a -jN as $1.
 JOBS_FLAG="${1:--j16}"
 
-TEST_BIN="${BUILD_DIR}/tests/bezel_tests"
+# The suite is several per-area binaries (bezel_tests_<group>); the
+# CMake-generated manifest lists every one CMake built, which is why nothing
+# here has to hardcode the set.
+MANIFEST="${BUILD_DIR}/tests/test_binaries.txt"
 
 if [[ ! -d "${BUILD_DIR}" ]]; then
   echo "error: build directory '${BUILD_DIR}' does not exist." >&2
@@ -42,19 +45,41 @@ if [[ ! -d "${BUILD_DIR}" ]]; then
 fi
 
 # 1. A stale binary must never survive into the run.
-rm -f "${TEST_BIN}"
+if [[ -s "${MANIFEST}" ]]; then
+  while IFS=$'\t' read -r _g bin _w; do
+    [[ -n "${bin:-}" ]] && rm -f "${bin}"
+  done < "${MANIFEST}"
+fi
 
 # 2. Build; set -e aborts the script (and this run) on any build error, so a
 #    failed build is never silently followed by a "passing" test run.
+#    `bezel_tests` is the aggregate target over every per-area binary.
 echo "==> building bezel_tests (${BUILD_DIR}, ${JOBS_FLAG})"
 cmake --build "${BUILD_DIR}" "${JOBS_FLAG}" --target bezel_tests
 
-# 3. The binary must exist and be freshly linked after a successful build.
-if [[ ! -x "${TEST_BIN}" ]]; then
-  echo "error: build reported success but '${TEST_BIN}' is missing." >&2
-  echo "       the test target may not be wired into the build." >&2
+# 3. Every binary the build claims to have produced must exist and be freshly
+#    linked. A missing manifest means we have no idea what the suite is — that
+#    is an error, never "run what happens to be there".
+if [[ ! -s "${MANIFEST}" ]]; then
+  echo "error: build reported success but '${MANIFEST}' is missing/empty." >&2
+  echo "       the test targets may not be wired into the build." >&2
   exit 3
 fi
+TEST_BINS=()
+while IFS=$'\t' read -r _g bin _w; do
+  [[ -n "${bin:-}" ]] || continue
+  if [[ ! -x "${bin}" ]]; then
+    echo "error: build reported success but '${bin}' is missing." >&2
+    exit 3
+  fi
+  TEST_BINS+=("${bin}")
+done < "${MANIFEST}"
 
-echo "==> running ${TEST_BIN}"
-exec "${TEST_BIN}"
+# 4. Run each binary serially, propagating the first failure. (`set -e` is on,
+#    so an explicit rc capture is needed to run them all before reporting.)
+rc=0
+for bin in "${TEST_BINS[@]}"; do
+  echo "==> running ${bin}"
+  "${bin}" || rc=$?
+done
+exit "${rc}"

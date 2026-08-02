@@ -103,7 +103,18 @@ const char* kForInGroupBySumViaTemp =
     "end C;";
 
 // All value-reading terminals in one expression: Sum + First + Last +
-// Single + ElementAt(1) + Count. xs = [4, 5] → 9 + 4 + 5 + 4 + 5 + 2 = 29.
+// ElementAt(1) + Count. xs = [4, 5] → 9 + 4 + 5 + 5 + 2 = 25.
+//
+// CORRECTED for #755/#2265 item 2. This source used to include `g.Single()`
+// and expect 29 — i.e. it asserted that `Single()` on a TWO-element group
+// yields its first element. That is not what the standard library says:
+// stdlib §5:3020 declares `Single(): T; // throws if not exactly one` and
+// §5:3089 names `InvalidOperationException`. The #1296 lowering had no arity
+// check (it emitted a bare `arr[0]`), and the expectation encoded that missing
+// fault as correct. The `Single()` contract now has its own tests below (one
+// pinning the value on a genuine one-element group, one pinning the fault on a
+// two-element group), and this case keeps only the terminals whose result is
+// well-defined for a two-element group.
 const char* kForInGroupByAllTerminals =
     "module M; "
     "import System.Collections.Linq; "
@@ -113,7 +124,7 @@ const char* kForInGroupByAllTerminals =
     "    xs.Add(4); xs.Add(5); "
     "    var r := 0; "
     "    for var g in xs.GroupBy(lambda(v) => 0) do "
-    "      r := g.Sum() + g.First() + g.Last() + g.Single() + g.ElementAt(1) + g.Count(); "
+    "      r := g.Sum() + g.First() + g.Last() + g.ElementAt(1) + g.Count(); "
     "    end; "
     "    return r; "
     "  end Main; "
@@ -171,8 +182,9 @@ BEZEL_TEST(igrouping_forin_terminal_1296,
     JitResult r = runAotChecked(kForInGroupByAllTerminals);
     if (wasSkipped(r)) return;
     BEZEL_EXPECT_TRUE(r.ran);
-    // Sum (9) + First (4) + Last (5) + Single (4) + ElementAt(1) (5) + Count (2)
-    BEZEL_EXPECT_EQ(r.exitCode, 29);
+    // Sum (9) + First (4) + Last (5) + ElementAt(1) (5) + Count (2)
+    // (`Single()` moved to its own pair of cases — see #755/#2265 item 2.)
+    BEZEL_EXPECT_EQ(r.exitCode, 25);
 }
 
 BEZEL_TEST(igrouping_forin_terminal_1296,

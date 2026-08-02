@@ -76,6 +76,34 @@ public:
         return builtinTypeArity(n) != kNotBuiltin;
     }
 
+    // §9.8 / #2325: the CLASS half of checkSerializationEligibility's
+    // component-eligibility and constructor-selection checks. Split into its
+    // own LATE pass — called from INSIDE typecheckExpressions() itself
+    // (ExprTypecheck.cpp, via the free-function wrapper below), not as part
+    // of resolveTypes() (this class's run()) — because §9.8 counts a
+    // primary-constructor parameter CAPTURED into a private field (§11.1:
+    // referenced in a body position — a method/property/constructor/
+    // destructor body, e.g. `property Id: int => id;`) as a genuine
+    // serialized component, and that classification
+    // (FieldSymbol::posParamBodyRef/posParamInitRef) is only computed by
+    // ExprTypecheck's OWN expression walk (ExprTypecheck_Exprs.cpp) — so this
+    // check cannot run any earlier than the end of that same function.
+    // Originally this was wired as a separate call the DRIVER made after
+    // typecheckExpressions(); that broke the moment a test-harness pipeline
+    // (which builds its own fresh SemaContext + resolveTypes +
+    // typecheckExpressions independent of Driver::compileFile — there are
+    // dozens of such call sites, not just the driver's) called
+    // typecheckExpressions() without ALSO separately calling this — silently
+    // readmitting classes that should have been rejected (verified: this
+    // regressed 4 tests in serialization_tier2_classes_test.cpp before the
+    // fix). Living inside typecheckExpressions() itself means every existing
+    // and future caller gets it automatically, with no separate wiring to
+    // remember or to miss. Public so the free-function wrapper
+    // `bezel::sema::checkClassSerializationEligibilityLate` (TypeResolution.hpp)
+    // — which ExprTypecheck.cpp calls — can reach it from a fresh Resolver,
+    // exactly like run() itself.
+    void checkClassSerializationEligibilityLate();
+
 private:
     // Lookup environment in scope. A stack of scopes (module-level + per-type
     // + per-method). Each scope contributes a small name → Symbol table.
@@ -258,7 +286,12 @@ private:
     // `: IDeserializable` must satisfy the synthesis-eligibility rule.  Types
     // that declare the conformance but are ineligible (ineligible component
     // type, no hand-written Serialize/Deserialize) are a compile error at the
-    // conformance declaration.
+    // conformance declaration.  (Classes are NOT checked here — see the
+    // PUBLIC checkClassSerializationEligibilityLate() above — but the
+    // PRE-PASS at the top of this function's definition still synthesizes
+    // each class's `serializedClass` tree/graph shape from field types,
+    // because ExprTypecheck's `.Serialize()`/`.Deserialize()` call
+    // resolution depends on that shape already being set.)
     void checkSerializationEligibility();
 
     // Slice S22 (§13.2): a top-level type may be `public` or `internal`
@@ -425,6 +458,19 @@ private:
     // checkOverrideSignatureMatch's override-constraint-inheritance check.
     bool constraintSetsEquivalent(const ast::GenericConstraint* a,
                                   const ast::GenericConstraint* b);
+
+    // fix #2391 (§14.2/§2.8.2, v0.236): the IMPORTED-base analog of
+    // `constraintSetsEquivalent`. Compares an override's locally-declared
+    // `where T: ...` clause (the `ast::GenericConstraint* d` form) against an
+    // IMPORTED base method's reconstructed clause set (the
+    // `ImportedGenericConstraint* b` side-table form, populated by
+    // ModuleLoader from MetaMember::genericParams). `b == nullptr` denotes the
+    // imported base had no `where` clause for this parameter at all (the empty
+    // set). Used by checkOverrideSignatureMatch when the base method is an
+    // IMPORTED generic declaration (no `ast::MethodDecl`).
+    bool derivedConstraintMatchesImported(
+        const ast::GenericConstraint* d,
+        const ImportedGenericConstraint* b);
 
     // Build the base-class generic substitution map (base class T → the
     // concrete arg the derived class binds it to) for an override pair, e.g.

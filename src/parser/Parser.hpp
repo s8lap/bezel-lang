@@ -90,10 +90,20 @@ private:
     // Slice 5: generic parameter list `<` (Variance? Identifier) (`,` ...)* `>`.
     // Empty vector if no `<...>` is present at the current position.
     std::vector<ast::GenericParam> parseGenericParams();
-    // Slice 5: inheritance clause `:` Type ("," Type)*. Optional
-    // base-class argument list `(...)` after each item is currently skipped
-    // (it contains expressions; see the inheritance slice notes in the PR).
-    std::vector<std::unique_ptr<ast::Type>> parseInheritance();
+    // Slice 5: inheritance clause `:` Type ("," Type)*. `decl` is the
+    // enclosing declaration being parsed (kind + name only are used here).
+    // For a `Class` decl reaching this function — guaranteed to have NO
+    // primary-constructor parameter list, since a primary-ctor class is
+    // parsed by the caller's separate `hasPositionalFields` branch — an
+    // argument list `(...)` on any inheritance item is rejected with a
+    // diagnostic (§11.1 / §22.10 / §12.8, v0.235; issue #2455): the header
+    // argument-list shorthand exists to feed a primary constructor's
+    // `base(...)` chain, and a class without one gets an implicit
+    // no-argument `base()` (§12.8) that cannot receive these arguments.
+    // Interface and record decls keep the original tokenize-away behavior
+    // unchanged (out of #2455's scope; see the .cpp for the tracking note).
+    std::vector<std::unique_ptr<ast::Type>> parseInheritance(
+        const ast::TypeDecl* decl);
     // Slice 24: zero or more `where T: Constraint, ...` clauses.
     std::vector<ast::GenericConstraint> parseGenericConstraints();
     // §22.16 (v0.203, #2053): zero or more contract clauses
@@ -128,8 +138,14 @@ private:
         ast::Visibility visibility, std::vector<std::string_view> modifiers,
         SourceLocation memberStart = {});
     // Caller has already consumed `method operator`.
+    // fix #2418: `memberStart` (default {} for call sites with none to give,
+    // e.g. none today) anchors OperatorDecl::span.begin, mirroring
+    // parseMethodDeclBody's #783 convention, so SymbolCollection's
+    // MethodSymbol::declLoc (operators reuse MethodSymbol) has a real
+    // location to read instead of the default {0,0}.
     std::unique_ptr<ast::Member> parseOperatorDeclBody(
-        ast::Visibility visibility, std::vector<std::string_view> modifiers);
+        ast::Visibility visibility, std::vector<std::string_view> modifiers,
+        SourceLocation memberStart = {});
     std::vector<ast::Param> parseParamList();
     // Slice 41: A.3 PositionalField list — `Identifier ":" Type
     // SerializedClause?`. Distinct from ParamList: no modifiers, no default

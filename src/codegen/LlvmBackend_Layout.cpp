@@ -102,11 +102,17 @@ llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
         if (llvm::Value* a = fieldAddr(*ma, elemTy)) return a;
     }
     if (llvm::GlobalVariable* gv = staticFieldGlobal(target)) {
-        // #720 / §22.13: a static-field lvalue (write or compound assign) is a
-        // "first use" — lazily initialize the owning type BEFORE the access, so a
-        // write-before-read is not later clobbered by the lazy initializer.
-        if (auto* sym = ctx_.exprSymbol(target))
+        // #720 / §22.13 / #1513: a static-field lvalue (write or compound
+        // assign) is a "first use" — lazily initialize the owning type (or,
+        // for a generic instantiation's per-instantiation global, the SHARED
+        // cross-module instantiation state, §2.8.3 rule 4) BEFORE the access,
+        // so a write-before-read is not later clobbered by the lazy initializer.
+        if (auto giIt = genericInstGlobalKeyOf_.find(gv);
+            giIt != genericInstGlobalKeyOf_.end()) {
+            emitEnsureGenericInstStaticInit(giIt->second);
+        } else if (auto* sym = ctx_.exprSymbol(target)) {
             emitEnsureStaticInit(memberOwner(sym));
+        }
         elemTy = gv->getValueType();
         return gv;
     }
@@ -419,6 +425,17 @@ bool Emitter::isNullableRecordTy(const sema::TypeRef* rt) {
     return rt && rt->nullable &&
            rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
            rt->declaration->kind == ast::TypeDeclKind::Record;
+}
+
+
+// fix #2447 / §35.9 / §7.2: a NULLABLE CHOICE (a nullable Named TypeRef
+// whose declaration is a choice) is a value type that lacked a null
+// representation — see the declaration comment in LlvmBackend_impl.hpp for
+// the full rationale. The choice analogue of isNullableRecordTy just above.
+bool Emitter::isNullableChoiceTy(const sema::TypeRef* rt) {
+    return rt && rt->nullable &&
+           rt->kind == sema::TypeRef::Kind::Named && rt->declaration &&
+           rt->declaration->kind == ast::TypeDeclKind::Choice;
 }
 
 
@@ -827,9 +844,21 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
                 return enumLlvmType(rt->declaration);
             // §35 (v0.200, #2045): a choice lowers to a value-type struct
             // `{ i32 tag, case0_payload, case1_payload, ... }` — see
-            // choiceStruct for the layout rationale. NB: this is the
+            // choiceStruct for the layout rationale. This is the
             // non-nullable form; the nullable `C?` wraps this struct in
-            // nullableValueStructTy's `{ i8 hasValue, <choice struct> }`.
+            // nullableValueStructTy's `{ i8 hasValue, <choice struct> }` —
+            // fix #2447 / §35.9: this branch is reached ONLY for a
+            // non-nullable choice, because isNullableValueTy (consulted at
+            // the top of this function) now recognizes a nullable choice
+            // via isNullableChoiceTy and routes it through
+            // nullableValueStructTy before control ever reaches here. Before
+            // #2447, isNullableValueTy did NOT recognize choices, so a
+            // nullable choice fell through to THIS branch regardless of
+            // `rt->nullable` — returning the bare struct with no null
+            // representation, contradicting this very comment (a
+            // long-standing aspirational note that was never actually
+            // wired up) and crashing the first time downstream code tested
+            // a (non-existent) hasValue tag.
             if (rt->declaration &&
                 rt->declaration->kind == ast::TypeDeclKind::Choice) {
                 // #2047: a CONCRETE generic-choice annotation (`Result<C,
@@ -950,10 +979,45 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
 
 
 llvm::Type* Emitter::storageType(const sema::Symbol* m) {
+    // fix #2533 (§24.1/§22.8/§2.8.2 clause 1, v0.236): an event's backing
+    // storage is a runtime `EventSource<T>` (`AsyncEventSource<T>` for async)
+    // referenced by an OPAQUE POINTER (§24.1), NOT the event's payload type.
+    // The wire-carried MetaMember::type for an IMPORTED event is its `: T`
+    // PAYLOAD type (e.g. `EvB2421` in the issue's repro), not the EventSource
+    // storage type — so the imported-member-type fallback below would happily
+    // pick that payload type up and LAY the struct out with the payload record
+    // in the event slot, mis-aligning the importer's struct relative to the
+    // exporter's. Concretely: the exporter's BaseWithEvt2421 struct is `{ ptr,
+    // i8, ptr }` (vtable, disposed flag, EventSource ptr) at offset 16; the
+    // importer's Derived2421 struct, with the event laid out as the payload
+    // record `EvB2421`, became `{ ptr, i8, %EvB2421 }` (where %EvB2421 is a
+    // `{ i32 }` payload record, alignment 4) — the EventSource landed at
+    // offset 12 inside that struct. The exporter's `bz$<Base>$init` (called
+    // via `emitImportedBaseFieldInit`) writes the EventSource at offset 16
+    // per the exporter's struct, but the importer's itable accessor
+    // (`bz$Derived2421$Ready$evtget`) reads at offset 12 per the importer's
+    // struct — the byte read is not the EventSource, so `bz_event_add`
+    // dereferences a junk pointer and SEGVs (#2533). This check has to come
+    // BEFORE the imported-member-type fallback (and the fd/pd branches, which
+    // are also decl-dependent) so EVERY event — local or imported, sync or
+    // async, payload or unit — gets the same opaque pointer storage the
+    // exporter uses. The `isEventStatic`/`isEventAsync` wire bits
+    // (added by #2421) carry the sync/async classification that determines
+    // whether the slot is initialized at all (`collectInstanceStorage` /
+    // `emitOwnFieldInit` gate on `eventIsStatic`); the storage TYPE itself is
+    // always `ptr` regardless of either bit.
+    if (dynamic_cast<const sema::EventSymbol*>(m))
+        return ptrTy();
     // §9.1: a record's positional field carries its type on the
     // originating Param, not a FieldDecl (its `decl` is the TypeDecl).
+    // fix #2516: for an IMPORTED positional field the importer synthesizes a
+    // null-type ast::Param so `fs->posParam != nullptr` distinguishes
+    // positional from body fields at the sema layer (SymbolCollection.cpp /
+    // ModuleLoader.cpp) — but the type itself is NOT recoverable from that
+    // synthetic Param. Fall through to the importedMemberType side table so
+    // the layout gets the real field type from `fieldTypes_`.
     if (auto* fs = dynamic_cast<const sema::FieldSymbol*>(m))
-        if (fs->posParam)
+        if (fs->posParam && fs->posParam->type)
             return lowerType(fs->posParam->type.get());
     // §2.5 / §22.8 (issue #328 FINDING [7]): an IMPORTED instance field has no
     // ast::FieldDecl — its resolved type rides the importedMemberType side table
@@ -971,10 +1035,6 @@ llvm::Type* Emitter::storageType(const sema::Symbol* m) {
         return lowerType(fd->type.get());
     if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
         return lowerType(pd->type.get());
-    // per §24.1: an event's backing EventSource<T> field is a runtime object
-    // referenced by an opaque pointer.
-    if (dynamic_cast<const sema::EventSymbol*>(m))
-        return ptrTy();
     return i32();
 }
 
@@ -1533,6 +1593,17 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
         RecordSubstGuard guard(this, rt);
         return llvm::StructType::get(
             llvm_, {nullablePrimHasValTy(), recordStruct(rt->declaration)});
+    }
+    // fix #2447 / §35.9 / §7.2: a nullable choice's payload is the bare
+    // choice struct ({i32 tag, case0_payload, ...} — choiceStruct), so the
+    // leading hasValue tag distinguishes null from any choice value
+    // (mirroring isNullableRecordTy just above; RecordSubstGuard is reused
+    // here exactly as it is for a nullable GENERIC record — a generic
+    // choice's payload struct is likewise per-instantiation, #2047).
+    if (isNullableChoiceTy(rt)) {
+        RecordSubstGuard guard(this, rt);
+        return llvm::StructType::get(
+            llvm_, {nullablePrimHasValTy(), choiceStruct(rt->declaration)});
     }
     // per §2.5–§2.6 / issue #1954: a nullable value-builtin's payload is the
     // NON-nullable builtin's lowering (DateTime/TimeSpan → i64, DateOnly/TimeOnly →
@@ -3053,8 +3124,49 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", thunk));
 
-    // Load the captured receiver from env; bind as `this`.
-    llvm::Value* thisVal = builder_.CreateLoad(ptrTy(), thunk->getArg(0));
+    // fix #2501 (§27.6, v0.236): "the instance is captured at formation — by
+    // reference for class-typed receivers, by copy for value-shaped (record)
+    // receivers". buildPropertyClosureCell (below) now copies ANY receiver
+    // shape into env, sized by getTypeStoreSize (mirroring
+    // buildMethodClosureCell) — so the reload here must match that shape, not
+    // assume a pointer. The shape is read off `receiverVal`'s OWN LLVM type
+    // (produced by the caller's `lowerExpr` on the receiver expression, so it
+    // is already correctly specialized for a generic receiver — no dependency
+    // on the §14.1 genericSubst_ block below) rather than re-derived from
+    // `ps->parent`, so this also covers an EXTENSION property (whose
+    // PropertySymbol carries no `parent` — SymbolCollection.cpp "patched by
+    // slice 2" never patches it for properties, only `MethodSymbol::
+    // extensionDecl` gets the analogous method-side wiring). The thunk body
+    // is built ONCE and cached per `ps` (propertyThunks_), so this shape is
+    // fixed at first emission — the same per-symbol-not-per-instantiation
+    // caching methodThunks_ already accepts.
+    //   - CLASS/INTERFACE receiver (or no receiver at all — a static
+    //     property; `thisVal` then has no real use since a static getter
+    //     body never reads `this`): unchanged pointer load.
+    //   - RECORD receiver: env holds the struct VALUE (an aggregate,
+    //     non-pointer type). Reload it, then re-spill to a fresh alloca so
+    //     the getter body's `this.field` GEPs still see a pointer — mirrors
+    //     the ordinary (non-thunk) record-getter read path
+    //     (LlvmBackend_Exprs.cpp, "issue #347 / §9.2").
+    //   - ENUM (or primitive-extension) receiver: env holds the raw SCALAR
+    //     value (e.g. i32 — enumLlvmType). Reload it as-is and use it
+    //     directly as `this` — never spill to a pointer, mirroring CG30 /
+    //     the §10.4 `isEnumReceiver` carve-out in that same read path (a
+    //     `case this` arm needs the bare scalar to icmp against an enum
+    //     constant; comparing a spilled pointer against one is malformed IR).
+    llvm::Value* envArg = thunk->getArg(0);
+    llvm::Type* recvLlvmTy = receiverVal ? receiverVal->getType() : nullptr;
+    llvm::Value* thisVal;
+    if (!recvLlvmTy || recvLlvmTy->isPointerTy()) {
+        thisVal = builder_.CreateLoad(ptrTy(), envArg);
+    } else if (recvLlvmTy->isAggregateType()) {
+        llvm::Value* loadedRecv = builder_.CreateLoad(recvLlvmTy, envArg);
+        llvm::AllocaInst* recvTmp = entryAlloca(recvLlvmTy);
+        builder_.CreateStore(loadedRecv, recvTmp);
+        thisVal = recvTmp;
+    } else {
+        thisVal = builder_.CreateLoad(recvLlvmTy, envArg);
+    }
     currentThis_ = thisVal;
 
     // §14.1: for a generic class receiver, set up the generic substitution so a
@@ -3124,19 +3236,106 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     }
     if (!result) {
         if (const ast::Expr* getter = computedGetterOf(ps)) {
+            // fix #2501 (#574 / §10.4 / §19.2 precedent): an enum computed
+            // property's getter body commonly dispatches with `case this ...`
+            // — patternMatches needs enumTypeOf("this") to resolve the
+            // declaring enum type, and enumTypeOf falls back to
+            // currentEnumMethod_ for a bare `this` identifier because sema
+            // attaches no exprType to it. The ordinary (non-thunk) getter
+            // read path sets this (LlvmBackend_Exprs.cpp, the #574 fix);
+            // makePropertyThunk never did, so an enum property referenced as
+            // a function value with a `case this` body was rejected at
+            // codegen ("pattern … did not resolve to a type, enum constant,
+            // or named constant") even after the receiver-capture fix above.
+            const sema::TypeSymbol* savedEnumMethod = currentEnumMethod_;
+            if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Enum)
+                currentEnumMethod_ = ps->parent;
             result = lowerExpr(*getter);
+            currentEnumMethod_ = savedEnumMethod;
         } else if (const ast::PropertyAccessor* acc = blockGetterOf(ps)) {
             if (llvm::Function* fn = ensurePropertyBlockGetter(pd, acc)) {
-                result = builder_.CreateCall(fn->getFunctionType(), fn, {thisVal});
+                // fix #2501 (§9.2/§27.6, v0.236): ensurePropertyBlockGetter's
+                // generated function always takes `this` as a POINTER
+                // (`fnTy = (ptr) -> retTy`, its own `currentThis_ = &*fn->
+                // args().begin()`), mirroring the ordinary (non-thunk)
+                // block-getter read path's unconditional spill
+                // (LlvmBackend_Exprs.cpp, "issue #347 / §9.2" — spills even
+                // an enum/primitive `this`, unlike the expression-getter
+                // path's isEnumReceiver carve-out just above). `thisVal` here
+                // is the raw scalar for an enum/primitive receiver (by
+                // design, so `case this` above can icmp it directly) — spill
+                // it to a fresh pointer for this call site specifically,
+                // rather than passing the scalar where a pointer is expected
+                // (a thunk->fn signature mismatch / malformed-IR call).
+                llvm::Value* blockThis = thisVal;
+                if (!blockThis->getType()->isPointerTy()) {
+                    llvm::AllocaInst* blockTmp =
+                        entryAlloca(blockThis->getType());
+                    builder_.CreateStore(blockThis, blockTmp);
+                    blockThis = blockTmp;
+                }
+                result = builder_.CreateCall(fn->getFunctionType(), fn,
+                                             {blockThis});
                 emitPendingCheck();
             }
-        } else if (isAutoProperty(ps)) {
+        } else if (isAutoPropertyStorage(ps)) {
+            // fix #2478 (§9.2/§22.8): isAutoPropertyStorage, not the bare
+            // decl-dependent isAutoProperty — an imported auto-property
+            // referenced as a FUNCTION VALUE (`var f := obj.Prop;`, §27.6)
+            // fell through to the `llvm::Constant::getNullValue` default
+            // below without this, silently yielding a permanently-0 thunk.
             auto idxIt = fieldIndex_.find(ps);
             if (idxIt != fieldIndex_.end()) {
                 llvm::StructType* st = classStruct(ps->parent);
                 llvm::Type* fty = st->getElementType(idxIt->second);
                 result = builder_.CreateLoad(
                     fty, builder_.CreateStructGEP(st, thisVal, idxIt->second));
+            }
+        } else if (ps->parent &&
+                   ps->parent->kind == ast::TypeDeclKind::Class) {
+            // fix #2489 (§9.2/§27.6, v0.236): an imported, non-virtual,
+            // non-auto COMPUTED property (an arrow-getter or block-form
+            // getter with no ast::PropertyDecl to drive computedGetterOf/
+            // blockGetterOf above, and no storage slot for
+            // isAutoPropertyStorage's branch either) referenced as a
+            // FUNCTION VALUE fell through every branch above straight to
+            // the `getNullValue` default below — silently yielding a
+            // thunk that always returns 0, never calling anything.
+            // Confirmed by probe: `var fn: () -> int := obj.Getter;
+            // return fn();` against an imported CLASS's arrow-getter
+            // property returned 0 instead of the field's real value.
+            // Mirror the ordinary (non-thunk) imported-getter fallback
+            // (LlvmBackend_Exprs.cpp's "imported non-virtual property
+            // getter" site, issue #503/#2474): call the exported
+            // `$propget` stub declareImportedPropertyGetters declared.
+            // `thisVal` here is ALWAYS `ptr` because this branch's own guard
+            // (`ps->parent->kind == Class`, just above) excludes Record/Enum
+            // — no by-value spill is needed the way the ordinary read path
+            // needs one.
+            //
+            // UPDATE (fix #2501, §27.6 v0.236): the general bug this
+            // comment originally described — buildPropertyClosureCell left
+            // the env null for any non-pointer (Record/Enum) receiver, so
+            // `thisVal` would have been a null pointer here had this branch
+            // admitted one — is now fixed at its source: buildPropertyClosureCell
+            // captures ANY receiver shape (sized by getTypeStoreSize,
+            // mirroring buildMethodClosureCell), and the `this`-reconstruction
+            // a few lines above this function's start now branches on that
+            // shape (pointer / spilled-record-pointer / raw-enum-scalar), so
+            // a LOCAL record or enum arrow-getter referenced as a function
+            // value no longer SIGSEGVs (see makePropertyThunk's `this`-
+            // reconstruction comment). This branch's restriction to Class is
+            // kept AS-IS regardless: it exists for the CROSS-MODULE ABI
+            // surface (the imported `$propget` stub call below), which
+            // #2501 did not exercise or test end-to-end (no `importedPropGetterFns_`
+            // entry was involved in its repro) — widening it to Record/Enum
+            // is a #2489-shaped follow-up, not folded in here.
+            auto git = importedPropGetterFns_.find(ps);
+            if (git != importedPropGetterFns_.end()) {
+                llvm::Function* fn = git->second;
+                result = builder_.CreateCall(fn->getFunctionType(), fn,
+                                             {thisVal});
+                emitPendingCheck();
             }
         }
     }
@@ -3193,15 +3392,40 @@ llvm::Value* Emitter::buildPropertyClosureCell(llvm::Function* thunk,
     // each reference still has its own rc/lifetime; equality is by the cell's
     // { fn, receiver-in-env, kind } value (bz_closure_value_equals), mirroring
     // buildMethodClosureCell.
+    //
+    // fix #2501 (§27.6, v0.236): "the instance is captured at formation — by
+    // reference for class-typed receivers, by copy for value-shaped (record)
+    // receivers". Before this fix the env was populated ONLY when
+    // `receiverVal->getType()->isPointerTy()` — true for a class/interface
+    // receiver, but false for a RECORD (a by-value struct, §9.2/#347) or an
+    // ENUM/primitive-extension receiver (a scalar, e.g. i32). For those the
+    // env silently stayed the null-pointer default, and makePropertyThunk's
+    // body unconditionally loaded `this` through it — a null-pointer read
+    // that SIGSEGVs the moment the getter body actually uses the receiver
+    // (confirmed: issue #2501's local-record repro). Capture ANY receiver
+    // shape (not just pointers), sized by getTypeStoreSize, mirroring
+    // buildMethodClosureCell's instMethod branch exactly. This is a raw
+    // value copy, never a retain: a record cannot declare `owned` fields or a
+    // destructor (§9.7 — "Records cannot have destructors, owned fields...
+    // the record does not own what they point to"), so there is nothing for
+    // the record itself to own or release, and envdtor stays null below
+    // (foundation: "a closure cell holds only borrows; freeing it frees ONLY
+    // the cell and its env block", bezel_runtime_refcounting.cpp) — exactly
+    // the same no-retain, no-envdtor contract buildMethodClosureCell already
+    // relies on for a record method-reference receiver.
     uint64_t cellSz =
         module_->getDataLayout().getTypeAllocSize(closureCellType());
     llvm::Value* closureObj = builder_.CreateCall(
         callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)cellSz)});
     builder_.CreateStore(thunk, closureObj);
     llvm::Value* envObj = llvm::ConstantPointerNull::get(ptrTy());
-    if (receiverVal && receiverVal->getType()->isPointerTy()) {
+    if (receiverVal) {
+        uint64_t envSz = module_->getDataLayout()
+                             .getTypeStoreSize(receiverVal->getType())
+                             .getFixedValue();
+        if (envSz < 8) envSz = 8;  // minimum 8 for alignment
         envObj = builder_.CreateCall(
-            callocFn(), {builder_.getInt64(1), builder_.getInt64(8)});
+            callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)envSz)});
         builder_.CreateStore(receiverVal, envObj);
     }
     builder_.CreateStore(
@@ -3216,7 +3440,20 @@ llvm::Value* Emitter::buildPropertyClosureCell(llvm::Function* thunk,
 
 sema::MemberSymbol* Emitter::storageMemberOf(sema::Symbol* sym) {
     if (auto* fs = dynamic_cast<sema::FieldSymbol*>(sym)) return fs;
-    if (isAutoProperty(sym))
+    // fix #2478 (§9.2/§22.8): isAutoPropertyStorage, not the bare
+    // decl-dependent isAutoProperty — this is the central GEP-address
+    // resolution function for a plain member-access read/write
+    // (fieldAddr/implicitFieldAddr and their callers below), so leaving it
+    // on the decl-dependent predicate meant an imported auto-property's
+    // STORAGE SLOT could be correctly counted by collectInstanceStorage/
+    // collectRecordStorage (this same issue's layout fix) while every
+    // ordinary READ/WRITE of that member still fell through to a different,
+    // wrong path (confirmed: `b.W` on an imported record with `public
+    // property W: int := 42;` still read `0` post-layout-fix until this
+    // line was widened too — the layout fix alone was necessary but not
+    // sufficient). See isAutoPropertyStorage's own comment
+    // (LlvmBackend_impl.hpp) for the full rationale and scope boundary.
+    if (isAutoPropertyStorage(sym))
         return dynamic_cast<sema::PropertySymbol*>(sym);
     return nullptr;
 }
@@ -3227,7 +3464,31 @@ llvm::Value* Emitter::implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy)
     auto* ms = storageMemberOf(ctx_.exprSymbol(e));
     if (!ms || !ms->parent || !currentThis_) return nullptr;
     auto idxIt = fieldIndex_.find(ms);
-    if (idxIt == fieldIndex_.end()) return nullptr;  // static field
+    // fix #2474 (§9.2/§23.1/§23.2, v0.235): `idxIt == end()` here does NOT
+    // necessarily mean `ms` is a static field (the pre-fix assumption, which
+    // returned null unconditionally at this point) — fieldIndex_ is
+    // populated lazily, by classStruct/recordStruct's FIRST call for
+    // ms->parent. A local CLASS always has its struct built early
+    // (declareVtables calls classStruct for every class up front to lay out
+    // the vtable), but a RECORD's struct is built lazily on first real use.
+    // When a record field is read ONLY from inside that field's own
+    // computed-property getter body (`property Getter: int => _pub;`, e.g.
+    // via emitExportedPropertyGetters/ensurePropertyAccessorFn — #2474's own
+    // fix widened that path to records — with no OTHER use of the record
+    // earlier in the same module), THIS call can be the very first thing to
+    // touch the record's layout at all, so the struct genuinely has not
+    // been built yet. The sibling qualified-access path, `fieldAddr` (a few
+    // hundred lines below in this file), already retries via
+    // `classStruct(ms->parent)` before concluding a field is absent —
+    // exactly the "imported/sibling path does a step this one skips" shape
+    // (lane protocol) except the sibling here isn't cross-module, it's this
+    // function's own qualified-access twin. Do not conclude "static field"
+    // (and return null, silently collapsing the caller's whole expression to
+    // a zero constant via ensurePropertyAccessorFn's own null-value
+    // fallback) until AFTER the retry below — which needs the ancestor
+    // generic-substitution setup installed first, exactly as fieldAddr does,
+    // so it is deferred to occur once that setup below has run rather than
+    // duplicated here.
     // §12 / §14 (#989): an INHERITED field declared on a generic base (ms->parent
     // has generic params) accessed via bare identifier inside a derived-class
     // method (implicit `this.field`). classStruct(ms->parent) with no active
@@ -3273,6 +3534,16 @@ llvm::Value* Emitter::implicitFieldAddr(const ast::Expr& e, llvm::Type*& elemTy)
     if (idxIt == fieldIndex_.end()) {
         classStruct(ms->parent);
         idxIt = fieldIndex_.find(ms);
+        // fix #2474: still absent after the struct is actually built ->
+        // genuinely a static field (or otherwise not instance storage), the
+        // ORIGINAL "static field" conclusion — restore state and bail, same
+        // as the pre-fix unconditional-null return did, just now correctly
+        // deferred until the lazy build has had a chance to populate it.
+        if (idxIt == fieldIndex_.end()) {
+            genericSubst_ = std::move(savedSubst);
+            genericSubstSemaTy_ = std::move(savedSemaTy);
+            return nullptr;
+        }
     }
     llvm::StructType* st = classStruct(ms->parent);
     elemTy = st->getElementType(idxIt->second);
@@ -3732,10 +4003,96 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                         ms = storageMemberOf(m);
                         if (ms) break;
                     }
+                    // #2445 (§14.2, v0.236): the substitution-site check for a
+                    // property/field READ on a bare type-parameter receiver.
+                    // The active `genericSubstSemaTy_` binds the receiver's
+                    // bare `T` to its concrete substituted type for THIS
+                    // instantiation (e.g. `T → Pt`), and the loop above
+                    // resolved the member by name on that substituted type's
+                    // declaration. When the substituted type is a genuine
+                    // record/class/choice/interface with a declaration but
+                    // no member by that name exists, the substitution site
+                    // IS where "no such member" is soundly decidable: the
+                    // monomorphized body cannot be re-checked against any
+                    // other substitution, and silently returning nullptr
+                    // degrades the slot to a zero value via CG8's fall-
+                    // through (#2547's generic "internal: codegen cannot
+                    // read member...") — a silent wrong-value miscompile
+                    // that the user has no way to trace back to the
+                    // substituted type. Emit the spec-cited §14.2
+                    // diagnostic here, naming the substituted type AND the
+                    // type parameter so the user can either (a) add a
+                    // `where T: <constraint>` that provides the member, or
+                    // (b) correct the member name. The wording mirrors
+                    // sema's #1078 reject (ExprTypecheck_Calls.cpp ~3095)
+                    // so the two diagnostics are recognizably the same
+                    // family. NOT fired for the substitution's own
+                    // `declaration==nullptr` shape (e.g. a builtin
+                    // declaration-less Named type like Array<T>, which has
+                    // no member surface to look up) — that case is
+                    // already covered by the CG8 fall-through diagnostic
+                    // for the concrete builtin-family path. Likewise NOT
+                    // fired for a `ma.member` that names a non-storage
+                    // member (a method, event, property-getter without a
+                    // backing field); such names are NOT in
+                    // `declaration->members` by name, but a method-call
+                    // form is sema-rejected upstream (#1078) and a
+                    // property-getter read is handled by the
+                    // property-read sibling site, not fieldAddr.
+                    if (!ms && cit->second->declaration) {
+                        std::string_view subName =
+                            cit->second->declaration->name;
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            std::string("no member `") +
+                                std::string(ma.member) +
+                                "` on substituted type `" +
+                                std::string(subName) +
+                                "` for type parameter `" +
+                                std::string(tt->headName()) +
+                                "`; the member is not part of `" +
+                                std::string(subName) +
+                                "`'s documented surface, or add a `where " +
+                                std::string(tt->headName()) +
+                                ": <constraint>` that provides this "
+                                "member (\xC2\xA7""14.2, #2445)");
+                        return nullptr;
+                    }
                 }
             }
         }
     }
+    // #2445 (§14.2, v0.236): RESIDUAL DECLINED — a property/field READ on a
+    // bare type-parameter receiver when `genericSubstSemaTy_` is empty (the
+    // generic method body is being validated independent of any
+    // instantiation, or no caller in this compilation unit ever instantiates
+    // it). Sema has no substitution information to consult, and codegen has
+    // none either. The "is this member soundly decidable here?" question is
+    // UNANSWERABLE at this site — the same architectural reason #1078's
+    // sema-level allowlist was structurally unsound (Bezel generics are
+    // monomorphized; sema runs ONCE, at the generic method's declaration
+    // site, with no visibility into the unenumerable, open-ended set of
+    // call-site type arguments). The original issue (#2445) explicitly
+    // flagged this as a "residual, unresolved question — possibly a
+    // 'worth a spec/rationale check' question per CLAUDE.md's
+    // decline-with-reasons discipline, since this may be an intentional
+    // consequence of the monomorphization design (comparable to C++
+    // template bodies not being validated for dependent names until
+    // instantiated)". A diagnostic here would also break legitimate
+    // uses — confirmed live: a `Container<Pt>.GetX()` reading
+    // `_val.X` on a bare-T field is emitted TWICE (once monomorphized
+    // with `T → Pt` for the call site, and once for the dead
+    // template-body IR-verification pass without substitution); the
+    // template-body pass would trip this check on the legitimate
+    // member read even though the monomorphized body resolves it
+    // correctly. Per CLAUDE.md "decline-with-reasons, never silently"
+    // discipline: the residual case is filed as a follow-up issue for
+    // an owner/spec decision (whether the dead template body needs a
+    // diagnostic at all, and if so what wording distinguishes it from
+    // the substitution-site error). Today the existing CG8 fall-through
+    // generic #2547 message continues to fire on this path for the
+    // bogus-member case, so the silent-fallthrough miscompile is no
+    // worse than the pre-#2445 state.
     if (!ms || !ms->parent || !ma.target) return nullptr;
     auto idxIt = fieldIndex_.find(ms);
     // CG-generic: for generic class field access (e.g. bd.value where

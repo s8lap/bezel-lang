@@ -8,14 +8,33 @@
 //
 //   1. buildModuleMetadata(): real Symbols → ModuleMetadata, with the §13
 //      public-surface filter — exported types are `public` only (§13.2),
-//      members are `public`/`protected` only (§13.1: the inheritance contract),
-//      private/internal members excluded. Signatures (types, params, modifiers,
-//      generics) come through from the resolved TypeRefs.
+//      CALLABLE/NAMEABLE members are `public`/`protected` only (§13.1: the
+//      inheritance contract), private/internal methods excluded. Signatures
+//      (types, params, modifiers, generics) come through from the resolved
+//      TypeRefs.
+//      fix #2456 (§22.8 / §2.8.2, v0.235): a private/internal INSTANCE FIELD
+//      of a non-generic class is NOW carried too (name + type + declaration
+//      order only, tagged `MetaVisibility::Private`/`Internal`, no
+//      initializer) — §13.1's table governs who may BIND to a member by
+//      name, not the artifact's wire format (§2.8.2: "the interface's
+//      required capability is semantic; its format is implementation-
+//      defined"). A field's PHYSICAL PRESENCE in the class's §22.8 instance
+//      layout is a declaration-order fact regardless of visibility; keeping
+//      it entirely off the wire left every importer's reconstructed struct
+//      layout for a class with a hidden private field ONE SLOT SHORT —
+//      #2456's confirmed heap-layout mismatch. Downstream NAME BINDING
+//      still enforces §13.1: the field is present in metadata but a
+//      cross-module `d.<privateField>` is still a compile error (verified
+//      by the codegen-level cross-module test suite,
+//      xmod_private_field_layout_import_2456_test.cpp) — the SAME pattern
+//      this file's `Region` (protected) case already demonstrates: present
+//      in metadata, its `visibility` tag is what the loader/sema enforce.
 //   2. embedModuleMetadata() → object section round-trip: compile a small module
 //      through the real AOT path (front-end → LLVM object), read the
 //      `.bezel.meta` section back out of the produced object with objcopy, and
-//      deserialize() it — asserting the recovered public interface matches and
-//      private members are absent.
+//      deserialize() it — asserting the recovered public interface matches, a
+//      private METHOD is absent, and a private FIELD is present but tagged
+//      Private (see the #2456 note above).
 
 #include "module/ModuleMetadataBuilder.hpp"
 
@@ -109,17 +128,23 @@ BEZEL_TEST(module_metadata_builder, only_public_types_exported_spec_13_2) {
 }
 
 // §13.1 / §13.3: within an exported type, `public` and `protected` members are
-// part of the interface (public = anyone, protected = the inheritance contract
-// visible to derived classes in other modules); `private` is excluded.
+// part of the CALLABLE/NAMEABLE interface (public = anyone, protected = the
+// inheritance contract visible to derived classes in other modules); a
+// private METHOD is excluded (no layout footprint, so nothing needs it to
+// cross). A private FIELD is a different story per fix #2456 (§22.8 /
+// §2.8.2, v0.235, see this file's header note): it now DOES cross, tagged
+// `Private`, name+type+position only — needed for §22.8 instance-layout
+// reconstruction, not for name binding (which the `visibility` tag still
+// gates downstream, unchanged).
 BEZEL_TEST(module_metadata_builder, member_visibility_filter_spec_13_1) {
     auto r = buildFromSource(
         "module Lib; "
         "public class Account "
         "  public Id: int; "                  // exported
         "  protected Region: int; "           // exported (inheritance surface)
-        "  private secret: long; "            // excluded
+        "  private secret: long; "            // fix #2456: now carried (layout only)
         "  public method Balance(): int => Id; "       // exported
-        "  private method recompute(): int => 0; "     // excluded
+        "  private method recompute(): int => 0; "     // excluded (no layout role)
         "end Account;");
     const MetaTypeDecl* acct = findType(r->meta, "Account");
     BEZEL_EXPECT_TRUE(acct != nullptr);
@@ -127,9 +152,18 @@ BEZEL_TEST(module_metadata_builder, member_visibility_filter_spec_13_1) {
     BEZEL_EXPECT_TRUE(findMember(*acct, "Id") != nullptr);
     BEZEL_EXPECT_TRUE(findMember(*acct, "Region") != nullptr);
     BEZEL_EXPECT_TRUE(findMember(*acct, "Balance") != nullptr);
-    // §13.1: private members are not bindable downstream → must be excluded.
-    BEZEL_EXPECT_TRUE(findMember(*acct, "secret") == nullptr);
+    // §13.1: a private METHOD carries no instance-layout footprint at all
+    // (it is not storage), so it stays excluded — unaffected by #2456.
     BEZEL_EXPECT_TRUE(findMember(*acct, "recompute") == nullptr);
+    // fix #2456: a private FIELD is now present (layout-only carriage) —
+    // but tagged Private, and with NO leaked initializer/value text (only
+    // NAME, TYPE, and declaration-order POSITION are needed for layout).
+    if (const MetaMember* secret = findMember(*acct, "secret")) {
+        BEZEL_EXPECT_TRUE(secret->visibility == MetaVisibility::Private);
+        BEZEL_EXPECT_TRUE(secret->valueText.empty());
+    } else {
+        BEZEL_EXPECT_TRUE(false);  // must be present post-#2456
+    }
 
     // The protected member carries its visibility for the loader to enforce §13.
     if (const MetaMember* region = findMember(*acct, "Region"))
@@ -333,14 +367,17 @@ std::vector<std::uint8_t> dumpSection(const std::string& objectPath,
 } // namespace
 
 BEZEL_TEST(module_metadata_emit, object_section_roundtrip_spec_2_6) {
-    // A representative library: a public class with a public + private member,
-    // and an internal (non-exported) type. After compilation the object must
-    // carry the public interface — and only the public surface.
+    // A representative library: a public class with a public + private
+    // member, and an internal (non-exported) type. After compilation the
+    // object must carry the public CALLABLE surface (methods) — but, per
+    // fix #2456 (§22.8 / §2.8.2, v0.235, see this file's header note), a
+    // private INSTANCE FIELD now also crosses (layout-only carriage: name +
+    // type + position, no initializer, still name-inaccessible downstream).
     const char* source =
         "module Bank.Core; "
         "public class Account "
         "  public Id: int; "
-        "  private balance: long; "          // §13.1: excluded from interface
+        "  private balance: long; "          // fix #2456: now carried (layout only)
         "  public method Deposit(amount: int): int => Id; "
         "end Account; "
         "class Internals "                    // §13.2 internal: not exported
@@ -389,11 +426,20 @@ BEZEL_TEST(module_metadata_emit, object_section_roundtrip_spec_2_6) {
         BEZEL_EXPECT_TRUE(findType(*recovered, "Account") != nullptr);
         BEZEL_EXPECT_TRUE(findType(*recovered, "App") != nullptr);
         BEZEL_EXPECT_TRUE(findType(*recovered, "Internals") == nullptr);
-        // Public member present, private member absent (§13.1).
+        // Public members present; a private FIELD is now present too
+        // (fix #2456, layout-only carriage — see this file's header note),
+        // tagged Private, surviving the real object-section round trip
+        // (embed → objcopy dump → deserialize), not just the in-process
+        // builder path T1's `member_visibility_filter_spec_13_1` covers.
         if (const MetaTypeDecl* acct = findType(*recovered, "Account")) {
             BEZEL_EXPECT_TRUE(findMember(*acct, "Id") != nullptr);
             BEZEL_EXPECT_TRUE(findMember(*acct, "Deposit") != nullptr);
-            BEZEL_EXPECT_TRUE(findMember(*acct, "balance") == nullptr);
+            if (const MetaMember* balance = findMember(*acct, "balance")) {
+                BEZEL_EXPECT_TRUE(balance->visibility == MetaVisibility::Private);
+                BEZEL_EXPECT_TRUE(balance->valueText.empty());
+            } else {
+                BEZEL_EXPECT_TRUE(false);  // must be present post-#2456
+            }
         }
         // The source declares App.Main, so the driver stamped the artifact
         // executable-kind (#1733, §2.8.4); verify that survived the roundtrip.

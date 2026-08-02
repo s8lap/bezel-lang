@@ -57,6 +57,22 @@ bool bodyContainsYield(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
 void scanReassignStmts(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                        sema::SemaContext& ctx,
                        std::unordered_set<const sema::Symbol*>& out);
+
+// §29.8 / §30.1 (#973a): can a frame's terminal-state disposal reclaim this
+// `owned` parameter through its capture slot? All three frame-disposal loops
+// (sync iterator, async iterator, plain async) LOAD the slot as a pointer,
+// null-test it and dispatch the destructor, so the parameter must be class- or
+// interface-typed. A move-only value type (an owning inline array, §15.3) rides
+// a different pass and is deliberately outside the conditional gate.
+bool ownedParamIsFrameDisposable(const sema::ParameterSymbol& ps,
+                                 sema::SemaContext& ctx) {
+    const sema::TypeRef* pt = ps.declType ? ctx.resolvedType(*ps.declType)
+                                          : ps.resolvedDeclType;
+    return pt && pt->kind == sema::TypeRef::Kind::Named && pt->declaration &&
+           (pt->declaration->kind == ast::TypeDeclKind::Class ||
+            pt->declaration->kind == ast::TypeDeclKind::Interface) &&
+           !pt->declaration->isValueBuiltin;
+}
 }  // namespace
 
 // §28.1 (v0.196, #1817/#1860): isValueSubstitutionErased is declared in
@@ -154,6 +170,11 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
         }
     }
     callBoundedScan(body);
+    // §28.14 v0.179 (#1527): call-bounded × task-abandonment. Runs right
+    // after callBoundedScan — needs the completed callBoundedAlias_ carrier
+    // map (the `var g := f;` local-rebinding idiom) but is otherwise
+    // independent of scopedPreScan's own state. // per §28.14 v0.179
+    checkCallBoundedTaskSettlement(body);
     scopedPreScan(body);
     scopedCalleeScan(body);
     checkTaskScopeConsumption(body);
@@ -449,6 +470,50 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             "`, to discharge it explicitly");
                         continue;
                     }
+                    // §29.8 / §30.1 (#973a): the CONDITIONALLY-discharged owned
+                    // parameter. §29.8 says the state machine disposes "any
+                    // `owned` parameter that has not been moved out of by the
+                    // body" — a RUNTIME property once the move-out sits on one
+                    // branch. The frame slot is therefore used as the runtime
+                    // moved-from flag: codegen NULLS it at the move-out site and
+                    // its terminal-state disposal is null-guarded, so the
+                    // discharged path skips and the fall-through path disposes
+                    // exactly once. That holds only when EVERY occurrence of the
+                    // parameter is one of the two forms the shared gate admits
+                    // (the marked adoption `using var y := owned p;`, whose
+                    // lowering nulls the frame slot, and a borrow read `p.F` /
+                    // `p.M(…)`); any other occurrence could discharge without
+                    // nulling the frame slot and the frame would double-free, so
+                    // the gate denies by default and the parameter keeps the
+                    // §28.3 reject below. Codegen emits the frame-slot null at
+                    // EVERY marked adoption of a frame-captured `owned`
+                    // parameter, admitted or not, so the nulled set is always a
+                    // superset of what this accepts — the accept can never
+                    // outrun the disposal that has to make it exactly-once.
+                    // // per §29.8, §30.1, §28.3
+                    if (ps->modifier == "owned" &&
+                        everDischarged_.count(sym) != 0 &&
+                        ownedParamIsFrameDisposable(*ps, ctx_) &&
+                        common::stateMachineOwnedParamIsFrameNullable(
+                            ctx_, sym, body)) {
+                        ps->iteratorFrameConditionalAutoDispose = true;
+                        // The same §28.3 must-use warning the never-discharged
+                        // branch above emits: on the branch that does NOT adopt,
+                        // the frame's teardown is an implicit drop.
+                        ctx_.diagnostics().report(
+                            Severity::Warning,
+                            st.obligationOrigin ? st.obligationOrigin->span.begin
+                                                : SourceLocation{},
+                            std::string("owned parameter `") +
+                            std::string(sym->name) +
+                            "` is implicitly disposed by the frame at teardown "
+                            "on the path that does not adopt it "
+                            "(§28.3/§29.8/§30.1 auto-drop); adopt it on every "
+                            "path with `using var _ := owned " +
+                            std::string(sym->name) +
+                            "`, to discharge it explicitly");
+                        continue;
+                    }
                 }
             }
             // §29.2 / §28.3 v0.157 (#1329): affine auto-drop for owned ITERATION
@@ -696,9 +761,49 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                 if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
                     if (auto* ld =
                             dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
+                        // §28.3/§28.11 (#1504): a suspend-local of a
+                        // BORROWING-COLLECTION type (isBorrowingCollectionName-
+                        // Head — Array<T>/Stack<T>/Queue<T>/Set<T>/
+                        // Dictionary<K,V>/LinkedList<T>, §28.11) whose element
+                        // type is Task-family (Task/Task<T>/OwningTask<T>) is
+                        // exempted from the suspend-local reject on the same
+                        // footing as SB01-C1/D2's bare-Task carve above: per
+                        // §28.11 the collection holds its elements as BORROWS
+                        // and never owns them, so dropping it — crossed-await
+                        // or not — abandons no task obligation, exactly the
+                        // issue's own argument for `Array<Task>`. Narrower
+                        // than a general "any trivial-dispose class" carve on
+                        // purpose: a plain non-collection class with no
+                        // destructor (`class T end T;`) stays the reject (see
+                        // tests/ownership/async_ownership_test.cpp's
+                        // suspend_local_dropped_on_normal_path_diagnosed,
+                        // #1504's negative control in
+                        // array_of_task_autodrop_warning_1504_test.cpp) —
+                        // whether §28.9's "implementation-defined reclaim"
+                        // genuinely carries zero leak risk on a permanently-
+                        // abandoned frame for an arbitrary trivial-dispose
+                        // class, the way it is accepted for Task specifically,
+                        // is a separate, NOT-YET-DECIDED design question this
+                        // fix declines to resolve silently (tracked #2332).
+                        // // per §28.3, §28.11, #1504
+                        bool taskElementBorrowingCollectionSuspendLocal = false;
+                        if (ld->initializer) {
+                            const sema::TypeRef* initTy =
+                                ctx_.exprType(*ld->initializer);
+                            if (initTy &&
+                                initTy->kind == sema::TypeRef::Kind::Named &&
+                                isBorrowingCollectionNameHead(initTy->headName()) &&
+                                !initTy->genericArgs.empty() &&
+                                initTy->genericArgs.back()) {
+                                taskElementBorrowingCollectionSuspendLocal =
+                                    common::isTaskFamilyHead(
+                                        initTy->genericArgs.back()->headName());
+                            }
+                        }
                         if (suspendLocalDecls_.count(ld) == 0 ||
                             borrowAwaitedOwnedTaskDecls_.count(ld) != 0 ||
-                            declInitializerIsOwnedTaskMint(ld)) {
+                            declInitializerIsOwnedTaskMint(ld) ||
+                            taskElementBorrowingCollectionSuspendLocal) {
                             const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd =
                                 true;
                             ctx_.diagnostics().report(
@@ -729,6 +834,15 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         dynamic_cast<const ast::LocalDecl*>(lsAt->decl)) {
                     if (ldAt->dischargedByArmTransfer) continue;
                 }
+            }
+            // #1634 / §22.4 / §28.8: companion to the handleAssignment fix
+            // above — an `out owned` parameter's value transfers to the caller
+            // at every method exit, releasing the callee-side obligation.
+            // Suppress the fall-through discharge error for these parameters
+            // (without this skip the assignment-time change would now fire the
+            // error on every legal exit). // per §22.4, §28.8
+            if (auto* psOut = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                if (psOut->modifier == "out owned") continue;
             }
             ctx_.diagnostics().report(
                 Severity::Error,
@@ -2494,8 +2608,38 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                         ys->value.get())) {
                     if (id->name != "this" && id->name != "base") {
                         if (auto* st = lookupState(id->name)) {
-                            if (st->state == OwnershipState::Owned)
+                            // fix #1267 / §29.2 "Iterator yield ownership" +
+                            // §28.10 (axiom A5): the consume above is a MOVE OUT
+                            // of the named binding, and a `using var` /
+                            // `await using var` is a scope pin — "never movable
+                            // out". Every other owned-consuming position already
+                            // rejects it (`return b;` under an `owned` return, an
+                            // `owned` argument, `move b`, `using var y := owned b`,
+                            // an arm marker); the owning-yield position was the one
+                            // that did not, and silently marking the pin Disposed
+                            // here let BOTH the consumer (through `TakeCurrent()`)
+                            // and the frame's own scope-exit disposal
+                            // (`registerUsingDisposal`) free the same slot — the
+                            // #1267 double-dispose. Reject instead: the frame keeps
+                            // the pin, so nothing is handed out twice. A plain `var`
+                            // binding is the spelling that hands the value to the
+                            // consumer. // per §29.2, §28.10, axiom A5
+                            if (st->implicitDischarge) {
+                                report(
+                                    Severity::Error, id->span.begin,
+                                    std::string("cannot yield `using var` `") +
+                                    std::string(id->name) +
+                                    "` from an owning iterator; the owning "
+                                    "`yield return` of a named owned binding "
+                                    "transfers ownership to the consumer, and a "
+                                    "`using var` is scope-bound — it cannot be "
+                                    "moved out of (§29.2 / §28.10, axiom A5); "
+                                    "bind it with a plain `var` to hand it to the "
+                                    "consumer");
+                                st->state = OwnershipState::Poisoned;
+                            } else if (st->state == OwnershipState::Owned) {
                                 markDisposedByName(id->name, id->span.begin);
+                            }
                         }
                     }
                 }
@@ -3471,6 +3615,30 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
         if (calleeMs && ctx_.importedReturnOwned(calleeMs) &&
             isClassOrInterfaceResult(ctx_.exprType(e)))
             return OwnershipState::Owned;
+        // #1718 / §32.6 / §28.1: an EXTERN (FFI) method declared with an
+        // `owned` return transfers ownership to the caller. The callee is an
+        // ExternDeclSymbol (not a MethodSymbol + no MethodDecl + no
+        // importedReturnOwned_ entry), so the returnOwned / importedReturnOwned
+        // paths above never fire and the result was classified Borrowed;
+        // `using var c := strdup(...)` (the spec §32.6 ownership-transferring
+        // example) emitted the §28.10 vacuous-pin warning and the strdup'd
+        // buffer was never freed (a memory leak). Classify it Owned when the
+        // callee is an owned-returning extern — codegen's isFfiBuf branch
+        // (registerUsingDisposal, LlvmBackend_Setup) already recognises the
+        // CString/WString/RawBytes builtin head on the binding and registers a
+        // null-guarded free() at scope end (RawBytes via bz_rawbytes_free);
+        // the only missing piece was ownership-pass agreement on the Owned
+        // verdict. // per §32.6, §28.1, #1718
+        if (!calleeMs) {
+            sema::Symbol* calleeSym = ce->callee
+                                          ? ctx_.exprSymbol(*ce->callee)
+                                          : nullptr;
+            if (auto* xd =
+                    dynamic_cast<sema::ExternDeclSymbol*>(calleeSym)) {
+                if (xd->externDecl && xd->externDecl->returnOwned)
+                    return OwnershipState::Owned;
+            }
+        }
         // #1290 / §27.1 / §28.3: a call through a FUNCTION-TYPED VALUE whose
         // declared return slot carries `owned` (`mk: () -> owned Res; mk()`)
         // produces a fresh owned value, exactly like an owned-returning method
@@ -3554,16 +3722,22 @@ OwnershipState MethodOwnership::producerState(const ast::Expr& e) {
             if (retTy->kind == sema::TypeRef::Kind::Named &&
                 retTy->astNode && retTy->astNode->name &&
                 !retTy->astNode->name->parts.empty()) {
+                // #2512 / §28.3 (v0.221, #1787 ruling; #2369): consult the
+                // shared `kOwningTypeHeads` set (the #1414 registry refactor
+                // this site was missed by) — a hand-maintained literal here
+                // drifts every time a new owning head is added. The set
+                // already covers Shared / Weak / ChannelSender / OwningTask /
+                // the six owning-collection heads / IOwningEnumerable /
+                // CancellationTokenSource AND the three owning iterable-
+                // interface heads (IOwningEnumerator, IOwningAsyncEnumerable,
+                // IOwningAsyncEnumerator) that #2369 added; without the
+                // registry hop, a fresh async yield-iterator returning one of
+                // the three sibling heads is misclassified Borrowed → the
+                // caller carries no disposal obligation and the freshly-
+                // allocated state-machine frame leaks at program exit.
                 std::string_view head = retTy->headName();
-                if (head == "Shared"          || head == "Weak"            ||
-                    head == "ChannelSender"    || head == "OwningTask"       ||
-                    head == "OwningArray"       || head == "OwningDictionary" ||
-                    head == "OwningSet"         || head == "OwningStack"      ||
-                    head == "OwningQueue"       || head == "OwningLinkedList" ||
-                    head == "IOwningEnumerable"  ||
-                    head == "CancellationTokenSource") {
+                if (common::isOwningTypeHead(head))
                     return OwnershipState::Owned;
-                }
             }
         }
     }
@@ -3944,6 +4118,55 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
             bool isAsync = false;
             for (std::string_view mod : md->modifiers)
                 if (mod == "async") { isAsync = true; break; }
+            // fix #2443 (§29.1 "The protocol", §28.10 using-var-from-a-borrow,
+            // v0.235): a manual, zero-arg `.GetEnumerator()` call whose
+            // sema-inferred result is the builtin `IEnumerator<T>`/
+            // `IOwningEnumerator<T>` sentinel is NEVER a recognized borrow,
+            // whatever `md`'s body shape scans as. §29.1 declares the
+            // protocol's signature as `method GetEnumerator(): owned
+            // IEnumerator<T>` and states plainly: "the caller takes ownership
+            // of the enumerator and must dispose it" — for EVERY call through
+            // this protocol, not merely ones whose implementation body is
+            // itself a fresh producer. The self-returning idiom (#2384: a
+            // class implementing both `IEnumerable<T>` and `IEnumerator<T>`,
+            // `GetEnumerator(): IEnumerator<int> return this; end
+            // GetEnumerator;`) spells its return type WITHOUT the `owned`
+            // keyword — the builtin sentinel is reached structurally, not via
+            // an interface-matching `owned` echo — so `md->returnOwned` reads
+            // false and the body-scan below would otherwise see a bare
+            // `return this;` and (correctly, IN GENERAL, for an ordinary
+            // receiver-returning method, §28.6 "Methods returning `this`")
+            // recognize it as a borrow-pin. But THIS specific call shape is
+            // never handed the raw receiver: LlvmBackend_Calls2.cpp's manual-
+            // `.GetEnumerator()` lowering (the #2388/#2440 fix site,
+            // `wrapUserClassAsIEnumerable`) always wraps the result in a
+            // freshly calloc'd adapter struct that the calling scope alone
+            // names and must dispose (its own Dispose, hardened by #2389/
+            // #2424/#2440, already resolves the self-returning alias
+            // correctly via a runtime pointer-equality guard so disposing the
+            // wrapper here is sound, not a double-free) — a purely codegen-
+            // level fact the body-shape scan below cannot see. Gated on the
+            // EXACT sema-type shape (Named, no `declaration`, an `astNode`
+            // with a single-part head of `IEnumerator`/`IOwningEnumerator`)
+            // codegen's own `resultIsEnumeratorSentinel` gate uses
+            // (LlvmBackend_Calls2.cpp `wrapUserClassAsIEnumerable` call site)
+            // so this carve fires on exactly the call shape codegen wraps and
+            // no other: the two-class idiom (`GetEnumerator()` returning a
+            // separate, freshly-`new`'d enumerator class) already fails the
+            // body-scan below on its own (a `new` producer is not receiver-
+            // sourced) and is unaffected either way. // per §29.1, §28.10,
+            // §28.6, #2443
+            bool isManualGetEnumeratorWrap = false;
+            if (md->name == "GetEnumerator") {
+                const sema::TypeRef* resultTy = ctx_.exprType(*ce);
+                isManualGetEnumeratorWrap =
+                    resultTy && resultTy->kind == sema::TypeRef::Kind::Named &&
+                    !resultTy->declaration && resultTy->astNode &&
+                    resultTy->astNode->name &&
+                    !resultTy->astNode->name->parts.empty() &&
+                    (resultTy->headName() == "IEnumerator" ||
+                     resultTy->headName() == "IOwningEnumerator");
+            }
             // #2137(b): the scan is the RECEIVER-SOURCED generalization — it
             // accepts, on every return path, a bare `this` (§28.6 "Methods
             // returning `this`"; for an extension method `this` IS the
@@ -3954,7 +4177,7 @@ bool MethodOwnership::usingVarInitIsRecognizedBorrow(const ast::Expr& init) cons
             // callee's definition (§28.3 "Borrow lifetime rules" — "a borrowed
             // *local or parameter* with no source that outlives the call may
             // not be returned"). // per §28.10, §28.6, §26.7, #2137
-            if (!isAsync && !md->returnOwned &&
+            if (!isAsync && !isManualGetEnumeratorWrap && !md->returnOwned &&
                 methodReturnsOnlyReceiverSourcedBorrows(*md))
                 return true;
         }
@@ -4284,7 +4507,24 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
         // not borrowable"; without this exclusion the inert-RHS check
         // would over-fire on every disposable-typed `using var` binding
         // (#2073 rework 2). // per §28.10, #2073 (rework 2)
-        const sema::TypeRef* rhsTy = ctx_.exprType(*ld.initializer);
+        //
+        // #2451 (rework 4): prefer the EXPLICIT declared type (`ld.type`) over
+        // the bare initializer expression's own type when both are present —
+        // mirrors codegen's own precedence for the identical decision
+        // (registerUsingDisposal, LlvmBackend_Setup.cpp: "const sema::TypeRef*
+        // lt = ld->type ? ctx_.resolvedType(*ld->type) :
+        // ctx_.exprType(*ld->initializer);"). This matters for a coercing
+        // binding — `using var seq: IEnumerable<int> := a;` where `a: Array<int>`
+        // — whose initializer's OWN type (Array<int>, trivial-dispose per
+        // §28.11) differs from the declared target type (IEnumerable<int>,
+        // one of the eight iteration-protocol sentinel names above): codegen
+        // wraps `a` into a fresh vtable-backed IEnumerable frame and registers
+        // a real disposal for it (the `wrappedHere`/`isSyncIterEnum` path), so
+        // keying this lint on the initializer's un-coerced type alone left the
+        // coercing shape misclassified as inert even after the head-name fix.
+        // Without a declared type this is exactly the prior behavior.
+        const sema::TypeRef* rhsTy = ld.type ? ctx_.resolvedType(*ld.type)
+                                              : ctx_.exprType(*ld.initializer);
         // §35.4 (#2047): an OWNING choice (`Result<Connection, string>`) is a
         // value type that DOES carry a disposal obligation — its active case's
         // owned payloads are disposed at scope end (§35.4). It is neither
@@ -4409,11 +4649,35 @@ bool MethodOwnership::rhsIsVacuousBorrowPin(const ast::Expr& e) const {
 // `Dictionary<K,V>`) are deliberately EXCLUDED: per §28.11 their `Dispose()`
 // is a no-op (trivial-dispose), so a `using var` over `new Array<int>()` is
 // the vacuous pattern the lint exists to steer away from — the §21.1 const
-// alias is the correct spelling. Interfaces with user TypeDecls (IEvent<T>,
-// IAsyncEvent<T>, the IOwningEnumerable<T> family, IEnumerable<T>,
-// IAsyncEnumerable<T>, …) are already covered by isBorrowableType's
-// interface branch (returns true) and never reach this exclusion.
-// // per §28.10, §28.11, #2073 (rework 3c)
+// alias is the correct spelling.
+//
+// #2385/#2451 (rework 4): the iteration-protocol sentinel family —
+// IEnumerable<T>/IEnumerator<T>/IOwningEnumerable<T>/IOwningEnumerator<T>
+// and their async counterparts IAsyncEnumerable<T>/IAsyncEnumerator<T>/
+// IOwningAsyncEnumerable<T>/IOwningAsyncEnumerator<T> — are NOT "interfaces
+// with user TypeDecls"; TypeResolution_Names.cpp registers all eight as
+// declaration-less builtins ("declaration stays null (no user TypeDecl)"),
+// the SAME representation as Channel<T>/EventSource<T> above, so a
+// previous version of this comment's claim that they are "already covered
+// by isBorrowableType's interface branch" was simply wrong — isBorrowableType
+// falls through the null-declaration branch and reports false for every one
+// of them, exactly like the builtins this function exists to rescue. Yet a
+// `using var`/`await using var` bound to one of them DOES carry a real
+// disposal obligation: `GetEnumerator()`/`GetOwningEnumerator()`/
+// `GetAsyncEnumerator()`/`GetOwningAsyncEnumerator()` return an `owned`
+// enumerator/enumerable per stdlib §4.12/§4.13 and language spec §29.1
+// ("the caller takes ownership of the enumerator and must dispose it" —
+// unconditional, not gated on the callee's implementation shape), and
+// codegen's registerUsingDisposal (LlvmBackend_Setup.cpp) genuinely
+// registers a disposal call for exactly this eight-name set — the sync
+// `isSyncIterEnum` list (IEnumerable/IOwningEnumerable/IEnumerator/
+// IOwningEnumerator/IAsyncEnumerable/IOwningAsyncEnumerable) plus the
+// `isAwaitUsing` branch's `isAsyncIterEnum` list (IAsyncEnumerator/
+// IOwningAsyncEnumerator) — never a no-op. Without this exclusion the
+// inert-RHS check wrongly steered users away from the canonical `using var
+// e := src.GetEnumerator();` spelling toward a `const` that would silently
+// drop the disposal and leak the enumerator/wrapper frame.
+// // per §28.10, §28.11, §29.1, #2073 (rework 3c), #2385, #2451
 bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     if (!rt) return false;
     if (rt->kind != sema::TypeRef::Kind::Named) return false;
@@ -4455,6 +4719,41 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     // (rework 3b).
     if (head == "BinarySerializer" || head == "BinaryDeserializer" ||
         head == "JsonSerializer"   || head == "JsonDeserializer")
+        return true;
+    // #1718 / §32.6 / stdlib §10: a CString/WString/RawBytes from an owned-
+    // returning EXTERN or static From/FromBytes factory carries a real free()
+    // disposal obligation (§32.6: "a `using var` discharges it"). The classifier
+    // would otherwise lump them with value-typed/runtime-managed types and fire
+    // the §28.10 vacuous-pin warning — even though codegen's isFfiBuf branch
+    // (registerUsingDisposal, LlvmBackend_Setup) registers the free(). Recognize
+    // them here so the lint does not fight the disposal.
+    if (head == "CString" || head == "WString" || head == "RawBytes")
+        return true;
+    // stdlib §7.2 (#645): FileStream declares `destructor;` outright — "flushes
+    // buffered writes and closes the OS file handle" — and §7.2's own prose
+    // makes `using var` the canonical spelling ("the `using var` idiom
+    // guarantees this on every exit edge, including exceptions"). Without this
+    // arm the §28.10 lint would call that idiom vacuous.
+    if (head == "FileStream") return true;
+    // #2385/#2451 / §29.1, §29.2, stdlib §4.12/§4.13: the iteration-protocol
+    // sentinel family. `GetEnumerator()`/`GetOwningEnumerator()`/
+    // `GetAsyncEnumerator()`/`GetOwningAsyncEnumerator()` return an `owned`
+    // enumerator/enumerable — §29.1: "the caller takes ownership of the
+    // enumerator and must dispose it", unconditionally, independent of the
+    // callee's implementation shape (compiler-generated iterator, hand-
+    // written user class, or an Array<T>/user-class value wrapped into the
+    // interface by codegen's wrapUserClassAsIEnumerable). A `using var`/
+    // `await using var` bound to one of these eight names is exactly the
+    // canonical §28.10 pattern, mirrored by registerUsingDisposal's own
+    // isSyncIterEnum / isAsyncIterEnum head-name sets (LlvmBackend_Setup.cpp)
+    // — never a no-op. Without this arm, isBorrowableType's null-declaration
+    // fallthrough (these are declaration-less builtins, TypeResolution_
+    // Names.cpp) left every one of them in the "no disposal obligation"
+    // bucket, misfiring the vacuous-pin warning on a real disposal.
+    if (head == "IEnumerable" || head == "IEnumerator" ||
+        head == "IOwningEnumerable" || head == "IOwningEnumerator" ||
+        head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
+        head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator")
         return true;
     return head == "Channel" || head == "ChannelSender" ||
            head == "EventSource" || head == "AsyncEventSource" ||
@@ -4701,14 +5000,20 @@ void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
             // method exit (the over-rejection of issue #390). Definite
             // assignment of the `out` parameter on every path (§7.9) is a
             // separate concern not handled here.
-            if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
-                if (ps->modifier == "out owned") {
-                    st.state = OwnershipState::Disposed;
-                    st.obligationOrigin = &as;
-                    st.source.reset();
-                    return;
-                }
-            }
+            // #1634 / §22.4 / §28.8: an `out owned` parameter's value transfers
+            // to the caller at method exit (the call site adopts the slot
+            // contents), so a mid-body read is a BORROW of the slot — never
+            // a use-after-dispose. The previous early-return marked the
+            // parameter Disposed immediately on assignment, which made the
+            // next read `if r <> null` fire a false "use after Dispose"
+            // warning (#1634). The correct model: let the assignment fall
+            // through to the normal handling below, leaving state Owned (the
+            // producer's state). The out-transfer releases the callee-side
+            // obligation at every exit edge (mirroring what `return`
+            // discharges for `owned` return types, but here implicit on every
+            // exit) — so the endState fall-through error below skips
+            // `out owned` parameters instead (companion fix). // per §22.4,
+            // §28.8
             // §28.3 / §28.7 (v0.180) consume-site freeze: reassigning an OWNED
             // local is a drop-on-overwrite that silently disposes the displaced
             // value. If a live local borrow of that value exists, the overwrite
@@ -5844,7 +6149,12 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
         //
         // §28.3 (#1660 review — reachable double-free): the #1493 receiver-
         // owned-field carve-out is UNSOUND for the owning DEFERRED-ACTIVATION
-        // heads — `OwningTask<T>` and `IOwningEnumerable<T>`. These are
+        // heads — `OwningTask<T>` and the four owning iterable-interface heads
+        // (`IOwningEnumerable<T>`, `IOwningEnumerator<T>`,
+        // `IOwningAsyncEnumerable<T>`, `IOwningAsyncEnumerator<T>`; #2369
+        // extended the set from `IOwningEnumerable<T>` alone per the #1787
+        // ruling — §28.6 "the same method-return exclusion applies to a field
+        // typed at an owning iterable-interface head"). These are
         // consumer-disposed (producerState's name-head fallback classifies a
         // call result of these types Owned) and their disposal is NOT
         // idempotent-protected (unlike Shared/Weak/ChannelSender/
@@ -5881,7 +6191,8 @@ void MethodOwnership::checkBorrowReturnedThroughOwningType(const ast::Expr& e) {
         // for a plain-`Task` return; excluding `Task` here routes it to the borrow
         // rejection below. // per §28.3, §28.6 (v0.190)
         const bool deferredActivationOwningHead =
-            common::isTaskFamilyHead(head) || head == "IOwningEnumerable";
+            common::isTaskFamilyHead(head) ||
+            common::isOwningIterableInterfaceHead(head);
         if (!deferredActivationOwningHead && exprIsReceiverOwnedFieldBorrow(e))
             return;
         bool isBorrow = ownedArgSourceIsBorrow(e);
@@ -7178,6 +7489,33 @@ void MethodOwnership::checkBareTypeParamReturn(const ast::Expr& e) {
                 return;
             }
     }
+    // §28.3 v0.235 (#1666, #2381): REJECT an iteration-variable borrow whose
+    // loop source is INTERFACE-TYPED (IEnumerable<T>/IAsyncEnumerable<T>). At an
+    // interface-typed enumeration source the element's backing is unprovable, so
+    // the variable's source is conservatively the loop's implicit enumerator — a
+    // scope-bound local — and returning it hands back a borrow that dies with the
+    // callee frame while the caller re-establishes only a borrow. A CONCRETE
+    // collection-backed source (Array<T>, …) re-borrows through element slot →
+    // collection → receiver and is ADMITTED (the ruling's accept half); the
+    // index spelling `this[i]` is not an iteration variable and is admitted by
+    // the fall-through. The owning heads (IOwningEnumerable<T>/…) seed the
+    // iteration variable OWNED and were already rejected by the owned-local arm
+    // above. // per §28.3, §29.1, §29.2 v0.235
+    if (borrowedIterVarFromInterfaceSource(e)) {
+        report(
+            Severity::Error, e.span.begin,
+            "a bare-type-parameter return may not return an iteration variable "
+            "borrowed from an interface-typed enumeration source "
+            "(IEnumerable<T>/IAsyncEnumerable<T>) — the element's backing is "
+            "unprovable, so the variable's source is the loop's implicit "
+            "enumerator, a scope-bound local that dies with the callee while the "
+            "caller re-establishes only a borrow (§28.3 *Bare-type-parameter "
+            "returns* / §29.2, v0.235, #1666); use the index spelling "
+            "`this[i]` (receiver-sourced), constrain the parameter "
+            "`where T: value` so the return copies, or declare the return type "
+            "`owned T`");
+        return;
+    }
     // Admit: a plain-parameter- / receiver- / static-storage-sourced borrow.
 }
 
@@ -7194,6 +7532,40 @@ void MethodOwnership::reportBareTypeParamOwnedReturn(const ast::Expr& e) {
         "(§28.3 *Bare-type-parameter returns*, v0.194); return `null`, a "
         "receiver- or plain-parameter-sourced borrow, or declare the return type "
         "`owned T` to transfer ownership");
+}
+
+// §28.3 v0.235 (#1666, #2381): the v0.235 iteration-variable ruling's must-
+// reject recognizer. A returned bare identifier `e` resolves to its LocalSymbol;
+// when that symbol is a for-loop's iteration variable (`decl` is a ForStmt) whose
+// loop source has the static type of a BORROWING enumeration interface —
+// `IEnumerable<T>` / `IAsyncEnumerable<T>` — the element's backing is unprovable,
+// so the variable's source is conservatively the loop's implicit enumerator (a
+// scope-bound local), and the borrow may not escape the loop body. The check is
+// keyed on the iterable's STATIC type head, mirroring iterableIsOwningEnumerable:
+// a Named TypeRef carries its name on the AST node (`astNode->name->parts`) or,
+// for an imported type, in `importedName`; check both. A CONCRETE collection
+// source (Array<T>, …) is collection-backed (the chain element slot → collection
+// → receiver) and returns null — admitted; the owning heads seed the iteration
+// variable OWNED and are rejected by the owned-local arm; range/span/inline-array/
+// string sources carry no enumeration interface and return null. // per §28.3,
+// §29.1, §29.2 v0.235
+const ast::ForStmt* MethodOwnership::borrowedIterVarFromInterfaceSource(
+    const ast::Expr& e) {
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+    if (!id) return nullptr;
+    auto* lsym = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!lsym) return nullptr;
+    auto* fs = dynamic_cast<const ast::ForStmt*>(lsym->decl);
+    if (!fs || !fs->iterable) return nullptr;
+    const sema::TypeRef* tt = ctx_.exprType(*fs->iterable);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named) return nullptr;
+    std::string_view head;
+    if (tt->astNode && tt->astNode->name && !tt->astNode->name->parts.empty())
+        head = tt->headName();
+    else if (!tt->importedName.empty())
+        head = tt->importedName;
+    if (head == "IEnumerable" || head == "IAsyncEnumerable") return fs;
+    return nullptr;
 }
 
 // §28.3 / §28.6 (v0.180 #1547; role changed v0.196 #1815): see the header
@@ -7296,31 +7668,93 @@ void MethodOwnership::checkBorrowedOwningCollectionCapability(
 //   `Take(): Cell? => move v;`).
 //
 // SCOPED TO THE `move` FORM. A BARE read of an owned field (`return this.f;` /
-// `=> f;`) is NOT caught here: per §28.6's "Methods returning `this`" rule a
-// method with a non-`owned` class return type returns a BORROW of the field —
-// "a reference whose lifetime is bounded by the receiver's lifetime" — which the
-// caller may not assign to an owned field or return as owned, and which the
-// field's owner (the receiver's destructor) still disposes. That is a legal,
-// double-free-free borrow return (codified by the cross-module `t3` canary
-// `GetConn(): Connection => Conn`, which returns 55 ASan-clean). The §28.6
-// example's `return _transactions` leak is the OWNING-COLLECTION case (the field
-// type is an owning collection / wrapper), already rejected at
-// checkBorrowReturnedThroughOwningType (#1007); a bare class-type field read is
-// a borrow, not a leak. So only the `move` form — which actually transfers the
-// value out — is the §28.6 violation handled here.
+// `=> f;`) is NOT caught here on the NON-`owned`-return path: per §28.6's
+// "Methods returning `this`" rule a method with a non-`owned` class return type
+// returns a BORROW of the field — "a reference whose lifetime is bounded by the
+// receiver's lifetime" — which the caller may not assign to an owned field or
+// return as owned, and which the field's owner (the receiver's destructor) still
+// disposes. That is a legal, double-free-free borrow return (codified by the
+// cross-module `t3` canary `GetConn(): Connection => Conn`, which returns 55
+// ASan-clean). The §28.6 example's `return _transactions` leak is the OWNING-
+// COLLECTION case (the field type is an owning collection / wrapper), already
+// rejected at checkBorrowReturnedThroughOwningType (#1007); a bare class-type
+// field read is a borrow, not a leak. So only the `move` form — which actually
+// transfers the value out — is the §28.6 violation handled on the non-`owned`-
+// return path below.
 //
-// An `owned` return type is the explicit, legal ownership-transfer form (§28.8)
-// and is exempt. Scoped to owned FIELD `move`s only: an owned LOCAL return
+// #2368 (§28.6 bullet 2 / §28.8.1, v0.236): the `owned`-return path is NO LONGER
+// blanket-exempt. The spec lists the ONLY transfer-to-caller form: "to the
+// caller only as `return move _f;` through an `owned` return type". A BARE read
+// of an owned field through an `owned` return (`public method Take(): owned T =>
+// _f;`) is rejected — the bare read LENDS (§28.6 bullet 1, K9.1) and leaves the
+// field UN-MOVED-FROM, so the holder's destructor still disposes the field,
+// while the caller now also owns the returned value and disposes it — a double-
+// free (the implicit terminal-move-without-restoration shape the #1814 ruling
+// and §28.8.1's "no terminal-move dispensation" reject). The remedy the spec
+// names is the `move` spelling (`return move _f;`), which marks the field
+// moved-from and whose restoration obligation §28.8.1 enforces separately; the
+// `move` form is therefore exempt here. The check is scoped to owned FIELD
+// reads: a fresh `new`, an owned local, an owned parameter, an owned-returning
+// call, or any other non-field-read expression is ADMITTED — `exprIsOwned-
+// FieldRead` resolves a MemberAccess `obj.f` or a bare identifier `f` (implicit
+// `this.f`) to its FieldSymbol, so non-FieldSymbol sources do not match.
+// // per §28.6 bullet 2, §28.8.1
+//
+// An `owned` return type's other shapes (a `move` of an owned LOCAL, etc.) are
+// out of scope here. Scoped to owned FIELD reads only: an owned LOCAL return
 // (`var r := new T(); return r;`) is a separate concern (#1006a, with
 // materializer-interaction risk) and is deliberately NOT handled here — `move`
 // of a local resolves to a LocalSymbol, not a FieldSymbol, so it does not match.
 // // per §28.6
 void MethodOwnership::checkOwnedFieldReturn(const ast::Expr& e) {
-    // An `owned` return type is the explicit, legal transfer — exempt.
-    if (returnOwned_) return;
-    // Require the `move` form: `move this.f` / `move f` is a UnaryExpr("move").
-    // A bare field read (no `move`) is a legal borrow return (see above) and is
-    // intentionally not flagged.
+    // #2368 (§28.6 bullet 2, v0.236): a BARE read of an owned field through an
+    // `owned` return is the double-free shape — the field is left un-moved-from
+    // (the holder's destructor still disposes it), while the caller now owns the
+    // returned value and disposes it too. Reject; the spec names `move` as the
+    // only transfer spelling. // per §28.6 bullet 2, §28.8.1
+    if (returnOwned_) {
+        // The `move` form is the spec-sanctioned transfer (§28.6 bullet 2); its
+        // §28.8.1 field-restoration obligation is enforced elsewhere. Exempt.
+        if (auto* un = dynamic_cast<const ast::UnaryExpr*>(&e))
+            if (un->op == "move") return;
+        // A bare owned-FIELD read (`_f`, `this._f`, `obj._f`, `Registry.Slot`)
+        // — the double-free shape. exprIsOwnedFieldRead resolves a MemberAccess
+        // or a bare identifier (implicit `this.f`) to its FieldSymbol and
+        // checks the `owned` modifier; a method-scope local/parameter is not a
+        // FieldSymbol, so `return ownedParam;` / `return ownedLocal;` does NOT
+        // match (those are the legal owned-passthrough shapes). A fresh `new`
+        // or owned-returning call result is not a field read either — admitted.
+        //
+        // #2518 (§28.6 bullet 2 / §17.8 / §28.8.1): look through a leading
+        // force-unwrap `!` so the nullable spelling `=> _f!` is classified
+        // identically to its bare form `=> _f`. §17.8 line 3271: "The null-
+        // forgiving operator preserves ownership ... it does not move, copy,
+        // or borrow beyond what reading `x` already does" — so `_f!` is the
+        // SAME bare read as `_f` (the `!` only strips the §7 nullable-vs-non-
+        // nullable mismatch that would otherwise fire first on the bare
+        // nullable form, exposing the very §28.6 bullet 2 hole #2368 closed;
+        // it does NOT make the read a `move`).
+        if (exprIsOwnedFieldRead(*lookThroughForceUnwrap(&e))) {
+            report(
+                Severity::Error, e.span.begin,
+                "a bare read of an owned field may not be returned through an "
+                "`owned` return type (§28.6 bullet 2): transfer to the caller "
+                "is \"only as `return move _f;` through an `owned` return "
+                "type\". The bare read leaves the field un-moved-from (the "
+                "holder's destructor still disposes it), while the caller now "
+                "owns the value and disposes it too — a double-free (the "
+                "terminal-move-without-restoration shape §28.8.1 rejects). "
+                "Use `return move <field>;` — and satisfy §28.8.1's field-"
+                "restoration obligation — to transfer ownership cleanly");
+            return;
+        }
+        return;  // owned return + non-field-read expression (fresh producer,
+                 // owned local/param, owned call result, etc.) — admitted
+    }
+    // NON-`owned` return path (#1005): require the `move` form. `move this.f` /
+    // `move f` is a UnaryExpr("move"). A bare field read (no `move`) through a
+    // non-`owned` return is a legal borrow (see the header note above) and is
+    // intentionally not flagged on this path.
     auto* un = dynamic_cast<const ast::UnaryExpr*>(&e);
     if (!un || un->op != "move" || !un->operand) return;
     // The moved operand must be a read of an `owned` FIELD of the enclosing
@@ -7328,7 +7762,19 @@ void MethodOwnership::checkOwnedFieldReturn(const ast::Expr& e) {
     // identifier `f` (implicit `this.f`) to its FieldSymbol and checks the
     // `owned` modifier; a method-scope local/parameter is not a FieldSymbol, so
     // `move localOwned` (the #1006a concern) does not match. // per §28.6
-    if (!exprIsOwnedFieldRead(*un->operand)) return;
+    //
+    // #2518 (§28.6 / §17.8 / §28.8.1): look through a leading force-unwrap
+    // `!` so the nullable spelling `move _f!` is classified identically to its
+    // bare form `move _f`. §17.8 line 3271 ("the null-forgiving operator ...
+    // does not move, copy, or borrow beyond what reading `x` already does")
+    // makes `move _f!` a `move` of the SAME underlying owned field as
+    // `move _f`; on the non-`owned`-return path that leaks the moved value
+    // out with no owner exactly like `move _f` (#1005). (`move _f!` followed
+    // by `_f := null` is §28.8.1's canonical nullable-field detach — line
+    // 4605 — but only through an `owned` return; the non-`owned`-return arm
+    // remains a leak.)
+    if (!exprIsOwnedFieldRead(*lookThroughForceUnwrap(un->operand.get())))
+        return;
     report(
         Severity::Error, e.span.begin,
         "cannot return an owned field's `move`d value through a non-`owned` "
@@ -7731,8 +8177,35 @@ void checkOperatorReturnDeclaration(const ast::OperatorDecl& od,
                             /*isOperator=*/true, ctx);
 }
 
+// §28.3 v0.235 (#1666, #2381): collect an extension block's type parameters as
+// synthetic `GenericParam`s. An `ExtensionDecl` carries no `genericParams`
+// vector — the block-level type parameters ride the target type's generic
+// argument list (the `T` in `extension IEnumerable<T>`). A generic argument
+// introduces a block-level type parameter when it is a bare single-segment
+// non-nullable Named type with no generic args of its own (mirroring
+// bindExtensionTargetTypeParams's recognition rule); a concrete-instantiation
+// head (`Array` in `Array<T>`) is not a parameter. The returned `string_view`s
+// point into the AST, which outlives the ownership pass. // per §26.4, §28.3 v0.235
+static std::vector<ast::GenericParam> extensionTypeParams(
+    const ast::ExtensionDecl& ext) {
+    std::vector<ast::GenericParam> out;
+    if (!ext.targetType) return out;
+    for (const auto& ga : ext.targetType->genericArgs) {
+        if (!ga) continue;
+        if (ga->kind == ast::TypeKind::Named && ga->name &&
+            ga->name->parts.size() == 1 && !ga->nullable &&
+            ga->genericArgs.empty()) {
+            ast::GenericParam gp;
+            gp.name = ga->name->parts.front();
+            out.push_back(gp);
+        }
+    }
+    return out;
+}
+
 void checkMember(const ast::Member& m, sema::SemaContext& ctx,
-                 const ast::TypeDecl* enclosingType = nullptr) {
+                 const ast::TypeDecl* enclosingType = nullptr,
+                 const ast::ExtensionDecl* enclosingExtension = nullptr) {
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(&m)) {
         // §28.3 *Bare-type-parameter returns* (v0.194, #1801 S6): assemble the
         // generic context the callee-side check keys on — this method's generic
@@ -7746,6 +8219,22 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         if (enclosingType) {
             genericCtx.enclosingParams = &enclosingType->genericParams;
             genericCtx.enclosingConstraints = &enclosingType->genericConstraints;
+        } else if (enclosingExtension) {
+            // §28.3 v0.235 (#1666, #2381): an ExtensionDecl carries no
+            // `genericParams` vector (the block-level type parameters ride the
+            // target type's generic argument list, e.g. the `T` in
+            // `extension IEnumerable<T>`), so collect them here as synthetic
+            // `GenericParam`s and point `enclosingParams` at the owned vector.
+            // This lets `computeBareReturnContext` recognize a bare-`T` return
+            // naming the extension-block-level parameter — the v0.235 ruling's
+            // must-reject shape (an extension method on `IEnumerable<T>` whose
+            // body returns the iteration variable). The block-level `where`
+            // constraints live on the ExtensionDecl directly. // per §28.3 v0.235
+            genericCtx.extensionEnclosingParams =
+                extensionTypeParams(*enclosingExtension);
+            genericCtx.enclosingParams = &genericCtx.extensionEnclosingParams;
+            genericCtx.enclosingConstraints =
+                &enclosingExtension->genericConstraints;
         }
         // §28.3 (v0.194 S10; #1885): does this INSTANCE method implement/override
         // a bare-T-returning generic declaration? If so, its return classification
@@ -7861,7 +8350,10 @@ void checkMember(const ast::Member& m, sema::SemaContext& ctx,
         // the constructor-body path applies. A NARROW check only. // per §28.6
         if (fd->initializer) {
             MethodOwnership mo(ctx);
-            mo.checkFieldInitializer(*fd);
+            // §9.7 / §9.1 (#1251): the declaring type's kind scopes the §9.7
+            // borrow-bearing-storage leg to a CLASS instance field (a record's
+            // own component is not one).
+            mo.checkFieldInitializer(*fd, enclosingType);
             // §28.3 SB01-B (v0.190, #1926): a field INITIALIZER expression can
             // embed a lambda (`f: (Task<int>) -> Task<int> := (t) => t;`) that
             // the block/expr method-body drivers never reach — the initializer
@@ -8063,11 +8555,15 @@ void checkTopDecl(const ast::TopDecl& d, sema::SemaContext& ctx) {
             if (m) checkMember(*m, ctx, td);
         }
     } else if (auto* ext = dynamic_cast<const ast::ExtensionDecl*>(&d)) {
-        // §28.3 (#1801 S6): an ExtensionDecl carries no `genericParams` vector
-        // (extension type parameters ride the target type), so only a method-
-        // LEVEL bare-T return is recognized here — extensionType stays null.
+        // §28.3 v0.235 (#1666, #2381): an ExtensionDecl carries no `genericParams`
+        // vector (the block-level type parameters ride the target type's generic
+        // argument list), so pass the ExtensionDecl to checkMember, which collects
+        // those parameters as synthetic GenericParams — letting the callee-side
+        // bare-T check recognize a bare-`T` return naming an extension-block-level
+        // parameter (the v0.235 iteration-variable ruling's must-reject shape).
+        // // per §28.3 v0.235
         for (const auto& m : ext->members) {
-            if (m) checkMember(*m, ctx);
+            if (m) checkMember(*m, ctx, /*enclosingType=*/nullptr, ext);
         }
     }
 }

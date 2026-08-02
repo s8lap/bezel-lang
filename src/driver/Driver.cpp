@@ -71,29 +71,61 @@ const char kResultPreludeSource[] =
     "  public method IsError(): bool => not IsOk();\n"
     "end Result;\n";
 
-// Parse the auto-imported stdlib prelude and PREPEND its top-level declarations
-// to `unit`. The prelude source is a program-lifetime constant, so the AST
-// string_views into it stay valid for the whole compilation; ownership of the
-// parsed nodes transfers into `unit->topDecls`. A private diagnostics sink
-// absorbs any prelude parse diagnostic (the prelude is known-valid — a
-// diagnostic here would be an internal compiler defect, never the user's fault).
-void injectStdlibPrelude(ast::SourceFile& unit) {
-    static const std::string preludeSrc(kResultPreludeSource);
+// stdlib §7.1 / §7.2 (issue #645): the System.IO enums. Like `Result` above,
+// these are pure Bezel declarations with no compiler intrinsic — every rule
+// that applies to a user enum (§10.2 auto-increment values, §10.6 `case`
+// matching with prefix omission, §19.6 exhaustiveness, the underlying-type
+// casts of §5.2) applies to them unchanged — so they are made available by
+// injecting their VERBATIM stdlib source rather than by hand-registering a
+// builtin. The declaration order fixes the ordinals the FileStream runtime
+// consumes (FileMode.CreateNew = 0 … Append = 5, etc.), so this source and
+// bz_fs_open_flags in bezel_runtime_fileio.cpp must stay in step.
+//
+// The enums are always available rather than gated on `import System.IO;` —
+// the same stance the compiler already takes for the other §7 types
+// (File/Directory/Path resolve without the import today; import-gating is a
+// separate, uniform piece of work).
+const char kIoPreludeSource[] =
+    "module __bezel_prelude_io__;\n"
+    "public enum SeekOrigin: byte\n"
+    "  Begin, Current, End;\n"
+    "end SeekOrigin;\n"
+    "\n"
+    "public enum FileMode: byte\n"
+    "  CreateNew, Create, Open, OpenOrCreate, Truncate, Append;\n"
+    "end FileMode;\n"
+    "\n"
+    "public enum FileAccess: byte\n"
+    "  Read, Write, ReadWrite;\n"
+    "end FileAccess;\n";
+
+// Parse ONE auto-imported stdlib prelude source and PREPEND its top-level
+// declarations to `unit`. The prelude sources are program-lifetime constants,
+// so the AST string_views into them stay valid for the whole compilation;
+// ownership of the parsed nodes transfers into `unit->topDecls`. A private
+// diagnostics sink absorbs any prelude parse diagnostic (the prelude is
+// known-valid — a diagnostic here would be an internal compiler defect, never
+// the user's fault).
+void injectOnePrelude(ast::SourceFile& unit, const std::string& preludeSrc) {
     DiagnosticEngine preludeDiags;
     Lexer preludeLexer(preludeSrc, preludeDiags);
     Parser preludeParser(preludeLexer, preludeDiags);
     std::unique_ptr<ast::SourceFile> preludeUnit =
         preludeParser.parseCompilationUnit();
     if (!preludeUnit || preludeDiags.hasErrors()) return;  // defensive: no-op
-    // #2047 follow-up 2: an auto-imported prelude type is SHADOWED by a user
-    // top-level declaration of the same name (standard auto-import shadowing) —
-    // inject a prelude decl ONLY when the user declares no type of that name.
-    // Without this, a program that declares its own `Result` (the corpus does —
-    // e.g. a `sealed abstract class Result<T>` hierarchy) collides with the
-    // injected `Result<T, E>` choice: two same-named top-level types corrupt name
-    // resolution and per-monomorphization descriptor emission for the WHOLE
-    // module (an unrelated `is Box<string>` then mis-resolves). The user's type
-    // wins; the stdlib `Result` is simply unavailable in that module.
+    // #2047 follow-up 2 / #2131 / §2.3 v0.226: an auto-imported prelude type
+    // is SHADOWED by a user top-level declaration of the same name (standard
+    // auto-import shadowing — §2.3's paragraph "the other always-available
+    // names... may be shadowed by local declarations under the normal
+    // name-resolution rules"). Inject a prelude decl ONLY when the user
+    // declares no type of that name. Without this, a program that declares its
+    // own `Result` (the corpus does — e.g. a `sealed abstract class Result<T>`
+    // hierarchy) collides with the injected `Result<T, E>` choice: two
+    // same-named top-level types corrupt name resolution and
+    // per-monomorphization descriptor emission for the WHOLE module (an
+    // unrelated `is Box<string>` then mis-resolves). The user's type wins; the
+    // stdlib `Result` is simply unavailable in that module. Pinned by
+    // tests/codegen/result_stdlib_2047_test.cpp (spec_2_20_user_result_type_*).
     std::unordered_set<std::string_view> userTypeNames;
     for (const auto& td : unit.topDecls)
         if (auto* decl = dynamic_cast<const ast::TypeDecl*>(td.get()))
@@ -119,14 +151,63 @@ void injectStdlibPrelude(ast::SourceFile& unit) {
         std::make_move_iterator(toInject.end()));
 }
 
-// Link a native object (plus any §2.5 dependency objects) into an executable
-// using clang (the project's toolchain). Returns true on success. The
-// dependency objects supply the definitions of the imported symbols the
-// importer's object references as externals (issue #328 inc 3).
-bool linkExecutable(const std::string& objectPath,
-                    const std::string& exePath,
-                    const std::vector<std::string>& extraObjects = {},
-                    bool sanitizeAddress = false) {
+// Inject every auto-imported stdlib prelude source into `unit`.
+void injectStdlibPrelude(ast::SourceFile& unit) {
+    static const std::string resultSrc(kResultPreludeSource);
+    static const std::string ioSrc(kIoPreludeSource);
+    injectOnePrelude(unit, resultSrc);   // stdlib §2.20 Result<T, E>
+    injectOnePrelude(unit, ioSrc);       // stdlib §7.1/§7.2 System.IO enums
+}
+
+} // namespace
+
+// Every auto-imported stdlib prelude source, concatenated — exactly the text
+// injectStdlibPrelude parses into EVERY compilation unit.
+//
+// Exposed for the AOT object cache's key. The prelude is an INPUT to codegen:
+// the same user source compiled against two different preludes can produce two
+// different objects, so a cache that did not key on it could serve an object
+// built against a stale prelude — a wrong binary reported as a pass. Today
+// these sources are `const char[]` compiled into bezel_core, so the compiler-
+// archive identity already covers them; but that is an incidental property of
+// where the text happens to LIVE, and a refactor that loaded the stdlib from
+// disk (a plausible direction) would silently remove the coverage while every
+// test kept passing. Keying on the text itself makes the guarantee local,
+// permanent, and testable instead of incidental.
+//
+// The NUL separator keeps the concatenation unambiguous: no shuffling of text
+// between two adjacent preludes can produce the same fingerprint.
+std::string Driver::preludeSourceFingerprint() {
+    std::string s;
+    s += kResultPreludeSource;   // stdlib §2.20 Result<T, E>
+    s += '\0';
+    s += kIoPreludeSource;       // stdlib §7.1/§7.2 System.IO enums
+    return s;
+}
+
+// The on-disk Bezel runtime archive the link consumes, or "" when CMake did not
+// inject a path. Exposed so a caller that must reason about the link's INPUTS
+// (the AOT test harness's link cache) reads the same value the link itself uses,
+// rather than guessing.
+std::string Driver::runtimeLibraryPath() {
+#ifdef BEZEL_RUNTIME_LIB_PATH
+    return BEZEL_RUNTIME_LIB_PATH;
+#else
+    return {};
+#endif
+}
+
+// The EXACT clang command `linkExecutableObject` runs. Factored out (rather than
+// built inline in the link) so the recipe has exactly ONE definition: a caller
+// that needs to know what the link depends on — the AOT test harness, which
+// hashes the recipe into its link-cache key — derives it from this function, so
+// any future edit to a flag, a library, or their order is picked up
+// automatically and cannot drift from what actually runs.
+std::string Driver::linkCommandLine(const std::string& objectPath,
+                                    const std::string& exePath,
+                                    const std::vector<std::string>& extraObjects,
+                                    bool sanitizeAddress,
+                                    const std::string& runtimeLibPath) {
     // Link with libc, libm, libpthread, and the Bezel runtime library.
     std::string cmd = "clang " + objectPath;
     for (const std::string& obj : extraObjects) cmd += " " + obj;
@@ -139,16 +220,51 @@ bool linkExecutable(const std::string& objectPath,
         // with --sanitize=address; the default link line is unchanged.
         cmd += " -fsanitize=address -g";
     }
-#ifdef BEZEL_RUNTIME_LIB_PATH
-    // Static-link the Bezel runtime (path injected at compile time by CMake).
-    cmd += " ";
-    cmd += BEZEL_RUNTIME_LIB_PATH;
-#endif
+    if (!runtimeLibPath.empty()) {
+        // Static-link the Bezel runtime (path injected at compile time by CMake).
+        cmd += " ";
+        cmd += runtimeLibPath;
+    }
     cmd += " -lstdc++";  // runtime uses C++ std (std::mutex, std::thread, etc.)
-    return std::system(cmd.c_str()) == 0;
+    return cmd;
 }
 
-} // namespace
+// A path-independent fingerprint of the link recipe, for cache keying. It is the
+// real command line with its three PATH inputs replaced by placeholders:
+//   * the object and executable paths are per-invocation temporaries — the
+//     linked bytes do not depend on them, and keying on them would defeat any
+//     cache outright;
+//   * the runtime archive's PATH is abstracted because a caller keys on the
+//     archive's CONTENT (its hash) instead — that is the load-bearing input, and
+//     abstracting the path lets two checkouts with byte-identical runtimes share
+//     entries. Whether a runtime is linked AT ALL is still visible (the
+//     placeholder is absent when no path was injected).
+// Everything else — the compiler name, every flag, every library, and their
+// ORDER — appears verbatim, so any recipe change changes this string.
+std::string Driver::linkRecipeSignature(bool sanitizeAddress) {
+    const std::string rt = runtimeLibraryPath();
+    return linkCommandLine("<OBJ>", "<EXE>", /*extraObjects=*/{}, sanitizeAddress,
+                           rt.empty() ? std::string() : std::string("<RUNTIME>"));
+}
+
+// Link a native object (plus any §2.5 dependency objects) into an executable
+// using clang (the project's toolchain). Returns true on success. The
+// dependency objects supply the definitions of the imported symbols the
+// importer's object references as externals (issue #328 inc 3).
+bool Driver::linkExecutableObject(const std::string& objectPath,
+                                  const std::string& exePath,
+                                  const std::vector<Dependency>& deps,
+                                  const codegen::CodegenOptions& opts) {
+    std::vector<std::string> depObjects;
+    for (const Dependency& dep : deps)
+        if (!dep.objectPath.empty()) depObjects.push_back(dep.objectPath);
+    const std::string cmd = linkCommandLine(objectPath, exePath, depObjects,
+                                            opts.sanitizeAddress,
+                                            runtimeLibraryPath());
+    if (std::system(cmd.c_str()) == 0) return true;
+    std::cerr << "bezelc: link error\n";
+    return false;
+}
 
 CompileResult Driver::compileFile(const std::string& path,
                                   const std::string& outputPath) {
@@ -162,10 +278,54 @@ CompileResult Driver::compileFile(const std::string& path,
     return compileFile(path, outputPath, deps, codegen::CodegenOptions{});
 }
 
+// compileFile is EXACTLY the composition of its two halves — compile the
+// executable-mode object, then link it — so the shipping AOT path and the split
+// entry points can never drift: there is one front-end (compileExecutableObject)
+// and one link recipe (linkExecutableObject), and this is their only caller
+// ordering. The object is a build temporary here, removed on both exits, so a
+// bezelc invocation is byte-for-byte what it was when the two halves were one
+// function.
+//
+// The one observable difference from the pre-split code is on the LINK-FAILURE
+// path: warnings recorded by a clean front-end are now printed (by
+// compileExecutableObject) BEFORE "bezelc: link error", where previously the
+// early return skipped them. A failing link is an infrastructure failure, not a
+// language-level outcome, and no caller inspects that ordering.
 CompileResult Driver::compileFile(const std::string& path,
                                   const std::string& outputPath,
                                   const std::vector<Dependency>& deps,
                                   const codegen::CodegenOptions& opts) {
+    // An empty outputPath is the front-end-only call (no codegen, no §33.5
+    // entry-point check): compileExecutableObject with no object to write.
+    if (outputPath.empty())
+        return compileExecutableObject(path, /*objectPath=*/"", deps, opts);
+
+    const std::string objectPath = outputPath + ".o";
+    CompileResult cc = compileExecutableObject(path, objectPath, deps, opts);
+    if (!cc.success) return cc;
+    if (!linkExecutableObject(objectPath, outputPath, deps, opts)) {
+        std::remove(objectPath.c_str());
+        return CompileResult{false, cc.errorCount + 1};
+    }
+    std::remove(objectPath.c_str());
+    return cc;
+}
+
+// The FRONT-END half of the executable build: everything compileFile does up to
+// and including `emitObjectFile`, leaving the native object at `objectPath` and
+// performing NO link. An empty `objectPath` runs the front-end only (no codegen,
+// no §33.5 entry-point check) — the historical `compileFile(path, "")` shape.
+//
+// Split out for the AOT test harness's two-level cache: the emitted object is a
+// pure function of (this compiler's code, `opts`, the source text) — codegen
+// includes no runtime header and never reads the runtime archive; the runtime is
+// consumed by the LINK alone (linkCommandLine). Keying the two halves separately
+// therefore lets a runtime-only rebuild keep cached objects valid, and a
+// codegen-only rebuild keep cached LINK products valid for every object that
+// came out unchanged.
+CompileResult Driver::compileExecutableObject(
+    const std::string& path, const std::string& objectPath,
+    const std::vector<Dependency>& deps, const codegen::CodegenOptions& opts) {
     std::string source;
     if (!readFile(path, source)) {
         std::cerr << "bezelc: error: cannot open '" << path << "'\n";
@@ -265,19 +425,19 @@ CompileResult Driver::compileFile(const std::string& path,
         ownershipChecker.check(*unit);
 
         // §33.5: an executable build requires exactly one qualifying `Main`.
-        // Scoped to the executable path (non-empty outputPath) so library
+        // Scoped to the executable path (non-empty objectPath) so library
         // compilation and the sema/JIT test harnesses — which run the shared
         // front-end on snippets that legitimately omit `Main` (§33.6) — are
         // not failed by this requirement. Only run when the front-end is
         // otherwise clean, to avoid cascading on already-broken programs.
-        if (!outputPath.empty() && !diagnostics.hasErrors()) {
+        if (!objectPath.empty() && !diagnostics.hasErrors()) {
             sema::checkEntryPoint(*unit, semaCtx);
         }
 
-        // Codegen: when an output path is requested and the front-end is
-        // clean, lower to LLVM, emit a native object, and link an
-        // executable with clang.
-        if (!outputPath.empty() && !diagnostics.hasErrors()) {
+        // Codegen: when an object path is requested and the front-end is
+        // clean, lower to LLVM and emit a native object. (The link is the
+        // caller's step — compileFile's second half.)
+        if (!objectPath.empty() && !diagnostics.hasErrors()) {
             llvm::LLVMContext llvmCtx;
             auto module = codegen::emitModule(*unit, semaCtx, llvmCtx, opts);
             // §2.6 step 4: embed the module's public-interface metadata in a
@@ -288,13 +448,12 @@ CompileResult Driver::compileFile(const std::string& path,
                 // §14 / #662c: pass `source` so ctor/dtor bodies for generic
                 // classes are span-extracted into the metadata (Foundation C).
                 // §2.8.4 rule 1 (#1733): this is the EXECUTABLE build path
-                // (non-empty outputPath, entry-point-checked above) — record
+                // (non-empty objectPath, entry-point-checked above) — record
                 // the artifact as executable-kind so an importer rejects it as a
                 // dependency (§2.8.4 rule 4).
                 bezel::module::embedModuleMetadata(*module, semaCtx, source,
                                                    /*isExecutable=*/true);
             }
-            std::string objectPath = outputPath + ".o";
             std::string err;
             if (!module || !codegen::emitObjectFile(*module, objectPath, err,
                                                     opts.sanitizeAddress)) {
@@ -309,21 +468,6 @@ CompileResult Driver::compileFile(const std::string& path,
                     std::cerr << "bezelc: codegen error: " << err << "\n";
                 return CompileResult{false, diagnostics.errorCount() + 1};
             }
-            // §2.6 step 4: link the importer's object together with each
-            // dependency's object, so the external references the importer's
-            // object holds (issue #328 inc 3) resolve against the dependency's
-            // emitted symbols.
-            std::vector<std::string> depObjects;
-            for (const Dependency& dep : deps)
-                if (!dep.objectPath.empty())
-                    depObjects.push_back(dep.objectPath);
-            if (!linkExecutable(objectPath, outputPath, depObjects,
-                                opts.sanitizeAddress)) {
-                std::cerr << "bezelc: link error\n";
-                std::remove(objectPath.c_str());
-                return CompileResult{false, diagnostics.errorCount() + 1};
-            }
-            std::remove(objectPath.c_str());
         }
     }
 

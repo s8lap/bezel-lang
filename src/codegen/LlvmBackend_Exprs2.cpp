@@ -22,6 +22,17 @@ llvm::Value* Emitter::lowerShortCircuit(const ast::BinaryExpr& bin) {
     bool isAnd = (bin.op == "and");
     llvm::Value* l = lowerExpr(*bin.left);
     if (!l) return nullptr;
+    // §22.4 / §7.9 (v0.235, #2395): pre-create/zero-init any inline
+    // `out var` slot inside the RIGHT operand — the one THIS operator may
+    // SKIP (`and` skips it when `l` is false, `or` skips it when `l` is
+    // true) — before the branch below. Without this, ensureOutVarSlots'
+    // zero-store (added by this same fix) runs from inside `rhsBB`, which
+    // does not dominate `sc.end`'s "skip" predecessor, so a read past the
+    // `if` on the skip path still observes stack garbage instead of the
+    // §7.9 default. `bin.left` needs no equivalent hoist: it is never
+    // skipped by this operator, so its own (possibly nested) lowering
+    // reaches any out-var call inside it unconditionally already.
+    if (bin.right) hoistSkippableOutVarSlots(*bin.right);
     auto* entryBB = builder_.GetInsertBlock();
     auto* rhsBB = llvm::BasicBlock::Create(llvm_, "sc.rhs", currentFn_);
     auto* endBB = llvm::BasicBlock::Create(llvm_, "sc.end", currentFn_);
@@ -1007,6 +1018,19 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     llvm::Value* savedCaught = currentCaughtExc_;
     std::size_t savedUnwindDepth = unwindScopeDepth_;
     bool savedDiverged = diverged_;
+    // #2515 / §27.3 / §28.9: save the enclosing method's return-type node and
+    // reset it for the lambda body (see the nullptr assignment at body-entry
+    // below).  Without this, a block-bodied lambda compiled inside a method
+    // whose declared return type is a FUNCTION type (e.g. `() -> Animal`) leaks
+    // that node into the body's ReturnStmt lowering: emitReturn's
+    // closure-return-retain branch (LlvmBackend_Stmts.cpp ~line 1828) sees a
+    // Function declRet and fires emitClosureRetain on a NON-closure return
+    // value (a captured class instance), writing 8 bytes at offset 16 of a
+    // 16-byte object — a heap-buffer-overflow that surfaces as a double-free
+    // under ASan.  The expr-body path is unaffected (it keys off retSemaTy, the
+    // lambda's OWN return type); only the block-body path goes through
+    // emitReturn, which reads currentReturnTypeNode_.
+    const ast::Type* savedCurrentReturnTypeNode = currentReturnTypeNode_;
 
     // §27.5: the set of outer locals/params the body references.
     std::unordered_set<const sema::Symbol*> capturedSyms;
@@ -1068,8 +1092,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         if (!alreadyBoxed && !wasGuardedParam &&
             currentFn_ == cellFreeEligibleFn_ &&
             cellFreeEligible_.count(static_cast<const void*>(sym))) {
-            lastLambdaCapturedCells_.push_back({newSlot,
-                                                static_cast<const void*>(sym)});
+            LastCellEntry lce{newSlot, static_cast<const void*>(sym)};
+            // fix #2334: propagate the TaskScope.Spawn unwind-unsafety onto
+            // this entry so consumeLastLambdaCapturedCells suppresses the
+            // free on the unwind edge (Disposal::skipCellFreeOnUnwind).
+            lce.unwindUnsafe =
+                unwindUnsafeCellFree_.count(static_cast<const void*>(sym)) !=
+                0;
+            lastLambdaCapturedCells_.push_back(lce);
         }
         // #429/#672: resolve sema type for retain/release classification.
         if (auto* par = dynamic_cast<const sema::ParameterSymbol*>(sym)) {
@@ -1078,6 +1108,37 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             else if (par->declType)
                 ce.semaTy = ctx_.resolvedType(*par->declType);
         }
+        // §27.5 / §28.9 / #694: free the capture CELL in the envdtor when this
+        // PARAMETER is captured by exactly ONE env (singleCaptureLocals_, which
+        // keys parameters by Symbol*) and THIS lambda DEFINITELY escapes
+        // (definitelyEscapingLambdas_). Exactly the guard the captured-LOCALS
+        // branch below applies, and sound for the same two reasons: the sole
+        // holder means this envdtor is the cell's only free (no double-free), and
+        // a definitely-escaping closure outlives its defining scope, so the frame
+        // is gone before the envdtor runs (no UAF). The scope-end boxedCellFree
+        // cannot also fire — collectCellFreeEligible excludes anything captured by
+        // an escaping lambda, and a returned lambda is always classified escaping
+        // there. Params are never for-var.
+        //
+        // GUARDED BOXING. A parameter's slot is written in the prologue, never in
+        // the capture site's own basic block, so boxLocalSlot always takes the
+        // GUARDED path for it (the null-guarded holder that allocates the cell on
+        // the first pass and reuses it on later ones). The hazard guarded boxing
+        // protects against is a capture site INSIDE A LOOP: one cell shared by
+        // every iteration's closure, so any one envdtor freeing it would
+        // double-free/UAF the others — and singleCaptureLocals_ cannot see that,
+        // since it counts syntactic lambda NODES, not the closures a loop makes
+        // from one node. `loopStack_.empty()` is the proof that this capture site
+        // has no backward edge above it: the cell is then allocated exactly once
+        // per invocation and held by exactly one closure. (The same
+        // guarded-cell-allocated-once proof the captured-LOCALS scope-end path
+        // below uses for an inline owned array.) A capture inside a loop keeps the
+        // conservative exclusion — a bounded leak, never an over-free.
+        if (!alreadyBoxed && (!wasGuardedParam || loopStack_.empty()) &&
+            currentFn_ == boxCaptureLocalsFn_ &&
+            definitelyEscapingLambdas_.count(static_cast<const void*>(&lam)) &&
+            singleCaptureLocals_.count(static_cast<const void*>(sym)))
+            ce.freeCellInEnvdtor = true;
         captures.push_back(ce);
     }
     // #1207 / §27.5/§22.3: captured outer ref/out params.
@@ -1248,10 +1309,14 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             // iteration can re-enter the arm.
             bool guardedOk = !wasGuardedLocal || isPatternBinding ||
                              (inlineN > 0 && loopStack_.empty());
-            if (guardedOk)
-                lastLambdaCapturedCells_.push_back({newSlot,
-                                                    static_cast<const void*>(decl),
-                                                    inlineN});
+            if (guardedOk) {
+                LastCellEntry lce{newSlot, static_cast<const void*>(decl),
+                                  inlineN};
+                // fix #2334: see the param-capture site above.
+                lce.unwindUnsafe = unwindUnsafeCellFree_.count(
+                                       static_cast<const void*>(decl)) != 0;
+                lastLambdaCapturedCells_.push_back(lce);
+            }
         }
         // #429/#672: resolve sema type for retain/release classification.
         for (const sema::Symbol* s : capturedSyms) {
@@ -1424,6 +1489,16 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     lastLambdaCapturedCells_.clear();
     currentFn_ = fn;
     currentThis_ = nullptr;
+    // #2515 / §27.3: a lambda body is NOT a method body — its `return` is an
+    // internal transfer to the trampoline, not a method-contract return that
+    // mints +1 / boxes against a declared return-type node.  Null it so
+    // emitReturn's retain/box branches (keyed on currentReturnTypeNode_) do not
+    // fire on the LEAKED enclosing-method return node.  The expr-body path
+    // already uses retSemaTy (the lambda's own return type) for its retain
+    // decisions; the block-body path now matches by carrying no declared node.
+    // A lambda's external RC/boxing contract is settled at the CALL SITE from
+    // the lambda's function type, not in the body.
+    currentReturnTypeNode_ = nullptr;
     locals_.clear();
     paramSlots_.clear();
     refParams_.clear();
@@ -1787,6 +1862,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
 
     // --- Restore emitter state ---
     expectedFunctionType_ = savedExpectedFT;  // #731
+    currentReturnTypeNode_ = savedCurrentReturnTypeNode;  // #2515
     lambdaParamTypeHint_ = std::move(savedLambdaParamHints);
     currentFn_ = savedFn;
     currentThis_ = savedThis;
@@ -2500,6 +2576,31 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 rt->astNode->name && !rt->astNode->name->parts.empty())
                 tnode = rt->astNode;
         }
+    }
+    // fix #2477: `new T()` in the dead abstract template body — the
+    // genericSubstSemaTy_ lookup just above is empty there (no monomorphization
+    // binding) so the bare type-param TypeRef falls through every construction
+    // branch below and lowerNew returns nullptr. The pre-existing #2434 generic
+    // warning (lowerLocalDecl's zero-init fallback) still fires as a backstop;
+    // this is the SPECIFIC, named complement that flags the abstract-template
+    // shape by name so the silence→zero-init case is observable in source. The
+    // abstract body is dead code (real calls route through the monomorphized
+    // clone, per #2477's analysis), so this is purely a diagnostics-clarity
+    // fix — no operational change. Gated on !hasErrors() to match the #2434
+    // message-quality guard.
+    if (!rt->declaration && rt->astNode && rt->astNode->name &&
+        rt->astNode->name->parts.size() == 1 &&
+        genericSubstSemaTy_.empty() &&
+        templateGenericParamNames_.count(rt->astNode->name->parts.back()) &&
+        !ctx_.diagnostics().hasErrors()) {
+        ctx_.diagnostics().report(
+            Severity::Warning, ne.span.begin,
+            "internal: codegen cannot construct 'new " +
+            std::string(rt->astNode->name->parts.back()) +
+            "()' in the dead abstract template body: no monomorphization "
+            "binding exists for this type parameter (spec #14.1 / #14.2 "
+            "permits the form but the abstract body is never invoked — "
+            "real calls route through the monomorphized clone — #2477)");
     }
     // §22.4 (#968): pre-create the `out var x` slot(s) for `new T(out var x)` so
     // the arg lowering below passes the slot's address and a later read sees the
@@ -3349,6 +3450,47 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 auto* allocFn = declareC("bz_stopwatch_alloc", ptrTy(), {});
                 return builder_.CreateCall(allocFn, {}, "sw.alloc");
             }
+            // stdlib §7.2 / issue #645: the two declared FileStream constructors
+            //   constructor(path: string, mode: FileMode)
+            //   constructor(path: string, mode: FileMode, access: FileAccess)
+            // lower to bz_filestream_open(path_data, path_len, mode, access).
+            // The enum arguments are ordinary Bezel enum values (the prelude
+            // declares them `: byte`), so widen whatever integer width they
+            // lower to up to the runtime's i32.
+            //
+            // NOTE (recorded choice, #645): stdlib §7.2 declares the two-argument
+            // constructor but does NOT state which FileAccess it implies. This
+            // lowering uses FileAccess.ReadWrite (ordinal 2) — every mode except
+            // `Open` creates or rewrites the file, so a read-only default would
+            // make five of the six modes unusable through the short form. The
+            // spec gap is filed separately; a later ruling changes only this
+            // constant.
+            if (colName == "FileStream" &&
+                (ne.args.size() == 2 || ne.args.size() == 3) &&
+                ne.args[0].value && ne.args[1].value) {
+                llvm::Value* pathStr = lowerExpr(*ne.args[0].value);
+                if (!pathStr) return nullptr;
+                llvm::Value* pathData = loadStringData(pathStr);
+                llvm::Value* pathLen  = loadStringLen(pathStr);
+                auto toI32 = [&](llvm::Value* v) -> llvm::Value* {
+                    if (!v) return nullptr;
+                    if (v->getType()->isIntegerTy(32)) return v;
+                    if (v->getType()->isIntegerTy())
+                        return builder_.CreateZExt(v, i32());
+                    return nullptr;
+                };
+                llvm::Value* mode = toI32(lowerExpr(*ne.args[1].value));
+                if (!mode) return nullptr;
+                llvm::Value* access = builder_.getInt32(2);  // FileAccess.ReadWrite
+                if (ne.args.size() == 3 && ne.args[2].value) {
+                    access = toI32(lowerExpr(*ne.args[2].value));
+                    if (!access) return nullptr;
+                }
+                auto* openFn = declareC("bz_filestream_open", ptrTy(),
+                                        {ptrTy(), i64(), i32(), i32()});
+                return builder_.CreateCall(
+                    openFn, {pathData, pathLen, mode, access}, "fs.open");
+            }
             // per §6.8 / #652: new Domain(name: string) — allocate a named
             // domain instance backed by a bz_domain_t with a stored name field.
             // bz_domain_alloc(name_str_p) → bz_domain_t* (refs=1 for `using var`).
@@ -3830,6 +3972,28 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         // enclosing-scope expression — lower it under the outer
                         // substitution, then restore the new type's subst for
                         // the field-type coercion + store below.
+                        // #2367: likewise for `currentThis_` — #597 fixed the
+                        // generic-substitution half of "enclosing-scope
+                        // expression" but left `currentThis_ = obj` (set above
+                        // for the DIFFERENT purpose of resolving `t`'s OWN
+                        // implicit-field reads, e.g. a chained base-ctor arg
+                        // that names one of `t`'s own primary-ctor params) in
+                        // effect across this evaluation too. An arg expression
+                        // that is itself an implicit-field read of the ENCLOSING
+                        // scope (e.g. `new Leaf(first)` as another class's own
+                        // field initializer, where `first` is the enclosing
+                        // class's primary-ctor param) resolved that read via
+                        // implicitFieldAddr against `obj` — the new, not-yet-
+                        // initialized `t` instance — instead of the enclosing
+                        // object, reading through a pointer sized/typed for `t`
+                        // as if it had the enclosing class's layout (a wrong-
+                        // object GEP; heap-buffer-overflow when `t`'s instance
+                        // is smaller). Restore the enclosing `this`
+                        // (`savedThisForInit`) for the evaluation only, mirroring
+                        // the explicit-ctor arg path below (case (b) in its
+                        // comment) which already does this correctly.
+                        llvm::Value* savedThisForArg = currentThis_;
+                        currentThis_ = savedThisForInit;
                         auto posSubst = genericSubst_;
                         auto posSemaTy = genericSubstSemaTy_;
                         genericSubst_ = savedSubst;
@@ -3837,6 +4001,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         llvm::Value* v = lowerExpr(*ne.args[pi].value);
                         genericSubst_ = std::move(posSubst);
                         genericSubstSemaTy_ = std::move(posSemaTy);
+                        currentThis_ = savedThisForArg;
                         if (!v) break;
                         llvm::Type* fieldTy =
                             st->getElementType(idxIt->second);
@@ -4979,28 +5144,179 @@ llvm::Value* Emitter::buildRecordValue(
     std::vector<const sema::Symbol*> fields;
     collectRecordStorage(t, fields);
 
+    // fix #2464 (§9.1, v0.235): `collectRecordStorage`/`t->members` order a
+    // record's BODY members ahead of its POSITIONAL fields regardless of
+    // source declaration order — SymbolCollection.cpp's collectTypeDecl
+    // always walks td.members (the body) before appending td.positionalFields
+    // — a storage detail §32.13 clause 2 leaves implementation-defined for an
+    // ordinary (non-C-compatible) record: "Field reordering and packing
+    // optimizations are forbidden for classified records; all other records
+    // keep unspecified layout." The §9.1 auto-generated PRIMARY constructor's
+    // parameters are "the positional fields, in declaration order" — never
+    // the body storage — so `args[i]` must map to the i-th POSITIONAL field
+    // specifically, never to `fields[i]` by raw storage index.
+    //
+    // The positional subset is computed inside the fast-path gate below, as
+    // the TRAILING `args.size()` entries of `fields` — NOT via
+    // FieldSymbol::posParam. posParam is a real `ast::Param*`, populated by
+    // SymbolCollection.cpp only for a LOCALLY-declared record; ModuleLoader.cpp
+    // never sets it for an IMPORTED field (there is no wire-level "is this
+    // field positional" tag on MetaMember — only the whole-type
+    // MetaTypeDecl::hasPositionalFields boolean). Filtering on posParam alone
+    // would leave every imported record's positional set EMPTY, breaking
+    // cross-module positional-record construction entirely. Instead this
+    // relies on a structural invariant that holds on BOTH sides: every
+    // positional field is always exported (an auto-generated PUBLIC
+    // read-only property, §9.1) and — because both
+    // ModuleMetadataBuilder.cpp's export loop and ModuleLoader.cpp's
+    // reconstruction loop are single linear passes over `t.members` that only
+    // ever SKIP non-exported entries, never reorder — the positional fields
+    // stay a single CONTIGUOUS block at the tail of `fields`/`t->members`,
+    // in their own declared order, on the importer's reconstruction exactly
+    // as on the exporter's own compilation. The §9.1 auto-generated primary
+    // constructor's arity always equals the record's TRUE positional-field
+    // count (sema rejects a mismatched call before codegen ever runs), so
+    // whenever this gate is reached (an implicit-primary-ctor call, so
+    // `args.size()` IS that arity), the trailing `args.size()`-length slice
+    // of `fields` is exactly the positional fields, in their declared order.
+    // The `args.size() <= fields.size()` bound below is a defensive guard
+    // against iterator underflow on a malformed call sema should already
+    // have rejected before codegen — not a claim that inequality is a
+    // legitimate case.
+    //
+    // §9.2 body record (or a combined-form record's non-positional storage):
+    // zero the whole struct, then run every body-declared field/auto-property
+    // initializer. Hoisted ahead of the positional fast path below (fix
+    // #2464, was previously only reached when falling through to the
+    // explicit-constructor path) — a combined-form record's positional fast
+    // path fills only the POSITIONAL slots, so any body storage must already
+    // be zeroed/defaulted first. A positional field's `m->decl` is the owning
+    // TypeDecl (never a FieldDecl/PropertyDecl), so this loop naturally skips
+    // positional fields — they have no separate initializer to run.
+    builder_.CreateStore(llvm::ConstantAggregateZero::get(st), slot);
+    for (const sema::Symbol* m : fields) {
+        const ast::Expr* init = nullptr;
+        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
+            init = fd->initializer.get();
+        else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
+            init = pd->autoInitializer.get();  // §9.2: `property X := v;`
+        auto idxIt = fieldIndex_.find(m);
+        if (idxIt == fieldIndex_.end()) continue;
+        if (init) {
+            llvm::Value* v = lowerExpr(*init);
+            if (!v) {
+                // #1386: ICE — lowerExpr returned null for a record field/
+                // property default initializer; the expression kind is not
+                // yet handled.
+                ctx_.diagnostics().report(
+                    Severity::Error, init->span.begin,
+                    "internal: lowerExpr returned null for record "
+                    "field/property default initializer — #1386");
+                continue;
+            }
+            // CG-nullable: a NULLABLE VALUE field initialized with a plain
+            // value (`property N: int? := 9;`, or `property C: Color? :=
+            // Color.Green;` — issue #364) must wrap the bare value into the
+            // {i8 hasValue; T value} struct, like the positional path below.
+            // per §9.2
+            const sema::TypeRef* initFty = recordMemberType(m);
+            if (isNullableValueTy(initFty)) {
+                auto* expectedSt = nullableValueStructTy(initFty);
+                if (v->getType() != expectedSt) {
+                    if (v->getType()->isPointerTy() &&
+                        llvm::isa<llvm::ConstantPointerNull>(v))
+                        v = nullableValueNull(initFty);
+                    else if (v->getType() == expectedSt->getElementType(1))
+                        v = wrapNullableValue(initFty, v);
+                }
+            }
+            builder_.CreateStore(
+                v, builder_.CreateStructGEP(st, slot, idxIt->second));
+            continue;
+        }
+        // fix #2467 (§9.2/§2.5, v0.235): `m->decl` is null for an IMPORTED
+        // body storage member — no `ast::FieldDecl`/`PropertyDecl` crosses
+        // the module boundary, so `init` above always misses and this
+        // initializer was silently skipped entirely, leaving the storage at
+        // its `ConstantAggregateZero` default regardless of the exporter's
+        // declared value (#2467's own confirmed repro: a fully public
+        // `record BodOnly { public property W: int := 42; }` reads `0`
+        // after import). A record's construction is fully inline and
+        // by-value, with NO cross-module CALL of any kind to hook a
+        // class-style `bz$<Type>$init` replay into (unlike #2452's class
+        // mechanism, which needs no textual carriage because the exporter's
+        // own compiled function runs the real initializer) — so this falls
+        // back to the SAME constant-foldable-text wire mechanism §22.12's
+        // const values and the Field-side §22.8 class layout carriage
+        // already use (ModuleMetadataBuilder.cpp's renderConstExpr /
+        // ctx_.importedConstValue / foldImportedConstText, issue #328
+        // FINDING [3]/[7] — extended to auto-properties by this same fix).
+        // No new metadata surface invented (CLAUDE.md rule 4): `valueText`
+        // already "rides every member" on the wire; this just consumes an
+        // existing field that had no reader for a record body member before.
+        // Only a CONSTANT-FOLDABLE initializer crosses this way
+        // (renderConstExpr returns "" for `new Array()`, `DateTime.Now`,
+        // etc., and a PRIVATE/internal member's valueText is deliberately
+        // stripped by the layout-only carriage, #2468) — a non-foldable or
+        // private body-member initializer remains a documented, pre-existing
+        // limitation, not newly regressed by this fix.
+        //
+        // A LOCAL positional field also reaches here (its `m->decl` is the
+        // owning TypeDecl, never a FieldDecl/PropertyDecl, so `init` misses
+        // above too) — gate on `m->decl == nullptr` (true only for an
+        // IMPORTED symbol; every LOCAL symbol, positional or otherwise, has
+        // a non-null decl) so a local positional field takes the same
+        // no-initializer-to-run `continue` it always did, without a wasted
+        // (harmless, since the map lookup would find nothing, but
+        // misleading) importedConstValue probe.
+        if (m->decl != nullptr) continue;
+        const std::string* text = ctx_.importedConstValue(m);
+        if (!text || text->empty()) continue;
+        const sema::TypeRef* fty = recordMemberTypeResolved(m);
+        llvm::Value* v = foldImportedConstText(*text, fty);
+        if (!v) continue;
+        if (isNullableValueTy(fty)) {
+            auto* expectedSt = nullableValueStructTy(fty);
+            if (v->getType() != expectedSt) {
+                if (v->getType()->isPointerTy() &&
+                    llvm::isa<llvm::ConstantPointerNull>(v))
+                    v = nullableValueNull(fty);
+                else if (v->getType() == expectedSt->getElementType(1))
+                    v = wrapNullableValue(fty, v);
+            }
+        }
+        builder_.CreateStore(
+            v, builder_.CreateStructGEP(st, slot, idxIt->second));
+    }
+
     // §9.1 positional record: a bare positional argument list whose count
-    // matches the storage members maps each argument to its field by
-    // position. This is the original positional-record construction path,
-    // taken only when the record has no explicit constructor.
+    // matches the POSITIONAL storage members (fix #2464: never total storage
+    // — a combined form's body fields/auto-properties are not primary-
+    // constructor parameters, §9.1) maps each argument to its positional
+    // field by position. This is the original positional-record construction
+    // path, taken only when the record has no explicit constructor.
     //
     // §22.5 / #540: named arguments on a positional record are also handled
     // here by reordering the supplied args to field-declaration order before
     // the field stores, mirroring buildOrderedArgs for class constructors.
-    if (!hasAnyConstructor(t) && !args.empty() &&
-        args.size() == fields.size()) {
+    if (!hasAnyConstructor(t) && !args.empty() && args.size() <= fields.size()) {
+        // fix #2464: the positional fields are the TRAILING args.size()
+        // entries of `fields` (see the comment above) — never fields[0..N).
+        std::vector<const sema::Symbol*> posFields(
+            fields.end() - static_cast<std::ptrdiff_t>(args.size()),
+            fields.end());
         bool allPositional = true;
         for (const auto& a : args)
             if (!a.name.empty()) { allPositional = false; break; }
 
         // Build a field-index-ordered pointer to each call argument.
         // For positional args: fieldArg[i] = &args[i].
-        // For named args: fieldArg[i] = the arg whose .name == fields[i]->name.
+        // For named args: fieldArg[i] = the arg whose .name == posFields[i]->name.
         // Fall through to the body-record path if any name is unrecognised.
-        std::vector<const ast::CallArgument*> fieldArg(fields.size(), nullptr);
+        std::vector<const ast::CallArgument*> fieldArg(posFields.size(), nullptr);
         bool mappingOk = true;
         if (allPositional) {
-            for (std::size_t i = 0; i < fields.size(); ++i)
+            for (std::size_t i = 0; i < posFields.size(); ++i)
                 fieldArg[i] = &args[i];
         } else {
             // §22.5 / #540: map each named argument to the field with that name.
@@ -5015,8 +5331,8 @@ llvm::Value* Emitter::buildRecordValue(
                     mappingOk = false; break;
                 }
                 bool found = false;
-                for (std::size_t fi = 0; fi < fields.size(); ++fi) {
-                    if (fields[fi]->name == a.name) {
+                for (std::size_t fi = 0; fi < posFields.size(); ++fi) {
+                    if (posFields[fi]->name == a.name) {
                         fieldArg[fi] = &a;
                         found = true;
                         break;
@@ -5026,13 +5342,13 @@ llvm::Value* Emitter::buildRecordValue(
             }
             // Verify every field got an argument.
             if (mappingOk) {
-                for (std::size_t fi = 0; fi < fields.size(); ++fi)
+                for (std::size_t fi = 0; fi < posFields.size(); ++fi)
                     if (!fieldArg[fi]) { mappingOk = false; break; }
             }
         }
 
         if (mappingOk) {
-            for (std::size_t i = 0; i < fields.size(); ++i) {
+            for (std::size_t i = 0; i < posFields.size(); ++i) {
                 if (!fieldArg[i] || !fieldArg[i]->value) return nullptr;
                 // §9.1 / §15.4 (#1129): an INLINE-ARRAY field whose positional
                 // argument is a collection literal `[e1, e2, …]` must be built IN
@@ -5044,7 +5360,7 @@ llvm::Value* Emitter::buildRecordValue(
                 // (Binding the literal to a named local first already worked
                 // because the local-decl path materializes the array.)
                 {
-                    auto fit = fieldIndex_.find(fields[i]);
+                    auto fit = fieldIndex_.find(posFields[i]);
                     if (fit != fieldIndex_.end()) {
                         llvm::Type* fty0 = st->getElementType(fit->second);
                         auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
@@ -5128,7 +5444,7 @@ llvm::Value* Emitter::buildRecordValue(
                 // nullable-value wrap below fires and the value is stored as the
                 // tagged `{i8 hasValue; int value}` struct (the unresolved `T?`
                 // was mis-judged, leaving the field wrong).
-                const sema::TypeRef* fty = recordMemberTypeResolved(fields[i]);
+                const sema::TypeRef* fty = recordMemberTypeResolved(posFields[i]);
                 if (isNullableValueTy(fty)) {
                     auto* expectedSt = nullableValueStructTy(fty);
                     llvm::Type* valTy = expectedSt->getElementType(1);
@@ -5151,7 +5467,7 @@ llvm::Value* Emitter::buildRecordValue(
                                 fty, builder_.CreateSExtOrTrunc(v, valTy));
                     }
                 }
-                auto idxIt = fieldIndex_.find(fields[i]);
+                auto idxIt = fieldIndex_.find(posFields[i]);
                 if (idxIt == fieldIndex_.end()) return nullptr;
                 // §5/§6/§9.1: widen/narrow a numeric positional argument to the
                 // field's storage type before the store — e.g. an `int` literal
@@ -5172,50 +5488,12 @@ llvm::Value* Emitter::buildRecordValue(
         }
     }
 
-    // §9.2 body record (or a record constructed through an explicit
-    // constructor): zero the storage, run auto-property / field
-    // initializers, then run the matching constructor with `this` bound to
-    // the struct slot. Mirrors the class construction path in lowerNew but
-    // for a by-value struct.
-    builder_.CreateStore(llvm::ConstantAggregateZero::get(st), slot);
-    for (const sema::Symbol* m : fields) {
-        const ast::Expr* init = nullptr;
-        if (auto* fd = dynamic_cast<const ast::FieldDecl*>(m->decl))
-            init = fd->initializer.get();
-        else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
-            init = pd->autoInitializer.get();  // §9.2: `property X := v;`
-        if (!init) continue;
-        auto idxIt = fieldIndex_.find(m);
-        if (idxIt == fieldIndex_.end()) continue;
-        llvm::Value* v = lowerExpr(*init);
-        if (!v) {
-            // #1386: ICE — lowerExpr returned null for a record field/property
-            // default initializer; the expression kind is not yet handled.
-            ctx_.diagnostics().report(
-                Severity::Error, init->span.begin,
-                "internal: lowerExpr returned null for record field/property "
-                "default initializer — #1386");
-            continue;
-        }
-        // CG-nullable: a NULLABLE VALUE field initialized with a plain value
-        // (`property N: int? := 9;`, or `property C: Color? := Color.Green;` —
-        // issue #364) must wrap the bare value into the {i8 hasValue; T value}
-        // struct, like the positional path above. per §9.2
-        const sema::TypeRef* fty = recordMemberType(m);
-        if (isNullableValueTy(fty)) {
-            auto* expectedSt = nullableValueStructTy(fty);
-            if (v->getType() != expectedSt) {
-                if (v->getType()->isPointerTy() &&
-                    llvm::isa<llvm::ConstantPointerNull>(v))
-                    v = nullableValueNull(fty);
-                else if (v->getType() == expectedSt->getElementType(1))
-                    v = wrapNullableValue(fty, v);
-            }
-        }
-        builder_.CreateStore(
-            v, builder_.CreateStructGEP(st, slot, idxIt->second));
-    }
-
+    // §9.2 body record, or a combined-form/positional record constructed
+    // through an EXPLICIT constructor: storage is already zeroed and
+    // body-declared initializers have already run (hoisted above, fix
+    // #2464); here, run the matching constructor with `this` bound to the
+    // struct slot. Mirrors the class construction path in lowerNew but for a
+    // by-value struct.
     if (sema::ConstructorSymbol* cs = ctorForArgs(t, args)) {
         auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
         if (!cd) return nullptr;
@@ -6622,6 +6900,44 @@ llvm::Value* Emitter::patternMatches(const ast::Pattern* pat, llvm::Value* scrut
             // #836: reconcile a non-literal constant's width to the scrutinee
             // (no-op for string / enum / already-matching types).
             if (!isStr) cv = reconcile(cv, scrut->getType());
+            // fix #2227 / §19.3 / §19.5: a ConstantPattern member whose lowered
+            // type is fundamentally incompatible with the scrutinee's LLVM type
+            // (a `null` literal pointer over a non-nullable int/float/bool/enum
+            // scrutinee — a `null` alternative is allowed by §19.3 but the
+            // non-nullable scrutinee cannot match it; or a string-literal
+            // `bz_string*` over an enum/record scrutinee whose typecheck guard
+            // did not fire because `scrutTy->kind != Kind::Primitive` (e.g. a
+            // bare `case c: Color of "Red" => …`). `reconcile` bridges only int
+            // widths and FP widths, so the residual `ptr` vs `i32` mismatch
+            // reaches `emitEquals` and trips `ICmpInst::AssertOK` (#2227
+            // repros; a sibling of #964 / #1213 — those sema guards cover the
+            // primitive-vs-primitive cases and the nullable-value `null`
+            // member case, but miss these two). Mirror the NamedPattern
+            // handler at L6422-6436: detect the fundamental mismatch, emit the
+            // §19 diagnostic once per bad member, and OR a never-match (false)
+            // into `any` so the rest of the arm's other members still
+            // participate correctly. The diagnostic fires at most once per
+            // pattern to keep the compiler output clean when the same
+            // ill-formed pattern has several bad members.
+            {
+                llvm::Type* st = scrut->getType();
+                llvm::Type* ct = cv->getType();
+                bool incompatible = st != ct &&
+                    (st->isPointerTy() != ct->isPointerTy() ||
+                     st->isIntegerTy(1) != ct->isIntegerTy(1) ||
+                     st->isFloatingPointTy() != ct->isFloatingPointTy());
+                if (incompatible) {
+                    if (!cp->constants.empty() && c.get() == cp->constants.front().get())
+                        ctx_.diagnostics().report(
+                            Severity::Error, c->span.begin,
+                            "case pattern constant type is not compatible with "
+                            "the scrutinee type (\xC2\xA7""19) — a `case` "
+                            "constant must be comparable to the scrutinee");
+                    // Skip this member — the OR-with-false leaves `any` unchanged
+                    // for the remaining members.
+                    continue;
+                }
+            }
             // CG27b: string scrutinee → content comparison (not ptr cmp).
             any = builder_.CreateOr(any, emitEquals(scrut, cv, isStr));
         }

@@ -198,11 +198,34 @@ BEZEL_TEST(discard_owning_collection_temp_1909, named_local_discard_unaffected_n
     BEZEL_EXPECT_EQ(run(src), 1);
 }
 
-// A discard of a BORROWED owning-collection producer (a user method returning
-// a non-`owned` owning collection — #1008 Part C classifies this Borrowed, a
-// bare receiver-field read) must NOT be disposed — the collection is owned
-// elsewhere. The field is later disposed once via the receiver's own owned
-// field cascade at scope end.
+// A discard of a BORROWED owning collection must NOT be disposed — the
+// collection is owned elsewhere. The field is later disposed once via the
+// receiver's own owned-field cascade at scope end.
+//
+// 2026-07-29: this case previously sourced the borrow from a user method
+// returning a non-`owned` owning collection (`public method Peek():
+// OwningArray<R> return Items; end Peek;` then `_ := h.Peek();`). That shape
+// stopped compiling when 342fdb9 (#1760) removed the receiver-owned-field
+// carve-out for the owning-collection heads, so the test has been RED on
+// origin/main since 2026-07-28 06:03.
+//
+// The shape is NOT restored here, because whether it should compile is an open
+// spec-vs-implementation conflict, not a test bug: spec §28.6 admits it in
+// prose ("applies uniformly to a class-typed owned field AND to an
+// owning-collection field") and as a worked example — `public method
+// GetTransactions(): OwningArray<Transaction> return _transactions;` — while
+// #1760's rationale argues the borrow is unsound under interface /
+// virtual-override / imported / function-value dispatch, where the caller
+// cannot resolve the concrete method and disposes the borrow. Resolving that
+// needs either a spec amendment or a sound call-site classification; both are
+// owner decisions, tracked in #2269. Per CLAUDE.md, a spec defect is fixed by
+// amending the spec, not by a test that blesses the divergence — so this test
+// does not encode either side of it.
+//
+// What #1909 is actually about — that discarding a borrowed owning collection
+// disposes nothing — is preserved by sourcing the borrow from a direct read of
+// the owned field, which is admissible under both readings and exercises the
+// same discard path.
 BEZEL_TEST(discard_owning_collection_temp_1909, borrowed_owning_collection_discard_not_disposed_28_3) {
     const std::string src = prog(
         "class Holder "
@@ -211,10 +234,9 @@ BEZEL_TEST(discard_owning_collection_temp_1909, borrowed_owning_collection_disca
         "    Items := new OwningArray<R>(); "
         "    Items.Add(new R()); "
         "  end constructor; "
-        "  public method Peek(): OwningArray<R> return Items; end Peek; "
         "end Holder; ",
         "  using var h := new Holder(); "
-        "  _ := h.Peek(); "   // a BORROW of h.Items — discard disposes nothing
+        "  _ := h.Items; "   // a BORROW of h.Items — discard disposes nothing
         "  return R._n; ");  // still 0 here — h's owned field disposes at scope end
     BEZEL_EXPECT_EQ(run(src), 0);
 }

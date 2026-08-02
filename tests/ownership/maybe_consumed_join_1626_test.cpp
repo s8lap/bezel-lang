@@ -20,23 +20,45 @@
 // markMovedByName (consume/move), markDisposedByName (explicit Dispose) —
 // each reject.
 //
-// Rework (reconciling §28.3 with §28.2 / #601): the marker is set ONLY for
-// the Owned ⊓ MOVED-FROM split — the move/`owned`-transfer freed the object
-// under its new owner, so any post-join use is a use-after-free. The Owned ⊓
-// DISPOSED split is NOT maybe-consumed: an explicit Dispose() is idempotent
-// (§28.2 — "a further Dispose() call remains a no-op, not an error"), and the
-// local still OWNS the reference on both branches (Disposed is a logical
-// state, not a transfer; the object is freed only at the per-path scope-end
-// auto-drop). That join resolves to plain Owned, so the post-join Dispose is
-// the proper discharge on the owned path and an idempotent no-op on the
-// disposed path — exactly #601's spec_28_2_one_branch_no_warn one-branch
-// discharge pattern. (The literal §28.3 "(or explicitly disposed)" clause
-// collides with §28.2's idempotent-Dispose guarantee there; the marker is the
-// move/transfer danger only.) These tests pin the fix: the asymmetric
-// Owned/moved-from join is rejected at every use, the Owned/disposed join
-// discharges clean (§28.2), the symmetric forms (owned on both branches;
-// discharged on both branches; reassign-after-join) stay clean, and the
-// undischarged-path leak (#338) still fires when there is no post-join use.
+// Rework (v0.180 era): the `maybeConsumed` marker is set ONLY for the
+// Owned ⊓ MOVED-FROM split — the move/`owned`-transfer freed the object under
+// its new owner, so any post-join use is a use-after-free. The Owned ⊓ DISPOSED
+// split is tracked by a separate `disposedOnSomePath` flag and joins to plain
+// Owned, because an explicit Dispose() nulls the slot, which makes the per-path
+// scope-end auto-drop null-safe.
+//
+// ── UPDATED 2026-07-29 for issue #2270 ─────────────────────────────────────
+//
+// That rework also concluded that a post-join USE of the DISPOSED split should
+// be ACCEPTED, on the reasoning that §28.2's idempotent-Dispose guarantee ("a
+// further Dispose() call remains a no-op, not an error") makes the post-join
+// `x.Dispose()` harmless. The current spec says the opposite, in two places:
+//
+//   * §28.2 (v0.228, "Use after disposal"), immediately after the mandatory
+//     straight-line warning: "A *conditional* kill is treated more strictly: at
+//     a join of an explicitly-disposed path with a still-owned path the
+//     variable is **maybe-consumed** and a later use is a compile error
+//     (§28.3)." The idempotent-Dispose sentence it was weighed against is about
+//     the RUNTIME checked/unchecked modes, not the compile-time join rule.
+//   * K4.2 (the kernel, v0.228 ~line 6241): "A *conditional* kill of either
+//     kind joins to maybe-consumed (K7) and later use is an error." "Either
+//     kind" is exactly the disposing/transferring split — the disposed side is
+//     named, not exempted.
+//   * K7.4 itself: the variable "may not be read, borrowed from, or consumed
+//     after the join". `x.Dispose()` reads the receiver and is a K4.2 announced
+//     kill — a consume — so it is doubly covered.
+//
+// So `dispose_after_owned_disposed_join_*` below is flipped: the post-join
+// Dispose is a compile ERROR, carrying the conditional-discharge diagnostic.
+// What is accepted is the same join with NO post-join use — "scope-end disposal
+// per-path" — and those cells live in branch_disposal_test.cpp and
+// conditional_discharge_1883_test.cpp.
+//
+// These tests pin: the asymmetric Owned/moved-from join is rejected at every
+// use, the Owned/disposed join is rejected at a post-join use, the symmetric
+// forms (owned on both branches; discharged on both branches;
+// reassign-after-join) stay clean, and the moved-from split with no post-join
+// use is still hard-rejected (#338/#1626).
 
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
@@ -81,6 +103,20 @@ bool hasMaybeConsumedError(const bezel::test::OwnershipResult& r) {
     return false;
 }
 
+// True iff any diagnostic is the §28.2 / K7.4 conditional-discharge rejection —
+// the DISPOSED-split sibling of hasMaybeConsumedError above (the checker keeps
+// the two messages distinct because the hazard differs: use-after-free for the
+// moved-from split, use-after-dispose for the disposed split).
+bool hasConditionalDischargeError(const bezel::test::OwnershipResult& r) {
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("may have already been disposed on another branch") !=
+            std::string::npos)
+            return true;
+    }
+    return false;
+}
+
 } // namespace
 
 // ---- §28.3 (#1626): the asymmetric Owned ⊓ MovedFrom join, then a use ----
@@ -99,26 +135,29 @@ BEZEL_TEST(own_maybe_consumed, dispose_after_owned_moved_join_rejected_1626) {
     BEZEL_EXPECT_TRUE(hasMaybeConsumedError(r));
 }
 
-// Owned ⊓ Disposed join + post-join Dispose — the §28.2/#601 one-branch
-// discharge pattern, which must compile CLEAN (reworked from the original
-// #1626, which wrongly rejected it). The maybe-consumed marker applies only
-// to the MOVED-FROM split (a transfer freed the object; re-use is a
-// use-after-free). The DISPOSED split is different: an explicit Dispose() is
-// IDEMPOTENT — §28.2: "a further Dispose() call remains a no-op, not an error,
-// in both modes" — and the local still OWNS the reference on both branches
-// (Disposed is a logical state, not a transfer; the object is freed only at
-// the per-path scope-end auto-drop). So the join resolves to plain Owned with
-// NO marker: the post-join `x.Dispose()` is the proper discharge on the
-// fall-through (owned) path and an idempotent no-op on the then (disposed)
-// path. This is exactly the shape #601's spec_28_2_one_branch_no_warn pins
-// (dispose on one branch, the final Dispose is the proper discharge); the two
-// sections coexist by scoping maybe-consumed to the move/transfer danger.
-BEZEL_TEST(own_maybe_consumed, dispose_after_owned_disposed_join_clean_28_2) {
+// Owned ⊓ Disposed join + post-join Dispose. §28.2 (v0.228): "A *conditional*
+// kill is treated more strictly: at a join of an explicitly-disposed path with
+// a still-owned path the variable is maybe-consumed and a later use is a
+// compile error (§28.3)" — and K7.4 lists the forbidden post-join operations as
+// "read, borrowed from, or consumed", all three of which `x.Dispose()` is (it
+// reads the receiver and is a K4.2 announced kill). REJECTED, with the
+// conditional-discharge diagnostic rather than the moved-from one: the checker
+// distinguishes the disposed split (use-after-dispose) from the moved-from
+// split (use-after-free).
+//
+// (#2270 / d2ecf82: this cell asserted the program was CLEAN, on the v0.180-era
+// reading that §28.2's idempotent-Dispose guarantee exempted the disposed
+// split. That guarantee is about the runtime checked/unchecked modes; the
+// compile-time join rule is the sentence quoted above. The accepted shape is
+// the same join with NO post-join use — branch_disposal_test.cpp.)
+BEZEL_TEST(own_maybe_consumed, dispose_after_owned_disposed_join_rejected_28_2) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Stream(); "
         "if cond then x.Dispose(); else end; "
         "x.Dispose();"));
-    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasConditionalDischargeError(r));
+    // The disposed split, not the moved-from split.
     BEZEL_EXPECT_FALSE(hasMaybeConsumedError(r));
 }
 
@@ -190,13 +229,15 @@ BEZEL_TEST(own_maybe_consumed, reassign_after_join_clears_marker_clean_28_3) {
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
 
-// ---- §28.6 (#338): no post-join use -> the per-path leak still fires ------
+// ---- §28.6 (#338): no post-join use, MOVED-FROM split -> still rejected ---
 
-// A maybe-consumed local with NO post-join use must still surface the
-// undischarged-path leak (§28.6): on the branch that never discharged it, the
-// value reaches scope end Owned. The maybe-consumed marker must NOT suppress
-// that leak diagnostic (it restricts re-use, not the per-path obligation).
-// This is the #338 soundness fix, preserved by keeping the Owned state.
+// A moved-from-split maybe-consumed local with NO post-join use is still hard-
+// rejected: the moved-out plain `var` slot is not nulled, so the per-path
+// scope-end auto-drop that the DISPOSED split gets (K7.4 "scope-end disposal
+// per-path", exercised in branch_disposal_test.cpp) cannot be applied here
+// without risking a double free. This is deliberately more conservative than
+// K7.4's literal text, which names moved-from and explicitly-disposed
+// symmetrically; see #2270.
 BEZEL_TEST(own_maybe_consumed, no_post_join_use_still_leaks_338) {
     auto r = parseAndCheckOwnership(wrap(
         "var x := new Stream(); "

@@ -4,12 +4,20 @@
 // §28.3 / §28.11 / #860 (REGRESSION — statement form dispose): disposing after
 // a statement-level TryPop still ACCEPTS. Guards the #860 positive case.
 //
-// Clean-compile ACCEPT control: bezelc -c must exit zero and emit no diagnostics.
+// ACCEPT-WITH-WARNING control: bezelc -c must exit zero (the program is
+// legal). It DOES emit one diagnostic — the `Cell._n` counter field below
+// is a mutable static of primitive type, which §22.12 rule 2 form (iii)
+// (#1393 warned-admission ruling, v0.221) admits only with a
+// declaration-site warning, unrelated to this test's own #860/#892
+// subject — pinned below so the ACCEPT assertion stays accurate. The
+// CHECK-NOT preserves this test's actual point: no §28.3 "auto-drop"
+// warning on `item`.
 //
 // RUN: %bezelc -c -o %t.o %s
-// RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
+// RUN: %bezelc -c %s 2>&1 | FileCheck %s
 
 module M; class Cell public static _n: int := 0; public constructor() Cell._n := Cell._n + 1; end constructor; destructor Cell._n := Cell._n - 1; end destructor; end Cell; class C public static method Main(): int do using var s := new OwningStack<Cell>(); s.Push(move (new Cell())); s.TryPop(out owned var item); item?.Dispose(); end; return Cell._n; end Main; end C;
 
-// NODIAG-NOT: error
-// NODIAG-NOT: §
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: mutable static field `_n` has type `int` — a primitive/enum value static is admitted only with a declaration-site warning (§22.12 rule 2 form (iii))
+// CHECK-SAME: (§22.12 rule 2, v0.221, #1393)
+// CHECK-NOT: auto-drop

@@ -61,17 +61,32 @@ bool Emitter::exprContainsAwait(const ast::Expr* e) {
     if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(e))
         return exprContainsAwait(bin->left.get()) ||
                exprContainsAwait(bin->right.get());
+    if (auto* me = dynamic_cast<const ast::MemberAccessExpr*>(e))
+        return exprContainsAwait(me->target.get());
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e))
+        return exprContainsAwait(nm->target.get());
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
         if (exprContainsAwait(ce->callee.get())) return true;
         for (const auto& a : ce->args)
             if (exprContainsAwait(a.value.get())) return true;
         return false;
     }
-    if (auto* me = dynamic_cast<const ast::MemberAccessExpr*>(e))
-        return exprContainsAwait(me->target.get());
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        if (exprContainsAwait(nc->callee.get())) return true;
+        for (const auto& a : nc->args)
+            if (exprContainsAwait(a.value.get())) return true;
+        return false;
+    }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
         if (exprContainsAwait(ix->target.get())) return true;
         for (const auto& a : ix->indices)
+            if (exprContainsAwait(a.value.get())) return true;
+        return false;
+    }
+    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        return exprContainsAwait(bg->operand.get());
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+        for (const auto& a : ne->args)
             if (exprContainsAwait(a.value.get())) return true;
         return false;
     }
@@ -79,6 +94,33 @@ bool Emitter::exprContainsAwait(const ast::Expr* e) {
         return exprContainsAwait(cd->condition.get()) ||
                exprContainsAwait(cd->thenValue.get()) ||
                exprContainsAwait(cd->elseValue.get());
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
+        return exprContainsAwait(te->operand.get());
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e))
+        return exprContainsAwait(th->operand.get());
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+        if (exprContainsAwait(we->source.get())) return true;
+        for (const auto& ia : we->assigns)
+            if (exprContainsAwait(ia.value.get())) return true;
+        return false;
+    }
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e))
+        return exprContainsAwait(re->lo.get()) ||
+               exprContainsAwait(re->hi.get()) ||
+               exprContainsAwait(re->step.get());
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        for (const auto& k : cl->keys)
+            if (exprContainsAwait(k.get())) return true;
+        for (const auto& v : cl->elements)
+            if (exprContainsAwait(v.get())) return true;
+        return false;
+    }
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        for (const auto& p : is->parts)
+            if (exprContainsAwait(p.expr.get())) return true;
+        return false;
+    }
+    // LambdaExpr is a separate async scope (§30.6) — not descended here.
     return false;
 }
 
@@ -134,22 +176,61 @@ static unsigned countAwaitsInExpr(const ast::Expr* e) {
     if (auto* bin = dynamic_cast<const ast::BinaryExpr*>(e))
         return countAwaitsInExpr(bin->left.get()) +
                countAwaitsInExpr(bin->right.get());
+    if (auto* me = dynamic_cast<const ast::MemberAccessExpr*>(e))
+        return countAwaitsInExpr(me->target.get());
+    if (auto* nm = dynamic_cast<const ast::NullCondMemberExpr*>(e))
+        return countAwaitsInExpr(nm->target.get());
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(e)) {
         unsigned n = countAwaitsInExpr(ce->callee.get());
         for (const auto& a : ce->args) n += countAwaitsInExpr(a.value.get());
         return n;
     }
-    if (auto* me = dynamic_cast<const ast::MemberAccessExpr*>(e))
-        return countAwaitsInExpr(me->target.get());
+    if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+        unsigned n = countAwaitsInExpr(nc->callee.get());
+        for (const auto& a : nc->args) n += countAwaitsInExpr(a.value.get());
+        return n;
+    }
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
         unsigned n = countAwaitsInExpr(ix->target.get());
         for (const auto& a : ix->indices) n += countAwaitsInExpr(a.value.get());
+        return n;
+    }
+    if (auto* bg = dynamic_cast<const ast::PostfixBangExpr*>(e))
+        return countAwaitsInExpr(bg->operand.get());
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+        unsigned n = 0;
+        for (const auto& a : ne->args) n += countAwaitsInExpr(a.value.get());
         return n;
     }
     if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e))
         return countAwaitsInExpr(cd->condition.get()) +
                countAwaitsInExpr(cd->thenValue.get()) +
                countAwaitsInExpr(cd->elseValue.get());
+    if (auto* te = dynamic_cast<const ast::TypeTestExpr*>(e))
+        return countAwaitsInExpr(te->operand.get());
+    if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e))
+        return countAwaitsInExpr(th->operand.get());
+    if (auto* we = dynamic_cast<const ast::WithExpr*>(e)) {
+        unsigned n = countAwaitsInExpr(we->source.get());
+        for (const auto& ia : we->assigns) n += countAwaitsInExpr(ia.value.get());
+        return n;
+    }
+    if (auto* re = dynamic_cast<const ast::RangeExpr*>(e))
+        return countAwaitsInExpr(re->lo.get()) +
+               countAwaitsInExpr(re->hi.get()) +
+               countAwaitsInExpr(re->step.get());
+    if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+        unsigned n = 0;
+        for (const auto& k : cl->keys) n += countAwaitsInExpr(k.get());
+        for (const auto& v : cl->elements) n += countAwaitsInExpr(v.get());
+        return n;
+    }
+    if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+        unsigned n = 0;
+        for (const auto& p : is->parts) n += countAwaitsInExpr(p.expr.get());
+        return n;
+    }
+    // LambdaExpr is a separate async scope (§30.6) — not descended here.
     return 0;
 }
 
@@ -873,6 +954,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         definitelyEscapingLambdas_.clear();
         boxCaptureLocalsFn_ = resumeFn;
         cellFreeEligible_.clear();
+        unwindUnsafeCellFree_.clear();  // fix #2334
         cellFreeEligibleFn_ = resumeFn;
         collectBoxCaptureLocals(*ci.stmts);
         collectDefinitelyEscapingLambdas(*ci.stmts);
@@ -1275,6 +1357,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         definitelyEscapingLambdas_.clear();
         boxCaptureLocalsFn_ = resumeFn;
         cellFreeEligible_.clear();
+        unwindUnsafeCellFree_.clear();  // fix #2334
         cellFreeEligibleFn_ = resumeFn;
         if (!lam.exprBody) {
             collectClosureReleaseEligible(lam.stmts);
@@ -1563,9 +1646,13 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     asyncResultTy_ = i1();
 
     // Frame: locals + [ T current_val, ptr perAdvanceTask, ptr pendingTask,
-    //                   ptr spill ].
+    //                   ptr spill, ptr token ].
+    // §30.7 (v0.228, #1525): TOKEN_FIELD is the CancellationToken cell captured
+    // by GetAsyncEnumerator(token) — null (CancellationToken.None) by default
+    // (calloc-zeroed at construction), never cancels until GetAsyncEnumerator
+    // stores a real token.
     StateMachineFrame frame = buildStateMachineFrame(
-        ms, *ci.stmts, {elemTy, ptrTy(), ptrTy(), ptrTy()},
+        ms, *ci.stmts, {elemTy, ptrTy(), ptrTy(), ptrTy(), ptrTy()},
         std::string("asynciter.") + std::string(ms->name));
     auto* stateStructTy = frame.structTy;
     const unsigned VTABLE_FIELD = frame.vtableField;
@@ -1574,6 +1661,7 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     const unsigned PER_ADVANCE_TASK_FIELD = frame.currentValField + 1;
     const unsigned PENDING_TASK_FIELD = frame.currentValField + 2;
     const unsigned SPILL_PTR_FIELD = frame.currentValField + 3;
+    const unsigned TOKEN_FIELD = frame.currentValField + 4;
     // The Resume completes the per-advance task; reuse asyncOuterTaskField_ for it.
     asyncOuterTaskField_ = PER_ADVANCE_TASK_FIELD;
     asyncPendingTaskField_ = PENDING_TASK_FIELD;
@@ -1609,8 +1697,33 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
         llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
 
-    // --- Vtable: [0]=self, [1]=Dispose, [2]=MoveNextAsync, [3]=Current ---
-    const unsigned VT_SIZE = 4;
+    // --- GetAsyncEnumerator(ptr self, ptr token) -> ptr (vtable slot 4) ---
+    // fix #1268 / §29.3 + §30.7: `IAsyncEnumerable<T>` is RE-ITERABLE — "each
+    // call to GetAsyncEnumerator() runs the body again from the start" (§29.3),
+    // and §29.11 "Each GetEnumerator() call produces an independent enumerator".
+    // The async iterator previously had no such slot: the value the factory
+    // returns WAS treated as the enumerator, so a second `await for` over the
+    // same bound source drove — and the first loop's exit had already Disposed
+    // and freed — the very same frame (ASan: heap-use-after-free in the
+    // consumer's Resume). This is the async twin of the sync fix #943
+    // (LlvmBackend_Iterators.cpp), and the slot is emitted with the same
+    // semantics: a fresh calloc byte-copy of the frame with the state reset to
+    // the start, so N `await for` loops replay the body N times.
+    //
+    // §30.7 (v0.228, #1525): "the enumerator returned by the generated
+    // GetAsyncEnumerator(token) captures the token" — the interface signature
+    // is `GetAsyncEnumerator(token: CancellationToken := CancellationToken.None):
+    // owned IAsyncEnumerator<T>`, so the slot now takes a second ptr argument (the
+    // CancellationToken cell; null = None) and stores it into the returned
+    // enumerator's TOKEN_FIELD.
+    auto* getAsyncEnumFn = llvm::Function::Create(
+        llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
+        llvm::Function::InternalLinkage, prefix + "GetAsyncEnumerator",
+        module_.get());
+
+    // --- Vtable: [0]=self, [1]=Dispose, [2]=MoveNextAsync, [3]=Current,
+    //             [4]=GetAsyncEnumerator (#1268, §29.11) ---
+    const unsigned VT_SIZE = 5;
     std::vector<llvm::Constant*> vtElems(
         VT_SIZE, llvm::ConstantPointerNull::get(ptrTy()));
     auto* vtGVType = llvm::ArrayType::get(ptrTy(), VT_SIZE);
@@ -1621,7 +1734,168 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     vtElems[1] = disposeFn;
     vtElems[2] = moveNextFn;
     vtElems[3] = currentFn;
+    vtElems[4] = getAsyncEnumFn;
     vtGV->setInitializer(llvm::ConstantArray::get(vtGVType, vtElems));
+
+    // --- GetAsyncEnumerator body (vtable slot 4, #1268; owned-param CLAIM
+    // mechanism fix #2356) ---
+    // §29.3 (v0.234): "`IAsyncEnumerable<T>` (re-iterable)" — the same defining
+    // clause as the sync form, "re-iterable: each call to `GetEnumerator()` runs
+    // the body again from the start" — with NO carve-out for an owned parameter;
+    // "`owned` parameters remain admitted (§29.8)" merely says the parameter
+    // kind does not disqualify the method from being an iterator at all (unlike
+    // `ref`/`out`, forbidden by the same sentence's neighbor), not that it
+    // waives re-iterability. §29.11: "Each `GetEnumerator()` call produces an
+    // independent enumerator." §30.7's own interface block types the method
+    // `GetAsyncEnumerator(...): owned IAsyncEnumerator<T>` — an `owned`-returning
+    // method mints a fresh, caller-owned value per call (§29.1: "the caller
+    // takes ownership of the enumerator and must dispose it"); handing back
+    // `self` — an object the ENUMERABLE's own binder still owns too — breaks
+    // that contract regardless of the disposal bookkeeping around it. Returning
+    // `self` unconditionally (the pre-#2356 shape) is therefore read as spec-
+    // NON-compliant, not merely leaky: issue #2356's own double-free was the
+    // symptom, not the defect (two bindings validly OWNING the SAME object, per
+    // §28's "every heap object is disposed exactly once").
+    //
+    // Fix: GetAsyncEnumerator ALWAYS hands back a genuine independent clone
+    // (byte-copy + state reset — the SAME machinery already used below for the
+    // no-owned-param case). For the affine `owned` parameter specifically (it
+    // cannot be duplicated — no implicit Clone()), the FIRST call CLAIMS every
+    // owned-param capture: the clone's byte-copy takes the (still-live) pointer,
+    // and `self`'s own copy is nulled — so `self`'s later Dispose
+    // (emitFreeAndReturn's existing null-guarded sweep, unchanged) becomes a
+    // no-op for it, exactly the same null-guard the moved-from case already
+    // relies on. `self`'s state becomes the sentinel `-3` (unused elsewhere in
+    // this state space — Dispose's own state switch (below) only recognizes
+    // non-negative suspension states and treats anything else, `-1` for
+    // "completed" included, as "no pending cleanup, just free"), so a SECOND
+    // GetAsyncEnumerator call sees the claim and raises a loud
+    // `InvalidOperationException` rather than silently handing out a second
+    // alias of the same affine resource — the same "claim once, IOE on repeat"
+    // shape as the sync iterator's #973a/#2154 GetEnumerator claim
+    // (LlvmBackend_Iterators.cpp), simplified: EVERY owned param is claimed
+    // uniformly by the first call (no attempt to distinguish a param the body
+    // never moves out from one it does — that finer-grained sharing the sync
+    // path allows for a never-consumed capture is intentionally NOT replicated
+    // here, tracked as a follow-up, #2377, for whoever revisits this for
+    // throughput; claim-once is conservative but sound for every shape).
+    // `await for`'s desugaring (lowerAwaitFor) already drives exclusively
+    // through the RETURNED enumerator pointer (never `self` directly), so it
+    // needs no change beyond the pending-exception check this fix adds at both
+    // call sites (here callers must, since this is now the first vtable-slot-4
+    // path that can throw).
+    bool hasOwnedParamCapture = false;
+    for (sema::Symbol* psym : ms->params) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(psym);
+        if (ps && ps->modifier == "owned") { hasOwnedParamCapture = true; break; }
+    }
+    {
+        auto* geEntry =
+            llvm::BasicBlock::Create(llvm_, "entry", getAsyncEnumFn);
+        llvm::IRBuilder<> gb(geEntry);
+        llvm::Value* geSelf = getAsyncEnumFn->getArg(0);
+        llvm::Value* geToken = getAsyncEnumFn->getArg(1);
+        llvm::Value* sourceStateField =
+            gb.CreateStructGEP(stateStructTy, geSelf, STATE_FIELD);
+        auto* cloneBB = geEntry;
+        if (hasOwnedParamCapture) {
+            auto* claimedBB =
+                llvm::BasicBlock::Create(llvm_, "gae.claimed", getAsyncEnumFn);
+            cloneBB = llvm::BasicBlock::Create(llvm_, "gae.claim", getAsyncEnumFn);
+            llvm::Value* priorState =
+                gb.CreateLoad(i32(), sourceStateField, "gae.priorstate");
+            gb.CreateCondBr(
+                gb.CreateICmpEQ(priorState, gb.getInt32(-3), "gae.isclaimed"),
+                claimedBB, cloneBB);
+
+            // Already claimed by an earlier GetAsyncEnumerator call: raise
+            // InvalidOperationException synchronously (this method is NOT
+            // itself async — a plain `owned IAsyncEnumerator<T>`-returning
+            // call — so the pending-exception protocol, not a faulted Task,
+            // is the right channel; mirrors the sync claim block's IOE, and
+            // the #1349 TakeCurrent IOE emission a few functions below).
+            // NOTE: this block builds `getAsyncEnumFn` through its OWN local
+            // `gb` IRBuilder, not the shared `builder_` — `emitExcSlot()`
+            // (like most Emitter helpers) emits through `builder_` and would
+            // insert the bz_exc_addr() call into whatever function/block
+            // `builder_` currently points at (a DIFFERENT function's IR —
+            // "referring to an instruction in another function", caught by
+            // the verifier). Declare and call bz_exc_addr directly through
+            // `gb` instead, exactly mirroring the sync iterator's GetEnumerator
+            // claim block (LlvmBackend_Iterators.cpp) and the #1349 TakeCurrent
+            // IOE emission (both of which build their own vtable function
+            // bodies the same self-contained way).
+            gb.SetInsertPoint(claimedBB);
+            llvm::Value* excObj = gb.CreateCall(
+                callocFn(),
+                {gb.getInt64(1), gb.getInt64((int64_t)kExcObjSize)},
+                "gae.excobj");
+            auto vit = builtinVtable_.find("InvalidOperationException");
+            if (vit != builtinVtable_.end())
+                gb.CreateStore(vit->second, excObj);
+            auto* excAddrTy = llvm::FunctionType::get(ptrTy(), {}, false);
+            auto* excAddrFnGE =
+                module_->getOrInsertFunction("bz_exc_addr", excAddrTy)
+                    .getCallee();
+            llvm::Value* excSlotGE =
+                gb.CreateCall(excAddrTy, excAddrFnGE, {}, "gae.excslot");
+            gb.CreateStore(excObj, excSlotGE);
+            gb.CreateRet(llvm::ConstantPointerNull::get(ptrTy()));
+            gb.SetInsertPoint(cloneBB);
+        }
+
+        uint64_t stSz =
+            module_->getDataLayout().getTypeAllocSize(stateStructTy);
+        auto* callocFnGE = declareC("calloc", ptrTy(), {i64(), i64()});
+        llvm::Value* clone = gb.CreateCall(
+            callocFnGE, {gb.getInt64(1), gb.getInt64((int64_t)stSz)},
+            "asynciter.clone");
+        auto* memcpyFnGE =
+            declareC("memcpy", ptrTy(), {ptrTy(), ptrTy(), i64()});
+        gb.CreateCall(memcpyFnGE,
+                      {clone, geSelf, gb.getInt64((int64_t)stSz)});
+        // Reset to the start: state 0, no yielded value, no in-flight
+        // per-advance / pending task, and no spill area (the clone lazily
+        // allocates its own on first resume — copying the source's pointer
+        // would make two frames free() the same region).
+        gb.CreateStore(gb.getInt32(0),
+            gb.CreateStructGEP(stateStructTy, clone, STATE_FIELD));
+        gb.CreateStore(llvm::Constant::getNullValue(elemTy),
+            gb.CreateStructGEP(stateStructTy, clone, CURRENT_VAL_FIELD));
+        gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+            gb.CreateStructGEP(stateStructTy, clone,
+                               PER_ADVANCE_TASK_FIELD));
+        gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+            gb.CreateStructGEP(stateStructTy, clone, PENDING_TASK_FIELD));
+        gb.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+            gb.CreateStructGEP(stateStructTy, clone, SPILL_PTR_FIELD));
+        // §30.7 (#1525): the clone captures the CALLER's token — NOT the
+        // source's (the source's own TOKEN_FIELD is whatever was stored the
+        // last time GetAsyncEnumerator was called on it, normally still null
+        // since the constructing call `Gen()` never sets it).
+        gb.CreateStore(geToken,
+            gb.CreateStructGEP(stateStructTy, clone, TOKEN_FIELD));
+        gb.CreateStore(vtGV,
+            gb.CreateStructGEP(stateStructTy, clone, VTABLE_FIELD));
+        if (hasOwnedParamCapture) {
+            // Transfer: the clone's byte-copy above already took a live
+            // pointer for every owned-param capture; null `self`'s own copies
+            // so `self`'s later Dispose (emitFreeAndReturn's null-guarded
+            // sweep, unchanged) is a no-op for them, and mark `self` claimed
+            // so a repeat call raises IOE above instead of aliasing the clone.
+            for (std::size_t i = 0; i < frame.captures.size(); ++i) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    frame.captures[i].first);
+                if (!ps || ps->modifier != "owned") continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                gb.CreateStore(
+                    llvm::Constant::getNullValue(frame.captures[i].second),
+                    gb.CreateStructGEP(stateStructTy, geSelf, fieldIdx));
+            }
+            gb.CreateStore(gb.getInt32(-3), sourceStateField);
+        }
+        gb.CreateRet(clone);
+    }
 
     // --- Construction entry (= the original method): calloc + fill frame ---
     {
@@ -1750,6 +2024,59 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
 
         llvm::Value* self = resumeFn->getArg(1);
         emitFrameCaptureRestores(frame, self);
+
+        // §30.7 (v0.228, #1525): "every MoveNextAsync() performs an implicit
+        // token.ThrowIfCancellationRequested() — on entry, and at each resume
+        // from suspension within the advance — so a requested cancellation
+        // faults the in-flight MoveNextAsync task with OperationCanceledException
+        // at the next suspension boundary." Resume is the SOLE trampoline for
+        // both cases: MoveNextAsync calls it directly (the "on entry" call), and
+        // the bz_task_then completion callback of every internal `await` calls it
+        // again to continue the advance (the "at each resume from suspension"
+        // call) — so one check here, before the state dispatch below, covers
+        // both. On cancellation the in-flight per-advance task is faulted with a
+        // fresh OperationCanceledException and STATE IS LEFT UNTOUCHED: the
+        // pending using-var/finally cleanup for whichever suspension point the
+        // frame is currently parked at is the consumer's Dispose() responsibility
+        // when it unwinds on the faulted task (§29.7) — exactly the same
+        // abandonment path a `break`/exception exit already takes, not a second,
+        // divergent cleanup written here.
+        {
+            llvm::Value* tokenFieldGEP =
+                builder_.CreateStructGEP(stateStructTy, self, TOKEN_FIELD);
+            llvm::Value* tokenLoaded =
+                builder_.CreateLoad(ptrTy(), tokenFieldGEP, "asynciter.tok");
+            auto* isCancFn = declareC("bz_ctoken_is_cancelled", i32(), {ptrTy()});
+            llvm::Value* isCancelled = builder_.CreateICmpNE(
+                builder_.CreateCall(isCancFn, {tokenLoaded}, "asynciter.tok.canc"),
+                builder_.getInt32(0));
+            auto* tokCancelBB =
+                llvm::BasicBlock::Create(llvm_, "asynciter.tokcancel", resumeFn);
+            auto* tokProceedBB =
+                llvm::BasicBlock::Create(llvm_, "asynciter.tokproceed", resumeFn);
+            builder_.CreateCondBr(isCancelled, tokCancelBB, tokProceedBB);
+
+            builder_.SetInsertPoint(tokCancelBB);
+            llvm::Value* advTaskField = builder_.CreateStructGEP(
+                stateStructTy, self, PER_ADVANCE_TASK_FIELD);
+            llvm::Value* advTask =
+                builder_.CreateLoad(ptrTy(), advTaskField, "asynciter.tok.task");
+            auto ceVit = builtinVtable_.find("OperationCanceledException");
+            if (ceVit != builtinVtable_.end()) {
+                llvm::Value* oceObj = builder_.CreateCall(
+                    callocFn(),
+                    {builder_.getInt64(1), builder_.getInt64(kExcObjSize)},
+                    "asynciter.tok.oce");
+                builder_.CreateStore(ceVit->second, oceObj);
+                auto* completeErrFn = declareC(
+                    "bz_task_complete_error_obj", llvm::Type::getVoidTy(llvm_),
+                    {ptrTy(), ptrTy()});
+                builder_.CreateCall(completeErrFn, {advTask, oceObj});
+            }
+            builder_.CreateRetVoid();
+
+            builder_.SetInsertPoint(tokProceedBB);
+        }
 
         llvm::Value* stateGEP =
             builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
@@ -1901,12 +2228,31 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             // after disposal so a re-entrant Dispose (or a param already moved out
             // and nulled) never double-frees. Only params flagged
             // iteratorAutoDispose (never discharged on any path, set in
-            // Ownership.cpp) are disposed; a conditionally-discharged param stays a
-            // reject (#973a).
+            // Ownership.cpp) are disposed.
+            //
+            // #973a: `iteratorFrameConditionalAutoDispose` extends the same loop
+            // to a CONDITIONALLY discharged parameter. Nothing else changes —
+            // the null-guard IS the runtime moved-from test: the marked-adoption
+            // lowering nulls this very slot
+            // (Emitter::nullStateMachineOwnedParamCapture), so the adopting path
+            // loads null and skips while the fall-through path disposes exactly
+            // once. fix #2356 / §29.8: an owned-param async iterator's
+            // GetAsyncEnumerator (vtable slot 4, above) now DOES clone — the
+            // first call transfers every owned-param capture into the clone
+            // and NULLS `self`'s own copies, so this sweep is a genuine no-op
+            // when it later runs on the (inert, never-driven) SOURCE frame,
+            // and disposes the still-live captures when it runs on the CLONE
+            // (the frame the body actually ran on). Both cases are exactly-
+            // once-safe through the same null guard; no clone/source
+            // distinction is needed here because the transfer already made
+            // "self's own copy" the single source of truth for whichever
+            // frame this call is disposing.
             for (std::size_t i = frame.captures.size(); i-- > 0;) {
                 auto* ps = dynamic_cast<sema::ParameterSymbol*>(
                     frame.captures[i].first);
-                if (!ps || !ps->iteratorAutoDispose) continue;
+                if (!ps || (!ps->iteratorAutoDispose &&
+                            !ps->iteratorFrameConditionalAutoDispose))
+                    continue;
                 unsigned fieldIdx = frame.captureStart + (unsigned)i;
                 llvm::Value* fptr =
                     builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
@@ -2629,7 +2975,15 @@ void Emitter::emitAsyncOwnedParamAutoDispose(llvm::Value* self) {
     const StateMachineFrame& frame = *asyncOwnedParamFrame_;
     for (std::size_t i = frame.captures.size(); i-- > 0;) {
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(frame.captures[i].first);
-        if (!ps || !ps->iteratorAutoDispose) continue;
+        // #973a: `iteratorFrameConditionalAutoDispose` admits a CONDITIONALLY
+        // discharged parameter to this same loop. The null-guard below is then
+        // the runtime moved-from test — the marked-adoption lowering nulls this
+        // slot on the path that adopts, so only the fall-through path disposes.
+        // A plain-async frame has no clone, so the frame the body ran on is the
+        // one whose completion edges reach here.
+        if (!ps || (!ps->iteratorAutoDispose &&
+                    !ps->iteratorFrameConditionalAutoDispose))
+            continue;
         unsigned fieldIdx = frame.captureStart + (unsigned)i;
         llvm::Value* fptr =
             builder_.CreateStructGEP(smStateStruct_, self, fieldIdx);

@@ -49,32 +49,50 @@ fi
 "$repo/scripts/dev_heavy.sh" build cmake --build "$build" -j"${ASAN_SWEEP_JOBS:-16}" \
   --target bezel_tests || { echo "asan_sweep: build FAILED"; exit 2; }
 
-bin="$build/tests/bezel_tests"
-[ -x "$bin" ] || { echo "asan_sweep: test binary missing at $bin"; exit 2; }
+# The suite is several per-area binaries; the CMake-generated manifest lists
+# them (tests/CMakeLists.txt). Reading it — rather than naming one path — is why
+# a new area cannot be silently left out of the sweep.
+manifest="$build/tests/test_binaries.txt"
+[ -s "$manifest" ] || { echo "asan_sweep: test-binary manifest missing at $manifest"; exit 2; }
+bins=()
+while IFS=$'\t' read -r _g p _w; do
+  [ -n "${p:-}" ] || continue
+  [ -x "$p" ] || { echo "asan_sweep: test binary missing at $p"; exit 2; }
+  bins+=("$p")
+done < "$manifest"
+[ "${#bins[@]}" -gt 0 ] || { echo "asan_sweep: empty test-binary manifest"; exit 2; }
 
-# Run all shards in parallel. Each program compiles+links with ASan (per-test,
-# via the harness) and runs under ASan; a report is re-emitted to the shard log.
-# Per-shard TMPDIR keeps the harness's fixed-stem temp files collision-free
-# (mirrors tests/run_parallel.sh). The compile concurrency is bounded machine-wide
-# by the #1780 link-token pool, so 8 shards do not oversubscribe fork/RAM.
+# Run all shards in parallel: each binary is split into $shards slices, so there
+# are ${#bins[@]} × $shards shard logs and every one of them must complete.
+# Each program compiles+links with ASan (per-test, via the harness) and runs
+# under ASan; a report is re-emitted to the shard log. Per-shard TMPDIR keeps the
+# harness's fixed-stem temp files collision-free (mirrors tests/run_parallel.sh).
+# The compile concurrency is bounded machine-wide by the #1780 link-token pool.
 fail=0
 pids=()
-for (( i=0; i<shards; i++ )); do
-  d=/var/tmp/bezel-scratch/asan_sweep.$i; mkdir -p "$d"; rm -f "$d/log"
-  ( TMPDIR="$d" BEZEL_AOT_FORCE_SANITIZE=address \
-      BEZEL_SHARD_COUNT="$shards" BEZEL_SHARD_INDEX="$i" \
-      "$bin" > "$d/log" 2>&1 ) &
-  pids+=($!)
+slices=()
+for bin in "${bins[@]}"; do
+  name="$(basename "$bin")"
+  for (( i=0; i<shards; i++ )); do
+    d=/var/tmp/bezel-scratch/asan_sweep.$name.$i; mkdir -p "$d"; rm -f "$d/log"
+    slices+=("$name.$i")
+    ( TMPDIR="$d" BEZEL_AOT_FORCE_SANITIZE=address \
+        BEZEL_SHARD_COUNT="$shards" BEZEL_SHARD_INDEX="$i" \
+        "$bin" > "$d/log" 2>&1 ) &
+    pids+=($!)
+  done
 done
 for p in "${pids[@]}"; do wait "$p" || true; done
 
 # Detect a real memory error via the sanitizer's own report headline in the shard
 # log (the harness re-emits any fired report there). Print one report per dirty
-# shard for triage. The per-shard "shard N: X ASan errors" line is the format
-# gate.sh's asan tier sums, and printing exactly `shards` of them lets gate.sh's
-# "all shards reported" integrity check pass.
-for (( i=0; i<shards; i++ )); do
-  log=/var/tmp/bezel-scratch/asan_sweep.$i/log
+# shard for triage. The per-shard "shard <group>.<i>: X ASan errors" line is the
+# format gate.sh's asan tier sums, and printing exactly one per slice — that is
+# (number of per-area binaries) × `shards` of them — lets gate.sh's "all shards
+# reported" integrity check pass.
+for slice in "${slices[@]}"; do
+  i="$slice"
+  log=/var/tmp/bezel-scratch/asan_sweep.$slice/log
   n=0
   # grep -c already prints 0 (exit 1) when there is no match; do NOT add a `|| echo
   # 0` fallback — that emits a SECOND "0" and splits the report line.

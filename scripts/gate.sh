@@ -78,9 +78,14 @@ DH=scripts/dev_heavy.sh
 # cold-cache timeout flake (the #1 documented cause). Refuse to start if heavy
 # compile/test comms are already active. Matched by process COMM (exact name) so
 # it cannot self-match this bash script. Bypass with GATE_SKIP_BUILDER_CHECK=1.
-if [ -z "${GATE_SKIP_BUILDER_CHECK:-}" ] && pgrep -x 'cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests' >/dev/null 2>&1; then
+# NB `bezel_tests(_[a-z]+)?` covers BOTH the historical single binary and the
+# per-area binaries the suite is now built as (bezel_tests_codegen, …) — pgrep's
+# pattern is a regex and -x anchors it to the WHOLE comm, so this still cannot
+# match this bash script.
+BUILDERS='cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests(_[a-z]+)?'
+if [ -z "${GATE_SKIP_BUILDER_CHECK:-}" ] && pgrep -x "$BUILDERS" >/dev/null 2>&1; then
   echo "GATE ABORT: heavy build/test process(es) already active — gating now risks the cold-cache flake (zero-builders rule). Stop them, or set GATE_SKIP_BUILDER_CHECK=1:" >&2
-  pgrep -ax 'cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests' >&2 || true
+  pgrep -ax "$BUILDERS" >&2 || true
   exit 2
 fi
 
@@ -254,6 +259,34 @@ trap 'rc=$?; gate_finish "$rc" || true; exit $rc' EXIT
 # still surfacing a genuine widespread regression (some sampled suspect fails
 # all 5). Replaces an earlier ">8 => fail-fast real-regression" that mis-reported
 # cold-cache timeouts as mass regressions (the #2205 mis-revert, 2026-07-25).
+# The per-area test binaries, from the CMake-generated manifest
+# (tests/CMakeLists.txt). Every runner reads this same file, so the set of
+# binaries the gate accounts for is exactly the set CMake built.
+test_binaries() { cut -f2 build/tests/test_binaries.txt 2>/dev/null; }
+
+# Re-run ONE gtest suite by filter across the per-area binaries. The shard log
+# does not say which binary a suspect came from, and it does not need to: a
+# binary holding none of the suite walks its registry and exits in ~30 ms, so
+# asking all of them costs nothing and cannot pick the wrong one.
+#
+# "Passes alone" requires BOTH every binary exiting 0 AND at least one test
+# actually having run. Without the second half a suspect name that matches
+# NOWHERE (a mapping bug, a rename) would exit 0 having validated nothing and be
+# laundered into a flake-ACCEPT — the exact false-green this gate exists to
+# prevent. ARB_ENV keeps ASan forced in ASan modes so an ASan-only failure
+# reproduces rather than being falsely cleared as flaky.
+arb_run_suite() { # $1 = gtest suite substring
+  local suite="$1" bin out rc n total=0
+  while IFS= read -r bin; do
+    [ -n "$bin" ] || continue
+    out=$(BEZEL_TEST_FILTER="$suite" "${ARB_ENV[@]}" timeout 180 "$bin" 2>&1); rc=$?
+    [ "$rc" -ne 0 ] && return 1
+    n=$(printf '%s\n' "$out" | grep -oE '^[0-9]+ passed, [0-9]+ failed' | tail -1 | awk '{print $1+$3}')
+    total=$(( total + ${n:-0} ))
+  done < <(test_binaries)
+  [ "$total" -gt 0 ]
+}
+
 arbitrate() { # $1 = sharded-run log
   local log="$1" crashed failed suspects nsus real t suite passed_alone k sampled
   crashed=$(grep 'died on:' "$log" | sed -E 's/.*died on: //')
@@ -268,22 +301,50 @@ arbitrate() { # $1 = sharded-run log
   [ -z "$suspects" ] && return 2
   nsus=$(printf '%s\n' "$suspects" | grep -c .)
   ARB_LAST_SUSPECTS=$nsus
+  # Two classes of suspect, and they deserve opposite treatment (2026-07-29):
+  #
+  #   [ FAIL ]   a test that RAN and failed — the actual evidence of a defect.
+  #   died on:   the test a shard happened to be executing when it was killed
+  #              (usually at the timeout ceiling). Almost always innocent.
+  #
+  # The old code merged both, sorted alphabetically, and arbitrated the first 8.
+  # On gate E that sampled 8 of 47 and every one landed in the a*-l* range, so
+  # ELEVEN deterministic ownership failures (own_branch_disposal.*, and friends)
+  # were never re-run and the gate PASSED red. Never sample away a [ FAIL ].
+  #
+  # Dedupe by SUITE first: the re-run below filters by suite substring, so N
+  # failures in one suite are one unit of work — that alone collapsed gate E's
+  # 47 suspects to far fewer, and makes arbitrating every failing suite cheap.
+  # Only the `died on:` victims are sampled, and only after every failing suite
+  # has been checked.
+  local fail_suites crash_suites ncrash
+  fail_suites=$(printf '%s\n' "$failed" | grep -v '^$' | grep -vx '<none>' | sed 's/\..*//' | sort -u)
+  crash_suites=$(printf '%s\n' "$crashed" | grep -v '^$' | grep -vx '<none>' | sed 's/\..*//' | sort -u)
+  # A suite already covered by a [ FAIL ] needs no second arbitration.
+  if [ -n "$fail_suites" ] && [ -n "$crash_suites" ]; then
+    crash_suites=$(comm -13 <(printf '%s\n' "$fail_suites") <(printf '%s\n' "$crash_suites") 2>/dev/null || printf '%s\n' "$crash_suites")
+  fi
+  ncrash=$(printf '%s\n' "$crash_suites" | grep -c . || true)
+  suspects=$(printf '%s\n' "$fail_suites" "$crash_suites" | grep -v '^$')
   real=0; sampled=0
   while IFS= read -r t; do
     [ -z "$t" ] && continue
-    sampled=$((sampled+1))
-    if [ "$sampled" -gt "${ARB_SAMPLE:-8}" ]; then
-      echo "   (capped arbitration at ${ARB_SAMPLE:-8} of $nsus suspects; a real cross-cutting regression would surface in the sample)"
-      break
+    # Cap applies ONLY to the timeout-victim suites, which are listed last.
+    if printf '%s\n' "$crash_suites" | grep -qxF -- "$t"; then
+      sampled=$((sampled+1))
+      if [ "$sampled" -gt "${ARB_SAMPLE:-8}" ]; then
+        echo "   (capped arbitration at ${ARB_SAMPLE:-8} of $ncrash timeout-victim suites; every suite with a real [ FAIL ] was arbitrated in full)"
+        break
+      fi
     fi
     suite="${t%%.*}"
     passed_alone=0
     for k in 1 2 3 4 5; do
-      # ARB_ENV forces ASan on the re-run in ASan modes so an ASan-only failure
-      # reproduces (empty array in plain mode -> identical command). The re-run
-      # is by SUITE substring, deliberately unrestricted by any subset list — it
-      # may run a few MORE tests than were selected; harmless extra coverage.
-      if BEZEL_TEST_FILTER="$suite" "${ARB_ENV[@]}" timeout 180 build/tests/bezel_tests >/dev/null 2>&1; then passed_alone=1; break; fi
+      # The re-run is by SUITE substring, deliberately unrestricted by any
+      # subset list — it may run a few MORE tests than were selected; harmless
+      # extra coverage. See arb_run_suite() above for the per-area-binary
+      # semantics and the "ran nothing is NOT a pass" rule.
+      if arb_run_suite "$suite"; then passed_alone=1; break; fi
     done
     if [ "$passed_alone" -eq 1 ]; then
       echo "   FLAKY: $t — its suite PASSES alone within 5 tries (sharding pollution/timing, not a deterministic failure)"
@@ -305,12 +366,21 @@ PHASE_T0=$(now)
 rec_ran configure "$prc"
 [ "$prc" -ne 0 ] && { tail -15 "$S/gate_reconf.log"; fail "configure"; }
 
-echo "== gate[2/6]: build bezel_tests =="
+# `bezel_tests` is the AGGREGATE target over the per-area binaries
+# (tests/CMakeLists.txt) — the target name is unchanged, so this phase is too.
+echo "== gate[2/6]: build bezel_tests (all per-area binaries) =="
 PHASE_T0=$(now)
 "$DH" build cmake --build build --target bezel_tests -j16 >"$S/gate_build.log" 2>&1; prc=$?
 rec_ran build "$prc"
 [ "$prc" -ne 0 ] && { grep -iE 'error:|FAILED:' "$S/gate_build.log" | head -20; fail "build"; }
-echo "   binary: $(ls -la --time-style=+%H:%M:%S build/tests/bezel_tests | awk '{print $6}')"
+# A missing/empty manifest means the gate has no idea what to run — refuse
+# rather than silently sharding a subset of the suite.
+[ -s build/tests/test_binaries.txt ] || fail "build produced no test-binary manifest (build/tests/test_binaries.txt)"
+while IFS= read -r _b; do
+  [ -n "$_b" ] || continue
+  [ -x "$_b" ] || fail "build reported success but test binary $_b is missing"
+  echo "   binary: $(basename "$_b")  $(ls -la --time-style=+%H:%M:%S "$_b" | awk '{print $6}')"
+done < <(test_binaries)
 
 # Decide the ASan per-shard ceiling now that coldness is knowable (#2100; see
 # the SHARD_ENV note above). Cold predicate: core.a rebuilt this gate (k2
@@ -319,15 +389,39 @@ echo "   binary: $(ls -la --time-style=+%H:%M:%S build/tests/bezel_tests | awk '
 # cheap and uncapped). Explicit BEZEL_SHARD_TIMEOUT wins unconditionally.
 if [ "$ASAN" -eq 1 ]; then
   core_post=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo -1)
-  cache_n=$(find "${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}" -type f 2>/dev/null | wc -l)
+  GATE_CACHE_ROOT="${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}"
+  cache_n=$(find "$GATE_CACHE_ROOT" -type f 2>/dev/null | wc -l)
   GATE_COLD=0
   { [ "$core_post" != "$CORE_MTIME_PRE" ] || [ "$cache_n" -lt 2000 ]; } && GATE_COLD=1
+  # IDENTITY CHECK (2026-07-29). The mtime comparison above only asks "did THIS
+  # gate's build touch core.a", which is the wrong question. The AOT bincache
+  # keys on a hash of libbezel_core.a AND libbezel_runtime.a (the "k2 identity",
+  # tests/support/aot_support.hpp), so a RUNTIME-only change invalidates every
+  # entry while core.a's mtime is unchanged relative to this build — and a
+  # previous gate that timed out leaves the store full of entries under the OLD
+  # identity, so the raw count looks warm too. Both signals said "warm" for a
+  # fully cold tree on 2026-07-29: gates C and D were given the 900s ceiling for
+  # a ~2400s cold run and were killed at it, having completed ~37% of the suite.
+  #
+  # Record the identity the cache is actually populated FOR, next to the store,
+  # and refresh it only after a COMPLETED pass (see the write at the end) so a
+  # timed-out gate cannot mark a half-populated store as warm.
+  GATE_CACHE_ID=$(cat build/libbezel_core.a build/libbezel_runtime.a 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1)
+  GATE_CACHE_ID_FILE="$GATE_CACHE_ROOT/.gate-identity"
+  gate_id_note="match"
+  if [ -n "${GATE_CACHE_ID:-}" ]; then
+    if [ "$GATE_CACHE_ID" != "$(cat "$GATE_CACHE_ID_FILE" 2>/dev/null || echo none)" ]; then
+      GATE_COLD=1; gate_id_note="CHANGED (cache is cold for this tree)"
+    fi
+  else
+    gate_id_note="unavailable"
+  fi
   sto="$GATE_EXPLICIT_STO"
   if [ -z "$sto" ]; then sto=900; [ "$GATE_COLD" -eq 1 ] && sto=1800; fi
   SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
   core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebuilt"
   cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
-  echo "   ASan shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n)"
+  echo "   ASan shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n, identity $gate_id_note)"
 fi
 
 # lit + FileCheck diagnostic track (tests/lit/): drives the REAL bezelc over .bzl
@@ -453,7 +547,9 @@ rec_ran shard "$rc" "$SHARD_NOTE"
 # Harvest run_parallel's own aggregate wall + shard count + per-shard times (obs only).
 SHARD_COUNT=$(grep -oE 'across [0-9]+ shards' "$S/gate_shard.log" | grep -oE '[0-9]+' | tail -1); SHARD_COUNT=${SHARD_COUNT:-0}
 SHARD_REPORTED_S=$(grep -oE 'across [0-9]+ shards, [0-9]+s' "$S/gate_shard.log" | grep -oE '[0-9]+s' | tr -d 's' | tail -1); SHARD_REPORTED_S=${SHARD_REPORTED_S:-0}
-SHARD_TIMES=$(grep -oE '^shard [0-9]+: [0-9.]+s$' "$S/gate_shard.log" | sed -E 's/^shard [0-9]+: ([0-9.]+)s$/\1/' | paste -sd, -)
+# Shard labels are "<group>.<index>" since the per-area split (they used to be
+# a bare index); observation only, but keep the harvest working.
+SHARD_TIMES=$(grep -oE '^shard [A-Za-z0-9_]+\.[0-9]+: [0-9.]+s$' "$S/gate_shard.log" | sed -E 's/^.*: ([0-9.]+)s$/\1/' | paste -sd, -)
 grep -E 'TOTAL:|## GATE FAILURE|died on|--- failing' "$S/gate_shard.log" || true
 # ASan on (--full / GATE_FAST_ASAN=1): a fired generated-code sanitizer report is
 # DETERMINISTIC evidence of a memory error — fail hard here, independent of the
@@ -511,6 +607,23 @@ fi
 # mistake this for a full-suite validation.
 if [ "${rc:-0}" -ne 0 ] && [ "${COV_GTESTS:-0}" -eq 0 ]; then
   echo "== gate: WARNING — accepted via flake arbitration with NO completed gtest total (whole-suite timeout shape): only the arbitrated suspect suites were validated in THIS run =="
+fi
+
+# Record the cache identity this pass populated the bincache for, so the NEXT
+# gate can tell warm from cold (see the IDENTITY CHECK above). Best-effort —
+# never fails a gate that already passed.
+#
+# The condition is `rc == 0`, i.e. the sharded pass ran to COMPLETION — not
+# merely "a nonzero gtest total". A run killed at the shard ceiling still
+# reports whatever it finished, so a nonzero total does NOT mean the store was
+# fully populated: gate I on 2026-07-29 reported 5600 of 12775 (44%) and passed
+# via arbitration, and under the old condition would have marked a 44%-populated
+# store warm — re-creating, from the other direction, exactly the mis-prediction
+# this marker exists to prevent.
+if [ "${rc:-1}" -eq 0 ] && [ "${COV_GTESTS:-0}" -gt 0 ] && [ -n "${GATE_CACHE_ID:-}" ] && [ -n "${GATE_CACHE_ID_FILE:-}" ]; then
+  mkdir -p "$(dirname "$GATE_CACHE_ID_FILE")" 2>/dev/null && \
+    printf '%s\n' "$GATE_CACHE_ID" > "$GATE_CACHE_ID_FILE" 2>/dev/null && \
+    echo "== gate: recorded AOT cache identity for the next run's warm/cold prediction =="
 fi
 
 echo "== GATE PASS =="

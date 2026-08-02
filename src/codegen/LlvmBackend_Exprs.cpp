@@ -449,10 +449,43 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     }
                     }  // end if (!pv) — LLVM-type integer/pointer fallback
                     // For struct (record value): spill to alloca, call ToString.
-                    if (!pv && ev->getType()->isStructTy() && rt &&
-                        rt->kind == sema::TypeRef::Kind::Named &&
-                        rt->declaration) {
-                        auto* ts = rt->declaration;
+                    // #2503 (§35.7/§9.1/§9.2): `rt->declaration` is null for a
+                    // bare, unresolved generic type-parameter operand
+                    // (`val: T`) — resolve it via the active generic
+                    // substitution first, the SAME resolution
+                    // `emitValueToString`'s bare-T redirect uses
+                    // (LlvmBackend_String.cpp, the `genericSubstSemaTy_` block
+                    // just above its final fallback) and the bare-T redirect
+                    // `lowerCall` uses for a direct `.ToString()` call
+                    // (LlvmBackend_Calls2.cpp, the `isToString &&
+                    // recvTy->kind == Named && !recvTy->declaration` block) —
+                    // so a struct-typed T instantiated to a record/choice
+                    // dispatches by ITS rule here too, instead of being
+                    // silently DROPPED from the interpolated string. Before
+                    // this fix neither this block (gated on `rt->declaration`)
+                    // nor the LLVM-type-inference fallback just above (gated
+                    // on isPointerTy/isIntegerTy/isDoubleTy/isFloatTy — none
+                    // of which match a struct) matched a struct-typed bare-T
+                    // value, so `pv` stayed null and the `if (pv)
+                    // appendPart(...)` below never fired: the hole vanished
+                    // from the interpolated string entirely (not merely
+                    // rendered as "" — confirmed by tracing `$"{val}"` for
+                    // `val: T` bound to a Choice, LlvmBackend_Exprs.cpp, #2503).
+                    const sema::TypeRef* structRt = rt;
+                    if (structRt && structRt->kind == sema::TypeRef::Kind::Named &&
+                        !structRt->declaration && structRt->astNode &&
+                        structRt->astNode->name &&
+                        structRt->astNode->name->parts.size() == 1 &&
+                        !genericSubstSemaTy_.empty()) {
+                        auto sit = genericSubstSemaTy_.find(structRt->headName());
+                        if (sit != genericSubstSemaTy_.end() && sit->second &&
+                            sit->second->declaration)
+                            structRt = sit->second;
+                    }
+                    if (!pv && ev->getType()->isStructTy() && structRt &&
+                        structRt->kind == sema::TypeRef::Kind::Named &&
+                        structRt->declaration) {
+                        auto* ts = structRt->declaration;
                         sema::MethodSymbol* toStr = nullptr;
                         for (auto* cur = ts; cur && !toStr;) {
                             for (auto* sym : cur->members) {
@@ -489,6 +522,44 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                             // gets the synthesized `TypeName(Prop: value, ...)`
                             // form over its storage members.
                             pv = emitRecordToString(ev, ts);
+                        } else if (ts->kind == ast::TypeDeclKind::Choice &&
+                                   sema::isAutoEqualityBearingChoice(
+                                       ts, ctx_, structRt)) {
+                            // #2479 / §35.7: a choice-typed interpolation hole
+                            // with no user ToString override, auto-equality-
+                            // bearing, gets the synthesized `TypeName.CaseName
+                            // (field: value, ...)` form — the same
+                            // emitChoiceToString the direct `.ToString()` call
+                            // (lowerValueSemMethodOn) and emitValueToString
+                            // (nested-field formatting) now use. Before this
+                            // fix, interpolation had its OWN hand-rolled
+                            // dispatch here with no Choice case at all, so a
+                            // choice-typed hole silently fell to the generic
+                            // "no ToString → type name" `else` branch below —
+                            // `$"{c}"` rendered just `"Color"`, dropping the
+                            // active case entirely (a distinct gap from, and
+                            // found while regression-testing, #2479's own
+                            // bare-T-receiver scope).
+                            pv = emitChoiceToString(ev, ts);
+                        } else if (ts->kind == ast::TypeDeclKind::Choice) {
+                            // §35.7's open question (see lowerValueSemMethodOn's
+                            // Choice/ToString branch for the full citation):
+                            // no compiler-defined default exists for a choice
+                            // that is not auto-equality-bearing. Diagnose
+                            // rather than silently rendering the misleading
+                            // bare type name (indistinguishable from a real
+                            // implemented default) or crashing.
+                            ctx_.diagnostics().report(
+                                Severity::Error, part.expr->span.begin,
+                                "member `ToString` on a choice that is not "
+                                "auto-equality-bearing (borrow-bearing, "
+                                "owning, or a value-like choice with an "
+                                "inadmissible payload, language spec "
+                                "\xC2\xA7""35.7) has no compiler-defined "
+                                "default; declare a plain `ToString(): "
+                                "string` member to replace it (\xC2\xA7"
+                                "10.5's choice model) (tracked #2479)");
+                            pv = llvm::PoisonValue::get(ptrTy());
                         } else {
                             // No ToString — use type name (§8.5).
                             pv = lowerStringLiteral(
@@ -2154,6 +2225,11 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                 std::string_view n = tt->headName();
                 if (n == "StringBuilder") return false;  // has own handler
                 if (n == "Buffer") return false;          // issue #545: own handler
+                // stdlib §7.2 (#645): FileStream has its own `.Length` handler
+                // (bz_filestream_length). The string fallback's loadStringLen
+                // would read field[1] of the bz_filestream_t — the stored `path`
+                // POINTER — and hand it back as the file's length.
+                if (n == "FileStream") return false;
                 // #1006(b): an array-backed collection (`Array<T>` etc.) has its
                 // own `.Length` handler below (bz_array_len) that also reclaims an
                 // UNBOUND owned borrowing-array receiver (`P.Fold(s).Length`). Do
@@ -2216,6 +2292,35 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
                     // Returns TimeSpan (i64, 100-ns ticks).
                     auto* fn = declareC("bz_stopwatch_elapsed_ticks", i64(), {ptrTy()});
                     return builder_.CreateCall(fn, {sw}, "sw.el");
+                }
+            }
+            // stdlib §7.1/§7.2 / issue #645: FileStream instance property reads.
+            // Receiver is a bz_filestream_t* (heap pointer).
+            if (cn == "FileStream") {
+                llvm::Value* fs = lowerExpr(*ma->target);
+                if (!fs) return nullptr;
+                // §7.2: Path → a FRESH +1 bz.string (the same producer shape as
+                // File.ReadAllText), so the reader owns the reference it gets.
+                if (ma->member == "Path") {
+                    auto* fn = declareC("bz_filestream_path", ptrTy(), {ptrTy()});
+                    return builder_.CreateCall(fn, {fs}, "fs.path");
+                }
+                if (ma->member == "Length") {
+                    auto* fn = declareC("bz_filestream_length", i64(), {ptrTy()});
+                    return builder_.CreateCall(fn, {fs}, "fs.len");
+                }
+                if (ma->member == "Position") {
+                    auto* fn = declareC("bz_filestream_position", i64(), {ptrTy()});
+                    return builder_.CreateCall(fn, {fs}, "fs.pos");
+                }
+                if (ma->member == "CanRead" || ma->member == "CanWrite" ||
+                    ma->member == "CanSeek") {
+                    const char* rt = ma->member == "CanRead"  ? "bz_filestream_can_read"
+                                   : ma->member == "CanWrite" ? "bz_filestream_can_write"
+                                                              : "bz_filestream_can_seek";
+                    auto* fn = declareC(rt, i32(), {ptrTy()});
+                    llvm::Value* flag = builder_.CreateCall(fn, {fs}, "fs.can");
+                    return builder_.CreateICmpNE(flag, builder_.getInt32(0), "fs.can.b");
                 }
             }
             // §6.4 / issue #647: Atomic<T> and AtomicInteger<T> — Value getter.
@@ -4246,7 +4351,7 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             emitPendingCheck();
             return res;
         }
-        // §2.5 / §22.9 (issue #503): imported non-virtual property getter.
+        // §2.5 / §23 (issue #503): imported non-virtual property getter.
         // computedGetterOf and blockGetterOf both returned null because the
         // imported PropertySymbol has no ast::PropertyDecl. Call the external
         // getter function `bz$<Class>$<Prop>$propget` declared by
@@ -4256,6 +4361,66 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
             auto git = importedPropGetterFns_.find(ps);
             if (git != importedPropGetterFns_.end() && ma->target) {
                 llvm::Value* obj = lowerExpr(*ma->target);
+                // fix #2474 (§9.2/§23.1/§23.2, v0.235): issue #347's own rationale
+                // applies here exactly as it does to the LOCAL computed-getter
+                // path above (~L4122-4156) and the block-getter path above
+                // that (~L4257-4267) — a RECORD receiver lowers to a by-value
+                // struct, not a heap pointer, but declareImportedPropertyGetters
+                // unconditionally declares the external stub as `T get(ptr
+                // %this)` (LlvmBackend_Setup.cpp declareImportedPropertyGetters,
+                // `{ptrTy()}`). Pre-fix, a non-pointer `obj` (any record
+                // receiver) failed `isPointerTy()` and fell through this whole
+                // `if`, past CG8's field-read fallback (which does not resolve
+                // a PropertySymbol either), out of lowerExpr entirely as a bare
+                // `nullptr` — a silent, contextless failure: `return r.Getter;`
+                // alone degraded to a bare 0 with no diagnostic, `var g :=
+                // r.Getter;` hit lowerLocalDecl's #2434 zero-init backstop
+                // (loud, but still 0), and `r.x + r.Getter` returned nullptr
+                // from lowerBinary's `if (!l || !r) return nullptr;` (line
+                // ~5537) — discarding r.x's already-correctly-lowered value
+                // too, not just the failing operand. Spill the record value to
+                // a stack slot and pass that slot's address as `this`,
+                // mirroring the sibling paths exactly.
+                //
+                // Guard the spill to AGGREGATE receivers only (mirroring the
+                // LOCAL computed-getter path's own `isAggregateType() &&
+                // !isEnumReceiver` condition exactly, not just its
+                // `isPointerTy()` half) — an ENUM receiver lowers to a bare
+                // scalar `i32`, never a struct, so it is not this fix's
+                // concern. Review caught an over-broad first draft here that
+                // guarded on `!isPointerTy()` alone: `declareImportedProperty
+                // Getters` (LlvmBackend_Setup.cpp) declares the external
+                // stub for EVERY imported PropertySymbol with no kind filter,
+                // including an enum's expression-bodied property (§10.4
+                // permits one), so an unconditional spill made THAT call fire
+                // too — but this fix's exporter-side half (
+                // emitExportedPropertyGetters) only widened its gate to
+                // `Class || Record`, not `Enum`, so the stub the call now
+                // reached had no definition anywhere. Confirmed mechanically:
+                // the over-broad draft turned a program that compiles and
+                // links TODAY (silently reading the documented `0` degrade,
+                // exactly like the record case pre-fix) into a hard
+                // `undefined reference` LINK ERROR — strictly worse than the
+                // preexisting silent-wrong-value gap it did not intend to
+                // touch. Restricting the spill to aggregates restores the
+                // exact preexisting (still-silently-wrong, still out of this
+                // record-scoped issue's scope) enum behavior. Filed as its
+                // own issue rather than fixed here or by widening layer 1 to
+                // `Enum` — that would additionally require confirming
+                // ensurePropertyAccessorFn's enum `this` handling is correct
+                // when reached through this NEW external-stub calling
+                // convention (today only exercised, if at all, through
+                // itable dispatch, a different call shape), which is exactly
+                // the kind of "one more layer" scope creep #2474 (a
+                // RECORD-scoped issue) should not silently absorb.
+                bool isEnumReceiver = ps->parent &&
+                                      ps->parent->kind == ast::TypeDeclKind::Enum;
+                if (obj && !obj->getType()->isPointerTy() &&
+                    obj->getType()->isAggregateType() && !isEnumReceiver) {
+                    llvm::AllocaInst* tmp = entryAlloca(obj->getType());
+                    builder_.CreateStore(obj, tmp);
+                    obj = tmp;
+                }
                 if (obj && obj->getType()->isPointerTy()) {
                     llvm::Value* res = builder_.CreateCall(
                         git->second->getFunctionType(), git->second, {obj});
@@ -4283,29 +4448,47 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // {K, V} struct (laid down by lowerDictEntryFor); field 0 is Key,
         // field 1 is Value. DictionaryEntry has no user TypeSymbol, so
         // fieldAddr cannot locate its fields — intercept here first.
+        // #2471 (stdlib §4.8/§4.12; language spec §29.1, v0.236): the target
+        // need not be a loop-variable local — it may be a TEMPORARY value like
+        // `e.Current` (the result of an explicit `.GetEnumerator()` call on a
+        // Dictionary<K,V>, dispatched via IEnumerator<DictionaryEntry<K,V>>
+        // slot 3) or any other DictionaryEntry-producing expression. Spill a
+        // non-local target to a fresh alloca before GEP-ing into the field,
+        // so the same field-access path serves both `for var entry in dict`
+        // (entry is a local) and `e.Current.Value` (e.Current is a temporary).
         if (ma->target && (ma->member == "Key" || ma->member == "Value")) {
             if (auto* tt = ctx_.exprType(*ma->target)) {
                 if (tt->kind == sema::TypeRef::Kind::Named &&
                     !tt->declaration &&
                     tt->importedName == "DictionaryEntry" &&
                     tt->genericArgs.size() >= 2) {
-                    // The target must be a local whose alloca holds the
-                    // {K,V} struct written by lowerDictEntryFor.
+                    // The entry alloca type is a 2-element struct {K, V}.
+                    llvm::Type* kTy = lowerTypeRef(tt->genericArgs[0]);
+                    llvm::Type* vTy = lowerTypeRef(tt->genericArgs[1]);
+                    llvm::StructType* entryStTy =
+                        llvm::StructType::get(llvm_, {kTy, vTy});
+                    unsigned fi = ma->member == "Key" ? 0 : 1;
+                    // Prefer an existing local alloca (the loop-variable case)
+                    // — its storage already holds the {K,V} struct. Otherwise
+                    // lower the target expression to its value and spill it to
+                    // a fresh alloca so CreateStructGEP has an addressable
+                    // slot (LLVM GEP needs a pointer; a struct SSA value must
+                    // be spilled first).
                     if (llvm::AllocaInst* slot = localSlot(*ma->target)) {
-                        unsigned fi = ma->member == "Key" ? 0 : 1;
-                        sema::TypeRef* fieldTy = tt->genericArgs[fi];
-                        llvm::Type* llvmFTy = fieldTy ? lowerTypeRef(fieldTy)
-                                                       : ptrTy();
-                        // The entry alloca type is a 2-element struct {K, V}.
-                        llvm::Type* kTy = lowerTypeRef(tt->genericArgs[0]);
-                        llvm::Type* vTy = lowerTypeRef(tt->genericArgs[1]);
-                        llvm::StructType* entryStTy =
-                            llvm::StructType::get(llvm_, {kTy, vTy});
                         llvm::Value* fieldPtr = builder_.CreateStructGEP(
                             entryStTy, slot, fi, "de.fld");
-                        (void)llvmFTy;
                         return builder_.CreateLoad(
                             entryStTy->getElementType(fi), fieldPtr, "de.load");
+                    } else if (llvm::Value* v = lowerExpr(*ma->target)) {
+                        if (v->getType()->isStructTy()) {
+                            llvm::AllocaInst* tmp = entryAlloca(entryStTy);
+                            builder_.CreateStore(v, tmp);
+                            llvm::Value* fieldPtr = builder_.CreateStructGEP(
+                                entryStTy, tmp, fi, "de.fld");
+                            return builder_.CreateLoad(
+                                entryStTy->getElementType(fi), fieldPtr,
+                                "de.load");
+                        }
                     }
                 }
                 // #628 / stdlib §4.9 v0.135: `e.Key` / `e.Value` on a
@@ -4349,16 +4532,119 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // fields have no instance slot, so fieldAddr misses; read the
         // backing global directly.
         if (llvm::GlobalVariable* gv = staticFieldGlobal(e)) {
-            // #720 / §22.13: lazily initialize the owning type on first use.
-            if (auto* sym = ctx_.exprSymbol(e)) {
+            // #720 / §22.13 / #1513: lazily initialize the owning type — or,
+            // for a generic instantiation's per-instantiation global, the
+            // SHARED cross-module instantiation state (§2.8.3 rule 4) — on
+            // first use.
+            if (auto giIt = genericInstGlobalKeyOf_.find(gv);
+                giIt != genericInstGlobalKeyOf_.end()) {
+                emitEnsureGenericInstStaticInit(giIt->second);
+            } else if (auto* sym = ctx_.exprSymbol(e)) {
                 emitEnsureStaticInit(memberOwner(sym));
+            }
+            if (auto* sym = ctx_.exprSymbol(e)) {
                 // #1553 / §22.13 (v0.181): a re-entrant read, on the owner thread,
                 // of a static this type's in-progress initializer has not assigned
                 // yet raises the cycle backstop rather than observing partial state.
+                // (No-op for a generic-instantiation field: initProgressGV_ has no
+                // entry for a generic TypeSymbol, matching pre-#1513 behavior.)
                 if (auto* fsym = dynamic_cast<const sema::FieldSymbol*>(sym))
                     emitStaticPartialReadGuard(memberOwner(sym), fsym);
             }
             return builder_.CreateLoad(gv->getValueType(), gv);
+        }
+        // fix #2547 (sibling of #2477): the third #605 / generic-new(T) silent-
+        // zero family shape — a bare MemberAccessExpr read `obj.f` (no parens,
+        // not a CallExpr callee) on a concrete-type receiver. The #2477 fix
+        // added the specific diagnostic at lowerCall's `if (!ms)` fall-through
+        // and at lowerNew's genericSubstSemaTy_ substitution; the CG8 field-read
+        // path was not covered. By the time control reaches this point both
+        // fieldAddr and staticFieldGlobal have returned null (no instance slot
+        // and no backing global), so the only prior signal was the generic
+        // #2434 internal warning emitted by lowerLocalDecl's zero-init fallback
+        // — which named the slot but not the member or the receiver type, so
+        // the slot-degraded-to-zero case was silently wrong. The SPECIFIC
+        // complement that names the member and the receiver type is added here.
+        // Gated on !hasErrors() to mirror the lowerCall / lowerNew guards
+        // (same message-quality rationale: don't stack this on top of an
+        // already-diagnosed shape). The pre-existing #2434 generic warning
+        // remains unchanged for the existing control test
+        // `tests/lit/local_decl_zero_init_fallback_warns_2434.bzl`.
+        //
+        // §27.6 carve-out: a bare MemberAccessExpr whose sema symbol is a
+        // MethodSymbol (a method reference like `a.GetVal` assigned to a
+        // function-typed local) is NOT a fall-through — CG60 below
+        // (`Class.StaticMethod` / `obj.InstanceMethod` used as a value)
+        // builds the closure struct. Without this carve-out, the canonical
+        // §27.6 idiom falsely trips the #2547 warning on the first reading.
+        // §27.6 (v0.184, #1758) carve-out: same goes for a primitive-
+        // intrinsic static-method reference (`int.Parse`, `char.IsDigit`,
+        // …) handled by the `isPrimIntrinsicMethodRef` branch immediately
+        // below — these have no MethodSymbol (intrinsics are name-recognized)
+        // and would otherwise fall through to CG8's nullptr return, falsely
+        // tripping this diagnostic on a legitimate method-reference read.
+        if (!ctx_.diagnostics().hasErrors() &&
+            !dynamic_cast<const sema::MethodSymbol*>(ctx_.exprSymbol(e)) &&
+            !isPrimIntrinsicMethodRef(&e)) {
+            const sema::TypeRef* recvTy = ma->target
+                ? ctx_.exprType(*ma->target) : nullptr;
+            using K = sema::TypeRef::Kind;
+            using P = sema::PrimitiveType;
+            // Shape 1: receiver is a concrete type whose declared member set
+            // is known to the type system (Named + declaration, or a primitive)
+            // — the silent-zero degradation is observable here. Object is
+            // included because Object has no documented members beyond the
+            // universal 5; an unknown member on Object is exactly the §3 /
+            // #605 case the lowerCall diagnostic also handles (with parens).
+            bool isConcreteType = recvTy && (
+                (recvTy->kind == K::Named && recvTy->declaration) ||
+                (recvTy->kind == K::Primitive &&
+                 recvTy->primitive != P::None));
+            // The universal Object surface (ToString/GetHashCode/Equals/
+            // GetType/Dispose) is always present on a value even when the
+            // static type is opaque. Anything else on a concrete type is
+            // genuinely undefined.
+            bool isUniversalObjMember =
+                ma->member == "ToString" ||
+                ma->member == "GetHashCode" ||
+                ma->member == "Equals" ||
+                ma->member == "GetType" ||
+                ma->member == "Dispose";
+            // Shape 2: bare type parameter in the dead template body (no
+            // monomorphization binding for this type parameter) — the
+            // abstract-generic-body form per #2477's analysis. Mirrors the
+            // lowerCall guard.
+            bool isBareTypeParamInDeadTemplate =
+                emittingGenericTemplateBody_ &&
+                recvTy && recvTy->kind == K::Named &&
+                !recvTy->declaration && recvTy->astNode &&
+                recvTy->astNode->name &&
+                !recvTy->astNode->name->parts.empty() &&
+                templateGenericParamNames_.count(
+                    recvTy->astNode->name->parts.back());
+            if (isConcreteType ? !isUniversalObjMember
+                                : isBareTypeParamInDeadTemplate) {
+                std::string recvName;
+                if (recvTy->kind == K::Primitive &&
+                    recvTy->astNode && recvTy->astNode->name &&
+                    !recvTy->astNode->name->parts.empty()) {
+                    recvName = std::string(
+                        recvTy->astNode->name->parts.back());
+                } else if (recvTy->declaration) {
+                    recvName = recvTy->declaration->name;
+                } else {
+                    recvName = std::string(recvTy->headName());
+                }
+                ctx_.diagnostics().report(
+                    Severity::Warning, ma->span.begin,
+                    "internal: codegen cannot read member '" +
+                    std::string(ma->member) + "' on receiver of type '" +
+                    recvName + "': permissive acceptance (spec §3 / "
+                    "issue #605) admits this site but no concrete "
+                    "member dispatch exists (CG8's fall-through "
+                    "degrades the slot to zero via lowerLocalDecl's "
+                    "initializer-failed fallback — #2547)");
+            }
         }
     }
     if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
@@ -4402,12 +4688,22 @@ llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
         // CG12: a bare identifier resolving to a static field reads
         // its backing global.
         if (llvm::GlobalVariable* gv = staticFieldGlobal(e)) {
-            // #720 / §22.13: lazily initialize the owning type on first use.
-            if (auto* sym = ctx_.exprSymbol(e)) {
+            // #720 / §22.13 / #1513: lazily initialize the owning type — or,
+            // for a generic instantiation's per-instantiation global, the
+            // SHARED cross-module instantiation state (§2.8.3 rule 4) — on
+            // first use.
+            if (auto giIt = genericInstGlobalKeyOf_.find(gv);
+                giIt != genericInstGlobalKeyOf_.end()) {
+                emitEnsureGenericInstStaticInit(giIt->second);
+            } else if (auto* sym = ctx_.exprSymbol(e)) {
                 emitEnsureStaticInit(memberOwner(sym));
+            }
+            if (auto* sym = ctx_.exprSymbol(e)) {
                 // #1553 / §22.13 (v0.181): a re-entrant read, on the owner thread,
                 // of a static this type's in-progress initializer has not assigned
                 // yet raises the cycle backstop rather than observing partial state.
+                // (No-op for a generic-instantiation field: initProgressGV_ has no
+                // entry for a generic TypeSymbol, matching pre-#1513 behavior.)
                 if (auto* fsym = dynamic_cast<const sema::FieldSymbol*>(sym))
                     emitStaticPartialReadGuard(memberOwner(sym), fsym);
             }
@@ -4697,7 +4993,8 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
 // #481: dynamic dispatch of a virtual/interface property SETTER for
 // `obj.P := v`, with the already-lowered value `v`. Mirrors the getter dispatch
 // above; the call is `void set(ptr this, T value)`.
-bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v) {
+bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
+                                      const ast::Expr* valueExpr) {
     if (!v) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target);
     if (!ma || !ma->target) return false;
@@ -4714,8 +5011,22 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v) {
     if (isIfaceProp && ifSetIt == ifacePropertySetIndex_.end()) return false;
 
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
-    if (!pd) return false;
-    llvm::Type* valTy = lowerType(pd->type.get());
+    // fix #2406 (§2.5 / §22.9 / §12.1, mirroring lowerVirtualPropertyGet's
+    // #503 fallback above): for an IMPORTED interface's own read-write
+    // PropertySymbol, ps->decl is null (no ast::PropertyDecl in the
+    // importer). propertyHasSetter's #2406 companion fix now reserves an
+    // itable setter slot for such a property (ifacePropertySetIndex_
+    // contains it, so the `!isIfaceProp && ...` guard above admits us here),
+    // so this function must be able to derive the value type without `pd`
+    // too, instead of bailing out — the value type rides the
+    // importedMemberType side table, exactly like the getter already reads.
+    llvm::Type* valTy = nullptr;
+    if (pd) {
+        valTy = lowerType(pd->type.get());
+    } else {
+        if (sema::TypeRef* tr = ctx_.importedMemberType(ps))
+            valTy = lowerTypeRef(tr);
+    }
     if (!valTy) valTy = i32();
     auto* fnTy = llvm::FunctionType::get(
         llvm::Type::getVoidTy(llvm_), {ptrTy(), valTy}, false);
@@ -4723,8 +5034,19 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v) {
     llvm::Value* recv = lowerExpr(*ma->target);
     if (!recv || !recv->getType()->isPointerTy()) return false;
     v = coerceNumericToType(v, valTy, isUnsignedTargetExpr(target));
+    // fix #2500 (§8.6/§23.3/§28.9, v0.236): virtual/interface-dispatch twin of
+    // lowerImportedPropertySetValue's boxing — an Object/interface property's
+    // setter slot expects a `ptr` (box) value parameter, but a value-typed RHS
+    // arrived bare; box it first. boxForTarget no-ops for a reference source
+    // and for a null valueExpr. Without this the itable/vtable setter call
+    // passed i32 where ptr is required and IR verification rejected the module.
+    v = boxForTarget(v, ctx_.exprType(target), valueExpr);
 
     llvm::Value* fnPtr = nullptr;
+    // fix #2506: retained across the dispatch so the post-call release can
+    // read the trailing owner-kind flag (class-backed vs box/record-backed) —
+    // see the release block below.
+    llvm::Value* itabForFlag = nullptr;
     if (isIfaceProp) {
         llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
         auto* lookupFn = declareC("bz_itable_lookup", ptrTy(),
@@ -4737,6 +5059,7 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v) {
         llvm::Value* itab = builder_.CreateCall(
             llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
             lookupFn, {itmapPtr, descIt->second}, "itab");
+        itabForFlag = itab;
         unsigned k = ifSetIt->second;
         fnPtr = builder_.CreateLoad(
             ptrTy(),
@@ -4749,6 +5072,147 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v) {
     }
     builder_.CreateCall(fnTy, fnPtr, {recv, v});
     emitPendingCheck();
+    // fix #2490/#2500/#2506 (§23.3/§4.6/§27.5/§28.9, v0.236): the virtual/
+    // interface-dispatch twin of lowerImportedPropertySetValue's ARGUMENT-PASS
+    // release — see that function's comment for the full rationale. The callee
+    // (ensurePropertyAccessorFn) retains its incoming `value` ONLY for a
+    // CLASS-owned property (§9/§9.7 — a RECORD's auto-property backing field
+    // is a borrow with no independent +1 and no disposer, so its setter keeps
+    // the plain store); a +1 producer passed directly as the value then holds
+    // an independent, doubled reference nothing else releases, and must be
+    // released HERE to balance the class setter's retain. A bare borrow (a
+    // named local/field) is unaffected either way.
+    //
+    // The release must fire ONLY when the concrete setter actually retained:
+    //   * `!isIfaceProp` — a class's own vtable-slot virtual/override
+    //     property. `ps->parent` IS reliably the declaring CLASS (records
+    //     cannot enter a vtable hierarchy at all: "A record cannot derive
+    //     from another record or from a class", §9), so the callee is
+    //     guaranteed to be the CLASS-gated retaining setter → unconditional.
+    //   * `isIfaceProp` — itable dispatch. `ps->parent` is always the
+    //     Interface, which carries no information about the CONCRETE runtime
+    //     receiver, which per §11 may be a class instance OR a boxed record.
+    //     fix #2506 added a trailing owner-kind flag word to every class and
+    //     record itable (non-null = class-backed retaining setter, null =
+    //     box/record plain-store setter) baked in by the concrete type's OWN
+    //     module, so the flag travels inside the itable bytes and is sound to
+    //     read cross-module regardless of vtable/descriptor linkage. Release
+    //     ONLY on the class-backed path; the box/record path skips (releasing
+    //     a producer the record's plain-store setter never retained drops the
+    //     field's only reference → UAF, the live failure #2490's adversarial
+    //     pass found for the direct-set record case). If the interface's flag
+    //     index is somehow unavailable, stay conservative and skip (leak-
+    //     over-UAF, the safe direction).
+    auto emitProducerRelease = [&] {
+        if (valueExpr && isPlusOneStringProducer(valueExpr))
+            emitStringRelease(v);
+        else if (valueExpr && (isPlusOneClosureProducer(valueExpr) ||
+                               isUserMethodClosureReturnCall(valueExpr)))
+            emitClosureRelease(v);
+        else if (valueExpr && v->getType()->isPointerTy()) {
+            // fix #2500 (§23.3/§28.9, v0.236): the box twin of the string/
+            // closure release above — same isProducer predicate as
+            // lowerBoxFieldStore / lowerImportedPropertySetValue. See those
+            // functions' comments for the full rationale. Gated on the TARGET
+            // being Object/interface (and v a ptr): a value-typed property's
+            // source may be boxable in isolation but is not boxed here.
+            const sema::TypeRef* tgtTy = ctx_.exprType(target);
+            if (tgtTy && isObjectOrInterfaceTarget(tgtTy)) {
+                const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+                if ((srcTy && (isBoxableValueType(srcTy) ||
+                               isNullableValueTy(srcTy))) ||
+                    isUserMethodBoxReturnCall(valueExpr))
+                    emitBoxRelease(v);
+            }
+        }
+    };
+    // fix #2535 (§23.3/§28.9/§11, v0.236): the NAMED-LOCAL twin of
+    // emitProducerRelease, pairing with the StringEscapeWalker's #2535
+    // AssignmentStmt relaxation (LlvmBackend_Setup.cpp ~14604 — the
+    // class-or-interface property-SET safe-read gate, closed in this
+    // commit). The walker now treats `iref.Name := s;` as a CALL-BOUNDED
+    // BORROW when `s` is the tracked local, arming its scope-end release.
+    // That release needs a paired +1 on the heap it can drop without
+    // danging any other reference — the setter provides it on the CLASS-
+    // backed path (setter retains → field has +1, local keeps its +1,
+    // scope-end release drops the local's, sound); on the RECORD-backed
+    // path the setter keeps the PLAIN STORE (§9/§9.7 — a boxed record's
+    // reference fields are borrows with no disposer), so the field ALIASES
+    // the local's only reference and the scope-end release would free the
+    // field's only ref → UAF. Mint that extra +1 here, on the record path
+    // ONLY, so the scope-end release has a balanced +1 to drop. Restricted
+    // to the NAMED LOCAL case (an IdentifierExpr whose LocalSymbol's decl
+    // is in stringReleaseEligible_ / stringBorrowRetainEligible_ — the
+    // SAME sets that the walker uses to decide whether to arm the scope-
+    // end release) so a producer-temporary RHS (whose only release is
+    // emitProducerRelease above on the class path) doesn't get a phantom
+    // retain — that would leave a stranded +1 on the heap (heap rc+1,
+    // field rc-1 at disposal, heap rc=1, leak; emitStringRetain/release
+    // are null-safe but the +1 still has no owner). Mirrors #2506's
+    // producer-release gating: a runtime owner-kind flag read from the
+    // itable's trailing word (ifaceItabSlotCount_[iface]) selects class-
+    // backed (release the producer, no extra retain) vs record-backed
+    // (skip the producer release, mint the named-local retain). On the
+    // class-vtable path (`!isIfaceProp`) no such retain is needed: the
+    // setter's own retain is unconditional for the class-gated branch
+    // (lowerImportedPropertySetValue's `classOwned` gate, mirrored by
+    // ensurePropertyAccessorFn's class-gated retain — a vtable slot is
+    // always a class's own slot, never a record's, so the class-retain
+    // invariant holds soundly and the scope-end release is balanced
+    // without help).
+    auto isTrackedStringLocalForRelease = [&](const ast::Expr* e) -> bool {
+        if (!e || currentFn_ != stringReleaseEligibleFn_) return false;
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return false;
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+        if (!loc || !loc->decl) return false;
+        const void* declNode = static_cast<const void*>(loc->decl);
+        return stringReleaseEligible_.count(declNode) ||
+               stringBorrowRetainEligible_.count(declNode);
+    };
+    bool ifaceNamedLocalEligible =
+        isIfaceProp && valueExpr && v && v->getType()->isPointerTy() &&
+        isTrackedStringLocalForRelease(valueExpr);
+    if (!isIfaceProp) {
+        emitProducerRelease();
+    } else if (itabForFlag) {
+        auto cntIt = ifaceItabSlotCount_.find(ps->parent);
+        if (cntIt != ifaceItabSlotCount_.end()) {
+            llvm::Value* flagAddr = builder_.CreateGEP(
+                ptrTy(), itabForFlag,
+                {builder_.getInt32(cntIt->second)}, "pset.flagaddr");
+            llvm::Value* flag = builder_.CreateLoad(
+                ptrTy(), flagAddr, "pset.flagval");
+            llvm::Value* isClassBacked = builder_.CreateICmpNE(
+                flag, llvm::ConstantPointerNull::get(ptrTy()),
+                "pset.isclass");
+            llvm::BasicBlock* curBB = builder_.GetInsertBlock();
+            llvm::Function* fn = curBB->getParent();
+            llvm::BasicBlock* classBB =
+                llvm::BasicBlock::Create(llvm_, "pset.class", fn);
+            llvm::BasicBlock* recordBB =
+                llvm::BasicBlock::Create(llvm_, "pset.record", fn);
+            llvm::BasicBlock* doneBB =
+                llvm::BasicBlock::Create(llvm_, "pset.done", fn);
+            builder_.CreateCondBr(isClassBacked, classBB, recordBB);
+            // CLASS-backed branch: setter retained → producer release (if RHS
+            // is a producer) balances it; no extra retain needed (the class
+            // setter's retain is the field's +1; scope-end release on the
+            // local drops the local's +1; both +1's are accounted for).
+            builder_.SetInsertPoint(classBB);
+            emitProducerRelease();
+            builder_.CreateBr(doneBB);
+            // RECORD-backed branch: setter plain-stored → skip producer
+            // release (would UAF the field's only ref). For a tracked-string
+            // NAMED LOCAL RHS, mint the extra +1 here so the walker's
+            // scope-end release on the local has a balanced +1 to drop.
+            builder_.SetInsertPoint(recordBB);
+            if (ifaceNamedLocalEligible)
+                emitStringRetain(v);
+            builder_.CreateBr(doneBB);
+            builder_.SetInsertPoint(doneBB);
+        }
+    }
     return true;
 }
 
@@ -5468,6 +5932,55 @@ llvm::Value* Emitter::lowerBinary(const ast::BinaryExpr& bin) {
     llvm::Value* r = lowerExpr(*bin.right);
     if (!l || !r) return nullptr;
     const auto& op = bin.op;
+    // fix #2497 / §8.3 / §9.2 / §35.2: `this` (or `base`) inside a record/
+    // choice instance method is lowered as a POINTER to the receiver storage
+    // (CG9 — "this is the receiver ptr"; §35.2 — "this in a choice instance
+    // method is a borrow of the receiver value"; the record analog is the
+    // same receiver-ptr convention, #575/§9.5's lowerWith documents it too).
+    // When such a bare-`this` operand is compared against a same-typed
+    // by-value operand with `=`/`<>`, the `this` operand is a pointer while
+    // the other side is a struct value — the struct-equality dispatch below
+    // keys on isStructTy() and would skip it, falling through to a raw
+    // ICmpEQ over mismatched operand types (ptr vs struct) and aborting in
+    // the IR verifier (LLVM ICmpInst::AssertOK operand-type-mismatch). Load
+    // the receiver struct through the pointer so both operands are
+    // struct-typed and the record/choice auto-equality dispatch proceeds —
+    // the same load `this with {…}` already does (#575, §9.5). This block
+    // runs only for the AUTO-equality path: a user-declared `operator =`/
+    // `<>` is intercepted earlier (the `opm` block above) and never reaches
+    // here. The other operand must be a bare (non-nullable) record/choice:
+    // its lowered struct matches the receiver storage shape exactly, and a
+    // nullable value-typed operand lowers to a different {i8, T} wrapper
+    // shape than the bare receiver (sema rejects or lifts that mix before
+    // codegen, so this guard must not fire for it).
+    if (op == "=" || op == "<>") {
+        auto isThisIdent = [](const ast::Expr* e) -> bool {
+            if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e))
+                return id->name == "this" || id->name == "base";
+            return false;
+        };
+        auto bareRecordOrChoiceStructTy = [&](const ast::Expr* other,
+                                              llvm::Value* thisVal,
+                                              llvm::Value* otherVal) -> llvm::Type* {
+            if (!other || !thisVal || !otherVal) return nullptr;
+            if (!thisVal->getType()->isPointerTy()) return nullptr;
+            llvm::Type* ot = otherVal->getType();
+            if (!ot->isStructTy()) return nullptr;
+            const sema::TypeRef* t = ctx_.exprType(*other);
+            if (!t || t->nullable) return nullptr;
+            if (t->kind != sema::TypeRef::Kind::Named || !t->declaration) return nullptr;
+            if (t->declaration->kind != ast::TypeDeclKind::Record &&
+                t->declaration->kind != ast::TypeDeclKind::Choice) return nullptr;
+            return ot;
+        };
+        if (isThisIdent(bin.left.get())) {
+            if (llvm::Type* st = bareRecordOrChoiceStructTy(bin.right.get(), l, r))
+                l = builder_.CreateLoad(st, l, "this.val");
+        } else if (isThisIdent(bin.right.get())) {
+            if (llvm::Type* st = bareRecordOrChoiceStructTy(bin.left.get(), r, l))
+                r = builder_.CreateLoad(st, r, "this.val");
+        }
+    }
     // §7.11 Lifted operators — nullable value types (int?, long?, double?,
     // bool?, …). When either operand is a nullable value type:
     //   - Arithmetic / bitwise / shift: result is T? (null when EITHER operand

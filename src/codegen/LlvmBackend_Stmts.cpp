@@ -179,6 +179,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // has no user PropertyDecl and the fallthrough would silently drop
             // the write.
             if (tryLowerAtomicValueSet(*as)) return false;
+            // stdlib §7.1 / #645: `fs.Position := n` — the one SETTABLE
+            // FileStream property (`public abstract property Position: long;`
+            // — Length and the Can* trio are `readonly`). Same reason as
+            // Atomic<T>.Value directly above: FileStream has no user
+            // PropertyDecl, so the fallthrough would silently drop the write.
+            if (tryLowerFileStreamPositionSet(*as)) return false;
             // §22.9: `obj.P := v` / `obj.P OP= v` where P is a block-form
             // property runs its setter body (with `value` = v); compound
             // assignment is a read-modify-write through getter + setter.
@@ -195,11 +201,28 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         (propSetSlot_.count(tps) ||
                          ifacePropertySetIndex_.count(tps))) {
                         llvm::Value* rhsV = lowerExpr(*as->value);
-                        if (lowerVirtualPropertySet(*as->target, rhsV))
+                        // fix #2490: thread the RHS expr through so a
+                        // directly-passed +1 producer gets its ARGUMENT-PASS
+                        // release (see lowerVirtualPropertySet's comment).
+                        if (lowerVirtualPropertySet(*as->target, rhsV,
+                                                    as->value.get()))
                             return false;
                     }
                 }
                 if (lowerPropertySet(*as->target, *as->value))
+                    return false;
+                // fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): a
+                // DIRECT cross-module set of a plain (non-virtual,
+                // non-interface) imported property — `importedObj.Prop := v`.
+                // lowerPropertySet just failed because the imported
+                // PropertySymbol has no ast::PropertyDecl (computedSetterOf
+                // requires one); before this fix nothing else recognized this
+                // shape either, so the write fell through to the generic
+                // lvalueAddr fallback below, which cannot resolve a
+                // PropertySymbol target and silently dropped it. Checked here,
+                // after the virtual/interface and local-setter paths, so it
+                // only engages for the shape neither of those covers.
+                if (lowerImportedPropertySet(*as->target, *as->value))
                     return false;
                 // §22.10: indexer setter for `obj[i] := v`.
                 // Evaluate RHS ONCE to avoid double side-effects if
@@ -209,7 +232,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         as->target.get())) {
                     llvm::Value* rhsOnce = lowerExpr(*as->value);
                     if (!rhsOnce) return false;
-                    if (lowerIndexerSet(*ix, rhsOnce)) return false;
+                    // fix #2540: pass `as->value.get()` so the interface-
+                    // dispatch branch in lowerIndexerSet can gate its paired
+                    // call-site retain on the RHS being a tracked string
+                    // NAMED LOCAL (matches the StringEscapeWalker's
+                    // stringReleaseEligible_ / stringBorrowRetainEligible_
+                    // sets — see the ifaceIdxNamedLocalEligible comment in
+                    // LlvmBackend_Assign.cpp at this function's
+                    // TypeDeclKind::Interface branch). nullptr would skip
+                    // the retain (leak-over-UAF, the safe direction for any
+                    // caller that doesn't have the source expression in
+                    // scope — the ref-arg write-back path in
+                    // emitAccessorRefArgWriteBacks which calls
+                    // lowerIndexerSet from a pre-loaded value).
+                    if (lowerIndexerSet(*ix, rhsOnce, as->value.get())) return false;
                     // issue #388 / stdlib §4.4-§4.9: heap-collection indexer
                     // setter `a[i] := v` / `dict[key] := v` (the OWNING
                     // variants dispose the displaced owner, §4.5 / §4.9).
@@ -1246,6 +1282,209 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                                      *ix);  // per §23.4 (#1172)
                             auto* pd = ps ? dynamic_cast<const ast::PropertyDecl*>(
                                                ps->decl) : nullptr;
+                            // fix #2509 (§9.2/§23.4, v0.236): the
+                            // IMPORTED-indexer increment/decrement twin of
+                            // the `!pd` branch just added to
+                            // lowerIndexerCompound (LlvmBackend_Assign.cpp)
+                            // — and of this block's own LOCAL `ps && pd`
+                            // path immediately below, which #2507 had just
+                            // fixed for the receiver copy-vs-address
+                            // crash. An imported indexer has no
+                            // ast::PropertyDecl (reconstructed from side
+                            // tables only, per #2414); pre-fix this block
+                            // gated on `ps && pd` and the imported case
+                            // fell through to `return false;` below — and
+                            // the write was SILENTLY DROPPED (confirmed by
+                            // probe: `r[5]++; return r[2];` against an
+                            // imported RECORD indexer returned 2, the
+                            // pristine getter value, not the expected 3;
+                            // identical shape against an imported CLASS
+                            // indexer — #2489's Class||Record scope).
+                            // Dispatch directly through the exported
+                            // `bz$<Class>$idxget$<arity>` /
+                            // `bz$<Class>$idxset$<arity>` ABI stubs so the
+                            // receiver and each index are evaluated ONCE
+                            // (§23.4); do NOT call
+                            // lowerIndexerGet/lowerIndexerSet, which would
+                            // re-evaluate them (issue text rules that out).
+                            if (ps && !pd &&
+                                (targetTy2->declaration->kind ==
+                                     ast::TypeDeclKind::Class ||
+                                 targetTy2->declaration->kind ==
+                                     ast::TypeDeclKind::Record)) {
+                                auto git =
+                                    importedIndexerGetterFns_.find(ps);
+                                auto sit =
+                                    importedIndexerSetterFns_.find(ps);
+                                if (git != importedIndexerGetterFns_.end() &&
+                                    sit != importedIndexerSetterFns_.end()) {
+                                    llvm::Function* getFn = git->second;
+                                    llvm::Function* setFn = sit->second;
+                                    // Resolve receiver storage ONCE
+                                    // (mirrors lowerIndexerCompound's
+                                    // #2509 `!pd` branch and #2489's
+                                    // lowerIndexerSet): prefer lvalueAddr
+                                    // (own storage) over lowerExpr (a
+                                    // copy) — a record receiver is
+                                    // by-value (§9.2).
+                                    llvm::Value* obj = nullptr;
+                                    llvm::Type* objElemTy = nullptr;
+                                    if (llvm::Value* addr = lvalueAddr(
+                                            *ix->target, objElemTy)) {
+                                        if (objElemTy &&
+                                            objElemTy->isPointerTy())
+                                            obj = builder_.CreateLoad(
+                                                objElemTy, addr);
+                                        else if (objElemTy &&
+                                                 objElemTy->isAggregateType())
+                                            obj = addr;
+                                    }
+                                    if (!obj) {
+                                        llvm::Value* ov =
+                                            lowerExpr(*ix->target);
+                                        if (ov) {
+                                            if (ov->getType()->isPointerTy()) {
+                                                obj = ov;
+                                            } else if (
+                                                ov->getType()
+                                                    ->isAggregateType()) {
+                                                auto* tmp = entryAlloca(
+                                                    ov->getType());
+                                                builder_.CreateStore(ov, tmp);
+                                                obj = tmp;
+                                            }
+                                        }
+                                    }
+                                    if (obj) {
+                                        auto* getFnTy =
+                                            getFn->getFunctionType();
+                                        // Spill each index once; shared by
+                                        // both getter and setter calls
+                                        // (§23.4).
+                                        std::vector<llvm::AllocaInst*>
+                                            idxSlots;
+                                        idxSlots.reserve(
+                                            ps->indexerParams.size());
+                                        bool ok = true;
+                                        for (std::size_t k = 0;
+                                             k < ps->indexerParams.size() &&
+                                             k < ix->indices.size() &&
+                                             k + 1 < getFnTy->getNumParams();
+                                             ++k) {
+                                            if (!ix->indices[k].value) {
+                                                ok = false; break;
+                                            }
+                                            llvm::Value* av =
+                                                lowerExpr(*ix->indices[k].value);
+                                            if (!av) {
+                                                ok = false; break;
+                                            }
+                                            auto* sl = entryAlloca(av->getType());
+                                            builder_.CreateStore(av, sl);
+                                            idxSlots.push_back(sl);
+                                        }
+                                        if (ok) {
+                                            // --- Call getter ---
+                                            std::vector<llvm::Value*> getArgs;
+                                            getArgs.push_back(obj);
+                                            for (std::size_t k = 0;
+                                                 k < idxSlots.size() &&
+                                                 k + 1 < getFnTy->getNumParams();
+                                                 ++k) {
+                                                if (!idxSlots[k]) {
+                                                    ok = false; break;
+                                                }
+                                                llvm::Value* v =
+                                                    builder_.CreateLoad(
+                                                        idxSlots[k]->
+                                                            getAllocatedType(),
+                                                        idxSlots[k]);
+                                                getArgs.push_back(
+                                                    coerceNumericToType(
+                                                        v, getFnTy->getParamType(
+                                                               k + 1), false));
+                                            }
+                                            llvm::Value* cur = nullptr;
+                                            if (ok) {
+                                                cur = builder_.CreateCall(
+                                                    getFnTy, getFn, getArgs);
+                                                emitPendingCheck();
+                                            }
+                                            // --- Compute ±1 and call setter ---
+                                            if (cur) {
+                                                const std::string binOp =
+                                                    (inc->op == "++")
+                                                        ? "+" : "-";
+                                                bool fp = cur->getType()
+                                                              ->isFloatingPointTy();
+                                                llvm::Value* one =
+                                                    fp ? llvm::cast<llvm::Value>(
+                                                             llvm::ConstantFP::get(
+                                                                 cur->getType(),
+                                                                 1.0))
+                                                       : llvm::cast<llvm::Value>(
+                                                             llvm::ConstantInt::get(
+                                                                 cur->getType(),
+                                                                 1));
+                                                llvm::Value* newVal =
+                                                    emitCompoundOp(
+                                                        binOp, cur, one, fp,
+                                                        isUnsignedTargetExpr(
+                                                            *inc->target),
+                                                        isCharTargetExpr(
+                                                            *inc->target));
+                                                        // §6.6/§5.2 #1961
+                                                if (newVal) {
+                                                    auto* setFnTy =
+                                                        setFn->getFunctionType();
+                                                    if (setFnTy->getNumParams()
+                                                            == 0) {
+                                                        ok = false;
+                                                    } else {
+                                                        std::vector<
+                                                            llvm::Value*>
+                                                            setArgs;
+                                                        setArgs.push_back(obj);
+                                                        for (std::size_t k = 0;
+                                                             k < idxSlots.size() &&
+                                                             k + 1 < setFnTy->getNumParams();
+                                                             ++k) {
+                                                            if (!idxSlots[k]) {
+                                                                ok = false; break;
+                                                            }
+                                                            llvm::Value* v =
+                                                                builder_
+                                                                    .CreateLoad(
+                                                                        idxSlots[k]->
+                                                                            getAllocatedType(),
+                                                                        idxSlots[k]);
+                                                            setArgs.push_back(
+                                                                coerceNumericToType(
+                                                                    v,
+                                                                    setFnTy->getParamType(
+                                                                        k + 1),
+                                                                    false));
+                                                        }
+                                                        if (ok) {
+                                                            llvm::Type* valTy =
+                                                                setFnTy->getParamType(
+                                                                    setFnTy->getNumParams() - 1);
+                                                            setArgs.push_back(
+                                                                coerceNumericToType(
+                                                                    newVal, valTy,
+                                                                    false));
+                                                            builder_.CreateCall(
+                                                                setFnTy, setFn,
+                                                                setArgs);
+                                                            emitPendingCheck();
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             if (ps && pd) {
                                 // Locate getter and setter bodies.
                                 const ast::Expr* getterExpr = nullptr;
@@ -1279,7 +1518,55 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                 if ((getterExpr || getterBlock) &&
                                     (setterExpr || setterStmts)) {
                                     // Evaluate receiver once.
-                                    llvm::Value* obj = lowerExpr(*ix->target);
+                                    // fix #2507 (§9.2/§23.4, v0.236): mirrors
+                                    // lowerIndexerCompound's own #2507 fix
+                                    // (LlvmBackend_Assign.cpp) and, upstream of
+                                    // both, #2502's lowerIndexerSet fix —
+                                    // resolve the receiver's OWN storage
+                                    // address via `lvalueAddr` rather than
+                                    // loading a COPY via `lowerExpr`. The old
+                                    // `obj = lowerExpr(*ix->target)` LOADS a
+                                    // byte-for-byte copy for a named
+                                    // record-typed local; that raw struct was
+                                    // then bound directly as `currentThis_`
+                                    // below with NO pointer/aggregate check at
+                                    // all for the expression-getter/setter
+                                    // calls, crashing the IR verifier for
+                                    // `r[i]++` / `r[i]--` on a record indexer
+                                    // (confirmed by probe, same "GEP base
+                                    // pointer is not a vector" shape as
+                                    // lowerIndexerCompound's own repro). Falls
+                                    // back to `lowerExpr` + spill only for a
+                                    // non-addressable temporary receiver.
+                                    llvm::Value* obj = nullptr;
+                                    llvm::Type* objElemTy = nullptr;
+                                    if (llvm::Value* addr = lvalueAddr(
+                                            *ix->target, objElemTy)) {
+                                        if (objElemTy &&
+                                            objElemTy->isPointerTy())
+                                            obj = builder_.CreateLoad(
+                                                objElemTy, addr);
+                                        else if (objElemTy &&
+                                                 objElemTy->isAggregateType())
+                                            obj = addr;
+                                    }
+                                    if (!obj) {
+                                        llvm::Value* ov =
+                                            lowerExpr(*ix->target);
+                                        if (ov) {
+                                            if (ov->getType()->isPointerTy()) {
+                                                obj = ov;
+                                            } else if (
+                                                ov->getType()
+                                                    ->isAggregateType()) {
+                                                llvm::AllocaInst* tmp =
+                                                    entryAlloca(
+                                                        ov->getType());
+                                                builder_.CreateStore(ov, tmp);
+                                                obj = tmp;
+                                            }
+                                        }
+                                    }
                                     if (obj) {
                                         // Spill each index param once; reused by
                                         // both getter and setter to avoid double
@@ -1473,65 +1760,89 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (rs->value) {
             if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
                     rs->value.get())) {
-                if (currentReturnTypeNode_) {
-                    if (const sema::TypeRef* rrt =
-                            ctx_.resolvedType(*currentReturnTypeNode_)) {
-                        // §15.3 (#781): a `return [e1, …]` whose declared return
-                        // type is an INLINE array (`[N owned]T?` / `[N]T`) builds
-                        // the `[N x elem]` aggregate and returns it BY VALUE.
-                        // lowerExpr returns null for a CollectionLiteralExpr, and
-                        // materializeHeapCollectionLiteral only makes a heap
-                        // bz_array_t* (a `ptr`, the wrong type for an inline
-                        // return) — so without this the method returned an
-                        // undef/zero array and the caller's `var a := Make()`
-                        // materialized as all-null. Mirrors the inline-array
-                        // local-decl build (lowerLocalDecl).
-                        if (rrt->kind == sema::TypeRef::Kind::InlineArray &&
-                            !cl->isDict) {
-                            if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
-                                    lowerTypeRef(rrt))) {
-                                llvm::Type* elemTy = aty->getElementType();
-                                llvm::AllocaInst* tmp = entryAlloca(aty);
-                                for (std::size_t i = 0; i < cl->elements.size();
-                                     ++i) {
-                                    if (!cl->elements[i]) continue;
-                                    llvm::Value* ev = lowerExpr(*cl->elements[i]);
-                                    if (!ev) {
-                                        // #1386: ICE — lowerExpr returned null
-                                        // for an inline-array return element.
-                                        ctx_.diagnostics().report(
-                                            Severity::Error,
-                                            cl->elements[i]->span.begin,
-                                            "internal: lowerExpr returned null "
-                                            "for inline-array return element"
-                                            " — #1386");
-                                        continue;
-                                    }
-                                    if (ev->getType() != elemTy &&
-                                        ev->getType()->isIntegerTy() &&
-                                        elemTy->isIntegerTy()) {
-                                        unsigned eb =
-                                            ev->getType()->getIntegerBitWidth();
-                                        unsigned db =
-                                            elemTy->getIntegerBitWidth();
-                                        ev = db > eb
-                                                 ? builder_.CreateSExt(ev, elemTy)
-                                                 : builder_.CreateTrunc(ev,
-                                                                        elemTy);
-                                    }
-                                    llvm::Value* gep = builder_.CreateGEP(
-                                        aty, tmp,
-                                        {builder_.getInt32(0),
-                                         builder_.getInt32((int)i)});
-                                    builder_.CreateStore(ev, gep);
+                // fix #1289 / §30.5 Pattern A: inside an async method (or async
+                // lambda) the DECLARED return type node is the task type
+                // (`Task<Array<int>>` / `OwningTask<T>`), but the value a
+                // `return [e1, …]` produces is the task's RESULT T. Materializing
+                // the literal against `Task<Array<int>>` matches none of the
+                // collection shapes below, so `v` stayed null, `lowerExpr` also
+                // returns null for a CollectionLiteralExpr, and
+                // emitAsyncComplete(nullptr) completed the task with an EMPTY
+                // result buffer — `t.Result` then read a null Array<int> and any
+                // use of it (`.Count`) SIGSEGV'd. asyncResultSemaType_ is exactly
+                // genericArgs[0] of the declared task type (set by
+                // emitAsyncMethod / emitAsyncLambda), so it is the literal's real
+                // target type; everything downstream (the §15.3 inline-array
+                // branch, the heap array/dict materializers) is unchanged.
+                // // per §30.5, §15.4, #1289
+                // The `currentFn_ == asyncResumeFn_` conjunct keeps this to the
+                // async body's OWN Resume function: a nested non-async lambda
+                // lowered mid-body does not save/restore the sm*_ fields, so
+                // `smStateStruct_` alone would misroute its `return [ … ]` to
+                // the enclosing task's result type.
+                const sema::TypeRef* retTargetTy = nullptr;
+                if (smKind_ == SuspendKind::Await && smStateStruct_ &&
+                    asyncResumeFn_ && currentFn_ == asyncResumeFn_ &&
+                    asyncResultSemaType_)
+                    retTargetTy = asyncResultSemaType_;
+                else if (currentReturnTypeNode_)
+                    retTargetTy = ctx_.resolvedType(*currentReturnTypeNode_);
+                if (const sema::TypeRef* rrt = retTargetTy) {
+                    // §15.3 (#781): a `return [e1, …]` whose declared return
+                    // type is an INLINE array (`[N owned]T?` / `[N]T`) builds
+                    // the `[N x elem]` aggregate and returns it BY VALUE.
+                    // lowerExpr returns null for a CollectionLiteralExpr, and
+                    // materializeHeapCollectionLiteral only makes a heap
+                    // bz_array_t* (a `ptr`, the wrong type for an inline
+                    // return) — so without this the method returned an
+                    // undef/zero array and the caller's `var a := Make()`
+                    // materialized as all-null. Mirrors the inline-array
+                    // local-decl build (lowerLocalDecl).
+                    if (rrt->kind == sema::TypeRef::Kind::InlineArray &&
+                        !cl->isDict) {
+                        if (auto* aty = llvm::dyn_cast<llvm::ArrayType>(
+                                lowerTypeRef(rrt))) {
+                            llvm::Type* elemTy = aty->getElementType();
+                            llvm::AllocaInst* tmp = entryAlloca(aty);
+                            for (std::size_t i = 0; i < cl->elements.size();
+                                 ++i) {
+                                if (!cl->elements[i]) continue;
+                                llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                                if (!ev) {
+                                    // #1386: ICE — lowerExpr returned null
+                                    // for an inline-array return element.
+                                    ctx_.diagnostics().report(
+                                        Severity::Error,
+                                        cl->elements[i]->span.begin,
+                                        "internal: lowerExpr returned null "
+                                        "for inline-array return element"
+                                        " — #1386");
+                                    continue;
                                 }
-                                v = builder_.CreateLoad(aty, tmp, "ret.inlarr");
+                                if (ev->getType() != elemTy &&
+                                    ev->getType()->isIntegerTy() &&
+                                    elemTy->isIntegerTy()) {
+                                    unsigned eb =
+                                        ev->getType()->getIntegerBitWidth();
+                                    unsigned db =
+                                        elemTy->getIntegerBitWidth();
+                                    ev = db > eb
+                                             ? builder_.CreateSExt(ev, elemTy)
+                                             : builder_.CreateTrunc(ev,
+                                                                    elemTy);
+                                }
+                                llvm::Value* gep = builder_.CreateGEP(
+                                    aty, tmp,
+                                    {builder_.getInt32(0),
+                                     builder_.getInt32((int)i)});
+                                builder_.CreateStore(ev, gep);
                             }
-                        } else if (!cl->isDict)
-                            v = materializeHeapCollectionLiteral(cl, rrt);
-                        else if (!cl->keys.empty())
-                            v = materializeHeapDictLiteral(cl, rrt);
-                    }
+                            v = builder_.CreateLoad(aty, tmp, "ret.inlarr");
+                        }
+                    } else if (!cl->isDict)
+                        v = materializeHeapCollectionLiteral(cl, rrt);
+                    else if (!cl->keys.empty())
+                        v = materializeHeapDictLiteral(cl, rrt);
                 }
             }
             if (!v) v = lowerExpr(*rs->value);
@@ -1542,6 +1853,39 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         bool chainedReturn = asyncChainedReturn_;
         asyncChainedReturn_ = false;
         if (diverged_) return true;  // CG40: the value expression threw
+        // #2491 (return-path twin of #2434): a return statement's value
+        // expression was present but failed to lower — either lowerExpr
+        // returned null for the whole expression, or a collection-literal
+        // materializer (the #465/#538 heap-array/dict arms above) yielded
+        // nothing. Every downstream return route (sync emitReturn's
+        // `v ? v : null` fallback in LlvmBackend_Setup.cpp, the async
+        // emitAsyncComplete-with-null task completion, and the finally
+        // routing's `if (slot && v)` skip-store) silently degrade a null
+        // value to a zero/null return — the correct degrade (definite
+        // assignment / §28.3 ownership make the zero safe), but #2434 made
+        // the local-decl twin of this exact fallback LOUD and explicitly
+        // asked for the same signal on this return path. Mirror #2434's
+        // posture exactly:
+        //   * Severity::Warning, not Error — the §3 / #605 permissive
+        //     "unknown member" shape `return o.Anything();` for
+        //     `o: Object` is accepted by sema BY DESIGN and currently
+        //     reaches here (codegen has no concrete member to dispatch
+        //     to), so an Error would false-reject legal programs exactly
+        //     as #2434's empirical lit-track check found for the
+        //     local-decl twin. Driver::compileExecutableObject prints
+        //     every diagnostic regardless of severity, so a Warning is
+        //     fully visible on stderr without failing the build.
+        //   * Guarded on !hasErrors() so this does not stack on top of an
+        //     already-reported, already-fatal lowerExpr error (e.g. an
+        //     unhandled `in` form) — same message-quality guard #2434 used.
+        // The zero/null degrade still happens downstream; this only makes
+        // the failure observable instead of invisible.
+        if (rs->value && !v && !ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Warning, rs->value->span.begin,
+                "internal: return-value expression failed to lower to a "
+                "value (degraded to a zero/null return value) — #2491");
+        }
         // §30.1: inside an async method's Resume function, `return expression;`
         // completes the OUTER task with the value (and `return;` / fall-off
         // completes with no value), then returns void from Resume — it does NOT
@@ -2110,6 +2454,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (lowerArrayFor(*fors)) return false;
         // §4.6: `for var c in s` over a string — iterates chars.
         if (lowerStringFor(*fors)) return false;
+        // §3.3 / §29.2 / #971 item 2: `for var c in sp` over a
+        // ReadOnlyStringSpan — iterates code points over the span's
+        // [start, start+len) sub-range of the source string. Runs after
+        // lowerStringFor (string is a more specific check) and before the
+        // enumerable paths (which would otherwise fall through to the NYI).
+        if (lowerStringSpanFor(*fors)) return false;
         // stdlib §5: `for var x in <lazy LINQ pipeline>` — iterate the deferred
         // enumerator without materializing it.
         if (lowerLazyLinqFor(*fors)) return false;
@@ -4215,6 +4565,25 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
     // §3: for var x in array (runtime Array<T> object).
     {
         auto* iterTy = ctx_.exprType(*fs.iterable);
+        // fix #2553 (stdlib §4.18, v0.236): SortedSet<T> is in
+        // isCollectionTypeName's set (the registry comment notes it routes
+        // through this gate alongside Set/OwningSet), but it's NOT array-backed
+        // — its count is in the same struct slot but `data` is a hash-bucket
+        // array, so this loop's bz_array_ptr_at readback would walk the bucket
+        // array as element bytes and yield garbage. SortedSet is supposed to
+        // be handled by lowerDictBackedSetFor (above), which only covers
+        // SORTABLE element types; for non-sortable (string, decimal-as-record,
+        // user choice, etc.) it now defers to lowerIEnumerableFor's SortedSet
+        // helper (#2553), which routes through wrapSortedSetAsIEnumerable for
+        // the correct sorted snapshot. Belt-and-suspenders: if the dispatch
+        // above falls through for any reason (shouldn't, after #2553), refuse
+        // the array-backed iteration here and return false so the generic
+        // for-handlers take over instead of miscompiling.
+        if (iterTy && iterTy->astNode && iterTy->astNode->name &&
+            !iterTy->astNode->name->parts.empty() &&
+            iterTy->headName() == "SortedSet") {
+            return false;
+        }
         if (isCollectionTypeName(iterTy)) {
             llvm::Value* arrObj = lowerExpr(*fs.iterable);
             if (!arrObj) return false;
@@ -4225,6 +4594,39 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
                 elemTy = lowerTypeRef(iterTy->genericArgs[0]);
                 esz = collectionElemSize(iterTy);
             }
+            // #2472 (stdlib §4.11 "Iteration order" v0.195; language spec
+            // §29.1's protocol / §29.2's desugaring). Every array-backed
+            // collection shares this one direct-indexed-loop lowering, an
+            // elision of the GetEnumerator()/MoveNext()/Current desugaring
+            // sanctioned by language spec §29.2's "Compiler optimization"
+            // clause ONLY when "the observable behavior is identical to the
+            // desugared form" — normatively true for a forward scan (index 0
+            // upward) EXCEPT for `Stack<T>`/`OwningStack<T>`, whose stdlib
+            // §4.11 contract is "a stack top-to-bottom (pop order)", the
+            // REVERSE of physical storage order. Physical index 0 is the
+            // BOTTOM of the stack (first pushed) and index Count-1 is the TOP
+            // (most recently pushed, the same index `Pop()` itself reads —
+            // LlvmBackend_Calls.cpp ~4566-4588's `m == "Pop"` case) — a
+            // forward scan would silently visit bottom-to-top, the exact
+            // reverse of what §4.11 requires, with no diagnostic (confirmed
+            // live before this fix: `Push(1);Push(2);Push(3); for x in s ...`
+            // visited 1,2,3, not the required 3,2,1). `Queue<T>`/
+            // `OwningQueue<T>`'s required order (front-to-back / dequeue
+            // order) coincides with physical/insertion order (front = index
+            // 0, the same index `Dequeue()` reads) so it needs no special
+            // case; neither does any other member of this shared dispatch
+            // (`Array`, `Set`, `SortedSet`, `OwningBuffer`), whose stdlib
+            // sections state no take-order contract distinct from storage
+            // order. `OwningStack<T>`'s default (borrowing)
+            // `IReadOnlyCollection<T>` conformance "iterate[s] identically"
+            // per §4.11, so it shares the reversal; `Drain()`'s SEPARATE
+            // `IOwningEnumerable<T>` path (an interface-typed source, so this
+            // `isCollectionTypeName` dispatch never matches it) is untouched
+            // by this fix.
+            bool isStackFamily = iterTy && iterTy->astNode &&
+                iterTy->astNode->name && !iterTy->astNode->name->parts.empty() &&
+                (iterTy->headName() == "Stack" ||
+                 iterTy->headName() == "OwningStack");
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
             auto* ptrAtFn = declareC("bz_array_ptr_at", ptrTy(), {ptrTy(), i64(), i64()});
             // §29.12 / #1232: capture mod epoch before the loop starts.
@@ -4234,7 +4636,16 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             builder_.CreateStore(epochVal, epochSlot);
             llvm::Value* len = builder_.CreateCall(lenFn, {arrObj});
             auto* idxSlotR = entryAlloca(i64());
-            builder_.CreateStore(builder_.getInt64(0), idxSlotR);
+            // Forward scan starts at 0 (unchanged); the Stack reversal starts
+            // at `len - 1` (top) — for an empty stack this is -1, which the
+            // `>= 0` loop condition below immediately fails, correctly
+            // running zero iterations, the same as the forward `0 < len`
+            // check does for an empty forward-scanned collection.
+            builder_.CreateStore(
+                isStackFamily
+                    ? builder_.CreateSub(len, builder_.getInt64(1))
+                    : builder_.getInt64(0),
+                idxSlotR);
             auto* varSlotR = entryAlloca(elemTy);
             locals_[&fs] = varSlotR;
             // #747 R42: spill the index + loop-var + epoch into the async frame
@@ -4259,7 +4670,10 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
                 // After emitGuardThrow the insert point is the continuation block.
             }
             llvm::Value* idxR = builder_.CreateLoad(i64(), idxSlotR);
-            builder_.CreateCondBr(builder_.CreateICmpSLT(idxR, len), bodyBBR, endBBR);
+            llvm::Value* loopCond = isStackFamily
+                ? builder_.CreateICmpSGE(idxR, builder_.getInt64(0))
+                : builder_.CreateICmpSLT(idxR, len);
+            builder_.CreateCondBr(loopCond, bodyBBR, endBBR);
             builder_.SetInsertPoint(bodyBBR);
             llvm::Value* idxR2 = builder_.CreateLoad(i64(), idxSlotR);
             llvm::Value* ep = builder_.CreateCall(ptrAtFn,
@@ -4278,7 +4692,13 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
             if (!termR) builder_.CreateBr(incBBR);
             builder_.SetInsertPoint(incBBR);
             llvm::Value* idxR3 = builder_.CreateLoad(i64(), idxSlotR);
-            builder_.CreateStore(builder_.CreateAdd(idxR3, builder_.getInt64(1)), idxSlotR);
+            // #2472: the Stack family steps the cursor DOWN (top-to-bottom);
+            // every other array-backed collection steps it up, unchanged.
+            builder_.CreateStore(
+                isStackFamily
+                    ? builder_.CreateSub(idxR3, builder_.getInt64(1))
+                    : builder_.CreateAdd(idxR3, builder_.getInt64(1)),
+                idxSlotR);
             builder_.CreateBr(condBBR);
             builder_.SetInsertPoint(endBBR);
             // #1055: a fresh `owned` Array materializer iterated directly as the
@@ -4488,6 +4908,17 @@ bool Emitter::lowerDictBackedSetFor(const ast::ForStmt& fs) {
     const sema::TypeRef* elemTy =
         genericBackingType(iterTy, 0, /*isSet=*/true, nullptr);
     if (!elemTy) return false;  // not dict-backed → let lowerArrayFor handle it
+    // fix #2553 (stdlib §4.18, v0.236): SortedSet<T> with an element type
+    // buildSortedKeyComparator can't rank (string, decimal-as-record,
+    // user choice, …) would otherwise silently drop the sort inside
+    // emitGenericKeyTableFor (the "fall through unsorted" branch) and yield
+    // insertion order — violating §4.18's ascending-iteration contract on a
+    // fundamental element type. Defer to lowerIEnumerableFor's SortedSet-aware
+    // helper, which routes through wrapSortedSetAsIEnumerable (its own string
+    // comparator from #2550, the dictionary-entry wrap for records, etc.) so
+    // the §4.18 promise holds for every SortedSet element type the wrapper
+    // supports.
+    if (n == "SortedSet" && !buildSortedKeyComparator(elemTy)) return false;
     llvm::Value* setObj = lowerExpr(*fs.iterable);
     if (!setObj) return false;
     bool sorted = (n == "SortedSet");
@@ -5164,6 +5595,86 @@ bool Emitter::lowerStringFor(const ast::ForStmt& fs) {
 }
 
 
+// §3.3 / §29.2 / #971 item 2: `for var c in sp do … end` over a
+// ReadOnlyStringSpan — iterate code points over the span's
+// [start, start+len) sub-range of the source string. Same lowering shape
+// as lowerStringFor but the source pointer (field 0 of the {ptr, i32, i32}
+// span struct), start offset (field 1) and code-point length (field 2) come
+// from the span; the loop variable is loaded via loadCodePoint(src, start+idx).
+// A null iterable / non-span static type / type without the span struct
+// falls through (returns false) so the regular for-handler chain can take it.
+bool Emitter::lowerStringSpanFor(const ast::ForStmt& fs) {
+    if (!fs.iterable) return false;
+    auto* tt = ctx_.exprType(*fs.iterable);
+    if (!tt || tt->kind != sema::TypeRef::Kind::Named || tt->declaration ||
+        !tt->astNode || !tt->astNode->name ||
+        tt->astNode->name->parts.empty())
+        return false;
+    if (tt->headName() != "ReadOnlyStringSpan") return false;
+
+    llvm::Value* sv = lowerExpr(*fs.iterable);
+    if (!sv) return false;
+    // {ptr source, i32 start, i32 length}
+    llvm::Value* srcPtr = builder_.CreateExtractValue(sv, {0u}, "ssp.src");
+    llvm::Value* start  = builder_.CreateExtractValue(sv, {1u}, "ssp.start");
+    llvm::Value* len32  = builder_.CreateExtractValue(sv, {2u}, "ssp.len");
+
+    // Index counter (i64) into the span's logical [0, len) range.
+    auto* idxSlot = entryAlloca(i64());
+    builder_.CreateStore(builder_.getInt64(0), idxSlot);
+
+    // Loop variable slot — the body sees `c` as the current char (i32).
+    auto* varSlot = entryAlloca(i32());
+    locals_[&fs] = varSlot;
+
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "ssp.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ssp.body", currentFn_);
+    auto* incBB  = llvm::BasicBlock::Create(llvm_, "ssp.inc",  currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "ssp.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot);
+    // idx < len, widened from i32 → i64 for the compare. The widening is a
+    // SIGN extension and the compare is SIGNED, matching every sibling span
+    // path (the array-span for-in above compares `slen` with ICmpSLT and
+    // sign-extends `base`). `Length` and `Start` are §3.3 `int` fields — signed
+    // — so a zero extension plus an UNSIGNED compare reinterprets a negative
+    // Length as ~4 billion and turns what must be a zero-trip loop into a
+    // multi-gigabyte out-of-bounds read of the source string. No producer can
+    // hand a negative Length here today (every AsSpan/Slice path guards
+    // start >= 0 and len >= 0 with emitGuardThrow), so this changes no
+    // reachable behavior — it removes the trap rather than fixing a live bug.
+    llvm::Value* len64 =
+        builder_.CreateSExt(len32, i64(), "ssp.len64");
+    llvm::Value* cond = builder_.CreateICmpSLT(idx, len64, "ssp.cond");
+    builder_.CreateCondBr(cond, bodyBB, endBB);
+
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* idxB = builder_.CreateLoad(i64(), idxSlot);
+    // Source index = start + idx (start is a signed i32 §3.3 `int` field).
+    llvm::Value* start64 =
+        builder_.CreateSExt(start, i64(), "ssp.start64");
+    llvm::Value* srcIdx =
+        builder_.CreateAdd(start64, idxB, "ssp.srcidx");
+    builder_.CreateStore(loadCodePoint(srcPtr, srcIdx), varSlot);
+    loopStack_.push_back({incBB, endBB, disposeStack_.size()});
+    lowerForBody(fs);
+    loopStack_.pop_back();
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateBr(incBB);
+
+    builder_.SetInsertPoint(incBB);
+    llvm::Value* idxInc = builder_.CreateLoad(i64(), idxSlot);
+    builder_.CreateStore(builder_.CreateAdd(idxInc, builder_.getInt64(1)),
+                         idxSlot);
+    builder_.CreateBr(condBB);
+
+    builder_.SetInsertPoint(endBB);
+    return true;
+}
+
+
 // #639 / stdlib §4.5/§4.7/§4.11 v0.135: `for var x in coll.Drain()` —
 // ownership-transferring drain over OwningArray<T>, OwningLinkedList<T>,
 // OwningStack<T>, OwningQueue<T>.
@@ -5798,6 +6309,23 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
         llvm::Value* geFnPtr = builder_.CreateLoad(ptrTy(), geSlotPtr);
         auto* geTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
         enumObj = builder_.CreateCall(geTy, geFnPtr, {enumObj}, "ib.getenum");
+        // §29.8 / §29.11 (#2154, #973a): GetEnumerator RAISES. When the frame's
+        // owned captures are affine — the state-keyed yield-transfer shape
+        // (#2154) or a conditionally-adopted `owned` parameter (#973a) — the
+        // first enumerator CLAIMS them and a second GetEnumerator sets a pending
+        // InvalidOperationException and returns NULL rather than replaying
+        // pointers the first enumerator already consumed. Without this standard
+        // post-call gate the null flowed straight into the MoveNext vtable load
+        // below and the intended loud exception became a SIGSEGV. The check is
+        // the ordinary CG20 gate: a no-op on every non-raising GetEnumerator.
+        //
+        // Placed BEFORE the loop-owned-source registration below on purpose, and
+        // that cannot leak the source: the claim raises only on a SECOND
+        // GetEnumerator over the SAME source object, which requires the source to
+        // be a NAMED binding (a one-shot `for … in Gen(…)` temporary is
+        // enumerated exactly once by construction) — and a named source is
+        // disposed at its own scope end, not here.
+        emitPendingCheck();
     }
 
     // Store the (fresh) enumerator in a slot.
@@ -5867,6 +6395,16 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     // (an auto-property backed by a compiler-generated field is the OWNED
     // NAMED case; every other property — expression-body, block-body,
     // expression-bodied `=>` — is the COMPUTED, fresh-value case).
+    // fix #2485 (§9.2/§22.8/§29.2, v0.235): sema::isAutoPropertySymbol is
+    // DECL-DEPENDENT and always false for an IMPORTED PropertySymbol, so an
+    // imported auto-property source was misclassified as COMPUTED — the loop
+    // then disposed a source it does not own. CONFIRMED live heap-use-after-
+    // free (a second `for x in h.Prop` read the source through the same,
+    // now-freed, pointer the first loop's erroneous disposal reclaimed).
+    // isAutoPropertyStorage (Emitter, LlvmBackend_impl.hpp) is the SAME
+    // predicate #2478 already built for the storage-layout family: local
+    // decl-based check first (byte-for-byte unchanged), wire-carried fallback
+    // for a decl-null imported Property.
     bool sourceIsNamedLocal = false;
     if (sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable)) {
         if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
@@ -5874,7 +6412,7 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
             dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
             sourceIsNamedLocal = true;
         } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
-            sourceIsNamedLocal = sema::isAutoPropertySymbol(ps);
+            sourceIsNamedLocal = isAutoPropertyStorage(ps);
         }
     }
     if (!sourceIsNamedLocal) {
@@ -5994,6 +6532,24 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     auto* iterTy = ctx_.exprType(*fs.iterable);
     if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named) return false;
     auto* ts = iterTy->declaration;
+
+    // fix #2553 (stdlib §4.18, v0.236): `for var x in <SortedSet<T>>` — see
+    // lowerDictBackedSetFor for the comparator-availability gate that defers
+    // a non-int/float SortedSet here. The stdlib-synthesised GetEnumerator
+    // iterates the dict's internal order[] insertion-order array; the
+    // `emitMethodCall(getEnumSym, ...)` path below would yield insertion
+    // order, violating §4.18's ascending-iteration contract. Route through
+    // wrapSortedSetAsIEnumerable (#2550/#2546) so the for-in surface matches
+    // the explicit `s.GetEnumerator()` surface on the same receiver.
+    // NOTE: SortedSet<string> reaches this handler with iterTy->declaration
+    // NULL (the registry treats SortedSet as a builtin name — the explicit
+    // GetEnumerator path sees the same null declaration, see
+    // LlvmBackend_Calls2.cpp:4800), so the SortedSet dispatch must NOT gate
+    // on the same `if (!ts) return false` the user-class path below uses.
+    if (iterTy->headName() == "SortedSet") {
+        if (lowerIEnumerableForSortedSet(fs, iterTy))
+            return true;
+    }
     if (!ts) return false;  // builtin/interface without concrete class — skip
 
     // #1776 / §21.4 / §29.2: the source's STATIC type is a user INTERFACE that
@@ -6088,11 +6644,18 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // If enumTs is null (builtin IEnumerator<T> interface), find the
     // concrete class structurally: any user class with both "MoveNext"
     // and ("Current" or a property) in its compiled methods.
+    //
+    // fix #2384 / §29.1/§29.11 (v0.235): check `ts` (the iterable source
+    // class) itself FIRST — same sibling defect, same fix, as
+    // `wrapUserClassAsIEnumerable` (LlvmBackend_Assign.cpp): a class may
+    // legally implement BOTH `IEnumerable<T>` and `IEnumerator<T>` and return
+    // `this` from `GetEnumerator()`. The old code unconditionally skipped
+    // `candidate == ts`, so `for var x in selfIterInstance do ... end` (a
+    // concrete-class-typed source, not routed through the interface wrapper)
+    // fell through every `for`-handler to the generic "not yet implemented:
+    // codegen for this for statement" diagnostic — confirmed via probe.
     if (!enumTs) {
-        for (const auto& sym : ctx_.symbols()) {
-            auto* candidate = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-            if (!candidate || candidate->kind != ast::TypeDeclKind::Class) continue;
-            if (candidate == ts) continue;  // skip the iterable itself
+        auto structurallyIsEnumerator = [&](const sema::TypeSymbol* candidate) {
             bool hasMoveNext = false, hasCurrent = false;
             for (auto* m : candidate->members) {
                 auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
@@ -6107,9 +6670,19 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                     if (ps && ps->name == "Current") { hasCurrent = true; break; }
                 }
             }
-            if (hasMoveNext && hasCurrent) {
-                enumTs = const_cast<sema::TypeSymbol*>(candidate);
-                break;
+            return hasMoveNext && hasCurrent;
+        };
+        if (structurallyIsEnumerator(ts)) {
+            enumTs = const_cast<sema::TypeSymbol*>(ts);
+        } else {
+            for (const auto& sym : ctx_.symbols()) {
+                auto* candidate = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+                if (!candidate || candidate->kind != ast::TypeDeclKind::Class) continue;
+                if (candidate == ts) continue;  // skip the iterable itself
+                if (structurallyIsEnumerator(candidate)) {
+                    enumTs = const_cast<sema::TypeSymbol*>(candidate);
+                    break;
+                }
             }
         }
     }
@@ -6152,10 +6725,89 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // caused break/exception to double-dispose (the enclosing scope already ran
     // it) AND normal exhaustion to never dispose (endBB had no emitDisposals
     // call) — see issue #972.
+    //
+    // fix #2384 / §29.1/§29.11 (v0.235): who disposes what when the class is
+    // its OWN enumerator (enumTs == ts, the self-returning idiom — `enumPtr`
+    // and `srcPtr` are then the SAME object). This scope's disposal reads the
+    // object back through `enumSlot` (a dedicated alloca) and, on a non-null
+    // slot, RECLAIMS the block (`emitDisposeAndReclaim`, LlvmBackend_Disposal.cpp)
+    // — unlike the idempotent flag-guarded `Dispose()` call itself, reclaiming
+    // physically frees the heap block. A NAMED iterable source (a local,
+    // parameter, field, or auto-property) is independently owned and disposes
+    // the SAME object again at ITS OWN scope end/using-var boundary — through
+    // a DIFFERENT alloca that this scope's null-guard cannot see nulled, so
+    // both sites would reclaim the identical block: a genuine double-free
+    // (confirmed under ASan as a heap-use-after-free — the second reclaim's
+    // vtable-pointer read lands in memory the first reclaim already freed).
+    // A fresh TEMPORARY source (`for var x in new SelfIter(3) do ... end`) has
+    // no independent owner, so this scope's registration remains its ONLY
+    // disposal and must still fire.
+    //
+    // The `enumPtr == srcPtr` test is a RUNTIME compare, mirroring
+    // `lowerAwaitFor`'s `afor.enown` guard (#1268/#2356): `enumTs == ts` is
+    // only a STRUCTURAL fact (the class exposes MoveNext + Current), not a
+    // proof that this particular `GetEnumerator()` body returns `this` — a
+    // self-implementing class could instead construct and return a fresh
+    // instance of its own type, in which case the two pointers differ and the
+    // ordinary distinct-object disposal is correct and must not be skipped.
+    // fix #2485 (§9.2/§22.8/§29.1, v0.235): isAutoPropertyStorage, not the
+    // bare decl-dependent sema::isAutoPropertySymbol — see the sibling fix a
+    // few lines up in lowerIEnumerableBuiltinFor's plain sync path for the
+    // confirmed heap-use-after-free this same misclassification produces.
+    bool sourceIsNamedOwner = false;
+    if (sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable)) {
+        if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+            dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
+            dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
+            sourceIsNamedOwner = true;
+        } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
+            sourceIsNamedOwner = isAutoPropertyStorage(ps);
+        }
+    }
+    llvm::AllocaInst* enumDisposeSlot = enumSlot;
+    if (enumTs == ts && sourceIsNamedOwner) {
+        llvm::Value* enumIsSrc =
+            builder_.CreateICmpEQ(enumPtr, srcPtr, "ien.selfen");
+        enumDisposeSlot = entryAlloca(ptrTy());
+        builder_.CreateStore(
+            builder_.CreateSelect(enumIsSrc,
+                                  llvm::ConstantPointerNull::get(ptrTy()),
+                                  enumPtr, "ien.enown"),
+            enumDisposeSlot);
+    }
     std::size_t outerDepth = disposeStack_.size();
     disposeStack_.emplace_back();
+    // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): a genuinely UNOWNED
+    // temporary iterable source (`for var x in new IntRange(...) do ... end`
+    // — the `new` result is bound to no other name anywhere) has no
+    // independent disposer in the program; this loop is its SOLE owner and
+    // must dispose it too, exactly as it already disposes the enumerator it
+    // constructs. Only the TWO-CLASS idiom needs a SEPARATE registration
+    // here (`enumTs != ts`): `srcPtr` is then a genuinely distinct object
+    // from `enumPtr`. The self-returning idiom (`enumTs == ts`) needs no
+    // separate entry — `enumPtr == srcPtr` at runtime, and the
+    // `enumDisposeSlot` registration just below (identity-guarded to null
+    // when `sourceIsNamedOwner`, or the plain `enumSlot` otherwise) already
+    // disposes that single shared object exactly once. A NAMED source
+    // (`sourceIsNamedOwner`) is disposed at ITS OWN scope end by the
+    // ordinary local/param/field disposal machinery — registering it again
+    // here would double-free. Mirrors `lowerIEnumerableBuiltinFor`'s
+    // identical `!sourceIsNamedLocal` gate for the array/collection sibling
+    // path (§29.2: "a freshly produced source value with no owning binding
+    // ... is owned by this loop"). Pushed BEFORE the enumerator's own entry
+    // so LIFO scope-end disposal (`emitDisposals` iterates in reverse) frees
+    // the enumerator first, the source second — the natural reverse of their
+    // construction order; the two never alias here (`enumTs != ts` is
+    // exactly this branch's guard) so the order has no correctness
+    // consequence, only readability.
+    llvm::AllocaInst* srcDisposeSlot = nullptr;
+    if (!sourceIsNamedOwner && enumTs != ts && disposerFns_.count(ts)) {
+        srcDisposeSlot = entryAlloca(ptrTy());
+        builder_.CreateStore(srcPtr, srcDisposeSlot);
+        disposeStack_.back().push_back({srcDisposeSlot, ts});
+    }
     if (disposerFns_.count(enumTs))
-        disposeStack_.back().push_back({enumSlot, enumTs});
+        disposeStack_.back().push_back({enumDisposeSlot, enumTs});
 
     // Determine the loop variable's element type.
     llvm::Type* elemTy = ptrTy();  // default: reference type
@@ -6181,7 +6833,12 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     // Loop variable slot — the body sees `x` here.
     auto* varSlot = entryAlloca(elemTy);
     locals_[&fs] = varSlot;
-    registerForLoopSpillSlots(fs, {enumSlot, varSlot});  // #747 R42
+    // fix #2424: srcDisposeSlot (null unless the two-class-idiom-owned-
+    // temporary branch above registered it) must survive a suspend the same
+    // way enumSlot already does — it is read back only at loop end (endBB),
+    // which may be reached after a resume. registerForLoopSpillSlots
+    // null-guards each slot itself, so passing a possibly-null entry is safe.
+    registerForLoopSpillSlots(fs, {enumSlot, srcDisposeSlot, varSlot});  // #747 R42
 
     auto* condBB = llvm::BasicBlock::Create(llvm_, "ien.cond", currentFn_);
     auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ien.body", currentFn_);
@@ -6261,6 +6918,173 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
 }
 
 
+// fix #2553 (stdlib §4.18, v0.236): `for var x in <SortedSet<T>>` — build the
+// same sorted-snapshot wrapper the explicit `.GetEnumerator()` call site uses
+// (wrapSortedSetAsIEnumerable, #2550/#2546), obtain the enumerator via the
+// wrapper's slot-4 GetEnumerator (which returns a non-owning clone over the
+// same sorted array), and dispatch MoveNext/Current through the enumerator's
+// vtable (slot 2 / slot 3 — the standard iterator-vtable layout, identical to
+// the Array/Stack/Queue/LinkedList enumerable wrappers the builtin path uses
+// in lowerIEnumerableBuiltinFor). The stdlib-synthesised SortedSet.GetEnumerator
+// iterates the dict's internal `order[]` insertion-order array, so the
+// `emitMethodCall(getEnumSym, ...)` path lowerIEnumerableFor would otherwise
+// take yields insertion order — diverging from the explicit-GetEnumerator
+// surface on the same receiver (#2550 made the explicit surface ascending;
+// this fix makes the for-in surface match).
+//
+// Disposal (#972 / §29.2): dedicated scope so break / early return / normal
+// exhaustion / exception ALL dispose the enumerator AND the wrapper exactly
+// once. LIFO at endBB — the wrapper (pushed first) is disposed LAST, freeing
+// the sorted snapshot array AFTER the enumerator (pushed second) has freed
+// its (non-owning) frame. Mirrors the explicit-GetEnumerator dispatch's
+// "dispose wrapper after the enumerator clone" ordering (#2471 / §29.11) so
+// the snapshot array stays live for the clone's full consumption — a dispose-
+// first wrapper would free the array out from under the live enumerator's
+// Current reads (confirmed UAF under ASan, see #2471).
+bool Emitter::lowerIEnumerableForSortedSet(const ast::ForStmt& fs,
+                                           const sema::TypeRef* iterTy) {
+    if (!fs.iterable || !iterTy) return false;
+    if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
+    const sema::TypeRef* elemTyRef = iterTy->genericArgs[0];
+    llvm::Type* elemTy = lowerTypeRef(elemTyRef);
+    if (!elemTy) return false;
+
+    // Evaluate the iterable to get the source object pointer.
+    llvm::Value* srcPtr = lowerExpr(*fs.iterable);
+    if (!srcPtr) return false;
+
+    // Snapshot + sort + wrap as the OWNING enumerable the #2550 wrap emits.
+    // The wrapper's vtable:
+    //   [0]=td, [1]=Dispose(frees sorted array, frees self),
+    //   [2]=MoveNext, [3]=Current, [4]=GetEnumerator(non-owning clone)
+    // — same shape wrapOwnedArrayAsIEnumerable produces.
+    llvm::Value* wrapper = wrapSortedSetAsIEnumerable(srcPtr, iterTy);
+    if (!wrapper || !wrapper->getType()->isPointerTy()) return false;
+
+    // slot-4 GetEnumerator — returns a non-owning clone over the same array.
+    llvm::Value* wt = builder_.CreateLoad(ptrTy(), wrapper);
+    llvm::Value* geSlotPtr =
+        builder_.CreateGEP(ptrTy(), wt, {builder_.getInt32(4)});
+    llvm::Value* geFnPtr = builder_.CreateLoad(ptrTy(), geSlotPtr);
+    auto* geTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    llvm::Value* enumPtr = builder_.CreateCall(
+        geTy, geFnPtr, {wrapper}, "ssenum.getenum");
+
+    // §29.7 (#623) / §28.3 (#972): dedicated disposal scope for both the
+    // enumerator (non-owning — Dispose frees only its frame) and the wrapper
+    // (owning — Dispose frees the sorted array then self). outerDepth saved
+    // BEFORE the push so `loopStack_` records the enclosing depth for
+    // break-path emitLoopDisposals.
+    std::size_t outerDepth = disposeStack_.size();
+    disposeStack_.emplace_back();
+
+    // Push wrapper FIRST, enumerator SECOND — LIFO reverse iteration on
+    // endBB runs the enumerator first (cheap frame-free, harmless because
+    // non-owning), then the wrapper (frees the sorted array, safe because
+    // no Current reads happen after the enumerator is gone). This matches
+    // the explicit-GetEnumerator dispatch's "defer wrapper disposal AFTER
+    // the enumerator clone" ordering (#2471).
+    llvm::AllocaInst* wrapperSlot = entryAlloca(ptrTy());
+    builder_.CreateStore(wrapper, wrapperSlot);
+    {
+        Disposal wd{wrapperSlot, nullptr};
+        wd.iterEnumDispose = true;
+        disposeStack_.back().push_back(wd);
+    }
+    llvm::AllocaInst* enumSlot = entryAlloca(ptrTy());
+    builder_.CreateStore(enumPtr, enumSlot);
+    {
+        Disposal ed{enumSlot, nullptr};
+        ed.iterEnumDispose = true;
+        disposeStack_.back().push_back(ed);
+    }
+
+    // Use vtable-based MoveNext (slot 2 → i1) and Current (slot 3 → T) — the
+    // same iterator-vtable layout lowerIEnumerableBuiltinFor dispatches
+    // through for Array/Stack/Queue/LinkedList enumerable wrappers. We can't
+    // reuse lowerIEnumerableFor's emitMethodCall(moveNextSym, ...) path
+    // because moveNextSym / currentSym are looked up on the SortedSet's
+    // declared enumerator class, NOT on the wrapper's bz$arrenum$...$ clone
+    // — the wrapper's class has its own MoveNext/Current with no sema
+    // MethodSymbol accessible from this scope. Vtable dispatch is the
+    // canonical escape (§29.2 vtable protocol).
+    auto* moveNextTy = llvm::FunctionType::get(i1(), {ptrTy()}, false);
+    auto* currentTy = llvm::FunctionType::get(elemTy, {ptrTy()}, false);
+
+    auto* varSlot = entryAlloca(elemTy);
+    locals_[&fs] = varSlot;
+    // NOTE: #747 R42 (state-machine spill) intentionally OMITTED for this
+    // helper — SortedSet for-in inside a yield iterator is a separate
+    // concern (#2553 follow-up; today's spec fix lands the simple synchronous
+    // case first). Filing a follow-up issue.
+
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "ss.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ss.body", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "ss.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    // cond: enumerator.MoveNext() → i1 via vtable slot 2.
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* obj = builder_.CreateLoad(ptrTy(), enumSlot);
+    llvm::Value* vtable = builder_.CreateLoad(ptrTy(), obj);
+    llvm::Value* mnSlotPtr =
+        builder_.CreateGEP(ptrTy(), vtable, {builder_.getInt32(2)});
+    llvm::Value* mnFnPtr = builder_.CreateLoad(ptrTy(), mnSlotPtr);
+    llvm::Value* moved = builder_.CreateCall(
+        moveNextTy, mnFnPtr, {obj}, "ss.moved");
+    builder_.CreateCondBr(moved, bodyBB, endBB);
+
+    // body: enumerator.Current → T via vtable slot 3, then run the user body.
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* obj2 = builder_.CreateLoad(ptrTy(), enumSlot);
+    llvm::Value* vtable2 = builder_.CreateLoad(ptrTy(), obj2);
+    llvm::Value* curSlotPtr =
+        builder_.CreateGEP(ptrTy(), vtable2, {builder_.getInt32(3)});
+    llvm::Value* curFnPtr = builder_.CreateLoad(ptrTy(), curSlotPtr);
+    llvm::Value* curVal = builder_.CreateCall(
+        currentTy, curFnPtr, {obj2}, "ss.cur");
+    builder_.CreateStore(curVal, varSlot);
+
+    // §29.7 (#623) / #2553 (v0.236): scopeDepth = MY scope's index (after push),
+    // not outerDepth (before push). The existing patterns in lowerIEnumerableFor
+    // / lowerIEnumerableBuiltinFor use outerDepth so emitLoopDisposals runs the
+    // body's iter-var scope + the loop's wrapper/enumerator scope on `break`;
+    // that double-disposes the wrapper/enumerator on `continue` too — the
+    // slots get nulled by iterEnumDispose and condBB's `Load(enumSlot)` reads
+    // NULL → SEGV (a pre-existing latent bug the vtable-protocol paths inherit,
+    // first exercised by #2553's SortedSet<string> for-in + `continue`).
+    // Moving scopeDepth to MY scope's index makes emitLoopDisposals a no-op on
+    // continue (the wrapper/enumerator stay live for the next MoveNext read)
+    // and on break (endBB picks them up via emitDisposals(disposeStack_.back()).
+    // The wrapper/enumerator are STILL disposed exactly once on every exit:
+    //   * normal exhaustion (condBB false-branch → endBB) — emitDisposals.
+    //   * break (lowerLoopJump → endBB) — emitDisposals.
+    //   * early `return` / exception — the next-emitDisposals on the unwind
+    //     path runs the scope unconditionally (§31.2), and `iterEnumDispose`
+    //     nulls the slot after Dispose so a second pass is a no-op.
+    //   * `continue` — slot stays live; loop body reuses the same enumerator.
+    // This matches LinkedList's iter-var scope (its scopeDepth is the
+    // current disposeStack size at push time, NOT before — see the original
+    // for-in patterns); the wrapper/enumerator are loop-scope resources that
+    // must outlive every continue.
+    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
+    bool term = lowerForBody(fs);
+    loopStack_.pop_back();
+    if (!term) builder_.CreateBr(condBB);
+
+    // Normal exhaustion: endBB. emitDisposals iterates the scope in REVERSE
+    // so the enumerator (pushed second) is disposed FIRST (frees its
+    // non-owning frame, harmless), then the wrapper (pushed first) is
+    // disposed SECOND (frees the sorted array, then self). See #972 for
+    // the disposal-protocol reasoning; mirrors lowerIEnumerableBuiltinFor's
+    // endBB handling exactly.
+    builder_.SetInsertPoint(endBB);
+    emitDisposals(disposeStack_.back());
+    disposeStack_.pop_back();
+    return true;
+}
+
+
 // §30.7: lower `await for var x in src do ... end`. The source is an
 // IAsyncEnumerable<T> / IAsyncEnumerator<T>; for an async-iterator method call
 // (`Gen()`) the value IS the enumerator (the generated frame, whose vtable has
@@ -6276,14 +7100,18 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
 // exactly the mechanism the embedded-await pre-suspend operands already rely on.
 bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     if (!fs.isAwait || !fs.iterable) return false;
-    // §30.7/§30.8 (#765): an optional `with token` clause is now lowered. For a
-    // compiler-generated async iterator the source value IS the enumerator (the
-    // enumPtr below is the source directly — there is no separate
-    // GetAsyncEnumerator(token) call), so the token is evaluated for its
-    // side-effects/ownership and then discarded; the rest of the loop is
-    // identical to the no-`with` form. Honoring the token for cancellation
-    // (§30.8) remains deferred, exactly as on a direct GetAsyncEnumerator path.
-    // The token expression is lowered after the source is evaluated, below.
+    // §30.7/§30.8 (#765, #1525): an optional `with token` clause. "The `with
+    // token` clause passes `token` as the argument to `GetAsyncEnumerator(token)`.
+    // When omitted, `CancellationToken.None` is passed." (§30.7 v0.228) — the
+    // token is now evaluated right after the source (below) and passed as the
+    // second argument to the slot-4 GetAsyncEnumerator call, so a
+    // compiler-generated async iterator captures it in its frame and checks it
+    // internally (LlvmBackend_Async.cpp's Resume-entry check). The per-iteration
+    // consumer-side check further below (§30.8 / #790) is KEPT as well — it is
+    // the only enforcement for enumerator producers with no frame of their own
+    // (e.g. `Task.WhenEach`'s runtime enumerator) and is a harmless redundant
+    // early-out for the compiler-generated case (same condition, checked one
+    // step earlier in program order).
     // The consuming context must be an async state machine (the await suspend
     // lives in its Resume function). sema rejects `await for` outside async; this
     // is a defensive guard so a stray case produces a diagnostic, not bad IR.
@@ -6304,16 +7132,100 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     // unwind path — mirroring the synchronous iterator-for (lowerIEnumerableBuiltinFor).
     // This replaces the prior SSA-promoted enumerator: holding it in a frame slot
     // lets the disposal scope below dispose the frame on EVERY exit edge.
-    llvm::Value* enumPtr = lowerExpr(*fs.iterable);
-    if (!enumPtr) return false;
+    llvm::Value* srcPtr = lowerExpr(*fs.iterable);
+    if (!srcPtr) return false;
+    // §30.7/§30.8 (#765/#1525): evaluate the optional `with` token right after
+    // the source, before the GetAsyncEnumerator(token) call below — the
+    // desugaring's own argument-evaluation order (receiver, then the token
+    // argument). `tokenVal` stays null (C++) when no `with` clause is written;
+    // `tokenArg` is the LLVM value actually passed (None ⇒ a null cell pointer).
+    llvm::Value* tokenVal = fs.withExpr ? lowerExpr(*fs.withExpr) : nullptr;
+    llvm::Value* tokenArg =
+        tokenVal ? tokenVal : llvm::ConstantPointerNull::get(ptrTy());
+    // fix #1268 / §29.3 + §29.11: the source is the async-ITERABLE; ask it for a
+    // FRESH, INDEPENDENT enumerator through vtable slot 4 (GetAsyncEnumerator)
+    // rather than driving — and Disposing — the source object itself. Without
+    // this a second `await for` over the same bound `IAsyncEnumerable<T>` local
+    // re-drove the frame the first loop had already Disposed and freed: a
+    // heap-use-after-free (SIGSEGV). Slot 4 is now carried by BOTH producers of
+    // an async-enumerable value the desugaring can see: the compiler-generated
+    // async iterator (emitAsyncIteratorMethod — returns a byte-copy clone reset
+    // to the start) and the runtime `Task.WhenEach`/`WhenEachOwned` enumerator
+    // (bezel_runtime_concurrency.cpp — returns `self`, its enumerable and
+    // enumerator being one object), so the slot-4 read is always in bounds.
+    llvm::Value* enumPtr = nullptr;
+    {
+        llvm::Value* srcVt = builder_.CreateLoad(ptrTy(), srcPtr);
+        llvm::Value* geSlotPtr =
+            builder_.CreateGEP(ptrTy(), srcVt, {builder_.getInt32(4)});
+        llvm::Value* geFnPtr = builder_.CreateLoad(ptrTy(), geSlotPtr);
+        auto* geTy =
+            llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false);
+        enumPtr = builder_.CreateCall(geTy, geFnPtr, {srcPtr, tokenArg},
+                                      "afor.getenum");
+        // fix #2356 / §29.8: an owned-param compiler-generated async iterator's
+        // GetAsyncEnumerator (LlvmBackend_Async.cpp) can now raise
+        // InvalidOperationException (the affine claim-once guard) — the first
+        // vtable-slot-4 producer able to throw, so this is the first call site
+        // that needs the check. A non-throwing producer (the no-owned-param
+        // clone path, or the runtime Task.WhenEach self-return) leaves no
+        // pending exception and this is a harmless no-op branch.
+        emitPendingCheck();
+    }
     auto* enumSlot = entryAlloca(ptrTy());
     builder_.CreateStore(enumPtr, enumSlot);
     asyncHandlerSpillSlots_.push_back(enumSlot);  // survive the condBB await suspend
-    // §30.8 (#765/#790): evaluate the optional `with` cancellation token. Its
-    // value is a pointer to the source's cancellation-state cell (null for
-    // CancellationToken.None). It is observed at each iteration's suspend point
-    // (condBB below): a cancelled token raises OperationCanceledException.
-    llvm::Value* tokenVal = fs.withExpr ? lowerExpr(*fs.withExpr) : nullptr;
+    // §29.11 / §29.2 (#1268): who disposes what.
+    //   * The per-loop ENUMERATOR is loop-owned and disposed on every exit edge
+    //     — EXCEPT when the source handed back ITSELF (`en == src`) and the
+    //     source is a NAMED binding, in which case disposing it here would free
+    //     an object the binder disposes at its own scope end (a double free).
+    //   * The SOURCE is disposed by the loop only when it is a freshly produced
+    //     temporary (a CallExpr/NewExpr with no owning binding) AND it handed
+    //     back a distinct enumerator; when `en == src` the enumerator disposal
+    //     above already covers it. A named local/param/field source is disposed
+    //     at its own lifetime end (registerIterableSourceDisposal, §29.11).
+    // The `en == src` test is a runtime compare because the two producers differ
+    // and the static type (`IAsyncEnumerable<T>`) cannot tell them apart.
+    // fix #2485 (§9.2/§22.8/§29.8, v0.235): isAutoPropertyStorage — the async
+    // `for await` twin of the sync for-in fix above (same misclassification,
+    // same confirmed heap-use-after-free direction: an imported auto-property
+    // source disposed early by a loop that does not own it).
+    bool sourceIsNamedLocal = false;
+    if (sema::Symbol* sym = ctx_.exprSymbol(*fs.iterable)) {
+        if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+            dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
+            dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
+            sourceIsNamedLocal = true;
+        } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
+            sourceIsNamedLocal = isAutoPropertyStorage(ps);
+        }
+    }
+    llvm::Value* enumIsSrc = builder_.CreateICmpEQ(enumPtr, srcPtr, "afor.selfen");
+    auto* enumOwnSlot = entryAlloca(ptrTy());
+    builder_.CreateStore(
+        sourceIsNamedLocal
+            ? builder_.CreateSelect(
+                  enumIsSrc, llvm::ConstantPointerNull::get(ptrTy()), enumPtr,
+                  "afor.enown")
+            : enumPtr,
+        enumOwnSlot);
+    asyncHandlerSpillSlots_.push_back(enumOwnSlot);
+    llvm::AllocaInst* srcOwnSlot = nullptr;
+    if (!sourceIsNamedLocal) {
+        srcOwnSlot = entryAlloca(ptrTy());
+        builder_.CreateStore(
+            builder_.CreateSelect(enumIsSrc,
+                                  llvm::ConstantPointerNull::get(ptrTy()),
+                                  srcPtr, "afor.srcown"),
+            srcOwnSlot);
+        asyncHandlerSpillSlots_.push_back(srcOwnSlot);
+    }
+    // §30.8 (#765/#790): `tokenVal` (evaluated earlier, above) is a pointer to
+    // the source's cancellation-state cell (null for CancellationToken.None). It
+    // is ALSO observed at each iteration's suspend point (condBB below): a
+    // cancelled token raises OperationCanceledException — the consumer-side half
+    // of the redundant pair described above.
 
     // Loop variable slot — the body sees `x` here.
     auto* varSlot = entryAlloca(elemTy);
@@ -6334,9 +7246,14 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     std::size_t outerDepth = disposeStack_.size();
     disposeStack_.emplace_back();
     {
-        Disposal d{enumSlot, nullptr};
+        Disposal d{enumOwnSlot, nullptr};
         d.iterEnumDispose = true;
         disposeStack_.back().push_back(d);
+    }
+    if (srcOwnSlot) {  // #1268: loop-owned temporary source (null when `en==src`)
+        Disposal ds{srcOwnSlot, nullptr};
+        ds.iterEnumDispose = true;
+        disposeStack_.back().push_back(ds);
     }
 
     // Vtable-dispatched MoveNextAsync (slot 2) / Current (slot 3); Dispose
@@ -6433,7 +7350,18 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     auto* iterTy = ctx_.exprType(*fs.iterable);
     // Only a lazy LINQ pipeline result (the structural sentinel) is handled
     // here; iterator state machines and Array<T> go through other paths.
-    if (!isLazyEnumerableType(iterTy)) return false;
+    //
+    // stdlib §5 (#755, finding [17]) / spec §29.2: an `IGrouping<TKey, T>` source
+    // is also handled here. `IGrouping : IEnumerable<T>` (stdlib §5:3076), so
+    // `for var el in g do … end` — the inner loop of the canonical
+    // `for var g in xs.GroupBy(k) do … end` shape — is well-formed Bezel; it
+    // was rejected with "not yet implemented: codegen for this for statement"
+    // because no for-handler recognized an IGrouping-typed source.
+    // lowerToLazyEnumerator wraps the grouping's (grouping-owned) element array
+    // as a BORROWING lazy array source, so the enumerator protocol below drives
+    // it exactly as it drives any lazy pipeline.
+    const sema::TypeRef* igroupingElem = iGroupingElemTypeRef(iterTy);
+    if (!igroupingElem && !isLazyEnumerableType(iterTy)) return false;
 
     // #752: route through lowerToLazyEnumerator (not lowerExpr) so a bare
     // `GroupBy(...)` iterable — which lowerExpr cannot lower to a usable
@@ -6450,7 +7378,10 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     llvm::Value* lazy = lowerToLazyEnumerator(*fs.iterable, lazyElemRef,
                                               /*ownFreshGroupings=*/true);
     if (!lazy) return false;
-    llvm::Type* elemTy = lowerTypeRef(iterTy->genericArgs[0]);
+    // #755: an IGrouping's element type is genericArgs[1] (genericArgs[0] is the
+    // key); every other source here carries its element at genericArgs[0].
+    llvm::Type* elemTy = lowerTypeRef(
+        igroupingElem ? igroupingElem : iterTy->genericArgs[0]);
     if (!elemTy) elemTy = i32();
 
     // Store the enumerator in a slot; iterate via its vtable.
@@ -6525,10 +7456,18 @@ bool Emitter::lowerLazyLinqFor(const ast::ForStmt& fs) {
     // Only fires when the iterable is a named local or parameter (IdentifierExpr);
     // a fresh inline lazy (CallExpr / chained operator) has no owning slot to null.
     // Per §29.11 pattern: localSlot handles both unboxed and cell-boxed variables.
-    if (llvm::AllocaInst* boundSlot = localSlot(*fs.iterable)) {
-        llvm::Type* ety = nullptr;
-        llvm::Value* addr = boxedStorage(boundSlot, ety);
-        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+    //
+    // #755: NOT for an IGrouping source. The slot there holds the GROUPING
+    // pointer (typically the enclosing `for var g in xs.GroupBy(k)` loop
+    // variable), not the enumerator this loop consumed — the enumerator is the
+    // fresh borrowing wrapper built above and already disposed. Nulling the
+    // grouping slot would dangle `g.Key` / the outer loop's own disposal.
+    if (!igroupingElem) {
+        if (llvm::AllocaInst* boundSlot = localSlot(*fs.iterable)) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(boundSlot, ety);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+        }
     }
     builder_.CreateBr(contBB);
 
@@ -6687,6 +7626,29 @@ bool Emitter::tryLowerAtomicValueSet(const ast::AssignmentStmt& as) {
                               {ptrTy(), i64(), i32()});
     builder_.CreateCall(storeFn,
         {atom, v64, builder_.getInt32(cs)});
+    return true;
+}
+
+// stdlib §7.1 / issue #645: `fs.Position := n` — an absolute seek from the
+// beginning, via bz_filestream_set_position. Returns true when handled (so the
+// main assignment dispatcher returns early rather than falling through to the
+// lvalue path, which would silently drop the write: FileStream has no user
+// PropertyDecl to store into).
+bool Emitter::tryLowerFileStreamPositionSet(const ast::AssignmentStmt& as) {
+    if (!as.target || !as.value || as.op != ":=") return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(as.target.get());
+    if (!ma || !ma->target || ma->member != "Position") return false;
+    if (builtinTypeName(ctx_.exprType(*ma->target)) != "FileStream") return false;
+
+    llvm::Value* fs = lowerExpr(*ma->target);
+    if (!fs) return true;   // handled (suppress the lvalue fallthrough)
+    llvm::Value* pos = lowerExpr(*as.value);
+    if (!pos) return true;
+    if (pos->getType()->isIntegerTy() && !pos->getType()->isIntegerTy(64))
+        pos = builder_.CreateSExt(pos, i64(), "fs.pos64");
+    auto* fn = declareC("bz_filestream_set_position",
+                        llvm::Type::getVoidTy(llvm_), {ptrTy(), i64()});
+    builder_.CreateCall(fn, {fs, pos});
     return true;
 }
 

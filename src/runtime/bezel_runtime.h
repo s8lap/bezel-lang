@@ -20,12 +20,13 @@ extern "C" {
 // Elements are stored as raw bytes; callers supply the element size.
 // ---------------------------------------------------------------------------
 
-// Allocate a new array capable of holding `initial_cap` elements of `elem_size`
-// bytes each. Returns a pointer to the internal bz_array_t struct (opaque to
-// Bezel code, which treats it as a plain `ptr`).
+// stdlib §4.4/§4.5 (Array<T>/OwningArray<T>): allocate a new array capable
+// of holding `initial_cap` elements of `elem_size` bytes each. Returns a
+// pointer to the internal bz_array_t struct (opaque to Bezel code, which
+// treats it as a plain `ptr`).
 void* bz_array_alloc(int64_t elem_size, int64_t initial_cap);
 
-// Return the current element count.
+// stdlib §4.4/§4.5: return the current element count (0 for a null arr).
 int64_t bz_array_len(void* arr);
 
 // stdlib §4.4/§4.5 (#741): the array-backed collection's allocated capacity.
@@ -38,13 +39,16 @@ int32_t bz_string_is_ascii(const void* s);
 // Used by `new OwningBuffer<T>(n)`.
 void* bz_array_alloc_count_n(int64_t elem_size, int64_t n);
 
-// Append one element (elem_size bytes) to the end. Grows capacity as needed.
+// stdlib §4.4/§4.5 (Array<T>.Add / OwningArray<T>.Add): append one element
+// (elem_size bytes) to the end. Grows capacity as needed.
 void bz_array_add(void* arr, const void* elem, int64_t elem_size);
 
-// Copy the element at `idx` into `out` (elem_size bytes). No bounds check.
+// stdlib §4.4/§4.5 (Array<T>/OwningArray<T> indexer getter): copy the
+// element at `idx` into `out` (elem_size bytes). No bounds check.
 void bz_array_get(void* arr, int64_t idx, void* out, int64_t elem_size);
 
-// Overwrite the element at `idx` with the elem_size bytes at `elem`.
+// stdlib §4.4/§4.5 (Array<T> indexer setter): overwrite the element at `idx`
+// with the elem_size bytes at `elem`. No bounds check.
 void bz_array_set(void* arr, int64_t idx, const void* elem, int64_t elem_size);
 
 // issue #388 / stdlib §4.5: the OwningArray<T> indexer setter — dispose the
@@ -57,7 +61,8 @@ void bz_array_set(void* arr, int64_t idx, const void* elem, int64_t elem_size);
 void bz_array_set_disposing(void* arr, int64_t idx, const void* elem,
                             int64_t elem_size, void (*dispose_elem)(void*));
 
-// Remove the element at `idx`, shifting subsequent elements down.
+// stdlib §4.4/§4.5 (Array<T>.RemoveAt): remove the element at `idx`,
+// shifting subsequent elements down. No bounds check.
 void bz_array_remove_at(void* arr, int64_t idx, int64_t elem_size);
 
 // fix #642 / stdlib §4.5: PopAt(i) — copy element at idx into *out (transferring
@@ -71,7 +76,10 @@ void bz_array_pop_at(void* arr, int64_t idx, void* out, int64_t elem_size);
 void bz_array_insert_at(void* arr, int64_t idx, const void* elem,
                         int64_t elem_size);
 
-// Set length to 0 (does NOT call dispose_elem; caller is responsible).
+// stdlib §4.4/§4.5 (Array<T>.Clear / OwningArray<T>.Clear): set length to 0.
+// Does NOT call dispose_elem; caller is responsible (the borrowing Array<T>
+// has nothing to dispose; the owning OwningArray<T> path is the
+// clear_disposing overload below).
 void bz_array_clear(void* arr);
 
 // stdlib §4.5: dispose every (non-null) class-typed element, then set length to
@@ -516,7 +524,12 @@ int64_t bz_decimal_to_int64(const bz_decimal_t* a, void* ove_vtable);
 // Parse from string (stdlib §9.3 Decimal.Parse / TryParse).
 // per fix #521: bz_decimal_parse raises FormatException (fe_vtable) for
 // malformed input and OverflowException (ove_vtable) for out-of-range.
-// bz_decimal_try_parse returns 0/1 with no exception.
+// bz_decimal_try_parse returns 0/1 with no exception, and writes
+// default(decimal) to *out on failure (stdlib §2.3).
+// per fix #2273: these two enforce the §9.3 grammar — "an optional leading sign
+// (+/-) followed by decimal digits with at most one `.`" — which admits NO
+// exponent, and they read the string's full length (a `string` is not
+// NUL-terminated and is not bounded by any fixed buffer here).
 void    bz_decimal_parse(const void* str, bz_decimal_t* out,
                          void* ove_vtable, void* fe_vtable);
 int32_t bz_decimal_try_parse(const void* str, bz_decimal_t* out);
@@ -528,9 +541,14 @@ void* bz_decimal_to_string(const bz_decimal_t* a);
 void bz_decimal_round(const bz_decimal_t* a, int32_t digits, bz_decimal_t* out);
 
 // Literal parse at compile-time (called by runtime init for MinValue/MaxValue).
-// Same as bz_decimal_parse but takes a null-terminated C string.
+// Takes a null-terminated C string.
 // per fix #521: ove_vtable/fe_vtable may be nullptr for compile-time use
 // (literals are lexer-validated; overflow cannot occur for known constants).
+// per fix #2273: this is the LITERAL grammar (language spec §18.1 / Appendix A)
+// and therefore admits scientific notation (`1.23e2m`) — unlike
+// bz_decimal_parse above, which implements the narrower stdlib §9.3 grammar.
+// The compile-time literal fold and bz_decimal_from_double ("%.15g" emits
+// exponent form) both depend on that admission.
 void bz_decimal_parse_cstr(const char* s, bz_decimal_t* out,
                             void* ove_vtable, void* fe_vtable);
 
@@ -721,6 +739,39 @@ char* bz_path_extension(const char* path);      // including dot, e.g. ".txt"
 char* bz_path_stem(const char* path);           // filename without extension
 char* bz_path_dirname(const char* path);        // directory part
 char* bz_path_absolute(const char* path);       // realpath equivalent
+
+// ---------------------------------------------------------------------------
+// stdlib §7.2 FileStream (issue #645) — a buffered OS file handle backing the
+// §7.1 Stream operations. `mode`/`access`/`origin` are the FileMode/FileAccess/
+// SeekOrigin ordinals (declaration order from 0, §10.2); see the
+// implementation comment in bezel_runtime_fileio.cpp for the mapping.
+// ---------------------------------------------------------------------------
+
+// `new FileStream(path, mode[, access])`. path_data/path_len are the bz.string
+// payload (not NUL-terminated). Null on an OS open failure.
+void*   bz_filestream_open(const char* path_data, int64_t path_len,
+                           int32_t mode, int32_t access);
+// Flush-on-dispose (§7.2): flush buffered writes, close the handle, free.
+// Idempotent and null-tolerant.
+void    bz_filestream_dispose(void* h);
+void    bz_filestream_flush(void* h);
+// Windowed read/write over a bz_array_t* of bytes. Both return -1 for an
+// out-of-range window so the caller raises IndexOutOfRangeException (§7.1)
+// before any I/O; bz_filestream_read otherwise returns the byte count (0 at
+// end of stream), bz_filestream_write returns 0 (whole window) or -2.
+int64_t bz_filestream_read(void* h, void* arr, int32_t offset, int32_t count);
+int32_t bz_filestream_write(void* h, void* arr, int32_t offset, int32_t count);
+int64_t bz_filestream_seek(void* h, int64_t offset, int32_t origin);
+int64_t bz_filestream_length(void* h);
+int64_t bz_filestream_position(void* h);
+void    bz_filestream_set_position(void* h, int64_t pos);
+int32_t bz_filestream_can_read(void* h);
+int32_t bz_filestream_can_write(void* h);
+int32_t bz_filestream_can_seek(void* h);
+// ReadAll(): current position to end, as a fresh owned Array<byte>.
+void*   bz_filestream_read_all(void* h);
+// The `Path` property — a fresh +1 bz.string.
+void*   bz_filestream_path(void* h);
 
 // ---------------------------------------------------------------------------
 // Task scheduler — minimal cooperative/preemptive scheduler for async/await.
@@ -1211,6 +1262,23 @@ int32_t bz_str_indexof(const void* self, const void* sub);
 int32_t bz_str_lastindexof(const void* self, const void* sub);
 // Substring(start, count): fresh string of `count` code points from `start`.
 void*   bz_str_substring(const void* self, int64_t start, int64_t count);
+// stdlib §3.3 / #971 item 1: the ReadOnlyStringSpan search + compare family.
+// Each operand is an explicit (source string, start, len) code-point triple —
+// a span views a SUB-RANGE of its source, so the whole-string helpers above do
+// not apply. Comparison is code-point-by-code-point, so the two operands'
+// storage widths are irrelevant and may differ (§4.6). `Contains` is not a
+// separate entry point: it is `bz_strspan_indexof* >= 0` (§3.3). The returned
+// index of the IndexOf forms is relative to the RECEIVER SPAN's start.
+int32_t bz_strspan_indexof_cp(const void* self, int64_t s_start, int64_t s_len,
+                              int32_t cp);
+int32_t bz_strspan_indexof(const void* self, int64_t s_start, int64_t s_len,
+                           const void* other, int64_t o_start, int64_t o_len);
+int32_t bz_strspan_startswith(const void* self, int64_t s_start, int64_t s_len,
+                              const void* other, int64_t o_start, int64_t o_len);
+int32_t bz_strspan_endswith(const void* self, int64_t s_start, int64_t s_len,
+                            const void* other, int64_t o_start, int64_t o_len);
+int32_t bz_strspan_seqequal(const void* self, int64_t s_start, int64_t s_len,
+                            const void* other, int64_t o_start, int64_t o_len);
 // #1282: char.ToString() / char interpolation — a single-code-point string at
 // the narrowest storage width (preserves the full Unicode scalar, no truncation).
 void*   bz_char_to_string(int32_t cp);

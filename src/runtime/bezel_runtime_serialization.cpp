@@ -57,11 +57,23 @@ struct bz_binser_t {
     int32_t  json_pending_tag_id;
 };
 
+// fix #1762 finding R5: realloc-into-same-pointer leaks on failure — keep the
+// original buffer intact instead of overwriting it with NULL.
+//
+// A failed growth TERMINATES per spec §31.4 ("collection growth" / "string
+// construction"). The serializer does not bound-check on write, so every other
+// posture is unsafe: the first cut of this fix returned void and documented the
+// resulting overrun as acceptable ("strictly a leak fix"), which turns a
+// deterministic NULL-deref crash into a silent heap-buffer-overflow; dropping
+// the write instead would emit a silently TRUNCATED payload that no reader can
+// distinguish from a short one.
 static void bz_binser_ensure(bz_binser_t* s, int64_t need) {
     if (s->used + need <= s->cap) return;
     int64_t newcap = s->cap == 0 ? 256 : s->cap;
     while (newcap < s->used + need) newcap *= 2;
-    s->buf = static_cast<uint8_t*>(realloc(s->buf, (size_t)newcap));
+    void* tmp = realloc(s->buf, (size_t)newcap);
+    if (!tmp) bz_alloc_fail("serializer buffer growth");
+    s->buf = static_cast<uint8_t*>(tmp);
     s->cap = newcap;
 }
 
@@ -685,8 +697,13 @@ int32_t bz_binser_graph_assign_tag(void* serp, void* ptr) {
     auto* s = static_cast<bz_binser_t*>(serp);
     if (s->tag_count >= s->tag_cap) {
         int32_t newcap = s->tag_cap == 0 ? 16 : s->tag_cap * 2;
-        s->tag_ptrs = static_cast<void**>(realloc(s->tag_ptrs,
-                                                   (size_t)newcap * sizeof(void*)));
+        // fix #1762 finding R5: same realloc anti-pattern as bz_binser_ensure,
+        // same §31.4 posture. Returning 0 here would mean "not seen before" to
+        // every caller, silently breaking §9.8 graph identity (the same object
+        // would be re-emitted instead of back-referenced) rather than failing.
+        void* tmp = realloc(s->tag_ptrs, (size_t)newcap * sizeof(void*));
+        if (!tmp) bz_alloc_fail("serializer graph identity-tag table growth");
+        s->tag_ptrs = static_cast<void**>(tmp);
         s->tag_cap  = newcap;
     }
     s->tag_ptrs[s->tag_count++] = ptr;
@@ -822,9 +839,27 @@ static int bz_binder_read_le64_impl(bz_binder_t* d, uint64_t* out) {
     return 1;
 }
 
+// fix #688 / §2.15: forward-declared here so bz_binder_read_bz_string (below,
+// used before the definition at its usual spot near the other throw helpers)
+// can raise on binary truncation the same way bz_binder_read_int/_uint/_float
+// already do. Defined further down in this file.
+static void bz_ser_throw_at_binary(const char* msg, int64_t offset);
+
 // Read a LE32-prefixed UTF-8 byte string and return a heap-allocated
 // bz_string_struct* with adaptive-width code-point storage.
-// Returns nullptr on truncated data.
+// Raises SerializationException (bz_ser_throw_at_binary) on truncated data —
+// fix #2403 / stdlib §2.14/§2.15 (v0.235): a truncated length prefix or a
+// length prefix whose declared byte count exceeds the remaining buffer is
+// "malformed input" under the stdlib's Errors rule ("Malformed input ...
+// raise SerializationException"; §2.15 also states the binary format "is
+// length-prefixed", so an unsatisfiable length prefix is definitionally
+// malformed) — exactly the same failure shape bz_binder_read_int/_uint/_float
+// already raise on. Previously this returned nullptr silently, so a truncated
+// string VALUE (via bz_binder_read_string), CHAR (bz_binder_read_char), or
+// FIELD NAME/discriminator (the other callers below) looked like ordinary
+// end-of-data instead of an error — the "worse than a leak" silent-data-loss
+// defect in #2403, sharing its root cause with #2394's bool/decimal reports
+// (see the fixes to bz_binder_read_bool/bz_binder_read_decimal below).
 //
 // #635: the bz_string `len` field is a CODE-POINT count, not a byte count.
 // Previously this function set len=byte_len with width=1 (treating each byte as
@@ -837,9 +872,20 @@ static int bz_binder_read_le64_impl(bz_binder_t* d, uint64_t* out) {
 // buffer at that width, and set len to the decoded code-point count.  This mirrors
 // exactly what lowerStringLiteralConst() does at compile time.
 static void* bz_binder_read_bz_string(bz_binder_t* d) {
+    // fix #2403 / §2.15: capture the start-of-value offset once, mirroring the
+    // scalar readers and the object-header read above — both failure sites
+    // below (truncated length prefix, truncated payload) report the same
+    // start-of-field offset rather than the mid-read position.
+    int64_t off = d->pos;
     uint32_t byte_len = 0;
-    if (!bz_binder_read_le32_impl(d, &byte_len)) return nullptr;
-    if (d->pos + (int64_t)byte_len > d->len)     return nullptr;
+    if (!bz_binder_read_le32_impl(d, &byte_len)) {
+        bz_ser_throw_at_binary("Truncated binary input reading string length (§2.15)", off);
+        return nullptr;
+    }
+    if (d->pos + (int64_t)byte_len > d->len) {
+        bz_ser_throw_at_binary("Truncated binary input reading string data (§2.15)", off);
+        return nullptr;
+    }
 
     const uint8_t* src = d->data + d->pos;
     d->pos += (int64_t)byte_len;
@@ -1465,9 +1511,21 @@ void* bz_binder_read_decimal(void* derp) {
     auto* d = static_cast<bz_binder_t*>(derp);
     if (d->kind >= 1) return bz_jder_parse_decimal(d);
     static thread_local uint32_t dec_buf[4];
+    // fix #2394 / §2.15 (v0.235): each of the 4 LE32 words was read unchecked,
+    // so a truncated wire silently left the tail word(s) zeroed instead of
+    // raising — e.g. cutting the flags word zeroes the decimal's scale,
+    // turning 3.14m into the wrong value 314m with NO exception (silent data
+    // corruption, not just a missing-value default). Mirror bz_binder_read_int
+    // /_uint/_float: report the offset of the decimal's first byte, matching
+    // the "off = start of this value" convention used there and in
+    // bz_binder_read_bz_string above.
+    int64_t off = d->pos;
     for (int i = 0; i < 4; ++i) {
         uint32_t v = 0;
-        bz_binder_read_le32_impl(d, &v);
+        if (!bz_binder_read_le32_impl(d, &v)) {
+            bz_ser_throw_at_binary("Truncated binary input reading decimal (§2.15)", off);
+            return dec_buf;  // pending exception; caller's emitPendingCheck() discards this
+        }
         dec_buf[i] = v;
     }
     return dec_buf;
@@ -1486,8 +1544,15 @@ int8_t bz_binder_read_bool(void* derp) {
         bz_ser_throw_at_json("Expected JSON bool (§2.15)", d);
         return 0;
     }
+    // fix #2394 / §2.15 (v0.235): the byte read was unchecked, so truncation
+    // silently returned the default `false` instead of raising — mirror
+    // bz_binder_read_int/_uint/_float (and the JSON branch above, which
+    // already throws on its own malformed-input shape).
+    int64_t off = d->pos;
     uint8_t b = 0;
-    bz_binder_read_byte_impl(d, &b);
+    if (!bz_binder_read_byte_impl(d, &b)) {
+        bz_ser_throw_at_binary("Truncated binary input reading bool (§2.15)", off);
+    }
     return b ? 1 : 0;
 }
 
@@ -2017,6 +2082,13 @@ void* bz_binder_read_poly_discriminator(void* derp) {
 
         // Pre-count the remaining fields (from current position).
         int32_t total_count = bz_jder_count_object_fields(d);
+        // fix #2432 (§9.8 / stdlib §2.15, v0.235): mirrors #2427's fix on the
+        // "$case" sibling below (bz_binder_read_case_discriminator) — LSan-
+        // confirmed via a truncated {"$type":"leaf","V":9 (missing '}'): the
+        // pre-count itself raises internally (and returns -1) on truncation, an
+        // already-in-flight exception the unconditional bz_ser_throw a few lines
+        // down would otherwise supersede/orphan. Bail out before re-inspecting.
+        if (bz_exc) return nullptr;
         if (total_count <= 0) {
             bz_ser_throw("Polymorphic deserialize: empty object, missing \"$type\" field (§9.8)",
                          nullptr);
@@ -2057,12 +2129,32 @@ void* bz_binder_read_poly_discriminator(void* derp) {
         }
         // Skip ':'.
         if (!bz_jder_expect_char(d, ':')) {
+            // fix #2432 (§9.8 / stdlib §2.15, v0.235): bz_jder_expect_char already
+            // raised internally (bz_ser_throw_at_json) on failure; bail out before
+            // the manual bz_ser_throw below supersedes it (Bug-A pattern). By
+            // inspection, byte-identical in shape to the LSan-confirmed "$case"
+            // sibling a few lines down (bz_binder_read_case_discriminator).
+            if (bz_exc) return nullptr;
             bz_ser_throw("Polymorphic deserialize: expected ':' after \"$type\" (§9.8)", nullptr);
             return nullptr;
         }
+        // fix #2419 (§9.8 / stdlib §2.15, v0.235): skip whitespace between the
+        // "$type" colon and its value — the identical gap flagged (but not
+        // independently confirmed) on this function's "$case" sibling
+        // (bz_binder_read_case_discriminator, above); see the fix comment
+        // there for the full rationale.
+        bz_jder_skip_ws(d);
         // Read the discriminator string value.
         void* disc = bz_jder_parse_string(d);
         if (!disc) {
+            // fix #2432 (§9.8 / stdlib §2.15, v0.235): bz_jder_parse_string raises
+            // internally on every malformed-input path; the one exception (OOM in
+            // bz_jder_cps_to_bz_string) returns nullptr WITHOUT throwing, so the
+            // manual bz_ser_throw below remains the correct safety net for THAT
+            // case. Bail out only when an exception is already in flight. By
+            // inspection, byte-identical in shape to the LSan-confirmed "$case"
+            // sibling a few lines down (bz_binder_read_case_discriminator).
+            if (bz_exc) return nullptr;
             bz_ser_throw("Polymorphic deserialize: failed to read \"$type\" value (§9.8)", nullptr);
             return nullptr;
         }
@@ -2153,6 +2245,20 @@ void* bz_binder_read_case_discriminator(void* derp) {
         }
 
         int32_t total_count = bz_jder_count_object_fields(d);
+        // fix #2427 (§9.8 / stdlib §2.15, v0.235): bz_jder_count_object_fields
+        // itself raises SerializationException (and returns -1) when the object
+        // is truncated before its closing '}' — an already-in-flight exception.
+        // total_count == -1 also satisfies `total_count <= 0` below, so without
+        // this check the unconditional bz_ser_throw a few lines down would
+        // SUPERSEDE that exception with a second, unrelated one ("missing
+        // \"$case\"") — orphaning/leaking the first exception object (its own
+        // heap-allocated message string included). Bail out immediately instead,
+        // mirroring the pending-check idiom used throughout this file (e.g.
+        // bezel_runtime_decimal_guid.cpp's `if (bz_exc) return 0;`) and the
+        // RECORD-side sibling (bz_binder_begin_object's JSON path), which does
+        // not double-throw because it propagates total_count/-1 straight to its
+        // codegen caller's own emitPendingCheck() rather than re-inspecting it.
+        if (bz_exc) return nullptr;
         if (total_count <= 0) {
             bz_ser_throw("Choice deserialize: empty object, missing \"$case\" "
                          "discriminator (§9.8)", nullptr);
@@ -2191,12 +2297,35 @@ void* bz_binder_read_case_discriminator(void* derp) {
             return nullptr;
         }
         if (!bz_jder_expect_char(d, ':')) {
+            // fix #2432 (§9.8 / stdlib §2.15, v0.235): bz_jder_expect_char already
+            // raised internally (bz_ser_throw_at_json) on failure; bail out before
+            // the manual bz_ser_throw below supersedes it (Bug-A pattern,
+            // LSan-confirmed: a non-colon byte after "$case" leaked 123 bytes /
+            // 3 allocations behind the wrong exception message).
+            if (bz_exc) return nullptr;
             bz_ser_throw("Choice deserialize: expected ':' after \"$case\" (§9.8)",
                          nullptr);
             return nullptr;
         }
+        // fix #2419 (§9.8 / stdlib §2.15, v0.235): skip whitespace between the
+        // "$case" colon and its value so ordinary/pretty-printed JSON spacing
+        // (`"$case": "Both"`) is tolerated exactly like every other field-value
+        // read in this file (e.g. bz_binder_read_string at line ~1560, which
+        // skips ws before its own bz_jder_parse_string call). Without this,
+        // bz_jder_parse_string_cps requires d->pos to sit exactly on the
+        // opening '"' and spuriously raises "failed to read \"$case\" value"
+        // on legally-formatted, RFC 8259-compliant JSON.
+        bz_jder_skip_ws(d);
         void* disc = bz_jder_parse_string(d);
         if (!disc) {
+            // fix #2432 (§9.8 / stdlib §2.15, v0.235): bz_jder_parse_string raises
+            // internally on every malformed-input path; the one exception (OOM in
+            // bz_jder_cps_to_bz_string) returns nullptr WITHOUT throwing, so the
+            // manual bz_ser_throw below remains the correct safety net for THAT
+            // case. Bail out only when an exception is already in flight
+            // (Bug-A pattern, LSan-confirmed: an unknown \z escape in the "$case"
+            // value leaked 122 bytes / 3 allocations behind the wrong message).
+            if (bz_exc) return nullptr;
             bz_ser_throw("Choice deserialize: failed to read \"$case\" value (§9.8)",
                          nullptr);
             return nullptr;
