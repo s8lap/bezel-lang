@@ -1290,6 +1290,19 @@ private:
     // collections (e.g. OwningArray<OwningArray<R>>). Keyed by the TypeRef* of
     // the inner collection element type (unique per sema type).
     std::map<const sema::TypeRef*, llvm::Function*> nestedCollectionDisposerThunks_;
+    // #2279 (§30.5 Pattern A, v0.236): per-result-collection-type thunks for the
+    // intrinsic-collection case `Task<intrinsic-coll>` — when a Pattern A task
+    // produces an Array<T>/Set<T>/Dictionary<K,V>/LinkedList<T>/OwningBuffer<T>/
+    // OwningArray<T>/... etc. as its class-typed result, the existing
+    // elementPolicyFor-based path returns a null disposer (the element is a
+    // value/string/etc., not a class), so the produced collection's backing
+    // storage was never reclaimed at task disposal (an LSan leak of the
+    // bz_array_t*/bz_dict_t*/bz_llist_t* header+data). This cache holds the
+    // per-collection-kind thunks that free the collection via the appropriate
+    // runtime call (bz_array_free / bz_dict_free / bz_llist_free / bz_buffer_free)
+    // with the right per-element disposer, exactly mirroring the `using var`
+    // collection disposal path. Keyed on the result-collection TypeRef*.
+    std::map<const sema::TypeRef*, llvm::Function*> patternAResultCollectionDisposers_;
     // #429 / §4.6 / §28.9: the cached per-element string-release thunk (built
     // lazily) for a borrowing Array<string>'s co-owned string elements.
     llvm::Function* stringElementReleaseThunk_ = nullptr;
@@ -7113,6 +7126,20 @@ private:
     // separately in LlvmBackend_Disposal.cpp). Shared by emitAsyncMethod and
     // emitAsyncLambda.
     llvm::Function* patternAResultDisposerFor(const sema::TypeRef* taskTypeRef);
+
+    // #2279 (§30.5 Pattern A, v0.236): when the result type of a Pattern A
+    // `Task<T:class>` is itself an INTRINSIC COLLECTION (Array<T> / Set<T> /
+    // Dictionary<K,V> / LinkedList<T> / Stack<T> / Queue<T> / OwningBuffer<T> /
+    // Owning* collections), the task owns the result directly, and disposing
+    // the task must free the collection's backing storage (a bz_array_t*,
+    // bz_dict_t*, bz_llist_t*, or bz_buffer_t*). Returns the per-result-
+    // collection-type `void(void*)` thunk that frees the collection via the
+    // appropriate runtime call with the right per-element disposer, mirroring
+    // the `using var` collection disposal path. Cached. Returns null when
+    // `resultCollTy` is not an intrinsic collection (the existing
+    // class-typed-result path is then correct).
+    llvm::Function* patternAResultCollectionDisposer(
+        const sema::TypeRef* resultCollTy);
 
     // §30.6 (#488): emit the async state machine for an `async` LAMBDA. Called
     // from lowerLambda after the closure entry function `fn(env, params...)` is

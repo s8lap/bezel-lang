@@ -610,6 +610,17 @@ bool Emitter::suspendInTryPosition(
 //     set), but the two call sites would then disagree about WHO owns the
 //     decision, so this function deliberately excludes it.
 // Shared by emitAsyncMethod and emitAsyncLambda.
+// §30.5 / #2279 (v0.236): when T is itself an INTRINSIC COLLECTION
+// (Array<T>/Set<T>/Dictionary<K,V>/LinkedList<T>/Stack<T>/Queue<T>/
+// OwningBuffer<T>/Owning* collections), the task owns the collection's
+// backing storage directly — the elementPolicyFor path returns a null
+// per-element disposer (the element is a value/string/etc., not a class),
+// so the produced collection was never reclaimed at task disposal (an
+// LSan leak of the bz_array_t*/bz_dict_t*/bz_llist_t* header+data —
+// #2279's repro leaks 104 bytes from bz_array_alloc per async_body exit).
+// patternAResultCollectionDisposer (declared in impl.hpp, defined in
+// Disposal.cpp alongside the matching `using var` collection path) fills
+// that gap with a per-collection-kind free thunk.
 llvm::Function* Emitter::patternAResultDisposerFor(
     const sema::TypeRef* taskTypeRef) {
     // isTaskTypeName is the established Task/OwningTask recognizer (used by
@@ -626,8 +637,15 @@ llvm::Function* Emitter::patternAResultDisposerFor(
     if (name != "Task") return nullptr;  // excludes OwningTask (Pattern B)
     if (taskTypeRef->genericArgs.empty() || !taskTypeRef->genericArgs[0])
         return nullptr;
-    ElementPolicy pol =
-        elementPolicyFor(taskTypeRef->genericArgs[0], /*owningFamily=*/true);
+    const sema::TypeRef* tElem = taskTypeRef->genericArgs[0];
+    // #2279: try the intrinsic-collection result path first. If T is a
+    // recognized intrinsic collection, the per-collection-kind free thunk
+    // frees it at task disposal (with the right per-element disposer
+    // internally). Returns null when T is not an intrinsic collection, in
+    // which case we fall through to the existing class-instance path.
+    if (llvm::Function* collDisp = patternAResultCollectionDisposer(tElem))
+        return collDisp;
+    ElementPolicy pol = elementPolicyFor(tElem, /*owningFamily=*/true);
     return pol.cat == ElementPolicy::Category::ClassOwned ? pol.disposerThunk
                                                            : nullptr;
 }
