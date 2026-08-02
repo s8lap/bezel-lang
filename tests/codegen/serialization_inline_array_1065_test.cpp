@@ -86,25 +86,53 @@ BEZEL_TEST(codegen_serialization_1065, owning_inline_array_still_rejected_spec_9
         "class C public static method Main(): int return 0; end Main; end C;"));
 }
 
-// A `string` element is excluded for now (the leak this slice declines to
-// ship — see file header). Pins the CURRENT conservative-reject behavior so
-// a future fix that lifts it does so deliberately (by replacing this test),
-// not by accident.
-BEZEL_TEST(codegen_serialization_1065, inline_array_string_element_still_rejected_1065_followup) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// A `string` element is admitted now that #2326 extended the
+// record-scope-end release walk to recurse into inline arrays
+// (LlvmBackend_impl.hpp recordHasStringFields /
+// emitRecordStringFieldReleases_impl / emitInlineArrayStringReleases_impl
+// — the #2326 fix). The previous over-broad exclusion in
+// typeRiskingUnreleasedStringInInlineArray has been relaxed for the
+// direct `[N]string` shape; the deserialize's per-element GEP-store loop
+// now has a matching per-element bz_string_release at scope end.
+BEZEL_TEST(codegen_serialization_1065, inline_array_string_element_roundtrip_spec_9_8_v0228) {
+    BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
         "record Strs(Names: [2]string): ISerializable, IDeserializable; "
-        "class C public static method Main(): int return 0; end Main; end C;"));
+        "class C public static method Main(): int "
+        "  var original := new Strs([\"alpha\", \"beta\"]); "
+        "  using var s := new BinarySerializer(); "
+        "  original.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var back := Strs.Deserialize(d); "
+        "  return (if back.Names[0] = \"alpha\" and back.Names[1] = \"beta\" "
+        "          then 1 else 0); "
+        "end Main; end C;"), 1);
 }
 
-// A nested-RECORD element is likewise excluded for now (same conservative
-// reason — it may itself carry a string). Pins the current behavior.
-BEZEL_TEST(codegen_serialization_1065, inline_array_record_element_still_rejected_1065_followup) {
-    BEZEL_EXPECT_TRUE(compileFails(
+// A nested-RECORD element is admitted now that #2326 extended the
+// record-scope-end release walk to recurse into inline arrays — a
+// `[N]RecWithStringField` (or, as a simpler verification, a `[N]Point`
+// where Point has no string at all) is leak-clean. The previous
+// over-broad exclusion in typeRiskingUnreleasedStringInInlineArray
+// has been relaxed for the direct `[N]string` shape and the Named-
+// record/choice shape is now admitted by the same recursive call.
+BEZEL_TEST(codegen_serialization_1065, inline_array_record_element_roundtrip_spec_9_8_v0228) {
+    BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kImport +
-        "record Point(X: int, Y: int); "
+        "record Point(X: int, Y: int): ISerializable, IDeserializable; "
         "record Path(Points: [2]Point): ISerializable, IDeserializable; "
-        "class C public static method Main(): int return 0; end Main; end C;"));
+        "class C public static method Main(): int "
+        "  var original := new Path([new Point(1, 2), new Point(3, 4)]); "
+        "  using var s := new BinarySerializer(); "
+        "  original.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  var back := Path.Deserialize(d); "
+        "  return (if back.Points[0].X = 1 and back.Points[0].Y = 2 "
+        "             and back.Points[1].X = 3 and back.Points[1].Y = 4 "
+        "          then 1 else 0); "
+        "end Main; end C;"), 1);
 }
 
 // ===========================================================================

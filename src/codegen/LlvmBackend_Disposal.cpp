@@ -1964,6 +1964,142 @@ void Emitter::emitChoiceStringFieldReleases_impl(
 }
 
 
+// fix #2326 / §9.8 v0.228: does the (statically-resolved) element type `tr`
+// of a non-nullable inline array carry a string — directly (a `string`
+// element), or transitively (through a non-nullable nested record / choice /
+// inline-array element)? Mirrors the per-field arm of recordHasStringFields
+// (LlvmBackend_impl.hpp) in shape: walk the element type one layer, and
+// recurse into the named record / choice / inline-array cases. The
+// element-type recursion is finite for the same reason as the record /
+// choice walks: sema rejects a self-containing value-type graph at the
+// declaration site (recordValueContainsSelf / checkChoiceSelfContainment
+// in TypeResolution_Checks.cpp), so the reachable type graph is a finite
+// DAG. A nullable element type is treated as string-free: a `string?` field
+// in a record lowers to a {i8, ptr} wrapper that the existing nullable
+// exclusion already handles, and the inline-array shape carries no parallel
+// obligation in the spec.
+//
+// Generic named element types are excluded by their own gate (declaration
+// null at this layer) — the same narrow, documented scope
+// choiceHasStringFields above has, mirroring #2405's record recursion. A
+// generic value-type element is therefore a residual gap, not a new one
+// this fix introduces; the live repros of this issue are all concrete.
+bool Emitter::inlineArrayElementCarriesString(const sema::TypeRef* tr) {
+    if (!tr || tr->nullable) return false;
+    using K = sema::TypeRef::Kind;
+    if (tr->kind == K::Primitive)
+        return tr->primitive == sema::PrimitiveType::String;
+    if (tr->kind == K::InlineArray)
+        return tr->arrayElement &&
+               inlineArrayElementCarriesString(tr->arrayElement);
+    if (tr->kind == K::Named && tr->declaration) {
+        if (tr->declaration->kind == ast::TypeDeclKind::Record)
+            return recordHasStringFields(tr->declaration);
+        if (tr->declaration->kind == ast::TypeDeclKind::Choice)
+            return choiceHasStringFields(tr->declaration);
+        return false;  // enum: integer representation, no string to release
+    }
+    return false;
+}
+
+
+// fix #2326 / §9.8 v0.228: release every `string` storage reachable from
+// inline-array element type at array ADDRESS `arrAddr` for the array
+// type `arrayTy` (the OUTER inline-array TypeRef). Parallels
+// emitInlineArrayEquality (LlvmBackend_Layout.cpp, §8.3 / §15.1.2): N is
+// compile-time-constant (`arraySizeValue`, folded by sema per §15.1.2),
+// so the walk is unrolled. Per-element dispatch mirrors
+// emitRecordStringFieldReleases_impl's nested-field dispatch: a `string`
+// element is bz_string_release'd and the slot nulled (matching the field
+// nulling in the record walker); a non-nullable record element recurses
+// via emitRecordStringFieldReleases_impl; a non-nullable choice element
+// recurses via emitChoiceStringFieldReleases_impl; a non-nullable nested
+// inline-array element recurses into itself. The element-type recursion
+// terminates for the same reason as the predicate's: a finite DAG over
+// the value-type graph.
+//
+// A NULLABLE element is excluded by the same reasoning the choice /
+// record walkers use: it lowers to a {i8, T} wrapper, not the bare layout
+// this walker assumes. A nullable element on a non-nullable array (e.g.
+// `[N]string?`) is therefore a separate concern: the wire path stores an
+// `i8` discriminator alongside each element; the inline-array
+// serialization lane currently rejects nullable element types
+// (isSerializationEligibleType's own gate, see TypeResolution_Checks.cpp),
+// so a nullable-element inline array is not a live shape here.
+//
+// Takes the OUTER array TypeRef (not just the element type) so the
+// per-element loop can derive N from `arraySizeValue` directly. Modern
+// LLVM opaque pointers would otherwise force a `getElementType` on the
+// pointee (which may be a primitive ptr, not a PointerType).
+//
+// Used by:
+//   * emitRecordStringFieldReleases_impl (LlvmBackend_impl.hpp), to
+//     recurse into a non-nullable inline-array field of a record;
+//   * the #2326 deserialize-disposal-scope registration
+//     (LlvmBackend_Serialization.cpp), to release the strings on a
+//     non-nullable inline-array component / payload slot against a
+//     LATER sibling's read throwing — its own entry, parallel to the
+//     recordStringFields / choiceStringFields entries.
+void Emitter::emitInlineArrayStringReleases_impl(
+        llvm::Value* arrAddr, const sema::TypeRef* arrayTy) {
+    if (!arrAddr || !arrayTy) return;
+    // The element type is the array's `arrayElement`; N is `arraySizeValue`
+    // (§15.1.2, folded by sema). §15.1 forbids an inline array of inline
+    // arrays in practice, so a NESTED `[M][N]T` is never live here — the
+    // recursion below handles only the defensive "what if §15.1 changes"
+    // case, and `arrayElement` will be a string-bearing non-Array type in
+    // every actual live shape.
+    const sema::TypeRef* elemTy = arrayTy->arrayElement;
+    int n_signed = arrayTy->arraySizeValue;
+    if (!elemTy || n_signed < 0) return;
+    if (elemTy->nullable) return;
+    // Guard with the same predicate: if the element type carries no
+    // string, there is nothing to release (the caller only ever invokes
+    // this when the gate was true, but defense-in-depth matches the
+    // emitChoiceStringFieldReleases_impl pattern).
+    if (!inlineArrayElementCarriesString(elemTy)) return;
+    unsigned n = static_cast<unsigned>(n_signed);
+
+    llvm::Type* elemLlvmTy = lowerTypeRef(elemTy);
+    if (!elemLlvmTy) return;
+    auto* arrLlvmTy = llvm::ArrayType::get(elemLlvmTy, n);
+    for (unsigned i = 0; i < n; ++i) {
+        llvm::Value* slotAddr = builder_.CreateConstGEP2_64(
+            arrLlvmTy, arrAddr, 0, i, "inlarr.elem.addr");
+        if (elemTy->kind == sema::TypeRef::Kind::Primitive &&
+            elemTy->primitive == sema::PrimitiveType::String) {
+            llvm::Value* v =
+                builder_.CreateLoad(ptrTy(), slotAddr, "inlarr.str.val");
+            emitStringRelease(v);
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                                 slotAddr);
+            continue;
+        }
+        if (elemTy->kind == sema::TypeRef::Kind::InlineArray) {
+            // Nested inline array: recurse into the sub-element type
+            // against the sub-array's address. §15.1 forbids this in
+            // practice (an inline array may not be the element of
+            // another inline array) — left in place defensively in case
+            // §15.1 ever changes; the recursion is finite.
+            emitInlineArrayStringReleases_impl(slotAddr, elemTy);
+            continue;
+        }
+        if (elemTy->nullable || elemTy->kind != sema::TypeRef::Kind::Named ||
+            !elemTy->declaration)
+            continue;
+        if (elemTy->declaration->kind == ast::TypeDeclKind::Record &&
+            recordHasStringFields(elemTy->declaration)) {
+            emitRecordStringFieldReleases_impl(slotAddr, elemTy->declaration);
+            continue;
+        }
+        if (elemTy->declaration->kind == ast::TypeDeclKind::Choice &&
+            choiceHasStringFields(elemTy->declaration)) {
+            emitChoiceStringFieldReleases_impl(slotAddr, elemTy->declaration);
+        }
+    }
+}
+
+
 void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
                                           llvm::Value* recvPtr,
                                           const sema::TypeRef* resultTy,
@@ -2763,6 +2899,22 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // throw path this scope exists to guard).
         if (it->choiceStringFields) {
             emitChoiceStringFieldReleases(it->slot, it->cls);
+            continue;
+        }
+        // fix #2326 / §9.8 v0.228: the array-side mirror of
+        // `choiceStringFields` just above — a non-nullable INLINE-ARRAY
+        // deserialize component/payload slot whose element type carries
+        // a string. The disposer's element TypeRef drives the per-element
+        // dispatch (string → release; record → recurse; choice →
+        // choice walker; nested array → recurse). Runs on BOTH the
+        // normal and unwind exits, gated on the same `stringReleaseEligible_`
+        // class as `stringRelease` / `recordStringFields` /
+        // `choiceStringFields` — the registration is popped WITHOUT
+        // disposal once every required component is confirmed present
+        // (#2398 / #2425 disposal-scope semantics), so this only ever
+        // fires on the throw path the scope exists to guard.
+        if (it->inlineArrayStringFields) {
+            emitInlineArrayStringReleases(it->slot, it->inlineArrayElemType);
             continue;
         }
         // #429 / §27.5: a boxed capture cell (shared heap allocation from

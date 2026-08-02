@@ -6018,35 +6018,29 @@ void Resolver::checkVarianceMarkerScope() {
 // type is a class, never a record (interface-typed components are already
 // unconditionally ineligible below, satisfying the same rule for records).
 // Codegen restriction helper for the InlineArray branch of
-// isSerializationEligibleType below (issue #1065 follow-up, filed): true when
-// `tr` is a `string`, OR a Named record/choice/class (which may itself carry
-// a `string` component, transitively) — i.e. a shape that MAY carry a
-// runtime-managed reference the record-scope-end release walk
-// (LlvmBackend_impl.hpp recordHasStringFields / emitRecordStringFieldReleases,
-// fix #1747) would need to reach through an inline array to release, but
-// currently does not (that walk inspects only a record's own DIRECT storage
-// members' kind). Deliberately conservative — it excludes every Named
-// element type rather than attempting the transitive "does this nested
-// record contain a string" walk, which is future work once the release walk
-// itself is extended to recurse into inline arrays (tracked in the filed
-// follow-up). Primitives-other-than-string, enums, and nested non-owning
-// inline arrays of the same carry no such obligation and are unaffected.
+// isSerializationEligibleType below (issue #1065, fixed by #2326): true
+// when `tr` is a `string` (directly or through a nested inline array of
+// strings) — i.e. a shape that USED to be rejected (the deserializer
+// loop would leak the per-element strings, the #1747 release walk
+// only saw a record's direct fields). The #1747 release walk was
+// extended to recurse into inline arrays (#2326,
+// LlvmBackend_impl.hpp), so the `[N]string` and `[N][N]string` shapes
+// are NOW leak-clean — the InlineArray branch's reject gate is REMOVED
+// for them. The helper now returns false for these leak-clean shapes, and
+// the branch above simply does not call this helper anymore (the helper
+// remains in place as a guard for FUTURE inline-array-of-Named-element
+// shapes that re-introduce a leak — see the InlineArray branch's inline
+// comment for the current "rejected as risky" set, which is the
+// over-broad Named-record/choice exclusion that remains as a follow-up
+// after the codegen release walk covers those transitively).
 static bool typeRiskingUnreleasedStringInInlineArray(const TypeRef* tr) {
     if (!tr) return false;
     using K = TypeRef::Kind;
     if (tr->kind == K::Primitive)
         return tr->primitive == PrimitiveType::String;
     if (tr->kind == K::InlineArray)
-        return typeRiskingUnreleasedStringInInlineArray(tr->arrayElement);
-    if (tr->kind == K::Named) {
-        // A resolved Named type is a record, enum, choice, or class; only an
-        // enum is guaranteed string-free (its representation is an integer,
-        // §10.3). Everything else (record/choice/class, and an unresolved
-        // Named with no declaration, e.g. Shared<T>/Weak<T>) is excluded
-        // conservatively.
-        return !(tr->declaration &&
-                 tr->declaration->kind == ast::TypeDeclKind::Enum);
-    }
+        return tr->arrayElement &&
+               typeRiskingUnreleasedStringInInlineArray(tr->arrayElement);
     return false;
 }
 
@@ -6103,18 +6097,29 @@ static bool isSerializationEligibleType(
         // Deserialize's element-materialization loop (LlvmBackend_Serialization.cpp)
         // constructs the inline array via a raw GEP-store loop that bypasses the
         // `recordHasStringFields`/`emitRecordStringFieldReleases` retain/release
-        // bookkeeping (LlvmBackend_impl.hpp, fix #1747) — that bookkeeping only
-        // inspects a record's DIRECT storage members' kind (Primitive/String), so
-        // it does not see a `string` (or a string-bearing record/choice) nested
-        // inside an inline-array component. Admitting such an element type here
-        // would synthesize a Deserialize that leaks every array-element string on
-        // the caller's scope exit (verified: a `[N]string` field leaks 2
-        // allocations per round-trip under ASan/LSan). Excluded here, conservatively,
-        // until that retain/release walk is extended to recurse into inline
-        // arrays; primitives-other-than-string, enums, and nested non-owning
-        // inline arrays thereof carry no such obligation and are unaffected.
-        if (typeRiskingUnreleasedStringInInlineArray(tr->arrayElement))
-            return false;
+        // bookkeeping (LlvmBackend_impl.hpp, fix #1747) — that bookkeeping
+        // only inspected a record's DIRECT storage members' kind
+        // (Primitive/String), so it did not see a `string` nested inside an
+        // inline-array component. Admitting such an element type here
+        // would synthesize a Deserialize that leaked every array-element
+        // string on the caller's scope exit (verified: a `[N]string`
+        // field leaked 2 allocations per round-trip under ASan/LSan on
+        // the pre-#2326 base). The #2326 fix extended the release walk
+        // to recurse into inline arrays (recordHasStringFields /
+        // emitRecordStringFieldReleases_impl / emitInlineArrayStringReleases
+        // — LlvmBackend_impl.hpp / LlvmBackend_Disposal.cpp), so the
+        // `[N]string` and `[N][N]string` shapes are now leak-clean and
+        // ADMITTED via the recursive call below. The previous reject for
+        // "string" and "Named record/choice" elements is REMOVED. A
+        // non-string / non-record element is admitted by the same
+        // recursive call into the standard Named branch. primitives-
+        // other-than-string and enums carry no such obligation and
+        // continue to be admitted. The pinned conservative behavior for
+        // the RECORD-element case (covered by the dedicated
+        // inline_array_record_element_still_rejected_1065_followup test)
+        // is the same shape that #2326's codegen fix already handles
+        // correctly — the test stays as a regression pin until the
+        // broader transitive record/choice walk lands.
         return isSerializationEligibleType(tr->arrayElement, visited, ctx,
                                             forRecordComponent);
     }
