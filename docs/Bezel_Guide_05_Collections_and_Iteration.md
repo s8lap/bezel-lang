@@ -40,9 +40,10 @@ So: an owning collection admits only class or interface elements (`where T: clas
 
 **Picking one is stating intent.** A holder that must dispose its elements says so in the type — `private owned _sessions: OwningArray<Session>;` — and the cascade replaces any destructor (Guide 1 §5). A collection that merely *indexes* objects owned elsewhere is the borrowing form, and storing a borrow carries the usual obligation: the element's owner must outlive the collection's use of it (spec §28.11).
 
-**The names tell you whether you now owe a disposal** (stdlib §1; spec §22.6): `Get`, `Peek`, `GetOrNull`, the indexer — borrows, no obligation; `Pop`, `Dequeue`, `Take`, `PopValue`, `Drain` — transfers, you discharge the result.
+**The names tell you whether you now owe a disposal** (stdlib §1; spec §22.6): `Get`, `Peek`, `GetOrNull`, the indexer — borrows, no obligation; on the **owning** family, `Pop`, `Dequeue`, `Take`, `PopValue`, `Drain` — transfers, you discharge the result. (The borrowing `Stack<T>`/`Queue<T>` at class elements hand back the same borrow they dropped — `Pop` and `Dequeue` there produce borrows sourced at the collection, stdlib §4.11.)
 
 ```bezel
+// jobs: OwningStack<Job>
 var top := jobs.Peek();          // borrow — the stack still owns it
 using var next := jobs.Pop();    // transfer — yours now, disposed at scope end
 ```
@@ -93,7 +94,7 @@ The mutating interfaces are deliberately separate hierarchies (`IList<T>` vs `IO
 
 Two consequences do the habit-breaking.
 
-**An element borrow does not escape the loop.** Over a *concrete* collection the borrow's source is the collection itself, so keeping a reference past the loop is fine while the collection lives. Over an *interface-typed* source the compiler cannot see the backing — the yielded value may live in the enumerator, which the loop disposes — so the variable's source is conservatively the loop's own enumerator, and any escape is rejected (spec §28.3/§29.2, v0.235):
+**An element borrow does not escape the loop.** Over a *concrete* collection the borrow's source is the collection itself, so keeping a reference past the loop is fine while the collection lives — with §1's residual still yours on the borrowing family: the elements' own owners must outlive that use (spec §28.11). Over an *interface-typed* source the compiler cannot see the backing — the yielded value may live in the enumerator, which the loop disposes — so the variable's source is conservatively the loop's own enumerator, and any escape is rejected (spec §28.3/§29.2, v0.235):
 
 ```bezel
 method Report(samples: IEnumerable<Sample>)
@@ -120,7 +121,7 @@ method Report(samples: Array<Sample>)   // concrete: the array is the backing
 end Report;
 ```
 
-When you are handed an interface over a collection-backed sequence, materializing first (`.ToArray()`, §4) gives you such a concrete backing to loop over. When the source *mints* its elements (an iterator yielding `new …`), no borrowing spelling keeps them alive — the elements need a real owner: the owning path of §3, or an owning collection built up front. (This is also why you cannot write your own `First()` over arbitrary `IEnumerable<T>` at class elements — see §6.)
+When you are handed an interface over a collection-backed sequence, materializing first (`.ToArray()`, §4) gives you such a concrete backing to loop over. When the source *mints* its elements (an iterator yielding `new …`), the elements need an owner that outlives the loop: the owning path of §3, or an owning collection built up front. (This is also why you cannot write your own `First()` over arbitrary `IEnumerable<T>` at class elements — see §6.)
 
 **You never dispose a borrowed element.** Only owners dispose (spec §28.6; Guide 1 §9), and a default-iteration variable, an indexer-get, and `entry.Value` are all borrows:
 
@@ -171,7 +172,7 @@ end;
 
 (The *borrowing* `Dictionary<K, V>` iterates entries directly — `for var entry in dict` yields `DictionaryEntry<K, V>` values in insertion order, `entry.Value` a borrow at class V. The owning dictionary deliberately has **no** default entry iteration: its common intent is transfer, so you either iterate `Keys` to look or `Drain()` to take — stdlib §4.8/§4.9.)
 
-For *one* element, use the take-forms — `PopAt(i)`/`PopFirst()`/`PopLast()` on `OwningArray<T>`, `Pop()`/`Dequeue()` on the owning stack and queue, `PopValue(key)` on the owning dictionary, `Take(query)` on the owning set, each with `Try*` variants (Guide 2 §2 shows the `Try` + `out using var` call shape). They remove the slot and hand you the owned element in one call. The low-level form is `move coll[i]`: it takes the element but leaves the slot **moved-from**, and the field-restoration rule applies — restore the slot before the method can exit (spec §28.8.1/§28.11; the same discipline as `move` on a field, Guide 1 §7):
+For *one* element, use the take-forms — `PopAt(i)`/`PopFirst()`/`PopLast()` on `OwningArray<T>`, `Pop()`/`Dequeue()` on the owning stack and queue, `PopValue(key)` on the owning dictionary, `Take(query)` on the owning set, each with a `Try*` variant except `PopAt` (Guide 2 §2 shows the `Try` + `out using var` call shape). They remove the slot and hand you the owned element in one call. The low-level form is `move coll[i]`: it takes the element but leaves the slot **moved-from**, and the field-restoration rule applies — restore the slot before the method can exit (spec §28.8.1/§28.11; the same discipline as `move` on a field, Guide 1 §7):
 
 ```bezel
 var fresh := Connect("fresh");   // build the replacement first — it may throw
@@ -288,7 +289,8 @@ idle?.Ping();                     // fine while fleet lives — fleet is the bac
 **The trap is the minting pipeline.** Over a fresh-yield source — an iterator that `new`s its elements, or an operator chain over one — the element lives in the pipeline's *own* enumerator, which the terminal operator disposes before returning. The borrow you get back points at a disposed element, and the next use faults deterministically in checked mode (`DisposedAccessException`, spec §28.2):
 
 ```bezel
-var p := Probes(8).First();       // Probes is an iterator minting fresh Probe objects
+using var probes := Probes(8);    // Probes is an iterator minting fresh Probe objects
+var p := probes.First();          // borrow of the element, sourced at probes — compiles
 p.Run();                          // checked mode: DisposedAccessException — the element
                                   //   died with First()'s internal enumerator
 ```
