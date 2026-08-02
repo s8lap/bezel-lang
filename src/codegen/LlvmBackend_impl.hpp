@@ -5262,11 +5262,50 @@ private:
     // A RETURN site can ignore it — the caller owns a returned enumerator by
     // construction (#1916); the ARGUMENT site must consult it and register
     // the scope-end iterEnumDispose (#1923, #2298).
+    // `srcOwnedByCallee`, when true, signals that the source expression is a
+    // callee-owned local whose underlying collection (Array/Stack/Queue/
+    // LinkedList/dict-backed-Set) the wrap only BORROWS — fix #2299 / §28.9:
+    // the wrap's slot-1 Dispose frees the wrapper frame but NEVER the backing,
+    // and the source local's scope-end reclaim is suppressed by §28.3
+    // ownership-transfer on `return`. This registers a scope-end disposal for
+    // the source so the RETURN produces no leak — the wrapper frame is freed
+    // first (LIFO), then the source collection. Caller MUST have verified
+    // callee-ownership (a NewExpr, a producer-initialized local, or a move);
+    // parameter/field/already-IEnumerable sources stay false to avoid freeing
+    // someone else's collection.
     llvm::Value* wrapAsIEnumerableForTarget(llvm::Value* v,
                                             const sema::TypeRef* targetTy,
                                             const ast::Expr* srcExpr,
                                             bool ownLazyPipeline = false,
-                                            bool* outWrapMade = nullptr);
+                                            bool* outWrapMade = nullptr,
+                                            bool srcOwnedByCallee = false);
+    // fix #2299 / §28.9 (RETURN-coercion source-ownership probe): is `src`
+    // the OWNED producer of a heap-allocated collection whose RETURN transfer
+    // moves ownership into the callee? Returns true for `new Array<int>()`,
+    // `new LinkedList<int>()`, `new Set<int>()` etc. (a NewExpr for a class
+    // type — §28.3 K1 — or a move expression), and for an IdentifierExpr
+    // naming a LOCAL whose initializer was a producer form (NewExpr/CallExpr)
+    // — mirrors producerState's "Owned" verdict at the OWNERSHIP pass. A bare
+    // parameter/field read, a method-call result whose declared return is not
+    // `owned`, and any initializer that is itself a borrow (an IdentifierExpr
+    // naming another local, a MemberAccess, an IndexExpr — §28.3 "storage
+    // lends") return false. Conservative: a shape we cannot classify without
+    // a deeper ownership analysis defaults to false (do NOT free — better
+    // leak a non-confirmed transfer than risk a UAF).
+    bool returnSourceIsCalleeOwnedCollection(const ast::Expr* src) const;
+
+    // fix #2299 / §28.9: emit an immediate free on the source collection
+    // right at the RETURN coercion (NOT at scope end — scope-end disposal
+    // would race the caller's iteration of the wrapping enumerator and
+    // free the source out from under it). Only safe when the caller has
+    // already established srcOwnedByCallee (the source is no longer needed
+    // because the wrap takes its slot-1 backing; for Array-family the
+    // OWNING wrap owns the source via its slot-1 Dispose; for Stack and
+    // LinkedList the source is freed here and the caller disposes only the
+    // wrapper frame; for dict-backed Set the snapshot is independent).
+    void freeCollectionSourceNow(llvm::Value* v);
+    void freeDictSourceNow(llvm::Value* v);
+    void freeLinkedListSourceNow(llvm::Value* v);
 
     // #1916 / #1911 / stdlib §5 / §29.11: drain a lazy LINQ pipeline (bz_lazy_t*)
     // once into a fresh owned Array<T> (bz_lazy_to_array also disposes the

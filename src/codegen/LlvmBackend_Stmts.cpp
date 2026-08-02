@@ -2017,7 +2017,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (v && rs->value && currentReturnTypeNode_)
             v = wrapAsIEnumerableForTarget(
                 v, ctx_.resolvedType(*currentReturnTypeNode_), rs->value.get(),
-                /*ownLazyPipeline=*/true);
+                /*ownLazyPipeline=*/true,
+                /*outWrapMade=*/nullptr,
+                /*srcOwnedByCallee=*/
+                returnSourceIsCalleeOwnedCollection(rs->value.get()));
         // #429 (RETURN-escape category) / §4.6 / §28.9 / §28.3: a method whose
         // declared return type is (non-nullable) `string` mints EXACTLY +1 for
         // the returned value, transferring ownership of one reference to the

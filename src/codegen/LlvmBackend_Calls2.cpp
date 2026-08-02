@@ -8506,7 +8506,10 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
             if (rv && ci.returnType)
                 rv = wrapAsIEnumerableForTarget(
                     rv, ctx_.resolvedType(*ci.returnType), ci.exprBody,
-                    /*ownLazyPipeline=*/true);
+                    /*ownLazyPipeline=*/true,
+                    /*outWrapMade=*/nullptr,
+                    /*srcOwnedByCallee=*/
+                    returnSourceIsCalleeOwnedCollection(ci.exprBody));
             // #2491 (twin of #2434): expression-body return failed to lower —
             // emitReturn's `v ? v : null` fallback would silently substitute a
             // zero/null return. See the ReturnStmt site in
@@ -8871,9 +8874,16 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
             // #1916: ownLazyPipeline=true — this is a RETURN position (the caller
             // owns the inlined result), so a lazy pipeline returned as
             // IEnumerable<T> is drained into an OWNING enumerator (leak-free).
+            // fix #2299 / §28.9: srcOwnedByCallee honours the §28.3 ownership
+            // transfer on `return` of a callee-owned local whose underlying
+            // collection the wrap only borrows (registers a scope-end
+            // bz_array_free / bz_dict_free / bz_llist_free for the source).
             result = wrapAsIEnumerableForTarget(
                 result, ctx_.resolvedType(*ci.returnType), ci.exprBody,
-                /*ownLazyPipeline=*/true);
+                /*ownLazyPipeline=*/true,
+                /*outWrapMade=*/nullptr,
+                /*srcOwnedByCallee=*/
+                returnSourceIsCalleeOwnedCollection(ci.exprBody));
         }
     } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
         // Block body: compile a specialized function and call it.

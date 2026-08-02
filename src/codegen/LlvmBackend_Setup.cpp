@@ -6267,7 +6267,10 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             if (v && currentReturnTypeNode_)
                 v = wrapAsIEnumerableForTarget(
                     v, ctx_.resolvedType(*currentReturnTypeNode_), ci.exprBody,
-                    /*ownLazyPipeline=*/true);
+                    /*ownLazyPipeline=*/true,
+                    /*outWrapMade=*/nullptr,
+                    /*srcOwnedByCallee=*/
+                    returnSourceIsCalleeOwnedCollection(ci.exprBody));
             // #694 residue-1 / §4.6 / §28.9 / §28.3: an arrow-body (`=> expr`)
             // string-returning method must mint EXACTLY +1 just like the explicit
             // ReturnStmt path (LlvmBackend_Stmts.cpp line ~750). Without this,

@@ -4200,7 +4200,7 @@ bool Emitter::argsCanFill(const std::vector<ast::Param>& params,
 llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         llvm::Value* v, const sema::TypeRef* targetTy,
         const ast::Expr* srcExpr, bool ownLazyPipeline,
-        bool* outWrapMade) {
+        bool* outWrapMade, bool srcOwnedByCallee) {
     if (outWrapMade) *outWrapMade = false;
     if (!v || !targetTy || !srcExpr) return v;
     if (!(targetTy->kind == sema::TypeRef::Kind::Named &&
@@ -4272,6 +4272,19 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         // dispatch is correct as-is for the nested shape too.
         if (nestedIEnumViewNeeded(actualTy, targetTy)) {
             if (outWrapMade) *outWrapMade = true;
+            // fix #2299 / §28.9: callee-owned source → use the OWNING
+            // nested-array enumerator (its slot-1 Dispose frees BOTH the
+            // wrapper frame and the backing array exactly once). For
+            // borrowed source, keep the plain wrap.
+            if (srcOwnedByCallee) {
+                // The nested wrap currently doesn't have an owning variant;
+                // free the source immediately and return the plain wrap. The
+                // caller will dispose the wrapper frame (free(self)).
+                llvm::Value* wrap =
+                    wrapNestedArrayAsIEnumerable(v, actualTy, targetTy);
+                freeCollectionSourceNow(v);
+                return wrap;
+            }
             return wrapNestedArrayAsIEnumerable(v, actualTy, targetTy);
         }
         // #2486 (stdlib §4.11 "Iteration order" v0.195; language spec §29.1,
@@ -4289,7 +4302,25 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         // (buildOrderedArgs) registers the scope-end iterEnumDispose that
         // frees the wrapper frame (slot-1 Dispose = `free(self)` for both
         // Array and Stack — only the frame, never the shared backing).
+        // fix #2299 / §28.9: at the RETURN coercion, a callee-owned Array/
+        // Queue source is wrapped in an OWNING enumerator (slot-1 Dispose
+        // frees the wrapper frame AND the backing array — the caller
+        // disposes the enumerator exactly once). A Stack/OwningStack source
+        // has no OWNING-wrap variant in this fix; the borrowing wrap is
+        // kept and the source is freed immediately after the wrap is built
+        // (the wrap's slot-1 Dispose is still `free(self)` on the caller's
+        // side, freeing only the wrapper frame — the backing was already
+        // reclaimed). A borrowed source keeps the plain wrap (the source's
+        // owner retains the disposal obligation).
         if (outWrapMade) *outWrapMade = true;
+        if (srcOwnedByCallee) {
+            if (an == "Stack" || an == "OwningStack") {
+                llvm::Value* wrap = wrapStackAsIEnumerator(v, targetTy);
+                freeCollectionSourceNow(v);
+                return wrap;
+            }
+            return wrapOwnedArrayAsIEnumerable(v, targetTy);
+        }
         if (an == "Stack" || an == "OwningStack")
             return wrapStackAsIEnumerator(v, targetTy);
         return wrapArrayAsIEnumerable(v, targetTy);
@@ -4299,10 +4330,13 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // snapshot. Reuses the tested §389 Set lazy source (bz_lazy_from_set, which
     // snapshots the key table) and the #1916 drain (bz_lazy_to_array, which
     // materialises the array AND disposes the lazy source), so the only new
-    // object is the snapshot the returned enumerator owns. The SOURCE set is
-    // untouched — no element is retained, released, or disposed here, so an
-    // owning set still disposes each element exactly once at its own binder's
-    // scope end. `outWrapMade` tells the caller it must dispose the enumerator.
+    // object is the snapshot the returned enumerator owns. fix #2299 / §28.9:
+    // the SOURCE set is no longer needed once the snapshot is taken (the
+    // snapshot is independent, owning its own key table) — the caller
+    // returns the OWNING-enumerator snapshot, while the source set is freed
+    // right here at the RETURN site. (Registering the free at scope end
+    // would race the caller's use of the returned wrapper.) The source local's
+    // normal reclaim is suppressed by §28.3, so this free is exactly-once.
     if (actualTy && (an == "Set" || an == "OwningSet")) {
         uint64_t ksz = 0;
         if (genericBackingType(actualTy, 0, /*isSet=*/true, &ksz)) {
@@ -4310,17 +4344,24 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
             llvm::Value* lazy = builder_.CreateCall(
                 setFn, {v, builder_.getInt64((int64_t)ksz)}, "setenum.lazy");
             if (outWrapMade) *outWrapMade = true;
+            // fix #2299 / §28.9: free the source set right after the snapshot.
+            if (srcOwnedByCallee)
+                freeDictSourceNow(v);
             return drainLazyPipelineToOwnedIEnumerable(lazy, targetTy);
         }
     }
     // fix #2298 / §28.9: LinkedList<T> widened to `IEnumerable<T>` here uses
     // the plain borrow wrap (slot-1 Dispose = `free(self)`, the wrapper frame
-    // only). The backing bz_llist_t* is freed by the source local's own
-    // scope-end reclaim, never by the wrap. Report `outWrapMade = true` so
-    // buildOrderedArgs registers the scope-end iterEnumDispose that frees
-    // the wrapper frame exactly once.
+    // only). fix #2299 / §28.9: LinkedList has no OWNING-wrap variant in
+    // this fix; for a callee-owned return, free the source immediately after
+    // the wrap is built (the caller disposes the wrap frame only).
     if (actualTy && isLinkedListTypeName(actualTy)) {
         if (outWrapMade) *outWrapMade = true;
+        if (srcOwnedByCallee) {
+            llvm::Value* wrap = wrapLinkedListAsIEnumerable(v, targetTy);
+            freeLinkedListSourceNow(v);
+            return wrap;
+        }
         return wrapLinkedListAsIEnumerable(v, targetTy);
     }
     // A user class implementing IEnumerable<T> (declaration-carrying). A source
@@ -4330,6 +4371,144 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         actualTy->declaration)
         return wrapUserClassAsIEnumerable(v, actualTy->declaration, targetTy);
     return v;
+}
+
+// fix #2299 / §28.9: emit an immediate bz_array_free(v, null) for the
+// source Array-family collection, right at the RETURN coercion (NOT at
+// scope end — the return is about to hand the wrapping enumerator to the
+// caller, and any scope-end disposal would fire before the caller
+// finishes iterating the wrap and free the source out from under it).
+// Caller MUST only invoke when srcOwnedByCallee was true (a parameter/
+// field/already-IEnumerable source must stay borrowed — its owner keeps
+// the disposal obligation). The wrapper's slot-1 Dispose runs on the
+// caller's side and frees only the wrapper frame (the backing was
+// already reclaimed here).
+void Emitter::freeCollectionSourceNow(llvm::Value* v) {
+    if (!v) return;
+    auto* fn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy()});
+    builder_.CreateCall(fn, {v, llvm::ConstantPointerNull::get(ptrTy())});
+}
+
+// fix #2299 / §28.9: emit an immediate bz_dict_free(v, null) for the
+// source dict-backed Set after the snapshot.
+void Emitter::freeDictSourceNow(llvm::Value* v) {
+    if (!v) return;
+    auto* fn = declareC("bz_dict_free", llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy()});
+    builder_.CreateCall(fn, {v, llvm::ConstantPointerNull::get(ptrTy())});
+}
+
+// fix #2299 / §28.9: emit an immediate bz_llist_free(v, null) for the
+// source LinkedList after the wrap.
+void Emitter::freeLinkedListSourceNow(llvm::Value* v) {
+    if (!v) return;
+    auto* fn = declareC("bz_llist_free", llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy()});
+    builder_.CreateCall(fn, {v, llvm::ConstantPointerNull::get(ptrTy())});
+}
+
+// fix #2299 / §28.9: at the RETURN coercion, decide whether the source
+// expression is a callee-OWNED producer whose ownership transfer on `return`
+// must be honoured by the wrap site. Mirrors `registerIterableSourceDisposal`'s
+// `ownsSource` gate (the local-decl path's #943/#1911/#1069 sibling, §29.11):
+//   * a `new T(...)` for any reference type → owned (§28.3 K1).
+//   * a `move e` → owned (§28.8.1 transfer mark).
+//   * an IdentifierExpr naming a LOCAL whose initializer was a producer form
+//     (NewExpr, CallExpr) → owned — the local's `+1` flows out via §28.3.
+// Anything else (a parameter read, a field read, a method-call result whose
+// declared return is not `owned`, a borrow-init local, an IndexExpr, an
+// arbitrary shape) is a BORROW; we do not register the source-disposal here.
+// Conservative: only NEW-of-ref and producer-init LOCAL classify as Owned
+// (a wider net risks UAF on borrowed collections that share the slot with
+// another owner).
+bool Emitter::returnSourceIsCalleeOwnedCollection(const ast::Expr* src) const {
+    if (!src) return false;
+    // fix #2299: a fresh-owned producer. `new T(...)` of a CLASS (or interface)
+    // is a +1 producer; the new T(...) shorthand (`new(...)`) is the same
+    // NewExpr with `type` null but sema has recorded the resolved target as
+    // the NewExpr's exprType, so type-class is checked via exprType here.
+    // Array<T> is a borrowing collection (no ownable backing — stdlib §4.4),
+    // but the wrapped RESULT is what we own (the NewExpr mints a fresh
+    // bz_array_t); callee-ownership is recognized by the fact that the source
+    // is a class-typed NewExpr (a class has +1 disposal obligation at the
+    // allocation site). For non-class types (records, value builtins) we
+    // fall through — they have no ownership to transfer (no disposal site).
+    if (dynamic_cast<const ast::NewExpr*>(src)) {
+        const sema::TypeRef* rt = ctx_.exprType(*src);
+        if (rt && rt->kind == sema::TypeRef::Kind::Named) {
+            // Class or interface declaration → owned. For decl-NULL (builtin
+            // collection types — Array<T>, Set<T>, LinkedList<T>, etc.) we
+            // recognize them by name. Both cases are "fresh +1 producers
+            // where the wrapper must take ownership of the allocation".
+            if (rt->declaration) {
+                if (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                    rt->declaration->kind == ast::TypeDeclKind::Interface)
+                    return true;
+            } else if (rt->astNode && rt->astNode->name &&
+                       !rt->astNode->name->parts.empty()) {
+                std::string_view n = rt->headName();
+                // Borrowing-family builtins (whose allocation is the source's
+                // sole bz_array_t / bz_llist_t) and the dict-backed Set. These
+                // are the cases the wrapAsIEnumerableForTarget branches handle
+                // (Array/Stack/Queue wrap, LinkedList wrap, dict-backed Set
+                // snapshot). Match them here so the OWNING/early-free logic
+                // in the wrap function applies.
+                if (n == "Array" || n == "OwningArray" || n == "OwningBuffer" ||
+                    n == "Stack" || n == "OwningStack" ||
+                    n == "Queue" || n == "OwningQueue" ||
+                    n == "LinkedList" || n == "OwningLinkedList" ||
+                    n == "Set" || n == "OwningSet" || n == "SortedSet" ||
+                    n == "Dictionary" || n == "OwningDictionary" ||
+                    n == "SortedDictionary")
+                    return true;
+            }
+        }
+        // Value-type NewExpr (record / built-in value type / non-collection
+        // class) is Borrowed — no ownership to transfer; falls through.
+        return false;
+    }
+    // `move e` — the §28.8.1 transfer mark moves ownership into the
+    // destination (here: the return wrapper), so the source local is freed
+    // exactly once at scope end (the UnwindIneligibleWalker suppresses the
+    // moved-from local's normal reclaim). The wrap can reuse that disposal:
+    // if `e` is a callee-owned local the underlying array/llist is the freed
+    // target. Conservatively only return true when the moved operand is
+    // itself a NEW or producer-init LOCAL (the cases that own something).
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(src)) {
+        if (un->op == "move" && un->operand)
+            return returnSourceIsCalleeOwnedCollection(un->operand.get());
+        return false;
+    }
+    // An IdentifierExpr naming a local: the local is owned if and only if its
+    // initializer was a producer form (NewExpr/CallExpr). The bare-identifier
+    // alias case (`return b;` where `b` was `var b := a;`) is intentionally
+    // classified Borrowed — `a` still owns and disposes the collection, and
+    // registering a disposal here would double-free. The same shared predicate
+    // registerIterableSourceDisposal uses (`isCall || isNew`) for the local-
+    // decl `ownsSource` gate, so the two sites agree.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(src)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            const ast::LocalDecl* ld =
+                dynamic_cast<const ast::LocalDecl*>(ls->decl);
+            if (!ld || !ld->initializer) return false;
+            if (dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                return true;
+            if (dynamic_cast<const ast::CallExpr*>(ld->initializer.get()))
+                return true;
+            return false;
+        }
+        // A ParameterSymbol, FieldSymbol, PropertySymbol, or a synthetic
+        // (sema-created) symbol is a BORROW by definition (§28.3 storage-
+        // lends + §28.6 no transfer without an explicit move mark).
+        return false;
+    }
+    // Method-call results, member-access, index, ternary, etc. — the
+    // narrower forms above already cover the typical RETURN shapes; a deeper
+    // ownership analysis (call-return-is-owned) is deliberately out of scope
+    // for this fix — err on the BORROW side.
+    return false;
 }
 
 // §29.2 (#437): generate a type-specific, vtable-backed array enumerator.
