@@ -998,6 +998,28 @@ llvm::Value* Emitter::emitRecordDeserialize(const TypeSymbol* ts,
             Disposal cd{slots[i], cty->declaration};
             cd.choiceStringFields = true;
             disposeStack_.back().push_back(cd);
+        } else if (!cty->nullable &&
+                   cty->kind == sema::TypeRef::Kind::InlineArray &&
+                   cty->arrayElement &&
+                   cty->arraySizeValue >= 0 &&
+                   inlineArrayElementCarriesString(cty->arrayElement)) {
+            // fix #2326 / §9.8 v0.228: a non-nullable INLINE-ARRAY record
+            // component whose element type (recursively) carries a string
+            // — `[N]string`, `[N]RecWithAStringField`, etc. Registered for
+            // the same reason as the recordStringFields arm above: a LATER
+            // sibling's read could throw, and without a registered release
+            // the already-read inline-array slot's element strings would
+            // orphan. Released via emitInlineArrayStringReleases, the
+            // array-side mirror of choiceStringFields (its own walker,
+            // because the array's element-dispatch has no analog of the
+            // record/choice field-index machinery). The slot's LLVM type
+            // is `[N x elem]`, the disposer's element TypeRef drives
+            // the per-element dispatch (string → release; record → recurse;
+            // choice → choice walker; nested array → recurse).
+            Disposal ad{slots[i], nullptr};
+            ad.inlineArrayStringFields = true;
+            ad.inlineArrayElemType = cty;
+            disposeStack_.back().push_back(ad);
         }
     }
 
@@ -2035,6 +2057,20 @@ llvm::Value* Emitter::emitChoiceDeserialize(const TypeSymbol* ts,
                     Disposal cd{slots[pi], pty->declaration};
                     cd.choiceStringFields = true;
                     disposeStack_.back().push_back(cd);
+                } else if (!pty->nullable &&
+                           pty->kind == sema::TypeRef::Kind::InlineArray &&
+                           pty->arrayElement &&
+                           pty->arraySizeValue >= 0 &&
+                           inlineArrayElementCarriesString(pty->arrayElement)) {
+                    // fix #2326 / §9.8 v0.228: a non-nullable INLINE-ARRAY
+                    // choice payload whose element type carries a string
+                    // — the array-side mirror of the choiceStringFields
+                    // arm just above. See the matching record branch in
+                    // emitRecordDeserialize for the full rationale.
+                    Disposal ad{slots[pi], nullptr};
+                    ad.inlineArrayStringFields = true;
+                    ad.inlineArrayElemType = pty;
+                    disposeStack_.back().push_back(ad);
                 }
             }
 

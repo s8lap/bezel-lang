@@ -881,6 +881,24 @@ private:
         // it cannot reuse `emitRecordStringFieldReleases` verbatim). `slot`
         // is the choice's struct alloca; `cls` is the choice TypeSymbol.
         bool choiceStringFields = false;
+        // fix #2326 / §9.8 v0.228: an ALREADY-POPULATED deserialize component
+        // slot (#2398 disposal scope, LlvmBackend_Serialization.cpp) whose
+        // declared type is a non-nullable INLINE ARRAY whose element type
+        // carries a string — `[N]string`, `[N]RecWithAStringField`, etc.
+        // Guards the slot against a LATER sibling's read throwing; released
+        // via emitInlineArrayStringReleases, the array-side mirror of
+        // `choiceStringFields` (its own walker, because the array's
+        // fixed-size-element layout has no analog of the record/choice
+        // field-index machinery the existing helpers key off). `slot` is
+        // the array's `[N x elem]` struct alloca; `inlineArrayElemType` is
+        // the element TypeRef the walker dispatches on. NOT the same
+        // mechanism as the #747 owning-inline-array scope-end disposal
+        // (a per-element dispose-and-reclaim via the element vtable — that
+        // path is for `[N owned]T` of class elements; this one is for
+        // `[N]T` of string/record/choice/inline-array elements whose
+        // strings must be released at scope end).
+        bool inlineArrayStringFields = false;
+        const sema::TypeRef* inlineArrayElemType = nullptr;
         // §2.15 / issue #550: a `using var` bound to a BinarySerializer or
         // BinaryDeserializer.  These are opaque heap handles with no user
         // TypeSymbol and no vtable.  At scope end they are freed via
@@ -2673,6 +2691,30 @@ private:
                 llvm::Value* nestedAddr = builder_.CreateStructGEP(
                     st, recAddr, idxIt->second, "recstrf.nested.ch.addr");
                 emitChoiceStringFieldReleases_impl(nestedAddr, mty->declaration);
+                continue;
+            }
+            // fix #2326 / §9.8 v0.228: a non-nullable INLINE-ARRAY field
+            // (e.g. `[N]string`, `[N]RecWithAStringField`, `[M][N]string`) whose
+            // element type carries a string. The array is a value type
+            // embedded INLINE in the record (§15.1), so its first slot sits
+            // at a GEP off the SAME outer struct address `recAddr` — exactly
+            // like reaching a direct string field or a nested record's
+            // storage. The per-element walker (emitInlineArrayStringReleases_impl)
+            // dispatches on each element's static type: `string` → release;
+            // non-nullable record → recurse; non-nullable choice → choice
+            // walker; non-nullable inline array → recurse. The call-result
+            // / deserialize-disposal-scope registrations gate on
+            // inlineArrayElementCarriesString, so this is reached only when
+            // a release is owed. The element-type recursion is finite for
+            // the same reason as the named record/choice arms: sema rejects
+            // a self-containing value-type graph at the declaration site.
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::InlineArray &&
+                mty->arrayElement &&
+                inlineArrayElementCarriesString(mty->arrayElement)) {
+                llvm::Value* arrAddr = builder_.CreateStructGEP(
+                    st, recAddr, idxIt->second, "recstrf.arr.addr");
+                emitInlineArrayStringReleases_impl(arrAddr, mty);
             }
         }
     }
@@ -6441,9 +6483,38 @@ private:
                 mty->declaration->kind == ast::TypeDeclKind::Choice &&
                 choiceHasStringFields(mty->declaration))
                 return true;
+            // fix #2326 / §9.8 v0.228: a non-nullable INLINE-ARRAY field whose
+            // element type (recursively, through nested record/choice/inline-
+            // array) carries a string needs the release walker to recurse into
+            // it. Without this arm a `[N]string` (or `[N]RecWithAStringField`)
+            // component is invisible to recordHasStringFields, and the call-
+            // result / deserialize-disposal-scope registrations BOTH key off
+            // this predicate to decide whether to recurse — so the +1
+            // allocated by the deserializer's `bz_binder_read_string` per
+            // element would never be released (verified: 2 allocations / 2
+            // leaks per round-trip under ASan/LSan). The element-type
+            // recursion is finite for the same reason as the named record /
+            // choice arms above: sema rejects a self-containing value graph,
+            // so the reachable type graph is a finite DAG.
+            if (mty && !mty->nullable &&
+                mty->kind == sema::TypeRef::Kind::InlineArray &&
+                mty->arrayElement &&
+                inlineArrayElementCarriesString(mty->arrayElement))
+                return true;
         }
         return false;
     }
+
+    // fix #2326 / §9.8 v0.228: does the element type of a non-nullable inline
+    // array carry a string — directly (a `string` element), or transitively
+    // through a non-nullable nested record / choice / inline array?
+    // Declared here so recordHasStringFields (above) and the deserialize-
+    // disposal-scope registration (LlvmBackend_Serialization.cpp) can share
+    // the same predicate, and so emitInlineArrayStringReleases_impl (below)
+    // can call it to recurse into a nested array element. Mirrors
+    // recordHasStringFields / choiceHasStringFields in shape; the termination
+    // argument is the same finite-DAG walk over the value-type graph.
+    bool inlineArrayElementCarriesString(const sema::TypeRef* tr);
 
     // fix #2425 / §9.8 / §28.9 / §35.4 v0.235: does value-like choice `ts`
     // own, directly (a `string` payload field in some declared case) or
@@ -6479,6 +6550,31 @@ private:
     void emitChoiceStringFieldReleases(llvm::Value* choiceAddr,
                                        const sema::TypeSymbol* choiceTy) {
         emitChoiceStringFieldReleases_impl(choiceAddr, choiceTy);
+    }
+
+    // fix #2326 / §9.8 v0.228: release every `string` storage reachable from
+    // inline-array element type `elemTy` at array ADDRESS `arrAddr` —
+    // mirrors emitInlineArrayEquality (the auto-equality walker, §8.3 /
+    // §15.1.2) in shape: walk N unrolled slots, dispatch on each slot's
+    // static type. `string` → bz_string_release; non-nullable record →
+    // recurse via emitRecordStringFieldReleases_impl; non-nullable choice
+    // → emitChoiceStringFieldReleases_impl; non-nullable nested inline
+    // array → recurse. Takes the OUTER array TypeRef (not just the
+    // element type) so the per-element loop can derive N from
+    // `arraySizeValue` (§15.1.2) without inspecting the LLVM type
+    // (modern LLVM opaque pointers would otherwise require a
+    // `getElementType` on a pointee that may be a primitive ptr — not a
+    // PointerType). Used by emitRecordStringFieldReleases_impl when
+    // a record's storage member is an inline array whose element type
+    // carries a string (#2326), and by the #2326 deserialize-disposal-
+    // scope registration (LlvmBackend_Serialization.cpp) for the same
+    // shape. Defined in LlvmBackend_Disposal.cpp next to its sibling
+    // choice walker.
+    void emitInlineArrayStringReleases_impl(llvm::Value* arrAddr,
+                                            const sema::TypeRef* arrayTy);
+    void emitInlineArrayStringReleases(llvm::Value* arrAddr,
+                                       const sema::TypeRef* arrayTy) {
+        emitInlineArrayStringReleases_impl(arrAddr, arrayTy);
     }
 
     // fix #1747 / §28.9 / §9.7 / §28.3: is `tr` a (non-nullable) record

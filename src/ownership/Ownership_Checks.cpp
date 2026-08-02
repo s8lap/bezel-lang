@@ -4871,11 +4871,59 @@ void MethodOwnership::checkCollectionBorrowStoreEscape(
         // rejected at the call site, with the same null-source exception
         // (an `Opt.None` payload-free case, or `Choice.Borrowed(null)` with
         // every borrow-carrying payload null, is admitted).
+        //
+        // §9.7 / §4.14 / §4.15 (v0.226, #2308): the builtin-SPAN face, the
+        // sibling of the #1251 instance-field fix. §9.7's "copied into a
+        // collection" bullet names the SAME regime-uniformity reasoning
+        // ("a record-carried borrow's access paths bypass the disposed-flag
+        // check") and applies to every storage position that escapes a
+        // method's scope — including a collection. `Span<T>` / `ReadOnlySpan<T>`
+        // (§4.14) and `ArraySpan<T>` / `ReadOnlyArraySpan<T>` (§4.15) are
+        // records over a class-typed backing store (OwningBuffer / Array),
+        // so they are borrow-bearing records by §9.7's own definition — and
+        // §9.7 names a span's buffer window as the CANONICAL example of
+        // "no per-access disposed-flag check." But a builtin span has no
+        // user Record `TypeDecl`, so `isBorrowBearingRecord` never
+        // classifies it; without this leg, `h.spans.Add(buf.AsSpan())`
+        // compiled clean and the runtime read a span whose backing buffer
+        // had been disposed (verified: rc=0 at compile, ASan SEGV in
+        // `bz_array_get` at run time). `isBorrowBearingRecordOrSpan` — the
+        // predicate the §30.1 async and #1251 instance-field legs already
+        // use — names the four builtin span types by head, closing this
+        // hole. No null-source exemption applies on the span leg: a span's
+        // backing-store field is non-nullable per §4.14/§4.15, and
+        // `isNullSourceRecordExpr` requires a user Record decl a span never
+        // has. The diagnostic names the collection-store bullet and the
+        // span's backing store so the remedy is the concrete one.
+        // // per §9.7, §4.14, §4.15, §28.11
         if (kind == RecvKind::Escapes) {
             const sema::TypeRef* argType = ctx_.exprType(*a.value);
             const bool argIsRecord = isBorrowBearingRecord(argType);
+            const bool argIsSpan =
+                !argIsRecord && isBorrowBearingRecordOrSpan(argType);
             const bool argIsChoice =
-                !argIsRecord && isBorrowBearingChoice(argType);
+                !argIsRecord && !argIsSpan && isBorrowBearingChoice(argType);
+            if (argIsSpan) {
+                const std::string recvName =
+                    recvRoot ? std::string(recvRoot->name) : std::string("it");
+                report(
+                    Severity::Error, a.value->span.begin,
+                    std::string("a span may not be copied into a collection "
+                                "passed to `.") +
+                    std::string(m) + "(...)` on `" + recvName +
+                    "` — a span (§4.14/§4.15) is a borrow-bearing record "
+                    "over its backing Array / OwningBuffer, and the "
+                    "collection is reachable beyond this method's scope "
+                    "(the receiver, a field, or a parameter); a span's "
+                    "buffer window is read with no per-access disposed-flag "
+                    "check, so the checked-mode trust regime that covers a "
+                    "direct class-typed borrow does not apply here (§9.7; "
+                    "store the backing store instead — e.g. an `owned "
+                    "OwningBuffer<T>` or `owned Array<T>` field of the "
+                    "holder — and re-derive the span with `AsSpan()` at the "
+                    "use site)");
+                continue;
+            }
             if ((argIsRecord && !isNullSourceRecordExpr(*a.value)) ||
                 (argIsChoice && !isNullSourceChoiceExpr(*a.value))) {
                 const std::string recvName =

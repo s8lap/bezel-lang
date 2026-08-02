@@ -14337,6 +14337,91 @@ struct StringEscapeWalker {
         sema::TypeRef* rt = ne->type
             ? ctx.resolvedType(*ne->type)
             : const_cast<sema::TypeRef*>(ctx.exprType(*ne));
+        // fix #2324 / §28.9 / §31.4: narrow relaxation for the BUILT-IN
+        // exception constructors (the §31.4 type set — Exception,
+        // ArgumentException, …, up to but not including any USER-defined
+        // exception subclass). A builtin exception ctor is the SAME shape as
+        // the #2023 user-ctor relaxation's "plain string parameter" model —
+        // the runtime ctor retains the borrow local's +1 into the slot
+        // (lowerExpr's emitStringRetain at the message slot) and the local's
+        // own scope-end release balances the call-side ownership exactly
+        // once — so a `var s := ...; new Exception(s);` is a CALL-BOUNDED
+        // BORROW, not an escape. The #2023 relaxation is keyed on a resolved
+        // ConstructorSymbol — these ctors have no user TypeSymbol, so they
+        // fell through to `walkAllEscape()`, tainting the local and
+        // suppressing its scope-end release (the #2324 leak). Apply the
+        // same plain-string-parameter discipline by name against the
+        // built-in exception vtable set; the runtime's emission path
+        // (LlvmBackend_Exprs2.cpp's `!rt->declaration` exception block) is
+        // already known correct (it RETAINs borrows, transfers +1 producers),
+        // so this just keys the walker on the structural fact. CRITICALLY
+        // NARROW: only the §31.4 built-in exception set (common::isBuiltinExceptionName
+        // is a name match against kBuiltinExceptionHierarchy, which lists
+        // exactly those types — no other declaration-less Named type
+        // qualifies, so `new Array<int>(...)` / `new FileStream(...)` / `new
+        // Dictionary<K,V>(...)` etc. KEEP their conservative escape
+        // classification, the #2023 narrowing's whole point).
+        if (rt && rt->kind == sema::TypeRef::Kind::Named && !rt->declaration &&
+            rt->astNode && rt->astNode->name &&
+            !rt->astNode->name->parts.empty() &&
+            bezel::common::isBuiltinExceptionName(
+                rt->astNode->name->parts.back())) {
+            // The §31.4 ctor shapes that take string parameters are
+            // exactly: () (0 args), (message: string) (1 arg), (message:
+            // string, paramName: string) (2 args). The (message: string,
+            // cause: Exception) form is NOT pure (§31.4) and is structurally
+            // an escape position for the cause — but the cause is an
+            // Exception, not a string, so the walker (StringEscapeWalker)
+            // would never taint it anyway; marking the FIRST `arg.size() - 1`
+            // args as safe reads captures the message + paramName form
+            // without ever over-relaxing the (msg, cause) case. Arity 3+ has
+            // no §31.4 builtin shape — fall through to the conservative
+            // escape (mirroring #2023's ambiguity fallback).
+            if (ne->args.size() <= 2) {
+                for (std::size_t i = 0; i + 1 < ne->args.size(); ++i) {
+                    const ast::CallArgument& a = ne->args[i];
+                    // Match #2023's plain-arg check: no modifier, no
+                    // name, no discard. The position is a known plain
+                    // `string` parameter by §31.4.
+                    if (a.modifier.empty() && a.name.empty() && !a.isDiscard) {
+                        expr(a.value.get(), /*safeRead=*/true);
+                    } else {
+                        expr(a.value.get(), /*safeRead=*/false);
+                    }
+                }
+                // The last arg, if present, is a known position-dependent
+                // shape: (message, paramName) is a plain string → safe
+                // read; (message, cause) is the borrowed cause → escape.
+                // We can't tell the two apart at this analysis level
+                // (the ctor is runtime-defined; the same goes for #2023's
+                // 2-arg ambiguity). Conservatively walk the last arg as
+                // an ESCAPE — the caller's +1 is properly transferred to
+                // the slot in EITHER case, so a leak is impossible;
+                // a false-taint on a (message, paramName) where the second
+                // arg IS a string local would be a leak — but the
+                // second arg's positional type is statically known to be
+                // a string only by the call site's static type
+                // (ne->args[1]'s exprType), and we DO inspect that here.
+                if (ne->args.size() == 2) {
+                    const ast::CallArgument& a = ne->args[1];
+                    bool lastIsString = false;
+                    if (const sema::TypeRef* a1ty = ctx.exprType(*a.value.get())) {
+                        lastIsString = a1ty->kind ==
+                            sema::TypeRef::Kind::Primitive &&
+                            a1ty->primitive ==
+                                sema::PrimitiveType::String;
+                    }
+                    bool safeArg = lastIsString &&
+                        a.modifier.empty() && a.name.empty() &&
+                        !a.isDiscard;
+                    expr(a.value.get(), safeArg);
+                }
+                return;
+            }
+            // arity 3+ has no §31.4 builtin shape — conservative escape.
+            walkAllEscape();
+            return;
+        }
         if (!rt || rt->kind != sema::TypeRef::Kind::Named || !rt->declaration) {
             walkAllEscape();  // builtin/unresolved type — no relaxation
             return;
