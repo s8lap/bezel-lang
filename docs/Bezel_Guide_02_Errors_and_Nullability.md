@@ -2,7 +2,15 @@
 
 *A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.236.*
 
-Most of the syntax here is mainstream: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. The *emphasis* is not. Bezel splits failure signals by one rule (the **failure-signal rule**, stdlib §1), and it is worth knowing the shape before the details: an **expected absence** returns a value — `T?` or a `Try` shape (§2); an **expected outcome the caller branches on** — with a plain value payload — returns a `Result<T, E>` or a domain choice (§3); a **caller bug** is a contract (`requires`, §7) or defect exception, and a **boundary fault** — I/O, network, anything logged or retried rather than branched on — is a typed exception (§4); a handful of fatal conditions simply terminate. So in Bezel application code the common case is a value return, and exceptions are the boundary-and-defect tool — not the default. Beyond the emphasis, two ownership rules will change ingrained habits — a caught exception is a *borrow* (§5), and cleanup on the exception path is *automatic* (§6) — each headed **How Bezel does it**; if you skim everything else, read those and the table in §7.
+Most of the syntax here is mainstream: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. The *emphasis* is not. Bezel splits failure signals by one rule (the **failure-signal rule**, stdlib §1), and it is worth knowing the shape before the details (teaching order here, not the rule's band order):
+
+- An **expected absence** returns a value — `T?` or a `Try` shape (§2).
+- An **expected outcome the caller branches on** — with a plain value payload — returns a `Result<T, E>` or a domain choice (§3).
+- A **caller bug** is a contract (`requires`, §7) or defect exception.
+- A **boundary fault** — I/O, network, anything logged or retried rather than branched on — is a typed exception (§4).
+- A handful of fatal conditions simply terminate.
+
+So in Bezel application code the common case is a value return; exceptions are the boundary-and-defect tool, not the default. Beyond the emphasis, two ownership rules will change ingrained habits: a caught exception is a *borrow* (§5), and cleanup on the exception path is *automatic* (§6). Each is headed **How Bezel does it**. If you skim everything else, read those and the table in §7.
 
 **Contents:** §1 nullability basics · §2 expected absence: `T?`, `*OrNull`, `Try` · §3 expected outcomes: `Result<T, E>` and domain choices · §4 exceptions: the familiar shape · §5 a caught exception is a borrow · §6 cleanup without leaks · §7 choosing the right tool.
 
@@ -44,9 +52,9 @@ if local <> null then
 end;
 ```
 
-The exception is `readonly` fields: a nullable `readonly` field — instance or static — narrows like a local, because nothing can rewrite it after construction, so no call, closure, or `await` can invalidate the fact. The tracked shape is one field directly off a tracked root (`this._f`, `TypeName._s`, or a tracked `local._f`), and the rule does not apply inside the declaring type's constructors and initializers, where the field is still being assigned (spec §7.4).
+The exception is `readonly` fields. A nullable `readonly` field — instance or static — narrows like a local: nothing can rewrite it after construction, so no call, closure, or `await` can invalidate the fact. The tracked shape is one field directly off a tracked root (`this._f`, `TypeName._s`, or a tracked `local._f`). The rule does not apply inside the declaring type's constructors and initializers, where the field is still being assigned (spec §7.4).
 
-Locals can lose their narrowing too: a local that is **mutably captured** — assigned, or passed by `ref`/`out`, inside any lambda in the method — is re-widened at the next call, function-value invocation, or `await` in the controlled block, because a closure could run and rewrite it in between (spec §7.4). Copy such a value into a plain, uncaptured local and test *that* — the same remedy as for a mutable field.
+Locals can lose their narrowing too. A local that is **mutably captured** — assigned, or passed by `ref`/`out`, inside any lambda in the method — is re-widened at the next call, function-value invocation, or `await` in the controlled block, because a closure could run and rewrite it in between (spec §7.4). Copy such a value into a plain, uncaptured local and test *that* — the same remedy as for a mutable field.
 
 ---
 
@@ -71,14 +79,14 @@ end;
 
 Or collapse it with the operators from §1: `directory.Find("alice")?.Name ?? "stranger"`.
 
-The standard library ships this idiom as the **`*OrNull` tier** (stdlib §1): every per-type `Parse` — the stdlib §9 primitives and the `DateTime`/`DateOnly`/`TimeOnly`/`Guid` families — has a `ParseOrNull` returning `T?`, the dictionaries have `GetOrNull`, and the composition is one line:
+The standard library ships this idiom as the **`*OrNull` tier** (stdlib §1). Every per-type `Parse` — the stdlib §9 primitives and the `DateTime`/`DateOnly`/`TimeOnly`/`Guid` families — has a `ParseOrNull` returning `T?`; the dictionaries have `GetOrNull`. The composition is one line:
 
 ```bezel
 var port     := int.ParseOrNull(raw) ?? 8080;
 var greeting := config.GetOrNull("greeting") ?? "hello";
 ```
 
-`ParseOrNull` returns null exactly where `Parse` would throw, so one `??` covers every failure path in a single expression. (For `int`/`bool` environment variables specifically, `Environment.GetInt`/`GetBool` are the dedicated one-call spelling.) When you must *distinguish* absence from a present null — a dictionary whose value type is itself nullable, say — `T?` collapses the two (the conflation caveat, stdlib §1/§4.8); use `ContainsKey` or the Try shape below instead.
+`ParseOrNull` returns null exactly where `Parse` would throw, so one `??` covers every failure path in a single expression. (For `int`/`bool` environment variables specifically, `Environment.GetInt`/`GetBool` are the dedicated one-call spelling.) When you must *distinguish* absence from a present null — a dictionary whose value type is itself nullable, say — `T?` collapses the two (the conflation caveat, stdlib §1/§4.8). Use `ContainsKey` or the Try shape below instead.
 
 **The `Try` pattern** when the failure path and success path differ, and especially when the value is *owned*. A `bool` return plus an `out owned` parameter, with a `when true` postcondition that lets the caller skip the `!`:
 
@@ -95,7 +103,7 @@ method TryTakeCached(name: string, out owned conn: Connection? when true): bool
 end TryTakeCached;
 ```
 
-The method is named `TryTakeCached`, not `TryGetCached`, on purpose: the stdlib gives the borrowing accessor and the ownership-transferring one distinct names — `Get`/`Peek` borrow; `Pop`/`Drain`/`Take` transfer — so the name alone tells you whether you now owe a disposal (spec §22.6). This one transfers: it hands the caller ownership through `out owned`. The parameter is typed `Connection?` (nullable) because the false path must assign *something* and `default(Connection)` is illegal for a non-nullable reference type. The `when true` clause states the contract in the signature — "a `true` return implies `conn` is non-null" — and the caller's flow analysis picks it up:
+The method is named `TryTakeCached`, not `TryGetCached`, on purpose. The stdlib gives the borrowing accessor and the ownership-transferring one distinct names — `Get`/`Peek` borrow; `Pop`/`Drain`/`Take` transfer — so the name alone tells you whether you now owe a disposal (spec §22.6). This one transfers: it hands the caller ownership through `out owned`. The parameter is typed `Connection?` (nullable) because the false path must assign *something*, and `default(Connection)` is illegal for a non-nullable reference type. The `when true` clause states the contract in the signature — "a `true` return implies `conn` is non-null" — and the caller's flow analysis picks it up:
 
 ```bezel
 if pool.TryTakeCached("primary", out using var c) then
@@ -103,13 +111,13 @@ if pool.TryTakeCached("primary", out using var c) then
 end;                               // c disposed at the end of the enclosing block
 ```
 
-`out using var c` binds the out value as an owned, scope-disposed local — so a successful call that handed you a `Connection` cannot leak. Its scope is the *enclosing* block, from the call onward (not just the `if`), so the connection is disposed when that block ends. Without the `when true` clause you would still write `UseConnection(c!)` — the bool guard alone does not narrow the nullable; only the postcondition does. (`out owned` in the signature and `out using var` at the call site must match: you cannot write `out using var` for a plain `out` parameter, nor plain `out var` for an `out owned` one — the compiler rejects the mismatch, because the ownership would have nowhere to go.) This is the ownership-aware `TryGet`: the contract is "on `true`, you now own it," and `out using var` discharges that obligation for you.
+`out using var c` binds the out value as an owned, scope-disposed local — so a successful call that handed you a `Connection` cannot leak. Its scope is the *enclosing* block, from the call onward — not just the `if` — so the connection is disposed when that block ends. Without the `when true` clause you would still write `UseConnection(c!)`: the bool guard alone does not narrow the nullable; only the postcondition does. `out owned` in the signature and `out using var` at the call site must match. You cannot write `out using var` for a plain `out` parameter, nor plain `out var` for an `out owned` one — the compiler rejects the mismatch, because the ownership would have nowhere to go. This is the ownership-aware `TryGet`: the contract is "on `true`, you now own it," and `out using var` discharges that obligation for you.
 
 ---
 
 ## 3. Expected failure: outcomes with information — `Result<T, E>` and domain choices
 
-When the failure itself has something to say — *which* error, at *which* position, of *which* kind — absence is not enough. **The `choice` return** is the tool when the failure is expected, branched on at or near the call site, and its payload is a plain value shape (spec §35; the failure-signal rule's band 3, stdlib §1). Where the nullable return says only "absent" and the Try pattern carries the failure in out-parameters, a `choice` names every outcome and carries each one's data — and the `case` over it is exhaustiveness-checked, so adding an outcome breaks every consumer at compile time instead of silently falling through a null check:
+When the failure itself has something to say — *which* error, at *which* position, of *which* kind — absence is not enough. **The `choice` return** is the tool when the failure is expected, branched on at or near the call site, and its payload is a plain value shape (spec §35; the failure-signal rule's band 3, stdlib §1). Where the nullable return says only "absent" and the Try pattern carries the failure in out-parameters, a `choice` names every outcome and carries each one's data. And the `case` over it is exhaustiveness-checked: adding an outcome breaks every consumer at compile time instead of silently falling through a null check:
 
 ```bezel
 public method ParsePort(text: string): Result<int, string>
@@ -128,7 +136,7 @@ case ParsePort(arg) of
 end;                                  // exhaustive; no _ arm needed
 ```
 
-The bare `Ok(value)` / `Error(msg)` spelling is **declared-result target-typing** (spec §35.3): in a `return` statement — or an expression body, or a lambda with a return-type ascription — whose declared result type is a choice, a bare case name constructs that choice's case, with the declared type supplying the type arguments whole. The qualified `Result<int, string>.Ok(value)` remains valid everywhere; the bare form exists for exactly these positions, and if a case name shadows something in scope the compiler warns. Restating the full type at every `return` was the old cost of the choice return; it is gone.
+The bare `Ok(value)` / `Error(msg)` spelling is **declared-result target-typing** (spec §35.3). In a `return` statement — or an expression body, or a lambda with a return-type ascription — whose declared result type is a choice, a bare case name constructs that choice's case; the declared type supplies the type arguments whole. The qualified `Result<int, string>.Ok(value)` remains valid everywhere. The bare form exists for exactly these positions, and if a case name shadows something in scope the compiler warns. Restating the full type at every `return` was the old cost of the choice return; it is gone.
 
 `Result<T, E>` (stdlib §2.20) is the stdlib's ready-made shape; a domain-specific choice with named cases (`Fetched`/`NotModified`/`Failed`) is often better still. When a case's payload is an owned resource, the `case` over a fresh call is an *owning match*: bind the payload and adopt it (`using var conn := owned c;`) — see Guide 1 §9.
 
@@ -157,7 +165,7 @@ public method WellKnownPort(text: string): Result<int, string>
 end WellKnownPort;
 ```
 
-Note the `AndThen` lambda's return-type ascription: it makes the lambda's own returns declared-result positions, so the bare `Ok`/`Error` spelling works inside it too. The combinators exist only at **value-like** instantiations — payloads of values and strings, the common case. A `Result` carrying an owned resource (`Result<Connection, string>`) has none of them, deliberately: extraction there is consumption, and consumption is the owning match's job — for owning results, the exhaustive `case` *is* the pipeline. The three idioms compose: `T?` for plain absence, the Try shape for value extraction with a boring failure, the choice return where the failure is branched on with a value-shaped payload.
+Note the `AndThen` lambda's return-type ascription: it makes the lambda's own returns declared-result positions, so the bare `Ok`/`Error` spelling works inside it too. The combinators exist only at **value-like** instantiations — payloads of values and strings, the common case. A `Result` carrying an owned resource (`Result<Connection, string>`) has none of them, deliberately. Extraction there is consumption, and consumption is the owning match's job — for owning results, the exhaustive `case` *is* the pipeline. The three idioms compose: `T?` for plain absence, the Try shape for value extraction with a boring failure, the choice return where the failure is branched on with a value-shaped payload.
 
 ---
 
@@ -244,7 +252,7 @@ The same borrow discipline reaches *inside* an exception you throw: don't stash 
 
 ## 6. How Bezel does it: exceptions and cleanup — there is no leak, automatically
 
-Elsewhere you reach for `try`/`finally` (or a `using` block) to avoid leaking on the exception path. In Bezel you usually write neither *for leak prevention*: an owned value live when an exception propagates is disposed automatically during unwinding (every owned local and `owned` parameter behaves as if wrapped in an implicit `try`/`finally`). `using var` stays the default — it declares *intent*, not exception-safety — and what you stop writing is the `try`/`finally` *cleanup plumbing*.
+Elsewhere you reach for `try`/`finally` (or a `using` block) to avoid leaking on the exception path. In Bezel you usually write neither *for leak prevention*. An owned value live when an exception propagates is disposed automatically during unwinding — every owned local and `owned` parameter behaves as if wrapped in an implicit `try`/`finally`. `using var` stays the default; it declares *intent*, not exception-safety. What you stop writing is the `try`/`finally` *cleanup plumbing*.
 
 ```bezel
 method Import(path: string)
@@ -286,6 +294,6 @@ One diagnostic worth recognizing in this area: disposing a value and then using 
 | Must dispose an owned resource on failure | nothing — ownership handles it automatically |
 | Preserve failure details past a `catch` | copy `ex.Message` / `ex.StackTrace` into owned values; never the exception itself |
 
-The table is the teaching mirror of a normative rule: the **failure-signal rule** (stdlib §1) classifies every fault condition a library surface declares — five bands, first match wins, one mechanism per condition. Two of its sentences are worth restating here. The line between the `choice` row and a typed exception is *where the failure is consumed* and *whether its payload can be a plain value* — never how much information it carries: a fault whose data is read once at a boundary is a typed exception however rich the data; a fault the caller branches on near the call site, with a value-shaped payload, is a `choice` return. And `catch` is a boundary-and-supervision tool — convert, log, retry, report, re-raise; branching program logic on caught exception types at an interior call site is the signal to check the rule for a value-shaped tier.
+The table is the teaching mirror of a normative rule: the **failure-signal rule** (stdlib §1) classifies every fault condition a library surface declares — five bands, first match wins, one mechanism per condition. Two of its sentences are worth restating here. First, the line between the `choice` row and a typed exception is *where the failure is consumed* and *whether its payload can be a plain value* — never how much information it carries. A fault whose data is read once at a boundary is a typed exception, however rich the data; a fault the caller branches on near the call site, with a value-shaped payload, is a `choice` return. Second, `catch` is a boundary-and-supervision tool — convert, log, retry, report, re-raise. Branching program logic on caught exception types at an interior call site is the signal to check the rule for a value-shaped tier.
 
-A few habits carry most of it: prefer a nullable, `Try`, or `choice` return over an exception whenever the failure is *expected and branched on* — and a `requires(...)` clause over a `throw` whenever the condition is something a correct caller already guarantees — and inside a `catch` treat the exception as something you read and let go of — copy out the strings you need, never the instance. And in choice-returning code, take the ergonomics the language gives you: bare case names in return positions, and the combinators where a `case` would only fold. The familiar syntax mostly transfers; the ownership rules around exceptions and `out` values are the part to internalize.
+A few habits carry most of it. Prefer a nullable, `Try`, or `choice` return over an exception whenever the failure is *expected and branched on*. Prefer a `requires(...)` clause over a `throw` whenever the condition is something a correct caller already guarantees. Inside a `catch`, treat the exception as something you read and let go of — copy out the strings you need, never the instance. And in choice-returning code, take the ergonomics the language gives you: bare case names in return positions, and the combinators where a `case` would only fold. The familiar syntax mostly transfers; the ownership rules around exceptions and `out` values are the part to internalize.

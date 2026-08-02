@@ -2,7 +2,7 @@
 
 *A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.223.*
 
-Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope (with a must-use warning), and a use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
+Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope, with a must-use warning. A use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
 The whole model reduces to one question for every class-typed value: **am I responsible for disposing this, or is someone else?** Owned means yes. Borrowed means no.
 
@@ -15,9 +15,9 @@ using var conn := new Connection("db://localhost");  // owned, disposed at block
 var view := conn.View();                             // borrowed, disposes nothing
 ```
 
-`using var` is the workhorse. It says *I own this, dispose it when this block ends.* Plain `var` takes whatever ownership the right-hand side produced — here `View()` returns a borrow, so `view` is a borrow and carries no obligation.
+`using var` is the workhorse. It says *I own this, dispose it when this block ends.* Plain `var` takes whatever ownership the right-hand side produced. Here `View()` returns a borrow, so `view` is a borrow and carries no obligation.
 
-You never *declare* a local `owned`; a local gets its state from how it is introduced. But you will still type `owned` next to locals often — as the *transfer marker* on a right-hand side or a call argument (`var y := owned x;`, `M(owned x)`) when you hand an owned value on to something that takes it (§28.3). The keyword written *on a declaration* is what's reserved for fields, parameters, and return types (sections 5–7).
+You never *declare* a local `owned`; a local gets its state from how it is introduced. But you will still type `owned` next to locals often. It appears as the *transfer marker* on a right-hand side or a call argument — `var y := owned x;`, `M(owned x)` — when you hand an owned value on to something that takes it (§28.3). The keyword written *on a declaration* is reserved for fields, parameters, and return types (sections 5–7).
 
 The disposal is automatic and ordered. At the end of the enclosing block, `using var` values are disposed in reverse order of declaration, including on the exception path:
 
@@ -29,13 +29,13 @@ method Import(path: string)
 end Import;
 ```
 
-You do not write cleanup code. If `ReadAll` throws, both are disposed, innermost first; if the `Parser` constructor itself throws, `file` is still disposed and `parser` — never bound — is not. A `using var` covers everything bound before the failure point.
+You do not write cleanup code. If `ReadAll` throws, both are disposed, innermost first. If the `Parser` constructor itself throws, `file` is still disposed; `parser`, never bound, is not. A `using var` covers everything bound before the failure point.
 
 ---
 
 ## 2. The four ways to dispose — and the habit to unlearn
 
-There is really only one disposal mechanism: at the end of a scope, every owned value still live is disposed — on the normal path and the exception path alike. Everything else is a specialization of that one rule. You will reach for four spellings; they differ only in *when* disposal happens and whether the compiler nudges you:
+There is really only one disposal mechanism. At the end of a scope, every owned value still live is disposed — on the normal path and the exception path alike. Everything else is a specialization of that one rule. You will reach for four spellings. They differ only in *when* disposal happens and whether the compiler nudges you:
 
 | You write | Disposes | The compiler… |
 |---|---|---|
@@ -44,9 +44,9 @@ There is really only one disposal mechanism: at the end of a scope, every owned 
 | `x.Dispose();` | right there, early | says nothing — the scope-end pass skips it |
 | `_ := x;` | right there, and ends the binding | says nothing — the discard is the announcement |
 
-`using var` is the default: *lives and dies here.* Plain `var` is for a value whose ownership will **move on** — a factory result you return, an accumulator, the best-so-far in a loop; the must-use warning then marks any path where it silently *doesn't* move on, so a leak is never quiet. An explicit `.Dispose()` is for an **early or conditional** release inside a longer scope. `_ := x;` disposes an unwanted owned value immediately (§9).
+`using var` is the default: *lives and dies here.* Plain `var` is for a value whose ownership will **move on** — a factory result you return, an accumulator, the best-so-far in a loop. The must-use warning then marks any path where it silently *doesn't* move on, so a leak is never quiet. An explicit `.Dispose()` is for an **early or conditional** release inside a longer scope. `_ := x;` disposes an unwanted owned value immediately (§9).
 
-**The habit to unlearn.** Elsewhere, a trailing `foo.Dispose()` at the end of a block is the anti-pattern `using` blocks exist to kill, because a thrown exception skips the trailing call. In Bezel the unwinding edge *always* disposes live owned values, so a trailing `Dispose()` is exception-safe by construction. It therefore never means "cleanup plumbing" — it means one thing only: *release this early.* Auto-drop is the safety net underneath all four forms; you are choosing *when* and *how loudly*, never *whether*.
+**The habit to unlearn.** Elsewhere, a trailing `foo.Dispose()` at the end of a block is the anti-pattern `using` blocks exist to kill, because a thrown exception skips the trailing call. In Bezel the unwinding edge *always* disposes live owned values, so a trailing `Dispose()` is exception-safe by construction. It therefore never means "cleanup plumbing." It means one thing only: *release this early.* Auto-drop is the safety net underneath all four forms. You are choosing *when* and *how loudly*, never *whether*.
 
 ---
 
@@ -60,7 +60,7 @@ method PrintSummary(account: BankAccount)        // borrows account
 end PrintSummary;                                // disposes nothing
 ```
 
-The caller keeps ownership; `PrintSummary` cannot dispose `account` and cannot return it. It *can* stash a reference under the back-reference discipline of §5 — a plain, non-owned field whose target is guaranteed to outlive the holder — but it cannot take ownership. This is the common case — most methods borrow.
+The caller keeps ownership; `PrintSummary` cannot dispose `account` and cannot return it. It *can* stash a reference under the back-reference discipline of §5 — a plain, non-owned field whose target is guaranteed to outlive the holder — but it cannot take ownership. This is the common case: most methods borrow.
 
 A borrow is valid only while its *source* stays alive. The compiler enforces this; you cannot return a borrow that outlives what it points into:
 
@@ -88,7 +88,13 @@ var t := source.PrefetchAsync();      // returns Task<Buffer>  -> owned (task ca
 var e := move holder.slot;            // move out of owned field -> owned
 ```
 
-The rule of thumb: `new` and any method whose return type says `owned` give you an owned value (you must discharge it). A plain field read or a plain (non-`owned`) return from an *instance* method is a borrow (you must not). Three refinements cover the rest: a *static* method's class-typed return must say `owned` — the compiler rejects the unmarked form, so a static signature always tells you whether you own the result; a call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` is **owned** no matter the callee — task-returning calls mint a fresh frame at every call, no marker needed (v0.190); and a generic call returning bare `T`, like `Math.Max(a, b)`, is a **borrow of its arguments** (v0.194). When in doubt, the spec's producers table (§28.3) is exhaustive.
+The rule of thumb: `new` and any method whose return type says `owned` give you an owned value (you must discharge it). A plain field read or a plain (non-`owned`) return from an *instance* method is a borrow (you must not). Three refinements cover the rest:
+
+- A *static* method's class-typed return must say `owned` — the compiler rejects the unmarked form, so a static signature always tells you whether you own the result.
+- A call whose declared return type is `Task`/`Task<T>`/`OwningTask<T>` is **owned** no matter the callee. Task-returning calls mint a fresh frame at every call, no marker needed (v0.190).
+- A generic call returning bare `T`, like `Math.Max(a, b)`, is a **borrow of its arguments** (v0.194).
+
+When in doubt, the spec's producers table (§28.3) is exhaustive.
 
 ---
 
@@ -108,7 +114,7 @@ Three things to copy from this:
 
 - **Resources you create and control are `owned`.** `_transactions` is disposed automatically when the `BankAccount` is disposed — no destructor needed.
 - **Back-references are not `owned`.** `_owner` points *up* to something that outlives this object; this object did not create it and must not dispose it. Marking it `owned` would be a double-free waiting to happen.
-- **A class whose only resources are `owned` fields needs no destructor.** The compiler-generated cleanup disposes them in reverse declaration order (a nullable field is null-checked first — a null field disposes nothing). Write a destructor only for native/foreign resources.
+- **A class whose only resources are `owned` fields needs no destructor.** The compiler-generated cleanup disposes them in reverse declaration order (a nullable field is null-checked first; a null field disposes nothing). Write a destructor only for native/foreign resources.
 
 `owned` is only for class- or interface-typed fields. `string` and function-typed fields are runtime-managed and cannot be `owned` (the compiler will tell you).
 
@@ -126,15 +132,15 @@ method CloneBuffer(): owned Buffer
 end CloneBuffer;
 ```
 
-Note this is plain `var`, not `using var`. Ownership is tracked on the value no matter how the local is declared — `new` produces an owned value. An owned value *should* reach a discharge point before the method ends — an `owned` field, a `using var`, an `owned` parameter, an **`owned` return**, an explicit `.Dispose()`, or the discard `_ := …` — and if it reaches none, it is auto-dropped at scope end and the compiler warns (§2). `return fresh` under the `owned` return type *is* such a discharge point, so the obligation is discharged by the return itself. (Transferring a *named* owned local into another local or a `using var` is spelled with the marker, `:= owned x` — §8.) Nothing is disposed here; ownership transfers to the caller, who writes:
+Note this is plain `var`, not `using var`. Ownership is tracked on the value no matter how the local is declared — `new` produces an owned value. An owned value *should* reach a discharge point before the method ends: an `owned` field, a `using var`, an `owned` parameter, an **`owned` return**, an explicit `.Dispose()`, or the discard `_ := …`. If it reaches none, it is auto-dropped at scope end and the compiler warns (§2). `return fresh` under the `owned` return type *is* such a discharge point, so the obligation is discharged by the return itself. (Transferring a *named* owned local into another local or a `using var` is spelled with the marker, `:= owned x` — §8.) Nothing is disposed here; ownership transfers to the caller, who writes:
 
 ```bezel
 using var s := factory.CloneBuffer();   // caller now owns it, disposes it
 ```
 
-**When would you use `using var` here instead?** Not for this factory shape at all. `using var` means *scope-pinned*: its value is disposed at this block's end and can never be moved out — `using var fresh := new Buffer(); … return fresh;` is a compile error ("cannot move out of `using var`"; spec §28.3). The factory idiom is plain `var`, and it is already exception-safe as written: if `CopyFrom` throws, `fresh` is a live owned value on the unwinding path and the exception-path discharge (spec §28.3) disposes it during unwinding — you write no cleanup code. And if some normal path drops `fresh` without returning it, it auto-drops at scope end with the must-use warning rather than leaking. The division of labor is intent: `using var` when the value should live and die in this scope; plain `var` when ownership will move on.
+**When would you use `using var` here instead?** Not for this factory shape at all. `using var` means *scope-pinned*: its value is disposed at this block's end and can never be moved out. `using var fresh := new Buffer(); … return fresh;` is a compile error ("cannot move out of `using var`"; spec §28.3). The factory idiom is plain `var`, and it is already exception-safe as written. If `CopyFrom` throws, `fresh` is a live owned value on the unwinding path, and the exception-path discharge (spec §28.3) disposes it during unwinding — you write no cleanup code. And if some normal path drops `fresh` without returning it, it auto-drops at scope end with the must-use warning rather than leaking. The division of labor is intent: `using var` when the value should live and die in this scope; plain `var` when ownership will move on.
 
-This is the one legal way to *transfer* an owned value past a method boundary. A method may also hand out a **borrow** of an owned field: a *bare read* of the field, returned through a **non-`owned`** return type, borrows the field (spec §28.6). The caller may read it but may not dispose it, store it as owned, or use it past the receiver's lifetime — the field's owner still disposes it. To hand the caller *ownership*, `move` the field out through an `owned` return type:
+This is the one legal way to *transfer* an owned value past a method boundary. A method may also hand out a **borrow** of an owned field: a *bare read* of the field, returned through a **non-`owned`** return type, borrows the field (spec §28.6). The caller may read it but may not dispose it, store it as owned, or use it past the receiver's lifetime. The field's owner still disposes it. To hand the caller *ownership*, `move` the field out through an `owned` return type:
 
 ```bezel
 method GetTransactions(): Array<Transaction>
@@ -152,7 +158,7 @@ end TakeTransactions;
 
 So a caller that needs to *look at* `_transactions` gets a borrow (the bare-field-read return above, or a dedicated borrowing view); a caller that must *take* it uses `move` with an `owned` return (next section).
 
-**Returning a lazy pipeline is fine — over your own inputs.** A method may build and return a lazy query (or an iterator, or a `Task`) over its *own parameters or receiver* — `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` (an instance form spells the same contract `owned IEnumerable<int>`, spec §28.3/§29.3, v0.223) — even though the returned frame borrows them. The caller re-establishes that borrow against its *own* argument and must keep it alive while it enumerates — for a returned `Task`, until the task settles (and the returned task is itself caller-owned: task calls mint, v0.190, so it is discharged like any other owned value). What you may *not* return this way is a pipeline over a local you created inside the method; that borrow would dangle — materialize it into an `owned Array<T>` instead.
+**Returning a lazy pipeline is fine — over your own inputs.** A method may build and return a lazy query (or an iterator, or a `Task`) over its *own parameters or receiver*, even though the returned frame borrows them: `static method Evens(xs: Array<int>): IEnumerable<int> => xs.Where(IsEven);` (an instance form spells the same contract `owned IEnumerable<int>`, spec §28.3/§29.3, v0.223). The caller re-establishes that borrow against its *own* argument and must keep it alive while it enumerates — for a returned `Task`, until the task settles. The returned task is itself caller-owned (task calls mint, v0.190), so it is discharged like any other owned value. What you may *not* return this way is a pipeline over a local you created inside the method; that borrow would dangle. Materialize it into an `owned Array<T>` instead.
 
 ---
 
@@ -170,7 +176,7 @@ method DetachLog(): owned Logfile?
 end DetachLog;
 ```
 
-`move _log` reads `_log` as an owned value and leaves the field moved-from. The **field-restoration rule** applies: if you `move` out of a field, every path to the end of that method must put something back:
+`move _log` reads `_log` as an owned value and leaves the field moved-from. The **field-restoration rule** applies here too: every path to the end of the method must put something back:
 
 ```bezel
 // A non-nullable owned field this time: private owned _log: Logfile;
@@ -182,13 +188,13 @@ method Rotate()
 end Rotate;                              // old disposed here
 ```
 
-Forgetting to reassign `_log` is a compile error, not a runtime surprise. So is restoring *via* something that can throw: a call between the move and the reassignment puts an exception edge there, and on that edge the method would exit with the field still moved-from — hence the *build before take* order above (§28.8.1, “Exception paths are not exempt”). The same `move` form works on owning-collection slots (`move buffer[i]`); see spec §28.8.1 (the move expression) and §28.11 (collection element ownership).
+Forgetting to reassign `_log` is a compile error, not a runtime surprise. So is restoring *via* something that can throw. A call between the move and the reassignment puts an exception edge there, and on that edge the method would exit with the field still moved-from — hence the *build before take* order above (§28.8.1, “Exception paths are not exempt”). The same `move` form works on owning-collection slots (`move buffer[i]`); see spec §28.8.1 (the move expression) and §28.11 (collection element ownership).
 
 ---
 
 ## 8. The one rule that will actually trip you: branch joins
 
-This is the most common compile error newcomers hit. If two branches of an `if` leave the same variable in *different* ownership states, the merge is rejected — because one path has a disposal obligation the other does not, and silently dropping it would leak:
+This is the most common compile error newcomers hit. If two branches of an `if` leave the same variable in *different* ownership states, the merge is rejected: one path has a disposal obligation the other does not, and silently dropping it would leak:
 
 ```bezel
 var x: Buffer;
@@ -225,7 +231,7 @@ class ResponseWriter
 end ResponseWriter;
 ```
 
-`dest ?? _fallback` reads: use `dest` if the caller supplied one, otherwise our `_fallback` field. Both are borrows, so the result is a borrow, and `target`'s source is whichever of the two long-lived objects was selected — both outlive the method, so the post-merge use is sound. This is the same code as the explicit form below, written the way you would reach for in most languages; here it happens to be legal because the ownership matches.
+`dest ?? _fallback` reads: use `dest` if the caller supplied one, otherwise our `_fallback` field. Both are borrows, so the result is a borrow. `target`'s source is whichever of the two long-lived objects was selected; both outlive the method, so the post-merge use is sound. This is the same code as the explicit form below, written the way you would reach for in most languages. Here it happens to be legal because the ownership matches.
 
 The explicit `if` is equivalent and is what you write when the per-branch logic needs more than a single selection, or when you want the ownership of each branch documented in a comment:
 
@@ -262,9 +268,9 @@ public method Write(dest: Stream?, payload: Array<byte>)
 end Write;
 ```
 
-`probe` is discharged when the else-branch closes, so at the post-merge `target.Write(...)` the borrow's source is already gone. The borrow checker rejects this — and it rejects it *early*, right at `target := probe;`: a borrow may not be assigned to a variable whose scope outlives the borrow's source (here `target` is method-scoped, `probe` lives only in the else-branch), so the diagnostic points at that assignment and names the source `probe` that `target` would outlive — you do not have to wait for the post-merge use to see it. (The genuinely *mixed* owned/borrowed merge at the start of this section is the one still reported at the merge point.) If a branch genuinely needs a short-lived owned object, let it finish its work and be discharged inside the branch; bind the post-merge variable from something longer-lived (a borrowed parameter, a field, or a value the caller owns).
+`probe` is discharged when the else-branch closes, so at the post-merge `target.Write(...)` the borrow's source is already gone. The borrow checker rejects this — and it rejects it *early*, right at `target := probe;`. A borrow may not be assigned to a variable whose scope outlives the borrow's source; here `target` is method-scoped and `probe` lives only in the else-branch. So the diagnostic points at that assignment and names the source `probe` that `target` would outlive — you do not have to wait for the post-merge use to see it. (The genuinely *mixed* owned/borrowed merge at the start of this section is the one still reported at the merge point.) If a branch genuinely needs a short-lived owned object, let it finish its work and be discharged inside the branch. Bind the post-merge variable from something longer-lived: a borrowed parameter, a field, or a value the caller owns.
 
-**Why not just `target := dest ?? new FileStream(...)`?** Earlier in this section, `dest ?? _fallback` *did* work — because both sides were borrows. Replacing `_fallback` with `new FileStream(...)` breaks it, and the contrast is the whole point. `dest` is a borrow (you do not own it); `new FileStream(...)` is owned (you must dispose it). `??` cannot yield "a borrow or an owned value depending on which side ran" — that is the rejected mixed-ownership merge from §8, just written as an expression. The working version coalesced two borrows; this one tries to coalesce a borrow with an owned value, and Bezel makes you resolve the ambiguity the null-coalescing operator would otherwise hide.
+**Why not just `target := dest ?? new FileStream(...)`?** Earlier in this section, `dest ?? _fallback` *did* work — because both sides were borrows. Replacing `_fallback` with `new FileStream(...)` breaks it, and the contrast is the whole point. `dest` is a borrow (you do not own it); `new FileStream(...)` is owned (you must dispose it). `??` cannot yield "a borrow or an owned value depending on which side ran" — that is the rejected mixed-ownership merge from §8, just written as an expression. The working version coalesced two borrows. This one tries to coalesce a borrow with an owned value, and Bezel makes you resolve the ambiguity the null-coalescing operator would otherwise hide.
 
 `??` is not broken, though — it is exactly right when both sides share ownership. The common case is supplying a default for a runtime-managed value like `string` (which is never owned, so there is no ambiguity):
 
@@ -272,9 +278,9 @@ end Write;
 var displayName: string := user?.Name ?? "Anonymous";   // both sides are string
 ```
 
-`a ?? b` returns `a` when non-null, else `b`. The right side may be `T` or `T?` — the result is nullable exactly when the right side is, so `user?.Name ?? "Anonymous"` is a plain `string`, while `primary ?? fallback` over two `string?`s stays `string?`. It works whenever `a` and `b` agree on ownership — two `string`s, two borrows (their sources need not match; the result is a borrow you use while both stay live), or two owned values *freshly produced in the arms*. Writing two *named* owned locals as the arms makes it a borrow merge instead — a named owned binding read as an arm is a borrow, never a silent consume — so to coalesce two owned locals into one owned result you use an explicit `if`/`else` with `owned` transfers. `??` is rejected only when the two sides disagree on ownership, which is the same single rule §8 is about. The `?.` (null-conditional) and `??=` (assign-if-null) operators follow the same principle.
+`a ?? b` returns `a` when non-null, else `b`. The right side may be `T` or `T?`, and the result is nullable exactly when the right side is: `user?.Name ?? "Anonymous"` is a plain `string`, while `primary ?? fallback` over two `string?`s stays `string?`. It works whenever `a` and `b` agree on ownership: two `string`s, two borrows (their sources need not match; the result is a borrow you use while both stay live), or two owned values *freshly produced in the arms*. Writing two *named* owned locals as the arms makes it a borrow merge instead — a named owned binding read as an arm is a borrow, never a silent consume; so to coalesce two owned locals into one owned result, use an explicit `if`/`else` with `owned` transfers. `??` is rejected only when the two sides disagree on ownership — the same single rule §8 is about. The `?.` (null-conditional) and `??=` (assign-if-null) operators follow the same principle.
 
-**Fixing it inside the method, with no field.** The earlier `ResponseWriter` used an object-scoped field so the fallback outlived the method. You do not need a field — you need the owned fallback to be live *at the point of use*. The cleanest way is to stop trying to make one `target` span the merge, and instead put the write where the fallback is in scope, using the nested-block tool the language provides for exactly this:
+**Fixing it inside the method, with no field.** The earlier `ResponseWriter` used an object-scoped field so the fallback outlived the method. You do not need a field — you need the owned fallback to be live *at the point of use*. The cleanest way is to stop trying to make one `target` span the merge. Instead, put the write where the fallback is in scope, using the nested-block tool the language provides for exactly this:
 
 ```bezel
 public method Write(dest: Stream?, payload: Array<byte>)
@@ -289,7 +295,7 @@ public method Write(dest: Stream?, payload: Array<byte>)
 end Write;
 ```
 
-There is no merged `target` variable, so there is no mixed-ownership merge to reject. Each branch uses its own destination while that destination is unambiguously live, and the owned fallback is created and disposed entirely within the branch that needs it — created lazily (never opened when `dest` was supplied) and disposed exactly once.
+There is no merged `target` variable, so there is no mixed-ownership merge to reject. Each branch uses its own destination while that destination is unambiguously live. The owned fallback is created and disposed entirely within the branch that needs it: created lazily (never opened when `dest` was supplied) and disposed exactly once.
 
 If the post-merge logic is substantial and you do not want to duplicate it across both branches, factor it into a helper that takes the destination as a *borrowed* parameter, and let each branch call it:
 
@@ -340,7 +346,7 @@ using var owned_x := owned x;     // adopt for scoped disposal (transfer marker)
 owned_x.Process();
 ```
 
-Pick A when the value is short-lived and you only need to read it; pick B when the value must outlive the `if`. A `var` that is owned but not yet under `using var` is still tracked — if it is neither disposed nor transferred, it auto-drops at scope end and the compiler raises the must-use warning (spec §28.3), so a drop is never silent. The mixed-ownership *merge* itself remains a hard error; its message names the variable and the disagreeing branches.
+Pick A when the value is short-lived and you only need to read it; pick B when the value must outlive the `if`. A `var` that is owned but not yet under `using var` is still tracked. If it is neither disposed nor transferred, it auto-drops at scope end and the compiler raises the must-use warning (spec §28.3) — a drop is never silent. The mixed-ownership *merge* itself remains a hard error; its message names the variable and the disagreeing branches.
 
 ---
 
@@ -370,7 +376,7 @@ In a *borrowing* iterator the bare `yield return line;` also compiles (it re-bor
 
 **Frame-disposed `owned` parameters — adopt on entry.** An `owned` parameter of an iterator or async method is disposed by the frame at teardown, but the must-use warning still fires at the parameter; `using var r := owned reader;` on the first line declares the intent and silences it.
 
-**Consuming a `choice` outcome — match the fresh call, adopt the payload.** A `case` directly over a call returning an owning `choice` (spec §35) is an *owning match*: the selected arm's `owned` payload binding is yours, and the adopt idiom applies inside the arm — while a `case` over a *named* binding just peeks (borrows), and consuming a named binding is spelled `case owned outcome of …`, the same marker discipline as every other transfer:
+**Consuming a `choice` outcome — match the fresh call, adopt the payload.** A `case` directly over a call returning an owning `choice` (spec §35) is an *owning match*: the selected arm's `owned` payload binding is yours, and the adopt idiom applies inside the arm. By contrast, a `case` over a *named* binding just peeks (borrows). Consuming a named binding is spelled `case owned outcome of …` — the same marker discipline as every other transfer:
 
 ```bezel
 case Connect(host) of                 // fresh call: owning match
@@ -382,7 +388,7 @@ case Connect(host) of                 // fresh call: owning match
 end;
 ```
 
-**Three one-line rules.** `_ := x;` disposes `x` *now* and ends the binding — an announced consume, no marker; afterward `x` is treated exactly as after an explicit `.Dispose()`, so a later read is flagged the same way (a straight-line read is a must-use warning plus a checked-mode fault; a read after a *conditional* discard — one branch consumed, another still owning — is a compile error at the merge; see Guide 2 §6). A **closure** may *read* a captured owned value but never dispose, reassign, or move it out; a callback that must consume takes an `owned` parameter. And `Dispose()` needs a receiver you *own* — disposing a borrowed parameter, `this`, or a borrowed element is a compile error, with no exception (the owner disposes it). If a collection's elements are yours to dispose, say so in the type: an owning-family collection cascades on `Dispose()`, and selective cleanup takes elements out first (`Drain()`, `Pop*`, `move coll[i]`) into bindings you own.
+**Three one-line rules.** First: `_ := x;` disposes `x` *now* and ends the binding — an announced consume, no marker. Afterward `x` is treated exactly as after an explicit `.Dispose()`, so a later read is flagged the same way: a straight-line read is a must-use warning plus a checked-mode fault, while a read after a *conditional* discard — one branch consumed, another still owning — is a compile error at the merge (see Guide 2 §6). Second: a **closure** may *read* a captured owned value but never dispose, reassign, or move it out; a callback that must consume takes an `owned` parameter. Third: `Dispose()` needs a receiver you *own* — disposing a borrowed parameter, `this`, or a borrowed element is a compile error, with no exception (the owner disposes it). If a collection's elements are yours to dispose, say so in the type: an owning-family collection cascades on `Dispose()`, and selective cleanup takes elements out first (`Drain()`, `Pop*`, `move coll[i]`) into bindings you own.
 
 ---
 
@@ -401,4 +407,4 @@ end;
 | Drain an owning collection | `for var e in coll.Drain() do using var x := owned e; … end;` |
 | Merge branches with mixed ownership | equalize first (Pattern A or B, §8) |
 
-Three habits cover almost everything: reach for `using var` by default, mark container-held resources `owned` and back-references plain, and when the compiler rejects a branch join, equalize the branches rather than fighting it — the rejection is almost always finding a real leak. Everything else — the explicit `.Dispose()`, the discard, the `owned` transfer marker — is just choosing *when* a disposal happens; auto-drop guarantees it always does.
+Three habits cover almost everything. Reach for `using var` by default. Mark container-held resources `owned` and back-references plain. And when the compiler rejects a branch join, equalize the branches rather than fighting it — the rejection is almost always finding a real leak. Everything else — the explicit `.Dispose()`, the discard, the `owned` transfer marker — is just choosing *when* a disposal happens; auto-drop guarantees it always does.
