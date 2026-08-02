@@ -238,6 +238,95 @@ BEZEL_TEST(sorted_1426, sorted_set_forin_after_remove_ascending_spec_4_18) {
     )), "1030");
 }
 
+// fix #2553 (stdlib §4.18, v0.236): the for-in path's stdlib-synthesised
+// GetEnumerator iterated the SortedSet<string> dict's internal order[] array,
+// yielding insertion order on non-trivial inserts — diverging from the
+// explicit `.GetEnumerator()` surface (#2550) which already promised
+// ascending order. Route the for-in through wrapSortedSetAsIEnumerable (the
+// SAME wrap the explicit `.GetEnumerator()` call site uses, LlvmBackend_Calls2
+// .cpp:5070) so the two §4.18 surfaces agree on the same receiver. The
+// element-type gate is the `buildSortedKeyComparator` non-support for string
+// (it ranks only integer/float scalars); that gate previously caused
+// lowerDictBackedSetFor to silently drop the sort and fall through to the
+// stdlib-synthesised GetEnumerator, which iterates insertion order. The fix
+// defers the non-sortable SortedSet element case to lowerIEnumerableFor's
+// SortedSet-aware helper, which routes through the same sorted-snapshot wrap
+// as the explicit-GetEnumerator surface.
+BEZEL_TEST(sorted_1426, sorted_set_forin_string_ascending_spec_4_18) {
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+        "  using var s := new SortedSet<string>(); "
+        "  s.Add(\"gamma\"); s.Add(\"alpha\"); s.Add(\"beta\"); "
+        "  for var v in s do Console.WriteLine(v); end; "
+        "  return 0; "
+    )), "alpha\nbeta\ngamma");
+}
+
+// fix #2553 follow-up (sibling of the explicit-GetEnumerator #2550 test):
+// after Remove, the remaining elements still iterate in ascending order via
+// the for-in path (the snapshot is taken before the loop body, so the
+// mid-loop Remove doesn't affect iteration order).
+BEZEL_TEST(sorted_1426, sorted_set_forin_string_after_remove_spec_4_18) {
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+        "  using var s := new SortedSet<string>(); "
+        "  s.Add(\"delta\"); s.Add(\"charlie\"); s.Add(\"alpha\"); "
+        "  s.Add(\"bravo\"); "
+        "  var ignored := s.Remove(\"charlie\"); "
+        "  for var v in s do Console.WriteLine(v); end; "
+        "  return 0; "
+    )), "alpha\nbravo\ndelta");
+}
+
+// fix #2553 follow-up (sibling of #2550): break/continue inside a `for var x in
+// sortedSet` over a SortedSet<string> disposes the loop's wrapper/enumerator
+// scope correctly — the loop's vtable-protocol path used scopeDepth == my-scope-
+// index (not outerDepth), so emitLoopDisposals on `continue` is a no-op (the
+// wrapper/enumerator stay live for the next MoveNext read); `break` and normal
+// exhaustion both land at endBB, which calls emitDisposals(disposeStack_.back())
+// for the wrapper/enumerator scope exactly once. Each variant uses a
+// shuffled input so the assertion discriminates ascending order from
+// insertion order (the #2553 bug would otherwise mask itself by yielding
+// insertion-order output that "looks sorted" for trivially-sorted inputs).
+BEZEL_TEST(sorted_1426, sorted_set_forin_string_with_break_continue_spec_4_18) {
+    // break: SHUFFLED input — break on "beta", assert ascending prefix.
+    // Without the fix, the for-in yields insertion order ("gamma,alpha")
+    // which disagrees with the expected ascending prefix ("alpha,").
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+        "  using var s := new SortedSet<string>(); "
+        "  s.Add(\"gamma\"); s.Add(\"alpha\"); s.Add(\"beta\"); "
+        "  var prefix := \"\"; "
+        "  for var v in s do "
+        "    if v = \"beta\" then break; end; "
+        "    prefix := prefix + v + \",\"; "
+        "  end; "
+        "  Console.WriteLine(prefix); return 0; "
+    )), "alpha,");
+    // continue: SHUFFLED input — skip "alpha" mid-list, assert ascending suffix.
+    // Without the fix, iteration would yield "gamma,beta" insertion order,
+    // not the ascending "beta,gamma," suffix.
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+        "  using var s := new SortedSet<string>(); "
+        "  s.Add(\"gamma\"); s.Add(\"alpha\"); s.Add(\"beta\"); "
+        "  var suffix := \"\"; "
+        "  for var v in s do "
+        "    if v = \"alpha\" then continue; end; "
+        "    suffix := suffix + v + \",\"; "
+        "  end; "
+        "  Console.WriteLine(suffix); return 0; "
+    )), "beta,gamma,");
+    // empty body: SHUFFLED input, no break/continue — must be fully ascending.
+    // Without the fix, this would yield "gamma,alpha,beta".
+    BEZEL_EXPECT_EQ(runAotOut(prog(
+        "  using var s := new SortedSet<string>(); "
+        "  s.Add(\"gamma\"); s.Add(\"alpha\"); s.Add(\"beta\"); "
+        "  var all := \"\"; "
+        "  for var v in s do "
+        "    if v = \"z\" then continue; end; "
+        "    all := all + v; "
+        "  end; "
+        "  Console.WriteLine(all); return 0; "
+    )), "alphabetagamma");
+}
+
 // ===========================================================================
 // SortedSet<T> — First (least) and Last (greatest)  (stdlib §4.18)
 // ===========================================================================

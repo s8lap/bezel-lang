@@ -8659,6 +8659,20 @@ private:
 
     bool lowerIEnumerableFor(const ast::ForStmt& fs);
 
+    // fix #2553 (stdlib §4.18, v0.236): `for var x in <SortedSet<T>>` — route
+    // through wrapSortedSetAsIEnumerable (the same sorted-snapshot wrap the
+    // explicit `.GetEnumerator()` call site uses via #2550/#2546) and dispatch
+    // MoveNext/Current via the wrapper's slot-4 enumerator's vtable, so the
+    // for-in order matches the §4.18 ascending-iteration contract. The
+    // stdlib-synthesised SortedSet.GetEnumerator iterates the dict's internal
+    // order[] insertion-order array; lowerIEnumerableFor's direct
+    // `emitMethodCall(getEnumSym, ...)` therefore yields insertion order on
+    // non-trivial inserts — the two §4.18 surfaces (`using var e := s.GetEnumerator()`
+    // vs `for var x in s`) were inconsistent on the same receiver before this
+    // helper made them agree.
+    bool lowerIEnumerableForSortedSet(const ast::ForStmt& fs,
+                                      const sema::TypeRef* iterTy);
+
     // stdlib §5: `for var x in <lazy LINQ pipeline>` — when the iterable is a
     // deferred LINQ operator call (or a chain of them), iterate the resulting
     // lazy enumerator via its vtable: MoveNext at slot 2 (-> i32), Current at

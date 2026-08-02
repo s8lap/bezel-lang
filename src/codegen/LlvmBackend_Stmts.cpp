@@ -4565,6 +4565,25 @@ bool Emitter::lowerArrayFor(const ast::ForStmt& fs) {
     // §3: for var x in array (runtime Array<T> object).
     {
         auto* iterTy = ctx_.exprType(*fs.iterable);
+        // fix #2553 (stdlib §4.18, v0.236): SortedSet<T> is in
+        // isCollectionTypeName's set (the registry comment notes it routes
+        // through this gate alongside Set/OwningSet), but it's NOT array-backed
+        // — its count is in the same struct slot but `data` is a hash-bucket
+        // array, so this loop's bz_array_ptr_at readback would walk the bucket
+        // array as element bytes and yield garbage. SortedSet is supposed to
+        // be handled by lowerDictBackedSetFor (above), which only covers
+        // SORTABLE element types; for non-sortable (string, decimal-as-record,
+        // user choice, etc.) it now defers to lowerIEnumerableFor's SortedSet
+        // helper (#2553), which routes through wrapSortedSetAsIEnumerable for
+        // the correct sorted snapshot. Belt-and-suspenders: if the dispatch
+        // above falls through for any reason (shouldn't, after #2553), refuse
+        // the array-backed iteration here and return false so the generic
+        // for-handlers take over instead of miscompiling.
+        if (iterTy && iterTy->astNode && iterTy->astNode->name &&
+            !iterTy->astNode->name->parts.empty() &&
+            iterTy->headName() == "SortedSet") {
+            return false;
+        }
         if (isCollectionTypeName(iterTy)) {
             llvm::Value* arrObj = lowerExpr(*fs.iterable);
             if (!arrObj) return false;
@@ -4889,6 +4908,17 @@ bool Emitter::lowerDictBackedSetFor(const ast::ForStmt& fs) {
     const sema::TypeRef* elemTy =
         genericBackingType(iterTy, 0, /*isSet=*/true, nullptr);
     if (!elemTy) return false;  // not dict-backed → let lowerArrayFor handle it
+    // fix #2553 (stdlib §4.18, v0.236): SortedSet<T> with an element type
+    // buildSortedKeyComparator can't rank (string, decimal-as-record,
+    // user choice, …) would otherwise silently drop the sort inside
+    // emitGenericKeyTableFor (the "fall through unsorted" branch) and yield
+    // insertion order — violating §4.18's ascending-iteration contract on a
+    // fundamental element type. Defer to lowerIEnumerableFor's SortedSet-aware
+    // helper, which routes through wrapSortedSetAsIEnumerable (its own string
+    // comparator from #2550, the dictionary-entry wrap for records, etc.) so
+    // the §4.18 promise holds for every SortedSet element type the wrapper
+    // supports.
+    if (n == "SortedSet" && !buildSortedKeyComparator(elemTy)) return false;
     llvm::Value* setObj = lowerExpr(*fs.iterable);
     if (!setObj) return false;
     bool sorted = (n == "SortedSet");
@@ -6502,6 +6532,24 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
     auto* iterTy = ctx_.exprType(*fs.iterable);
     if (!iterTy || iterTy->kind != sema::TypeRef::Kind::Named) return false;
     auto* ts = iterTy->declaration;
+
+    // fix #2553 (stdlib §4.18, v0.236): `for var x in <SortedSet<T>>` — see
+    // lowerDictBackedSetFor for the comparator-availability gate that defers
+    // a non-int/float SortedSet here. The stdlib-synthesised GetEnumerator
+    // iterates the dict's internal order[] insertion-order array; the
+    // `emitMethodCall(getEnumSym, ...)` path below would yield insertion
+    // order, violating §4.18's ascending-iteration contract. Route through
+    // wrapSortedSetAsIEnumerable (#2550/#2546) so the for-in surface matches
+    // the explicit `s.GetEnumerator()` surface on the same receiver.
+    // NOTE: SortedSet<string> reaches this handler with iterTy->declaration
+    // NULL (the registry treats SortedSet as a builtin name — the explicit
+    // GetEnumerator path sees the same null declaration, see
+    // LlvmBackend_Calls2.cpp:4800), so the SortedSet dispatch must NOT gate
+    // on the same `if (!ts) return false` the user-class path below uses.
+    if (iterTy->headName() == "SortedSet") {
+        if (lowerIEnumerableForSortedSet(fs, iterTy))
+            return true;
+    }
     if (!ts) return false;  // builtin/interface without concrete class — skip
 
     // #1776 / §21.4 / §29.2: the source's STATIC type is a user INTERFACE that
@@ -6863,6 +6911,173 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
 
     // §29.2 / §28.3 (#972): normal exhaustion — dispose the enumerator and pop
     // the dedicated scope, mirroring lowerIEnumerableBuiltinFor's endBB handling.
+    builder_.SetInsertPoint(endBB);
+    emitDisposals(disposeStack_.back());
+    disposeStack_.pop_back();
+    return true;
+}
+
+
+// fix #2553 (stdlib §4.18, v0.236): `for var x in <SortedSet<T>>` — build the
+// same sorted-snapshot wrapper the explicit `.GetEnumerator()` call site uses
+// (wrapSortedSetAsIEnumerable, #2550/#2546), obtain the enumerator via the
+// wrapper's slot-4 GetEnumerator (which returns a non-owning clone over the
+// same sorted array), and dispatch MoveNext/Current through the enumerator's
+// vtable (slot 2 / slot 3 — the standard iterator-vtable layout, identical to
+// the Array/Stack/Queue/LinkedList enumerable wrappers the builtin path uses
+// in lowerIEnumerableBuiltinFor). The stdlib-synthesised SortedSet.GetEnumerator
+// iterates the dict's internal `order[]` insertion-order array, so the
+// `emitMethodCall(getEnumSym, ...)` path lowerIEnumerableFor would otherwise
+// take yields insertion order — diverging from the explicit-GetEnumerator
+// surface on the same receiver (#2550 made the explicit surface ascending;
+// this fix makes the for-in surface match).
+//
+// Disposal (#972 / §29.2): dedicated scope so break / early return / normal
+// exhaustion / exception ALL dispose the enumerator AND the wrapper exactly
+// once. LIFO at endBB — the wrapper (pushed first) is disposed LAST, freeing
+// the sorted snapshot array AFTER the enumerator (pushed second) has freed
+// its (non-owning) frame. Mirrors the explicit-GetEnumerator dispatch's
+// "dispose wrapper after the enumerator clone" ordering (#2471 / §29.11) so
+// the snapshot array stays live for the clone's full consumption — a dispose-
+// first wrapper would free the array out from under the live enumerator's
+// Current reads (confirmed UAF under ASan, see #2471).
+bool Emitter::lowerIEnumerableForSortedSet(const ast::ForStmt& fs,
+                                           const sema::TypeRef* iterTy) {
+    if (!fs.iterable || !iterTy) return false;
+    if (iterTy->genericArgs.empty() || !iterTy->genericArgs[0]) return false;
+    const sema::TypeRef* elemTyRef = iterTy->genericArgs[0];
+    llvm::Type* elemTy = lowerTypeRef(elemTyRef);
+    if (!elemTy) return false;
+
+    // Evaluate the iterable to get the source object pointer.
+    llvm::Value* srcPtr = lowerExpr(*fs.iterable);
+    if (!srcPtr) return false;
+
+    // Snapshot + sort + wrap as the OWNING enumerable the #2550 wrap emits.
+    // The wrapper's vtable:
+    //   [0]=td, [1]=Dispose(frees sorted array, frees self),
+    //   [2]=MoveNext, [3]=Current, [4]=GetEnumerator(non-owning clone)
+    // — same shape wrapOwnedArrayAsIEnumerable produces.
+    llvm::Value* wrapper = wrapSortedSetAsIEnumerable(srcPtr, iterTy);
+    if (!wrapper || !wrapper->getType()->isPointerTy()) return false;
+
+    // slot-4 GetEnumerator — returns a non-owning clone over the same array.
+    llvm::Value* wt = builder_.CreateLoad(ptrTy(), wrapper);
+    llvm::Value* geSlotPtr =
+        builder_.CreateGEP(ptrTy(), wt, {builder_.getInt32(4)});
+    llvm::Value* geFnPtr = builder_.CreateLoad(ptrTy(), geSlotPtr);
+    auto* geTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+    llvm::Value* enumPtr = builder_.CreateCall(
+        geTy, geFnPtr, {wrapper}, "ssenum.getenum");
+
+    // §29.7 (#623) / §28.3 (#972): dedicated disposal scope for both the
+    // enumerator (non-owning — Dispose frees only its frame) and the wrapper
+    // (owning — Dispose frees the sorted array then self). outerDepth saved
+    // BEFORE the push so `loopStack_` records the enclosing depth for
+    // break-path emitLoopDisposals.
+    std::size_t outerDepth = disposeStack_.size();
+    disposeStack_.emplace_back();
+
+    // Push wrapper FIRST, enumerator SECOND — LIFO reverse iteration on
+    // endBB runs the enumerator first (cheap frame-free, harmless because
+    // non-owning), then the wrapper (frees the sorted array, safe because
+    // no Current reads happen after the enumerator is gone). This matches
+    // the explicit-GetEnumerator dispatch's "defer wrapper disposal AFTER
+    // the enumerator clone" ordering (#2471).
+    llvm::AllocaInst* wrapperSlot = entryAlloca(ptrTy());
+    builder_.CreateStore(wrapper, wrapperSlot);
+    {
+        Disposal wd{wrapperSlot, nullptr};
+        wd.iterEnumDispose = true;
+        disposeStack_.back().push_back(wd);
+    }
+    llvm::AllocaInst* enumSlot = entryAlloca(ptrTy());
+    builder_.CreateStore(enumPtr, enumSlot);
+    {
+        Disposal ed{enumSlot, nullptr};
+        ed.iterEnumDispose = true;
+        disposeStack_.back().push_back(ed);
+    }
+
+    // Use vtable-based MoveNext (slot 2 → i1) and Current (slot 3 → T) — the
+    // same iterator-vtable layout lowerIEnumerableBuiltinFor dispatches
+    // through for Array/Stack/Queue/LinkedList enumerable wrappers. We can't
+    // reuse lowerIEnumerableFor's emitMethodCall(moveNextSym, ...) path
+    // because moveNextSym / currentSym are looked up on the SortedSet's
+    // declared enumerator class, NOT on the wrapper's bz$arrenum$...$ clone
+    // — the wrapper's class has its own MoveNext/Current with no sema
+    // MethodSymbol accessible from this scope. Vtable dispatch is the
+    // canonical escape (§29.2 vtable protocol).
+    auto* moveNextTy = llvm::FunctionType::get(i1(), {ptrTy()}, false);
+    auto* currentTy = llvm::FunctionType::get(elemTy, {ptrTy()}, false);
+
+    auto* varSlot = entryAlloca(elemTy);
+    locals_[&fs] = varSlot;
+    // NOTE: #747 R42 (state-machine spill) intentionally OMITTED for this
+    // helper — SortedSet for-in inside a yield iterator is a separate
+    // concern (#2553 follow-up; today's spec fix lands the simple synchronous
+    // case first). Filing a follow-up issue.
+
+    auto* condBB = llvm::BasicBlock::Create(llvm_, "ss.cond", currentFn_);
+    auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ss.body", currentFn_);
+    auto* endBB  = llvm::BasicBlock::Create(llvm_, "ss.end",  currentFn_);
+    builder_.CreateBr(condBB);
+
+    // cond: enumerator.MoveNext() → i1 via vtable slot 2.
+    builder_.SetInsertPoint(condBB);
+    llvm::Value* obj = builder_.CreateLoad(ptrTy(), enumSlot);
+    llvm::Value* vtable = builder_.CreateLoad(ptrTy(), obj);
+    llvm::Value* mnSlotPtr =
+        builder_.CreateGEP(ptrTy(), vtable, {builder_.getInt32(2)});
+    llvm::Value* mnFnPtr = builder_.CreateLoad(ptrTy(), mnSlotPtr);
+    llvm::Value* moved = builder_.CreateCall(
+        moveNextTy, mnFnPtr, {obj}, "ss.moved");
+    builder_.CreateCondBr(moved, bodyBB, endBB);
+
+    // body: enumerator.Current → T via vtable slot 3, then run the user body.
+    builder_.SetInsertPoint(bodyBB);
+    llvm::Value* obj2 = builder_.CreateLoad(ptrTy(), enumSlot);
+    llvm::Value* vtable2 = builder_.CreateLoad(ptrTy(), obj2);
+    llvm::Value* curSlotPtr =
+        builder_.CreateGEP(ptrTy(), vtable2, {builder_.getInt32(3)});
+    llvm::Value* curFnPtr = builder_.CreateLoad(ptrTy(), curSlotPtr);
+    llvm::Value* curVal = builder_.CreateCall(
+        currentTy, curFnPtr, {obj2}, "ss.cur");
+    builder_.CreateStore(curVal, varSlot);
+
+    // §29.7 (#623) / #2553 (v0.236): scopeDepth = MY scope's index (after push),
+    // not outerDepth (before push). The existing patterns in lowerIEnumerableFor
+    // / lowerIEnumerableBuiltinFor use outerDepth so emitLoopDisposals runs the
+    // body's iter-var scope + the loop's wrapper/enumerator scope on `break`;
+    // that double-disposes the wrapper/enumerator on `continue` too — the
+    // slots get nulled by iterEnumDispose and condBB's `Load(enumSlot)` reads
+    // NULL → SEGV (a pre-existing latent bug the vtable-protocol paths inherit,
+    // first exercised by #2553's SortedSet<string> for-in + `continue`).
+    // Moving scopeDepth to MY scope's index makes emitLoopDisposals a no-op on
+    // continue (the wrapper/enumerator stay live for the next MoveNext read)
+    // and on break (endBB picks them up via emitDisposals(disposeStack_.back()).
+    // The wrapper/enumerator are STILL disposed exactly once on every exit:
+    //   * normal exhaustion (condBB false-branch → endBB) — emitDisposals.
+    //   * break (lowerLoopJump → endBB) — emitDisposals.
+    //   * early `return` / exception — the next-emitDisposals on the unwind
+    //     path runs the scope unconditionally (§31.2), and `iterEnumDispose`
+    //     nulls the slot after Dispose so a second pass is a no-op.
+    //   * `continue` — slot stays live; loop body reuses the same enumerator.
+    // This matches LinkedList's iter-var scope (its scopeDepth is the
+    // current disposeStack size at push time, NOT before — see the original
+    // for-in patterns); the wrapper/enumerator are loop-scope resources that
+    // must outlive every continue.
+    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
+    bool term = lowerForBody(fs);
+    loopStack_.pop_back();
+    if (!term) builder_.CreateBr(condBB);
+
+    // Normal exhaustion: endBB. emitDisposals iterates the scope in REVERSE
+    // so the enumerator (pushed second) is disposed FIRST (frees its
+    // non-owning frame, harmless), then the wrapper (pushed first) is
+    // disposed SECOND (frees the sorted array, then self). See #972 for
+    // the disposal-protocol reasoning; mirrors lowerIEnumerableBuiltinFor's
+    // endBB handling exactly.
     builder_.SetInsertPoint(endBB);
     emitDisposals(disposeStack_.back());
     disposeStack_.pop_back();
