@@ -43,6 +43,7 @@ DOCS = [
     ("guide3", "docs/Bezel_Guide_03_Modeling_Data.md"),
     ("guide4", "docs/Bezel_Guide_04_Concurrency.md"),
     ("guide5", "docs/Bezel_Guide_05_Collections_and_Iteration.md"),
+    ("guide6", "docs/Bezel_Guide_06_Contracts_and_Purity.md"),
     ("stdlib", "docs/Bezel_Standard_Library.md"),
 ]
 
