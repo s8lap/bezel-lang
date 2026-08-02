@@ -33,9 +33,9 @@ public class Account
 end Account;
 ```
 
-A clause's expression is `bool`, is checked under the pure-body discipline of §22.15 (so it can call only `pure` members — §7), and can neither write state, consume a value, nor suspend. A clause that evaluates `false` raises **`ContractViolationException`** (spec §31.4): catchable, its `Message` naming the clause kind, the member, and the clause's source text — but never a control-flow tool. It reports a **bug**: a caller bug for `requires`, an implementation bug for `ensures`/`invariant`.
+A clause's expression is `bool`, is checked under the pure-body discipline of §22.15 (so it can call only `pure` members — §7), and can neither write state, consume a value, nor suspend — and, unlike a pure *body*, a clause may not `throw`: a clause states a proposition, and the mechanism and blame of a violation belong to §22.16's own machinery (the throw carve-out stays available to a clause's pure *callees*). A clause that evaluates `false` raises **`ContractViolationException`** (spec §31.4): catchable, its `Message` naming the clause kind, the member, and the clause's source text — but never a control-flow tool. It reports a **bug**: a caller bug for `requires`, an implementation bug for `ensures`/`invariant`.
 
-**How Bezel does it: contracts are not compiled out.** The habit from environments where assertion machinery vanishes in release builds does not transfer. A `requires` clause is **always-on** — evaluated on every invocation in every build mode; the only elision is elision-by-*proof* (a statically discharged clause compiles to nothing). It replaces the always-on `throw new ArgumentException(...)` prologue, so it keeps that idiom's posture; the remedy for a hot path is the proven tier (§3), not a knob. `ensures` and `invariant` run under **checked-contracts mode** — off by default in release — but the relaxation is *defined* non-evaluation, unobservable for any program whose clauses hold, because clauses are pure (spec §22.16).
+**Contracts are not compiled out.** The habit from environments where assertion machinery vanishes in release builds does not transfer. A `requires` clause is **always-on** — evaluated on every invocation in every build mode; the only elision is elision-by-*proof* (a statically discharged clause compiles to nothing). It replaces the always-on `throw new ArgumentException(...)` prologue, so it keeps that idiom's posture; the remedy for a hot path is the proven tier (§3), not a knob. `ensures` and `invariant` run under **checked-contracts mode** — off by default in release — but the relaxation is *defined* non-evaluation, unobservable for any program whose clauses hold and never fault (§3), because clauses are pure (spec §22.16).
 
 Clauses are part of the member's contract in the fullest sense: they are carried by the artifact interface (spec §2.8.2), so a caller compiling against your module sees them — API documentation the compiler enforces. And they are **slot-bound** (spec §22.16): a clause on a virtual, abstract, or interface member binds every override and implementation, inherited verbatim and never restated. An override may *add* `ensures` clauses (strengthening its guarantee — always sound for callers) and may **not** declare `requires` clauses (strengthening a precondition would break every caller dispatching through the base contract).
 
@@ -58,7 +58,8 @@ public class SampleWindow
   end Push;
 
   public method At(index: int): double
-    requires(index >= 0 and index < _samples.Count)
+    requires(index >= 0)
+    requires(index < _samples.Count)
     return _samples[index];
   end At;
 end SampleWindow;
@@ -90,7 +91,7 @@ end Listen;
 
 The two-question test before writing `requires(E)`: *could a correct caller always guarantee E?* and *is a false E a bug in the calling code?* Two yeses: contract. Either no: a value shape (or, at a boundary consumed by logging/retry, a typed exception — Guide 2 §4).
 
-When it does run, `requires` evaluates after argument binding and before anything else — before a constructor's chain, before field initializers, before the first body statement — in declaration order, stopping at the first `false` (spec §22.16). A constructor's `requires` may not observe `this` (no field exists yet); it reads parameters and statics only.
+When it does run, `requires` evaluates after argument binding and before anything else — before a constructor's chain, before field initializers, before the first body statement — in declaration order, stopping at the first `false` (spec §22.16). A constructor's `requires` may not observe `this` (no field is assigned yet); it reads parameters and statics only.
 
 ---
 
@@ -101,7 +102,8 @@ An `ensures` clause evaluates on every **normal-completion** path — after the 
 ```bezel
 // private owned _items: Array<string>;
 public method Discard(count: int)
-  requires(count >= 0 and count <= _items.Count)
+  requires(count >= 0)
+  requires(count <= _items.Count)
   ensures(_items.Count = old(_items.Count) - count)
   for var i in 0..<count do
     _items.RemoveAt(_items.Count - 1);
@@ -109,7 +111,7 @@ public method Discard(count: int)
 end Discard;
 ```
 
-**`old` is shallow.** A class-typed capture holds the entry *reference*, so `old(_items).Count` reads the count *now* — almost never what you meant; `old(_items.Count)` captures the entry count. The idiom is value-typed projections inside `old`, and implementations warn on the dereferenced-class-capture form (spec §22.16).
+**`old` is shallow.** A class-typed capture holds the entry *reference*, so `old(_items).Count` reads the count *now* — almost never what you meant; `old(_items.Count)` captures the entry count. The idiom is value-typed projections inside `old`, and implementations are directed to warn on the dereferenced-class-capture form (spec §22.16).
 
 Contracts compose. Here the class invariant from §1 is what makes the postcondition true:
 
@@ -120,7 +122,7 @@ public pure method Headroom(): decimal
 end Headroom;
 ```
 
-Two more rules worth knowing. A clause that *faults* (overflow, an indexer fault, a pure callee's own validation throw) propagates that exception as itself — never converted to `ContractViolationException`, because the clause did not evaluate `false`; it failed to evaluate, which is a defect in the contract, and the original exception is its diagnosis. And every clause occupies one recorded **tier**: **proven** (discharged statically, zero cost — demanded by the `static` qualifier, where an undischargeable clause is a compile error, never a silent runtime check), **checked** (a runtime evaluation), or **assumed** (reserved, unpopulated). The shipped prover floor is deliberately small — constant folds, plus the `when true`/`when false` postconditions of Try methods, which are normatively `static ensures` clauses — so essentially every clause you author today is checked; the extended fragment (linear integer arithmetic, null-test flow, closed-set case analysis) is fixed in Appendix D.2 so `static`'s meaning never drifts (spec §22.16).
+Two more rules worth knowing. A clause that *faults* (overflow, an indexer fault, a pure callee's own validation throw) propagates that exception as itself — never converted to `ContractViolationException`, because the clause did not evaluate `false`; it failed to evaluate, which is a defect in the contract, and the original exception is its diagnosis. And every clause occupies one recorded **tier**: **proven** (discharged statically, zero cost — demanded by the `static` qualifier, where an undischargeable clause is a compile error, never a silent runtime check), **checked** (a runtime evaluation), or **assumed** (reserved, unpopulated). The shipped prover floor is deliberately small — constant folds, plus the `when true`/`when false` `out`-nullability postconditions (spec §22.4 — the Try shapes' familiar carrier), which are normatively `static ensures` clauses — so essentially every clause you author today is checked; the extended fragment (linear integer arithmetic, null-test flow, closed-set case analysis) is fixed in Appendix D.2 so `static`'s meaning never drifts (spec §22.16).
 
 ---
 
@@ -170,12 +172,12 @@ Record construction is fine in a pure body (the synthesized positional construct
 **The body rules** are a closed list (spec §22.15); in teaching terms:
 
 - **Reads are free — even of mutable state.** Locals, parameters, fields through `this` or any borrow, statics, `typeof`, `is`, `nameof` — reads are not effects.
-- **Frame-local mutation is fine.** Assign, compound-assign, `++`/`--` — provided the target's **root is a local or by-value parameter of this body** and the path from that root traverses only value-typed storage. The first class-typed dereference on the path leaves the frame and makes the store prohibited: mutating a record *local* is frame-private; storing through a field of `this` is not.
-- **Building values is fine**: primitives, enums, strings (concatenation and interpolation included), records, value-like choices, ranges. Defining lambdas is fine (the body runs later, at the caller's discipline) — but *invoking* a function value is prohibited, because its type carries no effect information.
+- **Frame-local mutation is fine.** Assign, compound-assign, `++`/`--` — provided the target's **root is a local or by-value parameter of this body** and the path from that root traverses only value-typed storage. The first class-typed dereference on the path leaves the frame and makes the store prohibited: mutating a record *local* is frame-private; storing through a field of `this` is not. (The one exception is a `pure` **constructor**: its stores to `this`'s own fields are admitted — the birth-store rule — because the instance is not yet reachable from any holder; spec §22.15.)
+- **Building values is fine**: primitives, enums, strings (concatenation and interpolation included), records, choices whose classification is not owning, ranges. Defining lambdas is fine (the body runs later, at the caller's discipline) — but *invoking* a function value is prohibited, because its type carries no effect information.
 - **All control flow is admitted**, `throw` included. `new E(args)` is admitted *only* as the immediate operand of a `throw`, with a `pure` constructor on a trivial-dispose class — the built-in exception types' `(message)` constructors qualify (spec §31.4) — so the validation idiom stays writable in the pure fragment.
 - **Calls resolve to `pure` declarations only.** This single rule fences off all I/O, tasks, channels, and synchronization — none of those entry points is or can be pure-declared.
 
-The rule that surprises people is the **`for`-loop rule**: a `for` over an `IEnumerable<T>`-typed source — including `Array<T>` and `string` — is rejected in a pure body, because its desugaring constructs an enumerator class instance. A `for` over a primitive `Range` is the admitted counted loop, and the remedy is the index loop (spec §22.15):
+The rule that surprises people is the **`for`-loop rule**: a `for` over an `IEnumerable<T>`-typed source — including `Array<T>` and `string` — is rejected in a pure body, because its desugaring constructs an enumerator class instance. A `for` over a primitive `Range` is the admitted counted loop — as are `for` loops over inline arrays, spans, `ReadOnlyStringSpan`, and value-typed `OwningBuffer<T>`, whose desugarings are already direct indexed loops — and the remedy for the rejected sources is the index loop (spec §22.15):
 
 ```bezel
 public static pure method CountOf(text: string, needle: char): int
@@ -234,7 +236,7 @@ What it does **not** buy: pure calls are not compile-time evaluated (a pure call
 ```bezel
 import System.Diagnostics;
 
-method Rebalance()
+public method Rebalance()
   // … move entries between _hot and _cold …
   Debug.Assert(_hot.Count + _cold.Count = _total, "rebalance lost entries");
 end Rebalance;
@@ -252,7 +254,7 @@ So: obligations between caller and callee go in clauses; sanity checks inside an
 
 ## 9. Choosing the right tool
 
-This table classifies the *condition*; Guide 2 §7's table — the home for failure signals — classifies the *outcome shapes*. They meet at the first and fourth rows.
+This table classifies the *condition*; Guide 2 §7's table — the home for failure signals — classifies the *outcome shapes*. They meet at rows 1, 4, 5 and 7 — the last of which Guide 2 states in the same words.
 
 | The condition is… | Reach for |
 |---|---|
