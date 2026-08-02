@@ -13526,6 +13526,66 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // fix #2304 / §11 (properties) / §4.6 / §28.9: an EXPRESSION-BODIED string
+    // PROPERTY read `obj.Tag` (a MemberAccessExpr — NOT a CallExpr) mints +1
+    // through the same path as the property's own getter body. `isUserMethodStringReturnCall`
+    // does not see it (the syntactic form is a MemberAccessExpr, not a CallExpr
+    // to a MethodSymbol), so without this arm the consumer (a `var s := obj.Tag;`
+    // bound local, a ctor-arg, a return-value, a field-store, a WriteLine-arg)
+    // retained the result as if it were a BORROW and never discharged the
+    // producer's +1 — leaking the freshly-allocated bz.string header +
+    // data buffer at scope end (37 bytes / 2 allocations per read, scaling
+    // with any loop over a string property). The shape is matched via the
+    // SAME `computedGetterOf` predicate lowerPropertyRead keys on: an
+    // expression-bodied property (PropertyDecl with bodyKind == Expression,
+    // the `=>` form) OR a block-getter with an expression body (`{ get => expr; }`)
+    // is a +1 string producer iff its body expression is itself a +1 producer.
+    // Recursing isPlusOneStringProducer on the body handles every existing
+    // producer shape (`+`/interpolation/case/if/??/substring/transforming-method/
+    // ToString/user-method) — a block-getter that returns a borrow, an imported
+    // string-returning property, an indexer `obj[i]`, or a property whose body
+    // is not a recognized producer all correctly return false here (the body
+    // arms of isPlusOneStringProducer handle the borrow/imported paths, and
+    // block getters with a statement body return null from computedGetterOf
+    // so the arm never fires — sound, the safe-direction leak remains in those
+    // unfixed shapes, in lockstep with the other `isUserMethodStringReturnCall`
+    // exclusions above). Indexers and non-string properties are excluded by
+    // the type/symbol gate below.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(init)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*ma);
+        if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
+            if (!ps->isIndexer) {
+                const sema::TypeRef* ty = ctx_.exprType(*init);
+                if (ty && ty->kind == sema::TypeRef::Kind::Primitive &&
+                    ty->primitive == sema::PrimitiveType::String &&
+                    !ty->nullable) {
+                    // Inline the predicate that computedGetterOf keys on
+                    // (isPlusOneStringProducer is `const`, but computedGetterOf
+                    // is not — duplicating the small constant-time check here
+                    // keeps this const-correct without widening the API):
+                    // an expression-bodied property, OR a block-getter with an
+                    // expression body.
+                    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                    const ast::Expr* getter = nullptr;
+                    if (pd && !pd->isIndexer) {
+                        if (pd->bodyKind == ast::PropertyBodyKind::Expression)
+                            getter = pd->exprBody.get();
+                        else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+                            for (const auto& acc : pd->accessors) {
+                                if (!acc.isSet &&
+                                    acc.bodyKind ==
+                                        ast::PropertyAccessorBodyKind::Expression) {
+                                    getter = acc.exprBody.get();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (getter && isPlusOneStringProducer(getter)) return true;
+                }
+            }
+        }
+    }
     return false;
 }
 
@@ -15229,7 +15289,8 @@ bool Emitter::lowerClosureFieldStore(const ast::Expr& target,
 bool Emitter::isUserMethodBoxReturnCall(const ast::Expr* init) const {
     auto* call = dynamic_cast<const ast::CallExpr*>(init);
     if (!call || !call->callee) return false;
-    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call->callee));
+    auto* sym = ctx_.exprSymbol(*call->callee);
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
     if (!ms) return false;
     if (ms->isOperator) return false;
     if (ctx_.isImported(ms)) return false;
@@ -17396,11 +17457,42 @@ void Emitter::collectSafeViewAliases(
 // Object/interface target boxForTarget never boxes (the local takes the value
 // type directly). Mirrors the boxForTarget gate in lowerLocalDecl exactly.
 bool Emitter::isPlusOneBoxProducer(const ast::LocalDecl* ld) {
-    if (!ld || !ld->type || !ld->initializer) return false;
-    const sema::TypeRef* declTy = ctx_.resolvedType(*ld->type);
-    if (!isObjectOrInterfaceTarget(declTy)) return false;
+    // fix #2304 / §8.6 / §28.9: an INFERRED Object local (`var x := MakeBox(7);`
+    // — no `: Object` annotation) is also a +1 box producer when its initializer
+    // is a box-return method call. The DECLARED-TARGET gate above short-circuits
+    // on inferred locals (ld->type is null), so case (b) below never fires for
+    // them and the local leaks (the box the callee minted) at scope end (a
+    // 24-byte Direct leak per iteration — the half of the #2060 fix the call-
+    // result form was missing). The inferred type IS Object/interface (sema
+    // promotes the call's return type into the local), so it passes
+    // isObjectOrInterfaceTarget's criteria; we use srcTy (the initializer's
+    // static type) AS the target type when no declared target exists. Built-in
+    // string methods (`Equals`/`ToString`/etc), lambda captures, and every
+    // other +1 producer path are unchanged: they always go through
+    // isPlusOneStringProducer (not isPlusOneBoxProducer). Crucially,
+    // isPlusOneStringProducer's `var o: Object := ToString()` / `var o: Object
+    // := Caller()` paths are already covered by case (a)/(b); the NEW case here
+    // is purely the INFERRED-LOCAL FALLBACK for case (b) — it admits the call
+    // when srcTy is Object/interface (case b's two-test pair already accepts
+    // the DECLARED variant). Recognized by the SAME shapes the declared case
+    // keys on (MemberSymbol binding, isImported check, boxReturnMethods_
+    // membership, operator exclusion) so a cross-module call (whose callee
+    // does NOT run THIS module's boxForTarget) is still rejected: the
+    // inferred-target fallback walks the same call-resolution / method-set
+    // paths as the declared variant, no new surface.
+    if (!ld || !ld->initializer) return false;
+    bool inferredTarget = !ld->type;
+    if (!inferredTarget && !ld->type) return false;
+    const sema::TypeRef* declTy = inferredTarget
+        ? nullptr
+        : ctx_.resolvedType(*ld->type);
     const sema::TypeRef* srcTy = ctx_.exprType(*ld->initializer);
     if (!srcTy) return false;
+    // For an inferred local, the declared type IS srcTy (sema promotes the
+    // call's return type into the local). Treating srcTy as the target lets
+    // case (b) admit the call when srcTy is Object/interface — the same
+    // shape isUserMethodBoxReturnCall already validates.
+    if (!isObjectOrInterfaceTarget(inferredTarget ? srcTy : declTy)) return false;
     // Case (a): the initializer itself is a boxable value source.
     if (isBoxableValueType(srcTy) || isNullableValueTy(srcTy)) return true;
     // Case (b): a call to a box-return method (always returns a fresh box).
