@@ -3906,6 +3906,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     std::vector<const ast::Expr*>  prebuiltCtorExprs;   // parallel to [1..n]
     sema::ConstructorSymbol*       prebuiltCtorCs   = nullptr;
     llvm::Function*                prebuiltCtorFn   = nullptr;
+    // fix #2319 / §22.3: accessor-mediated `ref`/`out` argument bracket
+    // (copy-IN) recorded by the pre-pass; consumed by the ctor-call section
+    // below to flush the copy-OUT after the ctor body runs. Empty unless an
+    // indexer-slot / property bracket was emitted — `ref local`/`ref field`
+    // still resolve through lvalueAddr and never enter here.
+    std::vector<AccessorRefArg>    prebuiltAccessorRefArgs;
 
     const bool importedGeneric =
         ctx_.isImported(t) && !t->genericParams.empty();
@@ -4083,9 +4089,20 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     // free cleanup, restoring the enclosing target before the ctor.
                     llvm::BasicBlock* savedArgUT = unwindTarget_;
                     if (!ne.args.empty()) unwindTarget_ = newArgUnwindCleanup(obj);
+                    // fix #2319 / §22.3: pass an accessor-ref-arg sink so
+                    // buildOrderedArgs can emit the §22.3 copy-IN bracket for
+                    // an indexer-slot / property `ref`/`out` argument here.
+                    // The pre-pass already lowered the arg expression; the
+                    // stored records (and their pinned receiver/index values)
+                    // are consumed by the ctor-call section below, which
+                    // emits the setter (the copy-OUT half) once the ctor body
+                    // has returned NORMALLY. Same plumbing as lowerCall's
+                    // method-call path; the helpers themselves are unchanged.
+                    std::vector<AccessorRefArg> accessorRefArgs;
                     bool ok = buildOrderedArgs(earlyCd->params, ne.args, eArgs,
                                               &eArgExprs,
-                                              /*nullTransferredOwned=*/true);
+                                              /*nullTransferredOwned=*/true,
+                                              &accessorRefArgs);
                     unwindTarget_ = savedArgUT;
                     currentThis_ = savedThisForArgs;
                     if (ok) {
@@ -4094,12 +4111,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         prebuiltCtorExprs = std::move(eArgExprs);
                         prebuiltCtorCs    = earlyCs;
                         prebuiltCtorFn    = earlyIt->second;
+                        // fix #2319: forward the §22.3 bracket records so the
+                        // ctor-call section can flush the setter after the body
+                        // runs. The prebuilt args are reused verbatim below
+                        // (no re-lowering), so the bracket setup moves with them.
+                        prebuiltAccessorRefArgs = std::move(accessorRefArgs);
                         // Pre-populate base positional-param fields using
                         // args[1..n] (param values, not the `this` in args[0]).
                         std::vector<llvm::Value*> paramVals(
                             prebuiltCtorArgs.begin() + 1,
                             prebuiltCtorArgs.end());
                         prePopulateBasePositionalFields(t, obj, paramVals, earlyCs);
+                    } else {
+                        // fix #2319: the call never runs, so no §22.3 write-back
+                        // is owed — release the pinned receiver/index values.
+                        emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
                     }
                 }
             }
@@ -4176,9 +4202,17 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // inlined ctor body, whose own cleanup then owns the block.
             llvm::BasicBlock* savedArgUT = unwindTarget_;
             if (!ne.args.empty()) unwindTarget_ = newArgUnwindCleanup(obj);
+            // fix #2319 / §22.3: pass an accessor-ref-arg sink so buildOrderedArgs
+            // emits the §22.3 copy-IN bracket for an indexer-slot / property
+            // `ref`/`out` argument. The setter (copy-OUT) is flushed below,
+            // after the inlined ctor body returns NORMALLY — the exception edge
+            // skips the write-back per §22.3's "on an exception exit no write-
+            // back occurs". Mirrors lowerCall's method-call path; helpers unchanged.
+            std::vector<AccessorRefArg> accessorRefArgs;
             bool builtArgs = buildOrderedArgs(cd->params, ne.args, args,
                                               &ctorArgExprs,
-                                              /*nullTransferredOwned=*/true);
+                                              /*nullTransferredOwned=*/true,
+                                              &accessorRefArgs);
             unwindTarget_ = savedArgUT;
             genericSubst_ = std::move(ctorArgSubst);
             genericSubstSemaTy_ = std::move(ctorArgSemaTy);
@@ -4203,6 +4237,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 currentThis_ = savedThis;
                 locals_ = std::move(savedLocals);
                 paramSlots_ = std::move(savedParams);
+                // fix #2319 / §22.3: flush the copy-OUT half of every
+                // accessor-mediated `ref`/`out` argument. The body has now
+                // written the slot's final value (or thrown — `!diverged_`
+                // matches §22.3's exception edge rule and lowerCall's own
+                // call-site discipline exactly). Mirrors the post-call
+                // emitAccessorRefArgWriteBacks call in lowerCall.
+                emitAccessorRefArgWriteBacks(accessorRefArgs,
+                                             /*emit=*/!diverged_);
                 // Release any +1 string producer ctor args after body completes.
                 if (!diverged_) {
                     for (std::size_t ai = 1;
@@ -4212,6 +4254,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             emitStringRelease(args[ai]);
                     }
                 }
+            } else {
+                // fix #2319: the ctor body never runs (buildOrderedArgs failed
+                // or args size mismatched) — release the pinned receiver/index
+                // values so their refcount isn't stranded.
+                emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
             }
         }
         emitNewPendingCheck(obj);
@@ -4245,9 +4292,49 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // by emitNewPendingCheck below.
             llvm::BasicBlock* savedArgUT = unwindTarget_;
             if (!ne.args.empty()) unwindTarget_ = newArgUnwindCleanup(obj);
+            // fix #2319 / §22.3: accessor-mediated `ref`/`out` argument bracket
+            // (copy-IN) recorded here, flushed (copy-OUT) after the call. This
+            // path iterates ne.args manually (no buildOrderedArgs), so the same
+            // emitAccessorRefArgCopyIn / emitAccessorRefArgWriteBacks helpers
+            // lowerCall uses for IMPORTED methods (LlvmBackend_Calls2.cpp ~6843)
+            // are invoked directly. A plain local/field `ref`/`out` argument
+            // still resolves through lvalueAddr (the alias path), so the
+            // bracket fires only for indexer slots / properties — the §22.3
+            // shapes that have no address to alias.
+            std::vector<AccessorRefArg> accessorRefArgs;
             for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
                 if (!ne.args[ai].value) { ok = false; break; }
-                llvm::Value* v = lowerExpr(*ne.args[ai].value);
+                // Determine the formal parameter's ref/out modifier from the
+                // imported ConstructorSymbol (mirrors lowerCall's imported-
+                // method arg path).
+                std::string_view formalMod;
+                if (ai < cs->params.size())
+                    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                            cs->params[ai]))
+                        formalMod = ps->modifier;
+                llvm::Value* v = nullptr;
+                if (isByRefMod(formalMod) || isByRefMod(ne.args[ai].modifier)) {
+                    // §22.3 alias path: a true-alias location — local, field,
+                    // static, §15.1 inline-array element — has an address the
+                    // callee can write through directly.
+                    llvm::Type* et = nullptr;
+                    v = lvalueAddr(*ne.args[ai].value, et);
+                    // §22.3 bracket path: an indexer slot or property has no
+                    // address to alias; emit copy-IN and record the copy-OUT
+                    // for after the call. Mirrors lowerCall's own imported-
+                    // method fallback (LlvmBackend_Calls2.cpp).
+                    if (!v && (formalMod == "ref" || formalMod == "out")) {
+                        llvm::Type* paramTy = nullptr;
+                        if (ai + 1 < fnTy->getNumParams())
+                            paramTy = fnTy->getParamType(ai + 1);
+                        v = emitAccessorRefArgCopyIn(
+                            *ne.args[ai].value, paramTy,
+                            /*isOut=*/formalMod == "out",
+                            accessorRefArgs);
+                    }
+                } else {
+                    v = lowerExpr(*ne.args[ai].value);
+                }
                 if (!v) { ok = false; break; }
                 // §5.1: widen an int argument to a wider numeric parameter, as
                 // the in-module ctor-call path does, so the ABI matches.
@@ -4260,6 +4347,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             unwindTarget_ = savedArgUT;
             if (ok && args.size() == ctorFn->arg_size())
                 builder_.CreateCall(ctorFn, args);
+            // fix #2319 / §22.3: flush the copy-OUT half of every accessor-
+            // mediated `ref`/`out` argument. Skipped on the throw edge per
+            // §22.3's "on an exception exit no write-back occurs", matching
+            // lowerCall's identical post-call discipline. The `if (ok)`
+            // guard above (the call was actually emitted) plus `!diverged_`
+            // (the call returned normally) together match the rule.
+            emitAccessorRefArgWriteBacks(accessorRefArgs,
+                                         /*emit=*/ok && !diverged_);
         }
         // §22.9 / §28.3 (FINDING [4]): an imported constructor may throw. As for
         // an in-module ctor, the imported ctor (compiled by this same compiler in
@@ -4291,6 +4386,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             std::vector<llvm::Value*> args;
             std::vector<const ast::Expr*> ctorArgExprs;
             bool builtArgs = false;
+            // fix #2319 / §22.3: accessor-mediated `ref`/`out` argument bracket
+            // — populated here (from the pre-pass via `prebuiltAccessorRefArgs`)
+            // OR fresh from buildOrderedArgs; flushed after the ctor body/call
+            // below. Mirrors lowerCall's method-call path (LlvmBackend_Calls2.cpp
+            // ~6444). The prebuilt-reuse branch moves it verbatim (no re-eval);
+            // the rebuild branch builds it fresh.
+            std::vector<AccessorRefArg> accessorRefArgs;
             // §11.1 / #873: reuse pre-evaluated ctor args from the
             // prePopulateBasePositionalFields step above (to avoid
             // double-evaluating side-effecting arg expressions).
@@ -4298,6 +4400,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 !prebuiltCtorArgs.empty()) {
                 args        = std::move(prebuiltCtorArgs);
                 ctorArgExprs = std::move(prebuiltCtorExprs);
+                // fix #2319: the pre-pass already recorded the §22.3 bracket
+                // setup; move it through so the post-ctor flush below has the
+                // copy-OUT records. The prebuilt args are reused verbatim, so
+                // the bracket setup moves with them.
+                accessorRefArgs = std::move(prebuiltAccessorRefArgs);
                 builtArgs   = true;
             } else {
             // issue #597 (§14.1 / §22.4): the constructor ARGUMENT expressions
@@ -4330,9 +4437,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // ctor call / inline body, whose own cleanup then owns the block.
             llvm::BasicBlock* savedArgUT = unwindTarget_;
             if (!ne.args.empty()) unwindTarget_ = newArgUnwindCleanup(obj);
+            // fix #2319 / §22.3: pass an accessor-ref-arg sink so buildOrderedArgs
+            // emits the §22.3 copy-IN bracket for an indexer-slot / property
+            // `ref`/`out` argument. Flushed below.
             builtArgs = buildOrderedArgs(cd->params, ne.args, args,
                                               &ctorArgExprs,
-                                              /*nullTransferredOwned=*/true);
+                                              /*nullTransferredOwned=*/true,
+                                              &accessorRefArgs);
             unwindTarget_ = savedArgUT;
             genericSubst_ = std::move(ctorArgSubst);
             genericSubstSemaTy_ = std::move(ctorArgSemaTy);
@@ -4396,6 +4507,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     locals_ = std::move(savedLocals);
                     paramSlots_ = std::move(savedParams);
                 }
+                // fix #2319 / §22.3: flush the copy-OUT half of every
+                // accessor-mediated `ref`/`out` argument. Skipped on the
+                // exception edge per §22.3's "on an exception exit no write-
+                // back occurs", matching lowerCall's post-call discipline.
+                emitAccessorRefArgWriteBacks(accessorRefArgs,
+                                             /*emit=*/!diverged_);
                 // #429 (ARGUMENT-PASS category) / §4.6 / §28.9: release any
                 // +1 string producer constructor arguments after the ctor body
                 // runs. Constructor params are borrows; field-store of a param
@@ -4409,6 +4526,11 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             emitStringRelease(args[ai]);
                     }
                 }
+            } else {
+                // fix #2319: the ctor body / call never ran (buildOrderedArgs
+                // failed or args size mismatched) — release the pinned
+                // receiver/index values so their refcount isn't stranded.
+                emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
             }
         }
     } else if (!hasAnyConstructor(t)) {
@@ -5513,11 +5635,23 @@ llvm::Value* Emitter::buildRecordValue(
         // transferred via `owned x` into an `owned` ctor parameter (mirrors the
         // class-ctor paths above; harmless for the common record ctor whose
         // params are value-typed — no bare owned local/param slot is nulled).
+        // fix #2319 / §22.3: pass an accessor-ref-arg sink so buildOrderedArgs
+        // emits the §22.3 copy-IN bracket for an indexer-slot / property
+        // `ref`/`out` argument. Flushed below after lowerScopedBlock (the
+        // record's inlined ctor body) returns NORMALLY. Mirrors lowerCall's
+        // method-call path; helpers themselves unchanged.
+        std::vector<AccessorRefArg> accessorRefArgs;
         bool builtRecArgs = buildOrderedArgs(cd->params, args, ordered, nullptr,
-                                             /*nullTransferredOwned=*/true);
+                                             /*nullTransferredOwned=*/true,
+                                             &accessorRefArgs);
         genericSubst_ = std::move(recSubst);
         genericSubstSemaTy_ = std::move(recSemaTy);
-        if (!builtRecArgs) return nullptr;
+        if (!builtRecArgs) {
+            // fix #2319: the ctor body never runs — release the pinned
+            // receiver/index values so their refcount isn't stranded.
+            emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
+            return nullptr;
+        }
         llvm::Value* savedThis = currentThis_;
         auto savedLocals = locals_;
         auto savedParams = paramSlots_;
@@ -5534,6 +5668,13 @@ llvm::Value* Emitter::buildRecordValue(
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
         paramSlots_ = std::move(savedParams);
+        // fix #2319 / §22.3: flush the copy-OUT half of every accessor-
+        // mediated `ref`/`out` argument. Skipped on the throw edge per
+        // §22.3's "on an exception exit no write-back occurs", matching
+        // lowerCall's post-call discipline. emitPendingCheck below handles
+        // the thrown path.
+        emitAccessorRefArgWriteBacks(accessorRefArgs,
+                                     /*emit=*/!diverged_);
         emitPendingCheck();  // §28: a constructor may throw
     } else if (!args.empty()) {
         // Arguments were supplied but no constructor accepts them — fall
