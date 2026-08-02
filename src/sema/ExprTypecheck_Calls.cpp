@@ -12930,19 +12930,33 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             //     SortedDictionary from its `hasCount` list
                             //     — a pre-existing gap this block would
                             //     otherwise expose.
-                            //   - SortedDictionary: `Keys`/`Values` are
-                            //     typed by the handler at ~10908 for
-                            //     Dictionary/OwningDictionary only, so
-                            //     `var f := sd.Keys;` falls through here
-                            //     untyped — same pre-existing gap, same
-                            //     false-reject risk.
-                            // Including these property names here (rather
-                            // than widening the property handlers, which
-                            // is a separate change) avoids a false
-                            // "no member" reject on a bare reference to
-                            // a real, documented property — the exact
-                            // false-reject failure mode the standing
-                            // protocol weights most heavily against.
+                            // `Count` is in the stdlib-documented surface of
+                            // every one of the eight families in this block
+                            // (std §4.7-§4.10, §4.17, §4.18), so it is allowed
+                            // unconditionally here.
+                            //
+                            // `Keys`/`Values` (stdlib §4.8/§4.9 only):
+                            // Dictionary<K,V> (§4.8) and OwningDictionary<K,V>
+                            // (§4.9) are the ONLY families whose stdlib
+                            // surface declares them. SortedDictionary (§4.17,
+                            // has FirstKey/LastKey but no Keys/Values),
+                            // SortedSet (§4.18), Set/OwningSet (§4.10), and
+                            // LinkedList/OwningLinkedList (§4.6/§4.7, sets
+                            // and lists — not maps at all) do NOT declare
+                            // either property. Without the per-family gate
+                            // below, a bare reference like
+                            //   `var k := sd.Keys;`
+                            // compiled silently on HEAD at exit 0 with no
+                            // diagnostic and no sema-typed result (the
+                            // property handler at ~10908 covers Dictionary/
+                            // OwningDictionary only; the catch-all here
+                            // exempts the name from the "no member" reject;
+                            // codegen's #2434 zero-init fallback then
+                            // degraded the local to `i32`). Gating on the
+                            // family name converts the silent false-accept
+                            // into a proper "no member" reject — exactly
+                            // what the catch-all was designed to do for
+                            // names outside the documented surface (#2457).
                             //
                             // #2538: `IsReadOnly` is declared on
                             // `ICollection<T>` (§4.1) and `IOwningCollection<T>`
@@ -12956,8 +12970,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                             // (checked together with the rest of the
                             // documented surface further below).
                             bool isKnownProperty =
-                                mbr == "Count" || mbr == "Keys" ||
-                                mbr == "Values";
+                                mbr == "Count" ||
+                                ((mbr == "Keys" || mbr == "Values") &&
+                                 (cn == "Dictionary" || cn == "OwningDictionary"));
                             // Per-family documented methods (stdlib
                             // §4.7-§4.10, §4.17, §4.18). Enumerated as a
                             // catch-all UNION across the family's own
