@@ -536,13 +536,15 @@ std::string methodSignatureString(std::string_view name,
     return s;
 }
 
-// §22.4 / #1303: true when `t` still references one of the method's own type
-// parameters — a bare `T` (or `T?`) or a `T` nested inside a constructed
-// generic's arguments (`Pair<T, U>`) — i.e. the generic out-parameter's
-// declared type was NOT fully substituted at the call site. Used to guard the
-// inline `out var x` re-type so a partially-substituted out param (a type
-// parameter left unbound by inference) is left untouched rather than
-// installing a half-resolved type. Mirrors substituteReturnType's bare-method-
+// §22.4 / §14.5 / #1303 / #2280: true when `t` still references one of the
+// method's own type parameters — a bare `T` (or `T?`), a `T` nested inside a
+// constructed generic's arguments (`Pair<T, U>`), or an inline-array element
+// (`[4]T`) — i.e. the generic parameter's declared type was NOT fully
+// substituted at the call site. Used to guard the inline `out var x` re-type so
+// a partially-substituted out param (a type parameter left unbound by inference)
+// is left untouched rather than installing a half-resolved type. Also gates the
+// §14.5 ref/out exact-unification check, so its inline-array element slot must
+// be inspected. Mirrors substituteReturnType's bare-method-
 // type-parameter detection (astNode / importedName single-part head).
 bool containsMethodTypeParam(
     const TypeRef* t,
@@ -554,13 +556,12 @@ bool containsMethodTypeParam(
     }
     for (auto* ga : t->genericArgs)
         if (containsMethodTypeParam(ga, gpNames)) return true;
-    return false;
+    return containsMethodTypeParam(t->arrayElement, gpNames);
 }
 
 // §22.3 / §14.5 (#2266): true when `t` mentions one of `tpNames` ANYWHERE in its
-// structure. Same question containsMethodTypeParam asks, but it walks EVERY
-// nested type slot — the inline-array element (`[4]T`) and a function type's
-// parameter/return slots (`(T) -> int`) as well as genericArgs (`Pair<T, U>`).
+// structure. It additionally walks function parameter/return slots beyond
+// containsMethodTypeParam's generic arguments and inline-array element.
 //
 // It gates a SKIP of a rejection: checkArgsAgainstParams' §22.3 ref/out
 // exact-type check defers every parameter this returns true for to §14.5's
@@ -570,8 +571,9 @@ bool containsMethodTypeParam(
 // `[4]int` argument. That is precisely how #1756's earlier narrow guards
 // (containsBareTypeParam, containsUnresolvedTypeParam — both recursing
 // genericArgs only) regressed the accepted generic ref/out calls and got
-// reverted. containsMethodTypeParam itself is left alone: it gates the §22.4
-// out-var re-type and §14.5's own domain test, whose contracts are unchanged.
+// reverted. containsMethodTypeParam is narrower because its callers only need
+// generic arguments and inline-array elements; this superset also covers
+// function slots for the §22.3 deferral gate.
 bool refOutParamTypeMentionsTypeParam(
     const TypeRef* t,
     const std::unordered_set<std::string_view>& tpNames) {
