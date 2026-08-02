@@ -7272,7 +7272,11 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     // scope around the loop — the iterator frame's Dispose is at vtable slot 1, so
     // use iterEnumDispose. Previously the frame was disposed only at endBB (normal
     // completion), leaking it when the body threw / returned / broke out.
-    std::size_t outerDepth = disposeStack_.size();
+    // fix #2566 (v0.236): the loop stack entry below uses `disposeStack_.size()`
+    // (AFTER this emplace_back), not a pre-push `outerDepth`. The pre-push form
+    // made `continue` walk the enumerator's slot to dispose, which FREEs the
+    // iterator frame; the next condBB then reads freed memory → heap-use-after-
+    // free. See the matching comment at the loopStack_.push_back below.
     disposeStack_.emplace_back();
     {
         Disposal d{enumOwnSlot, nullptr};
@@ -7356,9 +7360,20 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     emitPendingCheck();  // TakeCurrent may raise IOE on OwnedAsync path (#1349)
     builder_.CreateStore(curVal, varSlot);
 
-    // #792 / §29.7: loopScopeDepth = outerDepth (BEFORE the enumerator scope) so
-    // `break`/`return` out of the loop disposes the iterator frame too.
-    loopStack_.push_back({condBB, endBB, outerDepth});
+    // #792 / §29.7 / fix #2566 (v0.236): scopeDepth = MY scope's index (after
+    // push), not outerDepth (before push). The prior `outerDepth` form made
+    // emitLoopDisposals on `continue` walk the enumerator's slot to dispose,
+    // which (with `iterEnumDispose`) FREES the iterator frame; the next condBB
+    // re-loads the frame's enum slot and reads freed memory → heap-use-after-
+    // free (`READ` in `bz$async$Main$Resume`, `free` in
+    // `bz$asynciter$Gen$Dispose`). Matches the existing
+    // lowerIEnumerableForSortedSet (#2553) and the post-#2556 form in
+    // lowerIEnumerableFor / lowerIEnumerableBuiltinFor: `disposeStack_.size()`
+    // here, since the scope was just pushed via `disposeStack_.emplace_back()`
+    // a few lines up — the current size IS the new scope's index. The wrapper/
+    // enumerator resources must outlive every continue; `break` / normal
+    // exhaustion still dispose them via the endBB path.
+    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
     bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(condBB);
