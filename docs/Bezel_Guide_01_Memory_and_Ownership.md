@@ -194,7 +194,7 @@ Forgetting to reassign `_log` is a compile error, not a runtime surprise. So is 
 
 ## 8. The one rule that will actually trip you: branch joins
 
-This is the most common compile error newcomers hit. If two branches of an `if` leave the same variable in *different* ownership states, the merge is rejected. One path has a disposal obligation the other does not, and silently dropping it would leak:
+This is the most common compile error newcomers hit. If two branches of an `if` leave the same variable in *different* ownership states, the merge is rejected: one path has a disposal obligation the other does not, and silently dropping it would leak:
 
 ```bezel
 var x: Buffer;
@@ -278,7 +278,7 @@ end Write;
 var displayName: string := user?.Name ?? "Anonymous";   // both sides are string
 ```
 
-`a ?? b` returns `a` when non-null, else `b`. The right side may be `T` or `T?`, and the result is nullable exactly when the right side is: `user?.Name ?? "Anonymous"` is a plain `string`, while `primary ?? fallback` over two `string?`s stays `string?`. It works whenever `a` and `b` agree on ownership: two `string`s, two borrows (their sources need not match; the result is a borrow you use while both stay live), or two owned values *freshly produced in the arms*. Writing two *named* owned locals as the arms makes it a borrow merge instead — a named owned binding read as an arm is a borrow, never a silent consume. To coalesce two owned locals into one owned result, use an explicit `if`/`else` with `owned` transfers. `??` is rejected only when the two sides disagree on ownership — the same single rule §8 is about. The `?.` (null-conditional) and `??=` (assign-if-null) operators follow the same principle.
+`a ?? b` returns `a` when non-null, else `b`. The right side may be `T` or `T?`, and the result is nullable exactly when the right side is: `user?.Name ?? "Anonymous"` is a plain `string`, while `primary ?? fallback` over two `string?`s stays `string?`. It works whenever `a` and `b` agree on ownership: two `string`s, two borrows (their sources need not match; the result is a borrow you use while both stay live), or two owned values *freshly produced in the arms*. Writing two *named* owned locals as the arms makes it a borrow merge instead — a named owned binding read as an arm is a borrow, never a silent consume; so to coalesce two owned locals into one owned result, use an explicit `if`/`else` with `owned` transfers. `??` is rejected only when the two sides disagree on ownership — the same single rule §8 is about. The `?.` (null-conditional) and `??=` (assign-if-null) operators follow the same principle.
 
 **Fixing it inside the method, with no field.** The earlier `ResponseWriter` used an object-scoped field so the fallback outlived the method. You do not need a field — you need the owned fallback to be live *at the point of use*. The cleanest way is to stop trying to make one `target` span the merge. Instead, put the write where the fallback is in scope, using the nested-block tool the language provides for exactly this:
 
@@ -376,7 +376,7 @@ In a *borrowing* iterator the bare `yield return line;` also compiles (it re-bor
 
 **Frame-disposed `owned` parameters — adopt on entry.** An `owned` parameter of an iterator or async method is disposed by the frame at teardown, but the must-use warning still fires at the parameter; `using var r := owned reader;` on the first line declares the intent and silences it.
 
-**Consuming a `choice` outcome — match the fresh call, adopt the payload.** A `case` directly over a call returning an owning `choice` (spec §35) is an *owning match*: the selected arm's `owned` payload binding is yours, and the adopt idiom applies inside the arm. A `case` over a *named* binding just peeks (borrows). Consuming a named binding is spelled `case owned outcome of …` — the same marker discipline as every other transfer:
+**Consuming a `choice` outcome — match the fresh call, adopt the payload.** A `case` directly over a call returning an owning `choice` (spec §35) is an *owning match*: the selected arm's `owned` payload binding is yours, and the adopt idiom applies inside the arm. By contrast, a `case` over a *named* binding just peeks (borrows). Consuming a named binding is spelled `case owned outcome of …` — the same marker discipline as every other transfer:
 
 ```bezel
 case Connect(host) of                 // fresh call: owning match
