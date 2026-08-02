@@ -27,10 +27,10 @@ end Stats;
 
 Two refinements keep this honest:
 
-- **Interleaving still happens — at `await`, and only there.** Other continuations of your domain run while you are suspended. An invariant must hold *before* you suspend, and a check made before an `await` may be stale after it. This is why the compiler never flow-narrows mutable fields at all — spec §7.4 names exactly this interleaving among its reasons — and why it re-widens a mutably-captured local at every `await` (Guide 2 §1). Partially-written memory is never observed; logical interleaving is the only hazard.
+- **Interleaving still happens — at `await`, and only there.** Other continuations of your domain run while you are suspended. An invariant must hold *before* you suspend, and a check made before an `await` may be stale after it. This is why the compiler never flow-narrows mutable fields at all — spec §7.4 names exactly this interleaving among its reasons — and why it re-widens a mutably-captured local at every `await` (Guide 2 §1 covers both). Partially-written memory is never observed; logical interleaving is the only hazard.
 - **No thread affinity, no contexts.** A domain is not a thread. The runtime may run successive continuations on different threads — never two at once — preserving visibility across the migration. There are no synchronization contexts and therefore no `ConfigureAwait`-style opt-out to remember — nothing is captured, nothing needs configuring (rationale §12.3).
 
-**Blocking is fenced off, deterministically.** Inside a domain, a continuation blocked in `Wait()`/`Result` — or a blocking `Mutex.Acquire()` — freezes the very domain that must advance to unblock it. So the blocking forms are a *compile error* lexically inside `async` bodies — `await` is strictly better there. Where the compiler cannot see it — a non-`async` helper reached from a continuation — the runtime raises `InvalidOperationException` instead of parking: a defined fault, not a mystery hang (spec §30.3, §30.12).
+**Blocking is fenced off, deterministically.** Inside a domain, a continuation blocked in `Wait()`/`Result` — or a blocking `Mutex.Acquire()` — freezes the very domain that must advance to unblock it. So the blocking forms are a *compile error* lexically inside `async` bodies — `await` is strictly better there (spec §30.3, §30.12). Where the compiler cannot see it — a non-`async` helper reached from a continuation — the runtime raises `InvalidOperationException` instead of parking: a defined fault, not a mystery hang (spec §30.3, §30.12).
 
 ```bezel
 var cfg := LoadAsync().Result;    // ERROR inside async code: blocks its own domain — await it
@@ -133,7 +133,7 @@ The fix is the two-line canonical form above. The borrow flows like any other (G
 
 **Choosing, as producer** (rationale §12.2): ask *"can a second consumer legitimately need this same result instance?"* If yes — `Task<T>`, and say why at the declaration. If no, or unsure — `OwningTask<T>`. A fan-out façade over a Pattern B core is one line later (`return await FetchOwnedAsync(url);` from a `Task<Config>`-returning body). The reverse migration breaks callers.
 
-**One declaration the compiler refuses outright:** a task over a **move-only value** — an owning `choice` such as `Result<Connection, string>` with a class payload, or an owning inline array — is rejected at the declaration (spec §30.5, v0.230). Multi-award would hand the same must-move-exactly-once value to every awaiter, and `OwningTask<T>` admits class types only. The idiomatic shape for a fallible async acquisition is `OwningTask<Connection>` plus a typed exception; an owned resource's failure payload is exception territory anyway (Guide 2 §7).
+**One declaration the compiler refuses outright:** a task over a **move-only value** — an owning `choice` such as `Result<Connection, string>` with a class payload, or an owning inline array — is rejected at the declaration (spec §30.5, v0.230): multi-award would hand the same must-move-exactly-once value to every awaiter, and `OwningTask<T>` admits class types only. The idiomatic shape for a fallible async acquisition is `OwningTask<Connection>` plus a typed exception; an owned resource's failure payload is exception territory anyway (Guide 2 §7).
 
 Faults are ordinary: an exception in the async body faults the task, and each await re-raises it — the caught binding is a borrow, per Guide 2 §5 (spec §30.9).
 
@@ -173,7 +173,7 @@ var sizes := await job;                              //   inputs chunk-copied at
                                                      //   results in input order
 ```
 
-First fault cancels remaining work and surfaces at the await as `DomainFaultedException`. `Reduce`'s combiner must be associative with the seed as its identity (stdlib §6.12).
+First fault cancels remaining work and surfaces at the await as `DomainFaultedException` (stdlib §6.12). `Reduce`'s combiner must be associative with the seed as its identity (stdlib §6.12).
 
 **Free-range tasks** — start several, settle them together — are the exception, and the §2 holder discipline is the whole trick: name every task.
 
@@ -185,7 +185,7 @@ await Task.WhenAll(both);                                // settles ALL inputs; 
                                                          //   first non-successful input's fault
 ```
 
-`WhenAll` never abandons laggards. `WhenAny` yields the *index* of the first task to settle and never re-raises — you inspect the winner (spec §30.10). For results-bearing named holders, await each after the `WhenAll` — a completed await resumes synchronously. For a dynamically-sized set, use the owning family: `Task.WhenAllOwned(owned tasks)` collects everything, `Task.WhenEachOwned(owned tasks)` streams each task as it completes (stdlib §6.7).
+`WhenAll` never abandons laggards (spec §30.10). `WhenAny` yields the *index* of the first task to settle and never re-raises — you inspect the winner (spec §30.10). For results-bearing named holders, await each after the `WhenAll` — a completed await resumes synchronously. For a dynamically-sized set, use the owning family: `Task.WhenAllOwned(owned tasks)` collects everything, `Task.WhenEachOwned(owned tasks)` streams each task as it completes (stdlib §6.7).
 
 ---
 
@@ -395,4 +395,4 @@ Deadline-shaped stdlib operations signal timeout by returning `null` (`TryAcquir
 | Background work nobody waits for | `Task.FireAndForget(call())` — and only with owned/copied inputs (§2) |
 | To stop something | a `CancellationToken` threaded through; a channel message across domains (§9) |
 
-A few habits carry most of it. Trust the domain: inside one, state is just state, and the lock you reach for by reflex is usually noise. Name your tasks: `using var` for anything you will await below. Treat "who settles this task?" as seriously as Guide 1 treats "who disposes this object?" — it is the same question. Fan out inside a `TaskScope` unless you can say why not. And when state must genuinely be shared, make the sharing carry its own guarantee — a channel, a data-owning lock, an atomic, a shared event — rather than a convention. The compiler rejects most of the shortcuts: blocking waits in async code, capturing spawn entries, non-sendable arguments, mutable statics. The few obligations it leaves to you — settlement of abandoned tasks, source-outlives-token, reader purity through a read guard — are named in the diagnostics and backstopped in checked disposal mode. The concurrency chapter is Guide 1's chapter, run in parallel.
+A few habits carry most of it. Trust the domain: inside one, state is just state, and the lock you reach for by reflex is usually noise. Name your tasks: `using var` for anything you will await below. Treat "who settles this task?" as seriously as Guide 1 treats "who disposes this object?" — because it is the same question. Fan out inside a `TaskScope` unless you can say why not. And when state must genuinely be shared, make the sharing carry its own guarantee — a channel, a data-owning lock, an atomic, a shared event — rather than a convention. The compiler rejects most of the shortcuts — blocking waits in async code, capturing spawn entries, non-sendable arguments, mutable statics among them. The few obligations it leaves to you — settlement of abandoned tasks, source-outlives-token, reader purity through a read guard — are named in the diagnostics and backstopped in checked disposal mode. The concurrency chapter is Guide 1's chapter, run in parallel.
