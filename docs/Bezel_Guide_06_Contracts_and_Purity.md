@@ -89,6 +89,14 @@ public method TryListen(rawPort: string): bool
 end TryListen;
 ```
 
+`TryListen` follows one of the stdlib's own bool-only specimens, `TryAdd` (stdlib §4.10): where the owning set's `Add(owned item)` silently disposes a duplicate, `TryAdd(owned item): bool` reports the declined path as a value to act on:
+
+```bezel
+if not registry.TryAdd(owned session) then   // declined: an equal element is already
+  _rejected := _rejected + 1;                //   present; session is consumed either way,
+end;                                         //   and on this path also disposed (stdlib §4.10)
+```
+
 When no caller will branch — the consumer sits above the method, at a *supervision boundary*: a catch site that logs, retries, or converts failures into protocol answers — the sanctioned signal is a typed exception (Guide 2 §4; the failure-signal rule's band 4, stdlib §1). It is still never a caller bug: the input remains an expected outcome, and only the signal changes from the misclassified `requires`. Here the plain name keeps its plain contract — `Listen` returns having bound, or it throws:
 
 ```bezel
@@ -105,7 +113,7 @@ end Listen;
 
 Why not just call the throwing `int.Parse(rawPort)` and let its exception fly, if you were going to throw anyway? Two reasons. The throwing form is the *assert-shaped* tier — stdlib §1's words are that it "treats absence as a bug" — so calling it on boundary input re-asserts, in exception spelling, the same misclassification the bad `requires` made. And it splits the condition: `int.Parse` raises `FormatException` for a malformed numeral but `OverflowException` for an out-of-range one (stdlib §9.1, §2.3), while `Listen`'s condition is single — *not a port*. The explicit throw keeps one condition on one signal, in the domain's own words. The same reasoning rules out `ArgumentException`: the `Argument*` family is part of band 1's pre-contract defect residual (stdlib §1) — the exception that blames the *calling code* — and no caller is at fault here. Throwing it would plant a defect report in the boundary's log — telling whoever triages that log that the calling code needs fixing, when it does not; `FormatException` blames the input's shape, which is what actually failed. (The consuming side of this signal is Guide 2 §4's catch example, which handles exactly this fault.)
 
-The two-question test before writing `requires(E)`: *could a correct caller always guarantee E?* and *is a false E a bug in the calling code?* Two yeses: contract. Either no: a value shape — or, at a boundary consumed by logging/retry, a typed exception, as in the second rewrite (Guide 2 §4).
+The two-question test before writing `requires(E)`: *could a correct caller always guarantee E?* and *is a false E a bug in the calling code?* Two yeses: contract. Either no: a value shape — or, at a boundary consumed by logging/retry, a typed exception, as in the `Listen` rewrite (Guide 2 §4).
 
 When it does run, `requires` evaluates after argument binding and before anything else — before a constructor's chain, before field initializers, before the first body statement. Clauses run in declaration order, stopping at the first `false` (spec §22.16). A constructor's `requires` may not observe `this`, since no field is assigned yet; it reads parameters and statics only.
 
@@ -277,7 +285,7 @@ This table classifies the *condition*; Guide 2 §7's table — the home for fail
 | Something a correct caller already guarantees (argument range, index bounds, protocol order) | `requires(...)` — always-on, faults `ContractViolationException` (spec §22.16; stdlib §1 band 1) |
 | A guarantee your implementation makes back to its callers | `ensures(...)` — checked-contracts mode, or proven where the prover reaches (§3) |
 | A consistency property of an object's state at its public boundary | `invariant(...);` — checked at construction exit and public entry/exit only (§4) |
-| An expected outcome at a trust boundary — absence, malformed input, a branchable failure | never a contract: `T?`, a Try shape, `Result<T, E>`, or a domain choice (Guide 2 §2–§3, §7) — or, when the failure is consumed at a boundary rather than branched on, a typed exception (stdlib §1 band 4; §2's second rewrite) |
+| An expected outcome at a trust boundary — absence, malformed input, a branchable failure | never a contract: `T?`, a Try shape, `Result<T, E>`, or a domain choice (Guide 2 §2–§3, §7) — or, when the failure is consumed at a boundary rather than branched on, a typed exception (stdlib §1 band 4; §2's `Listen` rewrite) |
 | A boundary fault — I/O, environment, anything logged or retried rather than branched on | a typed exception (Guide 2 §4) |
 | A mid-body sanity check on your own algorithm's intermediate state | `Debug.Assert` — maybe elided, terminates on failure, never throws (stdlib §8.2) |
 | Invalid input at a pre-contract boundary (interop, code without clauses) | `throw new ArgumentException(...)` — the residual idiom `requires` replaces where a contract is possible |
