@@ -6287,9 +6287,22 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 return builder_.CreateCall(fn, {slot, oSlot}, "dec.cmp");
             }
             // Decimal.Round(digits: int): decimal — §9.3.
+            // Per stdlib §9.3 (v0.195, #2339): digits outside 0..28 must
+            // raise ArgumentOutOfRangeException. The codegen guard fires
+            // BEFORE the runtime call so the bounds check is statically
+            // visible at the IR level (it elides the runtime entirely on
+            // the rejection path, matching the §1/§4.4 constructor-guard
+            // pattern in LlvmBackend_Exprs2.cpp).
             if (mname == "Round" && call.args.size() == 1 && call.args[0].value) {
                 llvm::Value* digits = lowerExpr(*call.args[0].value);
                 if (!digits) return nullptr;
+                if (!digits->getType()->isIntegerTy(32))
+                    digits = builder_.CreateTrunc(digits, i32(), "dec.round.d");
+                emitGuardThrow(
+                    builder_.CreateOr(
+                        builder_.CreateICmpSLT(digits, builder_.getInt32(0)),
+                        builder_.CreateICmpSGT(digits, builder_.getInt32(28))),
+                    "ArgumentOutOfRangeException");
                 llvm::AllocaInst* oSlot = entryAlloca(dst);
                 auto* fn = declareC("bz_decimal_round", llvm::Type::getVoidTy(llvm_),
                                     {ptrTy(), i32(), ptrTy()});
