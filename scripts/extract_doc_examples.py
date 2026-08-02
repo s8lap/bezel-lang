@@ -40,6 +40,9 @@ DOCS = [
     ("spec",   "docs/Bezel_Language_Spec.md"),
     ("guide1", "docs/Bezel_Guide_01_Memory_and_Ownership.md"),
     ("guide2", "docs/Bezel_Guide_02_Errors_and_Nullability.md"),
+    ("guide3", "docs/Bezel_Guide_03_Modeling_Data.md"),
+    ("guide4", "docs/Bezel_Guide_04_Concurrency.md"),
+    ("guide5", "docs/Bezel_Guide_05_Collections_and_Iteration.md"),
     ("stdlib", "docs/Bezel_Standard_Library.md"),
 ]
 
