@@ -248,8 +248,15 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
         }
         else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s.get()))
             n += countAwaitsInExpr(lc->value.get());
-        else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s.get()))
+        else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s.get())) {
             n += countAwaitsInExpr(as->value.get());
+        }
+        // fix #2333: `_ := await …` parses as DiscardStmt, not AssignmentStmt;
+        // the resume switch must count the await in its `value` or the post-
+        // await continuation lands on the default (return) and the outer task
+        // never completes — the same hang shape as #441 for try-body awaits.
+        else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s.get()))
+            n += countAwaitsInExpr(ds->value.get());
         else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s.get()))
             n += countAwaitsInExpr(es->expr.get());
         else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s.get()))
