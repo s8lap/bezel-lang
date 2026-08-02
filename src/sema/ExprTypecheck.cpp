@@ -5863,12 +5863,9 @@ static std::string spellExtHeadTypeRef(const TypeRef* t) {
 
 // §26.5 rule 4 (#1307): a printable spelling of an AST type node, used for the
 // `where` clause of a rule-4 ambiguity candidate. Read directly from the AST
-// (ExtensionDecl::genericConstraints) rather than a resolved TypeRef, because
-// an imported extension's synthesized AST (ModuleLoader.cpp Pass 4) never
-// reconstructs genericConstraints — module metadata does not currently
-// serialize a block's `where` clause — so spellExtWhereClause below
-// intentionally returns "" for an imported candidate rather than fabricating
-// text; see the diagnostic-site comment for the recorded follow-up.
+// (ExtensionDecl::genericConstraints). Imported synthetic declarations are
+// reconstructed from MetaExtension's source-like constraint payload (#2329),
+// so local and imported candidates use the same spelling path.
 static std::string spellExtWhereAstType(const ast::Type& t) {
     std::string s;
     if (t.name)
@@ -6123,14 +6120,22 @@ Symbol* ExprTC::lookupExtensionMember(
                                        : std::string();
             if (!where.empty()) head += " " + where;
             std::string site;
-            if (c.decl && c.decl->span.begin.line != 0)
-                site = "declared at line " +
-                       std::to_string(c.decl->span.begin.line) + ", column " +
-                       std::to_string(c.decl->span.begin.column);
-            else
-                // §1307 follow-up: an imported extension's synthesized AST
-                // carries no source span (module metadata doesn't serialize
-                // cross-module positions) — say so rather than print 0:0.
+            if (c.decl && c.decl->span.begin.line != 0) {
+                site = "declared at ";
+                if (!c.decl->sourceFile.empty())
+                    site += c.decl->sourceFile + ":";
+                else
+                    site += "line ";
+                site += std::to_string(c.decl->span.begin.line);
+                if (!c.decl->sourceFile.empty())
+                    site += ":" + std::to_string(c.decl->span.begin.column);
+                else
+                    site += ", column " +
+                            std::to_string(c.decl->span.begin.column);
+            } else
+                // A dependency produced before #2329 has no source-span
+                // payload. Keep the established explicit degradation instead
+                // of fabricating 0:0.
                 site = "declaration site not tracked across module imports";
             msg += "\n  " + head + " — module `" + moduleName + "`, " + site;
         }

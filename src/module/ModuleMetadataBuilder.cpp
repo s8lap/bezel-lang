@@ -1479,16 +1479,73 @@ void pinInLlvmUsed(llvm::Module& module, llvm::GlobalVariable* gv) {
 
 }  // namespace
 
+// §26.5 rule 4 (#2329): preserve an extension block's declared `where` head in
+// a compact source-like form. The loader re-parses these clauses into the
+// synthetic ExtensionDecl; no constraint-resolution policy is duplicated in
+// the metadata layer.
+static std::string extensionConstraintTypeText(const ast::Type& t) {
+    std::string out;
+    if (t.name) {
+        for (std::size_t i = 0; i < t.name->parts.size(); ++i) {
+            if (i) out += '.';
+            out += std::string(t.name->parts[i]);
+        }
+    }
+    if (out.empty()) out = "?";
+    if (!t.genericArgs.empty()) {
+        out += '<';
+        for (std::size_t i = 0; i < t.genericArgs.size(); ++i) {
+            if (i) out += ", ";
+            out += extensionConstraintTypeText(*t.genericArgs[i]);
+        }
+        out += '>';
+    }
+    if (t.nullable) out += '?';
+    return out;
+}
+
+static std::vector<std::string> extensionConstraintTexts(
+    const std::vector<ast::GenericConstraint>& constraints) {
+    std::vector<std::string> out;
+    out.reserve(constraints.size());
+    for (const ast::GenericConstraint& gc : constraints) {
+        std::string text = "where " + std::string(gc.typeParam) + ": ";
+        if (!gc.modifierConstraint.empty()) {
+            text += std::string(gc.modifierConstraint);
+        } else {
+            for (std::size_t i = 0; i < gc.items.size(); ++i) {
+                if (i) text += ", ";
+                const ast::ConstraintItem& item = gc.items[i];
+                if (item.kind == "type" && item.typeArg)
+                    text += extensionConstraintTypeText(*item.typeArg);
+                else
+                    text += std::string(item.kind);
+            }
+        }
+        out.push_back(std::move(text));
+    }
+    return out;
+}
+
 // §26 / §2.5 (#735): convert one `public extension T` block into its wire form,
 // or return false to skip it (a shape whose cross-module dispatch is not exactly
 // the exported `bz$ext$<T>$<M>` symbol — see MetaExtension's header note).
 static bool convertExtension(const sema::ExtensionSymbol& ext,
                              sema::SemaContext& ctx, MetaExtension& out,
-                             std::string_view source) {
+                             std::string_view source,
+                             std::string_view sourceFile) {
     const auto* decl = dynamic_cast<const ast::ExtensionDecl*>(ext.decl);
     if (decl == nullptr || !decl->targetType) return false;
     // §13.2 / §26.3: an `internal` block (the default) is not downstream-visible.
     if (decl->visibility != ast::Visibility::Public) return false;
+    // §26.5 rule 4 (#2329): extension blocks are nameless, so diagnostics need
+    // their original declaration site and complete declared head after import.
+    out.sourceSpan.file = std::string(sourceFile);
+    out.sourceSpan.beginLine = decl->span.begin.line;
+    out.sourceSpan.beginColumn = decl->span.begin.column;
+    out.sourceSpan.endLine = decl->span.end.line;
+    out.sourceSpan.endColumn = decl->span.end.column;
+    out.genericConstraints = extensionConstraintTexts(decl->genericConstraints);
     // §26.4: a block with `where` constraints, or a target carrying type
     // arguments, binds block-level type parameters — the exported symbol was
     // compiled against the exporter's placeholder layout, so dispatching it
@@ -1525,7 +1582,8 @@ static bool convertExtension(const sema::ExtensionSymbol& ext,
 }
 
 ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
-                                    std::string_view source) {
+                                    std::string_view source,
+                                    std::string_view sourceFile) {
     ModuleMetadata md;
     sema::ModuleSymbol* mod = ctx.module();
     if (mod == nullptr) return md;  // no module (front-end error path)
@@ -1553,7 +1611,7 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
         // imported modules" for extension blocks on the receiver's type.
         if (auto* ext = dynamic_cast<const sema::ExtensionSymbol*>(child)) {
             MetaExtension me;
-            if (convertExtension(*ext, ctx, me, source))
+            if (convertExtension(*ext, ctx, me, source, sourceFile))
                 md.extensions.push_back(std::move(me));
             continue;
         }
@@ -1586,11 +1644,12 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
 }
 
 std::size_t embedModuleMetadata(llvm::Module& module, sema::SemaContext& ctx,
-                                std::string_view source, bool isExecutable) {
+                                std::string_view source, bool isExecutable,
+                                std::string_view sourceFile) {
     // §2.6 step 4: build → serialize → embed. Build the by-value metadata for
     // the just-compiled module and serialize it with Increment 1's bitstream
     // codec.
-    ModuleMetadata md = buildModuleMetadata(ctx, source);
+    ModuleMetadata md = buildModuleMetadata(ctx, source, sourceFile);
     // §2.8.4 rule 1 / rule 4 (issue #1733, schema v6): record the artifact kind
     // so module::loadDependency can reject this artifact if it is presented as a
     // dependency while being an executable (it carries a native entry symbol).
