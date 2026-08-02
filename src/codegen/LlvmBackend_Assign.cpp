@@ -2489,6 +2489,57 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     }
     if (setterExpr) lowerExpr(*setterExpr);
     else if (setterStmts) lowerScopedBlock(*setterStmts);
+    // fix #2567 (§23.4/§28.9/§4.6, v0.236): the COMPOUND-ASSIGNMENT twin of
+    // #2548's inline-body `emitProducerRelease()` (this file, line 2153-2154).
+    // `lowerIndexerCompound` desugars `a[i] OP= rhs` to `a[i] := a[i] OP rhs`:
+    //   * line 2452: `rhs = lowerExpr(*as.value)` — the rhs of the `+=`, e.g.
+    //     the +1 string producer from `"abc" + i.ToString()`.
+    //   * line 2464: `newVal = emitCompoundOp(op, cur, rhs, ...)` — a SECOND
+    //     +1 producer (emitStringConcat allocates rc=1 per #422).
+    //   * line 2488: `locals_[pd] = newVal` binds newVal as the setter's
+    //     implicit `value` parameter.
+    //   * line 2490-2491: setter body stores newVal to the class field.
+    //
+    // For a CLASS receiver, the setter (or inlined setter body) RETAINs its
+    // incoming value (§23.3 / §9), doubling newVal's +1. The plain-assignment
+    // path (`lowerIndexerSet`) closes this with a post-body `emitProducerRelease()`
+    // gated on `recvDecl->kind == Class`; the compound path had no analogue, so
+    // `h[i] += "abc" + i.ToString()` on a class indexer leaks 86 byte(s) per
+    // iteration (LSan-confirmed: 430 byte(s) direct + indirect across 5
+    // iterations of a 2-arg `+=` probe; the same shape leaks on a 1-arg
+    // indexer too — the gap is arity-independent, the same as `lowerIndexerSet`'s
+    // fix). The fix is the COMPOUND twin of that emitProducerRelease: after the
+    // setter body, drop newVal's doubled +1.
+    //
+    // BUT — and this is the subtle part — `rhs` ALSO leaks here. `rhs` is
+    // `lowerExpr(*as.value)`, a +1 string for `"abc" + i.ToString()`'s AST
+    // shape. `emitCompoundOp` does NOT consume rhs (it memcpy's its bytes
+    // into newVal and leaves rhs's +1 untouched). The plain-assignment path
+    // closes this via the SAME emitProducerRelease, gated on the outer value
+    // Expr's `isPlusOneStringProducer` predicate. We don't have the same AST
+    // context here (the outer "as" is a compound AssignmentStmt, whose `as.value`
+    // is the rhs AST — and that AST is itself a +1 producer for the canonical
+    // `"abc" + i.ToString()` shape). For the string-`+` case, rhs is a +1
+    // producer whose +1 was never discharged (the producer's whole life is
+    // here — line 2452's `lowerExpr` returns it; line 2464's emitStringConcat
+    // borrows it; the setter body stores newVal, NOT rhs). So rhs must be
+    // released here too.
+    //
+    // For a record receiver the setter plain-stores (§9/§9.7), so releasing
+    // would drop the field's only reference (UAF). Same gate as
+    // `lowerIndexerSet`'s inline-body emitProducerRelease at line 2153.
+    if (recvDecl->kind == ast::TypeDeclKind::Class) {
+        if (newVal && newVal->getType()->isPointerTy())
+            emitStringRelease(newVal);   // release the OP-result's +1
+        // For string `+=`, rhs is `lowerExpr(*as.value)` — a +1 string
+        // when the AST is a producer (e.g. BinaryExpr("+", ...)) but a
+        // BORROW when the AST is a named local (e.g. `s += t` where `t` is
+        // a tracked string local). Check the AST shape, not the LLVM
+        // pointer type: only release when the rhs is itself a +1 producer.
+        if (rhs && rhs->getType()->isPointerTy() && as.value.get() &&
+            isPlusOneStringProducer(as.value.get()))
+            emitStringRelease(rhs);      // release the rhs's +1 (producer)
+    }
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
