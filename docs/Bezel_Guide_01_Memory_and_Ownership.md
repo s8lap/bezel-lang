@@ -33,7 +33,7 @@ You do not write cleanup code. If `ReadAll` throws, both are disposed, innermost
 
 ---
 
-## 2. The four ways to dispose — and the C# habit to unlearn
+## 2. The four ways to dispose — and the habit to unlearn
 
 There is really only one disposal mechanism: at the end of a scope, every owned value still live is disposed — on the normal path and the exception path alike. Everything else is a specialization of that one rule. You will reach for four spellings; they differ only in *when* disposal happens and whether the compiler nudges you:
 
@@ -46,7 +46,7 @@ There is really only one disposal mechanism: at the end of a scope, every owned 
 
 `using var` is the default: *lives and dies here.* Plain `var` is for a value whose ownership will **move on** — a factory result you return, an accumulator, the best-so-far in a loop; the must-use warning then marks any path where it silently *doesn't* move on, so a leak is never quiet. An explicit `.Dispose()` is for an **early or conditional** release inside a longer scope. `_ := x;` disposes an unwanted owned value immediately (§9).
 
-**The C# habit to unlearn.** In C#, `foo.Dispose()` at the end of a block is the anti-pattern `using` exists to kill, because a thrown exception skips the trailing call. In Bezel the unwinding edge *always* disposes live owned values, so a trailing `Dispose()` is exception-safe by construction. It therefore never means "cleanup plumbing" — it means one thing only: *release this early.* Auto-drop is the safety net underneath all four forms; you are choosing *when* and *how loudly*, never *whether*.
+**The habit to unlearn.** Elsewhere, a trailing `foo.Dispose()` at the end of a block is the anti-pattern `using` blocks exist to kill, because a thrown exception skips the trailing call. In Bezel the unwinding edge *always* disposes live owned values, so a trailing `Dispose()` is exception-safe by construction. It therefore never means "cleanup plumbing" — it means one thing only: *release this early.* Auto-drop is the safety net underneath all four forms; you are choosing *when* and *how loudly*, never *whether*.
 
 ---
 
