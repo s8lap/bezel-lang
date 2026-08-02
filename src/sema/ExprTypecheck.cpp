@@ -3871,6 +3871,51 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
             return;
         }
     }
+    auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(*as.target));
+    if (!fs) return;
+    // §9.1 / §9.4 (v0.236, #2309): a positional RECORD's auto-generated
+    // property is read-only — "Properties auto-generated from positional
+    // fields are read-only" (§9.4). The readonly modifier branch below
+    // fires only on a user-written `readonly` modifier; the record's
+    // generated property carries no modifier (its read-onlyness is
+    // structural), so without this branch the assignment was silently
+    // accepted and codegen wrote straight into the backing storage — a
+    // wrong-value miscompile that printed the new value via the same
+    // getter (the issue's own repro: `r.X := 99;` then `r.X` returned 99).
+    //
+    // THIS BRANCH RUNS BEFORE THE BROAD `inConstructor_` EARLY-RETURN
+    // BELOW because that carve-out does NOT track WHICH type's constructor
+    // we're in — it returns early for any constructor body, which would
+    // allow, e.g., a `class C` constructor to write `r.X := 5` where `r`
+    // is a positional record instance. The carve-out here is intentionally
+    // narrower: only an instance OR body constructor of THE DECLARING
+    // record (so a combined-form record like `record R(X: int)
+    // constructor(v: int) X := v; end;` still initializes its positional
+    // field, the §9.2 example). Class primary-constructor parameters
+    // (`fs->posParam` set, `parent->kind == Class`) are NOT covered —
+    // they are parameters (§22.10), not auto-generated properties, and
+    // the spec says nothing to forbid their mutation. Confirmed
+    // mechanical: a `class C(name: string)` body method that does `name
+    // := n` still mutates and the read returns the new value.
+    if (fs->posParam && fs->parent &&
+        fs->parent->kind == ast::TypeDeclKind::Record) {
+        // Narrow construction-window carve-out: only the declaring
+        // record's constructor may initialize a positional field. The
+        // existing readonly modifier branch keeps its broader
+        // construction-window carve-out (a long-standing pattern, not
+        // changed here).
+        bool inDeclaringCtor = inConstructor_ && currentType_ == fs->parent;
+        if (!inDeclaringCtor) {
+            std::string nm = std::string(fs->name);
+            ctx_.diagnostics().report(
+                Severity::Error, as.span.begin,
+                std::string("cannot assign to the auto-generated property `") +
+                nm + "` of a positional record — a record's positional-field "
+                "properties are read-only (§9.1 / §9.4); use a `with` "
+                "expression to produce a new value (§9.5)");
+        }
+        return;
+    }
     if (inConstructor_) return;
     // §22.8 (#747 R42): a readonly field may be assigned only in a field
     // initializer or a constructor body; assignment anywhere else is a compile
@@ -3879,8 +3924,6 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
     // matched only `this.f`, so an instance- or type-qualified readonly write
     // (e.g. `Config.MaxSize := 50` in a normal method) slipped through and was
     // silently dropped at runtime.
-    auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(*as.target));
-    if (!fs) return;
     // Check the readonly modifier on the field's MemberSymbol.
     for (auto mod : fs->modifiers) {
         if (mod == "readonly") {
@@ -4091,6 +4134,27 @@ void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
     for (auto mod : fs.modifiers) {
         if (mod == "readonly") isReadonly = true;
         else if (mod == "static") isStatic = true;
+    }
+    // §9.1 / §9.4 (v0.236, #2309): a positional RECORD's auto-generated
+    // property is read-only and is never a ref/out target — the
+    // readonly-modifier branch below only fires on a user-written
+    // `readonly` modifier; the positional-record case has no modifier.
+    // Apply the SAME narrow construction-window carve-out as the
+    // `:=`-target check (the declaring record's constructor only) —
+    // without it a class C constructor could `ref r.X` where `r` is a
+    // positional record, an aliasing write through read-only storage.
+    if (fs.posParam && fs.parent &&
+        fs.parent->kind == ast::TypeDeclKind::Record) {
+        bool inDeclaringCtor = inConstructor_ && currentType_ == fs.parent;
+        if (!inDeclaringCtor) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument may not be the "
+                "auto-generated property `" + std::string(fs.name) +
+                "` of a positional record — a record's positional-field "
+                "properties are read-only (§9.1 / §9.4 / §22.3)");
+        }
+        return;
     }
     // §22.8: a readonly field is assignable only in a field initializer or
     // the declaring class's constructor — `inConstructor_` covers both
@@ -11689,6 +11753,38 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "` — `using var` is implicitly non-reassignable "
                                 "and `" + std::string(is->op) +
                                 "` reassigns it (§28.10 / §17.6)");
+                    }
+                }
+            }
+        }
+        // §9.1 / §9.4 (v0.236, #2309): `r.X++` / `r.X--` on a positional
+        // RECORD's auto-generated property is a write to read-only
+        // storage — `++`/`--` desugars to a reassignment (§17.6). This
+        // is the IncrementStmt sibling of the AssignmentStmt check above
+        // and the ref/out operand check in checkRefOutFieldOperand; the
+        // IncrementStmt path never reaches either, so without this
+        // branch `r.X++` was silently accepted and codegen wrote the
+        // increment straight to the backing field. Same narrow
+        // construction-window carve-out as the AssignmentStmt branch
+        // (the declaring record's constructor only — a class C
+        // constructor must not be able to write to a positional record's
+        // property via `++` either).
+        if (is->target) {
+            if (auto* fs = dynamic_cast<FieldSymbol*>(
+                    ctx_.exprSymbol(*is->target))) {
+                if (fs->posParam && fs->parent &&
+                    fs->parent->kind == ast::TypeDeclKind::Record) {
+                    bool inDeclaringCtor =
+                        inConstructor_ && currentType_ == fs->parent;
+                    if (!inDeclaringCtor) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, is->target->span.begin,
+                            std::string("cannot increment/decrement the "
+                            "auto-generated property `") +
+                            std::string(fs->name) +
+                            "` of a positional record — a record's "
+                            "positional-field properties are read-only "
+                            "(§9.1 / §9.4 / §17.6)");
                     }
                 }
             }
