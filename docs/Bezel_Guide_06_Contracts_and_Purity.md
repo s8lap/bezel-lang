@@ -76,20 +76,20 @@ public method Listen(rawPort: string)
 end Listen;
 ```
 
-A violated `requires` says "fix the calling code" — but there is no calling code to fix. The input was always going to be wrong sometimes. The first rewrite is value-shaped (Guide 2 §2–§3). When `Listen` is itself the site that consumes the failure, it handles the outcome in place:
+A violated `requires` says "fix the calling code" — but there is no calling code to fix. The input was always going to be wrong sometimes. The first rewrite makes the outcome a value the *caller* branches on — and renames the method to say so: a `Try` name announces that the declined path is expected and unexceptional (stdlib §1's `Try` convention, the bool-only shape; Guide 2 §2–§3):
 
 ```bezel
-public method Listen(rawPort: string)
+public method TryListen(rawPort: string): bool
   var port := int.ParseOrNull(rawPort);
-  if port <> null then
-    Bind(port);                                   // narrowed
-  else
-    Console.WriteLine($"not a port: {rawPort}");  // expected outcome, handled as a value
+  if port = null then
+    return false;                 // expected outcome, reported as a value
   end;
-end Listen;
+  Bind(port);                     // narrowed by the early exit
+  return true;
+end TryListen;
 ```
 
-When the consumer sits *above* `Listen` — a supervisor that logs, retries, or converts the failure rather than branching on it — the sanctioned signal is a typed exception (Guide 2 §4; the failure-signal rule's band 4, stdlib §1). It is still never a caller bug: the input remains an expected outcome, and only the signal changes:
+When no caller will branch — the consumer sits above the method, at a *supervision boundary*: a catch site that logs, retries, or converts failures into protocol answers — the sanctioned signal is a typed exception (Guide 2 §4; the failure-signal rule's band 4, stdlib §1). It is still never a caller bug: the input remains an expected outcome, and only the signal changes from the misclassified `requires`. Here the plain name keeps its plain contract — `Listen` returns having bound, or it throws:
 
 ```bezel
 public method Listen(rawPort: string)
@@ -103,7 +103,7 @@ public method Listen(rawPort: string)
 end Listen;
 ```
 
-Why not just call the throwing `int.Parse(rawPort)` and let its exception fly, if you were going to throw anyway? Two reasons. The throwing form is the *assert-shaped* tier — stdlib §1's words are that it "treats absence as a bug" — so calling it on boundary input re-asserts, in exception spelling, the same misclassification the bad `requires` made. And it splits the condition: `int.Parse` raises `FormatException` for a malformed numeral but `OverflowException` for an out-of-range one (stdlib §9.1, §2.3), while `Listen`'s condition is single — *not a port*. The explicit throw keeps one condition on one signal, in the domain's own words. The same reasoning rules out `ArgumentException`: the `Argument*` family is part of band 1's pre-contract defect residual (stdlib §1) — the exception that blames the *calling code* — and no caller is at fault here. Throwing it would hand the supervisor a bug report about a bug that does not exist; `FormatException` blames the input's shape, which is what actually failed.
+Why not just call the throwing `int.Parse(rawPort)` and let its exception fly, if you were going to throw anyway? Two reasons. The throwing form is the *assert-shaped* tier — stdlib §1's words are that it "treats absence as a bug" — so calling it on boundary input re-asserts, in exception spelling, the same misclassification the bad `requires` made. And it splits the condition: `int.Parse` raises `FormatException` for a malformed numeral but `OverflowException` for an out-of-range one (stdlib §9.1, §2.3), while `Listen`'s condition is single — *not a port*. The explicit throw keeps one condition on one signal, in the domain's own words. The same reasoning rules out `ArgumentException`: the `Argument*` family is part of band 1's pre-contract defect residual (stdlib §1) — the exception that blames the *calling code* — and no caller is at fault here. Throwing it would plant a defect report in the boundary's log — telling whoever triages that log that the calling code needs fixing, when it does not; `FormatException` blames the input's shape, which is what actually failed. (The consuming side of this signal is Guide 2 §4's catch example, which handles exactly this fault.)
 
 The two-question test before writing `requires(E)`: *could a correct caller always guarantee E?* and *is a false E a bug in the calling code?* Two yeses: contract. Either no: a value shape — or, at a boundary consumed by logging/retry, a typed exception, as in the second rewrite (Guide 2 §4).
 
