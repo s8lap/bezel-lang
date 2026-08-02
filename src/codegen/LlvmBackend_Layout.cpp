@@ -4003,10 +4003,96 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
                         ms = storageMemberOf(m);
                         if (ms) break;
                     }
+                    // #2445 (§14.2, v0.236): the substitution-site check for a
+                    // property/field READ on a bare type-parameter receiver.
+                    // The active `genericSubstSemaTy_` binds the receiver's
+                    // bare `T` to its concrete substituted type for THIS
+                    // instantiation (e.g. `T → Pt`), and the loop above
+                    // resolved the member by name on that substituted type's
+                    // declaration. When the substituted type is a genuine
+                    // record/class/choice/interface with a declaration but
+                    // no member by that name exists, the substitution site
+                    // IS where "no such member" is soundly decidable: the
+                    // monomorphized body cannot be re-checked against any
+                    // other substitution, and silently returning nullptr
+                    // degrades the slot to a zero value via CG8's fall-
+                    // through (#2547's generic "internal: codegen cannot
+                    // read member...") — a silent wrong-value miscompile
+                    // that the user has no way to trace back to the
+                    // substituted type. Emit the spec-cited §14.2
+                    // diagnostic here, naming the substituted type AND the
+                    // type parameter so the user can either (a) add a
+                    // `where T: <constraint>` that provides the member, or
+                    // (b) correct the member name. The wording mirrors
+                    // sema's #1078 reject (ExprTypecheck_Calls.cpp ~3095)
+                    // so the two diagnostics are recognizably the same
+                    // family. NOT fired for the substitution's own
+                    // `declaration==nullptr` shape (e.g. a builtin
+                    // declaration-less Named type like Array<T>, which has
+                    // no member surface to look up) — that case is
+                    // already covered by the CG8 fall-through diagnostic
+                    // for the concrete builtin-family path. Likewise NOT
+                    // fired for a `ma.member` that names a non-storage
+                    // member (a method, event, property-getter without a
+                    // backing field); such names are NOT in
+                    // `declaration->members` by name, but a method-call
+                    // form is sema-rejected upstream (#1078) and a
+                    // property-getter read is handled by the
+                    // property-read sibling site, not fieldAddr.
+                    if (!ms && cit->second->declaration) {
+                        std::string_view subName =
+                            cit->second->declaration->name;
+                        ctx_.diagnostics().report(
+                            Severity::Error, ma.span.begin,
+                            std::string("no member `") +
+                                std::string(ma.member) +
+                                "` on substituted type `" +
+                                std::string(subName) +
+                                "` for type parameter `" +
+                                std::string(tt->headName()) +
+                                "`; the member is not part of `" +
+                                std::string(subName) +
+                                "`'s documented surface, or add a `where " +
+                                std::string(tt->headName()) +
+                                ": <constraint>` that provides this "
+                                "member (\xC2\xA7""14.2, #2445)");
+                        return nullptr;
+                    }
                 }
             }
         }
     }
+    // #2445 (§14.2, v0.236): RESIDUAL DECLINED — a property/field READ on a
+    // bare type-parameter receiver when `genericSubstSemaTy_` is empty (the
+    // generic method body is being validated independent of any
+    // instantiation, or no caller in this compilation unit ever instantiates
+    // it). Sema has no substitution information to consult, and codegen has
+    // none either. The "is this member soundly decidable here?" question is
+    // UNANSWERABLE at this site — the same architectural reason #1078's
+    // sema-level allowlist was structurally unsound (Bezel generics are
+    // monomorphized; sema runs ONCE, at the generic method's declaration
+    // site, with no visibility into the unenumerable, open-ended set of
+    // call-site type arguments). The original issue (#2445) explicitly
+    // flagged this as a "residual, unresolved question — possibly a
+    // 'worth a spec/rationale check' question per CLAUDE.md's
+    // decline-with-reasons discipline, since this may be an intentional
+    // consequence of the monomorphization design (comparable to C++
+    // template bodies not being validated for dependent names until
+    // instantiated)". A diagnostic here would also break legitimate
+    // uses — confirmed live: a `Container<Pt>.GetX()` reading
+    // `_val.X` on a bare-T field is emitted TWICE (once monomorphized
+    // with `T → Pt` for the call site, and once for the dead
+    // template-body IR-verification pass without substitution); the
+    // template-body pass would trip this check on the legitimate
+    // member read even though the monomorphized body resolves it
+    // correctly. Per CLAUDE.md "decline-with-reasons, never silently"
+    // discipline: the residual case is filed as a follow-up issue for
+    // an owner/spec decision (whether the dead template body needs a
+    // diagnostic at all, and if so what wording distinguishes it from
+    // the substitution-site error). Today the existing CG8 fall-through
+    // generic #2547 message continues to fire on this path for the
+    // bogus-member case, so the silent-fallthrough miscompile is no
+    // worse than the pre-#2445 state.
     if (!ms || !ms->parent || !ma.target) return nullptr;
     auto idxIt = fieldIndex_.find(ms);
     // CG-generic: for generic class field access (e.g. bd.value where
