@@ -182,11 +182,28 @@ BEZEL_TEST(owning_array_drain_getowningenum_2218,
 // §29.1 / #2218: manual-protocol abandonment — MoveNext + no TakeCurrent +
 // Dispose. The advanced-but-untaken element MUST be disposed exactly once
 // (§29.1 "advanced-but-untaken pending value"; §28.2 dispose-exactly-once).
+//
+// #2264: the original test sources embedded Bezel `//` line comments inside
+// adjacent-string-literal concatenations that had NO newlines, so per §1.5
+// the `//` ran to end of input — every `//` line consumed the rest of the
+// program (the trailing `end;`, `return C.disposeCount;`, `end Main; end T;`).
+// runUnderASan then returned -1 (parse failure) and the original
+// `if (rc == -1) return;` silently passed the test. The cleaned-up sources
+// below use `/* ... */` block comments (Bezel §1.5 — comments that DO have
+// well-defined end) so the program is well-formed and the sentinel is now
+// BEZEL_EXPECT_TRUE(rc != -1) so a regression in the toolchain surfaces as a
+// hard test failure, not a silent skip.
 // ===========================================================================
 
 BEZEL_TEST(owning_array_drain_getowningenum_2218,
            asan_manual_protocol_untaken_pending_disposed_spec_29_1) {
-    int rc = runUnderASan(
+    // The program returns 42 (a fixed sentinel) so the value-path assertion
+    // is independent of the disposeCount. The ASan-path assertion checks
+    // that no memory error fires. Before the vacuous-comment cleanup the
+    // parse failed and both assertions were silently skipped; the program
+    // is now well-formed (`/* ... */` block comments replace the broken
+    // `// ...` line comments that ate the rest of the single-line source).
+    const std::string src =
         "module M; "
         "class C "
         "  public static disposeCount: int := 0; "
@@ -198,17 +215,21 @@ BEZEL_TEST(owning_array_drain_getowningenum_2218,
         "    using var a := new OwningArray<C>(); "
         "    a.Add(new C()); "
         "    a.Add(new C()); "
-        "    C.disposeCount := 0; "
         "    var drained := a.Drain(); "
         "    using var en := drained.GetOwningEnumerator(); "
         "    if en.MoveNext() then "
-        "      // Intentionally DO NOT call TakeCurrent — the pending C is "
-        "      // the advanced-but-untaken value. Dispose must reclaim it. "
+        "      /* Intentionally DO NOT call TakeCurrent — the pending C is "
+        "         the advanced-but-untaken value. Dispose must reclaim it. */ "
         "    end; "
-        "    return C.disposeCount; "
-        "  end Main; end T;");
-    if (rc == -1) return;  // toolchain unavailable
-    BEZEL_EXPECT_EQ(rc, 0);  // 0 = ASan clean
+        "    return 42; "
+        "  end Main; end T;";
+    int rcValue = runAotExitCode(src);
+    BEZEL_EXPECT_TRUE(rcValue != -999);  // AOT unavailable -> HARD failure
+    BEZEL_EXPECT_EQ(rcValue, 42);       // program completed normally
+
+    int rcAsan = runUnderASan(src);
+    BEZEL_EXPECT_TRUE(rcAsan != -1);     // toolchain unavailable -> HARD failure
+    BEZEL_EXPECT_EQ(rcAsan, 0);          // 0 = ASan clean
 }
 
 // Same shape but with multiple MoveNexts and an advance-without-take midway.
@@ -216,9 +237,14 @@ BEZEL_TEST(owning_array_drain_getowningenum_2218,
 // contract) before popping the next; the array's last element is reclaimed
 // by `a.Dispose` at scope end. Disposal count = N (every C runs its dtor
 // exactly once — no double-free, no leak).
+//
+// #2264: also exercises the fixed-MoveNext path — the final (false) MoveNext
+// MUST publish null to `pending` (not the stale popped pointer from the
+// previous true-MoveNext), or the using-var-en scope-end Dispose would
+// emitDisposeAndReclaim on freed memory.
 BEZEL_TEST(owning_array_drain_getowningenum_2218,
            asan_manual_protocol_full_drain_no_leak_spec_29_1) {
-    int rc = runUnderASan(
+    const std::string src =
         "module M; "
         "class C "
         "  public static disposeCount: int := 0; "
@@ -231,15 +257,75 @@ BEZEL_TEST(owning_array_drain_getowningenum_2218,
         "    a.Add(new C()); "
         "    a.Add(new C()); "
         "    a.Add(new C()); "
+        "    var drained := a.Drain(); "
+        "    using var en := drained.GetOwningEnumerator(); "
+        "    while en.MoveNext() do "
+        "      /* Skip TakeCurrent — the wrapper's MoveNext on the next iter "
+        "         disposes the prior pending (defensive §29.1 contract). */ "
+        "    end; "
+        "    return 42; "
+        "  end Main; end T;";
+    int rcValue = runAotExitCode(src);
+    BEZEL_EXPECT_TRUE(rcValue != -999);  // AOT unavailable -> HARD failure
+    BEZEL_EXPECT_EQ(rcValue, 42);       // program completed normally
+
+    int rcAsan = runUnderASan(src);
+    BEZEL_EXPECT_TRUE(rcAsan != -1);     // toolchain unavailable -> HARD failure
+    BEZEL_EXPECT_EQ(rcAsan, 0);          // 0 = ASan clean
+}
+
+// ===========================================================================
+// §29.1 / #2264: manual-protocol exhaustion — every element is taken via
+// TakeCurrent, the final (false) MoveNext MUST leave `pending` null, and the
+// using-var-en scope-end Dispose MUST be a no-op. Before the fix, the final
+// (false) MoveNext's outSlot alloca was uninitialised; the load picked up
+// the stale popped pointer from the previous true-MoveNext and stored it
+// into `pending`, so Dispose called emitDisposeAndReclaim on freed memory
+// (UAF; ASan flags the read-after-free in the runtime `free`/reclaim path).
+//
+// Asserts both the ASan-clean path AND the exact dispose count (via
+// runAotExitCode, which returns the program's 8-bit exit code) — a stale
+// pointer that happens to slip past ASan would still show up as an off-by-one
+// disposeCount (e.g. 3 disposes for 2 elements ⇒ the UAF double-freed the
+// last element). The two checks are independent: runAotExitCode runs WITHOUT
+// generated-code ASan (matching the #2218 base path) and asserts the exit
+// code; runUnderASan runs WITH ASan and asserts the exit-status-or-error
+// envelope. If the toolchain is missing both fail HARD, no silent skip.
+// ===========================================================================
+
+BEZEL_TEST(owning_array_drain_getowningenum_2218,
+           final_movenext_pending_is_null_no_uaf_spec_29_1) {
+    const std::string src =
+        "module M; "
+        "class C "
+        "  public static disposeCount: int := 0; "
+        "  public constructor() C.disposeCount := 0; end constructor; "
+        "  destructor C.disposeCount := C.disposeCount + 1; end destructor; "
+        "end C; "
+        "class T "
+        "  public static method Main(): int "
+        "    using var a := new OwningArray<C>(); "
+        "    a.Add(new C()); "
+        "    a.Add(new C()); "
         "    C.disposeCount := 0; "
         "    var drained := a.Drain(); "
         "    using var en := drained.GetOwningEnumerator(); "
         "    while en.MoveNext() do "
-        "      // Skip TakeCurrent — the wrapper's MoveNext on the next iter "
-        "      // disposes the prior pending (defensive §29.1 contract). "
+        "      using var u := en.TakeCurrent(); "
         "    end; "
         "    return C.disposeCount; "
-        "  end Main; end T;");
-    if (rc == -1) return;
-    BEZEL_EXPECT_EQ(rc, 0);  // ASan clean
+        "  end Main; end T;";
+
+    // Value path: exactly 2 elements, exactly 2 disposes (one per `using var u`
+    // scope-end). A stale-pending UAF that re-disposed the last element would
+    // surface as 3; a leaked element (Dispose skipped because pending was
+    // non-null and the using-var-en scope-end crashed) would surface as 1.
+    int rcValue = runAotExitCode(src);
+    BEZEL_EXPECT_TRUE(rcValue != -999);  // AOT unavailable -> HARD failure
+    BEZEL_EXPECT_EQ(rcValue, 2);        // exactly-once disposal via live counter
+
+    // ASan path: no UAF, no double-free, no leak.
+    int rcAsan = runUnderASan(src);
+    BEZEL_EXPECT_TRUE(rcAsan != -1);    // toolchain unavailable -> HARD failure
+    BEZEL_EXPECT_EQ(rcAsan, 0);         // 0 = ASan clean
 }

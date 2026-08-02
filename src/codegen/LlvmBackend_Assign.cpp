@@ -4684,18 +4684,33 @@ llvm::Value* Emitter::wrapArrayAsIOwningEnumerator(
         llvm::Value* arrF = builder_.CreateStructGEP(stTy, self, 1);
         llvm::Value* arrPtr = builder_.CreateLoad(ptrTy(), arrF, "oaem.arr");
         // Use a fresh alloca in the function's entry block for the out-param
-        // (drain writes the popped class pointer into it).
+        // (drain writes the popped class pointer into it). Zero-init the slot
+        // up front: #2264 / §28.3 — bz_array_drain_next returns false WITHOUT
+        // writing *val_out when the array is empty (a performance choice on
+        // the hot path), so the slot keeps the previous invocation's stale
+        // pointer on the final (false) MoveNext. The unconditional
+        // "load → store to pending" below would then publish that stale
+        // pointer to the wrapper's pending field, and the using-var scope-end
+        // Dispose (which calls emitDisposeAndReclaim on a non-null pending)
+        // would double-free / UAF the already-disposed element. Zero-init in
+        // the entry block runs on every MoveNext invocation, so the final
+        // false-returning call observes a clean null slot and publishes null
+        // to pending — Dispose becomes a no-op as §29.1 requires.
         auto* allocaBB = &mnFn->getEntryBlock();
         llvm::IRBuilder<> ab(allocaBB, allocaBB->begin());
         auto* outSlot = ab.CreateAlloca(ptrTy(), nullptr, "oaem.out");
+        ab.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), outSlot,
+                       "oaem.out.init");
         auto* drainFT = llvm::FunctionType::get(
             i1(), {ptrTy(), ptrTy()}, false);
         auto* drainFn = module_->getOrInsertFunction(
             "bz_array_drain_next", drainFT).getCallee();
         llvm::Value* ok = builder_.CreateCall(drainFT, drainFn, {arrPtr, outSlot},
                                        "oaem.ok");
-        // Store the popped pointer into pending (a no-op if drain returned
-        // false, since the slot was just nulled in that path).
+        // Store the popped pointer into pending. With the entry-block zero-init
+        // above, this is correct on both branches: drain-true → publish the
+        // just-written popped pointer; drain-false → publish null (the init),
+        // matching bz_array_drain_next's "false ⇒ no write" contract.
         llvm::Value* popped = builder_.CreateLoad(ptrTy(), outSlot, "oaem.popped");
         builder_.CreateStore(popped, builder_.CreateStructGEP(stTy, self, 2));
         builder_.CreateRet(ok);
