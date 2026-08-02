@@ -4200,8 +4200,8 @@ bool Emitter::argsCanFill(const std::vector<ast::Param>& params,
 llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         llvm::Value* v, const sema::TypeRef* targetTy,
         const ast::Expr* srcExpr, bool ownLazyPipeline,
-        bool* outOwningWrap) {
-    if (outOwningWrap) *outOwningWrap = false;
+        bool* outWrapMade) {
+    if (outWrapMade) *outWrapMade = false;
     if (!v || !targetTy || !srcExpr) return v;
     if (!(targetTy->kind == sema::TypeRef::Kind::Named &&
           !targetTy->declaration && targetTy->astNode &&
@@ -4225,7 +4225,7 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // the ARGUMENT position (a BORROWED callee param) needs a call-site
     // temporary-disposal contract and is deferred (#1916).
     if (ownLazyPipeline && isLazyEnumerableType(actualTy)) {
-        if (outOwningWrap) *outOwningWrap = true;
+        if (outWrapMade) *outWrapMade = true;
         return drainLazyPipelineToOwnedIEnumerable(v, targetTy);
     }
     std::string_view an;
@@ -4270,8 +4270,10 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         // — a Stack<T> OUTER container traverses pop order, and a Stack<T>
         // ELEMENT's leaf wrap reuses #2471's reverse machinery — so this
         // dispatch is correct as-is for the nested shape too.
-        if (nestedIEnumViewNeeded(actualTy, targetTy))
+        if (nestedIEnumViewNeeded(actualTy, targetTy)) {
+            if (outWrapMade) *outWrapMade = true;
             return wrapNestedArrayAsIEnumerable(v, actualTy, targetTy);
+        }
         // #2486 (stdlib §4.11 "Iteration order" v0.195; language spec §29.1,
         // agreeing with #2472's for-loop fix and #2471's explicit
         // .GetEnumerator() fix): a Stack<T>/OwningStack<T> widened to a pure
@@ -4283,12 +4285,11 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         // rather than minting a third implementation, so this path's element
         // order is structurally the SAME code as the explicit-GetEnumerator
         // and for-loop paths, not just independently re-derived to agree.
-        // The wrap stays a plain BORROW (mirrors wrapArrayAsIEnumerable's
-        // existing contract for this branch, unchanged by this fix): the
-        // source Stack remains the sole owner, so `outOwningWrap` is
-        // correctly left false for both Array/Queue and Stack here — no
-        // ownership question is introduced that wasn't already present for
-        // Array's identical borrowing wrap at this same call site.
+        // fix #2298 / §28.9: report `outWrapMade = true` so the caller
+        // (buildOrderedArgs) registers the scope-end iterEnumDispose that
+        // frees the wrapper frame (slot-1 Dispose = `free(self)` for both
+        // Array and Stack — only the frame, never the shared backing).
+        if (outWrapMade) *outWrapMade = true;
         if (an == "Stack" || an == "OwningStack")
             return wrapStackAsIEnumerator(v, targetTy);
         return wrapArrayAsIEnumerable(v, targetTy);
@@ -4301,19 +4302,27 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // object is the snapshot the returned enumerator owns. The SOURCE set is
     // untouched — no element is retained, released, or disposed here, so an
     // owning set still disposes each element exactly once at its own binder's
-    // scope end. `outOwningWrap` tells the caller it must dispose the enumerator.
+    // scope end. `outWrapMade` tells the caller it must dispose the enumerator.
     if (actualTy && (an == "Set" || an == "OwningSet")) {
         uint64_t ksz = 0;
         if (genericBackingType(actualTy, 0, /*isSet=*/true, &ksz)) {
             auto* setFn = declareC("bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
             llvm::Value* lazy = builder_.CreateCall(
                 setFn, {v, builder_.getInt64((int64_t)ksz)}, "setenum.lazy");
-            if (outOwningWrap) *outOwningWrap = true;
+            if (outWrapMade) *outWrapMade = true;
             return drainLazyPipelineToOwnedIEnumerable(lazy, targetTy);
         }
     }
-    if (actualTy && isLinkedListTypeName(actualTy))
+    // fix #2298 / §28.9: LinkedList<T> widened to `IEnumerable<T>` here uses
+    // the plain borrow wrap (slot-1 Dispose = `free(self)`, the wrapper frame
+    // only). The backing bz_llist_t* is freed by the source local's own
+    // scope-end reclaim, never by the wrap. Report `outWrapMade = true` so
+    // buildOrderedArgs registers the scope-end iterEnumDispose that frees
+    // the wrapper frame exactly once.
+    if (actualTy && isLinkedListTypeName(actualTy)) {
+        if (outWrapMade) *outWrapMade = true;
         return wrapLinkedListAsIEnumerable(v, targetTy);
+    }
     // A user class implementing IEnumerable<T> (declaration-carrying). A source
     // whose type is ALREADY a declaration-less IEnumerable (an alias / another
     // wrapped value) has no declaration and passes through unchanged.
@@ -4322,6 +4331,8 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         return wrapUserClassAsIEnumerable(v, actualTy->declaration, targetTy);
     return v;
 }
+
+// §29.2 (#437): generate a type-specific, vtable-backed array enumerator.
 
 // §29.2 (#437): generate a type-specific, vtable-backed array enumerator.
 // Layout:  { ptr vtable, ptr arr, i64 idx, i64 esz }
@@ -7276,21 +7287,33 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // fix #1069 / stdlib §4.10: the SAME contract now also covers a
             // DICT-backed `Set<T>` argument — its wrap snapshots the key table
             // into a fresh array behind an OWNING enumerator, a caller temporary
-            // with the identical disposal obligation. `owningArgWrap` is the
-            // wrap's own report of "this result is owned"; it is true for exactly
-            // the lazy-pipeline case (so the pre-existing behaviour is unchanged)
-            // and the new set-snapshot case. A CLASS-element set takes the
-            // BORROWING array wrap and reports false — nothing extra to dispose.
-            bool owningArgWrap = false;
+            // with the identical disposal obligation. `wrapMade` is the wrap's
+            // own report of "this call allocated a fresh wrapper the caller must
+            // dispose"; it is true for the lazy-pipeline case (owning), the
+            // dict-backed-set snapshot case (owning), and the Array/Stack/Queue/
+            // LinkedList wrap cases (borrowing — slot-1 Dispose is `free(self)`,
+            // the wrapper frame only, NEVER the shared backing). A CLASS-element
+            // set takes the BORROWING array wrap and reports true here so the
+            // wrapper frame is freed exactly once. fix #2298 / §28.9: before
+            // this, only the OWNING cases registered the iterEnumDispose, so
+            // every borrowing wrap leaked its 32-byte frame — silently unbounded
+            // in loops. Now both shapes share the same scope-end disposal, and
+            // the non-owning slot-1 Dispose (free(self) only, NEVER the shared
+            // backing) preserves the source's own ownership.
+            bool wrapMade = false;
             v = wrapAsIEnumerableForTarget(v, formalTy, a.value.get(),
                                            /*ownLazyPipeline=*/lazyArgWrapped,
-                                           &owningArgWrap);
-            if (owningArgWrap && v && v->getType()->isPointerTy() &&
+                                           &wrapMade);
+            if (wrapMade && v && v->getType()->isPointerTy() &&
                 !disposeStack_.empty()) {
                 llvm::AllocaInst* eslot = entryAlloca(v->getType());
                 builder_.CreateStore(v, eslot);
                 Disposal d{eslot, nullptr};
-                d.iterEnumDispose = true;  // slot-1 Dispose: free drained array + frame
+                d.iterEnumDispose = true;  // slot-1 Dispose: free wrapper frame
+                                            // (owning cases also free drained
+                                            // array; borrowing cases free only
+                                            // the frame — never the shared
+                                            // backing, exactly-once).
                 disposeStack_.back().push_back(d);
             }
             // §9 / §9.1 (#1759): passing `this` of a record method by value —

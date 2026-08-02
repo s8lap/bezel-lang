@@ -5252,17 +5252,21 @@ private:
     // dense element array, so it takes the plain (BORROWING) array enumerator; a
     // DICT-backed set (value/record/string element) is a hash table with no dense
     // element array, so it is snapshotted (bz_lazy_from_set → bz_lazy_to_array)
-    // into a fresh array behind an OWNING enumerator. `outOwningWrap`, when
-    // non-null, reports whether the returned value is such an OWNING enumerator
-    // the CALLER must dispose exactly once (true for both the lazy-pipeline drain
-    // and the dict-backed-set snapshot). A RETURN site can ignore it — the caller
-    // owns a returned enumerator by construction (#1916); the ARGUMENT site must
-    // consult it and register the scope-end iterEnumDispose (#1923).
+    // into a fresh array behind an OWNING enumerator. `outWrapMade`, when
+    // non-null, reports whether the returned value is a freshly allocated
+    // enumerator wrapper the CALLER must dispose exactly once — true for the
+    // lazy-pipeline drain (#1916), the dict-backed-set snapshot (#1069), AND
+    // the plain borrowing Array/Stack/Queue/LinkedList wraps whose slot-1
+    // Dispose is `free(self)` (the wrapper frame only, never the shared
+    // backing, exactly like the local-decl `wrappedHere` path #943/#1911).
+    // A RETURN site can ignore it — the caller owns a returned enumerator by
+    // construction (#1916); the ARGUMENT site must consult it and register
+    // the scope-end iterEnumDispose (#1923, #2298).
     llvm::Value* wrapAsIEnumerableForTarget(llvm::Value* v,
                                             const sema::TypeRef* targetTy,
                                             const ast::Expr* srcExpr,
                                             bool ownLazyPipeline = false,
-                                            bool* outOwningWrap = nullptr);
+                                            bool* outWrapMade = nullptr);
 
     // #1916 / #1911 / stdlib §5 / §29.11: drain a lazy LINQ pipeline (bz_lazy_t*)
     // once into a fresh owned Array<T> (bz_lazy_to_array also disposes the
