@@ -2,7 +2,7 @@
 
 *A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.229.*
 
-Bezel gives you five ways to declare a data shape and three ways to select over one. This guide is the picking rule for each — the definitions live in the spec (§9 records, §10 enums, §11 classes, §19 selection, §35 choices), and the *why* behind the design is rationale §9.6. For choosing a **failure signal** (`T?` vs `Try` vs `Result` vs `requires`/exceptions), see Guide 2 §7 — that table is the home; this guide does not repeat it.
+Bezel gives you five ways to declare a data shape and three ways to select over one. This guide is the picking rule for each. The definitions live in the spec (§9 records, §10 enums, §11 classes, §19 selection, §35 choices), and the *why* behind the design is rationale §9.6. For choosing a **failure signal** (`T?` vs `Try` vs `Result` vs `requires`/exceptions), see Guide 2 §7 — that table is the home; this guide does not repeat it.
 
 ## 1. The five data kinds — which one?
 
@@ -38,14 +38,14 @@ end Session;
 
 Boundary calls that come up in practice:
 
-- **Enum vs choice.** The moment one alternative needs a payload, it is a `choice`. Do not encode payloads beside an enum in parallel fields — the compiler cannot tie them together; a `choice` case carries its payload and the `case` arms bind it.
+- **Enum vs choice.** The moment one alternative needs a payload, it is a `choice`. Do not encode payloads beside an enum in parallel fields — the compiler cannot tie them together. A `choice` case carries its payload, and the `case` arms bind it.
 - **Record vs class.** If two instances with the same components should be *the same value* — dictionary keys, messages, coordinates — it is a `record`. If it has a lifecycle (opened, mutated, disposed) or identity matters, it is a `class`. A record cannot hold an owned resource; that is the design, not a limitation (spec §28.5 — copy-semantics holders cannot carry disposal obligations).
 - **Choice vs sealed hierarchy.** A `choice` is data-first: a fixed case list, pattern-matched everywhere, no per-case methods. A `sealed abstract` hierarchy is behavior-first: each leaf is a class with its own members and can carry owned state, and `case` over the leaves is still exhaustive (§19.6). Reach for the hierarchy when cases have *behavior*; reach for the choice when cases are *shapes of data*.
 - **Choice vs `T?`.** A choice with one meaningful payload and one empty case is what `T?` already provides — use `T?` (the recorded rule; DECLINED.md's `Option<T>` entry).
 
 ## 2. Selecting over a value — `(if …)`, `(when …)`, `(case …)`
 
-The three-sentence rule: a **two-way** pick on one condition is the conditional atom; a **ladder of conditions** is `(when …)`; **dispatch on the shape or value of one scrutinee** is `(case … of …)`. In statement position the same constructs take their `end`-terminated statement forms.
+The three-sentence rule: a **two-way** pick on one condition is the conditional atom. A **ladder of conditions** is `(when …)`. **Dispatch on the shape or value of one scrutinee** is `(case … of …)`. In statement position the same constructs take their `end`-terminated statement forms.
 
 ```bezel
 var max    := (if a > b then a else b);                       // two-way
@@ -61,10 +61,10 @@ var label  := (case outcome of                                 // shape dispatch
   Failed(var code)  => $"error {code}");
 ```
 
-- `elif` chains keep a short ladder inside the conditional atom (`(if c1 then a elif c2 then b else d)`); once arms stop being conditions-on-different-things and start being cases-of-one-thing, switch to `case`.
+- `elif` chains keep a short ladder inside the conditional atom (`(if c1 then a elif c2 then b else d)`). Once arms stop being conditions-on-different-things and start being cases-of-one-thing, switch to `case`.
 - `case` is the only form that *binds* — patterns destructure payloads (`Fetched(var body)`) and narrow types (`var c: Circle`). If you need the scrutinee's pieces, you want `case` regardless of arity.
-- Exhaustiveness: `case` over an enum, choice, or sealed hierarchy needs no `_` arm when every case is covered (§19.6) — prefer that; a `_` arm silences the compiler's help when the type grows.
-- Ownership in arms follows the meet rule (Guide 1 §8): arms must agree — all owned or all borrowed — and a named owned binding as an arm is a borrow unless you mark it (`owned x`, consume-if-selected).
+- Exhaustiveness: `case` over an enum, choice, or sealed hierarchy needs no `_` arm when every case is covered (§19.6) — prefer that. A `_` arm silences the compiler's help when the type grows.
+- Ownership in arms follows the meet rule (Guide 1 §8): arms must agree — all owned or all borrowed. A named owned binding as an arm is a borrow unless you mark it (`owned x`, consume-if-selected).
 
 ## 3. Where the failure signal fits
 
