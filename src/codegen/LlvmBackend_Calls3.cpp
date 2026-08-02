@@ -1750,11 +1750,30 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
              builder_.getInt64(valInline ? 1 : 0), valTramp, valClosure,
              builder_.getInt64(keyIsString ? 1 : 0)},
             "linq.todict");
+        // #2263 / stdlib §5 / §4.12 / #2151: when the value type is `string`
+        // (single-selector `ToDictionary(key)` over an `Array<string>` /
+        // `string.Split(...)` source — `hasValueSel` false, `valInline` true),
+        // `bz_lazy_to_dict` stores the element pointer into the dict slot
+        // WITHOUT retaining the string struct (the dict's per-value slot is a
+        // raw void* that aliases the bz_string_struct* the source array
+        // element holds). The freeUnboundOwnedBorrowingArrayTemp call below
+        // would then bz_array_free the source with the string-release thunk,
+        // dropping each substring's refcount to 0 — every dict value is now a
+        // dangling pointer (use-after-free on the next deref). SKIP the source
+        // reclaim entirely when the value type is string; the source array
+        // struct itself leaks (a small bounded leak vs. a guaranteed UAF). The
+        // int / float / struct-Value / record-Value cases are unaffected
+        // (struct values are malloc-copied in the runtime; scalars are
+        // refcount-free; only a `string` value aliases the source array).
+        bool valIsString = !hasValueSel && elemRef &&
+            elemRef->kind == sema::TypeRef::Kind::Primitive &&
+            elemRef->primitive == sema::PrimitiveType::String &&
+            !elemRef->nullable;
         // #2151 / §28.3: reclaim an unbound fresh-materializer receiver array
         // here (the lazy is already consumed/disposed by bz_lazy_to_dict). See
         // the matching comment at the ToDictionary entry above for rationale
         // and the no-double-free gate.
-        if (recvArr) freeUnboundOwnedBorrowingArrayTemp(
+        if (recvArr && !valIsString) freeUnboundOwnedBorrowingArrayTemp(
                 ma->target.get(), recvArr, ctx_.exprType(*ma->target));
         // Release the inline-lambda / primitive-intrinsic-method-ref key/value
         // closures if we own them (eager materialization — the closures are
