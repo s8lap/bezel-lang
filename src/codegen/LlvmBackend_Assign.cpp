@@ -1740,6 +1740,57 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         emitPendingCheck();
         return true;
     }
+    // fix #2548 (§23.4/§28.9/§4.6, v0.236): the INDEXER twin of
+    // lowerVirtualPropertySet's #2490/#2500/#2506 emitProducerRelease
+    // (LlvmBackend_Exprs.cpp ~5106-5128). The three setter-call paths below
+    // (interface itable dispatch, class-vtable dispatch, inline setter body)
+    // each invoke a class-owning setter (or class-side field store for the
+    // inline path) that RETAINS its incoming `value` — but for a +1
+    // PRODUCER RHS (`"abc" + i.ToString()`, a string interpolation, a method
+    // call returning a +1 closure, or a box-return call to an
+    // Object/interface property target), the caller transferred the fresh
+    // reference across the call and the callee's retain doubled it; the
+    // doubled reference would never be released. The pre-fix consequence:
+    // every loop iteration leaks the producer's +1 — for `"abc" + i.ToString()`
+    // that is ~37 bytes per iteration (32 byte bz_string header + ~5 byte
+    // payload for the digit) — exactly the leak the issue observed (185
+    // bytes per 10 iterations, the 50-byte "indirect" tail is the payload
+    // string's own referenced byte-string header). Mirrors the property
+    // setter's #2490 fix (the imported-stub sibling at lowerImportedPropertySetValue
+    // ~4038) — see its comment for the full rationale on the class-retain /
+    // record-plain-store split. As on the property side, the release is
+    // unconditional ONLY on the class-backed paths; on the record-backed
+    // itable path the setter plain-stores (a record's reference fields are
+    // borrows with no independent +1 and no disposer — §9/§9.7) and
+    // releasing here would drop the field's only reference (UAF). The
+    // lambda below is the single emitProducerRelease used by all three
+    // paths; each call site decides when to invoke it.
+    auto emitProducerRelease = [&] {
+        if (valueExpr && isPlusOneStringProducer(valueExpr))
+            emitStringRelease(val);
+        else if (valueExpr && (isPlusOneClosureProducer(valueExpr) ||
+                               isUserMethodClosureReturnCall(valueExpr)))
+            emitClosureRelease(val);
+        else if (valueExpr && val && val->getType()->isPointerTy()) {
+            // fix #2500 (§23.3/§28.9, v0.236): the box twin of the string/
+            // closure release above — same isProducer predicate as
+            // lowerBoxFieldStore / lowerImportedPropertySetValue. Gated on the
+            // TARGET being Object/interface (and val a ptr): a value-typed
+            // indexer's source may be boxable in isolation but is not boxed
+            // here. The target is `ix` (the IndexExpr) for the indexer
+            // shape; isObjectOrInterfaceTarget must accept IndexExpr (it's
+            // the assignment-target shape used by lowerPropertySetValue too —
+            // see #2500's call site in lowerVirtualPropertySet).
+            const sema::TypeRef* tgtTy = ctx_.exprType(ix);
+            if (tgtTy && isObjectOrInterfaceTarget(tgtTy)) {
+                const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+                if ((srcTy && (isBoxableValueType(srcTy) ||
+                               isNullableValueTy(srcTy))) ||
+                    isUserMethodBoxReturnCall(valueExpr))
+                    emitBoxRelease(val);
+            }
+        }
+    };
     // #730 / §13 / §23.4: `(arr: IFoo)[i] := v` through an INTERFACE-typed
     // receiver dispatches the setter dynamically through the itable — load the
     // implementing class's setter from itab[set-index] and call it as
@@ -1889,15 +1940,20 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
             llvm::BasicBlock* doneBB =
                 llvm::BasicBlock::Create(llvm_, "idxset.done", fn);
             builder_.CreateCondBr(isClassBacked, classBB, recordBB);
-            // CLASS-backed branch: setter retained → no producer release
-            // (the indexer shape does not yet have emitProducerRelease —
-            // that's a separate #2548 lane; the named-local CLOSE this
-            // fix lands is the property case's analogue, the producer-RHS
-            // family is its own work item), and no extra retain needed —
-            // the class setter's retain is the field's +1, the scope-end
-            // release on the walker-armed local drops the local's +1, all
-            // +1's accounted for.
+            // CLASS-backed branch: setter retained → release the producer-RHS
+            // +1 the setter's retain doubled (#2548, the indexer twin of
+            // lowerVirtualPropertySet's emitProducerRelease on its classBB
+            // — see emitProducerRelease's definition above). The named-local
+            // close (the walker-armed scope-end release on the local) is
+            // independent of this producer release — a producer RHS has no
+            // local binding, only the value itself, and the doubled +1 has
+            // no other owner; the classBB emitProducerRelease drops it
+            // here. No extra retain needed on classBB: the class setter's
+            // retain IS the field's +1, the local keeps its own +1, the
+            // walker's scope-end release drops the local's +1, all +1's
+            // accounted for.
             builder_.SetInsertPoint(classBB);
+            emitProducerRelease();
             builder_.CreateBr(doneBB);
             // RECORD-backed branch: setter plain-stored → field aliases
             // the local's only reference. For a tracked-string NAMED LOCAL
@@ -1950,6 +2006,19 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
                 callArgs.push_back(coerceNumericToType(val, valTy, false));
                 builder_.CreateCall(sFnTy, fnPtr, callArgs);
                 emitPendingCheck();
+                // fix #2548 (§23.4/§28.9/§4.6, v0.236): the CLASS-VTABLE
+                // twin of the interface-dispatch classBB emitProducerRelease
+                // above. The class-vtable path is unconditional-class-backed
+                // (a vtable slot is always a class's own slot, never a
+                // record's — §9: "A record cannot derive from another record
+                // or from a class"), so the setter's class-gated retain
+                // (ensureIndexerAccessorFn / ensureIndexerSetterFn's class
+                // path) DID fire and the producer-RHS +1 was doubled. Drop
+                // the doubled +1 here — see emitProducerRelease's definition
+                // above for the predicate. Mirrors lowerVirtualPropertySet's
+                // `!isIfaceProp` unconditional emitProducerRelease exactly
+                // (the property-side analogue handles the same vtable path).
+                emitProducerRelease();
                 return true;
             }
         }
@@ -2061,6 +2130,28 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         if (!term) builder_.CreateBr(accEndBB);
         builder_.SetInsertPoint(accEndBB);
     }
+    // fix #2548 (§23.4/§28.9/§4.6, v0.236): the INLINE-SETTER twin of the
+    // interface-dispatch classBB / class-vtable emitProducerRelease calls
+    // above. The inline path is reached for two receiver shapes:
+    //   * a CLASS receiver with a NON-VIRTUAL indexer (no propSetSlot_ entry
+    //     in the vtable — #1080's own classification) — the inlined setter
+    //     body stores `value` into the class's backing field, and the
+    //     class-field store mints its own +1 (the same retain
+    //     ensureIndexerSetterFn / ensurePropertyAccessorFn's class-gated
+    //     retain does on the vtable path). A +1 producer RHS therefore
+    //     leaves a doubled reference here too; release it.
+    //   * a RECORD receiver — §9/§9.7: a record's reference fields are
+    //     borrows with no independent +1 and no disposer, so the inline
+    //     setter body does a PLAIN STORE. Releasing the producer here
+    //     would drop the field's only reference (UAF). Skip on records.
+    // Gated on `recvDecl->kind == Class` — same shape as
+    // lowerImportedPropertySetValue's `classOwned` gate at this file ~4038
+    // and lowerVirtualPropertySet's classBB (the latter via the runtime
+    // itable flag for the interface dispatch). The inline path never
+    // encounters an interface receiver (the interface branch above
+    // returned true first), so no itable flag read is needed here.
+    if (recvDecl->kind == ast::TypeDeclKind::Class)
+        emitProducerRelease();
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
