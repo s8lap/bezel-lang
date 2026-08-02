@@ -3015,11 +3015,46 @@ bool MethodOwnership::isNullSourceChoiceExpr(const ast::Expr& e) const {
             ctx_.resolvedType(*pf.type), seen, fieldEnv);
     };
     const auto& fields = cc->caseDecl->payload;
-    for (std::size_t i = 0; i < ce->args.size() && i < fields.size(); ++i) {
-        const ast::Param& f = fields[i];
+    // §22.5 / #2268 (v0.236): build a payloadArg[] lookup keyed on the case's
+    // payload declaration order, mirroring the record codegen path
+    // (#540, LlvmBackend_Exprs2.cpp:5316-5348). A positional arg matches by
+    // source index; a named arg `name := expr` matches the payload field of
+    // the same name (sema already binds by name; the positional iteration
+    // below was the latent bug — `fields[i]` and `args[i]` disagreed on every
+    // reorder, so a borrow-carrying payload at index 0 was checked against
+    // the wrong argument, and a non-borrow payload at the same index was
+    // skipped when the named arg actually targeted a borrow-carrying sibling).
+    std::vector<const ast::CallArgument*> payloadArg(fields.size(), nullptr);
+    {
+        bool allPositional = true;
+        for (const auto& a : ce->args)
+            if (!a.name.empty()) { allPositional = false; break; }
+        if (allPositional) {
+            std::size_t argIdx = 0;
+            for (std::size_t fi = 0; fi < fields.size(); ++fi) {
+                if (argIdx < ce->args.size() && ce->args[argIdx].value)
+                    payloadArg[fi] = &ce->args[argIdx];
+                ++argIdx;
+            }
+        } else {
+            for (std::size_t ai = 0; ai < ce->args.size(); ++ai) {
+                const ast::CallArgument& a = ce->args[ai];
+                if (a.name.empty()) break;  // mixed positional+named: sema rejects
+                for (std::size_t fi = 0; fi < fields.size(); ++fi) {
+                    if (fields[fi].name == a.name) {
+                        payloadArg[fi] = &a;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    for (std::size_t fi = 0; fi < fields.size(); ++fi) {
+        const ast::Param& f = fields[fi];
         if (!isBorrowCarrying(f)) continue;
-        const ast::Expr* arg = ce->args[i].value.get();
-        if (!arg) return false;
+        const ast::CallArgument* a = payloadArg[fi];
+        if (!a || !a->value) return false;
+        const ast::Expr* arg = a->value.get();
         // Direct `null` literal borrow — the simple, no-dynamic-knowledge
         // null-source admission. The literal form is the only admissible
         // source of `null` here: a `null`-typed local of borrow-bearing
@@ -3214,20 +3249,70 @@ void MethodOwnership::checkRecordBorrowEscapesOnReturn(const ast::Expr& e) {
             }
             return false;
         };
-        for (std::size_t i = 0; i < ne->args.size(); ++i) {
-            const ast::CallArgument& a = ne->args[i];
-            if (!a.value) continue;
-            // §9.7 precision (#2150): skip a positional arg whose matched field
-            // is non-borrow-carrying — only borrows actually stored in borrow-
-            // carrying fields can escape (a value-typed field holds a value, not
-            // a borrow). A position without a matched positional field, or a
-            // builtin span (no recordDecl), stays conservative: rooted.
-            if (recordDecl && i < recordDecl->positionalFields.size()) {
-                const ast::Param& f = recordDecl->positionalFields[i];
-                if (f.type && !isBorrowCarryingField(ctx_.resolvedType(*f.type)))
-                    continue;
+        // §22.5 / #2268 (v0.236): build a fieldArg[] lookup keyed on the
+        // record's positional-field declaration order, mirroring the record
+        // codegen path (#540, LlvmBackend_Exprs2.cpp:5316-5348). The pre-fix
+        // loop iterated `ne->args` by source position and looked up
+        // `recordDecl->positionalFields[i]`, so a `new Holder(N := s.Count,
+        // S := p.AsSpan())` call (args[0]=`N:=`, args[1]=`S:=`) checked
+        // args[0] (the `int` value) against the field at index 0 (`S: span`,
+        // borrow-carrying) — the wrong direction. `s.Count`'s root `s` was
+        // then wrongly reported as the borrow's escape-bound source
+        // (false-reject), and conversely a reorder where the borrow-carrying
+        // arg sat at source index 0 of a value-typed field index would slip
+        // past the walker (under-reject / UAF). The named-arg lookup below
+        // matches sema's §22.5 binding (bindArgsToParams) and the codegen.
+        std::vector<const ast::CallArgument*> fieldArg(
+            recordDecl ? recordDecl->positionalFields.size() : 0, nullptr);
+        if (recordDecl) {
+            bool allPositional = true;
+            for (const auto& a : ne->args)
+                if (!a.name.empty()) { allPositional = false; break; }
+            if (allPositional) {
+                std::size_t argIdx = 0;
+                for (std::size_t fi = 0;
+                     fi < recordDecl->positionalFields.size(); ++fi) {
+                    if (argIdx < ne->args.size() && ne->args[argIdx].value)
+                        fieldArg[fi] = &ne->args[argIdx];
+                    ++argIdx;
+                }
+            } else {
+                for (std::size_t ai = 0; ai < ne->args.size(); ++ai) {
+                    const ast::CallArgument& a = ne->args[ai];
+                    if (a.name.empty()) break;  // mixed: sema rejects
+                    for (std::size_t fi = 0;
+                         fi < recordDecl->positionalFields.size(); ++fi) {
+                        if (recordDecl->positionalFields[fi].name == a.name) {
+                            fieldArg[fi] = &a;
+                            break;
+                        }
+                    }
+                }
             }
-            if (checkArg(*a.value)) return;
+        }
+        if (recordDecl) {
+            // Iterate the BOUND field, not the source position. A field that
+            // is non-borrow-carrying (an int, an enum, …) holds a value, not
+            // a borrow — the arg bound to it cannot be a borrow's source.
+            for (std::size_t fi = 0;
+                 fi < recordDecl->positionalFields.size(); ++fi) {
+                const ast::Param& f = recordDecl->positionalFields[fi];
+                if (f.type &&
+                    !isBorrowCarryingField(ctx_.resolvedType(*f.type)))
+                    continue;
+                const ast::CallArgument* a =
+                    (fi < fieldArg.size()) ? fieldArg[fi] : nullptr;
+                if (!a || !a->value) continue;
+                if (checkArg(*a->value)) return;
+            }
+        } else {
+            // builtin span (no recordDecl) — conservative: every arg is
+            // potentially a borrow source, so check each verbatim.
+            for (std::size_t i = 0; i < ne->args.size(); ++i) {
+                const ast::CallArgument& a = ne->args[i];
+                if (!a.value) continue;
+                if (checkArg(*a.value)) return;
+            }
         }
         return;
     }

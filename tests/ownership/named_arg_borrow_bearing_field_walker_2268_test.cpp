@@ -1,0 +1,177 @@
+// Spec-derived tests for issue #2268 — §9.7 / §22.5 (v0.236): the §9.7
+// borrow-bearing-record RETURN walker must key its borrow-carrying-field
+// check off the BOUND positional field (per sema's §22.5
+// bindArgsToParams), not off the argument's source position.
+//
+// The fix (Ownership_Checks.cpp:3252-3330, checkRecordBorrowEscapesOnReturn):
+// the pre-fix loop iterated `ne->args` by source position and looked up
+// `recordDecl->positionalFields[i]`, so a `new Holder(N := s.Count, S :=
+// p.AsSpan())` call (args[0]=`N:=`, args[1]=`S:=`) checked args[0] (the
+// `int` value `s.Count`) against the field at index 0 (`S: span`,
+// borrow-carrying) — the wrong direction. `s.Count`'s root `s` was then
+// wrongly reported as the borrow's escape-bound source (false-reject). The
+// inverse — a named-arg reorder where the borrow-carrying arg sat at
+// source index 0 of a value-typed field — slipped past the walker
+// (under-reject → use-after-free).
+//
+// Each test below pins one of these directions; the ACCEPT side runs the
+// full AOT oracle so a silently wrong value is caught too, and the REJECT
+// side asserts on diagnostic TEXT (the §9.7 message) rather than the
+// coarse `hasErrors()` (runAot synthesizes a crash-error on SIGSEGV too,
+// per the lane-protocol §3).
+//
+// per §9.7 (v0.236), §22.5 (v0.236), #2268.
+
+#include <string>
+
+#include "support/aot_support.hpp"
+#include "support/ownership_support.hpp"
+#include "test_harness.hpp"
+
+using bezel::test::parseAndCheckOwnership;
+using bezel::test::runAot;
+using bezel::test::runAotChecked;
+
+namespace {
+
+// True iff an ERROR diagnostic whose message contains `needle` was emitted.
+// Mirrors record_direct_new_non_borrow_arg_2150_test.cpp's hasError pattern.
+bool hasError(const std::string& src, const std::string& needle) {
+    auto r = parseAndCheckOwnership(src);
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find(needle) != std::string::npos) return true;
+    }
+    return false;
+}
+
+// ===========================================================================
+// DIRECTION 1 — FALSE REJECT (over-rejection, now ACCEPTED).
+//
+// §9.7 / §22.5: a record `Holder(S: ArraySpan<int>, N: int)` declared with
+// the span field FIRST. A return of `new Holder(N := s.Count, S :=
+// p.AsSpan())` with `s` a scope-bound owned local (using var) must NOT be
+// rejected: the int field's `s.Count` is a value (no borrow), and the
+// span field's `p.AsSpan()` borrows `p` (a parameter, not escape-bound).
+// The walker iterates the BOUND field, so the int field is skipped and the
+// span field's arg (`p.AsSpan()`, rooted at `p`) is not flagged.
+//
+// PRE-FIX: walker iterated args by source index and matched args[0]
+// (`N := s.Count`, an int) against field[0] (`S: span`, borrow-carrying);
+// `identifierRoot(s.Count)` is `s`, a scope-bound owned local → spurious
+// §9.7 rejection. (Confirmed on origin/main: the program is rejected with
+// the §9.7 message even though the runtime value is sound.)
+// ===========================================================================
+BEZEL_TEST(named_arg_walker_2268, false_reject_span_param_value_local_accepted) {
+    auto r = runAot(
+        "module M; "
+        "record Holder(S: ArraySpan<int>, N: int); "
+        "class C "
+        "  public static method View(p: Array<int>): Holder "
+        "    var s := new Array<int>(); s.Add(11); "
+        "    return new Holder(N := s.Count, S := p.AsSpan()); "
+        "  end View; "
+        "  public static method Main(): int "
+        "    var p := new Array<int>(); p.Add(7); "
+        "    var h := C.View(p); "
+        "    return h.S[0] + h.N; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 8);
+}
+
+// ===========================================================================
+// DIRECTION 2 — UNDER REJECT (under-rejection, now DETECTED).
+//
+// §9.7 / §22.5: a record `Holder(S: ArraySpan<int>, N: int)` declared with
+// the span field FIRST. A return of `new Holder(N := 0, S := s.AsSpan())`
+// with `s` a scope-bound owned local must BE rejected: the span field's
+// `s.AsSpan()` borrows `s`, a local disposed at scope end — the returned
+// Holder carries a borrow that outlives its source (UAF).
+//
+// PRE-FIX: walker iterated args by source index and matched args[0]
+// (`N := 0`, an int literal) against field[0] (`S: span`,
+// borrow-carrying); `identifierRoot(0)` is the literal, with no
+// escape-bound root → no rejection. The runtime read of `h.S[0]` after
+// `s`'s auto-drop is a classic §9.7 use-after-free (confirmed: pre-fix the
+// program compiles rc=0 and SEGV's under ASan).
+//
+// Assert on diagnostic TEXT (§9.7), not the coarse `rejects()` —
+// runAot's `WIFSIGNALED` path synthesizes a generic Error diagnostic on
+// a SIGSEGV, so a coarse accept-everything check would mask the real
+// under-reject path.
+// ===========================================================================
+BEZEL_TEST(named_arg_walker_2268, under_reject_span_field_binds_escape_bound_rejected) {
+    std::string src =
+        "module M; "
+        "record Holder(S: ArraySpan<int>, N: int); "
+        "class C "
+        "  public static method Make(): Holder "
+        "    using var s := new Array<int>(); s.Add(11); "
+        "    return new Holder(N := 0, S := s.AsSpan()); "
+        "  end Make; "
+        "  public static method Main(): int return 0; "
+        "end C;";
+    // Parse-and-check: the sema+ownership pass must report the §9.7 escape.
+    // (runAotChecked would also see a UAF at runtime, but the static reject
+    // is the load-bearing signal — the runtime crash is the consequence the
+    // fix prevents.)
+    BEZEL_EXPECT_TRUE(hasError(src, "§9.7"));
+    BEZEL_EXPECT_TRUE(hasError(src, "borrow-bearing record"));
+    BEZEL_EXPECT_TRUE(hasError(src, "carries a borrow of"));
+}
+
+// ===========================================================================
+// CONTROL — declaration-order named args: a `new Holder(S := p.AsSpan(),
+// N := s.Count)` call where the NAMED args are in declaration order. The
+// walker iterates the BOUND field, so the span field gets `p.AsSpan()`
+// (borrow from param p, no escape) and the int field gets `s.Count`
+// (value, skipped). This compiles cleanly with or without the fix (the
+// named-arg lookup returns the same answer as positional indexing in
+// declaration order) — guards that the new lookup path doesn't break
+// the trivial no-reorder case.
+// ===========================================================================
+BEZEL_TEST(named_arg_walker_2268, declaration_order_named_args_accepted) {
+    auto r = runAot(
+        "module M; "
+        "record Holder(S: ArraySpan<int>, N: int); "
+        "class C "
+        "  public static method View(p: Array<int>): Holder "
+        "    var s := new Array<int>(); s.Add(11); "
+        "    return new Holder(S := p.AsSpan(), N := s.Count); "
+        "  end View; "
+        "  public static method Main(): int "
+        "    var p := new Array<int>(); p.Add(7); "
+        "    var h := C.View(p); "
+        "    return h.S[0] + h.N; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 8);
+}
+
+// ===========================================================================
+// CONTROL — positional args unchanged (§9.7 precision #2150 covered this
+// shape; the named-arg fix must not regress the positional leg).
+// ===========================================================================
+BEZEL_TEST(named_arg_walker_2268, positional_args_still_accepted) {
+    auto r = runAot(
+        "module M; "
+        "record Holder(S: ArraySpan<int>, N: int); "
+        "class C "
+        "  public static method View(p: Array<int>): Holder "
+        "    var s := new Array<int>(); s.Add(11); "
+        "    return new Holder(p.AsSpan(), s.Count); "
+        "  end View; "
+        "  public static method Main(): int "
+        "    var p := new Array<int>(); p.Add(7); "
+        "    var h := C.View(p); "
+        "    return h.S[0] + h.N; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 8);
+}
+
+} // namespace

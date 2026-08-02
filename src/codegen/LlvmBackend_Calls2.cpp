@@ -3282,36 +3282,107 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             // order. Extra/missing args are a sema error — assume arity
             // matches (a mismatch was a sema compile error that should
             // have stopped codegen already).
-            std::size_t argCount = 0;
-            for (const auto& a : call.args) if (a.value) ++argCount;
-            // §A.6 CallExpr's `args` carry positional arguments only (named
-            // args are not in this surface). Bind positionally.
-            std::vector<llvm::Value*> payloadFields;
-            std::size_t argIdx = 0;
-            for (const auto& pf : cc->caseDecl->payload) {
-                (void)pf;
-                if (argIdx < call.args.size() && call.args[argIdx].value) {
-                    payloadFields.push_back(
-                        lowerExpr(*call.args[argIdx].value));
-                } else {
-                    // Defensive — sema should have rejected an under-bound
-                    // call. Use undef of the right type.
-                    auto* pty = st->getElementType(1 + tag);
-                    if (auto* payloadStruct =
-                            llvm::dyn_cast<llvm::StructType>(pty)) {
-                        auto idx = payloadFields.size();
-                        if (idx < payloadStruct->getNumElements()) {
-                            payloadFields.push_back(llvm::UndefValue::get(
-                                payloadStruct->getElementType(idx)));
-                        } else {
-                            payloadFields.push_back(llvm::UndefValue::get(
-                                i32()));
+            // §22.5 / #2268 (v0.236): named arguments on a choice case
+            // construction bind by payload field NAME, not by source
+            // position — `ast::CallArgument::name` carries the §22.5
+            // `name := expr` prefix (Node.hpp:95) and sema already accepts
+            // it (bindArgsToParams, ExprTypecheck_Calls.cpp:7996), but the
+            // codegen below indexed payload fields positionally and so
+            // stored each supplied arg into the slot at the same source
+            // index instead of the slot the name named — a
+            // wrong-field/miscompile on every reorder. Mirror the record
+            // path at LlvmBackend_Exprs2.cpp:5292-5350 (#540): build a
+            // payloadArg[] lookup keyed on the case's payload declaration
+            // order, fill it from named or positional args, then lower
+            // payload-by-payload through the lookup.
+            std::vector<const ast::CallArgument*> payloadArg(
+                cc->caseDecl->payload.size(), nullptr);
+            bool allPositional = true;
+            for (const auto& a : call.args)
+                if (!a.name.empty()) { allPositional = false; break; }
+            bool mappingOk = true;
+            if (allPositional) {
+                std::size_t argIdx = 0;
+                for (std::size_t fi = 0; fi < cc->caseDecl->payload.size();
+                     ++fi) {
+                    if (argIdx < call.args.size() &&
+                        call.args[argIdx].value)
+                        payloadArg[fi] = &call.args[argIdx];
+                    ++argIdx;
+                }
+            } else {
+                // §22.5: a named arg matches the payload field of the same
+                // name; every payload field must be supplied (sema already
+                // rejects arity mismatches above). A positional arg in a
+                // named-arg mix is rejected by sema as well.
+                for (std::size_t ai = 0; ai < call.args.size(); ++ai) {
+                    const ast::CallArgument& a = call.args[ai];
+                    if (a.name.empty()) { mappingOk = false; break; }
+                    bool found = false;
+                    for (std::size_t fi = 0;
+                         fi < cc->caseDecl->payload.size(); ++fi) {
+                        if (cc->caseDecl->payload[fi].name == a.name) {
+                            payloadArg[fi] = &a;
+                            found = true;
+                            break;
                         }
-                    } else {
+                    }
+                    if (!found) { mappingOk = false; break; }
+                }
+                if (mappingOk) {
+                    for (std::size_t fi = 0;
+                         fi < cc->caseDecl->payload.size(); ++fi)
+                        if (!payloadArg[fi]) { mappingOk = false; break; }
+                }
+            }
+            std::vector<llvm::Value*> payloadFields;
+            payloadFields.reserve(cc->caseDecl->payload.size());
+            if (!mappingOk) {
+                // Defensive — sema should have rejected the arg shape that
+                // prevented mapping; use undef for every payload slot so
+                // codegen still terminates with a defined LLVM value.
+                auto* pty = st->getElementType(1 + tag);
+                if (auto* payloadStruct =
+                        llvm::dyn_cast<llvm::StructType>(pty)) {
+                    for (std::size_t i = 0; i < cc->caseDecl->payload.size();
+                         ++i) {
+                        if (i < payloadStruct->getNumElements())
+                            payloadFields.push_back(llvm::UndefValue::get(
+                                payloadStruct->getElementType(i)));
+                        else
+                            payloadFields.push_back(
+                                llvm::UndefValue::get(i32()));
+                    }
+                } else {
+                    for (std::size_t i = 0; i < cc->caseDecl->payload.size();
+                         ++i)
                         payloadFields.push_back(llvm::UndefValue::get(pty));
+                }
+            } else {
+                for (std::size_t fi = 0; fi < cc->caseDecl->payload.size();
+                     ++fi) {
+                    const ast::CallArgument* a = payloadArg[fi];
+                    if (a && a->value) {
+                        payloadFields.push_back(lowerExpr(*a->value));
+                    } else {
+                        // Defensive — sema should reject; use undef of the
+                        // right type so the InsertValue below stays well-
+                        // typed.
+                        auto* pty = st->getElementType(1 + tag);
+                        if (auto* payloadStruct =
+                                llvm::dyn_cast<llvm::StructType>(pty)) {
+                            if (fi < payloadStruct->getNumElements())
+                                payloadFields.push_back(llvm::UndefValue::get(
+                                    payloadStruct->getElementType(fi)));
+                            else
+                                payloadFields.push_back(
+                                    llvm::UndefValue::get(i32()));
+                        } else {
+                            payloadFields.push_back(
+                                llvm::UndefValue::get(pty));
+                        }
                     }
                 }
-                ++argIdx;
             }
             // Build the case's payload struct value.
             auto* payloadTy = st->getElementType(1 + tag);
