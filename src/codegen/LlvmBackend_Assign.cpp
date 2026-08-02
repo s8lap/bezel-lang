@@ -3901,15 +3901,90 @@ const ast::PropertyAccessor* Emitter::computedSetterOf(const ast::Expr& target) 
 bool Emitter::lowerPropertySet(const ast::Expr& target, const ast::Expr& value) {
     if (!computedSetterOf(target)) return false;
     llvm::Value* v = lowerExpr(value);
-    return v ? lowerPropertySetValue(target, v) : false;
+    // fix #2568: thread `value` through as valueExpr so lowerPropertySetValue
+    // can release a +1 producer passed directly to a CLASS-owned computed
+    // setter (see the comment on the lambda above). The `ref`/`out` write-
+    // back call site that uses lowerPropertySetValue with a pre-loaded `v`
+    // (no source expression in scope) is the emitAccessorRefArgWriteBacks
+    // call, which deliberately passes nullptr — leak-over-UAF is the safe
+    // direction there, identical to #2540's nullptr-NAMED-LOCAL choice for
+    // lowerIndexerSet.
+    return v ? lowerPropertySetValue(target, v, &value) : false;
 }
 
 
-bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
+bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
+                                    const ast::Expr* valueExpr) {
     const ast::PropertyAccessor* setter = computedSetterOf(target);
     if (!setter || !v) return false;
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(target));
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    // fix #2568 (§23.3/§28.9/§4.6, v0.236): the LOCAL non-virtual computed-
+    // property setter path's missing producer release. The virtual/interface
+    // analogue `lowerVirtualPropertySet` (LlvmBackend_Exprs.cpp ~5106-5128) has
+    // emitted producer release since #2490/#2500/#2506; the indexer analogue
+    // `lowerIndexerSet` got the same lambda in #2548/#2567. This function (the
+    // block-setter / static-setter / compound-property / increment-property
+    // path) was the lone holdout: a +1 PRODUCER RHS (`"abc" + i.ToString()`,
+    // string interpolation, a closure-return method call, a box-return call to
+    // an Object/interface property target) passed directly to a CLASS-OWNED
+    // computed setter's inlined body is retained (the setter body stores it
+    // into the backing field, which routes through `lowerStringFieldStore`'s
+    // ARC — emitStringRetain/emitClosureRetain/emitBoxRetain), but no caller-
+    // side release fired to balance the retain, so the producer's +1 leaked
+    // out from under the caller's own reference. LSan-confirmed: 100
+    // iterations of `s.Name := "abc" + i.ToString();` against a non-virtual
+    // class computed property `set => _name := value;` leaked 3200 byte(s)
+    // direct + 590 byte(s) indirect (100 bz_string headers + 100 payload
+    // substrings), i.e. 32 + 5.9 ≈ 37 byte(s) per iteration, exactly the
+    // per-iteration pattern the issue brief observed. Pre-fix, every loop
+    // iteration leaked. Fix mirrors lowerIndexerSet's inline-body
+    // emitProducerRelease (`recvDecl->kind == Class` gate, applied below
+    // after the setter body) exactly: gated Class-only because a RECORD's
+    // setter body keeps the PLAIN STORE (§9/§9.7 — a record's reference
+    // fields are borrows with no independent +1 and no disposer), so the
+    // callee never retained and releasing here would drop the field's only
+    // reference (UAF, the live failure #2490/#2506/#2548 caught for the
+    // sibling sites).
+    //
+    // The lambda below is the single emitProducerRelease used by both the
+    // static and instance branches. Same predicates as
+    // lowerVirtualPropertySet's / lowerIndexerSet's / lowerIndexerCompound's
+    // / lowerImportedPropertySetValue's: isPlusOneStringProducer /
+    // isPlusOneClosureProducer / isUserMethodClosureReturnCall /
+    // isUserMethodBoxReturnCall, plus the §8.6 box target check.
+    auto emitProducerRelease = [&] {
+        if (valueExpr && isPlusOneStringProducer(valueExpr))
+            emitStringRelease(v);
+        else if (valueExpr && (isPlusOneClosureProducer(valueExpr) ||
+                               isUserMethodClosureReturnCall(valueExpr)))
+            emitClosureRelease(v);
+        else if (valueExpr && v && v->getType()->isPointerTy()) {
+            // fix #2500 (§23.3/§28.9, v0.236): the box twin of the string/
+            // closure release above — same isProducer predicate as
+            // lowerBoxFieldStore / lowerImportedPropertySetValue. Gated on the
+            // TARGET being Object/interface (and v a ptr): a value-typed
+            // property's source may be boxable in isolation but is not boxed
+            // here.
+            const sema::TypeRef* tgtTy = ctx_.exprType(target);
+            if (tgtTy && isObjectOrInterfaceTarget(tgtTy)) {
+                const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+                if ((srcTy && (isBoxableValueType(srcTy) ||
+                               isNullableValueTy(srcTy))) ||
+                    isUserMethodBoxReturnCall(valueExpr))
+                    emitBoxRelease(v);
+            }
+        }
+    };
+    // CLASS-OWNED PROPERTY gate (§9/§9.7): only release the producer on the
+    // CLASS path. Records' setter bodies plain-store, so the callee never
+    // retained and dropping the producer here would UAF the field's only ref.
+    // The static branch below has `ps->parent` set to the declaring class (a
+    // STATIC property's `parent` is its declaring type), so the same gate
+    // covers it. ENUM properties are blocked by `computedSetterOf` for
+    // non-block setters (#2499) and are not an active path here.
+    bool classOwned = ps->parent &&
+                      ps->parent->kind == ast::TypeDeclKind::Class;
     // per §23.3 / §13 / #476: a STATIC property has no receiver (`this`).
     // Mirrors the static-getter path in LlvmBackend_Exprs.cpp (the
     // "isStaticProp" branch). For static properties, skip receiver resolution
@@ -3935,6 +4010,13 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
         inlinedAccessorEnd_ = savedAccEnd;
         if (!term) builder_.CreateBr(accEndBB);
         builder_.SetInsertPoint(accEndBB);
+        // fix #2568: release the producer's +1 the static setter's body
+        // doubled via its field store. A static property's `ps->parent` is its
+        // declaring type (a class for `static` properties on a class), so
+        // classOwned already disambiguates class-vs-record for the static
+        // path. Records cannot have static properties per §10.5 anyway, so
+        // the gate is conservative-on-leak, correct-on-UAF.
+        if (classOwned) emitProducerRelease();
         return true;
     }
     // fix #2498 (§9.2/§9.4/§23, v0.236): mirrors lowerImportedPropertySetValue's
@@ -4017,6 +4099,11 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
     if (!term) builder_.CreateBr(accEndBB);
     builder_.SetInsertPoint(accEndBB);
     currentThis_ = savedThis;
+    // fix #2568 (§23.3/§28.9/§4.6, v0.236): the INSTANCE-PATH twin of the
+    // static-path emitProducerRelease above. Same gate (classOwned) for the
+    // same record-UAF reason. See the long comment above the static branch
+    // for the full rationale and LSan reproduction.
+    if (classOwned) emitProducerRelease();
     return true;
 }
 
@@ -4268,7 +4355,20 @@ bool Emitter::lowerPropertyCompound(const ast::AssignmentStmt& as) {
         isUnsignedTargetExpr(*as.target),
         isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
         isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
-    return res ? lowerPropertySetValue(*as.target, res) : false;
+    // fix #2568: thread as.value through as valueExpr so the setter's emit
+    // release can fire on a +1 producer RHS. The compound-path analogue of
+    // lowerIndexerCompound's #2567 release: `res` is a freshly-minted string
+    // from emitStringConcat (a +1 producer itself), the setter's body
+    // retains it via the field store, the producer's +1 needs caller-side
+    // release. `valueExpr = as.value` so isPlusOneStringProducer matches the
+    // AST shape — for `s.Name += "abc" + i.ToString()`, `as.value` is the
+    // BinaryExpr concat, which IS a +1 producer — and emitStringRelease(v)
+    // drops `res`'s +1. The `rhs` of the `+=` itself (lowered at line 4349
+    // but not consumed by emitStringConcat — sibling defect to the indexer
+    // compound case's rhs-leak, which is filed as #2568-B) is left untouched
+    // here; this commit fixes only the `res`/setter-body leak that mirrors
+    // lowerIndexerCompound's inline emitProducerRelease.
+    return res ? lowerPropertySetValue(*as.target, res, as.value.get()) : false;
 }
 
 

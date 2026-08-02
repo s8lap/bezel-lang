@@ -3815,7 +3815,15 @@ private:
     // `v` (the `value` parameter). Shared by the plain `obj.P := …` path and
     // the compound-assignment read-modify-write path. Returns false when
     // `target` is not a block-setter property.
-    bool lowerPropertySetValue(const ast::Expr& target, llvm::Value* v);
+    //
+    // fix #2568 (§23.3/§28.9, v0.236): `valueExpr` (default nullptr for the
+    // `ref`/`out` write-back call site and the increment-stmt call site that
+    // have no original source expression) is the source ast::Expr `v` was
+    // lowered from — see lowerVirtualPropertySet's comment for why a
+    // caller-side post-call release is needed now that the inlined setter
+    // body mints its own +1 on the class path.
+    bool lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
+                               const ast::Expr* valueExpr = nullptr);
 
     // fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): a DIRECT
     // (non-itable, non-virtual) cross-module property SET — `importedObj.Prop
