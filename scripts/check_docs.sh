@@ -40,6 +40,9 @@ DOCS = {
     'guide01':   'docs/Bezel_Guide_01_Memory_and_Ownership.md',
     'guide02':   'docs/Bezel_Guide_02_Errors_and_Nullability.md',
     'guide03':   'docs/Bezel_Guide_03_Modeling_Data.md',
+    'guide04':   'docs/Bezel_Guide_04_Concurrency.md',
+    'guide05':   'docs/Bezel_Guide_05_Collections_and_Iteration.md',
+    'guide06':   'docs/Bezel_Guide_06_Contracts_and_Purity.md',
 }
 text = {}
 for k, p in DOCS.items():

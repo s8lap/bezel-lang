@@ -1,6 +1,6 @@
 # The spec-change process
 
-*Supporting record (not a numbered proposal). Written 2026-07-11, distilled from the two whole-language review runs (2026-07-07 → v0.183, 2026-07-11 → v0.184) that produced most of the spec's recent revisions. This document formalizes **how** the six normative documents in `docs/` change: the classes of change, the gate each class must pass, the artifacts each leaves behind, and the tooling. It is meta-process — it does not itself change the language.*
+*Supporting record (not a numbered proposal). Written 2026-07-11, distilled from the two whole-language review runs (2026-07-07 → v0.183, 2026-07-11 → v0.184) that produced most of the spec's recent revisions. This document formalizes **how** the normative documents in `docs/` change: the classes of change, the gate each class must pass, the artifacts each leaves behind, and the tooling. It is meta-process — it does not itself change the language.*
 
 Status: proposed (owner review). The rules below describe what the last two runs did *plus* the improvements this document introduces (the change-class gates, the composition gate, the one-command validation, the review queue). Where the runs already worked this way, the doc records the practice; where it improves on it, the improvement is marked **NEW**.
 
@@ -17,9 +17,9 @@ The governing principle is unchanged from `CLAUDE.md`: **the spec is the source 
 
 ---
 
-## 1. The seven documents and what "changing the spec" means
+## 1. The ten documents and what "changing the spec" means
 
-The normative language is exactly the seven documents in `docs/`:
+The normative language is exactly the ten documents in `docs/`:
 
 | Document | Role | Carries the revision number? |
 |---|---|---|
@@ -30,6 +30,9 @@ The normative language is exactly the seven documents in `docs/`:
 | `Bezel_Guide_01_Memory_and_Ownership.md` | example-first idiom guide | no (revalidation pin only) |
 | `Bezel_Guide_02_Errors_and_Nullability.md` | example-first idiom guide | no (revalidation pin only) |
 | `Bezel_Guide_03_Modeling_Data.md` | example-first idiom guide | no (revalidation pin only) |
+| `Bezel_Guide_04_Concurrency.md` | example-first idiom guide | no (revalidation pin only) |
+| `Bezel_Guide_05_Collections_and_Iteration.md` | example-first idiom guide | no (revalidation pin only) |
+| `Bezel_Guide_06_Contracts_and_Purity.md` | example-first idiom guide | no (revalidation pin only) |
 
 `docs/proposals/` is **not** normative. A proposal is a design under consideration; it becomes normative only by *graduating* — being amended into the normative documents through this process, at which point the proposal file's `Status` flips to `superseded` with a pointer to the landed revision.
 
