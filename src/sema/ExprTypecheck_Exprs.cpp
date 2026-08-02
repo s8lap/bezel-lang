@@ -6013,13 +6013,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                 // return (a procedure lambda / all-bare-returns body).
                 if (!inferredReturn)
                     inferredReturn = ctx_.primitiveTypeRef(PrimitiveType::Int);
-                // §27.3 (v0.226, #2107): the divergent-return error fires only
-                // when the lambda has NEITHER a return-type ascription NOR a
-                // target return type (lamTargetRet), AND the body has ≥2 value
-                // returns whose types are not all the SAME type. The programmer
-                // states the intended type instead — a target type, a return-
-                // type ascription, or an ascribed variable type.
-                if (!hasAscription && lamTargetRet == nullptr &&
+                // §27.3 (v0.236, #2267): suppress the divergent-return
+                // inference error only when the target return slot is also the
+                // active declared return context and the two agree. Merely
+                // threading lamTargetRet does not check each return against it:
+                // without a lambda return-type ascription currentReturnType_ is
+                // null and ReturnStmt remains in its inference posture.
+                const bool returnsCheckedAgainstTarget =
+                    lamTargetRet != nullptr && currentReturnType_ != nullptr &&
+                    functionSlotTypeRefEqual(lamTargetRet, currentReturnType_);
+                if (!hasAscription && !returnsCheckedAgainstTarget &&
                     returnTypes.size() >= 2) {
                     TypeRef* first = returnTypes.front();
                     bool divergent = false;
