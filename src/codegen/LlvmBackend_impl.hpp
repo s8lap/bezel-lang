@@ -9746,6 +9746,33 @@ private:
     // §3: instance method calls on Array<T>, Dictionary<K,V>, etc.
     // Called from lowerCall before the normal method-symbol dispatch.
     llvm::Value* tryLowerCollectionInstanceCall(const ast::CallExpr& call);
+
+    // fix #2513 / spec §35.2 (v0.236): the stdlib §2.20 `Result<T, E>` carries
+    // four compiler-provided per-instantiation combinators (Map / MapError /
+    // AndThen / UnwrapOr) — only admissible where the receiver AND result
+    // instantiation are value-like (§35.4 rule 3). These members have NO
+    // MethodSymbol (they are compiler-provided; the prelude body injection that
+    // the previous lane attempted aborts on a choice-shaped return's PHI in
+    // lowerCaseExpr). The dedicated codegen path emits the inline body — a
+    // switch on the Ok/Error discriminator tag + branch-specific bodies — and
+    // returns null when the call is not a Result combinator (the regular
+    // method-symbol dispatch then runs unchanged).
+    llvm::Value* tryLowerResultCombinatorCall(const ast::CallExpr& call);
+
+    // fix #2513 helper: invoke the function-typed expression `arg` (a lambda
+    // or function parameter) with the single payload value `val`. Mirrors
+    // lowerCall's closure-call arm's fn-ptr / env-ptr / retTy derivation.
+    llvm::Value* invokeClosureOnValue(const ast::Expr& arg, llvm::Value* val,
+                                      llvm::Type* valLL,
+                                      const sema::TypeRef* retSemTy);
+    // fix #2513 helper: build a choice struct value { i32 tag, ok_payload,
+    // err_payload } with the active case's payload filled from `okPayload`
+    // or `errPayload`. Inactive slots stay undef (per §35.4 choice values
+    // carry no per-slot moved-from state). Used by every combinator branch.
+    llvm::Value* buildChoiceStructValue(const sema::TypeSymbol* choiceTy,
+                                        unsigned activeTag,
+                                        llvm::Value* okPayload,
+                                        llvm::Value* errPayload);
     // per §4.6/§4.7: lower LinkedList<T>/OwningLinkedList<T> instance calls
     // (Add*/Remove*/Find/Count/First/Last/etc.) and LinkedListNode<T> property
     // accesses (.Value/.Next/.Previous) via the bz_llist_* runtime.

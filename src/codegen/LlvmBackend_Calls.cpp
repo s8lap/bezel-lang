@@ -5947,6 +5947,286 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
 }
 
 
+// fix #2513 / spec §35.2 (v0.236): the stdlib §2.20 `Result<T, E>` carries four
+// compiler-provided per-instantiation combinators — `Map`, `MapError`,
+// `AndThen`, `UnwrapOr`. They have NO MethodSymbol (the prelude body injection
+// #2541's previous-lane attempt tried aborts with an LLVM PHI type assertion in
+// lowerCaseExpr on a choice-shaped return). Sema already typed the call with
+// the result instantiation's TypeRef (ExprTypecheck_Calls.cpp ~line 7412), so
+// the result type is known here; the dedicated path emits the inline body — a
+// switch on the choice discriminator tag + branch-specific bodies — and
+// returns null when the call is not a Result combinator, so the regular
+// method-symbol dispatch runs unchanged.
+//
+// ADMISSIBILITY (sema has already rejected non-value-like receivers and
+// non-value-like results per §35.4 rule 3, so by the time we get here both
+// receiver and result instantiations ARE value-like). The body is:
+//   * Map(f):    Ok(v)  -> Ok(f(v));     Error(e) -> Error(e)
+//   * MapError:  Ok(v)  -> Ok(v);        Error(e) -> Error(f(e))
+//   * AndThen:   Ok(v)  -> f(v);         Error(e) -> Error(e)
+//   * UnwrapOr:  Ok(v)  -> v;            Error(_) -> fallback
+// Every combinator is total — no fault path. Function parameters are
+// call-bounded (§28.14), so f is invoked now and never retained. Each call's
+// `f` is lowered via the function-typed argument's exprType (a Function
+// TypeRef), reusing the same fn/env/fnPtr-load pattern lowerCall's closure-
+// call arm uses; the lambda parameter binds the receiver's case payload.
+//
+// Returns nullptr when the call is not a Result combinator (lets the regular
+// dispatch handle it). Always lowers the receiver and arguments when
+// returning non-null — the dispatch returns the result value the caller
+// expects.
+llvm::Value* Emitter::tryLowerResultCombinatorCall(const ast::CallExpr& call) {
+    if (!call.callee) return nullptr;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return nullptr;
+    const std::string_view m = ma->member;
+    if (m != "Map" && m != "MapError" && m != "AndThen" && m != "UnwrapOr") {
+        return nullptr;
+    }
+    const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != sema::TypeRef::Kind::Named ||
+        !recvTy->declaration ||
+        recvTy->declaration->kind != ast::TypeDeclKind::Choice ||
+        recvTy->declaration->name != "Result" ||
+        recvTy->genericArgs.size() != 2) {
+        return nullptr;
+    }
+    if (call.args.size() != 1 || !call.args[0].value) {
+        // Sema rejected arity mismatches; defensive only.
+        return nullptr;
+    }
+    // The receiver choice struct type (specialized per-instantiation via the
+    // active substitution — `Result<int, string>` lays Error's payload as
+    // {ptr} for string, {i32} for int, etc., so the slot types match). The
+    // genericSubst_ populated by lowerTypeRef/RecordSubstGuard at the call
+    // site also drives the result struct below.
+    llvm::StructType* recvSt = choiceStruct(recvTy->declaration);
+    // §35.13 / §14.1: a GENERIC choice specializes its payload layout per
+    // instantiation, so the recvSt above is the UNSPECIALIZED template
+    // (`%choice.Result = { i32, { i32 }, { i32 } }` for T=int, E=int). The
+    // receiver value, lowered WITH the receiver's substitution active (a local
+    // `r: Result<int, string>` is built at `var r := ...Ok(5)` with the T/E
+    // substitutions installed), carries the SPECIALIZED layout
+    // (`%choice.Result$spec0 = { i32, { i32 }, { ptr } }` for E=string). Install
+    // the receiver's substitution so choiceStruct returns the specialized
+    // struct the receiver's value actually has, AND so the element-type
+    // derivations below (tLL/eLL) line up with the payload structs. Save and
+    // restore mirrors the rest of codegen's per-call substitution convention.
+    auto savedRecvSubst =
+        setupReceiverGenericSubst(ma->target.get(), recvTy->declaration);
+    llvm::StructType* recvStSpec = choiceStruct(recvTy->declaration);
+    genericSubst_ = savedRecvSubst;
+    if (recvStSpec) recvSt = recvStSpec;
+    // Lower the receiver expression. A local/parameter receiver lowers to a
+    // pointer (the spilled struct slot); a fresh construction or match
+    // scrutinee lowers to a struct value. Normalize to a struct value.
+    llvm::Value* recvPtrOrVal = lowerExpr(*ma->target);
+    if (!recvPtrOrVal) return nullptr;
+    llvm::Value* recvVal = recvPtrOrVal;
+    if (recvPtrOrVal->getType()->isPointerTy()) {
+        // Pointer → struct value load (the spilled slot is exactly recvSt).
+        recvVal = builder_.CreateLoad(recvSt, recvPtrOrVal, "rescomb.recv");
+    } else if (recvPtrOrVal->getType() != recvSt) {
+        // Unexpected type (e.g. ptr-to-struct or unrelated). Bail.
+        return nullptr;
+    }
+    // Read the discriminator tag at slot 0 (i32) and split on Ok/Error.
+    // Result's cases are declared Ok then Error, so OkTag == 0, ErrorTag == 1.
+    llvm::Value* tag = builder_.CreateExtractValue(recvVal, {0}, "rescomb.tag");
+    // Index 1 = Ok payload slot, 2 = Error payload slot.
+    llvm::Value* okPldStruct = builder_.CreateExtractValue(
+        recvVal, {1}, "rescomb.ok.pld");
+    llvm::Value* errPldStruct = builder_.CreateExtractValue(
+        recvVal, {2}, "rescomb.err.pld");
+    // Per-instantiation payload element types — for `Result<int, string>` the
+    // Ok payload struct is {i32} and the Error payload struct is {ptr}, so
+    // the elements are lowerTypeRef(recvTy->genericArgs[0|1]).
+    const sema::TypeRef* tArg = recvTy->genericArgs[0];
+    const sema::TypeRef* eArg = recvTy->genericArgs[1];
+    llvm::Type* tLL = lowerTypeRef(tArg);
+    llvm::Type* eLL = lowerTypeRef(eArg);
+    llvm::Value* v = builder_.CreateExtractValue(
+        okPldStruct, {0}, "rescomb.v");    // Ok(value: T)
+    llvm::Value* e = builder_.CreateExtractValue(
+        errPldStruct, {0}, "rescomb.e");  // Error(error: E)
+    // Decide the result type. For Map/AndThen the result is Result<U, E>;
+    // for MapError it is Result<T, F>; for UnwrapOr it is T. sema already
+    // set call.exprType to that instantiation's TypeRef, so use it.
+    const sema::TypeRef* resultSemTy = ctx_.exprType(call);
+    if (!resultSemTy) return nullptr;
+    // MapError's result is a different choice layout than the receiver (the
+    // Ok payload T is the same, but the Error payload type changes from E to
+    // F). Map / AndThen / UnwrapOr keep the same shape as the receiver (for
+    // Map / AndThen, only the Ok payload type changes from T to U — same
+    // struct {i32, Ok_payload, Error_payload} with the Ok slot's ELEMENT
+    // type swapped; choiceStruct keying on field types produces a distinct
+    // specialized struct per §14.1).
+    llvm::StructType* resultSt = nullptr;
+    // §35.13 / §14.1: the result choice also specializes per instantiation
+    // — for `Map(f: int->long)` on `Result<int, string>` the result is
+    // `Result<long, string>` which lays Error's payload as {ptr} (string)
+    // and Ok's payload as {i64} (long). Install the result TypeRef's
+    // substitution so the result choiceStruct AND every buildChoiceStructValue
+    // call (which reads genericSubst_ to materialize the payload struct type)
+    // return the specialized struct — not the unspecialized template.
+    RecordSubstGuard resultSubst(this, m == "UnwrapOr" ? nullptr : resultSemTy);
+    if (m != "UnwrapOr") {
+        resultSt = choiceStruct(resultSemTy->declaration);
+    }
+    // Build the dispatch. For Map/MapError/AndThen: tag-switch with Ok and
+    // Error branches building a Result<…> choice struct; for UnwrapOr: tag-
+    // switch returning either v or the fallback arg's value.
+    auto* okBB  = llvm::BasicBlock::Create(llvm_, "rescomb.ok",  currentFn_);
+    auto* errBB = llvm::BasicBlock::Create(llvm_, "rescomb.err", currentFn_);
+    auto* endBB = llvm::BasicBlock::Create(llvm_, "rescomb.end", currentFn_);
+    llvm::Value* isOk = builder_.CreateICmpEQ(
+        tag, llvm::ConstantInt::get(i32(), 0), "rescomb.isok");
+    builder_.CreateCondBr(isOk, okBB, errBB);
+    // --- Ok branch ---
+    builder_.SetInsertPoint(okBB);
+    llvm::Value* okResult = nullptr;
+    if (m == "Map") {
+        // Ok(f(v))
+        llvm::Value* mapped = invokeClosureOnValue(
+            *call.args[0].value, v, tLL,
+            resultSemTy->genericArgs[0]);  // U
+        okResult = buildChoiceStructValue(
+            resultSemTy->declaration, /*okTag=*/0,
+            /*okPayload=*/mapped,
+            /*errPayload=*/llvm::UndefValue::get(eLL));
+    } else if (m == "MapError") {
+        // Ok(v) — pass through unchanged.
+        okResult = buildChoiceStructValue(
+            resultSemTy->declaration, /*okTag=*/0,
+            /*okPayload=*/v,
+            /*errPayload=*/llvm::UndefValue::get(
+                lowerTypeRef(resultSemTy->genericArgs[1])));
+    } else if (m == "AndThen") {
+        // f(v) is itself a Result<U, E> (the lambda's return type). Invoke
+        // the closure with v as the parameter; the closure returns the
+        // Result<U, E> struct directly (lambda is plain `(T) -> Result<U, E>`,
+        // so the closure's funcReturn is the choice struct — pass that as the
+        // retSemTy to invokeClosureOnValue so the right FunctionType is built).
+        okResult = invokeClosureOnValue(
+            *call.args[0].value, v, tLL, resultSemTy);
+    } else {  // UnwrapOr
+        okResult = v;
+    }
+    if (m == "UnwrapOr") {
+        builder_.CreateBr(endBB);
+    } else {
+        builder_.CreateBr(endBB);
+    }
+    auto* okEnd = builder_.GetInsertBlock();
+    // --- Error branch ---
+    builder_.SetInsertPoint(errBB);
+    llvm::Value* errResult = nullptr;
+    if (m == "Map") {
+        // Error(e) — pass through unchanged.
+        errResult = buildChoiceStructValue(
+            resultSemTy->declaration, /*errTag=*/1,
+            /*okPayload=*/llvm::UndefValue::get(
+                lowerTypeRef(resultSemTy->genericArgs[0])),
+            /*errPayload=*/e);
+    } else if (m == "MapError") {
+        // Error(f(e))
+        llvm::Value* mapped = invokeClosureOnValue(
+            *call.args[0].value, e, eLL,
+            resultSemTy->genericArgs[1]);  // F
+        errResult = buildChoiceStructValue(
+            resultSemTy->declaration, /*errTag=*/1,
+            /*okPayload=*/llvm::UndefValue::get(tLL),
+            /*errPayload=*/mapped);
+    } else if (m == "AndThen") {
+        // Error(e) — pass through.
+        errResult = buildChoiceStructValue(
+            resultSemTy->declaration, /*errTag=*/1,
+            /*okPayload=*/llvm::UndefValue::get(
+                lowerTypeRef(resultSemTy->genericArgs[0])),
+            /*errPayload=*/e);
+    } else {  // UnwrapOr
+        // Evaluate the eagerly-supplied fallback argument (spec §35.2: no
+        // lazy UnwrapOrElse) and return its value.
+        llvm::Value* fb = lowerExpr(*call.args[0].value);
+        if (!fb) return nullptr;
+        errResult = fb;
+    }
+    builder_.CreateBr(endBB);
+    auto* errEnd = builder_.GetInsertBlock();
+    // --- Merge ---
+    builder_.SetInsertPoint(endBB);
+    if (m == "UnwrapOr") {
+        auto* phi = builder_.CreatePHI(tLL, 2, "rescomb.unwraphi");
+        phi->addIncoming(okResult, okEnd);
+        phi->addIncoming(errResult, errEnd);
+        return phi;
+    }
+    auto* phi = builder_.CreatePHI(resultSt, 2, "rescomb.phi");
+    phi->addIncoming(okResult, okEnd);
+    phi->addIncoming(errResult, errEnd);
+    return phi;
+}
+
+// fix #2513 helper: invoke the function-typed expression `arg` with the
+// single payload value `val` (LLVM type `valLL`), expecting the function's
+// return type to be `retSemTy`. Mirrors lowerCall's closure-call arm's
+// fn-ptr + env-ptr + retTy derivation.
+llvm::Value* Emitter::invokeClosureOnValue(
+        const ast::Expr& arg,
+        llvm::Value* val,
+        llvm::Type* valLL,
+        const sema::TypeRef* retSemTy) {
+    const sema::TypeRef* ft = ctx_.exprType(arg);
+    if (!ft || ft->kind != sema::TypeRef::Kind::Function) return nullptr;
+    llvm::Value* closurePtr = lowerExpr(arg);
+    if (!closurePtr || !closurePtr->getType()->isPointerTy()) return nullptr;
+    llvm::Value* fnPtr = builder_.CreateLoad(ptrTy(), closurePtr);
+    llvm::Value* envSlot = builder_.CreateGEP(
+        ptrTy(), closurePtr, {builder_.getInt32(1)});
+    llvm::Value* envPtr = builder_.CreateLoad(ptrTy(), envSlot);
+    llvm::Type* retLL = lowerTypeRef(retSemTy);
+    auto* fnTy = llvm::FunctionType::get(
+        retLL, {ptrTy(), valLL}, false);
+    llvm::Value* ret = builder_.CreateCall(
+        fnTy, fnPtr, {envPtr, val}, "rescomb.fcall");
+    return ret;
+}
+
+// fix #2513 helper: build a `Result<...>` choice struct value { i32 tag,
+// Ok_payload_struct, Error_payload_struct } with the active case's payload
+// filled and the other slot's element value left undefined (the inactive
+// payload struct's tag slot is never read; choice values carry no per-slot
+// moved-from state per §35.4). Used by every combinator's branch bodies.
+llvm::Value* Emitter::buildChoiceStructValue(
+        const sema::TypeSymbol* choiceTy,
+        unsigned activeTag,
+        llvm::Value* okPayload,
+        llvm::Value* errPayload) {
+    llvm::StructType* st = choiceStruct(choiceTy);
+    llvm::Value* whole = llvm::UndefValue::get(st);
+    whole = builder_.CreateInsertValue(
+        whole, llvm::ConstantInt::get(i32(), activeTag), {0});
+    // Active case: wrap the element value into its payload struct {T} and
+    // insert into the case's struct slot.
+    llvm::Type* payloadStructTy = st->getElementType(1 + activeTag);
+    llvm::Value* activePldStruct = llvm::UndefValue::get(payloadStructTy);
+    if (auto* pldStruct = llvm::dyn_cast<llvm::StructType>(payloadStructTy)) {
+        if (pldStruct->getNumElements() >= 1) {
+            activePldStruct = builder_.CreateInsertValue(
+                activePldStruct, (activeTag == 0 ? okPayload : errPayload),
+                {0});
+        }
+    } else {
+        // Payload struct is itself a single-element wrapper for non-record
+        // payloads; emit the value directly.
+        activePldStruct = (activeTag == 0 ? okPayload : errPayload);
+    }
+    whole = builder_.CreateInsertValue(
+        whole, activePldStruct, {1 + activeTag});
+    return whole;
+}
+
+
 llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());

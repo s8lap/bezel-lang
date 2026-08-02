@@ -9,6 +9,91 @@
 
 namespace bezel::sema {
 
+namespace {
+
+// fix #2513 / spec §35.2 (v0.236): a short, allocation-free TypeRef -> string
+// for the `Result` combinator diagnostics. The full typeRefToString lives in
+// support/, but pulling it in would entangle the TU; for these messages a
+// `head[args]` rendering matches what the user wrote, and an "unresolved" /
+// "fn ..." fallback is enough for everything else the diagnostic encounters.
+const char* primitiveSpellingForDiag(PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::Bool:    return "bool";
+        case P::Char:    return "char";
+        case P::String:  return "string";
+        case P::Byte:    return "byte";
+        case P::SByte:   return "sbyte";
+        case P::Short:   return "short";
+        case P::UShort:  return "ushort";
+        case P::Int:     return "int";
+        case P::UInt:    return "uint";
+        case P::Long:    return "long";
+        case P::ULong:   return "ulong";
+        case P::Float:   return "float";
+        case P::Double:  return "double";
+        case P::Decimal: return "decimal";
+        case P::Object:  return "Object";
+        case P::None:    return "<none>";
+    }
+    return "<unknown>";
+}
+
+std::string typeNameForDiag(const TypeRef* t) {
+    if (!t) return "<unresolved>";
+    std::string s;
+    if (t->nullable) s += "?";
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive:
+            s += primitiveSpellingForDiag(t->primitive);
+            break;
+        case TypeRef::Kind::Function:
+            s += "(fn ...)";
+            break;
+        case TypeRef::Kind::InlineArray:
+            s += "[N";
+            if (t->arrayOwned) s += " owned";
+            s += "]";
+            if (t->arrayElement) s += typeNameForDiag(t->arrayElement);
+            break;
+        case TypeRef::Kind::Unit:
+            s += "()";
+            break;
+        case TypeRef::Kind::Named: {
+            std::string_view nm;
+            if (t->declaration && !t->declaration->decl)
+                nm = t->declaration->name;
+            else if (!t->declaration && t->astNode && t->astNode->name &&
+                     !t->astNode->name->parts.empty())
+                nm = t->headName();
+            else if (t->declaration)
+                nm = t->declaration->name;
+            s.append(nm.data(), nm.size());
+            if (!t->genericArgs.empty()) {
+                s += "<";
+                for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                    if (i) s += ", ";
+                    s += typeNameForDiag(t->genericArgs[i]);
+                }
+                s += ">";
+            }
+            break;
+        }
+    }
+    return s;
+}
+
+const char* classificationName(common::ChoiceClassification c) {
+    switch (c) {
+        case common::ChoiceClassification::ValueLike:     return "value-like";
+        case common::ChoiceClassification::BorrowBearing: return "borrow-bearing";
+        case common::ChoiceClassification::Owning:        return "owning";
+    }
+    return "unknown";
+}
+
+}  // namespace
+
 // This translation unit holds the call-resolution and member-access
 // definitions of the ExprTC worker: CallExpr return-type / arity checking
 // (typeCall and friends) and the `.` / `?.` member-access resolvers.
@@ -7410,6 +7495,234 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         // EndObject / EndArray / SkipValue / Dispose → unit.
                     }
+
+                    // fix #2513 / spec §35.2 (v0.236): the four stdlib `Result<T,E>`
+                    // compiler-provided per-instantiation combinators (Map /
+                    // MapError / AndThen / UnwrapOr) have no MethodSymbol — they
+                    // are compiler-provided, and sema must type them with the
+                    // result-instantiation shape so codegen's dedicated lowering
+                    // (LlvmBackend_Calls.cpp::tryLowerResultCombinatorCall) can
+                    // build the result's choice struct. The combinators are only
+                    // admissible where the receiver AND result instantiation are
+                    // both value-like (§35.4 rule 3); non-value-like uses are
+                    // rejected here with a §3.6-derived-type-properties rule-2
+                    // diagnostic naming the classification, the deciding payload,
+                    // and the owning-match remedy (§35.5).
+                    if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                            recvTy->declaration &&
+                            recvTy->declaration->kind ==
+                                ast::TypeDeclKind::Choice &&
+                            recvTy->declaration->name == "Result" &&
+                            recvTy->genericArgs.size() == 2 &&
+                            (m == "Map" || m == "MapError" ||
+                             m == "AndThen" || m == "UnwrapOr")) {
+                        // §22.5: all four take exactly one argument. Sema's
+                        // generic-arity gate fires below; this is the
+                        // combinator-specific rejection.
+                        if (ce.args.size() != 1 || !ce.args[0].value) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`Result.") +
+                                std::string(m) +
+                                "` takes exactly one function argument (§35.2)");
+                            return;
+                        }
+                        TypeRef* tArg = recvTy->genericArgs[0];
+                        TypeRef* eArg = recvTy->genericArgs[1];
+                        const TypeRef* fnTy =
+                            m == "UnwrapOr" ? nullptr
+                                             : ctx_.exprType(*ce.args[0].value);
+                        // Per spec §14.5 phase 2, U/F infer from the function
+                        // argument's resolved Function TypeRef's funcReturn.
+                        // A lambda must have been typecheck'd to expose its
+                        // return type; a non-function argument is a type
+                        // error for the three function-typed combinators.
+                        // `UnwrapOr` takes a plain T fallback (eagerly
+                        // evaluated), NOT a function (§35.2 "no lazy
+                        // UnwrapOrElse"), so its argument is type-checked
+                        // against T below.
+                        TypeRef* resultTy = nullptr;
+                        std::string why;
+                        if (m != "UnwrapOr" &&
+                            (!fnTy || fnTy->kind != TypeRef::Kind::Function ||
+                             !fnTy->funcReturn)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`Result.") + std::string(m) +
+                                "` requires a function-typed argument (§35.2)");
+                            return;
+                        } else if (m == "UnwrapOr") {
+                            // §35.2: UnwrapOr(fallback: T): T — fallback is
+                            // an ordinary, eagerly evaluated T. Validate it
+                            // against the receiver's T below.
+                            resultTy = const_cast<TypeRef*>(tArg);
+                            why = std::string("the receiver's T=") +
+                                  typeNameForDiag(tArg);
+                        } else if (m == "Map" || m == "AndThen") {
+                            TypeRef* uArg = fnTy->funcReturn;
+                            // For `AndThen(f)`, the spec requires f: (T) ->
+                            // Result<U, E>, so the lambda's funcReturn IS a
+                            // Result<...> — extract its first generic arg as
+                            // U. For `Map(f)` the spec is f: (T) -> U, so the
+                            // lambda's funcReturn IS U directly. We cannot
+                            // distinguish at type-system level (both produce
+                            // a TypeRef that sema treats uniformly) so we
+                            // probe: if fnTy->funcReturn is a Named Result
+                            // choice with two generic args, treat its first
+                            // arg as U; otherwise treat the funcReturn as U.
+                            if (m == "AndThen" &&
+                                uArg && uArg->kind == TypeRef::Kind::Named &&
+                                uArg->declaration &&
+                                uArg->declaration->kind ==
+                                    ast::TypeDeclKind::Choice &&
+                                uArg->declaration->name == "Result" &&
+                                uArg->genericArgs.size() == 2) {
+                                uArg = uArg->genericArgs[0];
+                            }
+                            // Result<U, E>
+                            resultTy = ctx_.makeTypeRef();
+                            resultTy->kind = TypeRef::Kind::Named;
+                            resultTy->nullable = false;
+                            resultTy->declaration = recvTy->declaration;
+                            resultTy->genericArgs.push_back(uArg);
+                            resultTy->genericArgs.push_back(eArg);
+                            why = std::string("`Result<") +
+                                  "U, E> with U=" +
+                                  typeNameForDiag(uArg) +
+                                  " and E=" + typeNameForDiag(eArg);
+                        } else if (m == "MapError") {
+                            TypeRef* fArg = fnTy->funcReturn;
+                            // Result<T, F>
+                            resultTy = ctx_.makeTypeRef();
+                            resultTy->kind = TypeRef::Kind::Named;
+                            resultTy->nullable = false;
+                            resultTy->declaration = recvTy->declaration;
+                            resultTy->genericArgs.push_back(tArg);
+                            resultTy->genericArgs.push_back(fArg);
+                            why = std::string("`Result<") +
+                                  "T, F> with T=" +
+                                  typeNameForDiag(tArg) +
+                                  " and F=" + typeNameForDiag(fArg);
+                        } else {  // UnwrapOr
+                            // UnwrapOr(fallback: T): T
+                            resultTy = const_cast<TypeRef*>(tArg);
+                            why = std::string("the receiver's T=") +
+                                  typeNameForDiag(tArg);
+                        }
+                        // §35.4 rule 3: receiver AND result must both be
+                        // value-like. The receiver is value-like iff the
+                        // Result<T, E> is itself value-like; the result is
+                        // value-like iff its `Result<...>` (Map/MapError/
+                        // AndThen) classifies value-like, or — for UnwrapOr
+                        // — T is a value type.
+                        auto recvVerdict =
+                            common::classifyChoiceType(recvTy, ctx_);
+                        if (!recvVerdict ||
+                            *recvVerdict !=
+                                common::ChoiceClassification::ValueLike) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`Result.") + std::string(m) +
+                                "` is only admissible on a value-like "
+                                "receiver (§35.2 / §35.4 rule 3); the "
+                                "receiver instantiation `Result<" +
+                                typeNameForDiag(tArg) + ", " +
+                                typeNameForDiag(eArg) +
+                                ">` is " +
+                                (recvVerdict ? classificationName(*recvVerdict)
+                                             : std::string("not value-like")) +
+                                " — use an owning match (§35.5) for owning "
+                                "instantiations or borrow-bounded forms for "
+                                "borrow-bearing ones");
+                            return;
+                        }
+                        if (m != "UnwrapOr") {
+                            auto resVerdict =
+                                common::classifyChoiceType(resultTy, ctx_);
+                            if (!resVerdict ||
+                                *resVerdict !=
+                                    common::ChoiceClassification::ValueLike) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string("`Result.") +
+                                    std::string(m) +
+                                    "` is only admissible when its result "
+                                    "instantiation is value-like (§35.2 / "
+                                    "§35.4 rule 3); " + why +
+                                    " is " +
+                                    (resVerdict
+                                         ? classificationName(*resVerdict)
+                                         : std::string("not value-like")) +
+                                    " — the inference would mint " +
+                                    "a borrow-bearing or owning Result; use "
+                                    "an owning match (§35.5) instead");
+                                return;
+                            }
+                        } else if (m == "UnwrapOr") {
+                            // UnwrapOr is only admissible on a value-like
+                            // T (the receiver's first payload); owning T
+                            // cannot be copied into a fallback slot.
+                            auto tVerdict =
+                                common::classifyChoiceType(tArg, ctx_);
+                            // For a choice T, classify via the verdict; for
+                            // other payload kinds fall through as value-like
+                            // (primitives, records, strings, runtime-managed
+                            // types — all are copyable per §35.4 rule 3
+                            // payload kinds).
+                            bool tOk = true;
+                            if (tVerdict && *tVerdict !=
+                                    common::ChoiceClassification::ValueLike) {
+                                tOk = false;
+                            }
+                            // A class/interface T is also rejected: a
+                            // reference-typed T cannot be passed by value to
+                            // a fallback slot.
+                            if (tArg->kind == TypeRef::Kind::Named &&
+                                tArg->declaration &&
+                                (tArg->declaration->kind ==
+                                    ast::TypeDeclKind::Class ||
+                                 tArg->declaration->kind ==
+                                    ast::TypeDeclKind::Interface)) {
+                                tOk = false;
+                            }
+                            // An owning inline-array T is rejected per
+                            // §15.3 (move-only).
+                            if (tArg->kind == TypeRef::Kind::InlineArray &&
+                                tArg->arrayOwned) {
+                                tOk = false;
+                            }
+                            if (!tOk) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "`Result.UnwrapOr` requires a value-like "
+                                    "T payload (§35.2 / §35.4 rule 3); the "
+                                    "receiver's T=" + typeNameForDiag(tArg) +
+                                    " is move-only / borrow-bearing — use an "
+                                    "owning match (§35.5) for owning "
+                                    "instantiations");
+                                return;
+                            }
+                            // §35.2: the fallback's static type must match
+                            // the receiver's T (both are T values; the
+                            // §5.1 implicit-conversion table handles ordinary
+                            // widening / the T-equals-T identity case). A
+                            // mismatched fallback is a different error than
+                            // the value-like gate above — diagnose it as a
+                            // type mismatch rather than a §35.4 gate.
+                            const TypeRef* fbTy =
+                                ctx_.exprType(*ce.args[0].value);
+                            if (fbTy && !typeRefEqual(fbTy, tArg)) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "`Result.UnwrapOr` fallback must match "
+                                    "the receiver's T (§22.6); got `" +
+                                    typeNameForDiag(fbTy) + "`, expected `" +
+                                    typeNameForDiag(tArg) + "`");
+                                return;
+                            }
+                        }
+                        ctx_.setExprType(&ce, resultTy);
+                    }
                 }
 
                 // §30.14 (#600): Domain.Spawn — static class, colName == "Domain".
@@ -13851,6 +14164,44 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
     }
     if (!member) {
+        // fix #2513 / spec §35.2 (v0.236): stdlib `Result<T, E>` carries four
+        // COMPILER-PROVIDED per-instantiation combinators (Map / MapError /
+        // AndThen / UnwrapOr). They have no MethodSymbol — the prelude's
+        // member list holds only IsOk/IsError — so `lookupMember` returns
+        // null. Without an exemption here, the "no member" reject at the
+        // bottom of `resolveMemberAccess` would fire BEFORE `typeCall` could
+        // type the call (typeCall's combinator branch sets the call's
+        // exprType with the result instantiation per §14.5 phase 2 + §35.2).
+        // The combinator IS admissible (sema will validate the receiver /
+        // result classification and arity in `typeCall`'s combinator branch
+        // and reject there on §35.4 rule 3) — so we set a Function-typed
+        // placeholder on the MemberAccessExpr to keep the call alive AND
+        // exempt this access from the "no member" reject, then `typeCall`
+        // finishes the work.
+        bool isResultCombinator = false;
+        if (targetType->kind == ast::TypeDeclKind::Choice &&
+                targetType->name == "Result") {
+            const auto& cm = ma.member;
+            if (cm == "Map" || cm == "MapError" || cm == "AndThen" ||
+                cm == "UnwrapOr") {
+                isResultCombinator = true;
+            }
+        }
+        if (isResultCombinator) {
+            // Do NOT stamp a Function TypeRef on the MemberAccessExpr: the
+            // function-call argument gate at typeCall ~line 2819 consults
+            // ctx_.exprType(*ce.callee) (the MemberAccessExpr) and, when it
+            // sees a Function TypeRef, runs checkAssignable on every
+            // argument against the placeholder's parameter type — which
+            // would reject the lambda (Function -> Unit) with "the argument
+            // 1 ... has a type that is not implicitly convertible" before
+            // our combinator branch in typeCall can fire. typeCall's
+            // combinator branch re-stamps the CallExpr with the result
+            // instantiation per §14.5 phase 2 + §35.2 and rejects on
+            // §35.4 rule 3 / arity mismatches — so the only job here is to
+            // exempt this access from the "no member" reject below.
+            return;
+        }
         // #2517 (§9.2, §35.7): the §9.2 record use-site gate and §35.7 choice
         // use-site gate for direct `.Equals(...)` / `.GetHashCode()` calls fire
         // HERE, BEFORE the null-decl (`!targetType->decl`) builtin-class branch

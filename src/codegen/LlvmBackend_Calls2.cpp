@@ -3196,6 +3196,14 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         }
     }
     // §3: stdlib collection instance methods: arr.Add, arr.Get, dict.TryGetValue, etc.
+    // fix #2513 / spec §35.2 (v0.236): the stdlib §2.20 `Result<T, E>`
+    // compiler-provided combinators (Map/MapError/AndThen/UnwrapOr) are
+    // dispatched before the method-symbol path: they have NO MethodSymbol,
+    // and the previous-lane prelude-body injection attempt aborts on the
+    // choice-shaped return's PHI in lowerCaseExpr. tryLowerResultCombinator
+    // emits the inline body and returns null for non-Result combinators, so
+    // the regular dispatch runs unchanged for everything else.
+    if (auto* v = tryLowerResultCombinatorCall(call)) return v;
     if (auto* v = tryLowerCollectionInstanceCall(call)) return v;
     // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
     if (auto* v = tryLowerEncodingCall(call)) return v;
