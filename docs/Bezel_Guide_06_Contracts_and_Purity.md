@@ -89,7 +89,7 @@ public method TryListen(rawPort: string): bool
 end TryListen;
 ```
 
-When no caller will branch — the consumer above is a *supervision boundary*, a catch site that logs, retries, or converts failures into protocol answers — the sanctioned signal is a typed exception (Guide 2 §4; the failure-signal rule's band 4, stdlib §1). It is still never a caller bug: the input remains an expected outcome, and only the signal changes. Here the plain name keeps its plain contract — `Listen` returns having bound, or it throws:
+When no caller will branch — the consumer sits above the method, at a *supervision boundary*: a catch site that logs, retries, or converts failures into protocol answers — the sanctioned signal is a typed exception (Guide 2 §4; the failure-signal rule's band 4, stdlib §1). It is still never a caller bug: the input remains an expected outcome, and only the signal changes from the misclassified `requires`. Here the plain name keeps its plain contract — `Listen` returns having bound, or it throws:
 
 ```bezel
 public method Listen(rawPort: string)
