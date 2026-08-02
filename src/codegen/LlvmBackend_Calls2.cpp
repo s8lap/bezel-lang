@@ -8280,6 +8280,11 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     bool savedDiverged = diverged_;
     auto savedLoop = loopStack_;
     auto savedDispose = disposeStack_;
+    // #2281 / §31.2: a lazy specialization is a separate function. Clear its
+    // finally state, but preserve the caller's active try/finally frames across
+    // this emitter re-entry; finallyBodyStack_ stays depth-aligned per §29.7.
+    auto savedFinally = finallyStack_;
+    auto savedFinBodies = finallyBodyStack_;
     llvm::Function* savedFn = currentFn_;
     // fix #1483 / §28.3: registerUnwindOwnedParam (and the sibling unwind-local
     // registration sites) gate on `currentFn_ == unwindIneligibleFn_`, consulting
@@ -8450,7 +8455,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     currentCaughtExc_ = nullptr;
     unwindScopeDepth_ = 0;
     diverged_ = false;
-    loopStack_.clear(); finallyStack_.clear();
+    loopStack_.clear(); finallyStack_.clear(); finallyBodyStack_.clear();
     disposeStack_.clear();
 
     // fix #1483 / §28.3: populate unwindIneligible_ for THIS specialized
@@ -8542,6 +8547,8 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     diverged_ = savedDiverged;
     loopStack_ = std::move(savedLoop);
     disposeStack_ = std::move(savedDispose);
+    finallyStack_ = std::move(savedFinally);          // #2281 / §31.2
+    finallyBodyStack_ = std::move(savedFinBodies);    // #2281 / §29.7
     unwindIneligible_ = std::move(savedUnwindIneligible);  // fix #1483
     unwindIneligibleFn_ = savedUnwindIneligibleFn;          // fix #1483
     currentReturnTypeNode_ = savedRetNode;

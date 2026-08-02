@@ -2752,6 +2752,11 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     auto savedRefParams = refParams_;
     auto savedDisposeStack = disposeStack_;
     auto savedLoopStack = loopStack_;
+    // #2281 / §31.2: the method thunk is a separate function. Preserve the
+    // caller's active try/finally frames across this nested emission; keep the
+    // parallel finally-body stack depth-aligned per §29.7.
+    auto savedFinallyStack = finallyStack_;
+    auto savedFinallyBodies = finallyBodyStack_;
     llvm::BasicBlock* savedUnwind = unwindTarget_;
     llvm::BasicBlock* savedProp = propagateBB_;
     llvm::Value* savedCaught = currentCaughtExc_;
@@ -2762,6 +2767,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     currentThis_ = nullptr;
     locals_.clear(); paramSlots_.clear(); refParams_.clear();
     disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+    finallyBodyStack_.clear();
     unwindTarget_ = nullptr; propagateBB_ = nullptr;
     currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
     builder_.SetInsertPoint(
@@ -2887,6 +2893,8 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
     loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);          // #2281 / §31.2
+    finallyBodyStack_ = std::move(savedFinallyBodies);     // #2281 / §29.7
     unwindTarget_ = savedUnwind; propagateBB_ = savedProp;
     currentCaughtExc_ = savedCaught; unwindScopeDepth_ = savedUnwindDepth;
     diverged_ = savedDiverged;
@@ -3177,6 +3185,11 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     auto savedRefParams = refParams_;
     auto savedDisposeStack = disposeStack_;
     auto savedLoopStack = loopStack_;
+    // #2281 / §31.2: the property thunk is a separate function. Preserve the
+    // caller's active try/finally frames across this nested emission; keep the
+    // parallel finally-body stack depth-aligned per §29.7.
+    auto savedFinallyStack = finallyStack_;
+    auto savedFinallyBodies = finallyBodyStack_;
     llvm::BasicBlock* savedUnwind = unwindTarget_;
     llvm::BasicBlock* savedProp = propagateBB_;
     llvm::Value* savedCaught = currentCaughtExc_;
@@ -3189,6 +3202,7 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     currentThis_ = nullptr;
     locals_.clear(); paramSlots_.clear(); refParams_.clear();
     disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+    finallyBodyStack_.clear();
     unwindTarget_ = nullptr; propagateBB_ = nullptr;
     currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", thunk));
@@ -3418,6 +3432,8 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
     loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);          // #2281 / §31.2
+    finallyBodyStack_ = std::move(savedFinallyBodies);     // #2281 / §29.7
     unwindTarget_ = savedUnwind; propagateBB_ = savedProp;
     currentCaughtExc_ = savedCaught; unwindScopeDepth_ = savedUnwindDepth;
     diverged_ = savedDiverged;

@@ -3066,6 +3066,11 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     auto  savedRef       = refParams_;
     auto  savedDispose   = disposeStack_;
     auto  savedLoop      = loopStack_;
+    // #2281 / §31.2: an accessor is a separate function. Preserve the caller's
+    // active try/finally frames across this nested emission; keep the parallel
+    // finally-body stack depth-aligned per §29.7.
+    auto  savedFinally   = finallyStack_;
+    auto  savedFinBodies = finallyBodyStack_;
     auto* savedUnwind    = unwindTarget_;
     auto* savedProp      = propagateBB_;
     auto* savedCaught    = currentCaughtExc_;
@@ -3087,7 +3092,7 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     paramSlots_.clear();
     refParams_.clear();
     disposeStack_.clear();
-    loopStack_.clear(); finallyStack_.clear();
+    loopStack_.clear(); finallyStack_.clear(); finallyBodyStack_.clear();
     unwindTarget_       = nullptr;
     propagateBB_        = nullptr;
     currentCaughtExc_   = nullptr;
@@ -3331,6 +3336,8 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     refParams_          = std::move(savedRef);
     disposeStack_       = std::move(savedDispose);
     loopStack_          = std::move(savedLoop);
+    finallyStack_       = std::move(savedFinally);      // #2281 / §31.2
+    finallyBodyStack_   = std::move(savedFinBodies);    // #2281 / §29.7
     unwindTarget_       = savedUnwind;
     propagateBB_        = savedProp;
     currentCaughtExc_   = savedCaught;
@@ -6324,6 +6331,11 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
     auto  savedRef      = refParams_;
     auto  savedDispose  = disposeStack_;
     auto  savedLoop     = loopStack_;
+    // #2281 / §31.2: the expression-getter thunk is a separate function.
+    // Preserve the caller's active try/finally frames across nested emission;
+    // finallyBodyStack_ stays depth-aligned per §29.7.
+    auto  savedFinally   = finallyStack_;
+    auto  savedFinBodies = finallyBodyStack_;
     auto* savedUnwind   = unwindTarget_;
     auto* savedProp     = propagateBB_;
     auto* savedCaught   = currentCaughtExc_;
@@ -6336,6 +6348,7 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
     currentThis_       = &*fn->args().begin();
     locals_.clear(); paramSlots_.clear(); refParams_.clear();
     disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+    finallyBodyStack_.clear();
     unwindTarget_      = nullptr; propagateBB_ = nullptr;
     currentCaughtExc_  = nullptr; unwindScopeDepth_ = 0;
     diverged_          = false; genericSubst_.clear();
@@ -6356,6 +6369,8 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
     refParams_         = std::move(savedRef);
     disposeStack_      = std::move(savedDispose);
     loopStack_         = std::move(savedLoop);
+    finallyStack_      = std::move(savedFinally);       // #2281 / §31.2
+    finallyBodyStack_  = std::move(savedFinBodies);     // #2281 / §29.7
     unwindTarget_      = savedUnwind;
     propagateBB_       = savedProp;
     currentCaughtExc_  = savedCaught;
