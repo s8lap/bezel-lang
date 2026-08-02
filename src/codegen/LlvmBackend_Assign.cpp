@@ -7289,8 +7289,13 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
     // #1918 / §28.3: slots of bare owned local/param arguments transferred to an
     // `owned` parameter — nulled below at the "call about to run" point when
     // `nullTransferredOwned` is set (the ordinary user-method call path). See the
-    // discharge block and the header comment.
-    std::vector<llvm::AllocaInst*> transferredOwnedArgSlots;
+    // discharge block and the header comment. #2310 / §29.8 / §30.1 (#973a
+    // residual): keep the source EXPRESSION alongside each slot so the same
+    // "about to run" point can also null the FRAME capture slot of an `owned`
+    // state-machine parameter — covering forms 3 (`M(owned p)`) and 6
+    // (`new Ctor(owned p)`). // per §28.3, §29.8, §30.1
+    std::vector<std::pair<llvm::AllocaInst*, const ast::Expr*>>
+        transferredOwnedArgSlots;
     for (const auto& a : args) {
         std::size_t idx = params.size();
         if (a.name.empty()) {
@@ -7325,7 +7330,8 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                     eligible = (ps->modifier == "owned");
                 if (eligible)
                     if (llvm::AllocaInst* s = localSlot(*id)) {
-                        transferredOwnedArgSlots.push_back(s);
+                        transferredOwnedArgSlots.emplace_back(
+                            s, a.value.get());
                         // #1990 / #1992 / §28.3: a bare owned local/param whose
                         // ownership transfers into an `owned` argument has its
                         // auto-dispose registered by registerUnwindOwnedLocal /
@@ -7969,13 +7975,19 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
     // live and the unwind disposal reclaims it (the #1918 leak). Mirrors how an
     // explicit `x.Dispose()` / `_ := x` discharge nulls the slot for the same
     // null-guarded machinery. // per §28.3
-    for (llvm::AllocaInst* slot : transferredOwnedArgSlots) {
+    for (auto& [slot, srcExpr] : transferredOwnedArgSlots) {
         if (!slot) continue;
         llvm::Type* ety = nullptr;
         llvm::Value* addr = boxedStorage(slot, ety);
         if (addr && ety && ety->isPointerTy())
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
+        // #2310 / §29.8 / §30.1 (#973a residual): also null the FRAME capture
+        // slot of an `owned` state-machine PARAMETER this call just consumed —
+        // forms 3 (`M(owned p)`) and 6 (`new Ctor(owned p)`). Self-gating (no-op
+        // outside a state-machine body, for non-parameter sources, for non-owned
+        // parameters). per §29.8 / §30.1
+        nullStateMachineOwnedParamCapture(srcExpr);
     }
     return true;
 }
@@ -8007,6 +8019,15 @@ void Emitter::nullTransferredOwnedLocalSlot(const ast::Expr* argValue) {
     llvm::Value* addr = boxedStorage(slot, ety);
     if (addr && ety && ety->isPointerTy())
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+    // #2310 / §29.8 / §30.1 (#973a residual): when the source is an `owned`
+    // state-machine PARAMETER, also null its FRAME capture slot — so the
+    // frame's terminal-state disposal (null-guarded) skips the just-transferred
+    // parameter on the discharging path. Covers every call site of this helper:
+    // the `y := owned p` assignment marker (form 4) and the owning-collection
+    // element transfer Add / Insert / Set (form 5). Self-gating — no-op outside
+    // a state-machine body, for non-parameter sources, for non-owned parameters.
+    // per §29.8 / §30.1
+    nullStateMachineOwnedParamCapture(argValue);
 }
 
 

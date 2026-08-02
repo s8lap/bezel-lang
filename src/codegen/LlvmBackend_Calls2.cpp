@@ -6255,6 +6255,17 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                                 builder_.CreateStore(
                                     llvm::ConstantPointerNull::get(ptrTy()),
                                     slot);
+                            // #2310 / §29.8 / §30.1 (#973a residual): also null
+                            // the FRAME capture slot of an `owned` STATE-MACHINE
+                            // parameter this discharge just consumed — so the
+                            // frame's terminal-state disposal (null-guarded) skips
+                            // it on the discharging path. The alloca-null above
+                            // is the sync-method / owned-local piece; the frame
+                            // slot is the state-machine piece. nullStateMachine-
+                            // OwnedParamCapture is self-gating (no-op outside a
+                            // state-machine body, for non-parameter sources, for
+                            // non-owned parameters). // per §29.8 / §30.1
+                            nullStateMachineOwnedParamCapture(ma->target.get());
                             builder_.CreateBr(cont);
                             builder_.SetInsertPoint(cont);
                         } else if (isFreshOwnedClassProducer(ma->target.get())) {
@@ -9121,6 +9132,12 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                 if (!checkedDisposal_)
                     builder_.CreateStore(
                         llvm::ConstantPointerNull::get(ptrTy()), slot);
+                // #2310 / §29.8 / §30.1 (#973a residual): also null the FRAME
+                // capture slot of an `owned` state-machine parameter this
+                // discharge just consumed (no-op outside a state-machine body,
+                // for non-parameter sources, for non-owned parameters).
+                // per §29.8 / §30.1
+                nullStateMachineOwnedParamCapture(nm.target.get());
             } else {
                 emitDynamicDispose(recvD);
             }

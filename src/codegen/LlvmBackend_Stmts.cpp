@@ -2332,6 +2332,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         builder_.SetInsertPoint(dispBB);
                         emitDisposeAndReclaim(obj);
                         builder_.CreateStore(nullVal, slotAddr);
+                        // #2310 / §29.8 / §30.1 (#973a residual): also null the
+                        // FRAME capture slot of an `owned` state-machine parameter
+                        // this `_ := p` discard just consumed (no-op outside a
+                        // state-machine body, for non-parameter sources, for
+                        // non-owned parameters). per §29.8 / §30.1
+                        nullStateMachineOwnedParamCapture(ds->value.get());
                         builder_.CreateBr(contBB);
                         builder_.SetInsertPoint(contBB);
                     }

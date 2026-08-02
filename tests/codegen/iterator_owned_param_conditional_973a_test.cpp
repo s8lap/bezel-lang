@@ -298,34 +298,49 @@ BEZEL_TEST(iterator_owned_param_conditional_973a,
         "  end Main; "));
 }
 
-// The DELIBERATE BOUND (decline-with-reasons, tracked as the #973a residual):
-// the other discharge forms null only the caller's alloca, not the frame slot, so
-// admitting them would leave the frame double-freeing. They keep the §28.3
-// reject — a false reject, never a miscompile. These three pin the boundary so a
-// later widening cannot land silently.
+// The DELIBERATE BOUND, #2310 (the #973a residual widening): the other discharge
+// forms (`c.Dispose()` / `c?.Dispose()` / `_ := c` / `Sink(owned c)` / `new
+// Ctor(owned c)` / owning-collection transfer `Add(owned c)`) used to null
+// only the caller's alloca, not the frame capture slot, so admitting them would
+// have left the frame double-freeing (#973a precisely rejects them as a false
+// reject of a valid program, #2310 widens each to admit). The fix wires a
+// `nullStateMachineOwnedParamCapture` call beside the existing alloca-null at
+// each of the 6 lowering sites and widens the `stateMachineOwnedParamIsFrame-
+// Nullable` allowlist correspondingly; each shape now compiles to a
+// null-guarded frame-disposal skip on the discharging branch and a normal
+// disposal on the fall-through. The Cell counter (`Main` returns `Cell.n`)
+// pins EXACTLY-once: 0 means no leak and no extra disposal. Run under
+// generated-code ASan/LSan so a leak, double-free, or UAF flips `r.ran` to
+// false. // per §29.8 / §30.1, v0.236
 BEZEL_TEST(iterator_owned_param_conditional_973a,
-           conditional_explicit_dispose_still_rejected_spec_28_3) {
-    BEZEL_EXPECT_EQ(rejectedAtCompile(prog(
-        "  public static method Use(owned c: Cell, cond: bool): IEnumerable<int> "
-        "    if cond then c.Dispose(); end; "
-        "    yield return 1; "
-        "  end Use; "
-        "  public static method Main(): int return 0; end Main; ")), true);
+           conditional_explicit_dispose_admitted_spec_29_8) {
+    expectBalanced(prog(
+        std::string(kCondIter).replace(
+            std::string(kCondIter).find("using var x := owned c;"), 23,
+            "c.Dispose();") +
+        "  public static method Main(): int "
+        "    for var v in Use(new Cell(), true) do end; "
+        "    for var v in Use(new Cell(), false) do end; "
+        "    return Cell.n; "
+        "  end Main; "));
 }
 
 BEZEL_TEST(iterator_owned_param_conditional_973a,
-           conditional_discard_still_rejected_spec_28_3) {
-    BEZEL_EXPECT_EQ(rejectedAtCompile(prog(
-        "  public static method Use(owned c: Cell, cond: bool): IEnumerable<int> "
-        "    if cond then _ := c; end; "
-        "    yield return 1; "
-        "  end Use; "
-        "  public static method Main(): int return 0; end Main; ")), true);
+           conditional_discard_admitted_spec_29_8) {
+    expectBalanced(prog(
+        std::string(kCondIter).replace(
+            std::string(kCondIter).find("using var x := owned c;"), 23,
+            "_ := c;") +
+        "  public static method Main(): int "
+        "    for var v in Use(new Cell(), true) do end; "
+        "    for var v in Use(new Cell(), false) do end; "
+        "    return Cell.n; "
+        "  end Main; "));
 }
 
 BEZEL_TEST(iterator_owned_param_conditional_973a,
-           conditional_owned_argument_still_rejected_spec_28_3) {
-    BEZEL_EXPECT_EQ(rejectedAtCompile(prog(
+           conditional_owned_argument_admitted_spec_29_8) {
+    expectBalanced(prog(
         "  public static method Sink(owned c: Cell): int "
         "    using var k := owned c; return 1; "
         "  end Sink; "
@@ -333,5 +348,9 @@ BEZEL_TEST(iterator_owned_param_conditional_973a,
         "    if cond then var r := Sink(owned c); end; "
         "    yield return 1; "
         "  end Use; "
-        "  public static method Main(): int return 0; end Main; ")), true);
+        "  public static method Main(): int "
+        "    for var v in Use(new Cell(), true) do end; "
+        "    for var v in Use(new Cell(), false) do end; "
+        "    return Cell.n; "
+        "  end Main; "));
 }
