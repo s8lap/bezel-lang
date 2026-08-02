@@ -76,7 +76,7 @@ public method Listen(rawPort: string)
 end Listen;
 ```
 
-A violated `requires` says "fix the calling code" — but there is no calling code to fix. The input was always going to be wrong sometimes. The rewrite is value-shaped (Guide 2 §2–§3). When `Listen` is itself the site that consumes the failure, it handles the outcome in place:
+A violated `requires` says "fix the calling code" — but there is no calling code to fix. The input was always going to be wrong sometimes. The first rewrite is value-shaped (Guide 2 §2–§3). When `Listen` is itself the site that consumes the failure, it handles the outcome in place:
 
 ```bezel
 public method Listen(rawPort: string)
@@ -89,7 +89,7 @@ public method Listen(rawPort: string)
 end Listen;
 ```
 
-When the consumer sits *above* `Listen` — a supervisor that logs, retries, or converts the failure rather than branching on it — the sanctioned signal is a typed exception (Guide 2 §4; the failure-signal rule's band 4, stdlib §1). The classification has not moved: the input is still an expected outcome, never a caller bug. Only the signal changes:
+When the consumer sits *above* `Listen` — a supervisor that logs, retries, or converts the failure rather than branching on it — the sanctioned signal is a typed exception (Guide 2 §4; the failure-signal rule's band 4, stdlib §1). It is still never a caller bug: the input remains an expected outcome, and only the signal changes:
 
 ```bezel
 public method Listen(rawPort: string)
@@ -160,7 +160,7 @@ Elsewhere you may be used to a compiler or analyzer *deducing* that a function h
 
 The reason is stability (rationale §9.7). Inferred purity would be an observation callers silently convert into an obligation: adding one log line to a leaf method would flip the inferred purity of every transitive caller and break every contract clause that called them, with no declaration anywhere recording that a promise existed. Declared purity puts the promise, and any future breakage, at an explicit keyword whose removal is a visible signature change.
 
-Be equally clear about what `pure` is *not*: it is **not determinism**. A pure member may read *mutable* state. Purity promises no writes, no I/O, no disposal-time user code, no task or synchronization traffic — so two calls with identical arguments may return different values (spec §22.15). Do not memoize on the strength of `pure` alone.
+Be equally clear about what `pure` is *not*: it is **not determinism**. Purity promises no writes, no I/O, no disposal-time user code, no task or synchronization traffic. But a pure member may read *mutable* state, so two calls with identical arguments may return different values (spec §22.15). Do not memoize on the strength of `pure` alone.
 
 Dispatch keeps the promise honest. An override of a `pure` member must itself be `pure`. An override may *add* purity where the base lacks it, usable only through the derived static type; once a chain member is pure, every further override is (spec §22.15). Admission at a call site keys on the static type's declaration — which is what lets the checker admit virtual calls in pure bodies without seeing any body.
 
