@@ -718,7 +718,23 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // call. TakeCurrent (vtable slot 3) checks for null (before-first-advance /
     // after-exhaustion / double-take) and raises InvalidOperationException.
     // The iterator nulls current_val after transfer and on exhaustion.
-    bool isOwningIter = (retName == "IOwningEnumerable");
+    //
+    // §29.1 v0.236 / #2610: recognize BOTH owning iterator heads.
+    // IOwningEnumerable<T> is the spec-sanctioned iterator return (§29.2); the
+    // enumerator-direct `IOwningEnumerator<T>` return is the owning sibling of
+    // the `IEnumerator<T>`-direct single-use form §29.3/§29.11 supports, reached
+    // via `using var en := Gen();` where Gen's declared return type is
+    // IOwningEnumerator<T>. Pre-#2610 this head fell through here, so the codegen
+    // treated the frame as the BORROWING form: slot 3 was emitted as a plain
+    // non-destructive Current (no null-on-take), while the consumer dispatched
+    // `.TakeCurrent()` against the same slot expecting ownership transfer — a
+    // heap-use-after-free (the producer's #1120 advance/Dispose then touched the
+    // value the consumer already owned). Recognizing it makes TakeCurrent, the
+    // disposeYieldedVal owning-branch, and the owned-local scan below all apply,
+    // so the frame implements the §29.1 owning contract. Mirrors the async
+    // isOwningIter extension landed under #2591 (IOwningAsyncEnumerator).
+    bool isOwningIter = (retName == "IOwningEnumerable" ||
+                         retName == "IOwningEnumerator");
 
     // §29.8 (#2154/#2217): narrow CLONE-DISPOSES-CAPTURES prototype. The
     // ownership pass records a yield state only when the complete body is a
@@ -844,13 +860,23 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // value to the consumer via TakeCurrent() on each MoveNext call — the consumer
     // (not the enumerator) is responsible for disposing it; the enumerator must
     // NOT also dispose current_val or the result is a double-free.
+    //
+    // §29.1 v0.236 / #2610: the enumerator-direct IOwningEnumerator<T> return is
+    // the same owning contract (isOwningIter above) and is excluded for the same
+    // reason — without this, the #1120 advance-dispose / exhaustion-dispose
+    // machinery (gated on elemIsOwnedClass) would fire for an owning iterator
+    // and race the consumer's TakeCurrent (the slot-3 TakeCurrent nulls on take,
+    // but the owned-flag-gated borrowing-form disposal is the wrong model for the
+    // owning form, whose every yielded value transfers regardless of `new`-vs-
+    // local). Keeping the two owning heads symmetric makes IOwningEnumerator<T>-
+    // direct behave identically to IOwningEnumerable<T>.
     bool elemIsOwnedClass = false;
     if (elemSemaTy &&
         elemSemaTy->kind == sema::TypeRef::Kind::Named &&
         elemSemaTy->declaration != nullptr &&
         (elemSemaTy->declaration->kind == ast::TypeDeclKind::Class ||
          elemSemaTy->declaration->kind == ast::TypeDeclKind::Interface)) {
-        if (retName != "IOwningEnumerable")
+        if (retName != "IOwningEnumerable" && retName != "IOwningEnumerator")
             elemIsOwnedClass = true;
     }
 
