@@ -5909,22 +5909,34 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // postcondition. Clear the set for the lambda body and restore after.
         auto saveOutPostconds = std::move(currentOutPostconds_);
         currentOutPostconds_.clear();
-        // §7.4 (v0.226, #2113/#2116): the lambda body is DEFERRED code — its
-        // narrowing fact state is not the enclosing statement's. All three
-        // narrowing sets are saved now and restored after the body visit.
-        //   IN:  facts established BEFORE the lambda ride in (capture) — the
-        //        closure sees the ambient state. fieldNarrowed_ additionally
-        //        drops LOCAL-rooted facts here (the captured root may be
-        //        rebound between the closure's creation and its invocation,
-        //        which the enclosing walk cannot see); ambient-rooted facts
-        //        (rootId 0 — `this`/static) ride in unchanged, a readonly
-        //        field observed non-null holding that value forever after
-        //        (§22.8 single assignment; a during-construction test that
-        //        observed non-null saw the final value, §22.7/§7.4). The local
-        //        sets (nullNarrowed_/narrowings_) need NO in-side drop: their
-        //        key is the stable Symbol*, and §7.4's invalidation rules
-        //        (reassignment, ref/out, mutably-captured-then-call) have
-        //        already removed anything unsound by the point of capture.
+        // §7.4 / §27.5 (v0.236, #2113/#2116/#2259): the lambda body is DEFERRED
+        // code — its narrowing fact state is not the enclosing statement's. All
+        // three narrowing sets are saved now and restored after the body visit.
+        //   IN:  a fact established BEFORE the lambda would ride in (capture),
+        //        but §27.5 is explicit that capture is by REFERENCE —
+        //        "Modifications to a captured variable inside the lambda are
+        //        visible outside, and vice versa" — so the enclosing scope may
+        //        rebind a captured local's cell AFTER the closure's creation
+        //        but BEFORE its invocation, invalidating a fact the body
+        //        type-checked against (#2259: the captured read returned null
+        //        and SIGSEGV'd). The field set drops LOCAL-rooted facts here
+        //        for this reason (rootId >= 1; #2116); the two local sets are
+        //        ENTIRELY local-rooted (LocalSymbol/ParameterSymbol — §7.4
+        //        narrows no `this`/static through them; readonly fields go in
+        //        fieldNarrowed_), so each captured local's facts must be
+        //        dropped here for the identical reason. Clearing the whole set
+        //        is observably equivalent to dropping only the captured names'
+        //        entries (the body cannot reference an uncaptured local, and
+        //        the OUT-side restore below preserves the enclosing facts), so
+        //        the simple, obviously-sound rule is to clear both sets — the
+        //        direct analog of the field set's "drop all local-rooted". A
+        //        `const` local is also cleared here: §7.4 says a const local's
+        //        narrowing is "never invalidated" (const cannot be rebound),
+        //        so preserving its fact would be sound; the field set already
+        //        drops const-local-rooted field facts at this boundary for the
+        //        same simplicity, and this fix matches that precedent rather
+        //        than split the three sets' boundary policy. Re-narrow inside
+        //        the body (`if x <> null then … end`) to recover a fact.
         //   OUT: the enclosing sets are RESTORED — a fact established inside
         //        the lambda body must not leak to the enclosing scope (the body
         //        may run never or later; #2113's hole, now closed for all
@@ -5934,6 +5946,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         auto saveFieldNarrowed = fieldNarrowed_;
         fieldNarrowed_.erase(fieldNarrowed_.lower_bound({1u, 0u}),
                              fieldNarrowed_.end());  // drop local-rooted
+        nullNarrowed_.clear();   // §27.5 (#2259): captured locals are
+        narrowings_.clear();     // by-reference cells the enclosing scope may
+                                 // rebind between closure creation and
+                                 // invocation — drop on the way IN, matching
+                                 // the field set's local-rooted drop above
         currentScope_ = &lamScope;
         // §27.3 (v0.217, #2101): with a return-type ascription the body is
         // checked exactly as a method body against a declared return type —
