@@ -48,6 +48,7 @@
 #include "sema/SemaContext.hpp"
 #include "sema/SymbolCollection.hpp"
 #include "sema/TypeResolution.hpp"
+#include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
 #include "support/Diagnostic.hpp"
 #include "test_harness.hpp"
@@ -58,6 +59,8 @@
 
 namespace fs = std::filesystem;
 using bezel::test::runJit;
+using bezel::test::runAot;
+using bezel::test::JitResult;
 
 namespace {
 
@@ -647,4 +650,189 @@ BEZEL_TEST(codegen_atomic_asan_cross_domain_6_4,
     );
     if (r == -1) return;
     BEZEL_EXPECT_EQ(r, 0);
+}
+
+// ===========================================================================
+// #2605 / §7.4 (narrowing) / stdlib §6.4, v0.236 — narrowed `T?` operand on
+// Atomic<T>/AtomicInteger<T> instance methods.
+//
+// A `T?` local PROVED non-null by a preceding null-check (§7.4 narrowing) is
+// admissible as the non-nullable `value: T` / `expected: T` / `replacement: T`
+// / `delta: T` parameter (sema accepts — the §7.4 path is the standard idiom,
+// and #2602's §7 isAtomic gate admits the narrowed form). The narrowed local
+// nonetheless retains its tagged-optional `{i8 hasVal; T payload}` LLVM
+// representation; the atomic-intrinsic lowering must unwrap it to the bare T
+// payload before widening to i64 for bz_atomic_exchange /
+// bz_atomic_compare_exchange / bz_atomic_add. Without the unwrap the emitted
+// call passes `{i8,i32}` where `i64` is expected and LLVM `verifyModule`
+// rejects the module ("Call parameter type does not match function signature!"
+// → "IR verification failed") — a codegen ICE on a legitimate narrowed idiom.
+//
+// These tests use the STRICT AOT oracle (runAot): the bug is a verifyModule
+// failure, and verifyModule is the AOT-path gate (src/codegen/LlvmBackend.cpp
+// emitObjectFile); the lenient runJit path calls emitModule directly and does
+// NOT run verifyModule, so it cannot reliably observe this defect. FAILS
+// without the codegen unwrap (ran=false, IR verification failed) and PASSES
+// with it (ran=true, correct exit code). Mirrors the unwrap the user-method
+// binding path performs (unwrapNarrowedNullable, LlvmBackend_impl.hpp).
+//
+// An UN-narrowed `T?` is a sema reject (#2602), so codegen only ever sees a
+// narrowed or plain-T operand here — the unwrap helper is a no-op for a plain
+// primitive (positive control: atomic_methods_accept_plain_value and the
+// existing §6.4 Exchange/CAS/Add cases above cover plain-T).
+// ===========================================================================
+
+namespace {
+
+// runAot reports a SKIP (toolchain unavailable) as ran=false with a diagnostic
+// whose message contains "SKIP"; treat that as a no-op (the C toolchain is
+// available in this repo, but the guard keeps the test self-documenting).
+// Mirrors aot_checked_lenient_2214_test.cpp's wasSkipped.
+bool aotWasSkipped(const JitResult& r) {
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("SKIP") != std::string_view::npos) return true;
+    return false;
+}
+
+// §7.4-narrowing harness: a `T?` returned from a (flag-decided) helper, then
+// null-checked so the local is flow-narrowed to non-null T at the Atomic call.
+// `body` is spliced in after the narrowing check and must `return` an int.
+std::string narrowedProg(const std::string& body) {
+    return "module M; "
+           "class C "
+           "  private static method N(flag: bool): int? "
+           "    if flag then return 42; end; "
+           "    return null; "
+           "  end N; "
+           "  public static method Main(): int "
+           "    var a := new Atomic<int>(10); "      // cell starts at 10
+           "    var v := N(true); "                   // v: int?, runtime 42
+           "    if v = null then return 0; end; "     // narrows v → int (§7.4)
+           + body +
+           "  end Main; "
+           "end C;";
+}
+
+std::string narrowedIntPtrProg(const std::string& body) {
+    // AtomicInteger variant (cell starts at 10); same narrowing shape.
+    return "module M; "
+           "class C "
+           "  private static method N(flag: bool): int? "
+           "    if flag then return 5; end; "
+           "    return null; "
+           "  end N; "
+           "  public static method Main(): int "
+           "    var a := new AtomicInteger<int>(10); "
+           "    var v := N(true); "                   // v: int?, runtime 5
+           "    if v = null then return 0; end; "     // narrows v → int (§7.4)
+           + body +
+           "  end Main; "
+           "end C;";
+}
+
+}  // namespace
+
+// #2605 / §7.4 / stdlib §6.4: Atomic<int>.Exchange with a narrowed int?
+// operand. Without the unwrap the lowered bz_atomic_exchange call gets
+// {i8,i32} where i64 is expected → IR verification failed (ICE). With the
+// unwrap Exchange returns the previous cell value (10).
+BEZEL_TEST(codegen_atomic_narrowed_2605,
+           atomic_exchange_narrowed_nullable_value) {
+    JitResult r = runAot(narrowedProg(
+        "var prev := a.Exchange(v); "  // prev = 10 (old cell), cell now 42
+        "return prev; "
+    ));
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 10);
+}
+
+// #2605 / §7.4 / stdlib §6.4: Atomic<int>.CompareExchange with a narrowed
+// int? at the expected position (current cell 10 == narrowed expected 42 is
+// FALSE here, so CAS fails and returns the observed 10). Proves the unwrap
+// fires on the expected operand too, not only Exchange's value operand.
+BEZEL_TEST(codegen_atomic_narrowed_2605,
+           atomic_compareexchange_narrowed_expected) {
+    JitResult r = runAot(narrowedProg(
+        "var obs := a.CompareExchange(v, 99); "  // 10 != 42 → fail, obs = 10
+        "return obs; "
+    ));
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 10);
+}
+
+// #2605 / §7.4 / stdlib §6.4: AtomicInteger<int>.Add with a narrowed int?
+// delta. Without the unwrap bz_atomic_add gets {i8,i32} where i64 is expected
+// → ICE. With the unwrap Add returns the post-add value (10 + 5 = 15).
+BEZEL_TEST(codegen_atomic_narrowed_2605,
+           atomicinteger_add_narrowed_nullable_delta) {
+    JitResult r = runAot(narrowedIntPtrProg(
+        "var sum := a.Add(v); "  // 10 + 5 = 15
+        "return sum; "
+    ));
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 15);
+}
+
+// #2605 / §7.4 / stdlib §6.4: Atomic<int>.CompareExchange with the narrowed
+// operand at the REPLACEMENT position (current 10 == expected 10 → success,
+// swaps to narrowed replacement 42, returns observed 10). Proves the unwrap
+// fires at both CAS argument positions.
+BEZEL_TEST(codegen_atomic_narrowed_2605,
+           atomic_compareexchange_narrowed_replacement) {
+    JitResult r = runAot(narrowedProg(
+        "var obs := a.CompareExchange(10, v); "  // 10 == 10 → swap to 42, obs 10
+        "return obs; "
+    ));
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 10);
+}
+
+// #2605 / §7.4 / stdlib §6.4: Atomic<long>.Exchange with a narrowed long?
+// operand — confirms the unwrap keys on genericArgs[0]'s LLVM type (here i64,
+// matching the {i8,i64} nullable box), not a hardcoded i32. The 64-bit
+// payload must be passed to bz_atomic_exchange without truncation.
+BEZEL_TEST(codegen_atomic_narrowed_2605,
+           atomic_long_exchange_narrowed_nullable) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  private static method N(flag: bool): long? "
+        "    if flag then return 42; end; "
+        "    return null; "
+        "  end N; "
+        "  public static method Main(): int "
+        "    var a := new Atomic<long>(10); "
+        "    var v := N(true); "                 // v: long?, runtime 42
+        "    if v = null then return 0; end; "   // narrows v → long (§7.4)
+        "    var prev := a.Exchange(v); "        // prev = 10 (old cell)
+        "    return int(prev); "                 // §5.2 explicit long→int
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 10);
+}
+
+// #2605 / §7.4 / stdlib §6.4: Atomic<int>.Value SET with a narrowed int? RHS
+// — the SAME narrowed-nullable ICE class as Exchange/CompareExchange/Add, on
+// the fourth atomic intrinsic (bz_atomic_store in tryLowerAtomicValueSet,
+// LlvmBackend_Stmts.cpp). Sema admits the narrowed `T?` to the Value setter
+// via §7.4; without the codegen unwrap bz_atomic_store gets {i8,i32} where
+// i64 is expected → IR verification failed (ICE). With the unwrap the store
+// takes effect and the subsequent Value read observes 42.
+BEZEL_TEST(codegen_atomic_narrowed_2605,
+           atomic_value_set_narrowed_nullable_rhs) {
+    JitResult r = runAot(narrowedProg(
+        "a.Value := v; "          // store narrowed 42 into the cell
+        "return a.Value; "        // read back → 42
+    ));
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
 }

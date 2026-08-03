@@ -4897,6 +4897,15 @@ llvm::Value* Emitter::tryLowerAtomicCall(const ast::CallExpr& call) {
         // Exchange(value: T): T — seq-cst swap, returns old value.
         llvm::Value* rawVal = lowerExpr(*call.args[0].value);
         if (!rawVal) return nullptr;
+        // #2605 / §7.4: a flow-narrowed `T?` operand (proved non-null by a
+        // preceding null-check) lowers to its tagged-optional {i8,T} struct;
+        // unwrap to the bare T payload before widening — the same unwrap the
+        // user-method binding path performs (unwrapNarrowedNullable, mirrors
+        // the narrowed value-type receiver at LlvmBackend_Calls2.cpp ~6623).
+        // An un-narrowed `T?` is rejected by sema (#2602), so codegen only
+        // sees a narrowed or plain-T operand here; the helper is a no-op for
+        // a plain primitive.
+        rawVal = unwrapNarrowedNullable(rawVal, getTTy());
         // Widen arg to i64.
         llvm::Value* v64 = rawVal;
         if (rawVal->getType()->isIntegerTy() && !rawVal->getType()->isIntegerTy(64))
@@ -4913,6 +4922,10 @@ llvm::Value* Emitter::tryLowerAtomicCall(const ast::CallExpr& call) {
         llvm::Value* expVal = lowerExpr(*call.args[0].value);
         llvm::Value* repVal = lowerExpr(*call.args[1].value);
         if (!expVal || !repVal) return nullptr;
+        // #2605 / §7.4: unwrap a flow-narrowed `T?` (expected/replacement)
+        // to its bare payload before widening — see Exchange above.
+        expVal = unwrapNarrowedNullable(expVal, getTTy());
+        repVal = unwrapNarrowedNullable(repVal, getTTy());
         auto widen = [&](llvm::Value* v) -> llvm::Value* {
             if (v->getType()->isIntegerTy() && !v->getType()->isIntegerTy(64))
                 return builder_.CreateZExt(v, i64());
@@ -4960,6 +4973,9 @@ llvm::Value* Emitter::tryLowerAtomicCall(const ast::CallExpr& call) {
         if (mname == "Add" && !call.args.empty() && call.args[0].value) {
             llvm::Value* deltaRaw = lowerExpr(*call.args[0].value);
             if (!deltaRaw) return nullptr;
+            // #2605 / §7.4: unwrap a flow-narrowed `T?` delta to its bare
+            // payload before widening — see Exchange above.
+            deltaRaw = unwrapNarrowedNullable(deltaRaw, getTTy());
             // Sign-extend to i64 for signed T; zero-extend for unsigned T.
             llvm::Value* delta64 = deltaRaw;
             if (deltaRaw->getType()->isIntegerTy() &&

@@ -7705,6 +7705,17 @@ bool Emitter::tryLowerAtomicValueSet(const ast::AssignmentStmt& as) {
     }
 
     // Widen newVal to i64 for bz_atomic_store's uint64_t parameter.
+    // #2605 / §7.4: a flow-narrowed `T?` RHS (proved non-null by a preceding
+    // null-check) lowers to its tagged-optional {i8,T} struct; unwrap to the
+    // bare T payload before widening — same defect/fix as the
+    // Exchange/CompareExchange/Add path in tryLowerAtomicCall
+    // (LlvmBackend_Calls3.cpp). sema admits the narrowed `T?` to the Value
+    // setter via the §7.4 narrowing exception; without this unwrap the
+    // bz_atomic_store call gets {i8,i32} where i64 is expected and fails
+    // verifyModule. unwrapNarrowedNullable is a no-op for a plain primitive.
+    if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+        if (auto* tTy = lowerTypeRef(recvTy->genericArgs[0]))
+            newVal = unwrapNarrowedNullable(newVal, tTy);
     llvm::Value* v64 = newVal;
     if (newVal->getType()->isIntegerTy() && !newVal->getType()->isIntegerTy(64))
         v64 = builder_.CreateZExt(newVal, i64(), "aset.v64");
