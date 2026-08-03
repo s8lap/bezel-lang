@@ -3758,7 +3758,8 @@ private:
     // already gives an ordinary method call (LlvmBackend_Calls2.cpp), or it
     // leaks.
     bool lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
-                                 const ast::Expr* valueExpr = nullptr);
+                                 const ast::Expr* valueExpr = nullptr,
+                                 bool valueIsPlusOne = false);
 
     // §23.4: emit (or retrieve cached) a standalone LLVM function for a
     // BLOCK-form indexer getter body (`property [i: …]: T get => do…end;`).

@@ -285,8 +285,46 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             isUnsignedTargetExpr(*as->target),
                             isCharTargetExpr(*as->target),      // §6.6/§5.2 #1961
                             isUnsignedTargetExpr(*as->value));  // §6.2 #2140 rUns
-                        if (res && lowerVirtualPropertySet(*as->target, res))
+                        // fix #2586 (§23.3/§28.9/§4.6, v0.236): the VIRTUAL/
+                        // INTERFACE compound-assign twin of #2576's non-virtual
+                        // fix (lowerPropertyCompound). For a string target,
+                        // emitCompoundOp dispatches to emitStringConcat which
+                        // ALWAYS mints a fresh rc=1 `res` (memcpy of both
+                        // operands' bytes), and `rhs = lowerExpr(*as->value)`
+                        // is a SECOND +1 when the AST is a producer. The dynamic
+                        // setter (lowerVirtualPropertySet) retains `res` for a
+                        // CLASS-backed property, but was called with no valueExpr
+                        // — so its internal emitProducerRelease did not fire for
+                        // `res`. Pass valueIsPlusOne=true so lowerVirtualPropertySet
+                        // releases `res` itself on the retaining (class-backed)
+                        // path, using its OWN owner-kind flag branching (so a
+                        // boxed RECORD's plain-store setter — which never
+                        // retained res — is NOT double-released; res's +1 is the
+                        // record field's only ref, §9/§9.7). `rhs`'s orphan +1
+                        // (a producer rhs like `"abc" + i.ToString()`) is
+                        // released at THIS call site: rhs's +1 is NOT stored
+                        // anywhere (emitStringConcat memcpy's its bytes into res
+                        // and leaves rhs's own +1 untouched), so releasing rhs
+                        // is safe for ALL backings — class vtable, class-backed
+                        // iface, AND record-backed iface (a borrow rhs — e.g. a
+                        // named local — is not +1; the producer predicate gates
+                        // it). `cur` (the getter read) is a BORROW — the getter
+                        // accessor body returns a field load with no retain — so
+                        // it is deliberately NOT released (releasing a borrow
+                        // would UAF the field's own ref). Mirrors #2576's
+                        // structure in lowerPropertyCompound exactly.
+                        if (res && lowerVirtualPropertySet(*as->target, res,
+                                                           nullptr,
+                                                           /*valueIsPlusOne=*/true)) {
+                            // Release rhs's orphan +1 (producer only). Safe for
+                            // all backings — rhs is a distinct allocation from
+                            // res (emitStringConcat memcpy's into a fresh header),
+                            // and its +1 is never stored anywhere.
+                            if (rhs->getType()->isPointerTy() &&
+                                isPlusOneStringProducer(as->value.get()))
+                                emitStringRelease(rhs);
                             return false;
+                        }
                     }
                 }
                 if (lowerPropertyCompound(*as)) return false;

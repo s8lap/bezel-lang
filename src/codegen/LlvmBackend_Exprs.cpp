@@ -4994,7 +4994,8 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
 // `obj.P := v`, with the already-lowered value `v`. Mirrors the getter dispatch
 // above; the call is `void set(ptr this, T value)`.
 bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
-                                      const ast::Expr* valueExpr) {
+                                      const ast::Expr* valueExpr,
+                                      bool valueIsPlusOne) {
     if (!v) return false;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target);
     if (!ma || !ma->target) return false;
@@ -5104,6 +5105,24 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
     //     index is somehow unavailable, stay conservative and skip (leak-
     //     over-UAF, the safe direction).
     auto emitProducerRelease = [&] {
+        // fix #2586 (§23.3/§28.9/§4.6, v0.236): the COMPOUND-ASSIGN twin of the
+        // valueExpr-gated release below. A compound `obj.P OP= rhs` passes the
+        // emitCompoundOp RESULT as `v` (res) — a fresh +1 from emitStringConcat
+        // for a string target, ALWAYS +1 regardless of whether the rhs AST is a
+        // producer or a borrow. The valueExpr-based predicates below cannot
+        // recognize this (res has no source AST node — it is a computed value),
+        // so the compound caller sets valueIsPlusOne=true to force the string
+        // release here. The surrounding class-backed vs record-backed flag
+        // branching (this lambda is called only on the retaining path) gates
+        // the actual emission, so a boxed-RECORD's plain-store setter (which
+        // never retained `v`) is NOT double-released — the recordBB branch in
+        // the iface path skips the call, and the !isIfaceProp path is always a
+        // class vtable (records cannot be virtual per §9). Mirrors #2576's
+        // res-release structure in lowerPropertyCompound exactly.
+        if (valueIsPlusOne && v && v->getType()->isPointerTy()) {
+            emitStringRelease(v);
+            return;
+        }
         if (valueExpr && isPlusOneStringProducer(valueExpr))
             emitStringRelease(v);
         else if (valueExpr && (isPlusOneClosureProducer(valueExpr) ||
