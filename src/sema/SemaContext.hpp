@@ -321,6 +321,16 @@ public:
     // (non-import) path stay byte-for-byte unchanged when there are no imports.
     bool hasImports() const { return !importedByModule_.empty(); }
 
+    // §26.5 step 2 (#2573): true once at least one imported `public extension`
+    // block has been registered. An extension-only dependency (one whose public
+    // surface carries extension blocks but no exported types) never populates
+    // importedByModule_, so hasImports() alone must not gate extension
+    // visibility — the typecheck pass consults this to enter its
+    // extension-population loop even when no types were imported.
+    bool hasImportedExtensions() const {
+        return !importedExtensionsByModule_.empty();
+    }
+
     // Is `s` an imported (externally-defined) symbol? Codegen consults this to
     // emit an external declaration rather than a definition.
     bool isImported(const Symbol* s) const {

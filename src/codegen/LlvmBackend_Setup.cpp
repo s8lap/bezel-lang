@@ -1879,7 +1879,12 @@ void Emitter::declareFunctions() {
     // SemaContext's IMPORTED list (not `ctx_.symbols()`), so the loops above —
     // which both declare AND emit bodies — never touched them; this is the only
     // codegen path that engages imports, and only when imports were loaded.
-    if (ctx_.hasImports()) declareImportedFunctions();
+    // §26.5 step 2 (#2573): an extension-only dependency registers its
+    // `public extension` methods in importedSymbols_ but no exported types, so
+    // hasImports() is false — OR in hasImportedExtensions() or the imported
+    // `bz$ext$<T>$<M>` is never declared and the call lowers to a zero/null
+    // value (the latent #2491 "return-value expression failed to lower").
+    if (ctx_.hasImports() || ctx_.hasImportedExtensions()) declareImportedFunctions();
 
     // §2.5 / §2.6 / §28.4 (issue #328 item 1): declare each IMPORTED class's
     // external `bz$<Type>$Dispose` and register it in disposerFns_, so a `using

@@ -161,7 +161,13 @@ void ExprTC::run(const ast::SourceFile& src) {
     // §2.2 v0.164 collision rule (#1365): same as TypeResolution — track which
     // module first introduced each bare name; on collision, remove from scope
     // and record as ambiguous.
-    if (ctx_.hasImports()) {
+    // §26.5 step 2 (#2573): the gate also admits an extension-only dependency —
+    // one whose public surface registers `public extension` blocks but no
+    // exported types. Such a module never populates importedByModule_, so
+    // hasImports() alone would skip this loop and leave importedExtensions_
+    // empty, hiding the extension from lookupExtensionMember. OR in
+    // hasImportedExtensions() so the block below still populates extensions.
+    if (ctx_.hasImports() || ctx_.hasImportedExtensions()) {
         std::unordered_set<std::string_view> localNames;
         for (const auto& [name, _sym] : moduleScope_->names)
             localNames.insert(name);
