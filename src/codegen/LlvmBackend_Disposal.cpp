@@ -612,8 +612,17 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                     !collElem->nullable &&
                     it->collTy->astNode && it->collTy->astNode->name &&
                     !it->collTy->astNode->name->parts.empty() &&
-                    [](std::string_view n){ return n == "Array" || n == "Stack" ||
-                        n == "Queue"; }(it->collTy->headName()))
+                    [](std::string_view n){
+                        // #2603 / issue #401: IList<T>/IReadOnlyList<T> are
+                        // array-backed + borrowing (same bz_array_t* + per-
+                        // element string +1 as Array<T>), so a string-element
+                        // field of those interface types releases its elements
+                        // through the SAME stringElementReleaseThunk. IOwningList
+                        // is owning and never reaches this string gate (owning-
+                        // family disposer runs via elementPolicyFor instead).
+                        return n == "Array" || n == "Stack" || n == "Queue" ||
+                               n == "IList" || n == "IReadOnlyList";
+                    }(it->collTy->headName()))
                 elemDisp = stringElementReleaseThunk();
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)

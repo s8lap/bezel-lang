@@ -6437,6 +6437,10 @@ private:
             if (isCollectionTypeName(rt)) return rt;
             if (isLinkedListTypeName(rt)) return rt;
             if (isDictTypeName(rt)) return rt;
+            // #2603: an owned IList<T>/IReadOnlyList<T> captured primary-ctor
+            // parameter is array-backed + borrowing (issue #401) — same path as
+            // the FieldDecl arm below. IOwningList excluded (collIsOwning).
+            if (isBorrowingListInterfaceName(rt)) return rt;
             return nullptr;
         }
         if (!hasOwnedModifier(fs)) return nullptr;
@@ -6472,6 +6476,20 @@ private:
         // They own their V values for the OwningDictionary case; emitOwnedFieldDisposals
         // and lowerOwnedCollectionFieldStore detect isDict and use genericArgs[1].
         if (isDictTypeName(rt)) return rt;
+        // #2603 / §28.9 / issue #401: an owned IList<T> / IReadOnlyList<T> field
+        // is array-backed (same bz_array_t* as Array<T>) and borrowing, so it
+        // routes through the SAME collection-disposal path as owned Array<T> —
+        // emitOwnedFieldDisposals / lowerOwnedCollectionFieldStore free its
+        // backing via bz_array_free with the element disposer from
+        // elementPolicyFor (stringElementReleaseThunk for a string element).
+        // isCollectionTypeName only admits CONCRETE builtin names, so the
+        // borrowing list interfaces must be admitted explicitly. IOwningList<T>
+        // (owning) is excluded — it needs a separate collIsOwning fixup (filed
+        // separately) and admitting it here would free its backing but leak its
+        // class elements. Both isCollectionTypeName and isBorrowingListInterface-
+        // Name require declaration==nullptr, so a user class literally named
+        // IList keeps the existing class-instance path.
+        if (isBorrowingListInterfaceName(rt)) return rt;
         return nullptr;
     }
 
@@ -9606,6 +9624,20 @@ private:
     // the borrowing/read-only interfaces.
     static bool isListInterfaceName(const sema::TypeRef* rt,
                                     bool* outOwning = nullptr);
+
+    // #2603 / §28.9 / issue #401: the BORROWING list interfaces — IList<T> and
+    // IReadOnlyList<T>. Both are array-backed (same bz_array_t* as Array<T>) and
+    // borrowing (the holder does not own the elements, except the runtime-
+    // managed string +1 co-ownership), so an `owned` field of either static type
+    // routes through the IDENTICAL collection-disposal path as `owned Array<T>`:
+    // bz_array_free with the element disposer from elementPolicyFor (and the
+    // string-element-release thunk for a string element). IOwningList<T> is
+    // EXCLUDED — it is the OWNING variant (its elements are owned by the holder)
+    // and needs a separate collIsOwning fixup (filed separately).
+    static bool isBorrowingListInterfaceName(const sema::TypeRef* rt) {
+        bool owning = false;
+        return isListInterfaceName(rt, &owning) && !owning;
+    }
 
     // fix #853 / stdlib §4.1–§4.3: the *non-list* collection interfaces
     // (IReadOnlyCollection<T>, ICollection<T>, IOwningCollection<T>). These are

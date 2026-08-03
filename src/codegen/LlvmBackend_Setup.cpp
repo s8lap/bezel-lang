@@ -15601,6 +15601,9 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     llvm::Function* elemDisp = pol.disposerThunk;
     // §28.11: borrowing Array/Stack/Queue<string> co-owns a +1 per element
     // (retainRelease path); use the string-release thunk. Mirrors §2200-§2208.
+    // #2603 / issue #401: IList<T>/IReadOnlyList<T> are array-backed + borrowing
+    // (same bz_array_t* + per-element string +1 as Array<T>), so a string-element
+    // field of those interface types releases its elements through the SAME thunk.
     if (!elemDisp && !isDict &&
             pol.cat == ElementPolicy::Category::RuntimeManaged &&
             collElem &&
@@ -15609,8 +15612,10 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
             !collElem->nullable &&
             collTy && collTy->astNode && collTy->astNode->name &&
             !collTy->astNode->name->parts.empty() &&
-            [](std::string_view n){ return n == "Array" || n == "Stack" ||
-                n == "Queue"; }(collTy->headName()))
+            [](std::string_view n){
+                return n == "Array" || n == "Stack" || n == "Queue" ||
+                       n == "IList" || n == "IReadOnlyList";
+            }(collTy->headName()))
         elemDisp = stringElementReleaseThunk();
 
     llvm::Value* disp = elemDisp
