@@ -8972,6 +8972,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     llvm::Value* savedThis = currentThis_;
     auto savedLocals = locals_;
     auto savedParams = paramSlots_;
+    auto savedRefParams = refParams_;  // fix #2588
     llvm::BasicBlock* savedProp = propagateBB_;
     llvm::BasicBlock* savedUnwind = unwindTarget_;
     llvm::Value* savedCaught = currentCaughtExc_;
@@ -9017,11 +9018,30 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     diverged_ = false;
     // Bind user params (skip leading `this`).
     std::size_t paramStart = isStaticMethod(ms) ? 0 : 1;
+    // fix #2588 / §22.3: a `ref`/`out` param's arg is the caller's storage
+    // ADDRESS (alias path via lvalueAddr) or the §22.3 copy-in slot (bracket
+    // path) — register it in refParams_ so the inlined expression body's
+    // reads/writes dereference through it, exactly as bindParameters does
+    // for a compiled method's ref param (CG50) and as #2283 did for the
+    // inline ctor paths. Binding it in paramSlots_ instead left the body
+    // loading the pointer itself (`add ptr, i32` — malformed IR), the same
+    // shape as #2283 on the generic expression-bodied METHOD inline path.
+    // Block-bodied generic methods are unaffected: they go through
+    // emitGenericSpecialization -> buildSpecializedMethodFn -> bindParameters
+    // (which already routes ref/out through refParams_), so only the
+    // expression-bodied inline path had this gap.
     for (std::size_t pi = 0; pi < ms->params.size() &&
          pi + paramStart < args.size(); ++pi) {
-        auto* slot = entryAlloca(args[pi + paramStart]->getType());
-        builder_.CreateStore(args[pi + paramStart], slot);
-        paramSlots_[ms->params[pi]] = slot;
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[pi]);
+        if (ps && isByRefMod(ps->modifier)) {
+            llvm::Type* elemTy =
+                ps->declType ? lowerType(ps->declType) : i32();
+            refParams_[ms->params[pi]] = {args[pi + paramStart], elemTy};
+        } else {
+            auto* slot = entryAlloca(args[pi + paramStart]->getType());
+            builder_.CreateStore(args[pi + paramStart], slot);
+            paramSlots_[ms->params[pi]] = slot;
+        }
     }
 
     // Emit the body.
@@ -9072,6 +9092,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
+    refParams_ = std::move(savedRefParams);  // fix #2588
     propagateBB_ = savedProp;
     unwindTarget_ = savedUnwind;
     currentCaughtExc_ = savedCaught;
