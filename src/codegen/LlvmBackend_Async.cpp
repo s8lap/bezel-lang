@@ -1804,7 +1804,22 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                 rn = retRef->headName();
             else if (!retRef->importedName.empty())
                 rn = retRef->importedName;
-            isOwningIter = (rn == "IOwningAsyncEnumerable");
+            // §29.1 v0.236 / #2591: recognize BOTH owning async iterator heads.
+            // IOwningAsyncEnumerable<T> is the spec-sanctioned iterator return
+            // (§30.7); IOwningAsyncEnumerator<T> is the enumerator-direct return
+            // form (the owning sibling of the IAsyncEnumerator<T>-direct form
+            // fixed under #759), reached via `await using var en := Gen();`
+            // where Gen's declared return type is IOwningAsyncEnumerator<T>.
+            // Pre-#2591 this head fell through here, so the codegen treated the
+            // frame as the BORROWING form: Current was non-destructive and the
+            // Dispose path never disposed the yielded current_val — an owning
+            // iterator that leaked every yielded value. Recognizing it makes
+            // TakeCurrent (vtable slot 3), the disposeYieldedVal pass in
+            // emitFreeAndReturn, and the owned-local scan below all apply, so
+            // the frame implements the §29.1 owning contract (an advanced-but-
+            // untaken value is disposed by Dispose).
+            isOwningIter = (rn == "IOwningAsyncEnumerable" ||
+                            rn == "IOwningAsyncEnumerator");
         }
     }
     // The per-advance MoveNextAsync result is Task<bool>; the await-result type
@@ -2445,6 +2460,45 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
 
         auto emitFreeAndReturn = [&]() {
+            // §29.1 v0.236 / #2591: the async sibling of the sync iterator's
+            // disposeYieldedVal (§29 / #1120, LlvmBackend_Iterators.cpp:1719).
+            // For an IOwningAsyncEnumerable<T> / IOwningAsyncEnumerator<T>
+            // iterator whose element type is a reference type, current_val holds
+            // the last yielded OWNED value. TakeCurrent (vtable slot 3, the
+            // Current path above) nulls the slot when the consumer takes the
+            // value, so a NON-NULL current_val at Dispose time means the
+            // consumer abandoned after a successful MoveNextAsync WITHOUT
+            // calling TakeCurrent — the §29.1 "advanced-but-untaken" pending
+            // value. Dispose it exactly once (null-guarded) and null the slot.
+            // Mirrors the sync isOwningIter branch (unconditional dispose of a
+            // non-null current_val): the async frame carries no current_val_owned
+            // flag (there is no IAsyncEnumerable<owned T> flag form — only the
+            // owning interfaces transfer ownership per §29.1), so only the
+            // owning form (isOwningIter) with a pointer element type is handled.
+            // Null-guarded so full consumption (TakeCurrent already nulled the
+            // slot) and a re-entrant Dispose are no-ops — never a double-free.
+            // Runs BEFORE the owned-param/local sweeps, matching the sync
+            // Dispose's ordering (disposeYieldedVal → disposeOwnedParams → …);
+            // current_val is a dedicated trailing field that never aliases any
+            // param/local slot, so the ordering introduces no double-free.
+            if (isOwningIter && elemTy->isPointerTy()) {
+                llvm::Value* cvField = builder_.CreateStructGEP(
+                    stateStructTy, self, CURRENT_VAL_FIELD);
+                llvm::Value* yv = builder_.CreateLoad(elemTy, cvField, "aity.yv");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    yv, llvm::ConstantPointerNull::get(ptrTy()), "aity.yvnull");
+                auto* nonNullBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.yv.nonnull", disposeFn);
+                auto* contBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.yv.cont", disposeFn);
+                builder_.CreateCondBr(isNull, contBB, nonNullBB);
+                builder_.SetInsertPoint(nonNullBB);
+                emitDisposeAndReclaim(yv);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), cvField);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+            }
             // §29.8 (#973b): dispose never-discharged `owned` parameters captured
             // in the frame BEFORE freeing it — the async analogue of the sync
             // iterator's disposeOwnedParams (LlvmBackend_Iterators.cpp). Runs on
