@@ -312,3 +312,159 @@ BEZEL_TEST(increment_reference_type_2585,
         "end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// =========================================================================
+// §17.6 / #2599 — value-type RECORD sibling (pre-fix: codegen ICE on
+// `%record.R`, same malformed-`sadd.with.overflow` shape as #2585)
+//
+// §17.6 (v0.236) enumerates exactly three operand categories on which
+// `++`/`--` are defined:
+//   (1) "a value-type operand whose type T overloads `operator ++`"
+//   (2) "built-in numeric types" (`x++` ≡ `x := x + 1`)
+//   (3) "reference-type operands [that] overload the operator"
+// A user record is a value type (§9) that is NOT a built-in numeric, so
+// §17.6's category (1) is the ONLY clause that could admit `r++` — and it
+// applies IFF the record overloads `operator ++`. A record WITHOUT the
+// overload therefore matches none of §17.6's three categories and is
+// invalid by exhaustion (the basis is §17.6 itself, by case exhaustion —
+// not the reference-type clause literally, which is why the diagnostic
+// wording says "value-type record" rather than "reference type").
+//
+// Pre-fix (#2599): sema let `r++` through (the #2585 check was DELIBERATELY
+// scoped to reference types — records have a different TypeDeclKind and
+// fell through to `default`), and codegen's IncrementStmt handler reached
+// the "Built-in numeric" branch with `elemTy = %record.R = type { i32 }`,
+// building `ConstantInt::get(%record.R, 1)` — a degenerate `i33 1` — and
+// feeding it to `emitCompoundOp` -> `emitCheckedArith(sadd.with.overflow,
+// %record.R, i33)`, producing malformed IR
+// (`@llvm.sadd.with.overflow.s_record.Rs(%record.R %4, i33 1)`) that
+// verifyModule rejects (ICE) — the value-type sibling of #2585's
+// pointer-type ICE.
+//
+// The fix extends the #2585 IncrementStmt reject in ExprTypecheck.cpp to
+// also fire for a value-type RECORD (TypeDeclKind::Record) operand that
+// has no `operator ++`/`operator --` overload, with a §17.6 diagnostic
+// whose wording names the value-type-record category. Numeric primitives
+// keep their built-in `++` (the check's `default` branch skips them); a
+// record that DOES overload `++` (§25.3 `Counter`) is admitted by the
+// `hasOverload` guard — the key false-reject axis proven below.
+//
+// Tests (REJECT = the bug; ACCEPT = no-false-reject control):
+//   REJECT shapes (§17.6 violation — was an ICE pre-fix):
+//    1. `r++` on a record local whose record does NOT overload ++ (the
+//       issue's repro)
+//    2. `r--` on a record local (the `--` twin)
+//    3. `f++` on a record-typed FIELD (proves the check fires on a
+//       non-local target too — same code path, different lvalue category)
+//   ACCEPT shapes (no false reject — a regression here is worse than #2599):
+//    4. `i++` on an int local (built-in numeric — §17.6 category (2))
+//    5. `c++` on a record that overloads `operator ++` (§25.3 `Counter` —
+//       §17.6 category (1); the KEY false-reject axis: a record WITH an
+//       overload MUST still compile)
+// =========================================================================
+
+// §17.6 / #2599 primary repro: `r++` on a record local whose record does
+// NOT overload `operator ++`. Pre-fix: codegen built
+// `ConstantInt::get(%record.R, 1)` -> `i33 1` ->
+// `@llvm.sadd.with.overflow.s_record.Rs(%record.R, i33 1)` -> verifyModule
+// rejected the IR. Post-fix: clean sema REJECT citing §17.6.
+BEZEL_TEST(increment_record_value_type_2599,
+           record_local_increment_rejected_spec_17_6_issue_2599) {
+    auto r = parseSemaAll(
+        "module M; record R(x: int) end R; "
+        "class C "
+        "  public static method Main(): int "
+        "    var r := new R(1); "
+        "    r++; "
+        "    return r.x; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "`++` is not defined on record type `R`"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "§17.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "value-type record"));
+}
+
+// §17.6 / #2599: the `--` twin. `r--` on a record local must reject with
+// the same §17.6 rule (the operator token is `--`, not `++`).
+BEZEL_TEST(increment_record_value_type_2599,
+           record_local_decrement_rejected_spec_17_6_issue_2599) {
+    auto r = parseSemaAll(
+        "module M; record R(x: int) end R; "
+        "class C "
+        "  public static method Main(): int "
+        "    var r := new R(1); "
+        "    r--; "
+        "    return r.x; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "`--` is not defined on record type `R`"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "§17.6"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "value-type record"));
+}
+
+// §17.6 / #2599: `f++` on a record-typed FIELD — same defect on a
+// non-local target (the check keys on the target's resolved type, not the
+// lvalue category, so the field path is covered too). A field of record
+// type without an overload must reject identically.
+BEZEL_TEST(increment_record_value_type_2599,
+           record_field_increment_rejected_spec_17_6_issue_2599) {
+    auto r = parseSemaAll(
+        "module M; record R(x: int) end R; "
+        "class C "
+        "  public f: R := new R(0); "
+        "  public static method Main(): int "
+        "    var c := new C(); "
+        "    c.f++; "
+        "    return c.f.x; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasMsg(r, "`++` is not defined on record type `R`"));
+    BEZEL_EXPECT_TRUE(hasMsg(r, "§17.6"));
+}
+
+// §17.6 / §6.1: `i++` on an int local — "For built-in numeric types,
+// `x++` is equivalent to `x := x + 1`". MUST still compile — the numeric
+// value-type primitive is §17.6 category (2), skipped by the new check's
+// `default` branch. (Restated here in the #2599 suite so the record
+// reject's no-false-reject story is self-contained, independent of the
+// #2585 suite above.)
+BEZEL_TEST(increment_record_value_type_2599,
+           int_local_increment_accepted_spec_17_6_issue_2599) {
+    auto r = parseSemaAll(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var i := 5; "
+        "    i++; "
+        "    return i; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// §17.6 / §25.3 (the `Counter` example): a RECORD that overloads
+// `operator ++` — `c++` desugars to `c := Counter.operator++(c)` (§17.6
+// category (1)). This is the KEY no-false-reject axis for the #2599
+// record branch: the new check FIRES on the record operand, finds the
+// user-declared overload, and admits the statement. A false reject here
+// would break the §25.3 `Counter` idiom the spec explicitly demonstrates.
+BEZEL_TEST(increment_record_value_type_2599,
+           record_with_operator_increment_accepted_spec_17_6_spec_25_3_issue_2599) {
+    auto r = parseSemaAll(
+        "module M; "
+        "record Counter(value: int) "
+        "  public static method operator ++(c: Counter): Counter "
+        "    => new Counter(c.value + 1); "
+        "end Counter; "
+        "class C "
+        "  public static method Main(): int "
+        "    var c := new Counter(0); "
+        "    c++; "
+        "    return c.value; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}

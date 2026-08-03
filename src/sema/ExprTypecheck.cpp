@@ -11863,24 +11863,33 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
-        // §17.6 (v0.236, #2585): for a REFERENCE-type operand, `++`/`--` apply
-        // ONLY when the reference type overloads the operator (§4.6: string,
-        // classes, interfaces, function types, and heap-array builtins are
-        // reference types). A reference type that does NOT declare a matching
-        // `operator ++`/`operator --` overload must be rejected at the front
-        // end; without this check the operand reaches codegen, which has no
-        // built-in `++` for reference types and emits malformed IR
-        // (`ConstantInt::get(ptr, 1)` -> `sadd.with.overflow` on a pointer) in
-        // the "Built-in numeric increment/decrement" branch of
-        // LlvmBackend_Stmts.cpp's IncrementStmt handler (ICE on `s.P++`/`s++`
-        // for a string local or computed property). The value-type numeric
-        // primitives (int/long/double/char/...) and record/enum types are NOT
-        // touched here — numeric primitives have built-in `++`, and a record
-        // declaring `operator ++` still resolves through the overload. The
-        // operator-overload lookup mirrors codegen's own
-        // (LlvmBackend_Stmts.cpp ~line 1158), so a reference type that DOES
-        // overload `++`/`--` (the §17.6 `Counter` example, §25.3) still
-        // compiles.
+        // §17.6 (v0.236, #2585 / #2599): the increment/decrement operators
+        // are defined on exactly three operand categories — (1) a value-type
+        // operand whose type T overloads `operator ++`, (2) a built-in numeric
+        // type, (3) a reference-type operand whose type overloads the operator
+        // (§4.6: string, classes, interfaces, function types, and heap-array
+        // builtins are reference types). Any operand in NONE of those three
+        // must be rejected at the front end; without this check the operand
+        // reaches codegen, which has no built-in `++` for it and emits
+        // malformed IR (`ConstantInt::get(<non-numeric-type>, 1)` -> a
+        // degenerate constant fed to `sadd.with.overflow` on a pointer or
+        // record struct) in the "Built-in numeric increment/decrement" branch
+        // of LlvmBackend_Stmts.cpp's IncrementStmt handler (ICE: `s.P++`/`s++`
+        // on a string local or property (#2585, on `ptr`); `r++` on a record
+        // local without an overload (#2599, on `%record.R`)).
+        //
+        // #2585 covered reference-type operands. #2599 closes the value-type
+        // RECORD gap: a record is a value type (§9) that is NOT a built-in
+        // numeric, so §17.6's category (1) is the ONLY clause that could
+        // admit `r++` — and it applies IFF the record overloads `operator ++`.
+        // A record without the overload therefore matches none of §17.6's
+        // three categories and is invalid by exhaustion. The value-type
+        // numeric primitives (int/long/double/char/...) keep their built-in
+        // `++` (§17.6 category (2), skipped here); enums are left to their
+        // own rule (§17.6 does not govern enums — #2585 left them and #2599
+        // follows). The operator-overload lookup mirrors codegen's own
+        // (LlvmBackend_Stmts.cpp ~line 1158), so a type that DOES overload
+        // `++`/`--` (the §17.6 `Counter` example, §25.3) still compiles.
         if (is->target) {
             if (const sema::TypeRef* targetTy =
                     ctx_.exprType(*is->target)) {
@@ -11917,9 +11926,22 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 // inline array, unit, error — not a reference
                                 // type
                 }
-                if (isRefType) {
+                // §17.6 / #2599: a value-type RECORD operand. A record is a
+                // value type (§9) but NOT a built-in numeric, so without a
+                // user-declared `operator ++` it falls in none of §17.6's
+                // three categories (exhaustion). Nullability ignored — a
+                // record optional `R?` is not itself incrementable either.
+                bool isValueTypeRecord =
+                    targetTy->kind == sema::TypeRef::Kind::Named &&
+                    targetTy->declaration &&
+                    targetTy->declaration->kind ==
+                        ast::TypeDeclKind::Record;
+                if (isRefType || isValueTypeRecord) {
                     // Look for a user-defined `operator ++`/`operator --` on
                     // the target's Named type (§25 overload resolution).
+                    // Both reference types and value-type records resolve
+                    // through the same overload lookup (a record's
+                    // `operator ++` admits it under §17.6 category (1)).
                     bool hasOverload = false;
                     if (targetTy->kind == sema::TypeRef::Kind::Named &&
                         targetTy->declaration) {
@@ -11958,14 +11980,29 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                  !h.empty())
                             tyName = std::string(h);
                         else
-                            tyName = "reference type";
+                            tyName = isValueTypeRecord ? "record"
+                                                       : "reference type";
+                        // §17.6 diagnostic: the clause wording is category-
+                        // specific (reference type vs value-type record), but
+                        // both name §17.6 and the missing overload.
+                        std::string categoryWord =
+                            isValueTypeRecord ? "record type"
+                                              : "reference type";
+                        std::string clauseWord =
+                            isValueTypeRecord
+                                ? "on a value-type record"
+                                : "on a reference type";
+                        std::string overloadWord =
+                            isValueTypeRecord ? "the record"
+                                              : "the type";
                         ctx_.diagnostics().report(
                             Severity::Error, is->target->span.begin,
                             std::string("`") + std::string(is->op) +
-                            "` is not defined on reference type `" + tyName +
-                            "` — per §17.6, `++`/`--` on a reference type "
-                            "apply only when the type overloads the operator "
-                            "(and `" + tyName + "` does not)");
+                            "` is not defined on " + categoryWord + " `" +
+                            tyName + "` — per §17.6, `++`/`--` " + clauseWord +
+                            " apply only when " + overloadWord +
+                            " overloads the operator (and `" + tyName +
+                            "` does not)");
                     }
                 }
             }
