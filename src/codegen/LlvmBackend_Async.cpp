@@ -356,6 +356,147 @@ static unsigned countAwaitsInStmt(const ast::Stmt* s) {
 }
 
 
+// §29.7 (#2574): the async counterpart of collectYieldStatesForOwnedLocals
+// (LlvmBackend_Iterators.cpp, fix #2306). Same linear-scan contract — record
+// per-LocalDecl the (establishedAtState, transferredAtState) window — but the
+// async state machine numbers BOTH yields AND awaits as suspend states
+// (smNextSuspendState_ is pre-incremented for each, §30.7), so the scan must
+// advance `state` for awaits too. Without this, an await between a local's
+// declaration and its transfer-yield shifts the actual runtime states, and the
+// yield-only window would either miss a live await-state (leak) or over-fire
+// (double-free). The scan counts awaits in every simple-statement expression
+// position via countAwaitsInExpr, recurses through try bodies and do/end
+// blocks (matching the sync version), and ABORTS on any non-linear shape
+// (IfStmt / WhileStmt / ForStmt / lambdas), on `await using var` (its implicit
+// dispose-await at scope-end is a suspend point whose position the linear walk
+// cannot statically place), and on try statements with awaits in catch arms or
+// finally (the finally body is lowered TWICE — normal exit + unwind — doubling
+// its await count, making the linear scan's state numbering unreliable). A
+// try with catches/finally that have NO awaits is safe: they consume zero
+// suspend states, so the try body's yields+awaits fully determine the state
+// counter for code after the try. Aborting leaves the legacy bounded leak in
+// place rather than risking a double-free.
+static void collectAsyncSuspendStatesForOwnedLocals(
+    sema::SemaContext& ctx,
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+    unsigned& state,
+    std::unordered_map<const ast::LocalDecl*,
+        std::pair<unsigned, unsigned>>& out,
+    bool& ok) {
+    // (decl → (establishedAtState, transferredAtState))
+    for (const auto& s : stmts) {
+        if (!s) continue;
+        if (!ok) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s.get())) {
+            // `await using var` carries an implicit `await DisposeAsync()` at
+            // scope end — a suspend point whose position depends on the scope
+            // exit, not the linear walk. The linear scan cannot statically
+            // place it, so abort to avoid a state-numbering mismatch. This MUST
+            // precede the `isUsing` skip below: `isAwaitUsing` implies
+            // `isUsing` (ast/Node.hpp), so checking `isUsing` first would
+            // `continue` past this abort, silently mis-counting the scope-end
+            // await instead of bailing out.
+            if (ld->isAwaitUsing) { ok = false; return; }
+            if (ld->isUsing || ld->autoDropAtScopeEnd) continue;
+            auto oit = out.find(ld);
+            if (oit != out.end()) { ok = false; return; }
+            out[ld] = {state + 1, 0};
+            // Count awaits in the initializer — they consume suspend states
+            // BEFORE the next yield, advancing the state counter.
+            state += countAwaitsInExpr(ld->initializer.get());
+            continue;
+        }
+        // Simple statements whose expression positions may contain awaits.
+        // Each await consumes a suspend state, advancing `state`.
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s.get())) {
+            state += countAwaitsInExpr(lc->value.get());
+            continue;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s.get())) {
+            state += countAwaitsInExpr(as->value.get());
+            continue;
+        }
+        // fix #2333: `_ := await …` parses as DiscardStmt, not AssignmentStmt.
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s.get())) {
+            state += countAwaitsInExpr(ds->value.get());
+            continue;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s.get())) {
+            state += countAwaitsInExpr(es->expr.get());
+            continue;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s.get())) {
+            state += countAwaitsInExpr(rs->value.get());
+            continue;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s.get())) {
+            if (ys->isBreak || !ys->value) { ok = false; return; }
+            // §30.7 (#437): `yield return await Expr` contains an await in the
+            // value expression that suspends BEFORE the yield. Count it first.
+            state += countAwaitsInExpr(ys->value.get());
+            // Process the yield transfer (mirrors sync #2306).
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                ys->value.get());
+            if (id && (id->name == "this" || id->name == "base")) {
+                ok = false; return;
+            }
+            sema::Symbol* sym = id ? ctx.exprSymbol(*id) : nullptr;
+            auto* loc = dynamic_cast<sema::LocalSymbol*>(sym);
+            if (id && (!loc || !loc->decl || loc->isUsing)) {
+                ok = false; return;
+            }
+            if (loc && loc->decl) {
+                auto* ldDecl = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+                if (!ldDecl) { ok = false; return; }
+                auto oit = out.find(ldDecl);
+                if (oit == out.end()) { ok = false; return; }
+                if (oit->second.second != 0) { ok = false; return; }
+                oit->second.second = state + 1;
+            }
+            ++state;
+            continue;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            // Recurse into the protected body only (§29.6 forbids `yield` in
+            // catches / finally, so no yield-position transfer occurs there).
+            collectAsyncSuspendStatesForOwnedLocals(
+                ctx, ts->body, state, out, ok);
+            if (!ok) return;
+            // Catches and finally with awaits consume suspend states in a
+            // non-linear order (the finally body is lowered TWICE, doubling
+            // its await count). If any await is present, abort — the linear
+            // scan's state numbering would be unreliable past this point.
+            for (const auto& arm : ts->catches) {
+                if (arm.guard && countAwaitsInExpr(arm.guard.get()) > 0) {
+                    ok = false; return;
+                }
+                const ast::Stmt* ab = arm.body.get();
+                unsigned armAwaits = ab
+                    ? (dynamic_cast<const ast::DoEndBlock*>(ab)
+                         ? countAwaits(
+                               dynamic_cast<const ast::DoEndBlock*>(ab)->body)
+                         : countAwaitsInStmt(ab))
+                    : 0;
+                if (armAwaits > 0) { ok = false; return; }
+            }
+            if (ts->hasFinally && countAwaits(ts->finallyBody) > 0) {
+                ok = false; return;
+            }
+            continue;
+        }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
+            collectAsyncSuspendStatesForOwnedLocals(
+                ctx, db->body, state, out, ok);
+            continue;
+        }
+        // IfStmt / WhileStmt / ForStmt / lambdas / anything else has
+        // data-dependent state ordering — abort the linear scan.
+        ok = false;
+        return;
+    }
+}
+
+
 // §30.9 / §31.2 (#438): detect an `await` in a STILL-DEFERRED try position — a
 // catch arm (guard or body) or a `finally` body. An `await` in the try BODY is
 // now supported: lowerTry lowers the body (and hence the await's resume block)
@@ -1695,6 +1836,57 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
     bool isInstance = !isStaticMethod(ms);
     std::string prefix = std::string("bz$asynciter$") + std::string(ms->name) + "$";
 
+    // §29.7 (#2574): the LOCAL counterpart of the async iterator's owned-
+    // parameter scan. Restricted to IOwningAsyncEnumerable iterators — a bare-
+    // identifier `yield return L;` only transfers a local in the owning form
+    // (#1863); for an IAsyncEnumerable<owned T> iterator the bare-identifier
+    // yield is a borrow and the local's disposal is bounded by sema's never-
+    // discharged auto-drop or unwind (no Abandoned-state-keyed gap analogous
+    // to the bug). The scan counts BOTH yields AND awaits (async suspend
+    // states) so the (establishedAtState, transferredAtState) window matches
+    // the runtime smNextSuspendState_ numbering. On any non-linear shape the
+    // scan returns ok=false and the legacy bounded-leak path keeps working.
+    struct AsyncLocalKeyedDisposal {
+        unsigned establishedAtState = 0;
+        unsigned transferredAtState = 0;   // 0 = not transferred (legacy fallback)
+        unsigned frameField = 0;
+    };
+    std::unordered_map<const ast::LocalDecl*, AsyncLocalKeyedDisposal>
+        asyncOwnedLocalDisposals;
+    if (isOwningIter) {
+        bool lscanOk = true;
+        unsigned lscanState = 0;
+        std::unordered_map<const ast::LocalDecl*,
+            std::pair<unsigned, unsigned>> lscanOut;
+        collectAsyncSuspendStatesForOwnedLocals(
+            ctx_, *ci.stmts, lscanState, lscanOut, lscanOk);
+        if (lscanOk && !lscanOut.empty()) {
+            bool allTransferred = true;
+            for (auto& [ld, pr] : lscanOut) {
+                if (pr.second == 0) {
+                    allTransferred = false;
+                    break;
+                }
+                if (!unwindOwnedLocalClass(ld)) {
+                    allTransferred = false;
+                    break;
+                }
+            }
+            if (allTransferred) {
+                asyncOwnedLocalDisposals.clear();
+                for (auto& [ld, pr] : lscanOut) {
+                    AsyncLocalKeyedDisposal info;
+                    info.establishedAtState = pr.first;
+                    info.transferredAtState = pr.second;
+                    auto fit = frame.localFields.find(ld);
+                    if (fit != frame.localFields.end())
+                        info.frameField = fit->second;
+                    asyncOwnedLocalDisposals[ld] = info;
+                }
+            }
+        }
+    }
+
     // --- MoveNextAsync(ptr self) -> ptr (Task<bool>) ---
     auto* moveNextTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
     auto* moveNextFn = llvm::Function::Create(
@@ -2242,6 +2434,14 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             locals_[node] = slot;
         }
 
+        // §29.7 (#2574): load the suspension state ONCE, before any branch
+        // sets it to -1, so disposeOwnedLocals (inside emitFreeAndReturn) can
+        // test the live window (establishedAtState <= state < transferredAtState).
+        llvm::Value* disposeState = builder_.CreateLoad(
+            i32(),
+            builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD),
+            "dsp.curstate");
+
         auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
 
         auto emitFreeAndReturn = [&]() {
@@ -2296,6 +2496,69 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                     llvm::ConstantPointerNull::get(ptrTy()), fptr);
                 builder_.CreateBr(contBB);
                 builder_.SetInsertPoint(contBB);
+            }
+            // §29.7 (#2574): the LOCAL counterpart of the owned-parameter
+            // sweep above — the async sibling of the sync iterator's
+            // disposeOwnedLocals (#2306, LlvmBackend_Iterators.cpp). For each
+            // plain `var L` local of an owned-class type whose pre-pass
+            // produced a (establishedAtState, transferredAtState, frameField)
+            // tuple, dispose L's frame slot iff the current state is in L's
+            // live window:
+            //   establishedAtState <= state < transferredAtState
+            // The null guard handles "never reached (state 0)" — the calloc-
+            // zeroed slot is null because MoveNextAsync never ran past the
+            // declaration. Reverse establishment order matches §28.4's
+            // reverse-declaration destructor rule. Runs AFTER owned-param
+            // disposal and BEFORE the spill/frame free — no double-free with
+            // anything downstream. Only registered locals are visited, so the
+            // loop is a no-op (zero IR) for body shapes the pre-pass could
+            // not statically pin — preserving the existing bounded leak for
+            // those shapes rather than risking a double-free.
+            if (!asyncOwnedLocalDisposals.empty()) {
+                for (auto bit = frame.bodyLocals.rbegin();
+                     bit != frame.bodyLocals.rend(); ++bit) {
+                    const ast::Node* node = bit->first;
+                    auto* ld = dynamic_cast<const ast::LocalDecl*>(node);
+                    if (!ld) continue;
+                    auto oit = asyncOwnedLocalDisposals.find(ld);
+                    if (oit == asyncOwnedLocalDisposals.end()) continue;
+                    const AsyncLocalKeyedDisposal& info = oit->second;
+                    if (info.establishedAtState == 0 ||
+                        info.transferredAtState == 0 ||
+                        info.frameField == 0)
+                        continue;
+                    unsigned fieldIdx = info.frameField;
+                    llvm::Value* fptr = builder_.CreateStructGEP(
+                        stateStructTy, self, fieldIdx);
+                    llvm::Value* obj = builder_.CreateLoad(
+                        ptrTy(), fptr, "aitl.obj");
+                    llvm::Value* nonNull = builder_.CreateICmpNE(
+                        obj, llvm::ConstantPointerNull::get(ptrTy()),
+                        "aitl.nonnull");
+                    llvm::Value* established = builder_.CreateICmpSGE(
+                        disposeState,
+                        builder_.getInt32((int)info.establishedAtState),
+                        "aitl.estab");
+                    llvm::Value* beforeMove = builder_.CreateICmpSLT(
+                        disposeState,
+                        builder_.getInt32((int)info.transferredAtState),
+                        "aitl.beforemove");
+                    llvm::Value* shouldDispose = builder_.CreateAnd(
+                        nonNull,
+                        builder_.CreateAnd(established, beforeMove),
+                        "aitl.shoulddispose");
+                    auto* ldispBB = llvm::BasicBlock::Create(
+                        llvm_, "aitl.dispose", disposeFn);
+                    auto* lcontBB = llvm::BasicBlock::Create(
+                        llvm_, "aitl.cont", disposeFn);
+                    builder_.CreateCondBr(shouldDispose, ldispBB, lcontBB);
+                    builder_.SetInsertPoint(ldispBB);
+                    emitDisposeAndReclaim(obj);
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), fptr);
+                    builder_.CreateBr(lcontBB);
+                    builder_.SetInsertPoint(lcontBB);
+                }
             }
             // Free the spill area first (null-safe: free(null) is a no-op).
             llvm::Value* spillField2 =
