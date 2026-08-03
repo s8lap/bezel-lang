@@ -8560,33 +8560,39 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
     }
 }
 
-// §7 / stdlib §4.x (#2582) + §4.14/§4.15 (#2600): see the header comment for
-// the full rationale. The collection twin of #2315's checkBuiltinStringCallArgs.
-// A builtin collection instance method (Array<T>.IndexOf/Contains/…, Set<T>/
-// SortedSet<T>.Add/TryAdd/Contains/Remove, Stack<T>/Queue<T>.Push/Enqueue/
-// Contains, LinkedList<T>.AddFirst/AddLast/AddBefore/AddAfter/Find/Contains/
-// Remove, Dictionary<K,V>/SortedDictionary<K,V>.ContainsKey/Contains/Remove,
-// OwningDictionary<K,V>.PopValue/TryPopValue, OwningSet<T>.Take/TryTake), and
-// the span-buffer family (#2600: ArraySpan<T>/ReadOnlyArraySpan<T>.IndexOf/
-// Contains/Fill, value-T Span<T>/ReadOnlySpan<T>.IndexOf/Contains/Fill), has
-// no MethodSymbol — these are synthetic Named TypeRefs with no user
-// TypeSymbol — so checkCallArity → checkArgsAgainstParams → checkAssignable
-// never fires. An un-narrowed `int?` (or `T?`) argument was silently accepted
-// and reached codegen, where the equality-compare lowering tripped an LLVM
-// ICmpInst assertion (operand-type mismatch, exit 134). This helper mirrors
-// the user-method path against the instantiated element/key type, so an
-// un-narrowed `T?` is rejected exactly as a user `method Take(x: int)` rejects
-// it, while a NARROWED nullable (after a null-check) and a plain non-nullable
-// argument still compile (the §7.4 narrowing exception lives inside
-// checkAssignable, which this reuses).
+// §7 / stdlib §4.x (#2582) + §4.14/§4.15 (#2600) + §6.4 (#2602): see the
+// header comment for the full rationale. The collection twin of #2315's
+// checkBuiltinStringCallArgs. A builtin collection instance method (Array<
+// T>.IndexOf/Contains/…, Set<T>/SortedSet<T>.Add/TryAdd/Contains/Remove,
+// Stack<T>/Queue<T>.Push/Enqueue/Contains, LinkedList<T>.AddFirst/AddLast/
+// AddBefore/AddAfter/Find/Contains/Remove, Dictionary<K,V>/SortedDictionary<
+// K,V>.ContainsKey/Contains/Remove, OwningDictionary<K,V>.PopValue/
+// TryPopValue, OwningSet<T>.Take/TryTake), the span-buffer family (#2600:
+// ArraySpan<T>/ReadOnlyArraySpan<T>.IndexOf/Contains/Fill, value-T Span<T>/
+// ReadOnlySpan<T>.IndexOf/Contains/Fill), and the atomic family (#2602:
+// Atomic<T>.Exchange/CompareExchange, AtomicInteger<T>.Exchange/
+// CompareExchange/Add), has no MethodSymbol — these are synthetic Named
+// TypeRefs with no user TypeSymbol — so checkCallArity → checkArgsAgainstParams
+// → checkAssignable never fires. An un-narrowed `int?` (or `T?`) argument was
+// silently accepted and reached codegen, where the equality-compare lowering
+// tripped an LLVM ICmpInst assertion (operand-type mismatch, exit 134) — or,
+// for the atomic family (#2602), the atomic-exchange lowering emitted a call
+// with a mismatched parameter type (`{ i8, i32 }` passed where `i64` is
+// expected) and failed LLVM `verifyModule`. This helper mirrors the user-
+// method path against the instantiated element/key type, so an un-narrowed
+// `T?` is rejected exactly as a user `method Take(x: int)` rejects it, while
+// a NARROWED nullable (after a null-check) and a plain non-nullable argument
+// still compile (the §7.4 narrowing exception lives inside checkAssignable,
+// which this reuses).
 //
 // The element/key type is `recvTy->genericArgs[0]` for every covered family —
 // element-typed collections (Array<T>/Set<T>/Stack<T>/…) instantiate T at
 // genericArgs[0], the keyed collections (Dictionary<K,V>/OwningDictionary<
-// K,V>/SortedDictionary<K,V>) instantiate K at genericArgs[0], and the
-// span-buffer family (ArraySpan<T>/ReadOnlyArraySpan<T>/Span<T>/
-// ReadOnlySpan<T>) instantiates its element T at genericArgs[0]. The
-// parameter's OWN nullability is the instantiated type's nullability —
+// K,V>/SortedDictionary<K,V>) instantiate K at genericArgs[0], the span-buffer
+// family (ArraySpan<T>/ReadOnlyArraySpan<T>/Span<T>/ReadOnlySpan<T>)
+// instantiates its element T at genericArgs[0], and the atomic family
+// (Atomic<T>/AtomicInteger<T>) instantiates its operand T at genericArgs[0].
+// The parameter's OWN nullability is the instantiated type's nullability —
 // `Array<int?>` has `IndexOf(item: int?)`, so an `int?` argument is
 // admissible; `Array<int>` has `IndexOf(item: int)`, so an un-narrowed
 // `int?` is rejected. EXCEPTION (#2600): class-T `Span<T>`/`ReadOnlySpan<T>`
@@ -8595,7 +8601,12 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
 // suppresses the check for that case (an un-narrowed `T?` is admissible);
 // ArraySpan<T>/ReadOnlyArraySpan<T> keep `value: T` for class T too (§4.15
 // line 2881 — Array<T> slots do not wrap class T in T?), so they are covered
-// unconditionally. The borrowing mutators (Add/Push/Enqueue/Insert/AddFirst/
+// unconditionally. The atomic family needs NO class-T split: Atomic<T> is
+// compiler-restricted to cell-sized primitive VALUE types (§6.4 — bool/char/
+// byte/sbyte/short/ushort/int/uint/long/ulong/IntPtr/UIntPtr; AtomicInteger<T>
+// to the integer subset), so the operand is ALWAYS a non-nullable value T and
+// the param is `value: T` / `expected: T` / `replacement: T` / `delta: T`
+// (non-nullable). The borrowing mutators (Add/Push/Enqueue/Insert/AddFirst/
 // AddLast/AddBefore/AddAfter/TryAdd) are gated to the borrowing collection
 // names because their owning twins take `owned item: T` (the call-site
 // `owned` modifier aliases under §22.3 and is skipped by the modifier guard
@@ -8639,7 +8650,21 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     bool isSpanBuffer =
         colName == "ArraySpan" || colName == "ReadOnlyArraySpan" ||
         colName == "Span"      || colName == "ReadOnlySpan";
-    if (!isElementCollection && !isKeyedCollection && !isSpanBuffer) return;
+    // §7 / stdlib §6.4 (#2602): the atomic family — Atomic<T> and
+    // AtomicInteger<T> — is synthetically typed in the CallExpr handler (L7367)
+    // with the same no-MethodSymbol shape as the families above, so its
+    // Exchange/CompareExchange/Add `value: T` / `expected: T` / `replacement:
+    // T` / `delta: T` parameters skipped this check and an un-narrowed `T?`
+    // reached codegen, where the atomic-exchange lowering emitted a call with
+    // a mismatched parameter type and failed LLVM `verifyModule` (same #2582
+    // hazard class, different lowering). Atomic<T> is compiler-restricted to
+    // cell-sized primitive VALUE types (§6.4), so the operand is ALWAYS a
+    // non-nullable value T — no class-T nullable-param split is needed (unlike
+    // the span-buffer family's spanBufferSkipClassT branch).
+    bool isAtomic = colName == "Atomic" || colName == "AtomicInteger";
+    if (!isElementCollection && !isKeyedCollection && !isSpanBuffer &&
+        !isAtomic)
+        return;
     if (recvTy->genericArgs.empty() || !recvTy->genericArgs[0]) return;
     TypeRef* itemTy = recvTy->genericArgs[0];  // T (element) or K (key)
     const auto& m = ma->member;
@@ -8741,12 +8766,27 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
             m == "IndexOf" || m == "Contains" ||
             (m == "Fill" && (colName == "ArraySpan" || colName == "Span"))))
             return true;
+        // §7 / stdlib §6.4 (#2602): the atomic family's pos-0 value params.
+        // `Exchange(value: T)` is on BOTH Atomic<T> and AtomicInteger<T>;
+        // `CompareExchange(expected: T, replacement: T)` puts `expected` at
+        // pos 0 on both; `Add(delta: T)` is AtomicInteger-only (Atomic<T>
+        // does not declare it — the typeCall block at L7403 rejects an
+        // `Add` call on Atomic<T>). T is compiler-restricted to a cell-sized
+        // primitive VALUE type (§6.4), so the param is always non-nullable
+        // and no class-T split is needed (cf. spanBufferSkipClassT).
+        if (isAtomic && pos == 0 && (
+            m == "Exchange" || m == "CompareExchange" ||
+            (m == "Add" && colName == "AtomicInteger")))
+            return true;
         // Position-1 item methods.
         if (pos == 1 && (
             // Array<T>.Insert(index: int, item: T) — stdlib §4.4.
             (m == "Insert" && colName == "Array") ||
             // LinkedList<T>.AddBefore/After(node, item: T) — stdlib §4.6.
-            ((m == "AddBefore" || m == "AddAfter") && colName == "LinkedList")))
+            ((m == "AddBefore" || m == "AddAfter") && colName == "LinkedList") ||
+            // §6.4 (#2602): Atomic/AtomicInteger CompareExchange's `replacement:
+            // T` sits at pos 1 (pos 0 `expected: T` covered above).
+            (isAtomic && m == "CompareExchange")))
             return true;
         return false;
     };
