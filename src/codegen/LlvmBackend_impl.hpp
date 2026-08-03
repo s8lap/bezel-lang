@@ -3586,8 +3586,15 @@ private:
     // OwningDictionary) the displaced slot/value is disposed exactly once before
     // the new (owned) one is stored (§4.5 / §4.9); a borrowing collection just
     // overwrites. `val` is the already-lowered RHS. Returns true if handled.
+    // `valIsFreshPlusOneString` (fix #2596): when true, the caller guarantees
+    // `val` is ALREADY a +1 string producer (e.g. a compound-assignment OP-
+    // result from emitStringConcat, which always mints rc=1 per #422), so the
+    // borrowing-Dictionary<K,string> co-ownership retain (§28.9 / #429) is
+    // SKIPPED — the +1 transfers into the slot. Only the dict compound path
+    // sets this; the plain-set path derives +1-ness from `valueExpr`.
     bool lowerCollectionIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
-                                   const ast::Expr* valueExpr = nullptr);
+                                   const ast::Expr* valueExpr = nullptr,
+                                   bool valIsFreshPlusOneString = false);
 
     // CG15: collect a class's instance fields in layout order —
     // base-class fields FIRST (prefix layout: a `Derived*` aliases a

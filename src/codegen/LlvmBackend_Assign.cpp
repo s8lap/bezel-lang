@@ -773,10 +773,13 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
 // new owner is stored (§4.5 / §4.9). Mirrors `.Set(i, v)` (§4.5) and the dict
 // `.Add(k, v)` lowering. `val` is the already-lowered RHS; `valueExpr` is the
 // RHS AST (when available) used to decide transfer-vs-retain for a #429
-// borrowing Array<string> overwrite.
+// borrowing Array<string> overwrite. `valIsFreshPlusOneString` (fix #2596): set
+// by the dict COMPOUND path whose `val` is an emitStringConcat result (always
+// +1 per #422) — skips the #429 retain so the +1 transfers into the slot.
 bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                                         llvm::Value* val,
-                                        const ast::Expr* valueExpr) {
+                                        const ast::Expr* valueExpr,
+                                        bool valIsFreshPlusOneString) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value || !val)
         return false;
     auto* recvTy = ctx_.exprType(*ix.target);
@@ -1178,7 +1181,11 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     // bz_string* here; encodeValue returns it as-is for pointer values). Emit
     // the retain BEFORE the store so a self-overwrite `d[k] := d[k]` always
     // sees rc >= 2 when the old value is released. A +1 producer is transferred.
-    if (isStrVal && (!valueExpr || !isPlusOneStringProducer(valueExpr)))
+    // fix #2596: the dict COMPOUND path passes valIsFreshPlusOneString=true
+    // because its `val` is an emitStringConcat result (always rc=1 per #422) —
+    // a retain here would double-count to +2 and leak one +1 per iteration.
+    if (isStrVal && !valIsFreshPlusOneString &&
+        (!valueExpr || !isPlusOneStringProducer(valueExpr)))
         emitStringRetain(val);
     llvm::Value* vPtr = encodeValue(val);
     if (keyTy) {
@@ -2674,6 +2681,61 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
             isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
             isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
         if (!newVal) return false;
+        // fix #2596 (§23.4 / §28.9 / §4.6, v0.236): the DICT compound-assignment
+        // leak on a borrowing Dictionary<K,string> (and SortedDictionary<K,string>).
+        // The compound desugar `d[k] += rhs` mints TWO +1 string producers for a
+        // string value: `rhs = lowerExpr(*as.value)` (a +1 for the canonical
+        // BinaryExpr `"abc" + i.ToString()`) and `newVal = emitCompoundOp(...)`
+        // which dispatches to emitStringConcat (a SECOND +1, per #422 — always
+        // rc=1 regardless of whether rhs is itself a producer or a borrow). The
+        // write-back below delegates to lowerCollectionIndexerSet, whose #429
+        // borrowing-Dictionary<K,string> retain fires whenever valueExpr is null
+        // OR not a +1 producer — and the compound path passed valueExpr=nullptr,
+        // so the retain fired UNCONDITIONALLY, bumping newVal from +1 to +2.
+        // The disposing setter then transferred only ONE +1 into the slot,
+        // orphaning the retain's +1 each iteration (LSan on origin/main: 100
+        // iterations of `d[0] += "abc" + i.ToString()` leaked 31485 byte(s)
+        // across 400 allocations — two direct leak sites of 3200B each: the
+        // spurious-retain'd newVal +1 and the rhs orphan +1; same shape as the
+        // #2587 Array<string> compound leak and the #2567 user-indexer leak).
+        //
+        // The fix: signal to lowerCollectionIndexerSet that newVal is ALREADY a
+        // +1 string producer (valIsFreshPlusOneString=true) so the #429 retain is
+        // skipped and the +1 transfers into the slot via the disposing setter
+        // (which also releases the displaced OLD value). Do NOT release newVal
+        // afterward — its +1 is the slot's own reference (a COLLECTION indexer
+        // TRANSFERs the +1, UNLIKE a CLASS property setter which RETAINs; see the
+        // OWNERSHIP GATE in the #2587 isStrElemArr branch above). Then release rhs
+        // when the AST is a +1 producer (emitStringConcat does NOT consume rhs —
+        // it memcpy's its bytes and leaves rhs's +1 untouched). A BORROW rhs (a
+        // named local) is NOT a producer; releasing it would UAF the local's only
+        // ref. Gate on the AST shape, not the LLVM pointer type. Mirrors the
+        // #2587 rhs-release (this file, the isStrElemArr branch ~L2785-2880) and
+        // the plain-set path's conditional retain exactly.
+        bool dictIsOwningC =
+            recvTy && recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            recvTy->headName() == "OwningDictionary";
+        bool isStrValDict =
+            !dictIsOwningC && valTy && !valTy->nullable &&
+            valTy->kind == sema::TypeRef::Kind::Primitive &&
+            valTy->primitive == sema::PrimitiveType::String &&
+            elementPolicyFor(valTy, /*owning=*/false).cat ==
+                ElementPolicy::Category::RuntimeManaged;
+        if (isStrValDict) {
+            bool ok = lowerCollectionIndexerSet(*ix, newVal,
+                /*valueExpr=*/nullptr, /*valIsFreshPlusOneString=*/true);
+            // rhs is a +1 producer when the AST is a BinaryExpr/string-interp/
+            // call (emitStringConcat does NOT consume rhs — it memcpy's its bytes
+            // and leaves rhs's +1 untouched). A BORROW rhs (a named local) is NOT
+            // a producer; releasing it would UAF the local's only ref at its
+            // scope end. Gate on the AST shape, not the LLVM pointer type. Mirrors
+            // the #2587 rhs-release (this file, isStrElemArr branch ~L2863).
+            if (ok && rhs && rhs->getType()->isPointerTy() && as.value.get() &&
+                isPlusOneStringProducer(as.value.get()))
+                emitStringRelease(rhs);
+            return ok;
+        }
         // Write back via lowerCollectionIndexerSet (encodes and dispatches to
         // bz_dict_set_str / bz_dict_set_gen, handling disposing variants).
         return lowerCollectionIndexerSet(*ix, newVal, /*valueExpr=*/nullptr);
