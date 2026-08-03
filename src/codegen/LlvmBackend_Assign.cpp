@@ -956,6 +956,15 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         // rc dips +1 then back, never transiently 0 — no UAF / double-free). This
         // is checked BEFORE the owning-class disposer below; a string element is
         // never a class, so the two paths are mutually exclusive.
+        // #2598 / §4.1 / §4.4: an IList<string> receiver routes its indexer set
+        // through the SAME bz_array_set ABI (issue #401 — IList<T> is array-backed,
+        // same bz_array_t* as Array<T>), so the same disposing-setter path applies.
+        // The predicate previously gated on a head-name allowlist of concrete
+        // borrowing families (Array/Stack/Queue); IList<T> (the borrowing list
+        // interface, §4.1) is also array-backed and borrowing, so it is admitted.
+        // IReadOnlyList<T> is read-only (never reaches the setter); IOwningList<T>
+        // is owning (handled by the separate elemDisp path below, which runs the
+        // owning-family disposer against the class element — never a string).
         // #602 / §28.11 v0.135: derive element policy from elementPolicyFor.
         {
             const sema::TypeRef* arrEl =
@@ -973,8 +982,12 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                 arrEl->primitive == sema::PrimitiveType::String &&
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
-                [](std::string_view n){return n=="Array"||n=="Stack"||n=="Queue";}(
-                    recvTy->headName());
+                [](std::string_view n){
+                    // #2598: IList<T> is array-backed + borrowing (issue #401),
+                    // same bz_array_set ABI as Array<T>; admitted alongside the
+                    // concrete borrowing families.
+                    return n=="Array"||n=="Stack"||n=="Queue"||n=="IList";
+                }(recvTy->headName());
             if (isStrElemArr) {
                 if (!valueExpr || !isPlusOneStringProducer(valueExpr))
                     emitStringRetain(val);
@@ -2904,7 +2917,10 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
             recvTy->astNode && recvTy->astNode->name &&
             !recvTy->astNode->name->parts.empty() &&
             [](std::string_view n){
-                return n=="Array"||n=="Stack"||n=="Queue";
+                // #2598: IList<T> is array-backed + borrowing (issue #401),
+                // same bz_array_set ABI as Array<T>; admitted alongside the
+                // concrete borrowing families.
+                return n=="Array"||n=="Stack"||n=="Queue"||n=="IList";
             }(recvTy->headName());
         if (isStrElemArr) {
             // newVal is +1 (emitStringConcat always mints rc=1). Transfer that
