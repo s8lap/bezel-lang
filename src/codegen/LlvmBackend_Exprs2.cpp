@@ -4220,16 +4220,32 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 llvm::Value* savedThis = currentThis_;
                 auto savedLocals = locals_;
                 auto savedParams = paramSlots_;
+                auto savedRefParams = refParams_;  // fix #2283
                 llvm::BasicBlock* savedUnwindTarget = unwindTarget_;
                 std::size_t savedUnwindDepth = unwindScopeDepth_;
                 currentThis_ = obj;
                 locals_.clear();
                 paramSlots_.clear();
                 // Bind ctor params to the lowered arg values.
+                // fix #2283 / §22.3: a `ref`/`out` param's arg is the caller's
+                // storage ADDRESS (alias path via lvalueAddr) or the §22.3
+                // copy-in slot (bracket path) — register it in refParams_ so
+                // the inlined body's reads/writes dereference through it,
+                // exactly as bindParameters does for a compiled ctor's ref
+                // param. Binding it in paramSlots_ instead left the body
+                // loading the pointer itself (`add ptr, i32` — malformed IR).
                 for (std::size_t pi = 0; pi < cs->params.size(); ++pi) {
-                    auto* slot = entryAlloca(args[pi + 1]->getType());
-                    builder_.CreateStore(args[pi + 1], slot);
-                    paramSlots_[cs->params[pi]] = slot;
+                    auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                        cs->params[pi]);
+                    if (ps && isByRefMod(ps->modifier)) {
+                        llvm::Type* elemTy =
+                            ps->declType ? lowerType(ps->declType) : i32();
+                        refParams_[cs->params[pi]] = {args[pi + 1], elemTy};
+                    } else {
+                        auto* slot = entryAlloca(args[pi + 1]->getType());
+                        builder_.CreateStore(args[pi + 1], slot);
+                        paramSlots_[cs->params[pi]] = slot;
+                    }
                 }
                 inlineCtorBody(cs, obj);
                 unwindTarget_ = savedUnwindTarget;
@@ -4237,6 +4253,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 currentThis_ = savedThis;
                 locals_ = std::move(savedLocals);
                 paramSlots_ = std::move(savedParams);
+                refParams_ = std::move(savedRefParams);
                 // fix #2319 / §22.3: flush the copy-OUT half of every
                 // accessor-mediated `ref`/`out` argument. The body has now
                 // written the slot's final value (or thrown — `!diverged_`
@@ -4530,16 +4547,31 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     llvm::Value* savedThis = currentThis_;
                     auto savedLocals = locals_;
                     auto savedParams = paramSlots_;
+                    auto savedRefParams = refParams_;  // fix #2283
                     llvm::BasicBlock* savedUnwindTarget = unwindTarget_;
                     std::size_t savedUnwindDepth = unwindScopeDepth_;
                     currentThis_ = obj;
                     locals_.clear();
                     paramSlots_.clear();
                     // Bind constructor params to the concrete arg values.
+                    // fix #2283 / §22.3: a `ref`/`out` param's arg is the
+                    // caller's storage ADDRESS (alias) or the §22.3 copy-in
+                    // slot (bracket) — register it in refParams_ so the inlined
+                    // body dereferences through it, as bindParameters does for
+                    // a compiled ctor's ref param. paramSlots_ binding left the
+                    // body loading the pointer (`add ptr, i32` — malformed IR).
                     for (std::size_t pi = 0; pi < cs->params.size(); ++pi) {
-                        auto* slot = entryAlloca(args[pi + 1]->getType());
-                        builder_.CreateStore(args[pi + 1], slot);
-                        paramSlots_[cs->params[pi]] = slot;
+                        auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                            cs->params[pi]);
+                        if (ps && isByRefMod(ps->modifier)) {
+                            llvm::Type* elemTy =
+                                ps->declType ? lowerType(ps->declType) : i32();
+                            refParams_[cs->params[pi]] = {args[pi + 1], elemTy};
+                        } else {
+                            auto* slot = entryAlloca(args[pi + 1]->getType());
+                            builder_.CreateStore(args[pi + 1], slot);
+                            paramSlots_[cs->params[pi]] = slot;
+                        }
                     }
                     inlineCtorBody(cs, obj);
                     unwindTarget_ = savedUnwindTarget;
@@ -4547,6 +4579,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     currentThis_ = savedThis;
                     locals_ = std::move(savedLocals);
                     paramSlots_ = std::move(savedParams);
+                    refParams_ = std::move(savedRefParams);
                 }
                 // fix #2319 / §22.3: flush the copy-OUT half of every
                 // accessor-mediated `ref`/`out` argument. Skipped on the
@@ -5696,19 +5729,35 @@ llvm::Value* Emitter::buildRecordValue(
         llvm::Value* savedThis = currentThis_;
         auto savedLocals = locals_;
         auto savedParams = paramSlots_;
+        auto savedRefParams = refParams_;  // fix #2283
         currentThis_ = slot;
         locals_.clear();
         paramSlots_.clear();
+        // fix #2283 / §22.3: a `ref`/`out` param's arg is the caller's storage
+        // ADDRESS (alias path) or the §22.3 copy-in slot (bracket path) —
+        // register it in refParams_ so the inlined record ctor body
+        // dereferences through it, as bindParameters does for a compiled ref
+        // param. paramSlots_ binding left the body loading the pointer itself
+        // (`add ptr, i32` — malformed IR), the same gap as the class-ctor
+        // inline paths above.
         for (std::size_t pi = 0; pi < cs->params.size(); ++pi) {
             llvm::Value* av = ordered[pi + 1];
-            auto* pslot = entryAlloca(av->getType());
-            builder_.CreateStore(av, pslot);
-            paramSlots_[cs->params[pi]] = pslot;
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(cs->params[pi]);
+            if (ps && isByRefMod(ps->modifier)) {
+                llvm::Type* elemTy =
+                    ps->declType ? lowerType(ps->declType) : i32();
+                refParams_[cs->params[pi]] = {av, elemTy};
+            } else {
+                auto* pslot = entryAlloca(av->getType());
+                builder_.CreateStore(av, pslot);
+                paramSlots_[cs->params[pi]] = pslot;
+            }
         }
         lowerScopedBlock(cd->body);
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);
         paramSlots_ = std::move(savedParams);
+        refParams_ = std::move(savedRefParams);
         // fix #2319 / §22.3: flush the copy-OUT half of every accessor-
         // mediated `ref`/`out` argument. Skipped on the throw edge per
         // §22.3's "on an exception exit no write-back occurs", matching
