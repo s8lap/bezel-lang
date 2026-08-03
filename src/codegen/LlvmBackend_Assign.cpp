@@ -2785,6 +2785,91 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         }
     }
 
+    // fix #2587 (§23.3/§28.9/§4.6, v0.236): the COLLECTION-INDEXER compound-
+    // assignment leak on a borrowing Array<string> (and Stack<string> /
+    // Queue<string>). The compound desugar `arr[i] OP= rhs` mints TWO +1
+    // string producers for a string element: `rhs = lowerExpr(*as.value)` (a
+    // +1 for the canonical BinaryExpr `"abc" + i.ToString()`) and `newVal =
+    // emitCompoundOp(...)` which dispatches to emitStringConcat (a SECOND +1,
+    // per #422). The generic write-back below derives its disposer from
+    // elementPolicyFor, which returns disposerThunk=nullptr for a BORROWING
+    // string element (RuntimeManaged row, retainRelease=true) — so it falls to
+    // `bz_array_set` (a plain memcpy, no refcount management). That leaks
+    // THREE ways: (1) rhs's +1 is an orphan (emitStringConcat memcpy's rhs's
+    // bytes and leaves its +1 untouched), (2) the DISPLACED OLD slot value is
+    // never released (bz_array_set has no disposer), and (3) each iteration's
+    // newVal is byte-copied into the slot with no +1 bookkeeping. LSan on
+    // origin/main: 100 iterations of `arr[0] += "abc" + i.ToString()` leak
+    // 30961 byte(s) across 398 allocations (100 rhs headers + 99 displaced
+    // old-value headers + their byte buffers).
+    //
+    // The plain-assignment path (lowerCollectionIndexerSet, this file line
+    // ~957-987) closes this with a dedicated `isStrElemArr` branch: it emits
+    // `bz_array_set_disposing` with stringElementReleaseThunk() (which
+    // releases the displaced OLD slot value and memcpy's the new pointer in),
+    // retaining first only when the incoming value is a BORROW. The compound
+    // path had no analogue and fell through to the generic elementPolicyFor
+    // store (bz_array_set, the bug). This block is the COMPOUND twin: mirror
+    // that exact isStrElemArr branch.
+    //
+    // OWNERSHIP GATE — why newVal is NOT released here (UNLIKE #2567's class-
+    // property compound fix): a CLASS property setter RETAINs its incoming
+    // value (§23.3 / §9), doubling a +1 producer's refcount, so #2567
+    // releases the OP-result's "extra" +1 after the setter body. A COLLECTION
+    // indexer does NOT retain — it TRANSFERs the +1 into the slot (the
+    // disposing setter releases the OLD value and memcpy's the new pointer
+    // in, consuming exactly one +1). So newVal's +1 (from emitStringConcat)
+    // is the slot's own reference; releasing it here would UAF the slot.
+    // Only rhs's orphan +1 (when the AST is a producer) needs a caller-side
+    // release — a borrow rhs's +1 belongs to its own slot and must NOT be
+    // released (isPlusOneStringProducer gates this; a named-local rhs is a
+    // borrow → no release → no UAF). Same ownership model as the plain-set
+    // path's isStrElemArr branch (line ~975-987) and #429's dict-string fix.
+    {
+        const sema::TypeRef* sArrEl =
+            (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+        bool sArrIsOwning =
+            recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            common::isOwningPrefixedName(recvTy->headName());
+        ElementPolicy sArrPol = elementPolicyFor(sArrEl, sArrIsOwning);
+        bool isStrElemArr =
+            !sArrIsOwning &&
+            sArrPol.cat == ElementPolicy::Category::RuntimeManaged &&
+            sArrEl && !sArrEl->nullable &&
+            sArrEl->kind == sema::TypeRef::Kind::Primitive &&
+            sArrEl->primitive == sema::PrimitiveType::String &&
+            recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            [](std::string_view n){
+                return n=="Array"||n=="Stack"||n=="Queue";
+            }(recvTy->headName());
+        if (isStrElemArr) {
+            // newVal is +1 (emitStringConcat always mints rc=1). Transfer that
+            // +1 into the slot via the disposing setter, which also releases
+            // the displaced OLD value. Do NOT retain (newVal is already +1)
+            // and do NOT release newVal afterward (its +1 is the slot's).
+            llvm::AllocaInst* slot = entryAlloca(newVal->getType());
+            builder_.CreateStore(newVal, slot);
+            auto* setFn = declareC("bz_array_set_disposing",
+                llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(setFn,
+                {recv, idx, slot, builder_.getInt64(esz),
+                 stringElementReleaseThunk()});
+            // rhs is a +1 producer when the AST is a BinaryExpr/string-interp/
+            // call (emitStringConcat does NOT consume rhs — it memcpy's its
+            // bytes and leaves rhs's +1 untouched). A BORROW rhs (a named
+            // local) is NOT a producer; releasing it would UAF the local's
+            // only ref at its scope end. Gate on the AST shape, not the LLVM
+            // pointer type. Mirrors lowerIndexerCompound line ~2539 (#2567).
+            if (rhs && rhs->getType()->isPointerTy() && as.value.get() &&
+                isPlusOneStringProducer(as.value.get()))
+                emitStringRelease(rhs);
+            return true;
+        }
+    }
+
     // --- Write back (bz_array_set / bz_array_set_disposing for OwningArray). ---
     llvm::AllocaInst* setSlot = entryAlloca(newVal->getType());
     builder_.CreateStore(newVal, setSlot);
