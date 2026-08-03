@@ -7395,16 +7395,32 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
     }
-    // fix #1073 release site (2/2) — the EXCEPTION/UNWIND edge. Install the
-    // cleanup as `unwindTarget_` for the duration of the call only, so every
-    // unwind edge `emitMethodCall` emits (the callee's propagate, a static-init
-    // guard, an inlined generic body's uncaught throw) drops the same temporaries
-    // on its way to the enclosing catch/propagate boundary. Restored immediately
-    // after, so no later unwind edge can reach it. See
-    // Emitter::closureArgUnwindCleanup for the exactly-once argument.
+    // fix #1073 / #2305 release site (2/2) — the EXCEPTION/UNWIND edge.
+    // Install the cleanup as `unwindTarget_` for the duration of the call only,
+    // so every unwind edge `emitMethodCall` emits (the callee's propagate, a
+    // static-init guard, an inlined generic body's uncaught throw) drops the
+    // same temporaries on its way to the enclosing catch/propagate boundary.
+    // Restored immediately after, so no later unwind edge can reach it. The
+    // #2305 commit extends the cleanup to BOTH vector sets (the #1864
+    // sync-iterator release is a #2305 residual, its normal-edge-only release
+    // was widened to the unwind edge here too). The two vectors are disjoint
+    // — syncIterClosureArgs is gated to a sync-iterator callee, the
+    // call-bounded arm excludes sync-iterator callees — so combining them
+    // never double-releases. See Emitter::closureArgUnwindCleanup for the
+    // exactly-once argument.
     llvm::BasicBlock* savedClArgUnwind = unwindTarget_;
-    if (!callBoundedClosureArgs.empty())
-        unwindTarget_ = closureArgUnwindCleanup(callBoundedClosureArgs);
+    if (!syncIterClosureArgs.empty() || !callBoundedClosureArgs.empty()) {
+        std::vector<llvm::Value*> allClosureArgs;
+        allClosureArgs.reserve(syncIterClosureArgs.size() +
+                               callBoundedClosureArgs.size());
+        allClosureArgs.insert(allClosureArgs.end(),
+                              syncIterClosureArgs.begin(),
+                              syncIterClosureArgs.end());
+        allClosureArgs.insert(allClosureArgs.end(),
+                              callBoundedClosureArgs.begin(),
+                              callBoundedClosureArgs.end());
+        unwindTarget_ = closureArgUnwindCleanup(allClosureArgs);
+    }
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs);
     unwindTarget_ = savedClArgUnwind;
     if (!diverged_) {
@@ -7413,8 +7429,6 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // code in the pending check's `cont` block, with no branch between the
         // producer's evaluation and here, so it runs exactly once per evaluation
         // of the call and is mutually exclusive with the unwind cleanup above.
-        // (The #1864 sync-iterator block keeps its historical normal-edge-only
-        // behaviour; extending it is out of this fix's scope.)
         for (llvm::Value* cl : callBoundedClosureArgs) emitClosureRelease(cl);
     }
     // Record the concrete subst that drives the RESULT local's layout so that

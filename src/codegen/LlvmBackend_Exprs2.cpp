@@ -4463,13 +4463,54 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // active so GEPs use the spec struct layout.
                 bool needsInlineForLayout = !genericSubst_.empty();
 
+                // fix #2305 / §28.14 / §27.5 / §28.9: same call-bounded
+                // closure ARGUMENT-PASS release as lowerCall's, transplanted
+                // to the ctor formals. `verifiedCallBoundedFormalAt` already
+                // covers `ast::NewExpr` (Ownership_Checks.cpp), so the same
+                // AST-shape guard applies one-for-one. `cd->params` is the
+                // SOURCE-WRITTEN formals; `ctorArgExprs` is parallel to
+                // `args[1..]` (args[0]=obj). Exclude the receiver and
+                // excluded-`out` slots via the parallel size check.
+                std::vector<llvm::Value*> ctorClosureArgs;
+                if (!diverged_ && !needsInlineForLayout) {
+                    for (std::size_t pi = 0; pi < cd->params.size(); ++pi) {
+                        const ast::Param& p = cd->params[pi];
+                        if (!p.modifier.empty()) continue;
+                        if (!p.type ||
+                            p.type->kind != ast::TypeKind::Function)
+                            continue;
+                        const std::size_t ai = pi + 1;
+                        if (ai < args.size() && ai - 1 < ctorArgExprs.size() &&
+                            ctorArgExprs[ai - 1] &&
+                            isPlusOneClosureProducer(ctorArgExprs[ai - 1]))
+                            ctorClosureArgs.push_back(args[ai]);
+                    }
+                }
+
                 if (!typesMismatch && !needsInlineForLayout) {
+                    // fix #2305: install the unwind-edge cleanup so a
+                    // propagating constructor (the ctor body throws, or its
+                    // argument-eval threw and the new-arg-unwind cleanup
+                    // already reclaimed `obj` and routed to the enclosing
+                    // boundary) drops these temporaries on the way out.
+                    // Mutually exclusive with the normal-path release below.
+                    llvm::BasicBlock* savedClArgUnwind = unwindTarget_;
+                    if (!ctorClosureArgs.empty())
+                        unwindTarget_ = closureArgUnwindCleanup(ctorClosureArgs);
                     builder_.CreateCall(it->second, args);
+                    unwindTarget_ = savedClArgUnwind;
                     // §22.9 / §28.3 (FINDING [4]): the called ctor disposed its
                     // assigned owned fields + base subobject on its own unwind
                     // path (without freeing `this`); reclaim the instance block
                     // here on the throw edge.
                     emitNewPendingCheck(obj);
+                    // fix #2305: normal-edge release. Only when the ctor
+                    // returned (the throw edge already dropped these via the
+                    // unwind cleanup above).
+                    if (!diverged_) {
+                        for (llvm::Value* cl : ctorClosureArgs)
+                            emitClosureRelease(cl);
+                    }
                 } else {
                     // Inline the constructor body with the generic
                     // substitution so field stores use concrete types.
