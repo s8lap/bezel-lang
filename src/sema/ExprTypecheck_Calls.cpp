@@ -8560,13 +8560,15 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
     }
 }
 
-// §7 / stdlib §4.x (#2582): see the header comment for the full rationale.
-// The collection twin of #2315's checkBuiltinStringCallArgs. A builtin
-// collection instance method (Array<T>.IndexOf/Contains/…, Set<T>/SortedSet<
-// T>.Add/TryAdd/Contains/Remove, Stack<T>/Queue<T>.Push/Enqueue/Contains,
-// LinkedList<T>.AddFirst/AddLast/AddBefore/AddAfter/Find/Contains/Remove,
-// Dictionary<K,V>/SortedDictionary<K,V>.ContainsKey/Contains/Remove,
-// OwningDictionary<K,V>.PopValue/TryPopValue, OwningSet<T>.Take/TryTake) has
+// §7 / stdlib §4.x (#2582) + §4.14/§4.15 (#2600): see the header comment for
+// the full rationale. The collection twin of #2315's checkBuiltinStringCallArgs.
+// A builtin collection instance method (Array<T>.IndexOf/Contains/…, Set<T>/
+// SortedSet<T>.Add/TryAdd/Contains/Remove, Stack<T>/Queue<T>.Push/Enqueue/
+// Contains, LinkedList<T>.AddFirst/AddLast/AddBefore/AddAfter/Find/Contains/
+// Remove, Dictionary<K,V>/SortedDictionary<K,V>.ContainsKey/Contains/Remove,
+// OwningDictionary<K,V>.PopValue/TryPopValue, OwningSet<T>.Take/TryTake), and
+// the span-buffer family (#2600: ArraySpan<T>/ReadOnlyArraySpan<T>.IndexOf/
+// Contains/Fill, value-T Span<T>/ReadOnlySpan<T>.IndexOf/Contains/Fill), has
 // no MethodSymbol — these are synthetic Named TypeRefs with no user
 // TypeSymbol — so checkCallArity → checkArgsAgainstParams → checkAssignable
 // never fires. An un-narrowed `int?` (or `T?`) argument was silently accepted
@@ -8580,16 +8582,25 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
 //
 // The element/key type is `recvTy->genericArgs[0]` for every covered family —
 // element-typed collections (Array<T>/Set<T>/Stack<T>/…) instantiate T at
-// genericArgs[0], and the keyed collections (Dictionary<K,V>/OwningDictionary<
-// K,V>/SortedDictionary<K,V>) instantiate K at genericArgs[0]. The parameter's
-// OWN nullability is the instantiated type's nullability — `Array<int?>` has
-// `IndexOf(item: int?)`, so an `int?` argument is admissible; `Array<int>`
-// has `IndexOf(item: int)`, so an un-narrowed `int?` is rejected. The
-// borrowing mutators (Add/Push/Enqueue/Insert/AddFirst/AddLast/AddBefore/
-// AddAfter/TryAdd) are gated to the borrowing collection names because their
-// owning twins take `owned item: T` (the call-site `owned` modifier aliases
-// under §22.3 and is skipped by the modifier guard below, but the name gate
-// keeps the diagnostic precise when a caller forgets the marker).
+// genericArgs[0], the keyed collections (Dictionary<K,V>/OwningDictionary<
+// K,V>/SortedDictionary<K,V>) instantiate K at genericArgs[0], and the
+// span-buffer family (ArraySpan<T>/ReadOnlyArraySpan<T>/Span<T>/
+// ReadOnlySpan<T>) instantiates its element T at genericArgs[0]. The
+// parameter's OWN nullability is the instantiated type's nullability —
+// `Array<int?>` has `IndexOf(item: int?)`, so an `int?` argument is
+// admissible; `Array<int>` has `IndexOf(item: int)`, so an un-narrowed
+// `int?` is rejected. EXCEPTION (#2600): class-T `Span<T>`/`ReadOnlySpan<T>`
+// declare `IndexOf(value: T?)` / `Contains(value: T?)` — NULLABLE (stdlib
+// §4.14 line 2463/2611) — so the helper's spanBufferSkipClassT branch
+// suppresses the check for that case (an un-narrowed `T?` is admissible);
+// ArraySpan<T>/ReadOnlyArraySpan<T> keep `value: T` for class T too (§4.15
+// line 2881 — Array<T> slots do not wrap class T in T?), so they are covered
+// unconditionally. The borrowing mutators (Add/Push/Enqueue/Insert/AddFirst/
+// AddLast/AddBefore/AddAfter/TryAdd) are gated to the borrowing collection
+// names because their owning twins take `owned item: T` (the call-site
+// `owned` modifier aliases under §22.3 and is skipped by the modifier guard
+// below, but the name gate keeps the diagnostic precise when a caller
+// forgets the marker).
 void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
     if (!ma || !ma->target) return;
@@ -8618,10 +8629,49 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     bool isKeyedCollection =
         colName == "Dictionary" || colName == "OwningDictionary" ||
         colName == "SortedDictionary";
-    if (!isElementCollection && !isKeyedCollection) return;
+    // §7 / stdlib §4.14/§4.15 (#2600): the span-BUFFER family — ArraySpan<T>/
+    // ReadOnlyArraySpan<T> (borrowing, §4.15) and Span<T>/ReadOnlySpan<T>
+    // (owning, §4.14) — is synthetically typed in the CallExpr handler (L6575)
+    // with the same no-MethodSymbol shape as the element collections above, so
+    // its IndexOf/Contains/Fill `value: T` parameter skipped this check and an
+    // un-narrowed `T?` reached codegen and ICE'd (LLVM ICmpInst assertion,
+    // exit 134 — same #2582 failure mode).
+    bool isSpanBuffer =
+        colName == "ArraySpan" || colName == "ReadOnlyArraySpan" ||
+        colName == "Span"      || colName == "ReadOnlySpan";
+    if (!isElementCollection && !isKeyedCollection && !isSpanBuffer) return;
     if (recvTy->genericArgs.empty() || !recvTy->genericArgs[0]) return;
     TypeRef* itemTy = recvTy->genericArgs[0];  // T (element) or K (key)
     const auto& m = ma->member;
+
+    // §4.14 vs §4.15 parameter-nullability split for the span-buffer family.
+    // ArraySpan<T>/ReadOnlyArraySpan<T> declare `value: T` for EVERY T (Array<T>
+    // slots do not wrap class T in T? — stdlib §4.15 line 2881), so the param
+    // type is exactly `genericArgs[0]` and the check below is correct unconditionally.
+    // Span<T>/ReadOnlySpan<T> SPLIT by T's category: for VALUE T they declare
+    // `value: T` (non-nullable, §4.14 line 2522/2640 — check fires); for CLASS T
+    // they declare `value: T?` (NULLABLE, §4.14 line 2463/2611 — an un-narrowed
+    // `T?` is admissible, so the check must NOT fire). The class-T owning span
+    // also forbids Fill (the typeCall block at L6671 already rejects it). Mirror
+    // the typeCall block's elemIsClass computation (L6588-6602) to gate this.
+    bool spanBufferSkipClassT = false;
+    if (isSpanBuffer && (colName == "Span" || colName == "ReadOnlySpan")) {
+        const TypeRef* spEl = recvTy->genericArgs[0];
+        bool elemIsClass = false;
+        if (spEl && spEl->kind == TypeRef::Kind::Named) {
+            if (spEl->declaration &&
+                (spEl->declaration->kind == ast::TypeDeclKind::Class ||
+                 spEl->declaration->kind == ast::TypeDeclKind::Interface))
+                elemIsClass = true;
+            else if (!spEl->declaration && spEl->astNode && spEl->astNode->name &&
+                     !spEl->astNode->name->parts.empty()) {
+                auto en = spEl->headName();
+                if (en == "Shared" || en == "Weak")
+                    elemIsClass = true;
+            }
+        }
+        spanBufferSkipClassT = elemIsClass;
+    }
 
     // Per (method, position): is this position a NON-nullable `item: T` /
     // `query: T` / `key: K` parameter this helper covers? Borrows the SAME
@@ -8676,6 +8726,21 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
             (m == "AddFirst"  && colName == "LinkedList") ||
             (m == "AddLast"   && colName == "LinkedList")))
             return true;
+        // §7 / stdlib §4.14/§4.15 (#2600): span-buffer IndexOf/Contains declare
+        // NON-nullable `value: T` at pos 0 for every span-buffer family EXCEPT
+        // class-T Span/ReadOnlySpan (whose param is `value: T?` — handled by
+        // spanBufferSkipClassT below, which skips the entire arg loop body for
+        // that case). Fill is the additional value-T mutator the span-buffer
+        // family adds vs the element-collection set above; it is gated to the
+        // WRITABLE forms (ArraySpan/Span) because the read-only spans do not
+        // declare Fill (the typeCall block at L6664 already rejects Fill on a
+        // read-only span with its own diagnostic, so the check does not need to
+        // double-report). For class-T Span, Fill is already rejected by the
+        // typeCall block (L6671) and spanBufferSkipClassT skips the loop body.
+        if (isSpanBuffer && pos == 0 && (
+            m == "IndexOf" || m == "Contains" ||
+            (m == "Fill" && (colName == "ArraySpan" || colName == "Span"))))
+            return true;
         // Position-1 item methods.
         if (pos == 1 && (
             // Array<T>.Insert(index: int, item: T) — stdlib §4.4.
@@ -8697,6 +8762,10 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         // the parameter's nullability is governed by the §22.3 transfer rule.
         if (!a.modifier.empty()) continue;
         if (!isItemPosition(i)) continue;
+        // §4.14 (#2600): class-T Span/ReadOnlySpan declare `value: T?`
+        // (nullable) for IndexOf/Contains — an un-narrowed `T?` argument is
+        // admissible, so skip the §7 check for that case (would false-reject).
+        if (spanBufferSkipClassT) continue;
         TypeRef* argTy = ctx_.exprType(*a.value);
         if (!argTy) continue;
         checkAssignable(
