@@ -8816,13 +8816,14 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     }
 }
 
-// §7 / stdlib §3.3 (#2581): see the header comment for the full rationale. The
-// ReadOnlyStringSpan twin of #2315's checkBuiltinStringCallArgs. A builtin
-// ReadOnlyStringSpan instance method (IndexOf/Contains/StartsWith/EndsWith/
-// SequenceEqual, stdlib §3.3) declares NON-nullable `string`/`char` operands
-// but has no MethodSymbol — it is synthetically typed in the CallExpr block at
+// §7 / stdlib §3.3 (#2581, #2601): see the header comment for the full
+// rationale. The ReadOnlyStringSpan twin of #2315's checkBuiltinStringCallArgs.
+// A builtin ReadOnlyStringSpan instance method (IndexOf/Contains/StartsWith/
+// EndsWith/SequenceEqual, stdlib §3.3; plus Slice(start: int[, length: int]),
+// #2601) declares NON-nullable `string`/`char`/`int` operands but has no
+// MethodSymbol — it is synthetically typed in the CallExpr block at
 // L6419 — so checkCallArity → checkArgsAgainstParams → checkAssignable never
-// fired. An un-narrowed `string?` (or `char?`) argument was silently accepted.
+// fired. An un-narrowed `string?`/`char?`/`int?` argument was silently accepted.
 // #2315's gate keys on a Primitive-String VALUE receiver exprType, which
 // excludes the Named ReadOnlyStringSpan receiver, so the span path was left
 // open. This helper mirrors the user-method path against the §3.3-declared
@@ -8867,6 +8868,15 @@ void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
     auto paramKind = [&](std::size_t pos, PrimitiveType argKind)
             -> PrimitiveType {
         using PT = PrimitiveType;
+        // §3.3 (#2601): Slice(start: int, length: int) and the v0.195
+        // Slice(start) overload declare NON-nullable `int` at BOTH pos 0
+        // (start) and pos 1 (length). Unlike the search/compare family
+        // (one operand at pos 0), Slice has an int param at pos 1 too, so
+        // check those before the pos-0-only short-circuit below — an
+        // un-narrowed `int?` reaching codegen trips a `trunc {i8,i32}->i32`
+        // verifyModule failure (the same defect shape #2581 closed for
+        // `string.Insert` pos 0 via the intPos set in the string helper).
+        if (m == "Slice" && (pos == 0 || pos == 1)) return PT::Int;
         if (pos != 0) return PT::None;  // every covered method takes one operand
         if (m == "IndexOf" || m == "Contains") {
             if (argKind == PT::String) return PT::String;
