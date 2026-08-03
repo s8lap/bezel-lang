@@ -3921,6 +3921,37 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         } else if (fs->posParam && fs->posParam->type) {
             rt = ctx_.resolvedType(*fs->posParam->type);
         }
+        // fix #2300 (§2.8.2/§28.9, v0.236): an IMPORTED class field has no
+        // ast::FieldDecl — the importer (ModuleLoader) reconstructs a
+        // FieldSymbol from dependency metadata, so neither branch above
+        // resolves (fs->decl is not a FieldDecl and posParam is null for a
+        // body field). The resolved type rides the importedMemberType side
+        // table (set by ModuleLoader from MetaMember::type); consult it here,
+        // mirroring every other imported-field read site (LlvmBackend_Exprs.cpp
+        // ~L4844 for property reads, LlvmBackend_Layout.cpp ~L1032 for storage
+        // layout). Without this, `h.F(10)` on an imported function-typed field
+        // left rt=null, skipped the `rt->kind == Function` dispatch below, and
+        // fell through to the #2477 "cannot dispatch" zero-init fallback —
+        // silently returning 0 (garbage) instead of the call result. Binding
+        // to a local first (`g := h.F; g(10)`) worked because that dispatches
+        // through the LocalSymbol path with the field read supplying the
+        // closure pointer; only the FieldSymbol callee path missed the type.
+        //
+        // Gated on a CLASS receiver: an imported RECORD function-typed field
+        // has a SEPARATE, deeper pre-existing defect — the cross-module field
+        // READ itself yields a bad closure pointer (the local-bind workaround
+        // `g := r.F; g(n)` segfaults on an imported record on origin/main,
+        // independent of this fix). Routing the record direct-invoke through
+        // emitClosureCall here would only turn that case's silent zero-init
+        // into a segfault without fixing the underlying read. The record
+        // field-read ABI is filed separately and out of scope for #2300
+        // (which is class-specific); leave the record direct-invoke on its
+        // pre-fix #2477 zero-init path until that lands.
+        if (!rt && fs->parent &&
+            fs->parent->kind == ast::TypeDeclKind::Class) {
+            if (sema::TypeRef* it = ctx_.importedMemberType(fs))
+                rt = it;
+        }
         if (rt && rt->kind != sema::TypeRef::Kind::Function) {
             // Declared type isn't itself a function — but for a generic-param
             // field the substitution at the call site may have made it one.
