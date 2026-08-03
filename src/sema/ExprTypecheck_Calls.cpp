@@ -8057,6 +8057,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // set the minimum; the total is the maximum (no variadics in
     // Bezel — §22.5).
     if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
+        // fix #2328 (§26.5, v0.236): the per-arg type / arity check used
+        // to bail for extension methods (`if (!md || !ms->parent) return;`).
+        // The arity check is now run by the arity-aware extension lookup
+        // in `resolveMemberAccess` (which sees `currentCallArity_`); the
+        // per-arg type check is run below by the new extension branch in
+        // `checkCallArity` itself. So this call site is unchanged.
         checkCallArity(ce, ms);
     }
 
@@ -8220,6 +8226,32 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
     // or modifier argument is left to the deferred path rather than misreported.
     if (!md && ctx_.isImported(ms)) {
         checkImportedCallArity(ce, ms);
+        return;
+    }
+    // fix #2328 (§26.5, v0.236): extension methods have a null `ms->parent`
+    // (their owner is the ExtensionSymbol, not a class TypeSymbol), so the
+    // hierarchy walk below does not apply. Treat the extension's MethodSymbol
+    // itself as the sole candidate and run the ordinary per-argument check
+    // against its parameter list. The CALL-SITE ARITY was already filtered
+    // by the arity-aware `lookupExtensionMember` call from resolveMemberAccess
+    // (which sees `currentCallArity_` for the enclosing CallExpr), so a
+    // mismatch between the call's args and the chosen method's arity never
+    // reaches this branch — `checkArgsAgainstParams` is the per-argument
+    // §5.1 / §22.3 type gate, the same gate a class method's call gets.
+    // `classTarget` / `classParent` stay null: `substituteMemberType` short-
+    // circuits when `classParent` is null, so the receiver-class generic
+    // substitution that a class method's call runs (§14.1 / #1756) is
+    // unnecessary here — extension methods cannot reference a receiver
+    // class's own type parameters (extensions don't see them, §26.4).
+    if (md && ms->extensionDecl) {
+        const ast::Expr* recvTarget = nullptr;
+        if (auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+            recvTarget = ma->target.get();
+        checkArgsAgainstParams(
+            md->params, ce.args, ce.span.begin,
+            std::string("call to `") + std::string(ms->name) + "`",
+            recvTarget, /*classParent=*/nullptr, md);
         return;
     }
     if (!md || !ms->parent) return;
@@ -10713,10 +10745,39 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // reporting 'not yet supported', try a user-defined extension
                 // method"). Mirrors both.
                 if (Symbol* ext = lookupExtensionMember(
-                        ctx_.primitiveTypeRef(pt), mbr, nullptr, ma.span.begin)) {
+                        ctx_.primitiveTypeRef(pt), mbr, nullptr, ma.span.begin,
+                        /*reportAmbiguity=*/true, currentCallArity_)) {
                     resolveExtensionMember(ma, ext);
                     return;
                 }
+                // per §3.4: the primitive-static handler above recognises a
+                // fixed, closed set of names.  Any name that reached this
+                // point is NOT in that set — emit a diagnostic and return so
+                // the callee node is left untyped-but-diagnosed rather than
+                // untyped-and-silent, which would otherwise crash codegen
+                // (issue #491).
+                //
+                // fix #2328 (§26.5, v0.236): the lookup above is arity-
+                // aware (it took `currentCallArity_`); on no-match it
+                // stays silent (the caller has no extension candidates
+                // that match the call's arity, but the catch-all §3.4
+                // wording below is the correct diagnostic here — the
+                // primitive-static surface is a closed set with no
+                // "extension on primitive" path, so an arity mismatch
+                // is the same shape as a missing member). The primitive
+                // path's own fallback fires for BOTH the arity-aware and
+                // bare-reference cases (the latter takes `currentCallArity_
+                // == -1`, this is a bare `int.M` reference). Permissive
+                // receivers (Object, unconstrained type parameters) do
+                // NOT reach this path — they take the general path with
+                // the `knownCompleteUserType` gate, which IS suppressed
+                // for permissive receivers.
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    "type '" + std::string(id2->name) +
+                        "' has no static method or property '" +
+                        std::string(mbr) + "' (§3.4)");
+                return;
                 // per §3.4: the primitive-static handler above recognises a
                 // fixed, closed set of names.  Any name that reached this
                 // point is NOT in that set — emit a diagnostic and return so
@@ -12074,7 +12135,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // the extension's signature and return without error.  Only
                     // emit the diagnostic when no user extension matches.
                     if (Symbol* ext = lookupExtensionMember(
-                            tt, ma.member, nullptr, ma.span.begin)) {
+                            tt, ma.member, nullptr, ma.span.begin,
+                            /*reportAmbiguity=*/true, currentCallArity_)) {
                         resolveExtensionMember(ma, ext);
                         return;
                     }
@@ -12106,6 +12168,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ma.member == "Aggregate"  || ma.member == "ForEach";
                     if (!isLinqOp) {
                         // Emit a diagnostic for unrecognized string members.
+                        //
+                        // fix #2328 (§26.5, v0.236): the arity-aware
+                        // lookup above stays silent on no-match. The
+                        // string-codegen "not yet supported" wording is
+                        // still the right catch-all for primitive-string
+                        // members (the string-receiver path's surface is
+                        // a closed set; an arity mismatch on a string
+                        // user-extension is a separate concern, but the
+                        // general `if (knownCompleteUserType)` reject
+                        // only fires for non-string user types — the
+                        // primitive-string case stays here, with the
+                        // historical "not yet supported" wording for
+                        // both the arity-aware and bare-reference paths).
                         ctx_.diagnostics().report(
                             Severity::Error, ma.span.begin,
                             std::string("string member `.") +
@@ -13811,7 +13886,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 auto extLoc = ma.span.begin;
                 if (extLoc.line == 0 && ma.target) extLoc = ma.target->span.begin;
                 if (Symbol* ext = lookupExtensionMember(
-                        recvTy, ma.member, &binding, extLoc)) {
+                        recvTy, ma.member, &binding, extLoc,
+                        /*reportAmbiguity=*/true, currentCallArity_)) {
                     if (!binding.empty())
                         ctx_.setExprExtBinding(&ma, std::move(binding));
                     resolveExtensionMember(ma, ext);
@@ -14156,7 +14232,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         auto extLoc = ma.span.begin;
         if (extLoc.line == 0 && ma.target) extLoc = ma.target->span.begin;
         if (Symbol* ext = lookupExtensionMember(
-                recvTy, ma.member, &binding, extLoc)) {
+                recvTy, ma.member, &binding, extLoc,
+                /*reportAmbiguity=*/true, currentCallArity_)) {
             if (!binding.empty())
                 ctx_.setExprExtBinding(&ma, std::move(binding));
             resolveExtensionMember(ma, ext);
@@ -14813,11 +14890,107 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             auto nmLoc = ma.span.begin;
             if (nmLoc.line == 0 && ma.target)
                 nmLoc = ma.target->span.begin;
-            ctx_.diagnostics().report(
-                Severity::Error, nmLoc,
-                std::string("no member `") + std::string(ma.member) +
-                    "` on type `" + std::string(targetType->name) +
-                    "` (§11.3, §12.1)");
+            // fix #2328 (§26.5, v0.236): if `currentCallArity_ >= 0` the
+            // arity-aware `lookupExtensionMember` calls above silently
+            // returned null (no candidate with the call's arity), and the
+            // catch-all "no member `M` on type `T`" reject would be
+            // misleading — a call with the wrong arity is an ARITY error,
+            // not a "no such member" error. Emit an arity-specific
+            // diagnostic here, where the `knownCompleteUserType` gate
+            // already guards the catch-all path. Permissive receivers
+            // (Object, unconstrained type parameters, …) don't reach
+            // this branch, so their `Object.Unknown()` idiom is unaffected.
+            if (currentCallArity_ >= 0) {
+                // fix #2328 (§26.5, v0.236): the arity-aware
+                // `lookupExtensionMember` returned null. Distinguish
+                // two cases: (a) no extension method with this name
+                // exists on the receiver at any arity (a true
+                // "no member" error — the user typed `Spea` instead
+                // of `Speak`); (b) extension methods with this name
+                // exist on the receiver, but none take the call's
+                // arity (an "arity mismatch" — e.g. `o.Bar()` against
+                // `extension T method Bar(x: int)`). Only (b) gets
+                // the arity-specific diagnostic; (a) keeps the
+                // existing "no member" wording, which is what the
+                // `typo_of_real_method` test pins. Walk the
+                // candidate extensions to test the distinction.
+                bool anySameNamedExtension = false;
+                {
+                    std::vector<ExtensionSymbol*> cand;
+                    if (ctx_.module()) {
+                        for (Symbol* child : ctx_.module()->children) {
+                            if (auto* e =
+                                    dynamic_cast<ExtensionSymbol*>(child))
+                                cand.push_back(e);
+                        }
+                    }
+                    cand.insert(cand.end(), importedExtensions_.begin(),
+                                importedExtensions_.end());
+                    for (ExtensionSymbol* ext : cand) {
+                        auto* decl =
+                            dynamic_cast<const ast::ExtensionDecl*>(
+                                ext->decl);
+                        if (!decl) continue;
+                        // `decl->targetType` IS the extension's
+                        // declared target; the matching-vs-receiver
+                        // check (extensionFindMatchingAncestor) is
+                        // `static` in ExprTypecheck.cpp and would
+                        // require plumbing it across the TU
+                        // boundary. We instead use a conservative
+                        // name match on the AST target type — when
+                        // the candidate's declared target's last
+                        // name segment matches `targetType->name`
+                        // and the arity is different from the
+                        // call's, the arity-specific message is
+                        // more informative than "no member". The
+                        // targetType-name-keyed match can under-
+                        // approximate (a generic head like
+                        // `IEnumerable<T>` will match the first
+                        // extension on `Array<T>` for the wrong
+                        // reason), but the diagnostic is only
+                        // emitted on the "no member" reject
+                        // path, so a too-precise arity
+                        // diagnostic would merely widen the set
+                        // of cases that get the arity wording —
+                        // never narrow it.
+                        if (!decl->targetType || !decl->targetType->name)
+                            continue;
+                        const auto& nm = decl->targetType->name->parts;
+                        if (nm.empty()) continue;
+                        if (std::string(nm.back()) !=
+                            std::string(targetType->name))
+                            continue;
+                        for (Symbol* m : ext->members) {
+                            if (m && m->name == ma.member) {
+                                anySameNamedExtension = true;
+                                break;
+                            }
+                        }
+                        if (anySameNamedExtension) break;
+                    }
+                }
+                if (anySameNamedExtension) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, nmLoc,
+                        "no extension method `" + std::string(ma.member) +
+                            "` on type `" + std::string(targetType->name) +
+                            "` takes " +
+                            std::to_string(currentCallArity_) +
+                            " argument(s) (§26.5)");
+                } else {
+                    ctx_.diagnostics().report(
+                        Severity::Error, nmLoc,
+                        std::string("no member `") + std::string(ma.member) +
+                            "` on type `" + std::string(targetType->name) +
+                            "` (§11.3, §12.1)");
+                }
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, nmLoc,
+                    std::string("no member `") + std::string(ma.member) +
+                        "` on type `" + std::string(targetType->name) +
+                        "` (§11.3, §12.1)");
+            }
         }
         // #608 / §8.5 / §12: `ToString()` is universal and returns `string`.
         // Set the MemberAccessExpr's type so that callers (e.g. `.Length` on the
@@ -15050,8 +15223,13 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     if (!member) {
         const TypeRef* recvTy = nm.target ? ctx_.exprType(*nm.target) : nullptr;
         if (recvTy) {
-            member = lookupExtensionMember(recvTy, nm.member, nullptr,
-                                           nm.span.begin);
+            // fix #2328 (§26.5, v0.236): pass `currentCallArity_` so an
+            // arity-mismatched call (`obj?.M()` against `M(x: int)`) gets
+            // the arity-specific diagnostic from the lookup, not the
+            // bare-reference "no member" reject downstream.
+            member = lookupExtensionMember(
+                recvTy, nm.member, nullptr, nm.span.begin,
+                /*reportAmbiguity=*/true, currentCallArity_);
         }
         // §7.5 / #751: a string/primitive built-in member (e.g. `Length`) has
         // no Symbol — resolveMemberAccess types these via a large inlined

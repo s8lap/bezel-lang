@@ -257,6 +257,20 @@ private:
     // (the specific callee node), so a stale value never yields a false positive.
     // Saved/restored around each callee visit.
     const ast::Expr* calleeOfCallCtx_ = nullptr;
+    // fix #2328 (§26.5, v0.236): the call-site arity the currently-being-
+    // visited MemberAccessExpr belongs to (its enclosing CallExpr's argument
+    // count, when there is one). -1 means "no call context" — a bare-
+    // reference access (a method reference, a property read, etc.), which
+    // leaves `lookupExtensionMember`'s arity filter un-applied. `+N` means
+    // "this access is the callee of a `M(...)` call with N args" — the
+    // lookup filters out any same-named extension member whose parameter
+    // list has a different arity, BEFORE the §26.5.1 specificity ranking,
+    // so the per-call arity check that `checkCallArity` performs for
+    // ordinary methods happens in the same place for extensions and the
+    // user never sees a bogus §26.5 rule-4 ambiguity on a wrong-arity
+    // call. Saved/restored around each callee visit (a nested call sets
+    // the OUTER arity while the inner call's own arity is in flight).
+    std::ptrdiff_t currentCallArity_ = -1;
     // §11.8: one synthesized GenericParamSymbol marker per type-parameter
     // name, attached as the exprSymbol of a `T` member-access receiver so
     // resolveMemberAccess (and codegen) can identify the receiver kind.
@@ -1178,12 +1192,28 @@ private:
     // and `reportAmbiguity` lets a pure existence PROBE (see
     // extensionNameBlockedNote) suppress the diagnostic, since a probe must
     // not itself cause the ambiguity error it is only checking for.
+    // fix #2328 (§26.5, v0.236): `arity` (default -1 = no filter) narrows
+    // the candidate set to extension members whose parameter list has exactly
+    // that many parameters — the per-call arity check the §26.5 step-2 lookup
+    // previously skipped. A non-negative `arity` does NOT change the
+    // specificity ranking: an arity-filtered ambiguity still raises rule 4,
+    // and an arity-filtered unique winner is still preferred over an
+    // arity-mismatched block. Bare-reference call sites (which have no
+    // arity — they produce a Function value) leave it at the default.
+    //
+    // Parameter order is preserved with the original (receiver, name, outBinding,
+    // loc, reportAmbiguity) signature plus the new `arity` at the END, so the
+    // existing call sites — which pass `nullptr` for outBinding at the third
+    // slot — keep working without edits. The new arity-filtered path used by
+    // the §26.5 call-site fix in ExprTypecheck_Calls.cpp passes both an arity
+    // AND a non-null outBinding.
     Symbol* lookupExtensionMember(
         const TypeRef* receiver,
         std::string_view name,
         std::vector<std::pair<std::string, TypeRef*>>* outBinding = nullptr,
         SourceLocation loc = SourceLocation{},
-        bool reportAmbiguity = true);
+        bool reportAmbiguity = true,
+        std::ptrdiff_t arity = -1);
 
     // §26.5 step 1 (v0.183): when an instance member of `name` name-blocks
     // extension lookup for `receiver` and the committed instance call then

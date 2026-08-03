@@ -4460,7 +4460,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // function value. Saved/restored so a nested call's callee does not leak.
         const ast::Expr* savedCallee = calleeOfCallCtx_;
         calleeOfCallCtx_ = ce->callee.get();
+        // fix #2328 (§26.5, v0.236): the call's arity is the gate that
+        // arity-aware `lookupExtensionMember` consults while resolving the
+        // callee. Stash it on the worker for `resolveMemberAccess` /
+        // `resolveNullCondMember` to read; -1 (the default) means "not in
+        // a call context" — bare references and the post-arity visitor
+        // paths leave it untouched. Nested calls save/restore around their
+        // own callee visit, so an inner call's arity does not leak into
+        // the outer call's callee-visit lookup.
+        std::ptrdiff_t savedArity = currentCallArity_;
+        currentCallArity_ =
+            static_cast<std::ptrdiff_t>(ce->args.size());
         if (ce->callee) visitExpr(*ce->callee);
+        currentCallArity_ = savedArity;
         calleeOfCallCtx_ = savedCallee;
         // per §24.3: an event-handler argument (`<event>.Subscribe(h)` / .Add /
         // .Remove) — push the event payload type so an untyped handler lambda's

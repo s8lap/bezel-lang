@@ -5940,7 +5940,8 @@ Symbol* ExprTC::lookupExtensionMember(
     std::string_view name,
     std::vector<std::pair<std::string, TypeRef*>>* outBinding,
     SourceLocation loc,
-    bool reportAmbiguity) {
+    bool reportAmbiguity,
+    std::ptrdiff_t arity) {
     if (!receiver) return nullptr;
     // §26.5 step 2: "the compiler searches the current module AND all imported
     // modules for extension blocks on x's type". The candidate set is this
@@ -6052,6 +6053,16 @@ Symbol* ExprTC::lookupExtensionMember(
             target && target->kind == TypeRef::Kind::Named && !target->declaration;
         for (Symbol* m : ext->members) {
             if (!m || m->name != name) continue;
+            // fix #2328 (§26.5, v0.236): per-call arity filter on extension
+            // methods (the relevant kind for an arity-mismatched call — extension
+            // PROPERTYs are bare references and exempt). Skipping a non-matching
+            // member drops it from the candidate set; the per-block scan
+            // continues to the next name match.
+            if (arity >= 0) {
+                auto* ms = dynamic_cast<MethodSymbol*>(m);
+                if (ms && ms->params.size() != static_cast<std::size_t>(arity))
+                    continue;
+            }
             if (!freeVars.empty() && !targetIsBuiltin) {
                 // User-declared generic extension (#773): skip methods whose
                 // signatures reference a free type variable — that case is
@@ -6073,16 +6084,42 @@ Symbol* ExprTC::lookupExtensionMember(
                 // Collect T→concrete mapping positionally from matched ancestor.
                 collectFreeVarBinding(target, matchedAnc, freeVars, binding);
             }
-            // §26.5 (pre-existing, unchanged by #1307): the first same-named
-            // member within ONE block wins — per-block overload selection by
-            // arity/argument type is a separate, unimplemented gap (member
-            // access is typed independent of the enclosing call's argument
-            // list throughout this front-end), not touched here.
+            // fix #2328 (§26.5, v0.236): per-block same-name overloads are
+            // arity-filtered ABOVE (when `arity >= 0`), so the first surviving
+            // member within ONE block is the arity-correct candidate. A bare
+            // reference (`arity == -1`, the default) still picks the first
+            // same-named member per block — that gap is unchanged: per-block
+            // argument-type disambiguation for a name-matched, arity-matched
+            // overload set is a separate concern that §26.5 step 2 explicitly
+            // defers (the pre-#2328 comment in this slot). Adding a per-block
+            // arity/argument-type tie-break here would be out of scope for the
+            // fix; the call site can still surface an ambiguity in step 2.
             found.push_back({m, matchedAnc, target, ext, decl, std::move(binding)});
             break;
         }
     }
-    if (found.empty()) return nullptr;
+    if (found.empty()) {
+        // fix #2328 (§26.5, v0.236): a non-negative `arity` filters out same-
+        // named extension members whose parameter list has a different
+        // arity (see the per-block loop above). The lookup itself stays
+        // SILENT on no-match — the caller (resolveMemberAccess) decides
+        // whether to emit an arity-specific diagnostic, depending on the
+        // receiver's permissiveness. A permissive `Object`-typed
+        // receiver (§3 / #605) accepts any member name and the no-arity
+        // lookups are intentionally non-rejecting, so the "Object.
+        // Unknown()" idiom that several codegen tests rely on (a
+        // permissive member access whose only failure is the codegen
+        // zero-init warning) must not be rejected here. Emitting in the
+        // lookup would also break the "no member" reject's existing
+        // `knownCompleteUserType` gate — for a permissive receiver the
+        // caller would have fired its own diagnostic (or, as today,
+        // chosen not to); the lookup's silent null return lets the
+        // caller keep that decision. The per-call arity-specific
+        // diagnostic for the non-permissive (known-complete-type)
+        // case is added by the caller, which has the receiver
+        // `targetType` and the per-block arities in scope.
+        return nullptr;
+    }
     if (found.size() == 1) {
         if (outBinding) *outBinding = found[0].binding;
         return found[0].member;
