@@ -3967,6 +3967,81 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             return emitClosureCall(closurePtr, rt);
         }
     }
+    // fix #2589 (§23.1/§23/§2.8.2/§28.9, v0.236): directly invoking a
+    // function-typed auto-PROPERTY — `obj.P(args)` where `P` is declared
+    // `property P: (int) -> int := lambda(x) => x + 1;` — silently
+    // miscompiled, returning 0 (the #2477 zero-init fallback) instead of the
+    // call result. Binding the property to a local first (`var g := obj.P;
+    // g(args)`) was a complete workaround and produced the correct value, so
+    // the property READ (the backing-field load) was always correct — only
+    // the direct callee dispatch was broken.
+    //
+    // Root cause: lowerCall had closure-dispatch arms for ParameterSymbol,
+    // LocalSymbol, and FieldSymbol callees (#2300 added the imported-field
+    // type resolution), but NO PropertySymbol arm at all. `obj.P(args)`
+    // resolves `calleeSym` to a PropertySymbol, missed every dispatch arm,
+    // and fell through to the #2477 "cannot dispatch member 'P'" zero-init
+    // fallback — silently returning 0 (garbage) instead of the call result.
+    // This is a different root cause from #2300 (which is the FieldSymbol
+    // arm's imported-type resolution); the property defect has no arm, so it
+    // bites locally too (single-module), not just across --import.
+    //
+    // The fix adds the PropertySymbol arm, mirroring the FieldSymbol arm
+    // directly above: resolve the property's function TypeRef `rt` from the
+    // PropertyDecl's declared type (or, for an IMPORTED property that has no
+    // AST decl, from the ctx_.importedMemberType side table — exactly the
+    // #2300 fallback for imported fields), then read the closure pointer by
+    // lowering the callee MemberAccess (`lowerExpr(*call.callee)` dispatches
+    // the property GET — for an auto-property the CG8 field-read path loads
+    // the backing-field closure value; for a computed/block property the
+    // getter yields it directly), and emitClosureCall on that pointer.
+    //
+    // Gated on a CLASS or INTERFACE receiver for the imported-type fallback.
+    // An imported RECORD function-typed property read shares the separate
+    // deeper defect filed as #2590 (the cross-module field/closure READ
+    // yields a bad pointer): verified empirically, opening this gate to
+    // Record segfaults the imported-record direct-invoke (exit 139) — the
+    // same ABI defect #2300's record gate guards against for fields. The
+    // LOCAL record case (which has an AST decl and a sound read path) is
+    // covered by the `pd->type` branch above. Interface is included because
+    // the imported interface property read dispatches through the itable
+    // (lowerVirtualPropertyGet), which yields a sound closure pointer —
+    // verified: `i.F(10)` on an imported `IFunc` returns 11, no segfault.
+    // The `rt->kind == Function` guard still gates dispatch, so a non-
+    // function-typed property read (`obj.N`, an int) is wholly unaffected —
+    // it never enters this arm's dispatch.
+    if (auto* ps = dynamic_cast<sema::PropertySymbol*>(calleeSym)) {
+        if (!ps->isIndexer) {
+            sema::TypeRef* rt = nullptr;
+            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                if (pd->type) rt = ctx_.resolvedType(*pd->type);
+            } else if (ps->parent &&
+                       (ps->parent->kind == ast::TypeDeclKind::Class ||
+                        ps->parent->kind == ast::TypeDeclKind::Interface)) {
+                // Imported class/interface property: no ast::PropertyDecl
+                // (the importer reconstructs the PropertySymbol from
+                // dependency metadata), so the resolved type rides the
+                // importedMemberType side table — mirroring #2300's
+                // imported-field fallback and every other imported-property
+                // read site (LlvmBackend_Exprs.cpp ~L4844
+                // lowerVirtualPropertyGet, ~L5028 lowerPropertyLvalue).
+                if (sema::TypeRef* it = ctx_.importedMemberType(ps))
+                    rt = it;
+            }
+            if (rt && rt->kind != sema::TypeRef::Kind::Function) {
+                // Declared type isn't itself a function — but for a generic-
+                // param property the call-site substitution may have made it
+                // one (same fallback as the FieldSymbol arm above).
+                if (sema::TypeRef* sub = ctx_.exprType(*call.callee);
+                    sub && sub->kind == sema::TypeRef::Kind::Function)
+                    rt = sub;
+            }
+            if (rt && rt->kind == sema::TypeRef::Kind::Function) {
+                llvm::Value* closurePtr = lowerExpr(*call.callee);
+                return emitClosureCall(closurePtr, rt);
+            }
+        }
+    }
     // fix #507 / §27.3: IIFE — the callee is a LambdaExpr invoked directly at
     // its construction site: `((x) => x * 2)(5)`.  The sema TypeRef for the
     // lambda has null funcReturn when the lambda's params are unannotated (the
