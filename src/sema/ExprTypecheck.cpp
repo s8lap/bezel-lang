@@ -11863,6 +11863,113 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // §17.6 (v0.236, #2585): for a REFERENCE-type operand, `++`/`--` apply
+        // ONLY when the reference type overloads the operator (§4.6: string,
+        // classes, interfaces, function types, and heap-array builtins are
+        // reference types). A reference type that does NOT declare a matching
+        // `operator ++`/`operator --` overload must be rejected at the front
+        // end; without this check the operand reaches codegen, which has no
+        // built-in `++` for reference types and emits malformed IR
+        // (`ConstantInt::get(ptr, 1)` -> `sadd.with.overflow` on a pointer) in
+        // the "Built-in numeric increment/decrement" branch of
+        // LlvmBackend_Stmts.cpp's IncrementStmt handler (ICE on `s.P++`/`s++`
+        // for a string local or computed property). The value-type numeric
+        // primitives (int/long/double/char/...) and record/enum types are NOT
+        // touched here — numeric primitives have built-in `++`, and a record
+        // declaring `operator ++` still resolves through the overload. The
+        // operator-overload lookup mirrors codegen's own
+        // (LlvmBackend_Stmts.cpp ~line 1158), so a reference type that DOES
+        // overload `++`/`--` (the §17.6 `Counter` example, §25.3) still
+        // compiles.
+        if (is->target) {
+            if (const sema::TypeRef* targetTy =
+                    ctx_.exprType(*is->target)) {
+                // §4.6 reference type, IGNORING nullability — a `string?` is
+                // still a reference type that does not overload `++`.
+                bool isRefType = false;
+                switch (targetTy->kind) {
+                    case sema::TypeRef::Kind::Function:
+                        isRefType = true;
+                        break;
+                    case sema::TypeRef::Kind::Primitive:
+                        isRefType =
+                            (targetTy->primitive ==
+                             sema::PrimitiveType::String) ||
+                            (targetTy->primitive ==
+                             sema::PrimitiveType::Object);
+                        break;
+                    case sema::TypeRef::Kind::Named:
+                        // A Named TypeRef with no declaration is an
+                        // imported/builtin reference type (a collection
+                        // wrapper `Array<T>`/`OwningArray<T>`, `Task`, ...)
+                        // — same reasoning as isNonNullableReferenceType.
+                        if (!targetTy->declaration)
+                            isRefType = true;
+                        else
+                            isRefType =
+                                targetTy->declaration->kind ==
+                                    ast::TypeDeclKind::Class ||
+                                targetTy->declaration->kind ==
+                                    ast::TypeDeclKind::Interface;
+                        break;
+                    default:
+                        break;  // numeric/char/bool primitive, record, enum,
+                                // inline array, unit, error — not a reference
+                                // type
+                }
+                if (isRefType) {
+                    // Look for a user-defined `operator ++`/`operator --` on
+                    // the target's Named type (§25 overload resolution).
+                    bool hasOverload = false;
+                    if (targetTy->kind == sema::TypeRef::Kind::Named &&
+                        targetTy->declaration) {
+                        for (sema::Symbol* m :
+                             targetTy->declaration->members) {
+                            auto* ms =
+                                dynamic_cast<sema::MethodSymbol*>(m);
+                            if (ms && ms->isOperator &&
+                                ms->operatorToken == is->op &&
+                                ms->params.size() == 1) {
+                                hasOverload = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!hasOverload) {
+                        // Format the type name for the diagnostic. headName()
+                        // covers Named types; the String/Object primitives
+                        // spell themselves; fall back to a generic label.
+                        std::string tyName;
+                        if (targetTy->kind ==
+                                sema::TypeRef::Kind::Primitive &&
+                            targetTy->primitive ==
+                                sema::PrimitiveType::String)
+                            tyName = "string";
+                        else if (targetTy->kind ==
+                                    sema::TypeRef::Kind::Primitive &&
+                                 targetTy->primitive ==
+                                    sema::PrimitiveType::Object)
+                            tyName = "Object";
+                        else if (targetTy->kind ==
+                                    sema::TypeRef::Kind::Function)
+                            tyName = "function type";
+                        else if (std::string_view h =
+                                     targetTy->headName();
+                                 !h.empty())
+                            tyName = std::string(h);
+                        else
+                            tyName = "reference type";
+                        ctx_.diagnostics().report(
+                            Severity::Error, is->target->span.begin,
+                            std::string("`") + std::string(is->op) +
+                            "` is not defined on reference type `" + tyName +
+                            "` — per §17.6, `++`/`--` on a reference type "
+                            "apply only when the type overloads the operator "
+                            "(and `" + tyName + "` does not)");
+                    }
+                }
+            }
+        }
         // §7.4 (v0.214, #2116 pre-gate review): `c++`/`c--` desugars to
         // `c := T.operator++(c)` (§17.6) — a reassignment rebinding `c` to the
         // operator's result, so any `c._f` readonly-field facts rode the OLD
