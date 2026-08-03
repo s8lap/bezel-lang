@@ -1351,6 +1351,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 requireIntLike(0, "first argument");
                 requireIntLike(1, "(int) count");
             }
+            // §7 / stdlib §9.6 (#2581): string.Compare(a: string, b: string)
+            // (and its 3-arg `ignoreCase` overload) declare NON-nullable a/b.
+            // The callee target is the type name `string`, which carries no
+            // Primitive-String VALUE exprType, so checkBuiltinStringCallArgs
+            // (keyed on the instance-receiver VALUE) does not reach it — an
+            // un-narrowed `string?` argument was silently accepted. Run the §7
+            // assignability check against the declared non-nullable `string`
+            // (IsNullOrEmpty/IsNullOrWhiteSpace take `string?` and stay admissible;
+            // they are not `Compare` and are excluded by the method-name gate).
+            if (recvPt == PrimitiveType::String && mm == "Compare" &&
+                ce.args.size() >= 2) {
+                for (std::size_t ai : {std::size_t{0}, std::size_t{1}}) {
+                    if (ai >= ce.args.size() || !ce.args[ai].value) continue;
+                    const auto& a = ce.args[ai];
+                    if (!a.modifier.empty()) continue;  // §22.3 alias — skip
+                    TypeRef* argTy = ctx_.exprType(*a.value);
+                    if (!argTy) continue;  // untyped/error arg — its own diagnostic
+                    TypeRef* paramTy = ctx_.primitiveTypeRef(
+                        PrimitiveType::String, /*nullable=*/false);
+                    checkAssignable(
+                        argTy, paramTy, a.value->span.begin,
+                        "argument to `string.Compare`",
+                        a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
+                }
+            }
             // §9.5: char classification / transform statics take a `char`.
             if (recvPt == PrimitiveType::Char &&
                 (mm == "IsDigit" || mm == "IsLetter" || mm == "IsLetterOrDigit" ||
@@ -8081,6 +8106,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // element/key type so the builtin path agrees with the user-method path.
     checkBuiltinCollectionCallArgs(ce);
 
+    // §7 / stdlib §3.3 (#2581): the ReadOnlyStringSpan twin — a builtin
+    // ReadOnlyStringSpan instance method has no MethodSymbol either (it is
+    // synthetically typed at L6419), and #2315's gate keys on a Primitive-String
+    // VALUE receiver, so the Named ReadOnlyStringSpan receiver fell through.
+    // Run the §7 check against the §3.3-declared non-nullable char/string kinds.
+    checkBuiltinSpanCallArgs(ce);
+
     // §7.5 / FINDING [3] ADDENDUM: a null-conditional call `x?.M(args)` is
     // ALWAYS nullable — it returns null when the receiver is null. The callee is
     // a NullCondMemberExpr; lift the (raw) return type recorded above to its
@@ -8438,14 +8470,28 @@ ExprTC::BindResult ExprTC::bindArgsToParams(
 // (target is the type name, no value exprType). The static `IsNullOrEmpty`/
 // `IsNullOrWhiteSpace` take `string?` anyway, so excluding statics does not
 // leave a nullable hole.
+// #2581: a builtin instance-call callee is EITHER a MemberAccessExpr
+// (`recv.M(..)`) OR a NullCondMemberExpr (`recv?.M(..)`); the two are separate
+// Expr kinds but share identical `target`/`member` fields. The null-conditional
+// form (`s?.IndexOf(unNarrowedString?)`) is the same §7 hole on a separate path
+// that a `dynamic_cast<MemberAccessExpr*>`-only gate misses. Returns the
+// (target, member) pair, or (nullptr, {}) when the callee is neither kind.
+static std::pair<const ast::Expr*, std::string_view>
+builtinInstanceCallee(const ast::Expr* callee) {
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        return {ma->target.get(), ma->member};
+    if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(callee))
+        return {ncm->target.get(), ncm->member};
+    return {nullptr, {}};
+}
+
 void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
-    if (!ma || !ma->target) return;
-    TypeRef* recvTy = ctx_.exprType(*ma->target);
+    auto [tgt, m] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt) return;
+    TypeRef* recvTy = ctx_.exprType(*tgt);
     if (!recvTy || recvTy->kind != TypeRef::Kind::Primitive ||
         recvTy->primitive != PrimitiveType::String)
-        return;  // not a primitive `string` instance call
-    std::string_view m = ma->member;
+        return;  // not a primitive `string` instance call (incl. `?.`)
     // `Equals` declares `other: string?` (§11.2 widening) — admissible; skip.
     if (m == "Equals") return;
     // Map (method, position, argPrimitiveKind) → the declared NON-nullable
@@ -8481,8 +8527,9 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
         // IndexOf declares `startIndex: int` as the SECOND param of its 2-arg
         // overload (pos 0 is the char|string search value, handled above);
         // LastIndexOf has no integer parameter at all (only char/string).
+        // Insert(startIndex: int, value: string) (#2581) has its int at pos 0.
         bool intPos =
-            (pos == 0 && (m == "Substring" || m == "Remove" ||
+            (pos == 0 && (m == "Substring" || m == "Remove" || m == "Insert" ||
                           m == "PadLeft" || m == "PadRight" ||
                           m == "PadCenter")) ||
             (pos == 1 && (m == "Substring" || m == "Remove" ||
@@ -8656,6 +8703,88 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
             argTy, itemTy, a.value->span.begin,
             std::string("argument to `") + std::string(colName) + "<T>." +
             std::string(m) + "`",
+            a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
+    }
+}
+
+// §7 / stdlib §3.3 (#2581): see the header comment for the full rationale. The
+// ReadOnlyStringSpan twin of #2315's checkBuiltinStringCallArgs. A builtin
+// ReadOnlyStringSpan instance method (IndexOf/Contains/StartsWith/EndsWith/
+// SequenceEqual, stdlib §3.3) declares NON-nullable `string`/`char` operands
+// but has no MethodSymbol — it is synthetically typed in the CallExpr block at
+// L6419 — so checkCallArity → checkArgsAgainstParams → checkAssignable never
+// fired. An un-narrowed `string?` (or `char?`) argument was silently accepted.
+// #2315's gate keys on a Primitive-String VALUE receiver exprType, which
+// excludes the Named ReadOnlyStringSpan receiver, so the span path was left
+// open. This helper mirrors the user-method path against the §3.3-declared
+// non-nullable char/string parameter kinds, so an un-narrowed `string?`/`char?`
+// is rejected exactly as a user `method Take(x: string)` rejects it, while a
+// NARROWED nullable (after a null-check) and a plain non-nullable argument
+// still compile (the §7.4 narrowing exception lives inside checkAssignable).
+//
+// The receiver is recognized by the SAME head-name resolution the L6419 block
+// uses (`builtinInstName`): a synthetic Named TypeRef (declaration == nullptr,
+// astNode set) or a builtin-class stub (declaration set, declaration->decl
+// nullptr) resolves to "ReadOnlyStringSpan"; a fully-resolved user/stdlib record
+// with a real decl resolves to {} and is left to the user-method path (it has a
+// MethodSymbol). §3.3: IndexOf/Contains have char|string overloads (pick by the
+// argument's own kind); StartsWith/EndsWith/SequenceEqual have a string overload
+// only (no char form, so a char arg to those is a clean reject at L6419, not an
+// invented overload). The ReadOnlyStringSpan-Named operand overload is a Named
+// (non-primitive) type and is not part of the nullable-primitive hole this
+// covers.
+void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
+    auto [tgt, m] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt) return;
+    TypeRef* recvTy = ctx_.exprType(*tgt);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named) return;
+    // Resolve the builtin head name the same way `builtinInstName` (L6263) does:
+    // synthetic Named (declaration nullptr, astNode set) → headName; builtin-class
+    // stub (declaration set, decl nullptr) → declaration->name; a fully-resolved
+    // record (real decl) → {} (has a MethodSymbol → user path handled it).
+    std::string_view spanName;
+    if (!recvTy->declaration) {
+        if (recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty())
+            spanName = recvTy->headName();
+    } else if (!recvTy->declaration->decl) {
+        spanName = recvTy->declaration->name;
+    }
+    if (spanName != "ReadOnlyStringSpan") return;
+    // Map (method, position, argPrimitiveKind) → the declared NON-nullable
+    // primitive parameter kind, or None when this position is not a primitive
+    // char/string slot. §3.3: IndexOf/Contents have char|string overloads;
+    // StartsWith/EndsWith/SequenceEqual have a string overload only.
+    auto paramKind = [&](std::size_t pos, PrimitiveType argKind)
+            -> PrimitiveType {
+        using PT = PrimitiveType;
+        if (pos != 0) return PT::None;  // every covered method takes one operand
+        if (m == "IndexOf" || m == "Contains") {
+            if (argKind == PT::String) return PT::String;
+            if (argKind == PT::Char)  return PT::Char;
+            return PT::None;  // ReadOnlyStringSpan-Named operand — not covered
+        }
+        if (m == "StartsWith" || m == "EndsWith" || m == "SequenceEqual") {
+            if (argKind == PT::String) return PT::String;
+            return PT::None;  // no char overload; span/iface operands are Named
+        }
+        return PT::None;
+    };
+    for (std::size_t i = 0; i < ce.args.size(); ++i) {
+        const auto& a = ce.args[i];
+        if (!a.value || a.isDiscard) continue;
+        // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
+        // the caller slot under its own rule and is not a §7 nullable->non-
+        // nullable conversion; skip (span methods take plain value params).
+        if (!a.modifier.empty()) continue;
+        TypeRef* argTy = ctx_.exprType(*a.value);
+        if (!argTy || argTy->kind != TypeRef::Kind::Primitive) continue;
+        PrimitiveType declared = paramKind(i, argTy->primitive);
+        if (declared == PrimitiveType::None) continue;
+        TypeRef* paramTy = ctx_.primitiveTypeRef(declared, /*nullable=*/false);
+        checkAssignable(
+            argTy, paramTy, a.value->span.begin,
+            std::string("argument to `ReadOnlyStringSpan.") + std::string(m) + "`",
             a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
     }
 }

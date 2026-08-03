@@ -1748,6 +1748,19 @@ private:
     // MemberAccessExpr) and are not reached — filed separately.
     void checkBuiltinCollectionCallArgs(const ast::CallExpr& ce);
 
+    // §7 / stdlib §3.3 (#2581): the ReadOnlyStringSpan twin of #2315. A builtin
+    // ReadOnlyStringSpan instance method (IndexOf/Contains/StartsWith/EndsWith/
+    // SequenceEqual, stdlib §3.3) declares NON-nullable `string`/`char` operands
+    // but has no MethodSymbol (it is synthetically typed in the CallExpr block
+    // at L6419), so checkCallArity → checkArgsAgainstParams → checkAssignable
+    // never fired. #2315's gate keys on a Primitive-String VALUE receiver
+    // exprType, which excludes the Named ReadOnlyStringSpan receiver, so the
+    // span path was left open and an un-narrowed `string?`/`char?` was silently
+    // accepted. This helper mirrors the user-method path against the §3.3-declared
+    // non-nullable char/string kinds; the ReadOnlyStringSpan-Named operand
+    // overload is not a primitive slot and is not covered here.
+    void checkBuiltinSpanCallArgs(const ast::CallExpr& ce);
+
     // §2.5 / §22.7 (issue #328 FINDING [7] B): check `new ImportedT(args)`
     // against an imported type's reconstructed constructor signatures (no
     // ast::ConstructorDecl; ParameterSymbol resolved types). Single-ctor,
