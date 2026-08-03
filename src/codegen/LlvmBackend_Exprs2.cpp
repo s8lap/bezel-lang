@@ -2337,7 +2337,8 @@ void Emitter::prePopulateBasePositionalFields(
         const sema::TypeSymbol* t,
         llvm::Value* obj,
         const std::vector<llvm::Value*>& ctorArgVals,
-        const sema::ConstructorSymbol* cs) {
+        const sema::ConstructorSymbol* cs,
+        bool ctorArgsByRefAbi) {
     if (!t || !obj) return;
 
     // Find the first base class that has positional (primary-ctor) param fields.
@@ -2390,11 +2391,31 @@ void Emitter::prePopulateBasePositionalFields(
                 // Temporarily bind ctor params to their values so that the
                 // chain-call arg expressions (which reference ctor params) can
                 // be evaluated correctly. Save and restore paramSlots_.
+                // fix #2584 / §22.3 (v0.236): when ctorArgsByRefAbi (the
+                // top-level `new`-expression path), ctorArgVals[i] is the
+                // caller's storage ADDRESS for a ref/out param (CG50), not a
+                // value — binding that address in paramSlots_ and reading the
+                // param loads the POINTER itself, so a chain-call arg that
+                // reads the ref param (`base(n + 1)`) emits `add ptr, i32`
+                // (verifyModule rejects). Register the address in refParams_
+                // instead so reads dereference through it, mirroring
+                // bindParameters and #2283's inline-ctor path. The recursion
+                // (ctorArgsByRefAbi=false) passes lowered VALUES, so it keeps
+                // the paramSlots_ binding it always used.
                 auto savedParams = paramSlots_;
+                auto savedRefParams = refParams_;  // fix #2584
                 for (std::size_t pi = 0; pi < cs->params.size(); ++pi) {
-                    auto* slot = entryAlloca(ctorArgVals[pi]->getType());
-                    builder_.CreateStore(ctorArgVals[pi], slot);
-                    paramSlots_[cs->params[pi]] = slot;
+                    auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                        cs->params[pi]);
+                    if (ctorArgsByRefAbi && ps && isByRefMod(ps->modifier)) {
+                        llvm::Type* elemTy =
+                            ps->declType ? lowerType(ps->declType) : i32();
+                        refParams_[cs->params[pi]] = {ctorArgVals[pi], elemTy};
+                    } else {
+                        auto* slot = entryAlloca(ctorArgVals[pi]->getType());
+                        builder_.CreateStore(ctorArgVals[pi], slot);
+                        paramSlots_[cs->params[pi]] = slot;
+                    }
                 }
                 for (const auto& arg : chainCall->args) {
                     if (!arg.value) { baseArgVals.clear(); break; }
@@ -2403,6 +2424,7 @@ void Emitter::prePopulateBasePositionalFields(
                     baseArgVals.push_back(v);
                 }
                 paramSlots_ = std::move(savedParams);
+                refParams_ = std::move(savedRefParams);  // fix #2584
             }
         }
     }
@@ -4121,7 +4143,13 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         std::vector<llvm::Value*> paramVals(
                             prebuiltCtorArgs.begin() + 1,
                             prebuiltCtorArgs.end());
-                        prePopulateBasePositionalFields(t, obj, paramVals, earlyCs);
+                        // fix #2584: these args follow the CG50 by-ref ABI
+                        // (a ref/out param's arg is the caller's storage
+                        // ADDRESS), so the pre-pass must bind ref/out params
+                        // through refParams_, not paramSlots_.
+                        prePopulateBasePositionalFields(t, obj, paramVals,
+                                                        earlyCs,
+                                                        /*ctorArgsByRefAbi=*/true);
                     } else {
                         // fix #2319: the call never runs, so no §22.3 write-back
                         // is owed — release the pinned receiver/index values.

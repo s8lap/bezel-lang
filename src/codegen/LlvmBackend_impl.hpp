@@ -10314,11 +10314,15 @@ private:
     // temporarily bound to the evaluated `ne.args` values and the chain-call
     // arg expressions are evaluated and stored into the base's slots.
     // Recursive: the base class itself is also processed if needed.
+    // `ctorArgsByRefAbi` is true only at the top-level `new`-expression call
+    // site, where ctorArgVals[i] is the caller's storage ADDRESS for a
+    // ref/out param (CG50); the recursion passes lowered VALUES. fix #2584.
     void prePopulateBasePositionalFields(
         const sema::TypeSymbol* t,
         llvm::Value* obj,
         const std::vector<llvm::Value*>& ctorArgVals,  // already-evaluated ctor args
-        const sema::ConstructorSymbol* cs);             // null if no explicit ctor
+        const sema::ConstructorSymbol* cs,             // null if no explicit ctor
+        bool ctorArgsByRefAbi = false);
 };
 
 }  // namespace bezel::codegen
