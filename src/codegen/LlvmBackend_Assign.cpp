@@ -4355,20 +4355,81 @@ bool Emitter::lowerPropertyCompound(const ast::AssignmentStmt& as) {
         isUnsignedTargetExpr(*as.target),
         isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
         isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
-    // fix #2568: thread as.value through as valueExpr so the setter's emit
-    // release can fire on a +1 producer RHS. The compound-path analogue of
-    // lowerIndexerCompound's #2567 release: `res` is a freshly-minted string
-    // from emitStringConcat (a +1 producer itself), the setter's body
-    // retains it via the field store, the producer's +1 needs caller-side
-    // release. `valueExpr = as.value` so isPlusOneStringProducer matches the
-    // AST shape — for `s.Name += "abc" + i.ToString()`, `as.value` is the
-    // BinaryExpr concat, which IS a +1 producer — and emitStringRelease(v)
-    // drops `res`'s +1. The `rhs` of the `+=` itself (lowered at line 4349
-    // but not consumed by emitStringConcat — sibling defect to the indexer
-    // compound case's rhs-leak, which is filed as #2568-B) is left untouched
-    // here; this commit fixes only the `res`/setter-body leak that mirrors
-    // lowerIndexerCompound's inline emitProducerRelease.
-    return res ? lowerPropertySetValue(*as.target, res, as.value.get()) : false;
+    // fix #2576 (§23.3/§28.9/§4.6, v0.236): the COMPOUND-PROPERTY twin of
+    // lowerIndexerCompound's #2567 fix (this file, line ~2531-2542), mirrored
+    // EXACTLY. `lowerPropertyCompound` desugars `s.Name OP= rhs` to
+    // `s.Name := s.Name OP rhs`:
+    //   * line 4349: `rhs = lowerExpr(*as.value)` — a +1 string when the AST
+    //     is a producer (e.g. BinaryExpr `+` `"abc" + i.ToString()`), a BORROW
+    //     when the AST is a named local (`s.Name += t`).
+    //   * line 4353: `res = emitCompoundOp(op, cur, rhs, ...)` — for a string
+    //     target emitCompoundOp dispatches to emitStringConcat (line ~204),
+    //     which ALWAYS mints a fresh rc=1 string (per #422), memcpy'ing both
+    //     operands' bytes into a distinct header. So `res` is +1 regardless of
+    //     whether `rhs` is a producer or a borrow.
+    //   * lowerPropertySetValue inlines the setter body, which stores `res`
+    //     into the backing field via lowerStringFieldStore's ARC — retain(res)
+    //     doubles res's +1 for a CLASS-owned property (§9/§23.3).
+    //
+    // TWO +1 producers can escape here, and #2568's valueExpr-based release
+    // (threading `as.value` so emitProducerRelease fires inside
+    // lowerPropertySetValue) closes only HALF the gap:
+    //   (1) `res`'s +1 — #2568 releases it ONLY when `isPlusOneStringProducer
+    //       (as.value)` is true, i.e. only for a PRODUCER rhs. For a BORROW rhs
+    //       (`s.Name += local`), as.value is a named IdentifierExpr (not a
+    //       producer), so #2568's release does NOT fire, yet res is still +1
+    //       from emitStringConcat — so res's doubled +1 leaks (LSan-confirmed:
+    //       100 iterations of `s.Name += local` leak 3200 byte(s) direct +
+    //       15250 byte(s) indirect, the accumulated field string never freed
+    //       because each displaced value's refcount was 2 not 1). This is the
+    //       compound-path gap #2567 closed for indexers by releasing `newVal`
+    //       UNCONDITIONALLY on (classOwned && pointer), NOT gated on the rhs
+    //       predicate.
+    //   (2) `rhs`'s +1 — a producer rhs (`"abc" + i.ToString()`) is a SECOND
+    //       orphan +1: emitStringConcat memcpy's rhs's bytes into res and
+    //       leaves rhs's own +1 untouched (LSan-confirmed: 37 byte(s)/iter on
+    //       top of the res leak — 3200 direct + 590 indirect for the producer
+    //       shape when the res release is also missing).
+    //
+    // The fix mirrors lowerIndexerCompound's #2567 structure EXACTLY: pass
+    // `nullptr` as valueExpr so #2568's narrower producer-only release does
+    // NOT fire inside lowerPropertySetValue (avoiding a double-release of res
+    // for the producer-rhs case), then release BOTH producers here after the
+    // setter body returns:
+    //   * `res` — released when classOwned && pointer (the emitStringConcat
+    //     +1; unconditional for any string compound, producer OR borrow rhs,
+    //     because emitStringConcat always mints +1).
+    //   * `rhs` — released when classOwned && pointer && isPlusOneString
+    //     Producer(as.value) (only a producer rhs carries its own +1; a borrow
+    //     rhs's +1 belongs to its own slot and must not be released).
+    // CLASS-only gate (§9/§9.7): a record's setter body plain-stores `res`,
+    // so res's +1 is the field's own reference — releasing would UAF the
+    // field (the live failure #2490/#2506/#2548 caught for sibling sites).
+    // The record-side compound leak is the §9/§9.7 auto-property gap tracked
+    // by #2577; do NOT widen this gate to records. res and rhs are DISTINCT
+    // allocations (emitStringConcat allocates a fresh header), so releasing
+    // rhs cannot UAF res or the field.
+    if (!res) return false;
+    // nullptr valueExpr: see the long comment above — #2576 handles res's
+    // release itself (mirroring #2567) rather than relying on #2568's
+    // narrower producer-only valueExpr release inside lowerPropertySetValue.
+    bool handled = lowerPropertySetValue(*as.target, res, nullptr);
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*as.target));
+    bool classOwned = ps && ps->parent &&
+                      ps->parent->kind == ast::TypeDeclKind::Class;
+    if (classOwned) {
+        if (res && res->getType()->isPointerTy())
+            emitStringRelease(res);  // release the OP-result's +1 (emitStringConcat)
+        // For string `+=`, rhs is `lowerExpr(*as.value)` — a +1 string when
+        // the AST is a producer (e.g. BinaryExpr("+", ...)) but a BORROW when
+        // the AST is a named local. Check the AST shape, not the LLVM pointer
+        // type: only release when rhs is itself a +1 producer. Mirrors
+        // lowerIndexerCompound line ~2539.
+        if (rhs && rhs->getType()->isPointerTy() && as.value.get() &&
+            isPlusOneStringProducer(as.value.get()))
+            emitStringRelease(rhs);  // release the rhs's orphan +1 (producer)
+    }
+    return handled;
 }
 
 
