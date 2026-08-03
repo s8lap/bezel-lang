@@ -8065,12 +8065,53 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     }
     std::vector<llvm::Value*> args;
     args.push_back(currentThis_);
-    for (const auto& a : call->args) {
-        if (!a.value) return;
-        llvm::Value* v = lowerExpr(*a.value);
+    // fix #2579 / §22.3: a `ref`/`out` argument to a `base(...)`/`this(...)`
+    // chain call must pass the argument's ADDRESS — the compiled chain-target
+    // ctor's signature uses `ptr` for ref/out params (CG50, isByRefMod) — not
+    // its loaded value. The bare `lowerExpr` here passed the loaded value,
+    // producing malformed IR (`call @ctor(ptr, i32)` against a `(ptr, ptr)`
+    // signature) that `verifyModule` rejects. Mirror lowerCall's imported-
+    // method arg path (LlvmBackend_Calls2.cpp) and the #2319 ctor sites:
+    // `lvalueAddr` for the alias path (local/field/static/§15.1 inline-array
+    // element), the §22.3 copy-in/copy-out bracket (emitAccessorRefArgCopyIn)
+    // for an accessor-mediated location (indexer slot / property), with the
+    // copy-OUT flushed after the chain target runs (see both consuming paths
+    // below). §22.3 puts no restriction on ref/out params in a chain call.
+    std::vector<AccessorRefArg> accessorRefArgs;
+    for (std::size_t ai = 0; ai < call->args.size(); ++ai) {
+        const auto& a = call->args[ai];
+        if (!a.value) {
+            // fix #2579: the call never runs — release any bracket pins
+            // recorded by earlier args so their refcount isn't stranded.
+            emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
+            return;
+        }
+        // The formal modifier lives on the chain TARGET ctor's params.
+        std::string_view formalMod;
+        if (ai < target->params.size())
+            if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    target->params[ai]))
+                formalMod = ps->modifier;
+        llvm::Value* v = nullptr;
+        if (isByRefMod(a.modifier) || isByRefMod(formalMod)) {
+            // §22.3 alias path: a true-alias location has an address the
+            // callee writes through directly.
+            llvm::Type* et = nullptr;
+            v = lvalueAddr(*a.value, et);
+            // §22.3 bracket path: an indexer slot / property has no address
+            // to alias; emit the copy-IN and record the copy-OUT, restricted
+            // to plain ref/out (out owned etc. are not bracket-admitted,
+            // §22.3) — exactly the imported-method fallback in lowerCall.
+            if (!v && (formalMod == "ref" || formalMod == "out"))
+                v = emitAccessorRefArgCopyIn(
+                    *a.value, /*paramTy=*/nullptr,
+                    /*isOut=*/formalMod == "out", accessorRefArgs);
+        } else {
+            v = lowerExpr(*a.value);
+        }
         if (!v) {
-            // #1386: ICE — lowerExpr returned null for a base-ctor argument;
-            // the expression kind is not yet handled by codegen.
+            // #1386: ICE — the expression kind is not yet handled by codegen.
+            emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
             ctx_.diagnostics().report(
                 Severity::Error, a.value->span.begin,
                 "internal: lowerExpr returned null for base-constructor "
@@ -8134,14 +8175,31 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             llvm::Value* subObj = currentThis_;
             auto savedLocals = locals_;
             auto savedParams = paramSlots_;
+            auto savedRefParams = refParams_;  // fix #2579
             llvm::BasicBlock* savedUnwindTarget = unwindTarget_;
             std::size_t savedUnwindDepth = unwindScopeDepth_;
             locals_.clear();
             paramSlots_.clear();
+            // fix #2579 / §22.3: bind the chained ctor's params. A ref/out
+            // param's arg is now the caller's storage ADDRESS (alias path) or
+            // the §22.3 copy-in slot (bracket path) — register it in
+            // refParams_ so the inlined body's reads/writes dereference
+            // through it, exactly as bindParameters does for a compiled ctor's
+            // ref param. Without this the body loaded the pointer itself
+            // (the #2283 shape, on the chain-call inline path). A plain param
+            // keeps the paramSlots_ binding the inline path always used.
             for (std::size_t pi = 0; pi < target->params.size(); ++pi) {
-                auto* slot = entryAlloca(args[pi + 1]->getType());
-                builder_.CreateStore(args[pi + 1], slot);
-                paramSlots_[target->params[pi]] = slot;
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    target->params[pi]);
+                if (ps && isByRefMod(ps->modifier)) {
+                    llvm::Type* elemTy =
+                        ps->declType ? lowerType(ps->declType) : i32();
+                    refParams_[target->params[pi]] = {args[pi + 1], elemTy};
+                } else {
+                    auto* slot = entryAlloca(args[pi + 1]->getType());
+                    builder_.CreateStore(args[pi + 1], slot);
+                    paramSlots_[target->params[pi]] = slot;
+                }
             }
             inlineCtorBody(target, subObj);
             unwindTarget_ = savedUnwindTarget;
@@ -8149,6 +8207,13 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             currentThis_ = subObj;
             locals_ = std::move(savedLocals);
             paramSlots_ = std::move(savedParams);
+            refParams_ = std::move(savedRefParams);
+            // fix #2579 / §22.3: flush the copy-OUT of every accessor-mediated
+            // ref/out argument now that the inlined chain-target body has
+            // returned normally (!diverged_) — skipped on the throw edge per
+            // §22.3's "on an exception exit no write-back occurs". Mirrors
+            // lowerCall's post-call discipline.
+            emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/!diverged_);
             if (restoredSubstForBase) {
                 genericSubst_ = std::move(savedSubstForBase);
                 genericSubstSemaTy_ = std::move(savedSemaTyForBase);
@@ -8162,6 +8227,16 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     }
     if (args.size() == it->second->arg_size()) {
         builder_.CreateCall(it->second, args);
+        // fix #2579 / §22.3: flush the copy-OUT of every accessor-mediated
+        // ref/out argument now that the chain-target ctor call has returned
+        // normally (!diverged_) — skipped on the throw edge per §22.3's "on
+        // an exception exit no write-back occurs". Mirrors lowerCall's
+        // post-call discipline.
+        emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/!diverged_);
+    } else {
+        // fix #2579: arg-count mismatch — the call never ran, so no §22.3
+        // write-back is owed; release the bracket pins.
+        emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
     }
 }
 
