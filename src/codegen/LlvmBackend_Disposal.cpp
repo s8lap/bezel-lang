@@ -602,7 +602,13 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             bool collIsOwning =
                 it->collTy->astNode && it->collTy->astNode->name &&
                 !it->collTy->astNode->name->parts.empty() &&
-                common::isOwningPrefixedName(it->collTy->headName());
+                (common::isOwningPrefixedName(it->collTy->headName()) ||
+                 // #2606 / stdlib §4.5: IOwningList<T> is the OWNING list
+                 // interface — its elements are owned by the holder — but
+                 // isOwningPrefixedName("IOwningList") is false (the head starts
+                 // with "I", not "Owning"), so consult the interface recognizer
+                 // to mark the family owning (matches owned OwningArray<T>).
+                 isOwningListInterfaceName(it->collTy));
             ElementPolicy fieldCollPol = elementPolicyFor(collElem, collIsOwning);
             llvm::Function* elemDisp = fieldCollPol.disposerThunk;
             if (!elemDisp && !isDict &&

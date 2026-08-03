@@ -6439,8 +6439,10 @@ private:
             if (isDictTypeName(rt)) return rt;
             // #2603: an owned IList<T>/IReadOnlyList<T> captured primary-ctor
             // parameter is array-backed + borrowing (issue #401) — same path as
-            // the FieldDecl arm below. IOwningList excluded (collIsOwning).
+            // the FieldDecl arm below. #2606: IOwningList<T> (owning) is also
+            // admitted; collIsOwning at the disposal sites marks it owning.
             if (isBorrowingListInterfaceName(rt)) return rt;
+            if (isOwningListInterfaceName(rt)) return rt;
             return nullptr;
         }
         if (!hasOwnedModifier(fs)) return nullptr;
@@ -6483,13 +6485,16 @@ private:
         // backing via bz_array_free with the element disposer from
         // elementPolicyFor (stringElementReleaseThunk for a string element).
         // isCollectionTypeName only admits CONCRETE builtin names, so the
-        // borrowing list interfaces must be admitted explicitly. IOwningList<T>
-        // (owning) is excluded — it needs a separate collIsOwning fixup (filed
-        // separately) and admitting it here would free its backing but leak its
-        // class elements. Both isCollectionTypeName and isBorrowingListInterface-
-        // Name require declaration==nullptr, so a user class literally named
-        // IList keeps the existing class-instance path.
+        // borrowing list interfaces must be admitted explicitly. #2606: an
+        // owned IOwningList<T> field is the OWNING sibling — array-backed (same
+        // bz_array_t* as OwningArray<T>, the only implementer per stdlib §4.5)
+        // and owning, so it routes through the same path with collIsOwning=TRUE
+        // (the disposal sites consult isOwningListInterfaceName to mark it
+        // owning, since isOwningPrefixedName("IOwningList") is false). All
+        // three helpers require declaration==nullptr, so a user class literally
+        // named IList/IOwningList keeps the existing class-instance path.
         if (isBorrowingListInterfaceName(rt)) return rt;
+        if (isOwningListInterfaceName(rt)) return rt;
         return nullptr;
     }
 
@@ -9632,11 +9637,31 @@ private:
     // routes through the IDENTICAL collection-disposal path as `owned Array<T>`:
     // bz_array_free with the element disposer from elementPolicyFor (and the
     // string-element-release thunk for a string element). IOwningList<T> is
-    // EXCLUDED — it is the OWNING variant (its elements are owned by the holder)
-    // and needs a separate collIsOwning fixup (filed separately).
+    // EXCLUDED here — it is the OWNING variant (its elements are owned by the
+    // holder) and is covered by isOwningListInterfaceName below (#2606).
     static bool isBorrowingListInterfaceName(const sema::TypeRef* rt) {
         bool owning = false;
         return isListInterfaceName(rt, &owning) && !owning;
+    }
+
+    // #2606 / §28.11 / stdlib §4.5 / issue #401: the OWNING list interface —
+    // IOwningList<T>. It is array-backed (same bz_array_t* as OwningArray<T> —
+    // the only implementer per stdlib §4.5) AND owning: its elements are owned
+    // by the holder and disposed on the collection's Dispose (stdlib §4.5
+    // "Disposing an OwningArray<T> automatically disposes every element"). So an
+    // `owned` field of this static type routes through the collection-disposal
+    // path with collIsOwning=TRUE — bz_array_free frees the backing and the
+    // class-element disposer from elementPolicyFor(elem, owning=true) disposes
+    // each element, IDENTICAL to `owned OwningArray<T>`. (String elements are
+    // rejected at instantiation for owning collections per stdlib §4.4, so the
+    // borrowing-family string-element-release gate never applies here.) The
+    // `isOwningPrefixedName("IOwningList")` check used at the collIsOwning
+    // derivation sites returns FALSE (the prefix is "Owning", but the head
+    // starts with "I"), so this helper is also consulted there to mark the
+    // family owning.
+    static bool isOwningListInterfaceName(const sema::TypeRef* rt) {
+        bool owning = false;
+        return isListInterfaceName(rt, &owning) && owning;
     }
 
     // fix #853 / stdlib §4.1–§4.3: the *non-list* collection interfaces

@@ -15595,7 +15595,11 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     bool collIsOwning =
         collTy && collTy->astNode && collTy->astNode->name &&
         !collTy->astNode->name->parts.empty() &&
-        common::isOwningPrefixedName(collTy->headName());
+        (common::isOwningPrefixedName(collTy->headName()) ||
+         // #2606 / stdlib §4.5: IOwningList<T> is the OWNING list interface,
+         // but isOwningPrefixedName("IOwningList") is false — consult the
+         // interface recognizer (matches owned OwningArray<T>).
+         isOwningListInterfaceName(collTy));
 
     ElementPolicy pol = elementPolicyFor(collElem, collIsOwning);
     llvm::Function* elemDisp = pol.disposerThunk;
