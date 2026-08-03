@@ -2649,6 +2649,23 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
             llvm::Value* closure =
                 lowerEventHandlerClosure(call.args[0].value.get(), payload);
             if (!closure) return std::optional<llvm::Value*>(nullptr);
+            // fix #2334 / §28.14 / §6.5: lowerEventHandlerClosure ->
+            // lowerLambda just populated lastLambdaCapturedCells_ for any
+            // cellFreeEligible_ captures IFF the argument is a lambda LITERAL
+            // on a `using var` / `await using var` IEvent<T>/EventSource<T>
+            // receiver (collectCellFreeEligible's IEvent.Subscribe /
+            // EventSource.Add special case, mirroring the TaskScope.Spawn
+            // and CancellationToken.Register arms' own consume calls in
+            // LlvmBackend_Calls.cpp). A method-reference argument does not
+            // go through lowerLambda and would leave the vector
+            // stale/empty from whatever lambda last ran elsewhere in this
+            // function — guard on the AST shape here, exactly like those
+            // arms, so this never consumes an unrelated lambda's cells.
+            // Consuming is a harmless no-op when the pre-scan did not flag
+            // anything (an ordinary capture-free Subscribe / Add lambda, or
+            // one whose receiver isn't a using-var local).
+            if (dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()))
+                consumeLastLambdaCapturedCells();
             if (isSubscribe) {
                 auto* subFn =
                     declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
@@ -2741,6 +2758,22 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         llvm::Value* closure =
             lowerEventHandlerClosure(call.args[0].value.get(), payload);
         if (!closure) return std::optional<llvm::Value*>(nullptr);
+        // fix #2334 / §28.14 / §6.5: lowerEventHandlerClosure -> lowerLambda
+        // just populated lastLambdaCapturedCells_ for any cellFreeEligible_
+        // captures IFF the argument is a lambda LITERAL on a `using var` /
+        // `await using var` IEvent<T> receiver (collectCellFreeEligible's
+        // IEvent.Subscribe special case, mirroring the TaskScope.Spawn and
+        // CancellationToken.Register arms' own consume calls in
+        // LlvmBackend_Calls.cpp). A method-reference argument does not go
+        // through lowerLambda and would leave the vector stale/empty from
+        // whatever lambda last ran elsewhere in this function — guard on
+        // the AST shape here, exactly like those arms, so this never
+        // consumes an unrelated lambda's cells. Consuming is a harmless
+        // no-op when the pre-scan did not flag anything (an ordinary
+        // capture-free Subscribe lambda, or one whose receiver isn't a
+        // using-var local).
+        if (dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()))
+            consumeLastLambdaCapturedCells();
         auto* subFn =
             declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
         return std::optional<llvm::Value*>(

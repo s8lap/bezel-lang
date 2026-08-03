@@ -6776,6 +6776,28 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         llvm::Value* closure = lowerEventHandlerClosure(
                             call.args[0].value.get(), /*payload=*/nullptr);
                         if (!closure) return nullptr;
+                        // fix #2334 / §28.14 / §6.1: lowerEventHandlerClosure
+                        // -> lowerLambda just populated
+                        // lastLambdaCapturedCells_ for any cellFreeEligible_
+                        // captures IFF the argument is a lambda LITERAL on a
+                        // `using var` / `await using var` CancellationToken
+                        // receiver (collectCellFreeEligible's
+                        // CancellationToken.Register special case, mirroring
+                        // the TaskScope.Spawn arm's own consume above and the
+                        // IIFE arm's consume in LlvmBackend_Calls2.cpp). A
+                        // method-reference argument does not go through
+                        // lowerLambda and would leave the vector stale/empty
+                        // from whatever lambda last ran elsewhere in this
+                        // function — guard on the AST shape here, exactly
+                        // like the TaskScope.Spawn arm, so this never
+                        // consumes an unrelated lambda's cells. Consuming is
+                        // a harmless no-op when the pre-scan did not flag
+                        // anything (an ordinary capture-free Register
+                        // lambda, or one whose receiver isn't a using-var
+                        // local).
+                        if (dynamic_cast<const ast::LambdaExpr*>(
+                                call.args[0].value.get()))
+                            consumeLastLambdaCapturedCells();
                         llvm::Value* tokArg =
                             tok ? tok : llvm::ConstantPointerNull::get(ptrTy());
                         auto* fn = declareC("bz_ctoken_register",

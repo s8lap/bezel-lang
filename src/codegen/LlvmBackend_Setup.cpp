@@ -18170,6 +18170,12 @@ void Emitter::collectCellFreeEligible(
         // BOTH exit edges). See Disposal::skipCellFreeOnUnwind for why a
         // Spawn-sourced capture needs the unwind edge suppressed.
         std::unordered_set<const void*>& capturedByNonEscapingUnwindUnsafe;
+        // fix #2334: anchors for `using var` initializer CallExprs (form 2
+        // of §28.14 — `using var sub := cs.Token.Register(lambda)`). Populated
+        // by stmt() before the initializer is walked; consulted by expr() to
+        // resolve the bounding object of a scoped callback without mirroring
+        // MethodOwnership::scopedFormalAt's callee matching in full.
+        std::unordered_map<const ast::Expr*, const ast::LocalDecl*> usingInitOf;
 
         // Track whether we're inside a "direct initializer" position for a
         // `var` local that is in closureReleaseEligible_. Only at the TOP
@@ -18519,15 +18525,17 @@ void Emitter::collectCellFreeEligible(
                 } else {
                     expr(c->callee.get(), false);
                 }
-                // fix #2334 / §28.14 / §28.9 (v0.235): a lambda LITERAL passed
-                // directly as the sole argument of `scope.Spawn(...)` — stdlib
-                // §6.10's `scoped` callback parameter — where `scope` is a
-                // `using var`/`await using var` LOCAL of the CURRENT function,
-                // is treated as NON-ESCAPING for cellFreeEligible_ purposes,
-                // exactly like the IIFE case above — though for a DIFFERENT
-                // reason: the closure genuinely outlives the call (§28.14's
-                // storage-bounded admission), it just never outlives the
-                // captured local's own scope.
+                // fix #2334 / §28.14 / §28.9 (v0.236): a lambda LITERAL passed
+                // directly as the sole argument of a stdlib `scoped` register
+                // position — §6.10's `TaskScope.Spawn`, §6.1's
+                // `CancellationToken.Register`, §6.5's
+                // `IEvent<T>.Subscribe` / `EventSource<T>.Add` — where the
+                // receiver is a `using var` / `await using var` LOCAL of the
+                // CURRENT function, is treated as NON-ESCAPING for
+                // cellFreeEligible_ purposes, exactly like the IIFE case
+                // above — though for a DIFFERENT reason: the closure genuinely
+                // outlives the call (§28.14's storage-bounded admission), it
+                // just never outlives the captured local's own scope.
                 //
                 // Soundness: §28.14's admission for a `scoped` argument whose
                 // bounding object is the plain call RECEIVER (form 5, no
@@ -18539,16 +18547,21 @@ void Emitter::collectCellFreeEligible(
                 // ALREADY verified for this program to have reached codegen
                 // at all. So every captured local's own enclosing scope ends
                 // AT OR AFTER `L` (`scope`) does. `scope`'s disposal
-                // (`TaskScope.DisposeAsync`, stdlib §6.10) is contractually
-                // QUIESCENT (§28.14 "Quiescence": disposal must guarantee no
-                // stored callback runs after disposal completes) — the
-                // runtime backs this: bz_task_scope_spawn's per-child
-                // completion callback drops the closure's transferred +1
-                // (bezel_runtime_concurrency.cpp) strictly before the scope's
-                // pending count reaches zero, which is strictly before
-                // Join()/DisposeAsync() settle. So by the time a captured
-                // local's OWN scope-end is reached, the closure has already
-                // run its last invocation.
+                // `L`'s disposal is contractually QUIESCENT (§28.14
+                // "Quiescence": disposal must guarantee no stored callback
+                // runs after disposal completes) — the runtime backs this
+                // PER TYPE:
+                //   * `TaskScope.DisposeAsync` (stdlib §6.10) is a documented
+                //     (#1422) NON-BLOCKING zombie drain on the UNWIND edge,
+                //     so quiescence does not hold there; the free is
+                //     suppressed on the unwind path only (unwindUnsafe=true).
+                //   * `CancellationTokenSource.Dispose` (stdlib §6.1) fires
+                //     registered callbacks synchronously, so quiescence
+                //     holds on every exit path; no suppression needed
+                //     (unwindUnsafe=false).
+                //   * `EventSource<T>.Dispose` (stdlib §6.5) severs the
+                //     subscriber list before reclamation, so quiescence
+                //     holds on every exit path (unwindUnsafe=false).
                 //
                 // Marking the capture non-escaping here routes it through the
                 // EXISTING, already-sound cellFreeEligible_ /
@@ -18571,61 +18584,149 @@ void Emitter::collectCellFreeEligible(
                 // such race: it is governed by lexical program order, not by
                 // when the closure itself happens to drop.
                 //
-                // Narrowed to TaskScope.Spawn specifically, not every
-                // `scoped` call position: the same "declared-before +
-                // quiescent disposal" argument also holds for other §28.14
-                // register positions bound by a using-var (e.g. a `using var
-                // sub := pub.Clicked.Subscribe(h)`), but a `this`-bounded
-                // scoped registration (the common event-handler idiom,
-                // `this._clicked.Add(h)`) has NO current-method-scoped bound
-                // at all — the closure can run for as long as `this` lives,
-                // far past the subscribing method's own return — so blindly
-                // widening this optimization to every `scoped` position would
-                // free a captured local's cell while a long-lived
-                // registration could still invoke the stored callback: a real
-                // use-after-free. Widening beyond TaskScope.Spawn to the
-                // other declared-before-bounded register positions is left to
-                // a follow-up (bounding-object resolution would need to
-                // mirror MethodOwnership::scopedFormalAt's callee matching,
-                // Ownership_Checks.cpp) — filed as issue #2383.
-                bool spawnArgHandled = false;
-                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                        c->callee.get())) {
-                    if (ma->member == "Spawn" && ma->target &&
-                            c->args.size() == 1 && c->args[0].value) {
-                        if (auto* spawnLam =
-                                dynamic_cast<const ast::LambdaExpr*>(
-                                    c->args[0].value.get())) {
-                            // Mirrors MethodOwnership::typeRefIsTaskScope's
-                            // name resolution (Ownership_Checks.cpp);
-                            // duplicated here since that helper lives on a
-                            // different pass and is not reachable from this
-                            // codegen pre-scan.
-                            const sema::TypeRef* rt = ctx.exprType(*ma->target);
-                            bool isTaskScope =
-                                rt && rt->kind == sema::TypeRef::Kind::Named &&
-                                (rt->declaration
-                                     ? rt->declaration->name == "TaskScope"
-                                     : (rt->astNode && rt->astNode->name &&
-                                                !rt->astNode->name->parts
-                                                     .empty()
-                                            ? rt->headName() == "TaskScope"
-                                            : rt->importedName ==
-                                                  "TaskScope"));
-                            if (isTaskScope) {
-                                if (auto* loc =
-                                        dynamic_cast<sema::LocalSymbol*>(
-                                            ctx.exprSymbol(*ma->target))) {
-                                    if (auto* ld = dynamic_cast<
-                                            const ast::LocalDecl*>(
-                                                loc->decl)) {
-                                        if (ld->isUsing) {
-                                            collectLambdaCaptures(
-                                                spawnLam, em,
-                                                /*isNonEscaping=*/true,
-                                                /*unwindUnsafe=*/true);
-                                            spawnArgHandled = true;
-                                        }
+                // Narrowed to the stdlib `scoped` register positions whose
+                // RECEIVER is a `using var` local (form 5) — NOT every
+                // `scoped` call position. A `this`-bounded scoped
+                // registration (the common event-handler idiom,
+                // `this._clicked.Add(h)`) has NO current-method-scoped
+                // bound at all — the closure can run for as long as `this`
+                // lives, far past the subscribing method's own return — so
+                // blindly widening this optimization to every `scoped`
+                // position would free a captured local's cell while a
+                // long-lived registration could still invoke the stored
+                // callback: a real use-after-free. Form-2/3/4
+                // (using-var-initializer / owned-field / member-chain)
+                // widening is left to a follow-up — filed as issue #2383.
+                //
+                // Receiver type matching is name-based and STRICT — only the
+                // stdlib `scoped` register positions named in §28.14
+                // (§6.10's `TaskScope.Spawn`, §6.1's
+                // `CancellationToken.Register`, §6.5's
+                // `IEvent<T>.Subscribe` / `EventSource<T>.Add`) qualify. A
+                // user method that happens to be named `Register` or
+                // `Subscribe` on a non-stdlib receiver type is NOT a §28.14
+                // register position (it has no §28.14 admission), so it
+                // deliberately stays in the default (escaping) classification
+                // — its cell-free safety rests on the call-bounded default
+                // of §28.14, not on the using-var-bound argument above.
+                bool scopedCallArgHandled = false;
+                if (c->args.size() == 1 && c->args[0].value) {
+                    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(
+                            c->args[0].value.get())) {
+                        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                                c->callee.get())) {
+                            if (ma->target) {
+                                // Determine the bounding object: form 2
+                                // (using-var initializer) takes priority, then
+                                // form 5 (receiver is a using-var local).
+                                // Both routes land the lambda's captures in
+                                // the same non-escaping set; the form-2 case
+                                // is needed for the §6.1 / §6.5 idiom
+                                // `using var sub := cs.Token.Register(h)`
+                                // and `using var sub := ev.Subscribe(h)`,
+                                // whose receivers are NOT using-vars (they
+                                // are getter / method-call results on
+                                // using-var storage).
+                                const ast::LocalDecl* boundingLd = nullptr;
+                                auto uit = usingInitOf.find(c);
+                                if (uit != usingInitOf.end())
+                                    boundingLd = uit->second;
+                                if (!boundingLd) {
+                                    auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                                        ctx.exprSymbol(*ma->target));
+                                    boundingLd = loc ? dynamic_cast<const ast::LocalDecl*>(
+                                                          loc->decl)
+                                                     : nullptr;
+                                    if (boundingLd && !boundingLd->isUsing)
+                                        boundingLd = nullptr;
+                                }
+                                if (boundingLd) {
+                                    // Bounding type must be one of the
+                                    // stdlib §28.14 storage-bounded
+                                    // positions. For form 2 the bounding
+                                    // object's TYPE is the call's RETURN
+                                    // type (the owned Subscription /
+                                    // etc.); for form 5 the bounding
+                                    // object's type is the RECEIVER's
+                                    // static type. Both land in the same
+                                    // stdlib register-position list (the
+                                    // return type of Subscribe / Register
+                                    // is `owned Subscription` and its
+                                    // static type is `Subscription`, a
+                                    // plain builtin — the bound is on the
+                                    // call site, not the return type, so
+                                    // the form-2 check is by METHOD NAME
+                                    // + known receiver-or-bounding-object
+                                    // stdlib type, mirroring
+                                    // MethodOwnership::builtinScopedCallbackFormal).
+                                    std::string_view methodName = ma->member;
+                                    // Receiver type for form 5.
+                                    std::string_view recvName;
+                                    const sema::TypeRef* rt =
+                                        ctx.exprType(*ma->target);
+                                    if (rt && rt->kind ==
+                                                  sema::TypeRef::Kind::Named) {
+                                        if (rt->declaration)
+                                            recvName = rt->declaration->name;
+                                        else if (rt->astNode && rt->astNode->name &&
+                                                 !rt->astNode->name->parts.empty())
+                                            recvName = rt->headName();
+                                        else if (!rt->importedName.empty())
+                                            recvName = rt->importedName;
+                                    }
+                                                                                                    bool unwindUnsafe = false;
+                                    bool match = false;
+                                    if (methodName == "Spawn" &&
+                                        recvName == "TaskScope") {
+                                        // #1422: non-blocking zombie drain
+                                        // on the unwind edge → suppress the
+                                        // free there. Form 5 only — a
+                                        // `using var sub := TaskScope.Spawn()`
+                                        // is a less common form whose
+                                        // return type is `owned TaskScope`
+                                        // (whose own teardown IS the
+                                        // scope), so a form-2 / Spawn is
+                                        // unusual but still safe: the
+                                        // owned TaskScope is disposed at
+                                        // `sub`'s scope end, which IS the
+                                        // scope's quiescence point.
+                                        match = true;
+                                        unwindUnsafe = true;
+                                    } else if (methodName == "Register" &&
+                                               recvName == "CancellationToken") {
+                                        // §6.1: synchronous-cancel
+                                        // quiescence holds. Admitted
+                                        // under BOTH form 5 (`cs.Token`
+                                        // is a using-var CancellationToken
+                                        // — uncommon) and form 2
+                                        // (`using var sub := cs.Token.Register(h)` —
+                                        // the idiomatic form).
+                                        match = true;
+                                        unwindUnsafe = false;
+                                    } else if ((methodName == "Subscribe" ||
+                                                methodName == "Add") &&
+                                               (recvName == "EventSource" ||
+                                                recvName == "AsyncEventSource" ||
+                                                recvName == "IEvent" ||
+                                                recvName == "IAsyncEvent")) {
+                                        // §6.5: dispose-severs-subscribers
+                                        // quiescence holds. Admitted
+                                        // under BOTH form 5 (`eh` is a
+                                        // using-var EventSource — uncommon)
+                                        // and form 2 (`using var sub :=
+                                        // eh.Subscribe(h)` — the idiomatic
+                                        // form, including the property-hop
+                                        // shape `using var sub := pub.Clicked.Subscribe(h)`
+                                        // per stdlib §6.5's event pattern).
+                                        match = true;
+                                        unwindUnsafe = false;
+                                    }
+                                    if (match) {
+                                        collectLambdaCaptures(
+                                            lam, em,
+                                            /*isNonEscaping=*/true,
+                                            unwindUnsafe);
+                                        scopedCallArgHandled = true;
                                     }
                                 }
                             }
@@ -18633,7 +18734,7 @@ void Emitter::collectCellFreeEligible(
                     }
                 }
                 for (std::size_t ai = 0; ai < c->args.size(); ++ai) {
-                    if (spawnArgHandled && ai == 0) continue;
+                    if (scopedCallArgHandled && ai == 0) continue;
                     expr(c->args[ai].value.get(), false);
                 }
                 return; }
@@ -18680,6 +18781,13 @@ void Emitter::collectCellFreeEligible(
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
                 bool nonEsc = !ld->isUsing &&
                     closureNonEscaping.count(static_cast<const void*>(ld));
+                // fix #2334: anchor `using var` initializers that are CallExpr
+                // (form 2 of §28.14) so the CallExpr handling in expr() can
+                // resolve the bounding object. The map is consulted inside the
+                // CallExpr arm and routes the captures through the same
+                // collectLambdaCaptures path the form-5 receiver case uses.
+                if (ld->isUsing && ld->initializer)
+                    usingInitOf[ld->initializer.get()] = ld;
                 if (ld->initializer)
                     expr(ld->initializer.get(), nonEsc);
                 return;
