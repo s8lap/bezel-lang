@@ -1712,6 +1712,42 @@ private:
     // reached here (this covers the INSTANCE-receiver path only).
     void checkBuiltinStringCallArgs(const ast::CallExpr& ce);
 
+    // §7 / stdlib §4.x (#2582): the COLLECTION twin of #2315. A builtin
+    // collection instance method that declares a NON-nullable `item: T` /
+    // `query: T` / `key: K` parameter (Array<T>.IndexOf/Contains/Remove/
+    // LastIndexOf/Insert, Set<T>/SortedSet<T>.Add/TryAdd/Contains/Remove,
+    // Stack<T>/Queue<T>.Push/Enqueue/Contains, LinkedList<T>.AddFirst/
+    // AddLast/AddBefore/AddAfter/Find/Contains/Remove, Dictionary<K,V>/
+    // SortedDictionary<K,V>.ContainsKey/Contains/Remove, OwningDictionary<
+    // K,V>.PopValue/TryPopValue, OwningSet<T>.Take/TryTake) has no
+    // MethodSymbol — these are synthetic Named TypeRefs with no user
+    // TypeSymbol — so the ordinary checkCallArity → checkArgsAgainstParams
+    // → checkAssignable path never fires. An un-narrowed `int?` (or `T?`)
+    // argument was silently accepted and reached codegen, where the
+    // equality-compare lowering tripped an LLVM ICmpInst assertion
+    // (`ICmpInst::AssertOK`: operand-type mismatch, exit 134 — there is no
+    // runtime null guard to mask the type error here). A user
+    // `method Take(x: int)` with the identical signature correctly rejected
+    // it (§7), so the two paths disagreed. Run the SAME §7/§12
+    // assignability check the user-method path runs against the
+    // instantiated element/key type `recvTy->genericArgs[0]`, so a builtin
+    // collection call rejects an un-narrowed `T?` exactly as a user method
+    // does. The §7.4 narrowing exception (a `T?` proved non-null by a
+    // null-check IS assignable) lives inside checkAssignable, which this
+    // reuses. Only INSTANCE calls on the builtin collection families are
+    // covered: the gate requires a Named TypeRef with no user `declaration`
+    // and a recognized collection head name, which excludes static calls
+    // and user types (a user `method IndexOf(item: T): int` has a
+    // MethodSymbol → checkCallArity already ran). The owning family's
+    // `owned item: T` mutators (Add/Push/Enqueue/Insert/AddFirst/…) carry
+    // a §22.3 `owned` modifier at the call site and are skipped per that
+    // section (their nullability is governed by §22.3, not §7); the
+    // owning-family `Contains`/`IndexOf`/`Find`/`Take`/etc. take a PLAIN
+    // borrow `item: T`/`query: T` and ARE covered. Null-conditional calls
+    // (`coll?.IndexOf(n)`) have a NullCondMemberExpr callee (not a
+    // MemberAccessExpr) and are not reached — filed separately.
+    void checkBuiltinCollectionCallArgs(const ast::CallExpr& ce);
+
     // §2.5 / §22.7 (issue #328 FINDING [7] B): check `new ImportedT(args)`
     // against an imported type's reconstructed constructor signatures (no
     // ast::ConstructorDecl; ParameterSymbol resolved types). Single-ctor,

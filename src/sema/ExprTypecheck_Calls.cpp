@@ -8073,6 +8073,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // `string?` argument is rejected instead of silently accepted.
     checkBuiltinStringCallArgs(ce);
 
+    // §7 / stdlib §4.x (#2582): the collection twin of #2315 — a builtin
+    // collection instance method has no MethodSymbol either, so the same
+    // per-argument assignability hole let an un-narrowed `int?` (or `T?`)
+    // `item`/`query`/`key` argument reach codegen and ICE it (LLVM ICmpInst
+    // assertion, exit 134). Run the §7 check against the instantiated
+    // element/key type so the builtin path agrees with the user-method path.
+    checkBuiltinCollectionCallArgs(ce);
+
     // §7.5 / FINDING [3] ADDENDUM: a null-conditional call `x?.M(args)` is
     // ALWAYS nullable — it returns null when the receiver is null. The callee is
     // a NullCondMemberExpr; lift the (raw) return type recorded above to its
@@ -8501,6 +8509,153 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
         checkAssignable(
             argTy, paramTy, a.value->span.begin,
             std::string("argument to `string.") + std::string(m) + "`",
+            a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
+    }
+}
+
+// §7 / stdlib §4.x (#2582): see the header comment for the full rationale.
+// The collection twin of #2315's checkBuiltinStringCallArgs. A builtin
+// collection instance method (Array<T>.IndexOf/Contains/…, Set<T>/SortedSet<
+// T>.Add/TryAdd/Contains/Remove, Stack<T>/Queue<T>.Push/Enqueue/Contains,
+// LinkedList<T>.AddFirst/AddLast/AddBefore/AddAfter/Find/Contains/Remove,
+// Dictionary<K,V>/SortedDictionary<K,V>.ContainsKey/Contains/Remove,
+// OwningDictionary<K,V>.PopValue/TryPopValue, OwningSet<T>.Take/TryTake) has
+// no MethodSymbol — these are synthetic Named TypeRefs with no user
+// TypeSymbol — so checkCallArity → checkArgsAgainstParams → checkAssignable
+// never fires. An un-narrowed `int?` (or `T?`) argument was silently accepted
+// and reached codegen, where the equality-compare lowering tripped an LLVM
+// ICmpInst assertion (operand-type mismatch, exit 134). This helper mirrors
+// the user-method path against the instantiated element/key type, so an
+// un-narrowed `T?` is rejected exactly as a user `method Take(x: int)` rejects
+// it, while a NARROWED nullable (after a null-check) and a plain non-nullable
+// argument still compile (the §7.4 narrowing exception lives inside
+// checkAssignable, which this reuses).
+//
+// The element/key type is `recvTy->genericArgs[0]` for every covered family —
+// element-typed collections (Array<T>/Set<T>/Stack<T>/…) instantiate T at
+// genericArgs[0], and the keyed collections (Dictionary<K,V>/OwningDictionary<
+// K,V>/SortedDictionary<K,V>) instantiate K at genericArgs[0]. The parameter's
+// OWN nullability is the instantiated type's nullability — `Array<int?>` has
+// `IndexOf(item: int?)`, so an `int?` argument is admissible; `Array<int>`
+// has `IndexOf(item: int)`, so an un-narrowed `int?` is rejected. The
+// borrowing mutators (Add/Push/Enqueue/Insert/AddFirst/AddLast/AddBefore/
+// AddAfter/TryAdd) are gated to the borrowing collection names because their
+// owning twins take `owned item: T` (the call-site `owned` modifier aliases
+// under §22.3 and is skipped by the modifier guard below, but the name gate
+// keeps the diagnostic precise when a caller forgets the marker).
+void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || !ma->target) return;
+    TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||
+        recvTy->declaration)  // user types have a MethodSymbol → checkCallArity ran
+        return;
+    // Recognize the builtin collection families by their synthetic head name
+    // (mirrors the `colName` lambda at L3267: aliasResolvedHead wins; else
+    // astNode's headName). A user type aliasing to a builtin collection
+    // (type OA := OwningArray<R>) carries aliasResolvedHead and is covered.
+    std::string_view colName;
+    if (!recvTy->aliasResolvedHead.empty())
+        colName = recvTy->aliasResolvedHead;
+    else if (recvTy->astNode && recvTy->astNode->name &&
+             !recvTy->astNode->name->parts.empty())
+        colName = recvTy->headName();
+    if (colName.empty()) return;
+    bool isElementCollection =
+        colName == "Array" || colName == "OwningArray" ||
+        colName == "Set" || colName == "OwningSet" ||
+        colName == "SortedSet" ||
+        colName == "Stack" || colName == "OwningStack" ||
+        colName == "Queue" || colName == "OwningQueue" ||
+        colName == "LinkedList" || colName == "OwningLinkedList";
+    bool isKeyedCollection =
+        colName == "Dictionary" || colName == "OwningDictionary" ||
+        colName == "SortedDictionary";
+    if (!isElementCollection && !isKeyedCollection) return;
+    if (recvTy->genericArgs.empty() || !recvTy->genericArgs[0]) return;
+    TypeRef* itemTy = recvTy->genericArgs[0];  // T (element) or K (key)
+    const auto& m = ma->member;
+
+    // Per (method, position): is this position a NON-nullable `item: T` /
+    // `query: T` / `key: K` parameter this helper covers? Borrows the SAME
+    // stdlib-§4.x surface the typeCall result-typing branch (L4337+) dispatches
+    // on; the only methods included here are those whose declared first or
+    // second parameter is the collection's element/key type. Integer index
+    // params (RemoveAt/PopAt/Insert's `index`), function-typed params
+    // (Sort's comparer, First(pred)), Range params (Slice/AsSpan), and
+    // `owned`/`out`-marked slots are excluded — they are not §7 nullable->
+    // non-nullable conversions.
+    auto isItemPosition = [&](std::size_t pos) -> bool {
+        // Position-0 item/query/key methods (all collection families).
+        if (pos == 0 && (
+            // Search/query — plain `item: T`/`query: T` borrow param.
+            m == "IndexOf" || m == "LastIndexOf" ||
+            m == "Contains" || m == "ContainsKey" ||
+            m == "Find" ||
+            // OwningSet — `Take(query: T): owned T` and
+            // `TryTake(query: T, out owned removed: T?): bool` borrow the
+            // query (the out slot is modifier-marked, skipped below). Gated
+            // to OwningSet: on every OTHER collection family `Take` is the
+            // LINQ `Take(count: int)` operator (stdlib §5), whose `int`
+            // parameter is NOT an item slot — checking it against T would
+            // reject the legitimate `arr.Take(2)`. Sema's existing Take
+            // resolution mirrors this split (L4363: OwningSet.Take is the
+            // item-query form; everywhere else LINQ Take wins).
+            ((m == "Take" || m == "TryTake") && colName == "OwningSet") ||
+            // Removal by item/key — `Remove(item: T): bool` /
+            // `Remove(key: K): bool`. (RemoveAt/RemoveNode are NOT here:
+            // RemoveAt takes int index, RemoveNode takes LinkedListNode<T>.)
+            m == "Remove" ||
+            // OwningDictionary keyed take.
+            m == "PopValue" || m == "TryPopValue"))
+            return true;
+        // Borrowing-only pos-0 mutators: plain `item: T`. The owning twins
+        // declare `owned item: T` and are gated out by name (the call-site
+        // `owned` modifier carries §22.3, not §7); the name gate also keeps
+        // the diagnostic precise if the caller forgets the marker.
+        // `Dictionary<K,V>.Add(key: K, value: V)` and `OwningDictionary<K,V>.
+        // Add(key: K, owned value: V)` declare a NON-nullable key at pos 0
+        // (the value at pos 1 is a separate type V — filed separately). The
+        // owning form's value arg carries the §22.3 `owned` modifier and is
+        // skipped by the modifier guard below.
+        if (pos == 0 && (
+            (m == "Add"    && (colName == "Set" || colName == "SortedSet" ||
+                               colName == "LinkedList" ||
+                               colName == "Dictionary" ||
+                               colName == "OwningDictionary")) ||
+            (m == "TryAdd" && (colName == "Set" || colName == "SortedSet")) ||
+            (m == "Push"      && colName == "Stack") ||
+            (m == "Enqueue"   && colName == "Queue") ||
+            (m == "AddFirst"  && colName == "LinkedList") ||
+            (m == "AddLast"   && colName == "LinkedList")))
+            return true;
+        // Position-1 item methods.
+        if (pos == 1 && (
+            // Array<T>.Insert(index: int, item: T) — stdlib §4.4.
+            (m == "Insert" && colName == "Array") ||
+            // LinkedList<T>.AddBefore/After(node, item: T) — stdlib §4.6.
+            ((m == "AddBefore" || m == "AddAfter") && colName == "LinkedList")))
+            return true;
+        return false;
+    };
+
+    for (std::size_t i = 0; i < ce.args.size(); ++i) {
+        const auto& a = ce.args[i];
+        if (!a.value || a.isDiscard) continue;
+        // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
+        // the caller slot under its own rule and is not a §7 nullable->non-
+        // nullable conversion; skip. This is what excludes the owning family's
+        // `Add(owned item: T)` / `Push(owned item: T)` / `Insert(index,
+        // owned item: T)` / etc. — the caller writes the `owned` marker, and
+        // the parameter's nullability is governed by the §22.3 transfer rule.
+        if (!a.modifier.empty()) continue;
+        if (!isItemPosition(i)) continue;
+        TypeRef* argTy = ctx_.exprType(*a.value);
+        if (!argTy) continue;
+        checkAssignable(
+            argTy, itemTy, a.value->span.begin,
+            std::string("argument to `") + std::string(colName) + "<T>." +
+            std::string(m) + "`",
             a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
     }
 }
