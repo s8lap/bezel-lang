@@ -675,3 +675,178 @@ BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
         "  return (if hub2.Peek = 9 then 42 else 91); "
         "end Main; end C;"), 42);
 }
+
+// ===========================================================================
+// Issue #2362 — primary-ctor + explicit-ctor Deserialize combination
+// (§9.8, v0.236).
+//
+// #2325 (above) verified the primary-ctor-ONLY Deserialize path; the
+// explicit-ctor path (serialization_tier2_classes_test.cpp) was already long
+// established. #2362 is the VERIFICATION GAP between them: a class with BOTH
+// a primary constructor (§11.1) AND an explicit `constructor(...)` that
+// chains to it via `this(...)`, where §9.8's constructor-selection check
+// (line 1438: "When the class declares more than one constructor, the
+// synthesized Deserialize uses the *unique* constructor whose parameter list
+// binds exactly the owning-tree components and plain borrowing fields, matched
+// by name") picks the EXPLICIT ctor — not the primary — as the unique
+// bijection match.
+//
+// The shape: the primary ctor captures SOME components (here `id`, exposed
+// via a computed property), but an auto-property component (`Extra`) exists
+// that the primary ctor's parameter list does NOT cover, so the primary ctor
+// alone cannot bijection-match (1 param vs 2 components). The explicit
+// `constructor(id, extra)` is the unique match. The question #2362 asks:
+// does Widget.Deserialize(d) correctly populate BOTH `Id` (via the `this(id)`
+// chain running inside the explicit ctor — which captures the primary-ctor
+// param) AND `Extra` (via the explicit ctor's own `Extra := extra` body
+// assignment)?
+//
+// Verified CORRECT on origin/main (3a668dd): emitClassDeserialize's
+// matchedCtor branch (LlvmBackend_Serialization.cpp) calls the explicit
+// ctor's compiled LLVM body, whose emitConstructorBody runs the `this(id)`
+// chain call (emitChainCall, isThis=true — delegates to the primary ctor's
+// param-capture + field initializers per §22.9 step 0/2, with field
+// initializers running exactly once at the end of the this-chain per the
+// "Field initializers run exactly once" rule, spec line 4888), THEN the
+// explicit ctor's own body (`Extra := extra`). Both fields round-trip; no
+// code change warranted. These tests pin that combination durably.
+//
+// Note on the both-match ambiguity (adversarial self-pass): a class whose
+// primary ctor AND an explicit ctor both bijection-match the component set
+// is STRUCTURALLY IMPOSSIBLE — §11.1 line 1713 forbids redeclaring a
+// constructor with the same parameter list as the primary constructor, so
+// no ambiguity can arise between the primary and a chaining explicit ctor.
+// The §9.8 "more than one matches" compile error is reachable only between
+// two EXPLICIT ctors, which is already covered by
+// serialization_tier2_classes_test.cpp.
+// ===========================================================================
+
+// The issue's own repro, verbatim shape: a class exposing the primary-ctor
+// param `id` ONLY through a computed property (`=> id`), PLUS an auto-
+// property `Extra` populated solely by the explicit ctor's body. Component
+// set {id, Extra}; the 1-param primary ctor cannot bijection-match, so the
+// 2-param explicit ctor is the unique match. Asserts BOTH Id AND Extra
+// round-trip, under ASan/LSan (the string Extra is the field at risk of a
+// leak/double-free through the this-chain + body-assignment path).
+BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
+           primary_plus_explicit_ctor_chain_roundtrip_spec_9_8_2362) {
+    BEZEL_EXPECT_EQ(runChecked(
+        std::string("module M; ") + kImport +
+        "class Widget(id: int): ISerializable, IDeserializable "
+        "  public property Id: int => id; "
+        "  public Extra: string := \"\"; "
+        "  public constructor(id: int, extra: string) "
+        "    this(id); "
+        "    Extra := extra; "
+        "  end constructor; "
+        "end Widget; "
+        "class C public static method Main(): int "
+        "  using var w := new Widget(7, \"gadget\"); "
+        "  using var s := new BinarySerializer(); "
+        "  w.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var w2 := Widget.Deserialize(d); "
+        "  if w2.Id <> 7 then return 91; end; "
+        "  return (if w2.Extra = \"gadget\" then 42 else 92); "
+        "end Main; end C;"), 42);
+}
+
+// A scalar-only variant (Extra is `int`, not `string`) — removes string
+// ownership from the picture and isolates the construction-order question:
+// does the explicit ctor's body assignment (`Extra := extra`) correctly win
+// over the auto-property's own default initializer (`Extra: int := 0`), and
+// does the `this(id)` chain correctly populate the primary-ctor-captured Id?
+BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
+           primary_plus_explicit_ctor_int_extra_roundtrip_spec_9_8_2362) {
+    BEZEL_EXPECT_EQ(run(
+        std::string("module M; ") + kImport +
+        "class Widget(id: int): ISerializable, IDeserializable "
+        "  public property Id: int => id; "
+        "  public Extra: int := 0; "
+        "  public constructor(id: int, extra: int) "
+        "    this(id); "
+        "    Extra := extra; "
+        "  end constructor; "
+        "end Widget; "
+        "class C public static method Main(): int "
+        "  using var w := new Widget(42, 99); "
+        "  using var s := new BinarySerializer(); "
+        "  w.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var w2 := Widget.Deserialize(d); "
+        "  if w2.Id <> 42 then return 91; end; "
+        "  return (if w2.Extra = 99 then 42 else 92); "
+        "end Main; end C;"), 42);
+}
+
+// Repeated round-trips in a loop (50 allocate/serialize/deserialize/dispose
+// cycles through the primary+explicit ctor chain) — a per-iteration leak in
+// the string Extra (e.g. a missed release of the binder's +1 reference when
+// the explicit ctor retains it into the field) would surface as a large,
+// clearly-nonzero ASan/LSan report rather than a single missed free masked
+// by the allocator noise floor. Mirrors the primary-ctor-only
+// repeated_roundtrip_no_accumulating_leak test above, for the mixed path.
+BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
+           primary_plus_explicit_ctor_repeated_roundtrip_no_leak_spec_9_8_2362) {
+    BEZEL_EXPECT_EQ(runChecked(
+        std::string("module M; ") + kImport +
+        "class Widget(id: int): ISerializable, IDeserializable "
+        "  public property Id: int => id; "
+        "  public Extra: string := \"\"; "
+        "  public constructor(id: int, extra: string) "
+        "    this(id); "
+        "    Extra := extra; "
+        "  end constructor; "
+        "end Widget; "
+        "class C public static method Main(): int "
+        "  var total: int := 0; "
+        "  var i: int := 0; "
+        "  while i < 50 do "
+        "    using var w := new Widget(i, \"item\"); "
+        "    using var s := new BinarySerializer(); "
+        "    w.Serialize(s); "
+        "    using var bytes := s.ToBytes(); "
+        "    using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "    using var w2 := Widget.Deserialize(d); "
+        "    total := total + w2.Id; "
+        "    i := i + 1; "
+        "  end; "
+        // sum 0..49 = 1225; assert the exact accumulator to prove every
+        // iteration's Id round-tripped through the primary+explicit chain.
+        "  return (if total = 1225 then 42 else total); "
+        "end Main; end C;"), 42);
+}
+
+// Adversarial self-pass: when the primary ctor DOES bijection-match the
+// component set (primaryCtorUsed=true) AND a non-matching explicit ctor also
+// exists, the primary-ctor path runs and the explicit ctor is NOT selected
+// (the `if (!primaryCtorUsed)` gate at LlvmBackend_Serialization.cpp skips
+// the explicit-ctor search). This pins that the presence of a chaining
+// explicit ctor does not derail the primary-ctor path when the primary is the
+// match — the two paths are mutually exclusive, and #2362's mixed case is the
+// ONLY shape that reaches the explicit-ctor branch for a primary-ctor class.
+BEZEL_TEST(codegen_class_primary_ctor_serialization_2325,
+           primary_ctor_match_with_extra_explicit_ctor_uses_primary_spec_9_8_2362) {
+    BEZEL_EXPECT_EQ(runChecked(
+        std::string("module M; ") + kImport +
+        // Primary ctor (id) bijection-matches the single component {id}; the
+        // explicit ctor (id, note) has 2 params vs 1 component, cannot match,
+        // and exists only to confirm it does not disturb the primary path.
+        "class Widget(id: int): ISerializable, IDeserializable "
+        "  public property Id: int => id; "
+        "  public constructor(id: int, note: string) "
+        "    this(id); "
+        "  end constructor; "
+        "end Widget; "
+        "class C public static method Main(): int "
+        "  using var w := new Widget(5); "
+        "  using var s := new BinarySerializer(); "
+        "  w.Serialize(s); "
+        "  using var bytes := s.ToBytes(); "
+        "  using var d := new BinaryDeserializer(bytes.AsReadOnlySpan()); "
+        "  using var w2 := Widget.Deserialize(d); "
+        "  return (if w2.Id = 5 then 42 else 91); "
+        "end Main; end C;"), 42);
+}
