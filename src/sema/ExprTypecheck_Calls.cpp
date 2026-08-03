@@ -8066,6 +8066,13 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
         checkCallArity(ce, ms);
     }
 
+    // §7 / stdlib §9.6 (#2315): a primitive `string` instance-method call
+    // has no MethodSymbol (so checkCallArity above never ran), yet stdlib §9.6
+    // declares its parameters non-nullable. Run the same per-argument
+    // assignability check the user-method path runs so an un-narrowed
+    // `string?` argument is rejected instead of silently accepted.
+    checkBuiltinStringCallArgs(ce);
+
     // §7.5 / FINDING [3] ADDENDUM: a null-conditional call `x?.M(args)` is
     // ALWAYS nullable — it returns null when the receiver is null. The callee is
     // a NullCondMemberExpr; lift the (raw) return type recorded above to its
@@ -8399,6 +8406,103 @@ ExprTC::BindResult ExprTC::bindArgsToParams(
 
     res.ok = true;
     return res;
+}
+
+// §7 / stdlib §9.6 (#2315): see the header comment for the full rationale.
+// A primitive `string` instance-method call has no MethodSymbol, so the
+// ordinary per-argument assignability check (checkCallArity →
+// checkArgsAgainstParams → checkAssignable) never fires. This helper mirrors
+// that path against the stdlib-§9.6-declared parameter types, so an
+// un-narrowed `string?` (or `char?`) argument is rejected exactly as a user
+// `method Take(x: string)` rejects it, while a NARROWED nullable (after a
+// null-check) and a plain non-nullable argument still compile (the §7.4
+// narrowing exception lives inside checkAssignable, which this reuses).
+//
+// The stdlib §9.6 surface encodes, per method-name and zero-based parameter
+// position, the declared parameter's NON-nullable primitive kind — choosing
+// the matching overload for char|string-overloaded methods (IndexOf/
+// Contains/LastIndexOf/Replace/Split) by inspecting the argument's own kind.
+// `Equals(other: string?)` deliberately declares a NULLABLE parameter (§11.2
+// parameter-nullability widening) and is therefore omitted entirely, so a
+// `string?` argument to it continues to compile. Only INSTANCE calls are
+// covered: the callee target must carry a Primitive-String exprType (a value
+// of type `string`), which excludes static calls like `string.Compare(a, b)`
+// (target is the type name, no value exprType). The static `IsNullOrEmpty`/
+// `IsNullOrWhiteSpace` take `string?` anyway, so excluding statics does not
+// leave a nullable hole.
+void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || !ma->target) return;
+    TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Primitive ||
+        recvTy->primitive != PrimitiveType::String)
+        return;  // not a primitive `string` instance call
+    std::string_view m = ma->member;
+    // `Equals` declares `other: string?` (§11.2 widening) — admissible; skip.
+    if (m == "Equals") return;
+    // Map (method, position, argPrimitiveKind) → the declared NON-nullable
+    // parameter primitive kind to check against, or None when this position
+    // is not a primitive-string/char/int/bool slot this helper covers (e.g.
+    // Split's `Array<char>` form, Trim's `IEnumerable<char>` — those are
+    // Named-typed and not part of the nullable-primitive hole; they are left
+    // to their existing handling). For char|string-overloaded first params,
+    // pick the overload matching the argument's own kind.
+    auto paramKind = [&](std::size_t pos, PrimitiveType argKind)
+            -> PrimitiveType {
+        using PT = PrimitiveType;
+        // First-position char-or-string overload set (§9.6).
+        if (pos == 0 && (m == "Contains" || m == "IndexOf" ||
+                         m == "LastIndexOf" || m == "Replace" || m == "Split")) {
+            if (argKind == PT::String) return PT::String;
+            if (argKind == PT::Char)  return PT::Char;
+            return PT::None;  // Array<char>/span/other — not covered here
+        }
+        // Replace's second param is char-or-string too (matches the first).
+        if (pos == 1 && m == "Replace") {
+            if (argKind == PT::String) return PT::String;
+            if (argKind == PT::Char)  return PT::Char;
+            return PT::None;
+        }
+        // Single-kind string params.
+        if ((pos == 0 && (m == "StartsWith" || m == "EndsWith" ||
+                          m == "CompareTo")) ||
+            (pos == 1 && m == "Insert")) {
+            return PT::String;
+        }
+        // Integer params (startIndex / count / totalWidth / length) per §9.6.
+        // IndexOf declares `startIndex: int` as the SECOND param of its 2-arg
+        // overload (pos 0 is the char|string search value, handled above);
+        // LastIndexOf has no integer parameter at all (only char/string).
+        bool intPos =
+            (pos == 0 && (m == "Substring" || m == "Remove" ||
+                          m == "PadLeft" || m == "PadRight" ||
+                          m == "PadCenter")) ||
+            (pos == 1 && (m == "Substring" || m == "Remove" ||
+                          m == "IndexOf"));
+        if (intPos) return PT::Int;
+        // PadLeft/Right/Center paddingChar (second param) is char.
+        if (pos == 1 && (m == "PadLeft" || m == "PadRight" || m == "PadCenter"))
+            return PT::Char;
+        return PT::None;
+    };
+    for (std::size_t i = 0; i < ce.args.size(); ++i) {
+        const auto& a = ce.args[i];
+        if (!a.value || a.isDiscard) continue;
+        // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
+        // the caller slot under its own rule and is not a §7 nullable->non-
+        // nullable conversion; skip (string methods take plain value params
+        // anyway, so this is defensive).
+        if (!a.modifier.empty()) continue;
+        TypeRef* argTy = ctx_.exprType(*a.value);
+        if (!argTy || argTy->kind != TypeRef::Kind::Primitive) continue;
+        PrimitiveType declared = paramKind(i, argTy->primitive);
+        if (declared == PrimitiveType::None) continue;
+        TypeRef* paramTy = ctx_.primitiveTypeRef(declared, /*nullable=*/false);
+        checkAssignable(
+            argTy, paramTy, a.value->span.begin,
+            std::string("argument to `string.") + std::string(m) + "`",
+            a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
+    }
 }
 
 // Slices T5/T6/T7: shared check of an argument list against a parameter

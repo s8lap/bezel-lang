@@ -1690,6 +1690,28 @@ private:
     // is deferred, so skip.
     void checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t);
 
+    // §7 / stdlib §9.6 (#2315): a primitive `string` receiver's builtin
+    // instance methods (IndexOf/Contains/StartsWith/EndsWith/LastIndexOf/
+    // Replace/Split/Insert/Substring/...) declare NON-nullable `string`/
+    // `char`/`int` parameters, but the call has no MethodSymbol — `string`
+    // is a primitive with no user TypeSymbol — so the ordinary
+    // checkCallArity → checkArgsAgainstParams path never runs. An
+    // un-narrowed `string?` argument was silently accepted and reached
+    // codegen, where the runtime helper's accidental null guard
+    // (`bz_str_indexof` opens with `if (!self_p || !sub_p) return -1;`)
+    // converted the type error into a "not found"/wrong answer. That guard
+    // is load-bearing only while every lowering avoids dereferencing the
+    // operand (a new lowering already segfaulted on it once). Run the SAME
+    // §7/§12 assignability check the user-method path runs
+    // (checkArgsAgainstParams → checkAssignable) against the stdlib-§9.6-
+    // declared parameter types, so a builtin string call rejects an
+    // un-narrowed `string?` exactly as a user `method Take(x: string)`
+    // does. `Equals(other: string?)` is the documented exception (§11.2
+    // parameter-nullability widening) and stays admissible; the static
+    // `IsNullOrEmpty`/`IsNullOrWhiteSpace` take `string?` and are not
+    // reached here (this covers the INSTANCE-receiver path only).
+    void checkBuiltinStringCallArgs(const ast::CallExpr& ce);
+
     // §2.5 / §22.7 (issue #328 FINDING [7] B): check `new ImportedT(args)`
     // against an imported type's reconstructed constructor signatures (no
     // ast::ConstructorDecl; ParameterSymbol resolved types). Single-ctor,
