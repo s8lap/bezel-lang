@@ -2486,6 +2486,59 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
 
         llvm::Value* self = &*disposeFn->arg_begin();
 
+        // fix #2612 / §28.2 / §29.7 (v0.236): idempotent disposal — the ENTRY
+        // GUARD, the async sibling of the sync iterator Dispose's (#1107 rework,
+        // LlvmBackend_Iterators.cpp). §28.2 models idempotency as a
+        // "per-instance disposed flag"; as on the sync path we encode that flag
+        // as a distinct STATE SENTINEL that ONLY Dispose ever writes, and check
+        // it before any cleanup runs, so a Dispose re-entered from within its
+        // own cleanup (a finally body, or an owned param/local destructor, that
+        // reaches this same frame) returns immediately instead of running the
+        // sweeps a second time and, at the end, free()ing the spill area and the
+        // frame AGAIN — a double-free of the frame.
+        //
+        // The sentinel MUST be distinct from `-1`. The pre-fix code stored `-1`
+        // here and its comment claimed that made "re-entrant Dispose a no-op",
+        // but (a) nothing ever tested it, and (b) `-1` is also what Resume
+        // writes on natural exhaustion (the stores in emitResumeDispatch's done
+        // edges), which means "iteration complete, frame still allocated and
+        // STILL OWES DISPOSAL" — so guarding on `-1` would make the FIRST,
+        // legitimate Dispose after full consumption no-op before the owned-param
+        // (§29.8) / owned-local (§29.7) / yielded-value (§29.1) sweeps and the
+        // frame free, turning this fix into a leak. That is exactly the
+        // mis-predication #1107 shipped and the #1107 rework corrected on the
+        // sync path; `-2` is taken from there verbatim. The async state space is
+        // otherwise 0..N (suspension states), `-1` (exhausted) and `-3` (an
+        // owned-param source claimed by GetAsyncEnumerator), so `-2` collides
+        // with nothing and no live frame can present it before its first
+        // Dispose.
+        //
+        // SCOPE, stated plainly: this closes the RE-ENTRANT window — a nested
+        // Dispose that arrives while the first is still running, before the
+        // frame is freed. It does NOT make a SECOND, sequential Dispose safe:
+        // the first one free()s the frame, so a later call reads freed memory
+        // whatever it finds there. The sync guard has the same limit. Both
+        // sequential-double-dispose shapes reachable from source today (an
+        // `await using var` binding plus `await for` over the same enumerator;
+        // an explicit `.Dispose()` plus the scope-end disposal) are already
+        // handled upstream by the call-site null guard — verified under ASan.
+        {
+            llvm::Value* stateGEP0 = builder_.CreateStructGEP(
+                stateStructTy, self, STATE_FIELD);
+            llvm::Value* curState0 =
+                builder_.CreateLoad(i32(), stateGEP0, "dsp.entrystate");
+            llvm::Value* isDisposed = builder_.CreateICmpEQ(
+                curState0, builder_.getInt32(-2), "dsp.isdisposed");
+            auto* earlyRet =
+                llvm::BasicBlock::Create(llvm_, "dsp.idem", disposeFn);
+            auto* proceed =
+                llvm::BasicBlock::Create(llvm_, "dsp.proceed", disposeFn);
+            builder_.CreateCondBr(isDisposed, earlyRet, proceed);
+            builder_.SetInsertPoint(earlyRet);
+            builder_.CreateRetVoid();
+            builder_.SetInsertPoint(proceed);
+        }
+
         // Restore captures so finally bodies can access `this` / params.
         emitFrameCaptureRestores(frame, self);
 
@@ -2724,15 +2777,21 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             // cleanup — mark done and free.
             llvm::Value* stateGEP2 =
                 builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
-            builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            // fix #2612: the DISPOSED sentinel (-2), not the exhaustion value
+            // (-1) — see the entry guard above for why they must differ.
+            builder_.CreateStore(builder_.getInt32(-2), stateGEP2);
             emitFreeAndReturn();
         } else {
             auto* doneBB = llvm::BasicBlock::Create(llvm_, "dsp.done", disposeFn);
             llvm::Value* stateGEP2 =
                 builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
             llvm::Value* curState = builder_.CreateLoad(i32(), stateGEP2);
-            // Mark done immediately so re-entrant Dispose is a no-op.
-            builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            // Mark done immediately — BEFORE the finally chains run — so a
+            // Dispose re-entered from inside one of them no-ops at the entry
+            // guard. fix #2612: the DISPOSED sentinel (-2), not the exhaustion
+            // value (-1). The switch below dispatches on the already-loaded
+            // `curState`, so overwriting the field here is safe.
+            builder_.CreateStore(builder_.getInt32(-2), stateGEP2);
             std::set<unsigned> states;
             for (auto& kv : smIterCleanupAtState_) states.insert(kv.first);
             auto* sw = builder_.CreateSwitch(curState, doneBB,
