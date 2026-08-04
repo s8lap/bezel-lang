@@ -2434,6 +2434,40 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             }
             return diverged_;
         }
+        // fix #2728 / §32.6 + §28.3 + §21.9 (v0.240): a BARE FFI-buffer factory
+        // statement — `CString.From(s);` on a line of its own — mints a malloc'd
+        // buffer the Bezel side owns (§32.6: "The `CString` class is for
+        // caller-owned strings: those that the Bezel side allocated and is
+        // responsible for disposing") and binds it to nothing. §28.3: an unbound
+        // owned temporary "is disposed at the end of the full expression in which
+        // it is produced", with the boundary fixed in the same subsection — "in an
+        // expression statement, 'end of the full expression' and 'end of the
+        // statement' coincide (§21.9)". Before this the value was produced and
+        // dropped on the floor with no free emitted anywhere (measured: 64
+        // iterations leaked 64 allocations / 13120 B).
+        //
+        // Why this is a SEPARATE arm from #2655's above, not a widening of it:
+        // that arm's flag is set only for §21.9's `ownedProduced` set, and the
+        // ownership pass classifies the FFI factories **Borrowed**
+        // (src/ownership/Ownership.cpp), so `disposeOwnedValue` is false here and
+        // the arm above already returned. Equally important, this must NOT use
+        // `dynamicDispose`: an FFI buffer is a raw malloc with no object header,
+        // so a vtable dispatch would read the first bytes of the marshalled string
+        // data as a function pointer. It runs no user code — there is no user type
+        // involved at all — so §28.9's "runs no user code" holds trivially, which
+        // is exactly the gate #2655's review insisted on.
+        {
+            bool bareIsRawBytes = false;
+            if (es->expr && isFfiBufferFactoryCall(*es->expr, bareIsRawBytes)) {
+                llvm::Value* v = lowerExpr(*es->expr);
+                if (!diverged_ && v) {
+                    llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                    builder_.CreateStore(v, slot);
+                    emitFfiBufferTempFree(slot, bareIsRawBytes);
+                }
+                return diverged_;
+            }
+        }
         if (es->expr) lowerExpr(*es->expr);  // side effects only (CG3: none)
         return diverged_;  // CG40: a throw-expression terminated the block
     }
@@ -2643,6 +2677,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!diverged_ && v)
                     freeUnboundOwnedBorrowingArrayTemp(
                         ds->value.get(), v, ctx_.exprType(*ds->value));
+                // fix #2728 / §32.6 + §28.3 + §17.13 (v0.240): the same reclaim
+                // for a DISCARDED FFI-buffer factory (`_ := CString.From(s);`).
+                // Neither existing path covered it: the helper just above is a
+                // no-op for it (its guards admit only array/dict materializers),
+                // and the #1009 `disposeOwnedValue` arm did not fire because the
+                // ownership pass classifies the FFI factories Borrowed — so the
+                // buffer leaked (measured: 64 iterations leaked 64 allocations /
+                // 12864 B). §17.13's discard is a discharge point and §28.3 puts
+                // the boundary at the end of this statement.
+                bool discIsRawBytes = false;
+                if (!diverged_ && v &&
+                    isFfiBufferFactoryCall(*ds->value, discIsRawBytes)) {
+                    llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                    builder_.CreateStore(v, slot);
+                    emitFfiBufferTempFree(slot, discIsRawBytes);
+                }
             }
         }
         return diverged_;  // CG40

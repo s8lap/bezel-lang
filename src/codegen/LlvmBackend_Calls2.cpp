@@ -3643,10 +3643,55 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // entryAlloca slot, null-initialized; the slot is set to encData in
         // the wnBB block and free'd (null-guarded) after the call.
         std::vector<llvm::AllocaInst*> cstrBufSlots;
+        // fix #2728 (§32.6 + §28.3 *Unbound owned temporaries*, v0.240): the
+        // SIBLING leak of #2222. #2222 covered the buffer the compiler mints
+        // implicitly when a Bezel `string` is passed to a `CString` parameter;
+        // it did not cover the buffer the PROGRAMMER mints explicitly by writing
+        // `f(CString.From(s))` — that argument's static type is already CString,
+        // so the marshalling block below is skipped, no slot was recorded, and
+        // the malloc'd buffer was never freed by anything (#1718's `using var`
+        // covers only the extern's RETURN).
+        //
+        // Why freeing here cannot double-free — the two spec facts, together:
+        //   §32.5 v0.240, "Not admitted, with reasons": "`owned` parameters (no
+        //   native contract for consuming a Bezel-owned argument)". An extern
+        //   parameter therefore CANNOT be an ownership transfer — there is no
+        //   spelling for one — so an FFI buffer in this position is never
+        //   "transferred into an owning location" in §28.3's sense.
+        //   §28.3 v0.240: an unbound owned temporary "is disposed at the end of
+        //   the full expression in which it is produced, after every use of it
+        //   within that expression has completed", and a trivial-dispose one
+        //   "is freed at the same K8 boundary ... no user code".
+        // The caller keeps the obligation (§32.6: "The `CString` class is for
+        // caller-owned strings: those that the Bezel side allocated and is
+        // responsible for disposing"), and isFfiBufferFactoryCall admits only a
+        // directly-written factory call, which by construction is bound to no
+        // name — so exactly one free is emitted for exactly one malloc.
+        // Native RETENTION of the pointer past the call is out of scope by
+        // §32.10 v0.240, which assigns it to the programmer: "native retention
+        // of such an address past the synchronous call is a use-after-free
+        // hazard no rule in this chapter can track — validity ends at a disposal
+        // the native side is never told about." A `using var` binding has the
+        // same exposure, one scope later; the remedy there is the remedy here.
+        std::vector<std::pair<llvm::AllocaInst*, bool>> ffiTempSlots;
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
             llvm::Value* v = lowerExpr(*a.value);
             if (!v) return nullptr;
+            // Record BEFORE the RawBytes two-slot expansion below, which
+            // `continue`s past the rest of the loop body.
+            {
+                bool argIsRawBytes = false;
+                if (isFfiBufferFactoryCall(*a.value, argIsRawBytes)) {
+                    // No null pre-init is needed (unlike cstrBufSlots, whose
+                    // store is inside one arm of a width branch): this store is
+                    // straight-line before the call, so every path that reaches
+                    // the reclaim below has executed it.
+                    auto* tmpSlot = entryAlloca(ptrTy());
+                    builder_.CreateStore(v, tmpSlot);
+                    ffiTempSlots.emplace_back(tmpSlot, argIsRawBytes);
+                }
+            }
             // fix #1720 (§32.5, v0.186): marshal a RawBytes argument to its two
             // C slots — the buffer pointer (bz_rawbytes_ptr) then the length
             // (bz_rawbytes_length) — and push BOTH. A null `RawBytes?` value
@@ -3757,6 +3802,22 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
         }
+        // fix #2728: and free every EXPLICITLY-minted FFI buffer temporary
+        // (`f(CString.From(s))`) at the same point, for the same §32.6
+        // caller-owns reason. Placement note (§28.3's boundary is the end of the
+        // FULL EXPRESSION, which may be later than this): the reclaim is emitted
+        // immediately post-call rather than at the syntactic end of the full
+        // expression. That satisfies §28.3's "after every use of it within that
+        // expression has completed" — the call was the temporary's only use, and
+        // an unnamed buffer is reachable from nothing else in the expression —
+        // and it is the placement #2222 already established for the identical
+        // buffer kind three lines above. The one shape where the two placements
+        // would differ is an extern that RETURNS an alias of its own argument;
+        // that is already outside the model (§32.10, above) and equally broken
+        // under a `using var`-free-at-scope-end reading, so it is not a reason to
+        // hold the buffer longer. Recorded as a choice, per CLAUDE.md rule 4.
+        for (const auto& [tmpSlot, tmpIsRawBytes] : ffiTempSlots)
+            emitFfiBufferTempFree(tmpSlot, tmpIsRawBytes);
         llvm::Type* canonRet = it->second->getReturnType();
         llvm::Type* userRet = ed && ed->returnType
                                   ? lowerType(ed->returnType.get())

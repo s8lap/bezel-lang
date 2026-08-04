@@ -677,3 +677,194 @@ BEZEL_TEST(codegen_ffi_types, owned_extern_cstring_using_var_frees_strdup_buffer
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 1);
 }
+
+// ---------------------------------------------------------------------------
+// fix #2728 / §32.6 + §28.3 *Unbound owned temporaries* + §32.5 (v0.240):
+// an FFI buffer minted by `CString.From` / `WString.From` / `RawBytes.From` and
+// left UNBOUND — written directly in an extern argument list, or dropped as a
+// statement — was never freed by anything. §32.6 puts the obligation on the
+// caller ("The `CString` class is for caller-owned strings: those that the
+// Bezel side allocated and is responsible for disposing"); §28.3 places the
+// reclaim at "the end of the full expression in which it is produced". #1718's
+// `using var` covers only a BOUND buffer, and #2222 covers only the buffer the
+// compiler mints implicitly for a `string` argument — the explicitly-written
+// factory in argument position fell between them.
+//
+// MEASUREMENT NOTE (why every one of these tests loops 64x). LSan's verdict on
+// a SINGLE such leak is binary-layout dependent: the pointer often survives in
+// a register or stack slot at exit and is reported as reachable, so the same
+// program can pass at one commit and fail at the next with no semantic change
+// (this is exactly why #2728 sat undetected — the gate immediately before it
+// reported this file green). Looping makes the leak 64-fold: at most the final
+// iteration's pointer can be spuriously reachable, so the remaining 63 are
+// reported unconditionally. Each test also pins a VALUE through the exit code,
+// so a premature free (which corrupts what the C callee reads) and a double
+// free (which aborts, clearing `ran`) are caught independently of the sanitizer.
+//
+// Measured on the pre-fix compiler, all five: A 16448 B/64 allocs, B 12160 B/64,
+// C 1536 B/128 (RawBytes is two allocations — the {ptr,len} struct and its
+// buffer — hence the bz_rawbytes_free reclaim), D 13120 B/64, E 12864 B/64.
+// ---------------------------------------------------------------------------
+
+// §32.6 / §28.3 (v0.240): CString.From written directly in an extern ARGUMENT
+// list. The temporary is bound to no name, so §28.3's unbound-temporary rule
+// governs and it must be freed once the call is finished with it. Value pin:
+// 64 iterations x strlen(64-char literal) = 4096.
+BEZEL_TEST(codegen_ffi_types, cstring_from_argument_temporary_freed_spec_32_6_2728) {
+    auto r = runAotChecked(
+        "module M; "
+        "extern \"c\" public method strlen(s: CString): int; end; "
+        "class C public static method Main(): int "
+        "  var total := 0; var i := 0; "
+        "  while i < 64 do "
+        "    total := total + strlen(CString.From(\"abcdefghijklmnopqrstuvwxyz"
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ01\")); "
+        "    i := i + 1; "
+        "  end; "
+        "  if total = 4096 then return 21; end; "
+        "  return 1; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 21);
+}
+
+// §32.6 / §28.3 (v0.240): the WString family, same position. The declared C
+// signature is deliberately `strlen` over a WString — reading the UTF-16LE
+// buffer as bytes stops at the first NUL byte, which for an ASCII-leading
+// literal is index 1 and well inside the buffer, so the read is in bounds and
+// deterministic (§32.10 puts signature fidelity on the programmer; here the
+// point under test is the BUFFER's reclaim, not the callee). Pin: 64 x 1 = 64.
+BEZEL_TEST(codegen_ffi_types, wstring_from_argument_temporary_freed_spec_32_6_2728) {
+    auto r = runAotChecked(
+        "module M; "
+        "extern \"c\" public method strlen(s: WString): int; end; "
+        "class C public static method Main(): int "
+        "  var total := 0; var i := 0; "
+        "  while i < 64 do "
+        "    total := total + strlen(WString.From(\"wide-argument-temporary-"
+        "abcdefghijklmnopqrstuvw\")); "
+        "    i := i + 1; "
+        "  end; "
+        "  if total = 64 then return 22; end; "
+        "  return 1; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 22);
+}
+
+// §32.5 / §28.3 (v0.240): the RawBytes family, same position. §32.5: a RawBytes
+// parameter "occupies two consecutive C argument slots: the pointer
+// (`const void*`), then the length (`size_t`)" — so `write(fd, data)` lowers to
+// write(int, const void*, size_t). fd = -1 makes the call fail with EBADF
+// without writing anything, keeping the test's stdout clean while still passing
+// the marshalled buffer across the boundary. This case needs the TWO-level
+// bz_rawbytes_free (struct + buffer): pre-fix it leaked 128 allocations for 64
+// iterations, which a plain free() reclaim would have only halved.
+BEZEL_TEST(codegen_ffi_types, rawbytes_from_argument_temporary_freed_spec_32_5_2728) {
+    auto r = runAotChecked(
+        "module M; "
+        "extern \"c\" public method write(fd: int, data: RawBytes): long; end; "
+        "class C public static method Main(): int "
+        "  var src: Array<byte> := [1, 2, 3, 4, 5, 6, 7, 8]; "
+        "  var i := 0; "
+        "  while i < 64 do "
+        "    _ := write(-1, RawBytes.From(src)); "
+        "    i := i + 1; "
+        "  end; "
+        "  return 23; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 23);
+}
+
+// §28.3 + §21.9 (v0.240): the DISCARDED-EXPRESSION-STATEMENT position — a bare
+// `CString.From(s);` on a line of its own. §28.3 fixes the boundary: "in an
+// expression statement, 'end of the full expression' and 'end of the statement'
+// coincide (§21.9)". This is the FFI counterpart of #2655's bare `new T();`,
+// and it reaches a different codegen arm: the ownership pass classifies the FFI
+// factories Borrowed, so #2655's flag is never set for them.
+BEZEL_TEST(codegen_ffi_types, cstring_from_bare_statement_temporary_freed_spec_28_3_2728) {
+    auto r = runAotChecked(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var i := 0; "
+        "  while i < 64 do "
+        "    CString.From(\"bare-statement-temporary-abcdefghijklmnopqrstuvwxyz\"); "
+        "    i := i + 1; "
+        "  end; "
+        "  return 24; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 24);
+}
+
+// §17.13 + §28.3 (v0.240): the same statement written with the discard sink.
+// §17.13's discard is a discharge point; neither the #1009 `disposeOwnedValue`
+// arm (Borrowed classification) nor the #1015 collection-materializer helper
+// covered an FFI buffer, so this spelling leaked too.
+BEZEL_TEST(codegen_ffi_types, cstring_from_discard_statement_temporary_freed_spec_17_13_2728) {
+    auto r = runAotChecked(
+        "module M; "
+        "class C public static method Main(): int "
+        "  var i := 0; "
+        "  while i < 64 do "
+        "    _ := CString.From(\"discard-statement-temporary-abcdefghijklmnopqrstuv\"); "
+        "    i := i + 1; "
+        "  end; "
+        "  return 25; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 25);
+}
+
+// fix #2728 — the anti-PREMATURE-FREE half, on the PLAIN (non-sanitized) path.
+// The reclaim must land strictly AFTER the callee has read the buffer (§28.3:
+// "after every use of it within that expression has completed"). This is #2728's
+// own repro plus a length read: `strdup` copies the argument temporary, so if
+// the temporary were freed before the call — or freed twice — the copy would be
+// garbage or the allocator would abort. Pinning strlen of the COPY at 10
+// ("hello-2728") proves the buffer was intact at the boundary, and `ran` proves
+// no abort. Deliberately `runAot`, not `runAotChecked`: the value assertion has
+// to hold without a sanitizer underneath it.
+BEZEL_TEST(codegen_ffi_types, cstring_from_argument_temporary_not_freed_early_spec_28_3_2728) {
+    auto r = runAot(
+        "module M; "
+        "extern \"c\" "
+        "  public method strdup(s: CString): owned CString?; "
+        "  public method strlen(s: CString): int; "
+        "end; "
+        "class C public static method Main(): int "
+        "  using var c := strdup(CString.From(\"hello-2728\")); "
+        "  if c = null then return 99; end; "
+        "  return strlen(c!); "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 10);
+}
+
+// fix #2728 negative control — a BOUND buffer must still be freed exactly once,
+// by the `using var` path alone. §28.3: "A temporary that is instead bound (to a
+// `var`/`using var`), `move`d, returned, or transferred into an owning location
+// is governed by the corresponding transfer or discharge rule and is **not**
+// disposed under this rule (it would otherwise be disposed twice)." Passing the
+// BINDING to the same extern must therefore add no second free — which is why
+// the #2728 predicate keys on a directly-written factory call and not on the
+// argument's CString TYPE. A double free aborts and clears `ran`.
+// Pin: 64 x strlen("hello world") = 704.
+BEZEL_TEST(codegen_ffi_types, cstring_bound_argument_not_double_freed_spec_28_3_2728) {
+    auto r = runAotChecked(
+        "module M; "
+        "extern \"c\" public method strlen(s: CString): int; end; "
+        "class C public static method Main(): int "
+        "  var total := 0; var i := 0; "
+        "  while i < 64 do "
+        "    using var cs := CString.From(\"hello world\"); "
+        "    total := total + strlen(cs); "
+        "    i := i + 1; "
+        "  end; "
+        "  if total = 704 then return 26; end; "
+        "  return 1; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 26);
+}

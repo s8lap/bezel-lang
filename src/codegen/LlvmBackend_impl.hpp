@@ -8970,6 +8970,32 @@ private:
     // a method result, …) this is exactly lowerExpr.
     llvm::Value* lowerByteArrayFactoryArg(const ast::Expr& argExpr);
 
+    // fix #2728 / §32.6 + §28.3 *Unbound owned temporaries* (v0.240): true when
+    // `e` is a FRESHLY-MINTED FFI buffer — a direct call to one of the four
+    // factories `CString.From` / `CString.FromBytes` / `WString.From` /
+    // `RawBytes.From` (tryLowerBuiltinClassCall's table, LlvmBackend_Calls.cpp).
+    // §32.6: "The `CString` class is for caller-owned strings: those that the
+    // Bezel side allocated and is responsible for disposing." Sets `isRawBytes`
+    // when the buffer needs the two-level `bz_rawbytes_free` rather than free().
+    //
+    // ⚠ The predicate is deliberately SYNTACTIC-plus-type, never type alone.
+    // `builtinTypeName(exprType)` is true of EVERY CString-typed expression —
+    // a `using var` binding's read, an extern `CString` PARAMETER, a field —
+    // and freeing one of those is a double free or a use-after-free. §28.3
+    // draws exactly this line: "A temporary that is instead bound (to a
+    // `var`/`using var`), `move`d, returned, or transferred into an owning
+    // location is governed by the corresponding transfer or discharge rule and
+    // is **not** disposed under this rule (it would otherwise be disposed
+    // twice)." A factory call written directly at the use site is bound to
+    // nothing and reachable by nothing else, so it is the unbound case and only
+    // the unbound case.
+    bool isFfiBufferFactoryCall(const ast::Expr& e, bool& isRawBytes);
+
+    // fix #2728: emit the null-guarded reclaim of one FFI buffer temporary held
+    // in `slot` — free() for CString/WString, bz_rawbytes_free (buffer + the
+    // {ptr,len} struct) for RawBytes, matching emitDisposals' ffiBuffer arm.
+    void emitFfiBufferTempFree(llvm::AllocaInst* slot, bool isRawBytes);
+
     // #1501 / stdlib §6.7 (line 2884) / §30.10: a synthesized, concrete
     // `Array<Task>` sema::TypeRef for the Task.WhenAny/WhenAll `tasks`
     // argument. Mirrors builtinByteArrayTypeRef's rationale: these intrinsic

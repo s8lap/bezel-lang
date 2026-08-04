@@ -6227,6 +6227,64 @@ llvm::Value* Emitter::buildChoiceStructValue(
 }
 
 
+// fix #2728 / §32.6 + §28.3 *Unbound owned temporaries* (v0.240). See the
+// declaration in LlvmBackend_impl.hpp for the correctness argument; the short
+// form is that this must match the set of expressions that MINT a buffer, not
+// the set that merely HAS FFI-buffer type.
+bool Emitter::isFfiBufferFactoryCall(const ast::Expr& e, bool& isRawBytes) {
+    isRawBytes = false;
+    auto* call = dynamic_cast<const ast::CallExpr*>(&e);
+    if (!call || !call->callee) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target) return false;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get());
+    if (!id) return false;
+    if (call->args.size() != 1 || !call->args[0].value) return false;
+    // (1) the syntactic factory table, kept in lockstep with the lowering below.
+    bool shape = false;
+    if (id->name == "CString") {
+        shape = (ma->member == "From" || ma->member == "FromBytes");
+    } else if (id->name == "WString") {
+        shape = (ma->member == "From");
+    } else if (id->name == "RawBytes") {
+        shape = (ma->member == "From");
+        isRawBytes = shape;
+    }
+    if (!shape) return false;
+    // (2) and sema must actually have resolved the result to the BUILTIN
+    // CString/WString/RawBytes head (ExprTypecheck_Calls.cpp stamps a
+    // builtinClassSym TypeRef). Without this conjunct a user type that happened
+    // to be named `CString` with a static `From` would have its result freed.
+    std::string_view n = builtinTypeName(ctx_.exprType(e));
+    if (n != id->name) { isRawBytes = false; return false; }
+    return true;
+}
+
+// fix #2728: the reclaim itself — the same null-guarded shape emitDisposals
+// uses for a `using var`-bound FFI buffer (LlvmBackend_Disposal.cpp's
+// `ffiBuffer` arm), so the bound and unbound spellings free identically.
+void Emitter::emitFfiBufferTempFree(llvm::AllocaInst* slot, bool isRawBytes) {
+    llvm::Value* buf = builder_.CreateLoad(ptrTy(), slot, "ffitmp.buf");
+    llvm::Value* isNull = builder_.CreateICmpEQ(
+        buf, llvm::ConstantPointerNull::get(ptrTy()), "ffitmp.isnull");
+    auto* frBB = llvm::BasicBlock::Create(llvm_, "ffitmp.free", currentFn_);
+    auto* contBB = llvm::BasicBlock::Create(llvm_, "ffitmp.cont", currentFn_);
+    builder_.CreateCondBr(isNull, contBB, frBB);
+    builder_.SetInsertPoint(frBB);
+    if (isRawBytes) {
+        // stdlib §10.3 / fix #985: a RawBytes is a { ptr, len } struct whose
+        // buffer is a separate allocation — both are reclaimed by the runtime
+        // helper, exactly as the `using var` path does.
+        auto* fn = declareC("bz_rawbytes_free", llvm::Type::getVoidTy(llvm_),
+                            {ptrTy()});
+        builder_.CreateCall(fn, {buf});
+    } else {
+        builder_.CreateCall(freeFn(), {buf});
+    }
+    builder_.CreateBr(contBB);
+    builder_.SetInsertPoint(contBB);
+}
+
 llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
