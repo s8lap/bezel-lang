@@ -2547,6 +2547,36 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                         const_cast<ast::DiscardStmt*>(ds)
                             ->disposeOwnedCollectionValue = true;
             }
+            // fix #2655 / §17.13 / §28.3 / §28.9 (v0.237): a discard
+            // `_ := new StringBuilder();` — the spec's OWN §17.13 example
+            // ("trivial-dispose (§28.9): cosmetic — Array<T> needs no cleanup"
+            // sits two lines below it in the same block). The disposeOwnedValue
+            // gate above deliberately excludes it: StringBuilder is a decl-null
+            // builtin ("builtin handles … need their own free paths
+            // (deferred)"), and disposeOwnedCollectionValue covers only the
+            // OWNING-collection family. So NO branch fired and the builder's
+            // parts array leaked outright (560 B measured under LSan on the
+            // bare repro), while `using var sb := new StringBuilder();` — the
+            // same allocation, merely named — has been freed since #1185.
+            //
+            // The gate is #1009's, unchanged: producerState == Owned admits only
+            // a fresh producer, so the FLUENT borrow `_ := sb.Append("x");`
+            // (§21.9's "return this" shape — a plain non-`owned` instance-method
+            // return, classified Borrowed by K1.5) is left unmarked and codegen
+            // never frees a builder the receiver still owns. Deliberately scoped
+            // to StringBuilder ALONE rather than to decl-null builtins as a
+            // class: it is the only one with an already-proven free path (the
+            // #1185 `using var` wiring codegen reuses verbatim), and the others
+            // (Task, Subscription, Shared, Stopwatch, …) carry different
+            // ownership contracts — `Task` may not even be discarded (§17.13).
+            // The rest of that deferral stands. // per §17.13, §28.3, §28.9
+            if (producerState(*ds->value) == OwnershipState::Owned) {
+                if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
+                    if (rt->kind == sema::TypeRef::Kind::Named &&
+                        !rt->declaration && rt->headName() == "StringBuilder")
+                        const_cast<ast::DiscardStmt*>(ds)
+                            ->disposeOwnedBuilderValue = true;
+            }
             // §17.13 / §15.3 (#1016): a discard `_ := expr` of a move-only
             // owning inline array (`[N owned]T` / `[N owned]T?`). Permitted per
             // §17.13 bullet 2 — disposes each non-null slot at end-of-statement.

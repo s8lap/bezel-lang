@@ -2403,6 +2403,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 }
                 if (!diverged_) emitDisposals(disposeStack_.back());
                 disposeStack_.pop_back();
+            } else if (ds->disposeOwnedBuilderValue) {
+                // fix #2655 / §17.13 / §28.3 / §28.9 (v0.237): the ownership
+                // pass classified this discard's value as a fresh owned
+                // StringBuilder producer — the spec's own §17.13 example
+                // `_ := new StringBuilder();`. A StringBuilder's VALUE *is* a
+                // bz_array_t* of string parts owning a +1 per part (#1185); it
+                // is a decl-null builtin with no vtable, so dynamicDispose
+                // (the class branch above) would misread its first word as a
+                // vtable pointer. Free it through the SAME wiring the `using
+                // var` StringBuilder path has used since #1185:
+                // bz_array_free with the string-element release thunk, which
+                // bz_string_release's each part (null-/sentinel-safe) and frees
+                // the backing array. One-entry dispose scope for both-edge
+                // coverage, exactly as the class branch above.
+                disposeStack_.emplace_back();
+                llvm::Value* v = lowerExpr(*ds->value);
+                if (!diverged_ && v) {
+                    llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                    builder_.CreateStore(v, slot);
+                    Disposal d{slot, nullptr};
+                    d.collection = true;
+                    d.collectionElemDisposer = stringElementReleaseThunk();
+                    disposeStack_.back().push_back(d);
+                }
+                if (!diverged_) emitDisposals(disposeStack_.back());
+                disposeStack_.pop_back();
             } else if (ds->disposeOwnedCollectionValue) {
                 // fix #1909 / §17.13 / §28.3 / §28.11: the ownership pass
                 // classified this discard's value as an owned PRODUCER whose

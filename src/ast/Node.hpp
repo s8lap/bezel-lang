@@ -419,6 +419,20 @@ struct DiscardStmt : Stmt {
     // bz_dict_free / bz_llist_free), never dynamicDispose (owning
     // collections have no vtable).
     bool disposeOwnedCollectionValue = false;
+    // fix #2655 / §17.13 / §28.3 / §28.9 (v0.237): set by the ownership pass
+    // when `value` is an owned PRODUCER (producerState == Owned) whose type is
+    // the decl-null builtin `StringBuilder` — the spec's OWN §17.13 example
+    // (`_ := new StringBuilder();`). disposeOwnedValue above excludes it by its
+    // `rt->declaration->decl != nullptr` gate ("builtin handles … need their
+    // own free paths (deferred)"), and disposeOwnedCollectionValue covers only
+    // the owning-collection family, so the builder's parts array leaked
+    // outright. Codegen frees it through the SAME wiring the `using var`
+    // StringBuilder path already uses (#1185): bz_array_free with the
+    // string-element release thunk. Scoped to StringBuilder alone — the other
+    // decl-null handles (Task, Subscription, Shared, Stopwatch, …) have
+    // different ownership contracts and no proven free path, and `Task` may not
+    // be discarded at all (§17.13's carve-out).
+    bool disposeOwnedBuilderValue = false;
 };
 
 // A.6: `YieldStmt ::= "yield" "return" Expression ";" | "yield" "break" ";"`.
