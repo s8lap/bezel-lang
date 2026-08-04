@@ -2095,6 +2095,28 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         //     below — its single +1 flows out to the caller instead of leaking.
         // Otherwise (a param read, a field read `this.f`, a literal, an alias not
         // owning a +1) the value is a BORROW → RETAIN to mint the +1.
+        // fix #2688 / §27.3 / §28.9: a LAMBDA body carries no declared
+        // return-type NODE (#2515 nulls currentReturnTypeNode_ so the body does
+        // not box/mint against the enclosing METHOD's node), but it does have a
+        // return TYPE — currentLambdaReturnSemaTy_, the same `retSemaTy` the
+        // expression-body path keys its mint off. Without this the two body
+        // forms of the same lambda disagreed: `lambda(k) => k` returned +1 and
+        // `lambda(k) => do return k; end` returned a +0 borrow, so every caller
+        // that releases the result (a `var` bind, `Dictionary.GetOrAdd`'s
+        // store) double-freed the block-body form and only that form. Mirror
+        // the expr-body predicate EXACTLY, including its `!nullable` gate: a
+        // `string?` lambda return does not mint there, so it must not mint here
+        // either — agreement between the two forms is the invariant, and the
+        // method-side `string?` mint (#2196) is a method-contract rule the
+        // lambda call-site ABI does not share.
+        const sema::TypeRef* lamRet = currentLambdaReturnSemaTy_;
+        if (v && rs->value && !currentReturnTypeNode_ && lamRet &&
+            v->getType()->isPointerTy() && !lamRet->nullable &&
+            lamRet->kind == sema::TypeRef::Kind::Primitive &&
+            lamRet->primitive == sema::PrimitiveType::String &&
+            !isPlusOneStringProducer(rs->value.get()) &&
+            !returnedStringLocalOwnsPlusOne(rs->value.get()))
+            emitStringRetain(v);
         if (v && rs->value && currentReturnTypeNode_ &&
             v->getType()->isPointerTy()) {
             const sema::TypeRef* declRet =

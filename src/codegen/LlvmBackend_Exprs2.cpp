@@ -1498,6 +1498,21 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // decisions; the block-body path now matches by carrying no declared node.
     // A lambda's external RC/boxing contract is settled at the CALL SITE from
     // the lambda's function type, not in the body.
+    //
+    // fix #2688 / §27.3 / §28.9: BOXING is settled at the call site, but the
+    // refcount MINT is not — nulling the node also disabled emitReturn's
+    // `string` +1 mint, which left the two body forms of the SAME lambda
+    // disagreeing: `lambda(k) => k` minted +1 (the expr-body path below, keyed
+    // on retSemaTy) while `lambda(k) => do return k; end` returned a +0 borrow.
+    // Every caller that releases the result then double-freed the block-body
+    // form only — a defect whose reachability depended on nothing but which
+    // body form the author wrote. Carry the lambda's OWN return type into
+    // emitReturn so the block-body path mints against retSemaTy exactly as the
+    // expr-body path does. `retSemaTy` is already null for an async lambda
+    // (cleared above — its declared return is the outer Task, minted by the
+    // async machinery), so this is scoped to synchronous lambdas.
+    const sema::TypeRef* savedLambdaRetSemaTy = currentLambdaReturnSemaTy_;
+    currentLambdaReturnSemaTy_ = retSemaTy;
     currentReturnTypeNode_ = nullptr;
     locals_.clear();
     paramSlots_.clear();
@@ -1872,6 +1887,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // --- Restore emitter state ---
     expectedFunctionType_ = savedExpectedFT;  // #731
     currentReturnTypeNode_ = savedCurrentReturnTypeNode;  // #2515
+    currentLambdaReturnSemaTy_ = savedLambdaRetSemaTy;    // fix #2688
     lambdaParamTypeHint_ = std::move(savedLambdaParamHints);
     currentFn_ = savedFn;
     currentThis_ = savedThis;

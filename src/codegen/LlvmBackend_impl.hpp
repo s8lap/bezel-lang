@@ -454,6 +454,16 @@ private:
     // emitted, so a `return <value>` whose declared return type is
     // Object/interface boxes the value before returning.
     const ast::Type* currentReturnTypeNode_ = nullptr;
+    // fix #2688 / §27.3 / §28.9: the LAMBDA currently being emitted carries no
+    // declared return-type NODE (#2515 nulls currentReturnTypeNode_ above so a
+    // lambda body does not box/mint against the enclosing METHOD's node), but a
+    // lambda still has a return TYPE of its own — `retSemaTy` in lowerLambda.
+    // The expression-body path already keys its `string`/closure +1 mint off
+    // that type; this field carries the same type into emitReturn so the
+    // BLOCK-body path mints identically. Non-null only while a synchronous
+    // lambda body is being emitted (null for methods, ctors, and async lambdas,
+    // whose declared return is the outer Task).
+    const sema::TypeRef* currentLambdaReturnSemaTy_ = nullptr;
     // §22.16 (v0.203, #2053) Slice 4b: the ensures single-exit epilogue state
     // for the method/ctor currently being emitted. When `ensuresFn_` is
     // non-null, `emitReturn(fn, v)` redirects the return into
