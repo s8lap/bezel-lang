@@ -1108,6 +1108,55 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             else if (par->declType)
                 ce.semaTy = ctx_.resolvedType(*par->declType);
         }
+        // fix #2689 / §28.1 / §28.9 / §27.5: a captured PARAMETER of
+        // runtime-managed type takes a retain at EVERY capture — where a
+        // captured LOCAL takes one only on the 2nd-and-later capture (the
+        // `alreadyBoxed` branch in the captured-locals loop below).
+        //
+        // The asymmetry is not an oversight there; it is the difference between
+        // the two storage classes. A captured local's slot holds a reference
+        // this frame owns, and escape detection SUPPRESSES its scope-end
+        // release, so the first env inherits that suppressed release and only
+        // additional envs must mint. A PARAMETER of `string` or function type
+        // has no such reference to inherit: §28.1 makes the `owned` marker a
+        // compile error on exactly these types — "On any other type — a
+        // primitive, `string`, a function type, an ordinary record, an enum, a
+        // non-owning inline array, or the unit type — `owned` is a compile
+        // error: such values carry no disposal obligation to transfer (§28.9)"
+        // — and erases it at a runtime-managed substitution of a bare type
+        // parameter. So EVERY such parameter is an unmodified BORROW: the
+        // caller owns the reference and releases it, and this frame has no
+        // scope-end release for an env to take over.
+        //
+        // The envdtor nevertheless releases the cell's contents unconditionally
+        // on the sema type (see its emission below). Without a retain here the
+        // VERY FIRST capture therefore over-releases the caller's value — a
+        // use-after-free, not a leak, and reproducible from one lambda over one
+        // borrowed `string` parameter (#2689). N captures ⇒ N retains ⇒ N
+        // envdtor releases, leaving the caller's +1 untouched.
+        //
+        // Emitted per capture-site EXECUTION, which is what also keeps a
+        // capture site inside a LOOP balanced: a parameter always takes
+        // boxLocalSlot's GUARDED path (its slot is written in the prologue, not
+        // in the capture site's block), so ONE cell is reused across
+        // iterations — but each iteration still builds its own closure with its
+        // own envdtor run, so one retain per iteration pairs with one release
+        // per closure. Both helpers are null-safe, so a null cell content is a
+        // no-op. Nullable `string?` is excluded by isStringTypeRefNonNull on
+        // both sides, matching the envdtor exactly — agreement between the
+        // retain and release predicates is the invariant. A captured ref/out
+        // param is a different loop below and stays at semaTy = nullptr: it
+        // borrows the caller's storage and the envdtor releases nothing.
+        if (isStringTypeRefNonNull(ce.semaTy)) {
+            llvm::Value* str =
+                builder_.CreateLoad(ptrTy(), ce.envValue, "str.pcap");
+            emitStringRetain(str);
+        } else if (ce.semaTy &&
+                   ce.semaTy->kind == sema::TypeRef::Kind::Function) {
+            llvm::Value* cl =
+                builder_.CreateLoad(ptrTy(), ce.envValue, "cl.pcap");
+            emitClosureRetain(cl);
+        }
         // §27.5 / §28.9 / #694: free the capture CELL in the envdtor when this
         // PARAMETER is captured by exactly ONE env (singleCaptureLocals_, which
         // keys parameters by Symbol*) and THIS lambda DEFINITELY escapes
