@@ -7538,6 +7538,7 @@ private:
         const sema::TypeRef* expectedFunctionType_;
         std::unordered_map<std::string_view, llvm::Type*> lastCallGenericSubst_;
         llvm::BasicBlock*    inlinedAccessorEnd_;
+        bool                 asyncChainedReturn_;   // #2731 item 1
         // --- SAVED AND RESTORED BUT DELIBERATELY NOT CLEARED (see the .cpp) ---
         std::unordered_map<std::string_view, const sema::TypeRef*>
                              genericSubstSemaTy_;

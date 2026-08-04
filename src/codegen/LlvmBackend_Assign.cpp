@@ -3221,6 +3221,32 @@ const ast::PropertyAccessor* Emitter::blockGetterOf(sema::Symbol* sym) {
 //   * lastCallGenericSubst_ — a transient `lowerExpr` → `lowerStmt` channel
 //     (a call publishes, the next `var` decl consumes). A nested body's last
 //     call would otherwise be consumed by the CALLER's next local declaration.
+//   * asyncChainedReturn_ — fix #2731 item 1, the SHARPEST member of this set
+//     and the only one whose omission was a live MEMORY-SAFETY defect rather
+//     than an IR-verification failure. Same transient publish/consume shape as
+//     lastCallGenericSubst_ above: LlvmBackend_Stmts.cpp ~1826 sets it when a
+//     `return await <call>` is recognised as §30.5 Pattern A kind 2 (the
+//     CHAINED SLOT), and it is read back TWICE — once by `lowerAwait`
+//     (LlvmBackend_Async.cpp ~2932, `freeTaskAfter = isCall &&
+//     !asyncChainedReturn_`) and once by the return statement itself
+//     (Stmts.cpp ~1924, an UNCONDITIONAL read-and-clear with no
+//     smKind_/smStateStruct_ gate). Both reads happen AFTER the return value's
+//     operand has been lowered, so a nested body emitted during that lowering —
+//     `return await Fetch(o.BlockProp)` — runs its OWN `return` through
+//     Stmts.cpp ~1924 and clears the caller's flag before either legitimate
+//     consumer sees it. Both then read `false`: `lowerAwait` emits
+//     bz_task_free(source) at the await site (which runs the source task's
+//     result_disposer on the awaited result), and the return skips the
+//     bz_task_set_chained transfer and instead attaches a result disposer for
+//     the SAME object to the outer task — a double dispose. §30.5 Pattern A
+//     kind 2: "ownership of the source task transfers into the outer task's
+//     state (a chained slot), and the outer destructor disposes the chained
+//     source task, never the borrowed result directly … the source task is
+//     disposed exactly once — by the outer task's destructor, transitively."
+//     Reproduced as a heap-use-after-free under ASan and a SIGSEGV on the
+//     plain oracle, through both ensurePropertyBlockGetter and
+//     ensureIndexerBlockGetter (an expression-bodied getter is inlined, so it
+//     does not reach this window).
 //   * inlinedAccessorEnd_ — a `BasicBlock*` in the CALLER's function; a bare
 //     `return;` inside a nested body branches to it (LlvmBackend_Stmts.cpp
 //     ~1777). Latent (sema rejects a valueless return in a value-returning
@@ -3285,6 +3311,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
       expectedFunctionType_(e.expectedFunctionType_),
       lastCallGenericSubst_(std::move(e.lastCallGenericSubst_)),
       inlinedAccessorEnd_(e.inlinedAccessorEnd_),
+      asyncChainedReturn_(e.asyncChainedReturn_),
       genericSubstSemaTy_(e.genericSubstSemaTy_) {   // COPY: inherited, not cleared
     // The moved-from containers above are left in a valid-but-unspecified
     // state by `std::move`, so clear each explicitly.
@@ -3315,6 +3342,7 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     e.expectedFunctionType_      = nullptr;
     e.lastCallGenericSubst_.clear();
     e.inlinedAccessorEnd_        = nullptr;
+    e.asyncChainedReturn_        = false;
     // genericSubstSemaTy_ is intentionally left as-is (see the note above):
     // saved so a nested body's writes do not desynchronise it from
     // genericSubst_, but NOT cleared, because the body must resolve its type
@@ -3349,6 +3377,7 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
     e_.expectedFunctionType_      = expectedFunctionType_;
     e_.lastCallGenericSubst_      = std::move(lastCallGenericSubst_);
     e_.inlinedAccessorEnd_        = inlinedAccessorEnd_;
+    e_.asyncChainedReturn_        = asyncChainedReturn_;
     e_.genericSubstSemaTy_        = std::move(genericSubstSemaTy_);
 }
 
