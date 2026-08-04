@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.236 — July 2026**
+**Companion to the Bezel Language Specification, v0.237 — August 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -7296,3 +7296,14 @@ Rationale §3.3 is rewritten as the recorded reversal it is: the #1373 ruling's 
 **Kernel classification (the v0.198 obligation):** none — a non-normative guide teaching landed rules; no normative text touched.
 
 **Migration.** Doc-only; no program changes meaning. Guide 2's revalidation pin moves to v0.236; every new example traces against the landed rules (the pipelines mirror stdlib §2.20's definitional examples verbatim in shape; the config idiom uses the §2.4 renamed surface and the §1 tier contract). Guides 1 and 3 are untouched and keep their pins; the spec, stdlib, and rationale texts are unchanged and the changelog gains only this entry (headers in lockstep). No grammar, anchor, or section moves; the conformance corpus is untouched.
+
+### v0.237 changelog (v0.236 → v0.237)
+
+**Rationale front matter rewritten (owner-directed 2026-08-04) — the intro and §1 "The big picture."** Editorial, rationale-only: the spec and stdlib are textually unchanged (headers move in lockstep; the changelog gains this entry). Readers hit these pages first, and the owner directed a rewrite to the standard the rest of the document holds.
+
+- **The intro** no longer names any other programming language. It now states the document's role in the project's own terms — the recorded form of "why doesn't Bezel just do Y?", with each answer naming the alternative, what it would buy, and why it was declined — plus the decisions-recorded-with-reasoning discipline and the settled-convention carve-out, without attribution.
+- **§1** drops the three-things-at-once framing sentence and reframes around two commitments: the performance of a compiled language (native code, no collector, costs that follow from the source) and memory management that is predictable and checked (single ownership of resource-holding objects, disposal exactly once, compile-time rejection of leaks/double-frees with checked-mode faults at the deliberately-marked trust seams, and the no-ceremony tier noted with pointers to §4/§5.9). The Rust comparison compresses to the recorded form: the ownership model bears some similarity, deliberately — and differs in how much the checker demands (no lifetime annotations, no exclusive-writer rule; data-race freedom comes from serial domains rather than aliasing restrictions, §12) — yielding more freedom in how code is written without the common pitfalls of manual management, at the recorded price (a small class of statically-rejectable mistakes surfaces as deterministic checked-mode faults). The named-language inheritance paragraph is retired; the closing keeps the document's framing sentence (each chapter records what a stricter rule would buy, what it would cost, and why the balance landed where it did).
+
+**Kernel classification (the v0.198 obligation):** none — rationale prose only; no normative text touched.
+
+**Migration.** Doc-only; no program changes meaning. No grammar, anchor, or section moves — the §1 anchor, heading, and Contents list are unchanged, and the intro keeps its anchors. The guides are untouched and keep their pins; the conformance corpus is untouched.
