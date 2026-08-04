@@ -4537,7 +4537,27 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     { allPositional = false; break; }
                 continue;
             }
-            if (!a.modifier.empty() && !isByRefMod(a.modifier))
+            // fix #2659 (§22.3 "Parameter modifiers" / §28.8, v0.237): the
+            // by-value `owned` CALL-SITE MARKER against an `owned` formal is
+            // admitted. It has to be: §22.3 makes the marker MANDATORY on a
+            // named owned binding ("Omitting the marker on a named owned
+            // binding is a compile error naming the fix"), so with the ownership
+            // half of #2659 fixed — an imported `owned` formal is finally SEEN
+            // as an owned sink — this is the ONLY spelling that reaches codegen
+            // for `new ImportedT(owned r)`. Leaving it out would trade the old
+            // false reject for a silently default-initialized instance plus a
+            // leaked argument, which is worse.
+            //
+            // Lowering is identical to a plain positional argument: `owned` is
+            // by VALUE, `isByRefMod("owned")` is false, so the loop below takes
+            // its `lowerExpr` path and passes the same pointer a borrow would.
+            // The only extra obligation is #1918's transfer bookkeeping (null
+            // the caller's slot at the "call about to run" point), performed
+            // explicitly at the call below since this hand-rolled path does not
+            // use buildOrderedArgs. `scoped` stays excluded — it is a different
+            // (lifetime, not transfer) obligation and is filed, not guessed at.
+            if (!a.modifier.empty() && !isByRefMod(a.modifier) &&
+                !(a.modifier == "owned" && importedFormalMod(ai) == "owned"))
                 { allPositional = false; break; }
         }
         // fix #2658: whether the `bz$T$ctor` call was actually emitted. Every
@@ -4664,6 +4684,24 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             }
             unwindTarget_ = savedArgUT;
             if (ok && args.size() == ctorFn->arg_size()) {
+                // fix #2659 / #1918 (§28.3): the "call about to run" point —
+                // every argument has been evaluated and nothing can throw
+                // between here and the call. Null the caller's slot for each
+                // bare owned local / `owned` parameter whose ownership this
+                // call transfers, so the caller's null-guarded unwindOnly
+                // disposal (registerUnwindOwnedLocal / registerUnwindOwnedParam)
+                // skips a value the callee's own `owned`-parameter disposal now
+                // owns — no double free on the ctor's throw edge. This is the
+                // same placement and the same eligibility test buildOrderedArgs
+                // applies via `nullTransferredOwned`; this hand-rolled imported
+                // path never calls buildOrderedArgs, so it is done here.
+                for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
+                    const auto& a = ne.args[ai];
+                    if (a.value && !a.isDiscard &&
+                        (a.modifier == "owned" ||
+                         importedFormalMod(ai) == "owned"))
+                        nullTransferredOwnedLocalSlot(a.value.get());
+                }
                 builder_.CreateCall(ctorFn, args);
                 emittedImportedCtorCall = true;  // fix #2658
             }

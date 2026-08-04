@@ -517,4 +517,34 @@ bool isEqualityBearing(const TypeRef* ty, const SemaContext& ctx);
 std::string hashableFailureComponentPath(const TypeRef* ty,
                                          const SemaContext& ctx);
 
+// §22.3 "Parameter modifiers" / §2.5 "Dependency resolution" (v0.237, #2659,
+// #2374): the declared modifier of constructor formal `pos` — one of "", "ref",
+// "out", "owned", "out owned", "scoped".
+//
+// A constructor's formal list has two sources and every consumer must read
+// BOTH. A LOCALLY declared constructor carries its formals as `ast::Param`s on
+// its `ast::ConstructorDecl`; an IMPORTED one has NO AST at all — ModuleLoader
+// (`MetaMemberKind::Constructor`) reconstructs a `ConstructorSymbol` whose
+// `decl` is null and whose formals survive only as `ParameterSymbol` metadata,
+// with the exporter's modifier string on `ParameterSymbol::modifier`
+// (ModuleMetadataBuilder writes it, ModuleLoader::convertParams reads it back).
+// A consumer gated on `dynamic_cast<const ast::ConstructorDecl*>(cs.decl)`
+// therefore silently takes a "no modifiers at all" path for every imported
+// constructor — the #2374 defect class. #2659 is that bug at its worst: an
+// `owned` formal seen as non-owned means the caller's transfer is never
+// recorded, so caller AND callee both dispose the argument (a double free).
+//
+// Returns "" when `pos` is out of range or no source carries a modifier, so a
+// caller can treat "" and "not an owned sink" identically.
+std::string_view formalParamModifier(const ConstructorSymbol& cs,
+                                     std::size_t pos);
+
+// Declared NAME of constructor formal `pos`, same dual sourcing. Needed by the
+// §22.5 named-argument binding (a named argument binds the formal whose name
+// matches, wherever it sits). Empty when out of range.
+std::string_view formalParamName(const ConstructorSymbol& cs, std::size_t pos);
+
+// Arity of the constructor's formal list, same dual sourcing.
+std::size_t formalParamCount(const ConstructorSymbol& cs);
+
 } // namespace bezel::sema
