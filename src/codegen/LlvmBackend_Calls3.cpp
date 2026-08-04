@@ -1750,11 +1750,30 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
              builder_.getInt64(valInline ? 1 : 0), valTramp, valClosure,
              builder_.getInt64(keyIsString ? 1 : 0)},
             "linq.todict");
+        // #2263 / stdlib §5 / §4.12 / #2151: when the value type is `string`
+        // (single-selector `ToDictionary(key)` over an `Array<string>` /
+        // `string.Split(...)` source — `hasValueSel` false, `valInline` true),
+        // `bz_lazy_to_dict` stores the element pointer into the dict slot
+        // WITHOUT retaining the string struct (the dict's per-value slot is a
+        // raw void* that aliases the bz_string_struct* the source array
+        // element holds). The freeUnboundOwnedBorrowingArrayTemp call below
+        // would then bz_array_free the source with the string-release thunk,
+        // dropping each substring's refcount to 0 — every dict value is now a
+        // dangling pointer (use-after-free on the next deref). SKIP the source
+        // reclaim entirely when the value type is string; the source array
+        // struct itself leaks (a small bounded leak vs. a guaranteed UAF). The
+        // int / float / struct-Value / record-Value cases are unaffected
+        // (struct values are malloc-copied in the runtime; scalars are
+        // refcount-free; only a `string` value aliases the source array).
+        bool valIsString = !hasValueSel && elemRef &&
+            elemRef->kind == sema::TypeRef::Kind::Primitive &&
+            elemRef->primitive == sema::PrimitiveType::String &&
+            !elemRef->nullable;
         // #2151 / §28.3: reclaim an unbound fresh-materializer receiver array
         // here (the lazy is already consumed/disposed by bz_lazy_to_dict). See
         // the matching comment at the ToDictionary entry above for rationale
         // and the no-double-free gate.
-        if (recvArr) freeUnboundOwnedBorrowingArrayTemp(
+        if (recvArr && !valIsString) freeUnboundOwnedBorrowingArrayTemp(
                 ma->target.get(), recvArr, ctx_.exprType(*ma->target));
         // Release the inline-lambda / primitive-intrinsic-method-ref key/value
         // closures if we own them (eager materialization — the closures are
@@ -4878,6 +4897,15 @@ llvm::Value* Emitter::tryLowerAtomicCall(const ast::CallExpr& call) {
         // Exchange(value: T): T — seq-cst swap, returns old value.
         llvm::Value* rawVal = lowerExpr(*call.args[0].value);
         if (!rawVal) return nullptr;
+        // #2605 / §7.4: a flow-narrowed `T?` operand (proved non-null by a
+        // preceding null-check) lowers to its tagged-optional {i8,T} struct;
+        // unwrap to the bare T payload before widening — the same unwrap the
+        // user-method binding path performs (unwrapNarrowedNullable, mirrors
+        // the narrowed value-type receiver at LlvmBackend_Calls2.cpp ~6623).
+        // An un-narrowed `T?` is rejected by sema (#2602), so codegen only
+        // sees a narrowed or plain-T operand here; the helper is a no-op for
+        // a plain primitive.
+        rawVal = unwrapNarrowedNullable(rawVal, getTTy());
         // Widen arg to i64.
         llvm::Value* v64 = rawVal;
         if (rawVal->getType()->isIntegerTy() && !rawVal->getType()->isIntegerTy(64))
@@ -4894,6 +4922,10 @@ llvm::Value* Emitter::tryLowerAtomicCall(const ast::CallExpr& call) {
         llvm::Value* expVal = lowerExpr(*call.args[0].value);
         llvm::Value* repVal = lowerExpr(*call.args[1].value);
         if (!expVal || !repVal) return nullptr;
+        // #2605 / §7.4: unwrap a flow-narrowed `T?` (expected/replacement)
+        // to its bare payload before widening — see Exchange above.
+        expVal = unwrapNarrowedNullable(expVal, getTTy());
+        repVal = unwrapNarrowedNullable(repVal, getTTy());
         auto widen = [&](llvm::Value* v) -> llvm::Value* {
             if (v->getType()->isIntegerTy() && !v->getType()->isIntegerTy(64))
                 return builder_.CreateZExt(v, i64());
@@ -4941,6 +4973,9 @@ llvm::Value* Emitter::tryLowerAtomicCall(const ast::CallExpr& call) {
         if (mname == "Add" && !call.args.empty() && call.args[0].value) {
             llvm::Value* deltaRaw = lowerExpr(*call.args[0].value);
             if (!deltaRaw) return nullptr;
+            // #2605 / §7.4: unwrap a flow-narrowed `T?` delta to its bare
+            // payload before widening — see Exchange above.
+            deltaRaw = unwrapNarrowedNullable(deltaRaw, getTTy());
             // Sign-extend to i64 for signed T; zero-extend for unsigned T.
             llvm::Value* delta64 = deltaRaw;
             if (deltaRaw->getType()->isIntegerTy() &&

@@ -542,6 +542,123 @@ static void collectYieldStatesForOwnedParams(
 }
 
 
+// §29.7 (#2306): the LOCAL counterpart of the owned-parameter linear scan
+// above. For each plain `var L := ...` local of an owned class/interface type
+// in the iterator body (a `unwindOnly`-class plain `var`), record the
+// 1-based yield state at which L becomes live (declaration reached) and
+// the 1-based yield state at which L is transferred out via `yield return L;`.
+// `establishedAtState` lets the iterator Dispose distinguish "not yet
+// reached" (state S < establishedAtState) from "live" (establishedAtState <=
+// S < transferredAtState); a monotone "ever discharged" fact is NOT enough
+// because a transferred local is logically moved-from past the L-th yield —
+// the state-keyed predicate is required. The scan walks in EXECUTION order,
+// extending through `try` bodies and `do/end` blocks (mirroring the
+// parameter version) so the multi-yield shape
+// `try { yield return a; } ... ; var b := ...; yield return b;` is included.
+// If/else/while/for and lambdas have data-dependent state ordering — the
+// scan aborts (`ok=false`) and the iterator falls back to the legacy
+// monotone path (the existing #1897 leak persists for those shapes, but
+// calling the new path with an ambiguous timeline would risk a double-free
+// when a local is transferred by a path the linear scan can't statically
+// place).
+static void collectYieldStatesForOwnedLocals(
+    sema::SemaContext& ctx,
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+    unsigned& state,
+    std::unordered_map<const ast::LocalDecl*,
+        std::pair<unsigned, unsigned>>& out,
+    bool& ok) {
+    // (decl → (establishedAtState, transferredAtState))
+    for (const auto& s : stmts) {
+        if (!s) continue;
+        if (!ok) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s.get())) {
+            // Only plain (non-`using`) locals are in scope — `using var` has its
+            // own disposal path (#821 / smIterDisposalsAtState_) and an
+            // autoDropAtScopeEnd plain `var` is the affine-never-discharged
+            // case whose disposal runs unconditionally at scope end. The type
+            // gate (class/interface vs. collection/task/subscription) is
+            // applied at emit time via unwindOwnedLocalClass so the runtime
+            // vtable-slot-2 Dispose we emit is sound for the local type.
+            if (ld->isUsing || ld->autoDropAtScopeEnd) continue;
+            auto oit = out.find(ld);
+            if (oit != out.end()) {
+                // Re-declaration in the linear scan: not legal Bezel, abort.
+                ok = false; return;
+            }
+            // establishedAtState = next yield state after this declaration.
+            // After K yields have been emitted we're at state K (resumed for
+            // MoveNext state K); the next yield (yield K+1) advances to state
+            // K+1. A declaration seen BEFORE any yield (state=0) becomes live
+            // at state 1; one seen between yield K and yield K+1 becomes
+            // live at state K+1. So `state + 1` captures it.
+            out[ld] = {state + 1, 0};
+            continue;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s.get())) {
+            if (ys->isBreak || !ys->value) { ok = false; return; }
+            // A `yield return <plain bare-identifier local>` (IOwningEnumerable)
+            // TRANSFERS L's ownership out via the consumer's TakeCurrent. The
+            // sema side (Ownership.cpp #1863) has already markDisposedByName'd
+            // the local; the codegen-side question is the SUSPENSION STATE at
+            // which that happens, which this scan records. Any other yielded
+            // expression (a `new`, a call, a field/member read) does NOT
+            // transfer a tracked local — fall through without touching `out`.
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                ys->value.get());
+            if (id && (id->name == "this" || id->name == "base")) {
+                ok = false; return;
+            }
+            sema::Symbol* sym = id ? ctx.exprSymbol(*id) : nullptr;
+            auto* loc = dynamic_cast<sema::LocalSymbol*>(sym);
+            if (id && (!loc || !loc->decl || loc->isUsing)) {
+                // Bare identifier that isn't a tracked plain owned local —
+                // ambiguous, abort.
+                ok = false; return;
+            }
+            if (loc && loc->decl) {
+                auto* ldDecl = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+                if (!ldDecl) { ok = false; return; }
+                auto oit = out.find(ldDecl);
+                if (oit == out.end()) {
+                    // Yielding a local that wasn't pre-registered (e.g., a
+                    // local declared in a branch the linear scan couldn't
+                    // see, or a non-owned local) — ambiguous.
+                    ok = false; return;
+                }
+                if (oit->second.second != 0) {
+                    // Two transfers of the same local — sema would reject
+                    // an affine move-out more than once anyway, so abort.
+                    ok = false; return;
+                }
+                oit->second.second = state + 1;
+            }
+            ++state;
+            continue;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            // Recurse through the protected body only; §29.6 forbids `yield`
+            // in catches / finally, so no yield-position transfer occurs
+            // there for us to miss.
+            collectYieldStatesForOwnedLocals(
+                ctx, ts->body, state, out, ok);
+            continue;
+        }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
+            collectYieldStatesForOwnedLocals(
+                ctx, db->body, state, out, ok);
+            continue;
+        }
+        // IfStmt / WhileStmt / ForStmt / lambdas / anything else has
+        // data-dependent state ordering — abort the linear scan. The legacy
+        // monotone path (#1897) keeps working; the brief explicitly scopes
+        // the new state-keyed path to the linear shape.
+        ok = false;
+        return;
+    }
+}
+
+
 void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
                          const CallableInfo& ci) {
     if (!ci.stmts) return;
@@ -601,7 +718,23 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // call. TakeCurrent (vtable slot 3) checks for null (before-first-advance /
     // after-exhaustion / double-take) and raises InvalidOperationException.
     // The iterator nulls current_val after transfer and on exhaustion.
-    bool isOwningIter = (retName == "IOwningEnumerable");
+    //
+    // §29.1 v0.236 / #2610: recognize BOTH owning iterator heads.
+    // IOwningEnumerable<T> is the spec-sanctioned iterator return (§29.2); the
+    // enumerator-direct `IOwningEnumerator<T>` return is the owning sibling of
+    // the `IEnumerator<T>`-direct single-use form §29.3/§29.11 supports, reached
+    // via `using var en := Gen();` where Gen's declared return type is
+    // IOwningEnumerator<T>. Pre-#2610 this head fell through here, so the codegen
+    // treated the frame as the BORROWING form: slot 3 was emitted as a plain
+    // non-destructive Current (no null-on-take), while the consumer dispatched
+    // `.TakeCurrent()` against the same slot expecting ownership transfer — a
+    // heap-use-after-free (the producer's #1120 advance/Dispose then touched the
+    // value the consumer already owned). Recognizing it makes TakeCurrent, the
+    // disposeYieldedVal owning-branch, and the owned-local scan below all apply,
+    // so the frame implements the §29.1 owning contract. Mirrors the async
+    // isOwningIter extension landed under #2591 (IOwningAsyncEnumerator).
+    bool isOwningIter = (retName == "IOwningEnumerable" ||
+                         retName == "IOwningEnumerator");
 
     // §29.8 (#2154/#2217): narrow CLONE-DISPOSES-CAPTURES prototype. The
     // ownership pass records a yield state only when the complete body is a
@@ -645,6 +778,18 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             ownedParamYieldStates.clear();
         }
     }
+    // §29.7 (#2306): the LOCAL counterpart of the owned-parameter scan above.
+    // Recorded here (before `frame` is built below at buildStateMachineFrame)
+    // so the linear walk is purely AST-driven and doesn't depend on the
+    // frame layout. Frame-field indices are filled in after the frame is
+    // built (see the second pass below, just after buildStateMachineFrame).
+    struct LocalKeyedDisposal {
+        unsigned establishedAtState = 0;
+        unsigned transferredAtState = 0;   // 0 = not transferred (legacy fallback)
+        unsigned frameField = 0;
+    };
+    std::unordered_map<const ast::LocalDecl*, LocalKeyedDisposal>
+        ownedLocalYieldStates;
     // §29.8 (#973a): does any `owned` parameter carry the CONDITIONAL frame
     // auto-dispose flag (discharged on some path, every occurrence admitted by
     // common::stateMachineOwnedParamIsFrameNullable)? For such a parameter the
@@ -715,13 +860,23 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
     // value to the consumer via TakeCurrent() on each MoveNext call — the consumer
     // (not the enumerator) is responsible for disposing it; the enumerator must
     // NOT also dispose current_val or the result is a double-free.
+    //
+    // §29.1 v0.236 / #2610: the enumerator-direct IOwningEnumerator<T> return is
+    // the same owning contract (isOwningIter above) and is excluded for the same
+    // reason — without this, the #1120 advance-dispose / exhaustion-dispose
+    // machinery (gated on elemIsOwnedClass) would fire for an owning iterator
+    // and race the consumer's TakeCurrent (the slot-3 TakeCurrent nulls on take,
+    // but the owned-flag-gated borrowing-form disposal is the wrong model for the
+    // owning form, whose every yielded value transfers regardless of `new`-vs-
+    // local). Keeping the two owning heads symmetric makes IOwningEnumerator<T>-
+    // direct behave identically to IOwningEnumerable<T>.
     bool elemIsOwnedClass = false;
     if (elemSemaTy &&
         elemSemaTy->kind == sema::TypeRef::Kind::Named &&
         elemSemaTy->declaration != nullptr &&
         (elemSemaTy->declaration->kind == ast::TypeDeclKind::Class ||
          elemSemaTy->declaration->kind == ast::TypeDeclKind::Interface)) {
-        if (retName != "IOwningEnumerable")
+        if (retName != "IOwningEnumerable" && retName != "IOwningEnumerator")
             elemIsOwnedClass = true;
     }
 
@@ -749,6 +904,63 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
     bool isInstance = !isStaticMethod(ms);
     std::string prefix = std::string("bz$iter$") + std::string(ms->name) + "$";
+
+    // §29.7 (#2306): finish the local pre-pass now that `frame` is built.
+    // Run the linear scan (it was declared above but its frame-field slot
+    // filling was deferred) and populate ownedLocalYieldStates with both
+    // (establishedAtState, transferredAtState) and frame field indices.
+    // Restricted to IOwningEnumerable iterators — `yield return L;` only
+    // transfers a local in the owning form (#1863); for an
+    // IEnumerable<owned T> iterator the bare-identifier yield is a borrow
+    // and the local's disposal is bounded by sema's never-discharged auto-
+    // drop or unwind (no Abandoned-state-keyed gap analogous to the bug).
+    // Cross-check: every registered local must have transferredAtState > 0
+    // (the linear scan only succeeded when each transfer was at a yield);
+    // any non-yield transfer means we can't statically place the
+    // discharge — fall back to "do not dispose" (bounded leak) rather than
+    // risk a double-free against a runtime non-yield discharge site.
+    if (isOwningIter) {
+        bool lscanOk = true;
+        unsigned lscanState = 0;
+        std::unordered_map<const ast::LocalDecl*,
+            std::pair<unsigned, unsigned>> lscanOut;
+        collectYieldStatesForOwnedLocals(
+            ctx_, *ci.stmts, lscanState, lscanOut, lscanOk);
+        if (lscanOk && !lscanOut.empty()) {
+            bool allTransferred = true;
+            for (auto& [ld, pr] : lscanOut) {
+                if (pr.second == 0) {
+                    allTransferred = false;
+                    break;
+                }
+                if (!unwindOwnedLocalClass(ld)) {
+                    // The local's type is not a class/interface instance that
+                    // admits dispose-via-vtable-slot-2 (it might be a
+                    // collection, a Task, a built-in handle, etc.) — those
+                    // have their own disposal paths and aren't this fix's
+                    // target.
+                    allTransferred = false;
+                    break;
+                }
+            }
+            if (allTransferred) {
+                ownedLocalYieldStates.clear();
+                for (auto& [ld, pr] : lscanOut) {
+                    LocalKeyedDisposal info;
+                    info.establishedAtState = pr.first;
+                    info.transferredAtState = pr.second;
+                    auto fit = frame.localFields.find(ld);
+                    if (fit != frame.localFields.end())
+                        info.frameField = fit->second;
+                    ownedLocalYieldStates[ld] = info;
+                }
+            } else {
+                ownedLocalYieldStates.clear();
+            }
+        } else {
+            ownedLocalYieldStates.clear();
+        }
+    }
 
     // --- MoveNext(ptr self) -> i1 ---
     auto* moveNextTy = llvm::FunctionType::get(i1(), {ptrTy()}, false);
@@ -1201,9 +1413,43 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // defensive null on the exhaustion path covers manual-protocol usage
             // where MoveNext returning false without a prior TakeCurrent is
             // possible (e.g. zero-element owning iterator, or skip pattern).
+            // fix #2616 / §29.1 (v0.236): the null must be preceded by a
+            // DISPOSE. Under the §29.1 owning contract ownership transfers to
+            // the consumer only at TakeCurrent, so a NON-NULL current_val here
+            // is a value the consumer never took — the enumerator still owns
+            // it, and nulling the only reference leaked it. This is reachable
+            // exactly on manual-protocol abandonment (`en.MoveNext()` without a
+            // matching `en.TakeCurrent()`, then driving on to exhaustion); the
+            // dominant `for var x in src` desugaring takes every value, so
+            // current_val is null here and the branch below is a no-op.
+            //
+            // Exactly-once, not a double-free: the abandon-then-Dispose path
+            // (disposeYieldedVal, below) is the same dispose-then-null under
+            // the same null guard, so after this runs its load sees null and
+            // no-ops. TakeCurrent is the only other reader and raises §29.1's
+            // InvalidOperationException on null (unchanged: after exhaustion it
+            // already saw null). The BORROWING head is untouched — this branch
+            // is gated on isOwningIter, and the `elemIsOwnedClass` block just
+            // above (mutually exclusive with isOwningIter by construction,
+            // since elemIsOwnedClass is only set when retName is neither owning
+            // head) keeps its owned-flag-gated behaviour.
             if (isOwningIter && elemTy->isPointerTy()) {
                 llvm::Value* cvField = builder_.CreateStructGEP(
                     stateStructTy, self, CURRENT_VAL_FIELD);
+                llvm::Value* pend =
+                    builder_.CreateLoad(elemTy, cvField, "ity.pend");
+                llvm::Value* pendNull = builder_.CreateICmpEQ(
+                    pend, llvm::ConstantPointerNull::get(ptrTy()),
+                    "ity.pendnull");
+                auto* dispBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.pend.disp", moveNextFn);
+                auto* contBB2 = llvm::BasicBlock::Create(
+                    llvm_, "ity.pend.cont", moveNextFn);
+                builder_.CreateCondBr(pendNull, contBB2, dispBB);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(pend);
+                builder_.CreateBr(contBB2);
+                builder_.SetInsertPoint(contBB2);
                 builder_.CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy()), cvField);
             }
@@ -1421,6 +1667,74 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             }
         };
 
+        // §29.7 (#2306): the LOCAL counterpart of disposeOwnedParams. For each
+        // plain `var L` local of an owned-class type whose pre-pass produced a
+        // (establishedAtState, transferredAtState, frameField) tuple, dispose
+        // L's frame slot iff the current state is in L's live window:
+        //   establishedAtState <= state < transferredAtState
+        // (a non-transferred local uses unbounded upper bound). The null guard
+        // handles "never reached (state 0)" — the calloc-zeroed slot is null
+        // because MoveNext never ran past the declaration. Mirrors the
+        // parameter version's state-keyed test (§29.8 #2154/#2217) plus the
+        // extra establishment gate for the local's declaration. Reverse
+        // establishment order matches §28.4's reverse-declaration destructor
+        // rule. Only registered locals are visited, so the lambda is a no-op
+        // (zero IR) for body shapes the pre-pass could not statically pin —
+        // preserving the existing #1897 bug for those shapes rather than
+        // risking a double-free against a non-yield discharge.
+        auto disposeOwnedLocals = [&]() {
+            if (ownedLocalYieldStates.empty()) return;
+            for (auto bit = frame.bodyLocals.rbegin();
+                 bit != frame.bodyLocals.rend(); ++bit) {
+                const ast::Node* node = bit->first;
+                auto* ld = dynamic_cast<const ast::LocalDecl*>(node);
+                if (!ld) continue;  // for-loop var / for-in iterable node.
+                auto oit = ownedLocalYieldStates.find(ld);
+                if (oit == ownedLocalYieldStates.end()) continue;
+                const LocalKeyedDisposal& info = oit->second;
+                if (info.establishedAtState == 0 ||
+                    info.transferredAtState == 0 ||
+                    info.frameField == 0)
+                    continue;
+                unsigned fieldIdx = info.frameField;
+                llvm::Value* fptr = builder_.CreateStructGEP(
+                    stateStructTy, self, fieldIdx);
+                llvm::Value* obj = builder_.CreateLoad(
+                    ptrTy(), fptr, "itl.obj");
+                llvm::Value* nonNull = builder_.CreateICmpNE(
+                    obj, llvm::ConstantPointerNull::get(ptrTy()),
+                    "itl.nonnull");
+                // Established: suspension state >= establishedAtState.
+                llvm::Value* established = builder_.CreateICmpSGE(
+                    disposeState,
+                    builder_.getInt32((int)info.establishedAtState),
+                    "itl.estab");
+                // Not transferred: state < transferredAtState. (If
+                // transferredAtState == 0, fall back to always-live, but the
+                // pre-pass already filtered such cases out — every registered
+                // local has transferredAtState > 0.)
+                llvm::Value* beforeMove = builder_.CreateICmpSLT(
+                    disposeState,
+                    builder_.getInt32((int)info.transferredAtState),
+                    "itl.beforemove");
+                llvm::Value* shouldDispose = builder_.CreateAnd(
+                    nonNull,
+                    builder_.CreateAnd(established, beforeMove),
+                    "itl.shoulddispose");
+                auto* dispBB = llvm::BasicBlock::Create(
+                    llvm_, "itl.dispose", targetFn);
+                auto* contBB = llvm::BasicBlock::Create(
+                    llvm_, "itl.cont", targetFn);
+                builder_.CreateCondBr(shouldDispose, dispBB, contBB);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(obj);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), fptr);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+            }
+        };
+
         // #1864 / §27.5 / §28.9: release each closure (function-typed) parameter
         // the frame RETAINED at construction (emitIteratorMethod's capture-store
         // retain). The frame held its own +1 so it could invoke the closure
@@ -1540,6 +1854,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             builder_.CreateStore(builder_.getInt32(-2), stateGEP2);
             disposeYieldedVal();       // §29 (#1120): dispose outstanding yield val
             disposeOwnedParams();      // §29.8 (#945)
+            disposeOwnedLocals();      // §29.7 (#2306): state-keyed plain-owned locals
             releaseClosureCaptures();  // #1864 §27.5/§28.9: drop frame's +1 on closure captures
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});
@@ -1648,6 +1963,7 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             builder_.SetInsertPoint(doneBB);
             disposeYieldedVal();       // §29 (#1120): dispose outstanding yield val
             disposeOwnedParams();      // §29.8 (#945): after the finally chains
+            disposeOwnedLocals();      // §29.7 (#2306): state-keyed plain-owned locals
             releaseClosureCaptures();  // #1864 §27.5/§28.9: drop frame's +1 on closure captures
             emitFreeSpillArea(self);   // #747: free any spilled for-loop frame
             builder_.CreateCall(freeFn, {self});

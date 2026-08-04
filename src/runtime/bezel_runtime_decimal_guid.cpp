@@ -842,9 +842,25 @@ extern "C" void* bz_decimal_to_string(const bz_decimal_t* a) {
 
 // Round(digits) — rounds to `digits` decimal places using banker's rounding
 // (round-half-to-even), per stdlib §9.3 ("matching Math.Round (§2.2)").
+//
+// Per stdlib §9.3 (v0.195, #2339): digits outside 0..28 must raise
+// ArgumentOutOfRangeException. The contract is enforced by the codegen
+// caller (LlvmBackend_Calls.cpp "Decimal.Round" branch emits an
+// emitGuardThrow for `digits < 0 || digits > 28` BEFORE invoking this
+// runtime helper), so the runtime can assume the precondition holds and
+// simply compute the rounding. Defensive: if a non-codegen caller does
+// invoke this helper with out-of-range digits, abort — silently clamping
+// or returning the operand was the #2339 defect (Round(-1) returned -2m
+// instead of raising).
 extern "C" void bz_decimal_round(const bz_decimal_t* a, int32_t digits,
                                   bz_decimal_t* out) {
-    if (digits < 0) digits = 0;
+    if (digits < 0 || digits > 28) {
+        // Precondition violation: caller should have rejected this. Write
+        // default(decimal) so the out slot is left in a defined state
+        // even when the abort is caught by a test harness; then bail.
+        out->lo32 = 0; out->mid32 = 0; out->hi32 = 0; out->flags = 0;
+        abort();  // precondition violated — codegen guards this
+    }
     uint32_t s = dec_scale(a);
     if ((uint32_t)digits >= s) { *out = *a; return; }
     __uint128_t m = dec_mantissa(a);

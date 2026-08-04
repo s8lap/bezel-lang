@@ -602,7 +602,13 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             bool collIsOwning =
                 it->collTy->astNode && it->collTy->astNode->name &&
                 !it->collTy->astNode->name->parts.empty() &&
-                common::isOwningPrefixedName(it->collTy->headName());
+                (common::isOwningPrefixedName(it->collTy->headName()) ||
+                 // #2606 / stdlib §4.5: IOwningList<T> is the OWNING list
+                 // interface — its elements are owned by the holder — but
+                 // isOwningPrefixedName("IOwningList") is false (the head starts
+                 // with "I", not "Owning"), so consult the interface recognizer
+                 // to mark the family owning (matches owned OwningArray<T>).
+                 isOwningListInterfaceName(it->collTy));
             ElementPolicy fieldCollPol = elementPolicyFor(collElem, collIsOwning);
             llvm::Function* elemDisp = fieldCollPol.disposerThunk;
             if (!elemDisp && !isDict &&
@@ -612,8 +618,17 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                     !collElem->nullable &&
                     it->collTy->astNode && it->collTy->astNode->name &&
                     !it->collTy->astNode->name->parts.empty() &&
-                    [](std::string_view n){ return n == "Array" || n == "Stack" ||
-                        n == "Queue"; }(it->collTy->headName()))
+                    [](std::string_view n){
+                        // #2603 / issue #401: IList<T>/IReadOnlyList<T> are
+                        // array-backed + borrowing (same bz_array_t* + per-
+                        // element string +1 as Array<T>), so a string-element
+                        // field of those interface types releases its elements
+                        // through the SAME stringElementReleaseThunk. IOwningList
+                        // is owning and never reaches this string gate (owning-
+                        // family disposer runs via elementPolicyFor instead).
+                        return n == "Array" || n == "Stack" || n == "Queue" ||
+                               n == "IList" || n == "IReadOnlyList";
+                    }(it->collTy->headName()))
                 elemDisp = stringElementReleaseThunk();
             llvm::Value* disp = elemDisp
                 ? llvm::cast<llvm::Value>(elemDisp)
@@ -2473,6 +2488,203 @@ llvm::Function* Emitter::nestedCollectionDisposerThunk(const sema::TypeRef* elem
     b.CreateRetVoid();
 
     nestedCollectionDisposerThunks_[elemCollTy] = fn;
+    return fn;
+}
+
+
+// #2279 (§30.5 Pattern A, v0.236): build the per-result-collection-type
+// `void(void*)` thunk that frees a Pattern A task's RESULT when that result
+// is itself an intrinsic collection (Array<T> / Set<T> / Dictionary<K,V> /
+// LinkedList<T> / Stack<T> / Queue<T> / OwningBuffer<T> / OwningArray<T> /
+// Owning* collections). §30.5 producer-side rules: a `Task<T:class>` for
+// class T always owns its result directly, and "disposing the task disposes
+// the result" — for a class instance that means calling its destructor via
+// the vtable; for an intrinsic collection that means freeing the
+// collection's backing storage (the bz_array_t*/bz_dict_t*/bz_llist_t*/*
+// bz_buffer_t* header+data) with the right per-element disposer. The
+// existing elementPolicyFor-based path (`patternAResultDisposerFor`'s
+// ClassOwned branch) returns null when T is e.g. Array<int> (int is a Value
+// category, no disposer thunk) — the result then leaked (LSan: 104 bytes
+// from bz_array_alloc per #2279's repro). This helper fills that gap.
+//
+// Free fn selection (mirrors the `using var` collection disposal path and
+// `nestedCollectionDisposerThunk` above, so the result-disposal contract
+// stays consistent regardless of whether the consumer is the task's own
+// teardown or a `using var` of the task):
+//   Array / Stack / Queue / Set / SortedSet / OwningArray / OwningStack
+//     / OwningQueue / OwningSet              → bz_array_free(ptr, elemDisposer)
+//   Dictionary / OwningDictionary / SortedDictionary
+//                                             → bz_dict_free(ptr, valueDisposer)
+//   LinkedList / OwningLinkedList             → bz_llist_free(ptr, elemDisposer)
+//   OwningBuffer                             → bz_buffer_free(ptr)
+//
+// Per-element disposer is the per-element-policy disposer for the SAME
+// family (owning vs borrowing) as the result collection — so a borrowing
+// Array<MyClass> passes null (the array only borrows its class elements per
+// §28.11; elements are owned elsewhere and never disposed by the array),
+// an OwningArray<MyClass> passes the element-disposer thunk, an
+// Array<string> passes stringElementReleaseThunk (the +1 retained at insert
+// is released at free), an OwningDictionary<MyClass, MyClass> passes the
+// value-side disposer (genericArgs[1]). Returns null when `resultCollTy` is
+// not an intrinsic collection — the caller falls back to the existing
+// class-result path which is correct for plain classes.
+llvm::Function* Emitter::patternAResultCollectionDisposer(
+    const sema::TypeRef* resultCollTy) {
+    // Cache hit.
+    auto it = patternAResultCollectionDisposers_.find(resultCollTy);
+    if (it != patternAResultCollectionDisposers_.end()) return it->second;
+
+    // Reject non-intrinsic-collection types — the existing class-result path
+    // is correct for plain classes. An intrinsic collection has no
+    // declaration (it's a compiler-known builtin, like the Shared/Weak/
+    // IGrouping/Subscription builtins) with a name-typed astNode. Mirror
+    // the builtin-collTy detection already used by nestedCollectionDisposer-
+    // Thunk / collectionTypeOfLocal / linkedListTypeOfLocal — same keying,
+    // so a user class literally named `Array` keeps the existing path.
+    std::string_view collName;
+    if (!resultCollTy || resultCollTy->kind != sema::TypeRef::Kind::Named ||
+        resultCollTy->declaration ||
+        !resultCollTy->astNode || !resultCollTy->astNode->name ||
+        resultCollTy->astNode->name->parts.empty()) {
+        return nullptr;
+    }
+    collName = resultCollTy->headName();
+
+    // Map the collection kind to (free-fn, family-for-element-policy). The
+    // runtime free fns accept a null per-element disposer for value-typed
+    // elements (bz_array_free skips the dispose loop) and for borrowing
+    // elements (the array only borrows its elements per §28.11). For a
+    // borrowing collection of strings, stringElementReleaseThunk is the
+    // right disposer (the +1 retained at insert must be released at free).
+    bool isLL          = (collName == "OwningLinkedList" || collName == "LinkedList");
+    bool isDict        = (collName == "Dictionary" || collName == "OwningDictionary" ||
+                          collName == "SortedDictionary");
+    bool isBuffer      = (collName == "OwningBuffer");
+    bool isOwningColl  = isLL || isDict || isBuffer
+                          ? false  // isOwning derived per-coll below
+                          : common::isOwningPrefixedName(collName) ||
+                            collName == "Array" || collName == "Stack" ||
+                            collName == "Queue" || collName == "Set" ||
+                            collName == "SortedSet";
+    // For LinkedList / Dictionary, the owning property is the head's
+    // "Owning" prefix (per stdlib §4.6/§4.7/§4.8/§4.9 — OwningLinkedList /
+    // OwningDictionary own their elements; the borrowing forms don't).
+    if (collName == "LinkedList" || collName == "Dictionary" ||
+        collName == "SortedDictionary") {
+        isOwningColl = common::isOwningPrefixedName(collName);
+    }
+    if (!isLL && !isDict && !isBuffer && !isOwningColl) {
+        // Not a recognized intrinsic collection. Fall through to the
+        // class-result path; the caller returns null in that case.
+        return nullptr;
+    }
+    // OwningBuffer is NOT value-owning by element kind — its `T` is value-
+    // typed by construction (it is the manual-storage primitive, §4.14) and
+    // bz_buffer_free does not take an element disposer. The owning flag is
+    // irrelevant for buffer selection; treat its element disposer as null.
+    if (isBuffer) {
+        isOwningColl = false;  // no element disposer on bz_buffer_free
+    }
+
+    const char* freeName = isLL ? "bz_llist_free"
+                         : isDict ? "bz_dict_free"
+                         : isBuffer ? "bz_buffer_free"
+                         : "bz_array_free";
+    // The free fn signature: bz_array_free/bz_llist_free/bz_dict_free take
+    // (ptr, dispose_elem), bz_buffer_free takes (ptr) only.
+    bool freeFnTakesElem = !isBuffer;
+
+    // Per-element (or per-value) disposer:
+    //   Array/Stack/Queue/Set/OwningArray/OwningStack/OwningQueue/OwningSet/
+    //   LinkedList/OwningLinkedList: elementType = genericArgs[0], isOwning
+    //     = isOwningColl
+    //   Dictionary/OwningDictionary/SortedDictionary: elementType is the
+    //     KEY (genericArgs[0]) for isOwning purposes, BUT the value
+    //     (genericArgs[1]) is the one that carries the disposal obligation
+    //     (§28.11 "owning dictionary owns its values, keys are value-like").
+    //     For the runtime free call we pass the VALUE disposer; the value
+    //     element policy (owningDictionaryElementDisposer etc.) already uses
+    //     genericArgs[1].
+    //   OwningBuffer: no per-element disposer.
+    const sema::TypeRef* elemForDisposer = nullptr;
+    if (isBuffer) {
+        elemForDisposer = nullptr;
+    } else if (isDict) {
+        elemForDisposer = (resultCollTy->genericArgs.size() > 1)
+                              ? resultCollTy->genericArgs[1] : nullptr;
+    } else {
+        elemForDisposer = (!resultCollTy->genericArgs.empty())
+                              ? resultCollTy->genericArgs[0] : nullptr;
+    }
+    // Resolve the disposer thunk through elementPolicyFor — it returns null
+    // for value elements (no obligation), the class element-disposer thunk
+    // for class elements, and a string-typed variant via the same call. For
+    // the array-of-string case specifically, elementPolicyFor returns
+    // Category::RuntimeManaged with disposerThunk=null but retainRelease=true;
+    // we explicitly use stringElementReleaseThunk below because the runtime
+    // call needs a real function pointer for the per-element release.
+    llvm::Value* elemDisposer = nullptr;
+    if (elemForDisposer) {
+        ElementPolicy elemPol = elementPolicyFor(elemForDisposer, isOwningColl);
+        if (elemPol.disposerThunk) {
+            elemDisposer = elemPol.disposerThunk;
+        } else if (elemPol.cat == ElementPolicy::Category::RuntimeManaged &&
+                   elemForDisposer->kind == sema::TypeRef::Kind::Primitive &&
+                   elemForDisposer->primitive == sema::PrimitiveType::String) {
+            // Borrowing Array<string> / Dictionary<string, int> / etc. —
+            // release each string element. Mirrors the
+            // collectionElemDisposer wiring in LlvmBackend_Setup.cpp
+            // (which sets stringElementReleaseThunk for string-element
+            // collections).
+            elemDisposer = stringElementReleaseThunk();
+        }
+    }
+
+    // Build the thunk: void(void* resultCollPtr) {
+    //                       if (!ptr) return;
+    //                       freeFn(ptr, elemDisposer); }
+    // For bz_buffer_free (no element-disposer arg), the call drops it.
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    std::string thunkName = std::string("bz$patAResultCollFree$") +
+                            std::string(collName);
+    if (module_->getFunction(thunkName)) {
+        thunkName += "$" + std::to_string(
+            reinterpret_cast<std::uintptr_t>(resultCollTy));
+    }
+    auto* fn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      thunkName, module_.get());
+    llvm::Argument* ptr = &*fn->args().begin();
+    auto* entry  = llvm::BasicBlock::Create(llvm_, "entry",    fn);
+    auto* freeBB = llvm::BasicBlock::Create(llvm_, "coll.free", fn);
+    auto* retBB  = llvm::BasicBlock::Create(llvm_, "coll.ret",  fn);
+    llvm::IRBuilder<> b(entry);
+    // Null-guard: every free fn above is null-safe but the guard matches the
+    // nestedCollectionDisposerThunk convention.
+    b.CreateCondBr(
+        b.CreateICmpEQ(ptr, llvm::ConstantPointerNull::get(ptrTy())),
+        retBB, freeBB);
+    b.SetInsertPoint(freeBB);
+    if (freeFnTakesElem) {
+        llvm::Value* dispArg = elemDisposer
+            ? elemDisposer
+            : llvm::ConstantPointerNull::get(ptrTy());
+        auto* freeFn = declareC(freeName,
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy(), ptrTy()});
+        b.CreateCall(freeFn, {ptr, dispArg});
+    } else {
+        // bz_buffer_free: single-arg free.
+        auto* freeFn = declareC(freeName,
+                                llvm::Type::getVoidTy(llvm_),
+                                {ptrTy()});
+        b.CreateCall(freeFn, {ptr});
+    }
+    b.CreateBr(retBB);
+    b.SetInsertPoint(retBB);
+    b.CreateRetVoid();
+
+    patternAResultCollectionDisposers_[resultCollTy] = fn;
     return fn;
 }
 

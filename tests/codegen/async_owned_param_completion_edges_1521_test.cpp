@@ -380,14 +380,19 @@ BEZEL_TEST(async_owned_param_completion_edges_1521,
         0);
 }
 
-// REGRESSION — a parameter discharged on only SOME paths (not every path)
-// must remain the hard §28.3 reject (#973a: the state machine cannot
-// statically tell whether the body moved it out on the untaken branch, so
-// auto-disposing would risk a double-free). Unaffected by this fix — pins
-// the widened `sawYield_ || isAsync_` gate did not loosen the
-// `everDischarged_`-based conditional-discharge criterion itself.
+// REGRESSION (superseded by #2310) — the #973a test the issue tracked as
+// the "still_rejected" boundary for the `c.Dispose()` discharge form in a
+// plain `async` method. #2310 widens the §29.8/§30.1 admission from the
+// marked-adoption-only subset to all six discharge forms (including
+// `p.Dispose()` / `p?.Dispose()`): each lowering site nulls the FRAME
+// capture slot beside the caller's alloca, so the frame's null-guarded
+// terminal-state disposal skips on the discharging branch and disposes
+// exactly once on the fall-through. The wider shape is exercised by the
+// dedicated `state_machine_param_conditional_discharge_2310` tests in
+// tests/ownership/; this test is now an ADMIT-side check (Cell.n == 0
+// pins EXACTLY-once disposal).
 BEZEL_TEST(async_owned_param_completion_edges_1521,
-          conditionally_discharged_param_still_rejected) {
+          conditionally_discharged_param_admitted_after_2310) {
     BEZEL_EXPECT_EQ(run(
         "module M; " + std::string(kCell) +
         "class C "
@@ -398,10 +403,11 @@ BEZEL_TEST(async_owned_param_completion_edges_1521,
         "  end Worker; "
         "  public static async method Main(): Task<int> "
         "    await C.Worker(new Cell(), true); "
+        "    await C.Worker(new Cell(), false); "
         "    return Cell.n; "
         "  end Main; "
         "end C;"),
-        -999);  // still a compile error, not a silently-accepted leak/UB
+        0);  // admitted (#2310): Cell.n == 0 means no leak and no extra disposal
 }
 
 // ---------------------------------------------------------------------------

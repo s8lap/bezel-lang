@@ -257,6 +257,20 @@ private:
     // (the specific callee node), so a stale value never yields a false positive.
     // Saved/restored around each callee visit.
     const ast::Expr* calleeOfCallCtx_ = nullptr;
+    // fix #2328 (§26.5, v0.236): the call-site arity the currently-being-
+    // visited MemberAccessExpr belongs to (its enclosing CallExpr's argument
+    // count, when there is one). -1 means "no call context" — a bare-
+    // reference access (a method reference, a property read, etc.), which
+    // leaves `lookupExtensionMember`'s arity filter un-applied. `+N` means
+    // "this access is the callee of a `M(...)` call with N args" — the
+    // lookup filters out any same-named extension member whose parameter
+    // list has a different arity, BEFORE the §26.5.1 specificity ranking,
+    // so the per-call arity check that `checkCallArity` performs for
+    // ordinary methods happens in the same place for extensions and the
+    // user never sees a bogus §26.5 rule-4 ambiguity on a wrong-arity
+    // call. Saved/restored around each callee visit (a nested call sets
+    // the OUTER arity while the inner call's own arity is in flight).
+    std::ptrdiff_t currentCallArity_ = -1;
     // §11.8: one synthesized GenericParamSymbol marker per type-parameter
     // name, attached as the exprSymbol of a `T` member-access receiver so
     // resolveMemberAccess (and codegen) can identify the receiver kind.
@@ -1137,7 +1151,8 @@ private:
     // "out var"/"out using var"/"out owned var" always declare a FRESH
     // local (no pre-existing-location question), and "owned"/"scoped" are
     // unrelated call-site markers (§22.3 / §28.14).
-    void checkRefOutOperandCategory(const ast::CallArgument& a);
+    void checkRefOutOperandCategory(const ast::CallArgument& a,
+                                    std::string_view formalParamModifier = "");
     // Shared by the Identifier and MemberAccess cases of
     // checkRefOutOperandCategory: readonly-outside-context (§22.8) and
     // mutable-static-rule-2 (§22.12) for a field operand.
@@ -1177,12 +1192,28 @@ private:
     // and `reportAmbiguity` lets a pure existence PROBE (see
     // extensionNameBlockedNote) suppress the diagnostic, since a probe must
     // not itself cause the ambiguity error it is only checking for.
+    // fix #2328 (§26.5, v0.236): `arity` (default -1 = no filter) narrows
+    // the candidate set to extension members whose parameter list has exactly
+    // that many parameters — the per-call arity check the §26.5 step-2 lookup
+    // previously skipped. A non-negative `arity` does NOT change the
+    // specificity ranking: an arity-filtered ambiguity still raises rule 4,
+    // and an arity-filtered unique winner is still preferred over an
+    // arity-mismatched block. Bare-reference call sites (which have no
+    // arity — they produce a Function value) leave it at the default.
+    //
+    // Parameter order is preserved with the original (receiver, name, outBinding,
+    // loc, reportAmbiguity) signature plus the new `arity` at the END, so the
+    // existing call sites — which pass `nullptr` for outBinding at the third
+    // slot — keep working without edits. The new arity-filtered path used by
+    // the §26.5 call-site fix in ExprTypecheck_Calls.cpp passes both an arity
+    // AND a non-null outBinding.
     Symbol* lookupExtensionMember(
         const TypeRef* receiver,
         std::string_view name,
         std::vector<std::pair<std::string, TypeRef*>>* outBinding = nullptr,
         SourceLocation loc = SourceLocation{},
-        bool reportAmbiguity = true);
+        bool reportAmbiguity = true,
+        std::ptrdiff_t arity = -1);
 
     // §26.5 step 1 (v0.183): when an instance member of `name` name-blocks
     // extension lookup for `receiver` and the committed instance call then
@@ -1658,6 +1689,77 @@ private:
     // takes no arguments. Multiple constructors → overload resolution
     // is deferred, so skip.
     void checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t);
+
+    // §7 / stdlib §9.6 (#2315): a primitive `string` receiver's builtin
+    // instance methods (IndexOf/Contains/StartsWith/EndsWith/LastIndexOf/
+    // Replace/Split/Insert/Substring/...) declare NON-nullable `string`/
+    // `char`/`int` parameters, but the call has no MethodSymbol — `string`
+    // is a primitive with no user TypeSymbol — so the ordinary
+    // checkCallArity → checkArgsAgainstParams path never runs. An
+    // un-narrowed `string?` argument was silently accepted and reached
+    // codegen, where the runtime helper's accidental null guard
+    // (`bz_str_indexof` opens with `if (!self_p || !sub_p) return -1;`)
+    // converted the type error into a "not found"/wrong answer. That guard
+    // is load-bearing only while every lowering avoids dereferencing the
+    // operand (a new lowering already segfaulted on it once). Run the SAME
+    // §7/§12 assignability check the user-method path runs
+    // (checkArgsAgainstParams → checkAssignable) against the stdlib-§9.6-
+    // declared parameter types, so a builtin string call rejects an
+    // un-narrowed `string?` exactly as a user `method Take(x: string)`
+    // does. `Equals(other: string?)` is the documented exception (§11.2
+    // parameter-nullability widening) and stays admissible; the static
+    // `IsNullOrEmpty`/`IsNullOrWhiteSpace` take `string?` and are not
+    // reached here (this covers the INSTANCE-receiver path only).
+    void checkBuiltinStringCallArgs(const ast::CallExpr& ce);
+
+    // §7 / stdlib §4.x (#2582): the COLLECTION twin of #2315. A builtin
+    // collection instance method that declares a NON-nullable `item: T` /
+    // `query: T` / `key: K` parameter (Array<T>.IndexOf/Contains/Remove/
+    // LastIndexOf/Insert, Set<T>/SortedSet<T>.Add/TryAdd/Contains/Remove,
+    // Stack<T>/Queue<T>.Push/Enqueue/Contains, LinkedList<T>.AddFirst/
+    // AddLast/AddBefore/AddAfter/Find/Contains/Remove, Dictionary<K,V>/
+    // SortedDictionary<K,V>.ContainsKey/Contains/Remove, OwningDictionary<
+    // K,V>.PopValue/TryPopValue, OwningSet<T>.Take/TryTake) has no
+    // MethodSymbol — these are synthetic Named TypeRefs with no user
+    // TypeSymbol — so the ordinary checkCallArity → checkArgsAgainstParams
+    // → checkAssignable path never fires. An un-narrowed `int?` (or `T?`)
+    // argument was silently accepted and reached codegen, where the
+    // equality-compare lowering tripped an LLVM ICmpInst assertion
+    // (`ICmpInst::AssertOK`: operand-type mismatch, exit 134 — there is no
+    // runtime null guard to mask the type error here). A user
+    // `method Take(x: int)` with the identical signature correctly rejected
+    // it (§7), so the two paths disagreed. Run the SAME §7/§12
+    // assignability check the user-method path runs against the
+    // instantiated element/key type `recvTy->genericArgs[0]`, so a builtin
+    // collection call rejects an un-narrowed `T?` exactly as a user method
+    // does. The §7.4 narrowing exception (a `T?` proved non-null by a
+    // null-check IS assignable) lives inside checkAssignable, which this
+    // reuses. Only INSTANCE calls on the builtin collection families are
+    // covered: the gate requires a Named TypeRef with no user `declaration`
+    // and a recognized collection head name, which excludes static calls
+    // and user types (a user `method IndexOf(item: T): int` has a
+    // MethodSymbol → checkCallArity already ran). The owning family's
+    // `owned item: T` mutators (Add/Push/Enqueue/Insert/AddFirst/…) carry
+    // a §22.3 `owned` modifier at the call site and are skipped per that
+    // section (their nullability is governed by §22.3, not §7); the
+    // owning-family `Contains`/`IndexOf`/`Find`/`Take`/etc. take a PLAIN
+    // borrow `item: T`/`query: T` and ARE covered. Null-conditional calls
+    // (`coll?.IndexOf(n)`) have a NullCondMemberExpr callee (not a
+    // MemberAccessExpr) and are not reached — filed separately.
+    void checkBuiltinCollectionCallArgs(const ast::CallExpr& ce);
+
+    // §7 / stdlib §3.3 (#2581): the ReadOnlyStringSpan twin of #2315. A builtin
+    // ReadOnlyStringSpan instance method (IndexOf/Contains/StartsWith/EndsWith/
+    // SequenceEqual, stdlib §3.3) declares NON-nullable `string`/`char` operands
+    // but has no MethodSymbol (it is synthetically typed in the CallExpr block
+    // at L6419), so checkCallArity → checkArgsAgainstParams → checkAssignable
+    // never fired. #2315's gate keys on a Primitive-String VALUE receiver
+    // exprType, which excludes the Named ReadOnlyStringSpan receiver, so the
+    // span path was left open and an un-narrowed `string?`/`char?` was silently
+    // accepted. This helper mirrors the user-method path against the §3.3-declared
+    // non-nullable char/string kinds; the ReadOnlyStringSpan-Named operand
+    // overload is not a primitive slot and is not covered here.
+    void checkBuiltinSpanCallArgs(const ast::CallExpr& ce);
 
     // §2.5 / §22.7 (issue #328 FINDING [7] B): check `new ImportedT(args)`
     // against an imported type's reconstructed constructor signatures (no

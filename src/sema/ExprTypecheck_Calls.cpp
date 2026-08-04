@@ -9,6 +9,91 @@
 
 namespace bezel::sema {
 
+namespace {
+
+// fix #2513 / spec §35.2 (v0.236): a short, allocation-free TypeRef -> string
+// for the `Result` combinator diagnostics. The full typeRefToString lives in
+// support/, but pulling it in would entangle the TU; for these messages a
+// `head[args]` rendering matches what the user wrote, and an "unresolved" /
+// "fn ..." fallback is enough for everything else the diagnostic encounters.
+const char* primitiveSpellingForDiag(PrimitiveType p) {
+    using P = PrimitiveType;
+    switch (p) {
+        case P::Bool:    return "bool";
+        case P::Char:    return "char";
+        case P::String:  return "string";
+        case P::Byte:    return "byte";
+        case P::SByte:   return "sbyte";
+        case P::Short:   return "short";
+        case P::UShort:  return "ushort";
+        case P::Int:     return "int";
+        case P::UInt:    return "uint";
+        case P::Long:    return "long";
+        case P::ULong:   return "ulong";
+        case P::Float:   return "float";
+        case P::Double:  return "double";
+        case P::Decimal: return "decimal";
+        case P::Object:  return "Object";
+        case P::None:    return "<none>";
+    }
+    return "<unknown>";
+}
+
+std::string typeNameForDiag(const TypeRef* t) {
+    if (!t) return "<unresolved>";
+    std::string s;
+    if (t->nullable) s += "?";
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive:
+            s += primitiveSpellingForDiag(t->primitive);
+            break;
+        case TypeRef::Kind::Function:
+            s += "(fn ...)";
+            break;
+        case TypeRef::Kind::InlineArray:
+            s += "[N";
+            if (t->arrayOwned) s += " owned";
+            s += "]";
+            if (t->arrayElement) s += typeNameForDiag(t->arrayElement);
+            break;
+        case TypeRef::Kind::Unit:
+            s += "()";
+            break;
+        case TypeRef::Kind::Named: {
+            std::string_view nm;
+            if (t->declaration && !t->declaration->decl)
+                nm = t->declaration->name;
+            else if (!t->declaration && t->astNode && t->astNode->name &&
+                     !t->astNode->name->parts.empty())
+                nm = t->headName();
+            else if (t->declaration)
+                nm = t->declaration->name;
+            s.append(nm.data(), nm.size());
+            if (!t->genericArgs.empty()) {
+                s += "<";
+                for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                    if (i) s += ", ";
+                    s += typeNameForDiag(t->genericArgs[i]);
+                }
+                s += ">";
+            }
+            break;
+        }
+    }
+    return s;
+}
+
+const char* classificationName(common::ChoiceClassification c) {
+    switch (c) {
+        case common::ChoiceClassification::ValueLike:     return "value-like";
+        case common::ChoiceClassification::BorrowBearing: return "borrow-bearing";
+        case common::ChoiceClassification::Owning:        return "owning";
+    }
+    return "unknown";
+}
+
+}  // namespace
+
 // This translation unit holds the call-resolution and member-access
 // definitions of the ExprTC worker: CallExpr return-type / arity checking
 // (typeCall and friends) and the `.` / `?.` member-access resolvers.
@@ -536,13 +621,15 @@ std::string methodSignatureString(std::string_view name,
     return s;
 }
 
-// §22.4 / #1303: true when `t` still references one of the method's own type
-// parameters — a bare `T` (or `T?`) or a `T` nested inside a constructed
-// generic's arguments (`Pair<T, U>`) — i.e. the generic out-parameter's
-// declared type was NOT fully substituted at the call site. Used to guard the
-// inline `out var x` re-type so a partially-substituted out param (a type
-// parameter left unbound by inference) is left untouched rather than
-// installing a half-resolved type. Mirrors substituteReturnType's bare-method-
+// §22.4 / §14.5 / #1303 / #2280: true when `t` still references one of the
+// method's own type parameters — a bare `T` (or `T?`), a `T` nested inside a
+// constructed generic's arguments (`Pair<T, U>`), or an inline-array element
+// (`[4]T`) — i.e. the generic parameter's declared type was NOT fully
+// substituted at the call site. Used to guard the inline `out var x` re-type so
+// a partially-substituted out param (a type parameter left unbound by inference)
+// is left untouched rather than installing a half-resolved type. Also gates the
+// §14.5 ref/out exact-unification check, so its inline-array element slot must
+// be inspected. Mirrors substituteReturnType's bare-method-
 // type-parameter detection (astNode / importedName single-part head).
 bool containsMethodTypeParam(
     const TypeRef* t,
@@ -554,13 +641,12 @@ bool containsMethodTypeParam(
     }
     for (auto* ga : t->genericArgs)
         if (containsMethodTypeParam(ga, gpNames)) return true;
-    return false;
+    return containsMethodTypeParam(t->arrayElement, gpNames);
 }
 
 // §22.3 / §14.5 (#2266): true when `t` mentions one of `tpNames` ANYWHERE in its
-// structure. Same question containsMethodTypeParam asks, but it walks EVERY
-// nested type slot — the inline-array element (`[4]T`) and a function type's
-// parameter/return slots (`(T) -> int`) as well as genericArgs (`Pair<T, U>`).
+// structure. It additionally walks function parameter/return slots beyond
+// containsMethodTypeParam's generic arguments and inline-array element.
 //
 // It gates a SKIP of a rejection: checkArgsAgainstParams' §22.3 ref/out
 // exact-type check defers every parameter this returns true for to §14.5's
@@ -570,8 +656,9 @@ bool containsMethodTypeParam(
 // `[4]int` argument. That is precisely how #1756's earlier narrow guards
 // (containsBareTypeParam, containsUnresolvedTypeParam — both recursing
 // genericArgs only) regressed the accepted generic ref/out calls and got
-// reverted. containsMethodTypeParam itself is left alone: it gates the §22.4
-// out-var re-type and §14.5's own domain test, whose contracts are unchanged.
+// reverted. containsMethodTypeParam is narrower because its callers only need
+// generic arguments and inline-array elements; this superset also covers
+// function slots for the §22.3 deferral gate.
 bool refOutParamTypeMentionsTypeParam(
     const TypeRef* t,
     const std::unordered_set<std::string_view>& tpNames) {
@@ -1263,6 +1350,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 ce.args.size() == 2) {
                 requireIntLike(0, "first argument");
                 requireIntLike(1, "(int) count");
+            }
+            // §7 / stdlib §9.6 (#2581): string.Compare(a: string, b: string)
+            // (and its 3-arg `ignoreCase` overload) declare NON-nullable a/b.
+            // The callee target is the type name `string`, which carries no
+            // Primitive-String VALUE exprType, so checkBuiltinStringCallArgs
+            // (keyed on the instance-receiver VALUE) does not reach it — an
+            // un-narrowed `string?` argument was silently accepted. Run the §7
+            // assignability check against the declared non-nullable `string`
+            // (IsNullOrEmpty/IsNullOrWhiteSpace take `string?` and stay admissible;
+            // they are not `Compare` and are excluded by the method-name gate).
+            if (recvPt == PrimitiveType::String && mm == "Compare" &&
+                ce.args.size() >= 2) {
+                for (std::size_t ai : {std::size_t{0}, std::size_t{1}}) {
+                    if (ai >= ce.args.size() || !ce.args[ai].value) continue;
+                    const auto& a = ce.args[ai];
+                    if (!a.modifier.empty()) continue;  // §22.3 alias — skip
+                    TypeRef* argTy = ctx_.exprType(*a.value);
+                    if (!argTy) continue;  // untyped/error arg — its own diagnostic
+                    TypeRef* paramTy = ctx_.primitiveTypeRef(
+                        PrimitiveType::String, /*nullable=*/false);
+                    checkAssignable(
+                        argTy, paramTy, a.value->span.begin,
+                        "argument to `string.Compare`",
+                        a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
+                }
             }
             // §9.5: char classification / transform statics take a `char`.
             if (recvPt == PrimitiveType::Char &&
@@ -7408,6 +7520,234 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::Int));
                         // EndObject / EndArray / SkipValue / Dispose → unit.
                     }
+
+                    // fix #2513 / spec §35.2 (v0.236): the four stdlib `Result<T,E>`
+                    // compiler-provided per-instantiation combinators (Map /
+                    // MapError / AndThen / UnwrapOr) have no MethodSymbol — they
+                    // are compiler-provided, and sema must type them with the
+                    // result-instantiation shape so codegen's dedicated lowering
+                    // (LlvmBackend_Calls.cpp::tryLowerResultCombinatorCall) can
+                    // build the result's choice struct. The combinators are only
+                    // admissible where the receiver AND result instantiation are
+                    // both value-like (§35.4 rule 3); non-value-like uses are
+                    // rejected here with a §3.6-derived-type-properties rule-2
+                    // diagnostic naming the classification, the deciding payload,
+                    // and the owning-match remedy (§35.5).
+                    if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
+                            recvTy->declaration &&
+                            recvTy->declaration->kind ==
+                                ast::TypeDeclKind::Choice &&
+                            recvTy->declaration->name == "Result" &&
+                            recvTy->genericArgs.size() == 2 &&
+                            (m == "Map" || m == "MapError" ||
+                             m == "AndThen" || m == "UnwrapOr")) {
+                        // §22.5: all four take exactly one argument. Sema's
+                        // generic-arity gate fires below; this is the
+                        // combinator-specific rejection.
+                        if (ce.args.size() != 1 || !ce.args[0].value) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`Result.") +
+                                std::string(m) +
+                                "` takes exactly one function argument (§35.2)");
+                            return;
+                        }
+                        TypeRef* tArg = recvTy->genericArgs[0];
+                        TypeRef* eArg = recvTy->genericArgs[1];
+                        const TypeRef* fnTy =
+                            m == "UnwrapOr" ? nullptr
+                                             : ctx_.exprType(*ce.args[0].value);
+                        // Per spec §14.5 phase 2, U/F infer from the function
+                        // argument's resolved Function TypeRef's funcReturn.
+                        // A lambda must have been typecheck'd to expose its
+                        // return type; a non-function argument is a type
+                        // error for the three function-typed combinators.
+                        // `UnwrapOr` takes a plain T fallback (eagerly
+                        // evaluated), NOT a function (§35.2 "no lazy
+                        // UnwrapOrElse"), so its argument is type-checked
+                        // against T below.
+                        TypeRef* resultTy = nullptr;
+                        std::string why;
+                        if (m != "UnwrapOr" &&
+                            (!fnTy || fnTy->kind != TypeRef::Kind::Function ||
+                             !fnTy->funcReturn)) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`Result.") + std::string(m) +
+                                "` requires a function-typed argument (§35.2)");
+                            return;
+                        } else if (m == "UnwrapOr") {
+                            // §35.2: UnwrapOr(fallback: T): T — fallback is
+                            // an ordinary, eagerly evaluated T. Validate it
+                            // against the receiver's T below.
+                            resultTy = const_cast<TypeRef*>(tArg);
+                            why = std::string("the receiver's T=") +
+                                  typeNameForDiag(tArg);
+                        } else if (m == "Map" || m == "AndThen") {
+                            TypeRef* uArg = fnTy->funcReturn;
+                            // For `AndThen(f)`, the spec requires f: (T) ->
+                            // Result<U, E>, so the lambda's funcReturn IS a
+                            // Result<...> — extract its first generic arg as
+                            // U. For `Map(f)` the spec is f: (T) -> U, so the
+                            // lambda's funcReturn IS U directly. We cannot
+                            // distinguish at type-system level (both produce
+                            // a TypeRef that sema treats uniformly) so we
+                            // probe: if fnTy->funcReturn is a Named Result
+                            // choice with two generic args, treat its first
+                            // arg as U; otherwise treat the funcReturn as U.
+                            if (m == "AndThen" &&
+                                uArg && uArg->kind == TypeRef::Kind::Named &&
+                                uArg->declaration &&
+                                uArg->declaration->kind ==
+                                    ast::TypeDeclKind::Choice &&
+                                uArg->declaration->name == "Result" &&
+                                uArg->genericArgs.size() == 2) {
+                                uArg = uArg->genericArgs[0];
+                            }
+                            // Result<U, E>
+                            resultTy = ctx_.makeTypeRef();
+                            resultTy->kind = TypeRef::Kind::Named;
+                            resultTy->nullable = false;
+                            resultTy->declaration = recvTy->declaration;
+                            resultTy->genericArgs.push_back(uArg);
+                            resultTy->genericArgs.push_back(eArg);
+                            why = std::string("`Result<") +
+                                  "U, E> with U=" +
+                                  typeNameForDiag(uArg) +
+                                  " and E=" + typeNameForDiag(eArg);
+                        } else if (m == "MapError") {
+                            TypeRef* fArg = fnTy->funcReturn;
+                            // Result<T, F>
+                            resultTy = ctx_.makeTypeRef();
+                            resultTy->kind = TypeRef::Kind::Named;
+                            resultTy->nullable = false;
+                            resultTy->declaration = recvTy->declaration;
+                            resultTy->genericArgs.push_back(tArg);
+                            resultTy->genericArgs.push_back(fArg);
+                            why = std::string("`Result<") +
+                                  "T, F> with T=" +
+                                  typeNameForDiag(tArg) +
+                                  " and F=" + typeNameForDiag(fArg);
+                        } else {  // UnwrapOr
+                            // UnwrapOr(fallback: T): T
+                            resultTy = const_cast<TypeRef*>(tArg);
+                            why = std::string("the receiver's T=") +
+                                  typeNameForDiag(tArg);
+                        }
+                        // §35.4 rule 3: receiver AND result must both be
+                        // value-like. The receiver is value-like iff the
+                        // Result<T, E> is itself value-like; the result is
+                        // value-like iff its `Result<...>` (Map/MapError/
+                        // AndThen) classifies value-like, or — for UnwrapOr
+                        // — T is a value type.
+                        auto recvVerdict =
+                            common::classifyChoiceType(recvTy, ctx_);
+                        if (!recvVerdict ||
+                            *recvVerdict !=
+                                common::ChoiceClassification::ValueLike) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("`Result.") + std::string(m) +
+                                "` is only admissible on a value-like "
+                                "receiver (§35.2 / §35.4 rule 3); the "
+                                "receiver instantiation `Result<" +
+                                typeNameForDiag(tArg) + ", " +
+                                typeNameForDiag(eArg) +
+                                ">` is " +
+                                (recvVerdict ? classificationName(*recvVerdict)
+                                             : std::string("not value-like")) +
+                                " — use an owning match (§35.5) for owning "
+                                "instantiations or borrow-bounded forms for "
+                                "borrow-bearing ones");
+                            return;
+                        }
+                        if (m != "UnwrapOr") {
+                            auto resVerdict =
+                                common::classifyChoiceType(resultTy, ctx_);
+                            if (!resVerdict ||
+                                *resVerdict !=
+                                    common::ChoiceClassification::ValueLike) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string("`Result.") +
+                                    std::string(m) +
+                                    "` is only admissible when its result "
+                                    "instantiation is value-like (§35.2 / "
+                                    "§35.4 rule 3); " + why +
+                                    " is " +
+                                    (resVerdict
+                                         ? classificationName(*resVerdict)
+                                         : std::string("not value-like")) +
+                                    " — the inference would mint " +
+                                    "a borrow-bearing or owning Result; use "
+                                    "an owning match (§35.5) instead");
+                                return;
+                            }
+                        } else if (m == "UnwrapOr") {
+                            // UnwrapOr is only admissible on a value-like
+                            // T (the receiver's first payload); owning T
+                            // cannot be copied into a fallback slot.
+                            auto tVerdict =
+                                common::classifyChoiceType(tArg, ctx_);
+                            // For a choice T, classify via the verdict; for
+                            // other payload kinds fall through as value-like
+                            // (primitives, records, strings, runtime-managed
+                            // types — all are copyable per §35.4 rule 3
+                            // payload kinds).
+                            bool tOk = true;
+                            if (tVerdict && *tVerdict !=
+                                    common::ChoiceClassification::ValueLike) {
+                                tOk = false;
+                            }
+                            // A class/interface T is also rejected: a
+                            // reference-typed T cannot be passed by value to
+                            // a fallback slot.
+                            if (tArg->kind == TypeRef::Kind::Named &&
+                                tArg->declaration &&
+                                (tArg->declaration->kind ==
+                                    ast::TypeDeclKind::Class ||
+                                 tArg->declaration->kind ==
+                                    ast::TypeDeclKind::Interface)) {
+                                tOk = false;
+                            }
+                            // An owning inline-array T is rejected per
+                            // §15.3 (move-only).
+                            if (tArg->kind == TypeRef::Kind::InlineArray &&
+                                tArg->arrayOwned) {
+                                tOk = false;
+                            }
+                            if (!tOk) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "`Result.UnwrapOr` requires a value-like "
+                                    "T payload (§35.2 / §35.4 rule 3); the "
+                                    "receiver's T=" + typeNameForDiag(tArg) +
+                                    " is move-only / borrow-bearing — use an "
+                                    "owning match (§35.5) for owning "
+                                    "instantiations");
+                                return;
+                            }
+                            // §35.2: the fallback's static type must match
+                            // the receiver's T (both are T values; the
+                            // §5.1 implicit-conversion table handles ordinary
+                            // widening / the T-equals-T identity case). A
+                            // mismatched fallback is a different error than
+                            // the value-like gate above — diagnose it as a
+                            // type mismatch rather than a §35.4 gate.
+                            const TypeRef* fbTy =
+                                ctx_.exprType(*ce.args[0].value);
+                            if (fbTy && !typeRefEqual(fbTy, tArg)) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "`Result.UnwrapOr` fallback must match "
+                                    "the receiver's T (§22.6); got `" +
+                                    typeNameForDiag(fbTy) + "`, expected `" +
+                                    typeNameForDiag(tArg) + "`");
+                                return;
+                            }
+                        }
+                        ctx_.setExprType(&ce, resultTy);
+                    }
                 }
 
                 // §30.14 (#600): Domain.Spawn — static class, colName == "Domain".
@@ -7742,8 +8082,36 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // set the minimum; the total is the maximum (no variadics in
     // Bezel — §22.5).
     if (auto* ms = dynamic_cast<MethodSymbol*>(calleeSym)) {
+        // fix #2328 (§26.5, v0.236): the per-arg type / arity check used
+        // to bail for extension methods (`if (!md || !ms->parent) return;`).
+        // The arity check is now run by the arity-aware extension lookup
+        // in `resolveMemberAccess` (which sees `currentCallArity_`); the
+        // per-arg type check is run below by the new extension branch in
+        // `checkCallArity` itself. So this call site is unchanged.
         checkCallArity(ce, ms);
     }
+
+    // §7 / stdlib §9.6 (#2315): a primitive `string` instance-method call
+    // has no MethodSymbol (so checkCallArity above never ran), yet stdlib §9.6
+    // declares its parameters non-nullable. Run the same per-argument
+    // assignability check the user-method path runs so an un-narrowed
+    // `string?` argument is rejected instead of silently accepted.
+    checkBuiltinStringCallArgs(ce);
+
+    // §7 / stdlib §4.x (#2582): the collection twin of #2315 — a builtin
+    // collection instance method has no MethodSymbol either, so the same
+    // per-argument assignability hole let an un-narrowed `int?` (or `T?`)
+    // `item`/`query`/`key` argument reach codegen and ICE it (LLVM ICmpInst
+    // assertion, exit 134). Run the §7 check against the instantiated
+    // element/key type so the builtin path agrees with the user-method path.
+    checkBuiltinCollectionCallArgs(ce);
+
+    // §7 / stdlib §3.3 (#2581): the ReadOnlyStringSpan twin — a builtin
+    // ReadOnlyStringSpan instance method has no MethodSymbol either (it is
+    // synthetically typed at L6419), and #2315's gate keys on a Primitive-String
+    // VALUE receiver, so the Named ReadOnlyStringSpan receiver fell through.
+    // Run the §7 check against the §3.3-declared non-nullable char/string kinds.
+    checkBuiltinSpanCallArgs(ce);
 
     // §7.5 / FINDING [3] ADDENDUM: a null-conditional call `x?.M(args)` is
     // ALWAYS nullable — it returns null when the receiver is null. The callee is
@@ -7907,6 +8275,32 @@ void ExprTC::checkCallArity(const ast::CallExpr& ce, MethodSymbol* ms) {
         checkImportedCallArity(ce, ms);
         return;
     }
+    // fix #2328 (§26.5, v0.236): extension methods have a null `ms->parent`
+    // (their owner is the ExtensionSymbol, not a class TypeSymbol), so the
+    // hierarchy walk below does not apply. Treat the extension's MethodSymbol
+    // itself as the sole candidate and run the ordinary per-argument check
+    // against its parameter list. The CALL-SITE ARITY was already filtered
+    // by the arity-aware `lookupExtensionMember` call from resolveMemberAccess
+    // (which sees `currentCallArity_` for the enclosing CallExpr), so a
+    // mismatch between the call's args and the chosen method's arity never
+    // reaches this branch — `checkArgsAgainstParams` is the per-argument
+    // §5.1 / §22.3 type gate, the same gate a class method's call gets.
+    // `classTarget` / `classParent` stay null: `substituteMemberType` short-
+    // circuits when `classParent` is null, so the receiver-class generic
+    // substitution that a class method's call runs (§14.1 / #1756) is
+    // unnecessary here — extension methods cannot reference a receiver
+    // class's own type parameters (extensions don't see them, §26.4).
+    if (md && ms->extensionDecl) {
+        const ast::Expr* recvTarget = nullptr;
+        if (auto* ma =
+                dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get()))
+            recvTarget = ma->target.get();
+        checkArgsAgainstParams(
+            md->params, ce.args, ce.span.begin,
+            std::string("call to `") + std::string(ms->name) + "`",
+            recvTarget, /*classParent=*/nullptr, md);
+        return;
+    }
     if (!md || !ms->parent) return;
     // §22.3 (#1756): pass the call's receiver as classTarget (and ms->parent as
     // classParent) so checkArgsAgainstParams's ref/out exact-type check can run
@@ -8052,6 +8446,499 @@ ExprTC::BindResult ExprTC::bindArgsToParams(
 
     res.ok = true;
     return res;
+}
+
+// §7 / stdlib §9.6 (#2315): see the header comment for the full rationale.
+// A primitive `string` instance-method call has no MethodSymbol, so the
+// ordinary per-argument assignability check (checkCallArity →
+// checkArgsAgainstParams → checkAssignable) never fires. This helper mirrors
+// that path against the stdlib-§9.6-declared parameter types, so an
+// un-narrowed `string?` (or `char?`) argument is rejected exactly as a user
+// `method Take(x: string)` rejects it, while a NARROWED nullable (after a
+// null-check) and a plain non-nullable argument still compile (the §7.4
+// narrowing exception lives inside checkAssignable, which this reuses).
+//
+// The stdlib §9.6 surface encodes, per method-name and zero-based parameter
+// position, the declared parameter's NON-nullable primitive kind — choosing
+// the matching overload for char|string-overloaded methods (IndexOf/
+// Contains/LastIndexOf/Replace/Split) by inspecting the argument's own kind.
+// `Equals(other: string?)` deliberately declares a NULLABLE parameter (§11.2
+// parameter-nullability widening) and is therefore omitted entirely, so a
+// `string?` argument to it continues to compile. Only INSTANCE calls are
+// covered: the callee target must carry a Primitive-String exprType (a value
+// of type `string`), which excludes static calls like `string.Compare(a, b)`
+// (target is the type name, no value exprType). The static `IsNullOrEmpty`/
+// `IsNullOrWhiteSpace` take `string?` anyway, so excluding statics does not
+// leave a nullable hole.
+// #2581: a builtin instance-call callee is EITHER a MemberAccessExpr
+// (`recv.M(..)`) OR a NullCondMemberExpr (`recv?.M(..)`); the two are separate
+// Expr kinds but share identical `target`/`member` fields. The null-conditional
+// form (`s?.IndexOf(unNarrowedString?)`) is the same §7 hole on a separate path
+// that a `dynamic_cast<MemberAccessExpr*>`-only gate misses. Returns the
+// (target, member) pair, or (nullptr, {}) when the callee is neither kind.
+static std::pair<const ast::Expr*, std::string_view>
+builtinInstanceCallee(const ast::Expr* callee) {
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        return {ma->target.get(), ma->member};
+    if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(callee))
+        return {ncm->target.get(), ncm->member};
+    return {nullptr, {}};
+}
+
+void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
+    auto [tgt, m] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt) return;
+    TypeRef* recvTy = ctx_.exprType(*tgt);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Primitive ||
+        recvTy->primitive != PrimitiveType::String)
+        return;  // not a primitive `string` instance call (incl. `?.`)
+    // `Equals` declares `other: string?` (§11.2 widening) — admissible; skip.
+    if (m == "Equals") return;
+    // Map (method, position, argPrimitiveKind) → the declared NON-nullable
+    // parameter primitive kind to check against, or None when this position
+    // is not a primitive-string/char/int/bool slot this helper covers (e.g.
+    // Split's `Array<char>` form, Trim's `IEnumerable<char>` — those are
+    // Named-typed and not part of the nullable-primitive hole; they are left
+    // to their existing handling). For char|string-overloaded first params,
+    // pick the overload matching the argument's own kind.
+    auto paramKind = [&](std::size_t pos, PrimitiveType argKind)
+            -> PrimitiveType {
+        using PT = PrimitiveType;
+        // First-position char-or-string overload set (§9.6).
+        if (pos == 0 && (m == "Contains" || m == "IndexOf" ||
+                         m == "LastIndexOf" || m == "Replace" || m == "Split")) {
+            if (argKind == PT::String) return PT::String;
+            if (argKind == PT::Char)  return PT::Char;
+            return PT::None;  // Array<char>/span/other — not covered here
+        }
+        // Replace's second param is char-or-string too (matches the first).
+        if (pos == 1 && m == "Replace") {
+            if (argKind == PT::String) return PT::String;
+            if (argKind == PT::Char)  return PT::Char;
+            return PT::None;
+        }
+        // Single-kind string params.
+        if ((pos == 0 && (m == "StartsWith" || m == "EndsWith" ||
+                          m == "CompareTo")) ||
+            (pos == 1 && m == "Insert")) {
+            return PT::String;
+        }
+        // Integer params (startIndex / count / totalWidth / length) per §9.6.
+        // IndexOf declares `startIndex: int` as the SECOND param of its 2-arg
+        // overload (pos 0 is the char|string search value, handled above);
+        // LastIndexOf has no integer parameter at all (only char/string).
+        // Insert(startIndex: int, value: string) (#2581) has its int at pos 0.
+        bool intPos =
+            (pos == 0 && (m == "Substring" || m == "Remove" || m == "Insert" ||
+                          m == "PadLeft" || m == "PadRight" ||
+                          m == "PadCenter")) ||
+            (pos == 1 && (m == "Substring" || m == "Remove" ||
+                          m == "IndexOf"));
+        if (intPos) return PT::Int;
+        // PadLeft/Right/Center paddingChar (second param) is char.
+        if (pos == 1 && (m == "PadLeft" || m == "PadRight" || m == "PadCenter"))
+            return PT::Char;
+        return PT::None;
+    };
+    for (std::size_t i = 0; i < ce.args.size(); ++i) {
+        const auto& a = ce.args[i];
+        if (!a.value || a.isDiscard) continue;
+        // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
+        // the caller slot under its own rule and is not a §7 nullable->non-
+        // nullable conversion; skip (string methods take plain value params
+        // anyway, so this is defensive).
+        if (!a.modifier.empty()) continue;
+        TypeRef* argTy = ctx_.exprType(*a.value);
+        if (!argTy || argTy->kind != TypeRef::Kind::Primitive) continue;
+        PrimitiveType declared = paramKind(i, argTy->primitive);
+        if (declared == PrimitiveType::None) continue;
+        TypeRef* paramTy = ctx_.primitiveTypeRef(declared, /*nullable=*/false);
+        checkAssignable(
+            argTy, paramTy, a.value->span.begin,
+            std::string("argument to `string.") + std::string(m) + "`",
+            a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
+    }
+}
+
+// §7 / stdlib §4.x (#2582) + §4.14/§4.15 (#2600) + §6.4 (#2602) + §6.6
+// (#2604): see the header comment for the full rationale. The collection twin
+// of #2315's
+// checkBuiltinStringCallArgs. A builtin collection instance method (Array<
+// T>.IndexOf/Contains/…, Set<T>/SortedSet<T>.Add/TryAdd/Contains/Remove,
+// Stack<T>/Queue<T>.Push/Enqueue/Contains, LinkedList<T>.AddFirst/AddLast/
+// AddBefore/AddAfter/Find/Contains/Remove, Dictionary<K,V>/SortedDictionary<
+// K,V>.ContainsKey/Contains/Remove, OwningDictionary<K,V>.PopValue/
+// TryPopValue, OwningSet<T>.Take/TryTake), the span-buffer family (#2600:
+// ArraySpan<T>/ReadOnlyArraySpan<T>.IndexOf/Contains/Fill, value-T Span<T>/
+// ReadOnlySpan<T>.IndexOf/Contains/Fill), the atomic family (#2602:
+// Atomic<T>.Exchange/CompareExchange, AtomicInteger<T>.Exchange/
+// CompareExchange/Add), and the task-completion-source family (#2604:
+// TaskCompletionSource<T>.SetResult/TrySetResult — the Owning twin's `owned
+// result: T` is excluded per §22.3), has no MethodSymbol — these are synthetic Named
+// TypeRefs with no user TypeSymbol — so checkCallArity → checkArgsAgainstParams
+// → checkAssignable never fires. An un-narrowed `int?` (or `T?`) argument was
+// silently accepted and reached codegen, where the equality-compare lowering
+// tripped an LLVM ICmpInst assertion (operand-type mismatch, exit 134) — or,
+// for the atomic family (#2602), the atomic-exchange lowering emitted a call
+// with a mismatched parameter type (`{ i8, i32 }` passed where `i64` is
+// expected) and failed LLVM `verifyModule`. This helper mirrors the user-
+// method path against the instantiated element/key type, so an un-narrowed
+// `T?` is rejected exactly as a user `method Take(x: int)` rejects it, while
+// a NARROWED nullable (after a null-check) and a plain non-nullable argument
+// still compile (the §7.4 narrowing exception lives inside checkAssignable,
+// which this reuses).
+//
+// The element/key type is `recvTy->genericArgs[0]` for every covered family —
+// element-typed collections (Array<T>/Set<T>/Stack<T>/…) instantiate T at
+// genericArgs[0], the keyed collections (Dictionary<K,V>/OwningDictionary<
+// K,V>/SortedDictionary<K,V>) instantiate K at genericArgs[0], the span-buffer
+// family (ArraySpan<T>/ReadOnlyArraySpan<T>/Span<T>/ReadOnlySpan<T>)
+// instantiates its element T at genericArgs[0], the atomic family
+// (Atomic<T>/AtomicInteger<T>) instantiates its operand T at genericArgs[0],
+// and TaskCompletionSource<T> (#2604) instantiates its result T there too.
+// The parameter's OWN nullability is the instantiated type's nullability —
+// `Array<int?>` has `IndexOf(item: int?)`, so an `int?` argument is
+// admissible; `Array<int>` has `IndexOf(item: int)`, so an un-narrowed
+// `int?` is rejected. EXCEPTION (#2600): class-T `Span<T>`/`ReadOnlySpan<T>`
+// declare `IndexOf(value: T?)` / `Contains(value: T?)` — NULLABLE (stdlib
+// §4.14 line 2463/2611) — so the helper's spanBufferSkipClassT branch
+// suppresses the check for that case (an un-narrowed `T?` is admissible);
+// ArraySpan<T>/ReadOnlyArraySpan<T> keep `value: T` for class T too (§4.15
+// line 2881 — Array<T> slots do not wrap class T in T?), so they are covered
+// unconditionally. The atomic family needs NO class-T split: Atomic<T> is
+// compiler-restricted to cell-sized primitive VALUE types (§6.4 — bool/char/
+// byte/sbyte/short/ushort/int/uint/long/ulong/IntPtr/UIntPtr; AtomicInteger<T>
+// to the integer subset), so the operand is ALWAYS a non-nullable value T and
+// the param is `value: T` / `expected: T` / `replacement: T` / `delta: T`
+// (non-nullable). The borrowing mutators (Add/Push/Enqueue/Insert/AddFirst/
+// AddLast/AddBefore/AddAfter/TryAdd) are gated to the borrowing collection
+// names because their owning twins take `owned item: T` (the call-site
+// `owned` modifier aliases under §22.3 and is skipped by the modifier guard
+// below, but the name gate keeps the diagnostic precise when a caller
+// forgets the marker).
+void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
+    if (!ma || !ma->target) return;
+    TypeRef* recvTy = ctx_.exprType(*ma->target);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||
+        recvTy->declaration)  // user types have a MethodSymbol → checkCallArity ran
+        return;
+    // Recognize the builtin collection families by their synthetic head name
+    // (mirrors the `colName` lambda at L3267: aliasResolvedHead wins; else
+    // astNode's headName). A user type aliasing to a builtin collection
+    // (type OA := OwningArray<R>) carries aliasResolvedHead and is covered.
+    std::string_view colName;
+    if (!recvTy->aliasResolvedHead.empty())
+        colName = recvTy->aliasResolvedHead;
+    else if (recvTy->astNode && recvTy->astNode->name &&
+             !recvTy->astNode->name->parts.empty())
+        colName = recvTy->headName();
+    if (colName.empty()) return;
+    bool isElementCollection =
+        colName == "Array" || colName == "OwningArray" ||
+        colName == "Set" || colName == "OwningSet" ||
+        colName == "SortedSet" ||
+        colName == "Stack" || colName == "OwningStack" ||
+        colName == "Queue" || colName == "OwningQueue" ||
+        colName == "LinkedList" || colName == "OwningLinkedList";
+    bool isKeyedCollection =
+        colName == "Dictionary" || colName == "OwningDictionary" ||
+        colName == "SortedDictionary";
+    // §7 / stdlib §4.14/§4.15 (#2600): the span-BUFFER family — ArraySpan<T>/
+    // ReadOnlyArraySpan<T> (borrowing, §4.15) and Span<T>/ReadOnlySpan<T>
+    // (owning, §4.14) — is synthetically typed in the CallExpr handler (L6575)
+    // with the same no-MethodSymbol shape as the element collections above, so
+    // its IndexOf/Contains/Fill `value: T` parameter skipped this check and an
+    // un-narrowed `T?` reached codegen and ICE'd (LLVM ICmpInst assertion,
+    // exit 134 — same #2582 failure mode).
+    bool isSpanBuffer =
+        colName == "ArraySpan" || colName == "ReadOnlyArraySpan" ||
+        colName == "Span"      || colName == "ReadOnlySpan";
+    // §7 / stdlib §6.4 (#2602): the atomic family — Atomic<T> and
+    // AtomicInteger<T> — is synthetically typed in the CallExpr handler (L7367)
+    // with the same no-MethodSymbol shape as the families above, so its
+    // Exchange/CompareExchange/Add `value: T` / `expected: T` / `replacement:
+    // T` / `delta: T` parameters skipped this check and an un-narrowed `T?`
+    // reached codegen, where the atomic-exchange lowering emitted a call with
+    // a mismatched parameter type and failed LLVM `verifyModule` (same #2582
+    // hazard class, different lowering). Atomic<T> is compiler-restricted to
+    // cell-sized primitive VALUE types (§6.4), so the operand is ALWAYS a
+    // non-nullable value T — no class-T nullable-param split is needed (unlike
+    // the span-buffer family's spanBufferSkipClassT branch).
+    bool isAtomic = colName == "Atomic" || colName == "AtomicInteger";
+    // §7 / stdlib §6.6 (#2604): the task-completion-source family. stdlib §6.6
+    // declares `TaskCompletionSource<T>.SetResult(result: T)` and
+    // `TrySetResult(result: T): bool` with a NON-nullable `result: T`, and the
+    // CallExpr handler types them synthetically at L7288 — it sets only the
+    // RESULT type (bool for TrySet*, unit for Set*) and runs no per-argument
+    // check — so this is the same no-MethodSymbol §7 hole as #2582/#2600/#2602
+    // on a family none of the name lists above covered. Unlike those, an
+    // un-narrowed `T?` here does NOT ICE codegen (the SetResult lowering
+    // tolerates the nullable `{ i8, i32 }` representation): it is a SILENT
+    // accept, storing an un-narrowed nullable as the task's non-nullable `T`
+    // result. `OwningTaskCompletionSource<T>` is deliberately EXCLUDED — its
+    // `SetResult(owned result: T)` / `TrySetResult(owned result: T)` carry the
+    // §22.3 `owned` modifier, the same exclusion the owning collections'
+    // `Add(owned item: T)` gets. `SetException`/`TrySetException` take
+    // `owned exception: Exception` on every form (§6.6) and are likewise out
+    // of scope; `SetCancelled`/`TrySetCancelled`/`Dispose` take no arguments.
+    // The non-generic `TaskCompletionSource` (§6.6, void completion) has no
+    // genericArgs and is filtered by the emptiness guard below — its
+    // `SetResult()` takes no argument anyway.
+    bool isTaskSource = colName == "TaskCompletionSource";
+    if (!isElementCollection && !isKeyedCollection && !isSpanBuffer &&
+        !isAtomic && !isTaskSource)
+        return;
+    if (recvTy->genericArgs.empty() || !recvTy->genericArgs[0]) return;
+    TypeRef* itemTy = recvTy->genericArgs[0];  // T (element) or K (key)
+    const auto& m = ma->member;
+
+    // §4.14 vs §4.15 parameter-nullability split for the span-buffer family.
+    // ArraySpan<T>/ReadOnlyArraySpan<T> declare `value: T` for EVERY T (Array<T>
+    // slots do not wrap class T in T? — stdlib §4.15 line 2881), so the param
+    // type is exactly `genericArgs[0]` and the check below is correct unconditionally.
+    // Span<T>/ReadOnlySpan<T> SPLIT by T's category: for VALUE T they declare
+    // `value: T` (non-nullable, §4.14 line 2522/2640 — check fires); for CLASS T
+    // they declare `value: T?` (NULLABLE, §4.14 line 2463/2611 — an un-narrowed
+    // `T?` is admissible, so the check must NOT fire). The class-T owning span
+    // also forbids Fill (the typeCall block at L6671 already rejects it). Mirror
+    // the typeCall block's elemIsClass computation (L6588-6602) to gate this.
+    bool spanBufferSkipClassT = false;
+    if (isSpanBuffer && (colName == "Span" || colName == "ReadOnlySpan")) {
+        const TypeRef* spEl = recvTy->genericArgs[0];
+        bool elemIsClass = false;
+        if (spEl && spEl->kind == TypeRef::Kind::Named) {
+            if (spEl->declaration &&
+                (spEl->declaration->kind == ast::TypeDeclKind::Class ||
+                 spEl->declaration->kind == ast::TypeDeclKind::Interface))
+                elemIsClass = true;
+            else if (!spEl->declaration && spEl->astNode && spEl->astNode->name &&
+                     !spEl->astNode->name->parts.empty()) {
+                auto en = spEl->headName();
+                if (en == "Shared" || en == "Weak")
+                    elemIsClass = true;
+            }
+        }
+        spanBufferSkipClassT = elemIsClass;
+    }
+
+    // Per (method, position): is this position a NON-nullable `item: T` /
+    // `query: T` / `key: K` parameter this helper covers? Borrows the SAME
+    // stdlib-§4.x surface the typeCall result-typing branch (L4337+) dispatches
+    // on; the only methods included here are those whose declared first or
+    // second parameter is the collection's element/key type. Integer index
+    // params (RemoveAt/PopAt/Insert's `index`), function-typed params
+    // (Sort's comparer, First(pred)), Range params (Slice/AsSpan), and
+    // `owned`/`out`-marked slots are excluded — they are not §7 nullable->
+    // non-nullable conversions.
+    auto isItemPosition = [&](std::size_t pos) -> bool {
+        // Position-0 item/query/key methods (all collection families).
+        if (pos == 0 && (
+            // Search/query — plain `item: T`/`query: T` borrow param.
+            m == "IndexOf" || m == "LastIndexOf" ||
+            m == "Contains" || m == "ContainsKey" ||
+            m == "Find" ||
+            // OwningSet — `Take(query: T): owned T` and
+            // `TryTake(query: T, out owned removed: T?): bool` borrow the
+            // query (the out slot is modifier-marked, skipped below). Gated
+            // to OwningSet: on every OTHER collection family `Take` is the
+            // LINQ `Take(count: int)` operator (stdlib §5), whose `int`
+            // parameter is NOT an item slot — checking it against T would
+            // reject the legitimate `arr.Take(2)`. Sema's existing Take
+            // resolution mirrors this split (L4363: OwningSet.Take is the
+            // item-query form; everywhere else LINQ Take wins).
+            ((m == "Take" || m == "TryTake") && colName == "OwningSet") ||
+            // Removal by item/key — `Remove(item: T): bool` /
+            // `Remove(key: K): bool`. (RemoveAt/RemoveNode are NOT here:
+            // RemoveAt takes int index, RemoveNode takes LinkedListNode<T>.)
+            m == "Remove" ||
+            // OwningDictionary keyed take.
+            m == "PopValue" || m == "TryPopValue"))
+            return true;
+        // Borrowing-only pos-0 mutators: plain `item: T`. The owning twins
+        // declare `owned item: T` and are gated out by name (the call-site
+        // `owned` modifier carries §22.3, not §7); the name gate also keeps
+        // the diagnostic precise if the caller forgets the marker.
+        // `Dictionary<K,V>.Add(key: K, value: V)` and `OwningDictionary<K,V>.
+        // Add(key: K, owned value: V)` declare a NON-nullable key at pos 0
+        // (the value at pos 1 is a separate type V — filed separately). The
+        // owning form's value arg carries the §22.3 `owned` modifier and is
+        // skipped by the modifier guard below.
+        if (pos == 0 && (
+            (m == "Add"    && (colName == "Set" || colName == "SortedSet" ||
+                               colName == "LinkedList" ||
+                               colName == "Dictionary" ||
+                               colName == "OwningDictionary")) ||
+            (m == "TryAdd" && (colName == "Set" || colName == "SortedSet")) ||
+            (m == "Push"      && colName == "Stack") ||
+            (m == "Enqueue"   && colName == "Queue") ||
+            (m == "AddFirst"  && colName == "LinkedList") ||
+            (m == "AddLast"   && colName == "LinkedList")))
+            return true;
+        // §7 / stdlib §4.14/§4.15 (#2600): span-buffer IndexOf/Contains declare
+        // NON-nullable `value: T` at pos 0 for every span-buffer family EXCEPT
+        // class-T Span/ReadOnlySpan (whose param is `value: T?` — handled by
+        // spanBufferSkipClassT below, which skips the entire arg loop body for
+        // that case). Fill is the additional value-T mutator the span-buffer
+        // family adds vs the element-collection set above; it is gated to the
+        // WRITABLE forms (ArraySpan/Span) because the read-only spans do not
+        // declare Fill (the typeCall block at L6664 already rejects Fill on a
+        // read-only span with its own diagnostic, so the check does not need to
+        // double-report). For class-T Span, Fill is already rejected by the
+        // typeCall block (L6671) and spanBufferSkipClassT skips the loop body.
+        if (isSpanBuffer && pos == 0 && (
+            m == "IndexOf" || m == "Contains" ||
+            (m == "Fill" && (colName == "ArraySpan" || colName == "Span"))))
+            return true;
+        // §7 / stdlib §6.4 (#2602): the atomic family's pos-0 value params.
+        // `Exchange(value: T)` is on BOTH Atomic<T> and AtomicInteger<T>;
+        // `CompareExchange(expected: T, replacement: T)` puts `expected` at
+        // pos 0 on both; `Add(delta: T)` is AtomicInteger-only (Atomic<T>
+        // does not declare it — the typeCall block at L7403 rejects an
+        // `Add` call on Atomic<T>). T is compiler-restricted to a cell-sized
+        // primitive VALUE type (§6.4), so the param is always non-nullable
+        // and no class-T split is needed (cf. spanBufferSkipClassT).
+        if (isAtomic && pos == 0 && (
+            m == "Exchange" || m == "CompareExchange" ||
+            (m == "Add" && colName == "AtomicInteger")))
+            return true;
+        // §7 / stdlib §6.6 (#2604): `TaskCompletionSource<T>.SetResult(result:
+        // T)` / `TrySetResult(result: T): bool` — the sole non-`owned` T-typed
+        // parameter on the family, at pos 0. The Owning twin's `owned result:
+        // T` is excluded by the isTaskSource name gate above (and would also
+        // be skipped by the modifier guard below); the exception setters take
+        // `owned exception: Exception`, not T.
+        if (isTaskSource && pos == 0 &&
+            (m == "SetResult" || m == "TrySetResult"))
+            return true;
+        // Position-1 item methods.
+        if (pos == 1 && (
+            // Array<T>.Insert(index: int, item: T) — stdlib §4.4.
+            (m == "Insert" && colName == "Array") ||
+            // LinkedList<T>.AddBefore/After(node, item: T) — stdlib §4.6.
+            ((m == "AddBefore" || m == "AddAfter") && colName == "LinkedList") ||
+            // §6.4 (#2602): Atomic/AtomicInteger CompareExchange's `replacement:
+            // T` sits at pos 1 (pos 0 `expected: T` covered above).
+            (isAtomic && m == "CompareExchange")))
+            return true;
+        return false;
+    };
+
+    for (std::size_t i = 0; i < ce.args.size(); ++i) {
+        const auto& a = ce.args[i];
+        if (!a.value || a.isDiscard) continue;
+        // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
+        // the caller slot under its own rule and is not a §7 nullable->non-
+        // nullable conversion; skip. This is what excludes the owning family's
+        // `Add(owned item: T)` / `Push(owned item: T)` / `Insert(index,
+        // owned item: T)` / etc. — the caller writes the `owned` marker, and
+        // the parameter's nullability is governed by the §22.3 transfer rule.
+        if (!a.modifier.empty()) continue;
+        if (!isItemPosition(i)) continue;
+        // §4.14 (#2600): class-T Span/ReadOnlySpan declare `value: T?`
+        // (nullable) for IndexOf/Contains — an un-narrowed `T?` argument is
+        // admissible, so skip the §7 check for that case (would false-reject).
+        if (spanBufferSkipClassT) continue;
+        TypeRef* argTy = ctx_.exprType(*a.value);
+        if (!argTy) continue;
+        checkAssignable(
+            argTy, itemTy, a.value->span.begin,
+            std::string("argument to `") + std::string(colName) + "<T>." +
+            std::string(m) + "`",
+            a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
+    }
+}
+
+// §7 / stdlib §3.3 (#2581, #2601): see the header comment for the full
+// rationale. The ReadOnlyStringSpan twin of #2315's checkBuiltinStringCallArgs.
+// A builtin ReadOnlyStringSpan instance method (IndexOf/Contains/StartsWith/
+// EndsWith/SequenceEqual, stdlib §3.3; plus Slice(start: int[, length: int]),
+// #2601) declares NON-nullable `string`/`char`/`int` operands but has no
+// MethodSymbol — it is synthetically typed in the CallExpr block at
+// L6419 — so checkCallArity → checkArgsAgainstParams → checkAssignable never
+// fired. An un-narrowed `string?`/`char?`/`int?` argument was silently accepted.
+// #2315's gate keys on a Primitive-String VALUE receiver exprType, which
+// excludes the Named ReadOnlyStringSpan receiver, so the span path was left
+// open. This helper mirrors the user-method path against the §3.3-declared
+// non-nullable char/string parameter kinds, so an un-narrowed `string?`/`char?`
+// is rejected exactly as a user `method Take(x: string)` rejects it, while a
+// NARROWED nullable (after a null-check) and a plain non-nullable argument
+// still compile (the §7.4 narrowing exception lives inside checkAssignable).
+//
+// The receiver is recognized by the SAME head-name resolution the L6419 block
+// uses (`builtinInstName`): a synthetic Named TypeRef (declaration == nullptr,
+// astNode set) or a builtin-class stub (declaration set, declaration->decl
+// nullptr) resolves to "ReadOnlyStringSpan"; a fully-resolved user/stdlib record
+// with a real decl resolves to {} and is left to the user-method path (it has a
+// MethodSymbol). §3.3: IndexOf/Contains have char|string overloads (pick by the
+// argument's own kind); StartsWith/EndsWith/SequenceEqual have a string overload
+// only (no char form, so a char arg to those is a clean reject at L6419, not an
+// invented overload). The ReadOnlyStringSpan-Named operand overload is a Named
+// (non-primitive) type and is not part of the nullable-primitive hole this
+// covers.
+void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
+    auto [tgt, m] = builtinInstanceCallee(ce.callee.get());
+    if (!tgt) return;
+    TypeRef* recvTy = ctx_.exprType(*tgt);
+    if (!recvTy || recvTy->kind != TypeRef::Kind::Named) return;
+    // Resolve the builtin head name the same way `builtinInstName` (L6263) does:
+    // synthetic Named (declaration nullptr, astNode set) → headName; builtin-class
+    // stub (declaration set, decl nullptr) → declaration->name; a fully-resolved
+    // record (real decl) → {} (has a MethodSymbol → user path handled it).
+    std::string_view spanName;
+    if (!recvTy->declaration) {
+        if (recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty())
+            spanName = recvTy->headName();
+    } else if (!recvTy->declaration->decl) {
+        spanName = recvTy->declaration->name;
+    }
+    if (spanName != "ReadOnlyStringSpan") return;
+    // Map (method, position, argPrimitiveKind) → the declared NON-nullable
+    // primitive parameter kind, or None when this position is not a primitive
+    // char/string slot. §3.3: IndexOf/Contents have char|string overloads;
+    // StartsWith/EndsWith/SequenceEqual have a string overload only.
+    auto paramKind = [&](std::size_t pos, PrimitiveType argKind)
+            -> PrimitiveType {
+        using PT = PrimitiveType;
+        // §3.3 (#2601): Slice(start: int, length: int) and the v0.195
+        // Slice(start) overload declare NON-nullable `int` at BOTH pos 0
+        // (start) and pos 1 (length). Unlike the search/compare family
+        // (one operand at pos 0), Slice has an int param at pos 1 too, so
+        // check those before the pos-0-only short-circuit below — an
+        // un-narrowed `int?` reaching codegen trips a `trunc {i8,i32}->i32`
+        // verifyModule failure (the same defect shape #2581 closed for
+        // `string.Insert` pos 0 via the intPos set in the string helper).
+        if (m == "Slice" && (pos == 0 || pos == 1)) return PT::Int;
+        if (pos != 0) return PT::None;  // every covered method takes one operand
+        if (m == "IndexOf" || m == "Contains") {
+            if (argKind == PT::String) return PT::String;
+            if (argKind == PT::Char)  return PT::Char;
+            return PT::None;  // ReadOnlyStringSpan-Named operand — not covered
+        }
+        if (m == "StartsWith" || m == "EndsWith" || m == "SequenceEqual") {
+            if (argKind == PT::String) return PT::String;
+            return PT::None;  // no char overload; span/iface operands are Named
+        }
+        return PT::None;
+    };
+    for (std::size_t i = 0; i < ce.args.size(); ++i) {
+        const auto& a = ce.args[i];
+        if (!a.value || a.isDiscard) continue;
+        // §22.3: a `ref`/`out`/`owned`/`scoped` modifier aliases or transfers
+        // the caller slot under its own rule and is not a §7 nullable->non-
+        // nullable conversion; skip (span methods take plain value params).
+        if (!a.modifier.empty()) continue;
+        TypeRef* argTy = ctx_.exprType(*a.value);
+        if (!argTy || argTy->kind != TypeRef::Kind::Primitive) continue;
+        PrimitiveType declared = paramKind(i, argTy->primitive);
+        if (declared == PrimitiveType::None) continue;
+        TypeRef* paramTy = ctx_.primitiveTypeRef(declared, /*nullable=*/false);
+        checkAssignable(
+            argTy, paramTy, a.value->span.begin,
+            std::string("argument to `ReadOnlyStringSpan.") + std::string(m) + "`",
+            a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
+    }
 }
 
 // Slices T5/T6/T7: shared check of an argument list against a parameter
@@ -10398,10 +11285,39 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 // reporting 'not yet supported', try a user-defined extension
                 // method"). Mirrors both.
                 if (Symbol* ext = lookupExtensionMember(
-                        ctx_.primitiveTypeRef(pt), mbr, nullptr, ma.span.begin)) {
+                        ctx_.primitiveTypeRef(pt), mbr, nullptr, ma.span.begin,
+                        /*reportAmbiguity=*/true, currentCallArity_)) {
                     resolveExtensionMember(ma, ext);
                     return;
                 }
+                // per §3.4: the primitive-static handler above recognises a
+                // fixed, closed set of names.  Any name that reached this
+                // point is NOT in that set — emit a diagnostic and return so
+                // the callee node is left untyped-but-diagnosed rather than
+                // untyped-and-silent, which would otherwise crash codegen
+                // (issue #491).
+                //
+                // fix #2328 (§26.5, v0.236): the lookup above is arity-
+                // aware (it took `currentCallArity_`); on no-match it
+                // stays silent (the caller has no extension candidates
+                // that match the call's arity, but the catch-all §3.4
+                // wording below is the correct diagnostic here — the
+                // primitive-static surface is a closed set with no
+                // "extension on primitive" path, so an arity mismatch
+                // is the same shape as a missing member). The primitive
+                // path's own fallback fires for BOTH the arity-aware and
+                // bare-reference cases (the latter takes `currentCallArity_
+                // == -1`, this is a bare `int.M` reference). Permissive
+                // receivers (Object, unconstrained type parameters) do
+                // NOT reach this path — they take the general path with
+                // the `knownCompleteUserType` gate, which IS suppressed
+                // for permissive receivers.
+                ctx_.diagnostics().report(
+                    Severity::Error, ma.span.begin,
+                    "type '" + std::string(id2->name) +
+                        "' has no static method or property '" +
+                        std::string(mbr) + "' (§3.4)");
+                return;
                 // per §3.4: the primitive-static handler above recognises a
                 // fixed, closed set of names.  Any name that reached this
                 // point is NOT in that set — emit a diagnostic and return so
@@ -11759,7 +12675,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // the extension's signature and return without error.  Only
                     // emit the diagnostic when no user extension matches.
                     if (Symbol* ext = lookupExtensionMember(
-                            tt, ma.member, nullptr, ma.span.begin)) {
+                            tt, ma.member, nullptr, ma.span.begin,
+                            /*reportAmbiguity=*/true, currentCallArity_)) {
                         resolveExtensionMember(ma, ext);
                         return;
                     }
@@ -11791,6 +12708,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                         ma.member == "Aggregate"  || ma.member == "ForEach";
                     if (!isLinqOp) {
                         // Emit a diagnostic for unrecognized string members.
+                        //
+                        // fix #2328 (§26.5, v0.236): the arity-aware
+                        // lookup above stays silent on no-match. The
+                        // string-codegen "not yet supported" wording is
+                        // still the right catch-all for primitive-string
+                        // members (the string-receiver path's surface is
+                        // a closed set; an arity mismatch on a string
+                        // user-extension is a separate concern, but the
+                        // general `if (knownCompleteUserType)` reject
+                        // only fires for non-string user types — the
+                        // primitive-string case stays here, with the
+                        // historical "not yet supported" wording for
+                        // both the arity-aware and bare-reference paths).
                         ctx_.diagnostics().report(
                             Severity::Error, ma.span.begin,
                             std::string("string member `.") +
@@ -13496,7 +14426,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 auto extLoc = ma.span.begin;
                 if (extLoc.line == 0 && ma.target) extLoc = ma.target->span.begin;
                 if (Symbol* ext = lookupExtensionMember(
-                        recvTy, ma.member, &binding, extLoc)) {
+                        recvTy, ma.member, &binding, extLoc,
+                        /*reportAmbiguity=*/true, currentCallArity_)) {
                     if (!binding.empty())
                         ctx_.setExprExtBinding(&ma, std::move(binding));
                     resolveExtensionMember(ma, ext);
@@ -13841,7 +14772,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         auto extLoc = ma.span.begin;
         if (extLoc.line == 0 && ma.target) extLoc = ma.target->span.begin;
         if (Symbol* ext = lookupExtensionMember(
-                recvTy, ma.member, &binding, extLoc)) {
+                recvTy, ma.member, &binding, extLoc,
+                /*reportAmbiguity=*/true, currentCallArity_)) {
             if (!binding.empty())
                 ctx_.setExprExtBinding(&ma, std::move(binding));
             resolveExtensionMember(ma, ext);
@@ -13849,6 +14781,44 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         }
     }
     if (!member) {
+        // fix #2513 / spec §35.2 (v0.236): stdlib `Result<T, E>` carries four
+        // COMPILER-PROVIDED per-instantiation combinators (Map / MapError /
+        // AndThen / UnwrapOr). They have no MethodSymbol — the prelude's
+        // member list holds only IsOk/IsError — so `lookupMember` returns
+        // null. Without an exemption here, the "no member" reject at the
+        // bottom of `resolveMemberAccess` would fire BEFORE `typeCall` could
+        // type the call (typeCall's combinator branch sets the call's
+        // exprType with the result instantiation per §14.5 phase 2 + §35.2).
+        // The combinator IS admissible (sema will validate the receiver /
+        // result classification and arity in `typeCall`'s combinator branch
+        // and reject there on §35.4 rule 3) — so we set a Function-typed
+        // placeholder on the MemberAccessExpr to keep the call alive AND
+        // exempt this access from the "no member" reject, then `typeCall`
+        // finishes the work.
+        bool isResultCombinator = false;
+        if (targetType->kind == ast::TypeDeclKind::Choice &&
+                targetType->name == "Result") {
+            const auto& cm = ma.member;
+            if (cm == "Map" || cm == "MapError" || cm == "AndThen" ||
+                cm == "UnwrapOr") {
+                isResultCombinator = true;
+            }
+        }
+        if (isResultCombinator) {
+            // Do NOT stamp a Function TypeRef on the MemberAccessExpr: the
+            // function-call argument gate at typeCall ~line 2819 consults
+            // ctx_.exprType(*ce.callee) (the MemberAccessExpr) and, when it
+            // sees a Function TypeRef, runs checkAssignable on every
+            // argument against the placeholder's parameter type — which
+            // would reject the lambda (Function -> Unit) with "the argument
+            // 1 ... has a type that is not implicitly convertible" before
+            // our combinator branch in typeCall can fire. typeCall's
+            // combinator branch re-stamps the CallExpr with the result
+            // instantiation per §14.5 phase 2 + §35.2 and rejects on
+            // §35.4 rule 3 / arity mismatches — so the only job here is to
+            // exempt this access from the "no member" reject below.
+            return;
+        }
         // #2517 (§9.2, §35.7): the §9.2 record use-site gate and §35.7 choice
         // use-site gate for direct `.Equals(...)` / `.GetHashCode()` calls fire
         // HERE, BEFORE the null-decl (`!targetType->decl`) builtin-class branch
@@ -14460,11 +15430,107 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             auto nmLoc = ma.span.begin;
             if (nmLoc.line == 0 && ma.target)
                 nmLoc = ma.target->span.begin;
-            ctx_.diagnostics().report(
-                Severity::Error, nmLoc,
-                std::string("no member `") + std::string(ma.member) +
-                    "` on type `" + std::string(targetType->name) +
-                    "` (§11.3, §12.1)");
+            // fix #2328 (§26.5, v0.236): if `currentCallArity_ >= 0` the
+            // arity-aware `lookupExtensionMember` calls above silently
+            // returned null (no candidate with the call's arity), and the
+            // catch-all "no member `M` on type `T`" reject would be
+            // misleading — a call with the wrong arity is an ARITY error,
+            // not a "no such member" error. Emit an arity-specific
+            // diagnostic here, where the `knownCompleteUserType` gate
+            // already guards the catch-all path. Permissive receivers
+            // (Object, unconstrained type parameters, …) don't reach
+            // this branch, so their `Object.Unknown()` idiom is unaffected.
+            if (currentCallArity_ >= 0) {
+                // fix #2328 (§26.5, v0.236): the arity-aware
+                // `lookupExtensionMember` returned null. Distinguish
+                // two cases: (a) no extension method with this name
+                // exists on the receiver at any arity (a true
+                // "no member" error — the user typed `Spea` instead
+                // of `Speak`); (b) extension methods with this name
+                // exist on the receiver, but none take the call's
+                // arity (an "arity mismatch" — e.g. `o.Bar()` against
+                // `extension T method Bar(x: int)`). Only (b) gets
+                // the arity-specific diagnostic; (a) keeps the
+                // existing "no member" wording, which is what the
+                // `typo_of_real_method` test pins. Walk the
+                // candidate extensions to test the distinction.
+                bool anySameNamedExtension = false;
+                {
+                    std::vector<ExtensionSymbol*> cand;
+                    if (ctx_.module()) {
+                        for (Symbol* child : ctx_.module()->children) {
+                            if (auto* e =
+                                    dynamic_cast<ExtensionSymbol*>(child))
+                                cand.push_back(e);
+                        }
+                    }
+                    cand.insert(cand.end(), importedExtensions_.begin(),
+                                importedExtensions_.end());
+                    for (ExtensionSymbol* ext : cand) {
+                        auto* decl =
+                            dynamic_cast<const ast::ExtensionDecl*>(
+                                ext->decl);
+                        if (!decl) continue;
+                        // `decl->targetType` IS the extension's
+                        // declared target; the matching-vs-receiver
+                        // check (extensionFindMatchingAncestor) is
+                        // `static` in ExprTypecheck.cpp and would
+                        // require plumbing it across the TU
+                        // boundary. We instead use a conservative
+                        // name match on the AST target type — when
+                        // the candidate's declared target's last
+                        // name segment matches `targetType->name`
+                        // and the arity is different from the
+                        // call's, the arity-specific message is
+                        // more informative than "no member". The
+                        // targetType-name-keyed match can under-
+                        // approximate (a generic head like
+                        // `IEnumerable<T>` will match the first
+                        // extension on `Array<T>` for the wrong
+                        // reason), but the diagnostic is only
+                        // emitted on the "no member" reject
+                        // path, so a too-precise arity
+                        // diagnostic would merely widen the set
+                        // of cases that get the arity wording —
+                        // never narrow it.
+                        if (!decl->targetType || !decl->targetType->name)
+                            continue;
+                        const auto& nm = decl->targetType->name->parts;
+                        if (nm.empty()) continue;
+                        if (std::string(nm.back()) !=
+                            std::string(targetType->name))
+                            continue;
+                        for (Symbol* m : ext->members) {
+                            if (m && m->name == ma.member) {
+                                anySameNamedExtension = true;
+                                break;
+                            }
+                        }
+                        if (anySameNamedExtension) break;
+                    }
+                }
+                if (anySameNamedExtension) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, nmLoc,
+                        "no extension method `" + std::string(ma.member) +
+                            "` on type `" + std::string(targetType->name) +
+                            "` takes " +
+                            std::to_string(currentCallArity_) +
+                            " argument(s) (§26.5)");
+                } else {
+                    ctx_.diagnostics().report(
+                        Severity::Error, nmLoc,
+                        std::string("no member `") + std::string(ma.member) +
+                            "` on type `" + std::string(targetType->name) +
+                            "` (§11.3, §12.1)");
+                }
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, nmLoc,
+                    std::string("no member `") + std::string(ma.member) +
+                        "` on type `" + std::string(targetType->name) +
+                        "` (§11.3, §12.1)");
+            }
         }
         // #608 / §8.5 / §12: `ToString()` is universal and returns `string`.
         // Set the MemberAccessExpr's type so that callers (e.g. `.Length` on the
@@ -14697,8 +15763,13 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
     if (!member) {
         const TypeRef* recvTy = nm.target ? ctx_.exprType(*nm.target) : nullptr;
         if (recvTy) {
-            member = lookupExtensionMember(recvTy, nm.member, nullptr,
-                                           nm.span.begin);
+            // fix #2328 (§26.5, v0.236): pass `currentCallArity_` so an
+            // arity-mismatched call (`obj?.M()` against `M(x: int)`) gets
+            // the arity-specific diagnostic from the lookup, not the
+            // bare-reference "no member" reject downstream.
+            member = lookupExtensionMember(
+                recvTy, nm.member, nullptr, nm.span.begin,
+                /*reportAmbiguity=*/true, currentCallArity_);
         }
         // §7.5 / #751: a string/primitive built-in member (e.g. `Length`) has
         // no Symbol — resolveMemberAccess types these via a large inlined

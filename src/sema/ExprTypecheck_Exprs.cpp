@@ -2,6 +2,7 @@
 
 #include "common/BuiltinRegistry.hpp"
 #include "common/OwnershipFacts.hpp"  // §35.7 (#2045): classifyChoiceType
+#include "sema/TypeResolution.hpp"  // fix #2320: typeRefEqual for ctor overload re-resolution
 
 #include <cmath>
 #include <unordered_set>
@@ -1632,9 +1633,49 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // §3.3 (#883): ReadOnlyStringSpan[i] → char (the i-th code
                     // point of the viewed range). Non-generic, so its element
                     // type is the fixed `char` primitive (not genericArgs[0]).
-                    else if (cn == "ReadOnlyStringSpan")
+                    else if (cn == "ReadOnlyStringSpan") {
+                        // §7 / stdlib §3.3 (#2613): stdlib §3.3 line 1321
+                        // declares the indexer `public property [i: int]: char`
+                        // — a single NON-nullable `int` index, and the only
+                        // indexer form the record declares (no Range overload).
+                        // The builtin has no PropertySymbol (ReadOnlyStringSpan
+                        // resolves to a synthetic Named TypeRef with a null
+                        // declaration, which is why this branch types the result
+                        // by hand), so nothing on the IndexExpr path ever ran
+                        // checkAssignable on the index — an un-narrowed `int?`
+                        // was silently accepted by sema and reached codegen,
+                        // where the indexer lowering truncated the `{ i8, i32 }`
+                        // nullable-value struct to `i32` and failed
+                        // verifyModule ("Trunc only operates on integer"). Same
+                        // §7 hole #2601 closed for `Slice` on the CallExpr path
+                        // (checkBuiltinSpanCallArgs), on the IndexExpr path.
+                        //
+                        // The check is deliberately gated to a NULLABLE index
+                        // type: this fix is scoped to the §7 nullable ->
+                        // non-nullable conversion #2613 reports, and gating it
+                        // that way makes a false reject of some other index
+                        // spelling structurally impossible (a non-nullable
+                        // index of any kind is left exactly as it was). A
+                        // NARROWED `int?` stays accepted — the §7.4 narrowing
+                        // exception lives inside checkAssignable, which this
+                        // reuses — and a `ref`/`out`-modified or discard index
+                        // is skipped, mirroring the CallExpr gates' guard.
+                        if (ix->indices.size() == 1 && ix->indices[0].value &&
+                            !ix->indices[0].isDiscard &&
+                            ix->indices[0].modifier.empty()) {
+                            TypeRef* idxTy =
+                                ctx_.exprType(*ix->indices[0].value);
+                            if (idxTy && idxTy->nullable)
+                                checkAssignable(
+                                    idxTy,
+                                    ctx_.primitiveTypeRef(PrimitiveType::Int),
+                                    ix->indices[0].value->span.begin,
+                                    "index argument to `ReadOnlyStringSpan[i]`",
+                                    ix->indices[0].value.get());
+                        }
                         ctx_.setExprType(
                             &e, ctx_.primitiveTypeRef(PrimitiveType::Char));
+                    }
                     // #794 / §14.2 + §23.4: `x[i]` where `x` has the type of a
                     // bare generic parameter `T` constrained `where T: IIndexable`
                     // and the constraint interface declares an indexer. The stdlib
@@ -4459,7 +4500,19 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // function value. Saved/restored so a nested call's callee does not leak.
         const ast::Expr* savedCallee = calleeOfCallCtx_;
         calleeOfCallCtx_ = ce->callee.get();
+        // fix #2328 (§26.5, v0.236): the call's arity is the gate that
+        // arity-aware `lookupExtensionMember` consults while resolving the
+        // callee. Stash it on the worker for `resolveMemberAccess` /
+        // `resolveNullCondMember` to read; -1 (the default) means "not in
+        // a call context" — bare references and the post-arity visitor
+        // paths leave it untouched. Nested calls save/restore around their
+        // own callee visit, so an inner call's arity does not leak into
+        // the outer call's callee-visit lookup.
+        std::ptrdiff_t savedArity = currentCallArity_;
+        currentCallArity_ =
+            static_cast<std::ptrdiff_t>(ce->args.size());
         if (ce->callee) visitExpr(*ce->callee);
+        currentCallArity_ = savedArity;
         calleeOfCallCtx_ = savedCallee;
         // per §24.3: an event-handler argument (`<event>.Subscribe(h)` / .Add /
         // .Remove) — push the event payload type so an untyped handler lambda's
@@ -5194,8 +5247,28 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // §22.3 (v0.184, #1682): validate the operand category of a
             // bare `ref`/`out` argument (a no-op for every other modifier).
             // Runs after the argument's own visitExpr above so exprSymbol is
-            // populated for it.
-            checkRefOutOperandCategory(a);
+            // populated for it. fix #2320 / §22.3 / §22.4: pass the FORMAL
+            // parameter's modifier so the function can emit a clean §22.3
+            // rejection for the `out owned` variant when the argument is
+            // anything other than an inline `out using var` / `out owned var`
+            // declaration (an indexer slot, a property, a bare local, …) —
+            // those used to leak through to codegen's #1386 fallback.
+            {
+                std::string_view formalMod;
+                if (calleeMd2) {
+                    std::size_t pidx = pos2;
+                    if (!a.name.empty()) {
+                        for (std::size_t j = 0; j < calleeMd2->params.size(); ++j)
+                            if (calleeMd2->params[j].name == a.name) {
+                                pidx = j;
+                                break;
+                            }
+                    }
+                    if (pidx < calleeMd2->params.size())
+                        formalMod = calleeMd2->params[pidx].modifier;
+                }
+                checkRefOutOperandCategory(a, formalMod);
+            }
             ++pos2;
         }
     } else if (auto* nc = dynamic_cast<const ast::NullCondCallExpr*>(&e)) {
@@ -5464,8 +5537,127 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // §22.3 (v0.184, #1682): validate a bare `ref`/`out` constructor
             // argument's operand category (a no-op for every other
             // modifier) — grammar A.4 admits ParamModifiers on a
-            // constructor's ParamList same as a method's.
-            checkRefOutOperandCategory(a);
+            // constructor's ParamList same as a method's. fix #2320:
+            // thread the constructor's formal param modifier so an
+            // `out owned` constructor parameter receives the same
+            // §22.3/§22.4 rejection as a method's. The ctor overload
+            // resolution that `checkNewExprArgs` already ran BEFORE
+            // visitChildren is the authority — the `ctorDecl` chosen
+            // here is the same sole-or-first-arity guess the `out var`
+            // block above uses, which mis-binds under same-arity
+            // overloads (an `out owned Cell` ctor declared before an
+            // `out int` ctor would otherwise wrongly tag an
+            // `out n` argument as §22.3-out-owned). Re-resolve here by
+            // `bindArgsToParams` on every arity-matching ctor, then
+            // type-filter (a ref/out argument's type must EXACTLY match
+            // the param's referent type per §14.5/§22.3, and a plain
+            // argument's type must be §5.1-assignable to the param) to
+            // find the candidate overload-resolution would pick. Apply
+            // the rejection ONLY when exactly one type-compatible
+            // candidate exists. Zero candidates defer; multiple
+            // candidates defer (genuinely ambiguous — let overload-
+            // resolution emit its own diagnostic). Mirrors
+            // checkNewExprArgs's overload handling at ~line 8693.
+            {
+                std::string_view formalMod;
+                if (ctorDecl && ne->type) {
+                    if (auto* rt = ctx_.resolvedType(*ne->type)) {
+                        if (rt->kind == TypeRef::Kind::Named &&
+                            rt->declaration) {
+                            const ast::Param* pickedParam = nullptr;
+                            int compatibleCount = 0;
+                            for (Symbol* m : rt->declaration->members) {
+                                if (auto* cs =
+                                        dynamic_cast<ConstructorSymbol*>(m)) {
+                                    if (cs->isStatic) continue;
+                                    auto* cd = dynamic_cast<
+                                        const ast::ConstructorDecl*>(
+                                        cs->decl);
+                                    if (!cd) continue;
+                                    if (cd->params.size() != ne->args.size())
+                                        continue;
+                                    BindResult b = bindArgsToParams(
+                                        cd->params, ne->args, ne->span.begin,
+                                        /*calleeDesc=*/std::string(),
+                                        /*emit=*/false);
+                                    if (!b.ok) continue;
+                                    // Type filter: each ref/out argument
+                                    // must exactly match the param's
+                                    // referent type per §14.5/§22.3 (a
+                                    // ref/out argument aliases the
+                                    // caller's storage, so no implicit
+                                    // conversion is admitted). Plain
+                                    // positional args without a modifier
+                                    // go through the standard overload-
+                                    // resolution path (resolveOverload +
+                                    // checkArgsAgainstParams in
+                                    // checkNewExprArgs) — we do NOT
+                                    // duplicate the §5.1 assignability
+                                    // probe here; an exact ref/out
+                                    // filter is sufficient to pick the
+                                    // resolved overload for the §22.3/§22.4
+                                    // diagnostic the issue calls out
+                                    // (the indexer-slot/property cases
+                                    // all carry an explicit `out`/`ref`/
+                                    // `out owned` modifier).
+                                    bool typeOk = true;
+                                    for (std::size_t j = 0;
+                                         j < cd->params.size(); ++j) {
+                                        int ai = b.paramToArg[j];
+                                        if (ai < 0) continue;
+                                        const ast::CallArgument& arg =
+                                            ne->args[ai];
+                                        if (!arg.value) continue;
+                                        const std::string_view am =
+                                            arg.modifier;
+                                        if (am != "ref" && am != "out")
+                                            continue;
+                                        const ast::Param& rp = cd->params[j];
+                                        if (!rp.type) continue;
+                                        TypeRef* argTy =
+                                            ctx_.exprType(*arg.value);
+                                        TypeRef* paramTy =
+                                            ctx_.resolvedType(*rp.type);
+                                        if (!argTy || !paramTy) continue;
+                                        // §14.5 / §22.3: exact type
+                                        // match for ref/out.
+                                        if (!typeRefEqual(argTy,
+                                                          paramTy)) {
+                                            typeOk = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!typeOk) continue;
+                                    ++compatibleCount;
+                                    if (compatibleCount == 1) {
+                                        std::size_t pidx = posn;
+                                        if (!a.name.empty()) {
+                                            for (std::size_t j = 0;
+                                                 j < cd->params.size(); ++j)
+                                                if (cd->params[j].name ==
+                                                    a.name) {
+                                                    pidx = j;
+                                                    break;
+                                                }
+                                        }
+                                        if (pidx < cd->params.size())
+                                            pickedParam = &cd->params[pidx];
+                                    }
+                                }
+                            }
+                            // Ambiguous or unresolved: defer —
+                            // overload-resolution will pick the winner
+                            // (and emit its own modifier-match
+                            // diagnostic for an unmatched modifier).
+                            // Picking here would risk a wrong-formal /
+                            // false-reject.
+                            if (compatibleCount == 1 && pickedParam)
+                                formalMod = pickedParam->modifier;
+                        }
+                    }
+                }
+                checkRefOutOperandCategory(a, formalMod);
+            }
             ++posn;
         }
     } else if (auto* ce = dynamic_cast<const ast::ConditionalExpr*>(&e)) {
@@ -5757,22 +5949,34 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // postcondition. Clear the set for the lambda body and restore after.
         auto saveOutPostconds = std::move(currentOutPostconds_);
         currentOutPostconds_.clear();
-        // §7.4 (v0.226, #2113/#2116): the lambda body is DEFERRED code — its
-        // narrowing fact state is not the enclosing statement's. All three
-        // narrowing sets are saved now and restored after the body visit.
-        //   IN:  facts established BEFORE the lambda ride in (capture) — the
-        //        closure sees the ambient state. fieldNarrowed_ additionally
-        //        drops LOCAL-rooted facts here (the captured root may be
-        //        rebound between the closure's creation and its invocation,
-        //        which the enclosing walk cannot see); ambient-rooted facts
-        //        (rootId 0 — `this`/static) ride in unchanged, a readonly
-        //        field observed non-null holding that value forever after
-        //        (§22.8 single assignment; a during-construction test that
-        //        observed non-null saw the final value, §22.7/§7.4). The local
-        //        sets (nullNarrowed_/narrowings_) need NO in-side drop: their
-        //        key is the stable Symbol*, and §7.4's invalidation rules
-        //        (reassignment, ref/out, mutably-captured-then-call) have
-        //        already removed anything unsound by the point of capture.
+        // §7.4 / §27.5 (v0.236, #2113/#2116/#2259): the lambda body is DEFERRED
+        // code — its narrowing fact state is not the enclosing statement's. All
+        // three narrowing sets are saved now and restored after the body visit.
+        //   IN:  a fact established BEFORE the lambda would ride in (capture),
+        //        but §27.5 is explicit that capture is by REFERENCE —
+        //        "Modifications to a captured variable inside the lambda are
+        //        visible outside, and vice versa" — so the enclosing scope may
+        //        rebind a captured local's cell AFTER the closure's creation
+        //        but BEFORE its invocation, invalidating a fact the body
+        //        type-checked against (#2259: the captured read returned null
+        //        and SIGSEGV'd). The field set drops LOCAL-rooted facts here
+        //        for this reason (rootId >= 1; #2116); the two local sets are
+        //        ENTIRELY local-rooted (LocalSymbol/ParameterSymbol — §7.4
+        //        narrows no `this`/static through them; readonly fields go in
+        //        fieldNarrowed_), so each captured local's facts must be
+        //        dropped here for the identical reason. Clearing the whole set
+        //        is observably equivalent to dropping only the captured names'
+        //        entries (the body cannot reference an uncaptured local, and
+        //        the OUT-side restore below preserves the enclosing facts), so
+        //        the simple, obviously-sound rule is to clear both sets — the
+        //        direct analog of the field set's "drop all local-rooted". A
+        //        `const` local is also cleared here: §7.4 says a const local's
+        //        narrowing is "never invalidated" (const cannot be rebound),
+        //        so preserving its fact would be sound; the field set already
+        //        drops const-local-rooted field facts at this boundary for the
+        //        same simplicity, and this fix matches that precedent rather
+        //        than split the three sets' boundary policy. Re-narrow inside
+        //        the body (`if x <> null then … end`) to recover a fact.
         //   OUT: the enclosing sets are RESTORED — a fact established inside
         //        the lambda body must not leak to the enclosing scope (the body
         //        may run never or later; #2113's hole, now closed for all
@@ -5782,6 +5986,11 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         auto saveFieldNarrowed = fieldNarrowed_;
         fieldNarrowed_.erase(fieldNarrowed_.lower_bound({1u, 0u}),
                              fieldNarrowed_.end());  // drop local-rooted
+        nullNarrowed_.clear();   // §27.5 (#2259): captured locals are
+        narrowings_.clear();     // by-reference cells the enclosing scope may
+                                 // rebind between closure creation and
+                                 // invocation — drop on the way IN, matching
+                                 // the field set's local-rooted drop above
         currentScope_ = &lamScope;
         // §27.3 (v0.217, #2101): with a return-type ascription the body is
         // checked exactly as a method body against a declared return type —

@@ -773,10 +773,13 @@ llvm::Value* Emitter::lowerMoveFromCollectionSlot(const ast::IndexExpr& ix) {
 // new owner is stored (§4.5 / §4.9). Mirrors `.Set(i, v)` (§4.5) and the dict
 // `.Add(k, v)` lowering. `val` is the already-lowered RHS; `valueExpr` is the
 // RHS AST (when available) used to decide transfer-vs-retain for a #429
-// borrowing Array<string> overwrite.
+// borrowing Array<string> overwrite. `valIsFreshPlusOneString` (fix #2596): set
+// by the dict COMPOUND path whose `val` is an emitStringConcat result (always
+// +1 per #422) — skips the #429 retain so the +1 transfers into the slot.
 bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                                         llvm::Value* val,
-                                        const ast::Expr* valueExpr) {
+                                        const ast::Expr* valueExpr,
+                                        bool valIsFreshPlusOneString) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value || !val)
         return false;
     auto* recvTy = ctx_.exprType(*ix.target);
@@ -953,6 +956,15 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
         // rc dips +1 then back, never transiently 0 — no UAF / double-free). This
         // is checked BEFORE the owning-class disposer below; a string element is
         // never a class, so the two paths are mutually exclusive.
+        // #2598 / §4.1 / §4.4: an IList<string> receiver routes its indexer set
+        // through the SAME bz_array_set ABI (issue #401 — IList<T> is array-backed,
+        // same bz_array_t* as Array<T>), so the same disposing-setter path applies.
+        // The predicate previously gated on a head-name allowlist of concrete
+        // borrowing families (Array/Stack/Queue); IList<T> (the borrowing list
+        // interface, §4.1) is also array-backed and borrowing, so it is admitted.
+        // IReadOnlyList<T> is read-only (never reaches the setter); IOwningList<T>
+        // is owning (handled by the separate elemDisp path below, which runs the
+        // owning-family disposer against the class element — never a string).
         // #602 / §28.11 v0.135: derive element policy from elementPolicyFor.
         {
             const sema::TypeRef* arrEl =
@@ -970,8 +982,12 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
                 arrEl->primitive == sema::PrimitiveType::String &&
                 recvTy->astNode && recvTy->astNode->name &&
                 !recvTy->astNode->name->parts.empty() &&
-                [](std::string_view n){return n=="Array"||n=="Stack"||n=="Queue";}(
-                    recvTy->headName());
+                [](std::string_view n){
+                    // #2598: IList<T> is array-backed + borrowing (issue #401),
+                    // same bz_array_set ABI as Array<T>; admitted alongside the
+                    // concrete borrowing families.
+                    return n=="Array"||n=="Stack"||n=="Queue"||n=="IList";
+                }(recvTy->headName());
             if (isStrElemArr) {
                 if (!valueExpr || !isPlusOneStringProducer(valueExpr))
                     emitStringRetain(val);
@@ -1178,7 +1194,11 @@ bool Emitter::lowerCollectionIndexerSet(const ast::IndexExpr& ix,
     // bz_string* here; encodeValue returns it as-is for pointer values). Emit
     // the retain BEFORE the store so a self-overwrite `d[k] := d[k]` always
     // sees rc >= 2 when the old value is released. A +1 producer is transferred.
-    if (isStrVal && (!valueExpr || !isPlusOneStringProducer(valueExpr)))
+    // fix #2596: the dict COMPOUND path passes valIsFreshPlusOneString=true
+    // because its `val` is an emitStringConcat result (always rc=1 per #422) —
+    // a retain here would double-count to +2 and leak one +1 per iteration.
+    if (isStrVal && !valIsFreshPlusOneString &&
+        (!valueExpr || !isPlusOneStringProducer(valueExpr)))
         emitStringRetain(val);
     llvm::Value* vPtr = encodeValue(val);
     if (keyTy) {
@@ -1740,6 +1760,57 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         emitPendingCheck();
         return true;
     }
+    // fix #2548 (§23.4/§28.9/§4.6, v0.236): the INDEXER twin of
+    // lowerVirtualPropertySet's #2490/#2500/#2506 emitProducerRelease
+    // (LlvmBackend_Exprs.cpp ~5106-5128). The three setter-call paths below
+    // (interface itable dispatch, class-vtable dispatch, inline setter body)
+    // each invoke a class-owning setter (or class-side field store for the
+    // inline path) that RETAINS its incoming `value` — but for a +1
+    // PRODUCER RHS (`"abc" + i.ToString()`, a string interpolation, a method
+    // call returning a +1 closure, or a box-return call to an
+    // Object/interface property target), the caller transferred the fresh
+    // reference across the call and the callee's retain doubled it; the
+    // doubled reference would never be released. The pre-fix consequence:
+    // every loop iteration leaks the producer's +1 — for `"abc" + i.ToString()`
+    // that is ~37 bytes per iteration (32 byte bz_string header + ~5 byte
+    // payload for the digit) — exactly the leak the issue observed (185
+    // bytes per 10 iterations, the 50-byte "indirect" tail is the payload
+    // string's own referenced byte-string header). Mirrors the property
+    // setter's #2490 fix (the imported-stub sibling at lowerImportedPropertySetValue
+    // ~4038) — see its comment for the full rationale on the class-retain /
+    // record-plain-store split. As on the property side, the release is
+    // unconditional ONLY on the class-backed paths; on the record-backed
+    // itable path the setter plain-stores (a record's reference fields are
+    // borrows with no independent +1 and no disposer — §9/§9.7) and
+    // releasing here would drop the field's only reference (UAF). The
+    // lambda below is the single emitProducerRelease used by all three
+    // paths; each call site decides when to invoke it.
+    auto emitProducerRelease = [&] {
+        if (valueExpr && isPlusOneStringProducer(valueExpr))
+            emitStringRelease(val);
+        else if (valueExpr && (isPlusOneClosureProducer(valueExpr) ||
+                               isUserMethodClosureReturnCall(valueExpr)))
+            emitClosureRelease(val);
+        else if (valueExpr && val && val->getType()->isPointerTy()) {
+            // fix #2500 (§23.3/§28.9, v0.236): the box twin of the string/
+            // closure release above — same isProducer predicate as
+            // lowerBoxFieldStore / lowerImportedPropertySetValue. Gated on the
+            // TARGET being Object/interface (and val a ptr): a value-typed
+            // indexer's source may be boxable in isolation but is not boxed
+            // here. The target is `ix` (the IndexExpr) for the indexer
+            // shape; isObjectOrInterfaceTarget must accept IndexExpr (it's
+            // the assignment-target shape used by lowerPropertySetValue too —
+            // see #2500's call site in lowerVirtualPropertySet).
+            const sema::TypeRef* tgtTy = ctx_.exprType(ix);
+            if (tgtTy && isObjectOrInterfaceTarget(tgtTy)) {
+                const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+                if ((srcTy && (isBoxableValueType(srcTy) ||
+                               isNullableValueTy(srcTy))) ||
+                    isUserMethodBoxReturnCall(valueExpr))
+                    emitBoxRelease(val);
+            }
+        }
+    };
     // #730 / §13 / §23.4: `(arr: IFoo)[i] := v` through an INTERFACE-typed
     // receiver dispatches the setter dynamically through the itable — load the
     // implementing class's setter from itab[set-index] and call it as
@@ -1889,15 +1960,20 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
             llvm::BasicBlock* doneBB =
                 llvm::BasicBlock::Create(llvm_, "idxset.done", fn);
             builder_.CreateCondBr(isClassBacked, classBB, recordBB);
-            // CLASS-backed branch: setter retained → no producer release
-            // (the indexer shape does not yet have emitProducerRelease —
-            // that's a separate #2548 lane; the named-local CLOSE this
-            // fix lands is the property case's analogue, the producer-RHS
-            // family is its own work item), and no extra retain needed —
-            // the class setter's retain is the field's +1, the scope-end
-            // release on the walker-armed local drops the local's +1, all
-            // +1's accounted for.
+            // CLASS-backed branch: setter retained → release the producer-RHS
+            // +1 the setter's retain doubled (#2548, the indexer twin of
+            // lowerVirtualPropertySet's emitProducerRelease on its classBB
+            // — see emitProducerRelease's definition above). The named-local
+            // close (the walker-armed scope-end release on the local) is
+            // independent of this producer release — a producer RHS has no
+            // local binding, only the value itself, and the doubled +1 has
+            // no other owner; the classBB emitProducerRelease drops it
+            // here. No extra retain needed on classBB: the class setter's
+            // retain IS the field's +1, the local keeps its own +1, the
+            // walker's scope-end release drops the local's +1, all +1's
+            // accounted for.
             builder_.SetInsertPoint(classBB);
+            emitProducerRelease();
             builder_.CreateBr(doneBB);
             // RECORD-backed branch: setter plain-stored → field aliases
             // the local's only reference. For a tracked-string NAMED LOCAL
@@ -1950,6 +2026,19 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
                 callArgs.push_back(coerceNumericToType(val, valTy, false));
                 builder_.CreateCall(sFnTy, fnPtr, callArgs);
                 emitPendingCheck();
+                // fix #2548 (§23.4/§28.9/§4.6, v0.236): the CLASS-VTABLE
+                // twin of the interface-dispatch classBB emitProducerRelease
+                // above. The class-vtable path is unconditional-class-backed
+                // (a vtable slot is always a class's own slot, never a
+                // record's — §9: "A record cannot derive from another record
+                // or from a class"), so the setter's class-gated retain
+                // (ensureIndexerAccessorFn / ensureIndexerSetterFn's class
+                // path) DID fire and the producer-RHS +1 was doubled. Drop
+                // the doubled +1 here — see emitProducerRelease's definition
+                // above for the predicate. Mirrors lowerVirtualPropertySet's
+                // `!isIfaceProp` unconditional emitProducerRelease exactly
+                // (the property-side analogue handles the same vtable path).
+                emitProducerRelease();
                 return true;
             }
         }
@@ -2061,6 +2150,28 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         if (!term) builder_.CreateBr(accEndBB);
         builder_.SetInsertPoint(accEndBB);
     }
+    // fix #2548 (§23.4/§28.9/§4.6, v0.236): the INLINE-SETTER twin of the
+    // interface-dispatch classBB / class-vtable emitProducerRelease calls
+    // above. The inline path is reached for two receiver shapes:
+    //   * a CLASS receiver with a NON-VIRTUAL indexer (no propSetSlot_ entry
+    //     in the vtable — #1080's own classification) — the inlined setter
+    //     body stores `value` into the class's backing field, and the
+    //     class-field store mints its own +1 (the same retain
+    //     ensureIndexerSetterFn / ensurePropertyAccessorFn's class-gated
+    //     retain does on the vtable path). A +1 producer RHS therefore
+    //     leaves a doubled reference here too; release it.
+    //   * a RECORD receiver — §9/§9.7: a record's reference fields are
+    //     borrows with no independent +1 and no disposer, so the inline
+    //     setter body does a PLAIN STORE. Releasing the producer here
+    //     would drop the field's only reference (UAF). Skip on records.
+    // Gated on `recvDecl->kind == Class` — same shape as
+    // lowerImportedPropertySetValue's `classOwned` gate at this file ~4038
+    // and lowerVirtualPropertySet's classBB (the latter via the runtime
+    // itable flag for the interface dispatch). The inline path never
+    // encounters an interface receiver (the interface branch above
+    // returned true first), so no itable flag read is needed here.
+    if (recvDecl->kind == ast::TypeDeclKind::Class)
+        emitProducerRelease();
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
@@ -2398,6 +2509,57 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     }
     if (setterExpr) lowerExpr(*setterExpr);
     else if (setterStmts) lowerScopedBlock(*setterStmts);
+    // fix #2567 (§23.4/§28.9/§4.6, v0.236): the COMPOUND-ASSIGNMENT twin of
+    // #2548's inline-body `emitProducerRelease()` (this file, line 2153-2154).
+    // `lowerIndexerCompound` desugars `a[i] OP= rhs` to `a[i] := a[i] OP rhs`:
+    //   * line 2452: `rhs = lowerExpr(*as.value)` — the rhs of the `+=`, e.g.
+    //     the +1 string producer from `"abc" + i.ToString()`.
+    //   * line 2464: `newVal = emitCompoundOp(op, cur, rhs, ...)` — a SECOND
+    //     +1 producer (emitStringConcat allocates rc=1 per #422).
+    //   * line 2488: `locals_[pd] = newVal` binds newVal as the setter's
+    //     implicit `value` parameter.
+    //   * line 2490-2491: setter body stores newVal to the class field.
+    //
+    // For a CLASS receiver, the setter (or inlined setter body) RETAINs its
+    // incoming value (§23.3 / §9), doubling newVal's +1. The plain-assignment
+    // path (`lowerIndexerSet`) closes this with a post-body `emitProducerRelease()`
+    // gated on `recvDecl->kind == Class`; the compound path had no analogue, so
+    // `h[i] += "abc" + i.ToString()` on a class indexer leaks 86 byte(s) per
+    // iteration (LSan-confirmed: 430 byte(s) direct + indirect across 5
+    // iterations of a 2-arg `+=` probe; the same shape leaks on a 1-arg
+    // indexer too — the gap is arity-independent, the same as `lowerIndexerSet`'s
+    // fix). The fix is the COMPOUND twin of that emitProducerRelease: after the
+    // setter body, drop newVal's doubled +1.
+    //
+    // BUT — and this is the subtle part — `rhs` ALSO leaks here. `rhs` is
+    // `lowerExpr(*as.value)`, a +1 string for `"abc" + i.ToString()`'s AST
+    // shape. `emitCompoundOp` does NOT consume rhs (it memcpy's its bytes
+    // into newVal and leaves rhs's +1 untouched). The plain-assignment path
+    // closes this via the SAME emitProducerRelease, gated on the outer value
+    // Expr's `isPlusOneStringProducer` predicate. We don't have the same AST
+    // context here (the outer "as" is a compound AssignmentStmt, whose `as.value`
+    // is the rhs AST — and that AST is itself a +1 producer for the canonical
+    // `"abc" + i.ToString()` shape). For the string-`+` case, rhs is a +1
+    // producer whose +1 was never discharged (the producer's whole life is
+    // here — line 2452's `lowerExpr` returns it; line 2464's emitStringConcat
+    // borrows it; the setter body stores newVal, NOT rhs). So rhs must be
+    // released here too.
+    //
+    // For a record receiver the setter plain-stores (§9/§9.7), so releasing
+    // would drop the field's only reference (UAF). Same gate as
+    // `lowerIndexerSet`'s inline-body emitProducerRelease at line 2153.
+    if (recvDecl->kind == ast::TypeDeclKind::Class) {
+        if (newVal && newVal->getType()->isPointerTy())
+            emitStringRelease(newVal);   // release the OP-result's +1
+        // For string `+=`, rhs is `lowerExpr(*as.value)` — a +1 string
+        // when the AST is a producer (e.g. BinaryExpr("+", ...)) but a
+        // BORROW when the AST is a named local (e.g. `s += t` where `t` is
+        // a tracked string local). Check the AST shape, not the LLVM
+        // pointer type: only release when the rhs is itself a +1 producer.
+        if (rhs && rhs->getType()->isPointerTy() && as.value.get() &&
+            isPlusOneStringProducer(as.value.get()))
+            emitStringRelease(rhs);      // release the rhs's +1 (producer)
+    }
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
@@ -2532,6 +2694,61 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
             isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
             isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
         if (!newVal) return false;
+        // fix #2596 (§23.4 / §28.9 / §4.6, v0.236): the DICT compound-assignment
+        // leak on a borrowing Dictionary<K,string> (and SortedDictionary<K,string>).
+        // The compound desugar `d[k] += rhs` mints TWO +1 string producers for a
+        // string value: `rhs = lowerExpr(*as.value)` (a +1 for the canonical
+        // BinaryExpr `"abc" + i.ToString()`) and `newVal = emitCompoundOp(...)`
+        // which dispatches to emitStringConcat (a SECOND +1, per #422 — always
+        // rc=1 regardless of whether rhs is itself a producer or a borrow). The
+        // write-back below delegates to lowerCollectionIndexerSet, whose #429
+        // borrowing-Dictionary<K,string> retain fires whenever valueExpr is null
+        // OR not a +1 producer — and the compound path passed valueExpr=nullptr,
+        // so the retain fired UNCONDITIONALLY, bumping newVal from +1 to +2.
+        // The disposing setter then transferred only ONE +1 into the slot,
+        // orphaning the retain's +1 each iteration (LSan on origin/main: 100
+        // iterations of `d[0] += "abc" + i.ToString()` leaked 31485 byte(s)
+        // across 400 allocations — two direct leak sites of 3200B each: the
+        // spurious-retain'd newVal +1 and the rhs orphan +1; same shape as the
+        // #2587 Array<string> compound leak and the #2567 user-indexer leak).
+        //
+        // The fix: signal to lowerCollectionIndexerSet that newVal is ALREADY a
+        // +1 string producer (valIsFreshPlusOneString=true) so the #429 retain is
+        // skipped and the +1 transfers into the slot via the disposing setter
+        // (which also releases the displaced OLD value). Do NOT release newVal
+        // afterward — its +1 is the slot's own reference (a COLLECTION indexer
+        // TRANSFERs the +1, UNLIKE a CLASS property setter which RETAINs; see the
+        // OWNERSHIP GATE in the #2587 isStrElemArr branch above). Then release rhs
+        // when the AST is a +1 producer (emitStringConcat does NOT consume rhs —
+        // it memcpy's its bytes and leaves rhs's +1 untouched). A BORROW rhs (a
+        // named local) is NOT a producer; releasing it would UAF the local's only
+        // ref. Gate on the AST shape, not the LLVM pointer type. Mirrors the
+        // #2587 rhs-release (this file, the isStrElemArr branch ~L2785-2880) and
+        // the plain-set path's conditional retain exactly.
+        bool dictIsOwningC =
+            recvTy && recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            recvTy->headName() == "OwningDictionary";
+        bool isStrValDict =
+            !dictIsOwningC && valTy && !valTy->nullable &&
+            valTy->kind == sema::TypeRef::Kind::Primitive &&
+            valTy->primitive == sema::PrimitiveType::String &&
+            elementPolicyFor(valTy, /*owning=*/false).cat ==
+                ElementPolicy::Category::RuntimeManaged;
+        if (isStrValDict) {
+            bool ok = lowerCollectionIndexerSet(*ix, newVal,
+                /*valueExpr=*/nullptr, /*valIsFreshPlusOneString=*/true);
+            // rhs is a +1 producer when the AST is a BinaryExpr/string-interp/
+            // call (emitStringConcat does NOT consume rhs — it memcpy's its bytes
+            // and leaves rhs's +1 untouched). A BORROW rhs (a named local) is NOT
+            // a producer; releasing it would UAF the local's only ref at its
+            // scope end. Gate on the AST shape, not the LLVM pointer type. Mirrors
+            // the #2587 rhs-release (this file, isStrElemArr branch ~L2863).
+            if (ok && rhs && rhs->getType()->isPointerTy() && as.value.get() &&
+                isPlusOneStringProducer(as.value.get()))
+                emitStringRelease(rhs);
+            return ok;
+        }
         // Write back via lowerCollectionIndexerSet (encodes and dispatches to
         // bz_dict_set_str / bz_dict_set_gen, handling disposing variants).
         return lowerCollectionIndexerSet(*ix, newVal, /*valueExpr=*/nullptr);
@@ -2640,6 +2857,94 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
                 else
                     newVal = wrapNullableValue(elemTyRef, newVal);
             }
+        }
+    }
+
+    // fix #2587 (§23.3/§28.9/§4.6, v0.236): the COLLECTION-INDEXER compound-
+    // assignment leak on a borrowing Array<string> (and Stack<string> /
+    // Queue<string>). The compound desugar `arr[i] OP= rhs` mints TWO +1
+    // string producers for a string element: `rhs = lowerExpr(*as.value)` (a
+    // +1 for the canonical BinaryExpr `"abc" + i.ToString()`) and `newVal =
+    // emitCompoundOp(...)` which dispatches to emitStringConcat (a SECOND +1,
+    // per #422). The generic write-back below derives its disposer from
+    // elementPolicyFor, which returns disposerThunk=nullptr for a BORROWING
+    // string element (RuntimeManaged row, retainRelease=true) — so it falls to
+    // `bz_array_set` (a plain memcpy, no refcount management). That leaks
+    // THREE ways: (1) rhs's +1 is an orphan (emitStringConcat memcpy's rhs's
+    // bytes and leaves its +1 untouched), (2) the DISPLACED OLD slot value is
+    // never released (bz_array_set has no disposer), and (3) each iteration's
+    // newVal is byte-copied into the slot with no +1 bookkeeping. LSan on
+    // origin/main: 100 iterations of `arr[0] += "abc" + i.ToString()` leak
+    // 30961 byte(s) across 398 allocations (100 rhs headers + 99 displaced
+    // old-value headers + their byte buffers).
+    //
+    // The plain-assignment path (lowerCollectionIndexerSet, this file line
+    // ~957-987) closes this with a dedicated `isStrElemArr` branch: it emits
+    // `bz_array_set_disposing` with stringElementReleaseThunk() (which
+    // releases the displaced OLD slot value and memcpy's the new pointer in),
+    // retaining first only when the incoming value is a BORROW. The compound
+    // path had no analogue and fell through to the generic elementPolicyFor
+    // store (bz_array_set, the bug). This block is the COMPOUND twin: mirror
+    // that exact isStrElemArr branch.
+    //
+    // OWNERSHIP GATE — why newVal is NOT released here (UNLIKE #2567's class-
+    // property compound fix): a CLASS property setter RETAINs its incoming
+    // value (§23.3 / §9), doubling a +1 producer's refcount, so #2567
+    // releases the OP-result's "extra" +1 after the setter body. A COLLECTION
+    // indexer does NOT retain — it TRANSFERs the +1 into the slot (the
+    // disposing setter releases the OLD value and memcpy's the new pointer
+    // in, consuming exactly one +1). So newVal's +1 (from emitStringConcat)
+    // is the slot's own reference; releasing it here would UAF the slot.
+    // Only rhs's orphan +1 (when the AST is a producer) needs a caller-side
+    // release — a borrow rhs's +1 belongs to its own slot and must NOT be
+    // released (isPlusOneStringProducer gates this; a named-local rhs is a
+    // borrow → no release → no UAF). Same ownership model as the plain-set
+    // path's isStrElemArr branch (line ~975-987) and #429's dict-string fix.
+    {
+        const sema::TypeRef* sArrEl =
+            (!recvTy->genericArgs.empty()) ? recvTy->genericArgs[0] : nullptr;
+        bool sArrIsOwning =
+            recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            common::isOwningPrefixedName(recvTy->headName());
+        ElementPolicy sArrPol = elementPolicyFor(sArrEl, sArrIsOwning);
+        bool isStrElemArr =
+            !sArrIsOwning &&
+            sArrPol.cat == ElementPolicy::Category::RuntimeManaged &&
+            sArrEl && !sArrEl->nullable &&
+            sArrEl->kind == sema::TypeRef::Kind::Primitive &&
+            sArrEl->primitive == sema::PrimitiveType::String &&
+            recvTy->astNode && recvTy->astNode->name &&
+            !recvTy->astNode->name->parts.empty() &&
+            [](std::string_view n){
+                // #2598: IList<T> is array-backed + borrowing (issue #401),
+                // same bz_array_set ABI as Array<T>; admitted alongside the
+                // concrete borrowing families.
+                return n=="Array"||n=="Stack"||n=="Queue"||n=="IList";
+            }(recvTy->headName());
+        if (isStrElemArr) {
+            // newVal is +1 (emitStringConcat always mints rc=1). Transfer that
+            // +1 into the slot via the disposing setter, which also releases
+            // the displaced OLD value. Do NOT retain (newVal is already +1)
+            // and do NOT release newVal afterward (its +1 is the slot's).
+            llvm::AllocaInst* slot = entryAlloca(newVal->getType());
+            builder_.CreateStore(newVal, slot);
+            auto* setFn = declareC("bz_array_set_disposing",
+                llvm::Type::getVoidTy(llvm_),
+                {ptrTy(), i64(), ptrTy(), i64(), ptrTy()});
+            builder_.CreateCall(setFn,
+                {recv, idx, slot, builder_.getInt64(esz),
+                 stringElementReleaseThunk()});
+            // rhs is a +1 producer when the AST is a BinaryExpr/string-interp/
+            // call (emitStringConcat does NOT consume rhs — it memcpy's its
+            // bytes and leaves rhs's +1 untouched). A BORROW rhs (a named
+            // local) is NOT a producer; releasing it would UAF the local's
+            // only ref at its scope end. Gate on the AST shape, not the LLVM
+            // pointer type. Mirrors lowerIndexerCompound line ~2539 (#2567).
+            if (rhs && rhs->getType()->isPointerTy() && as.value.get() &&
+                isPlusOneStringProducer(as.value.get()))
+                emitStringRelease(rhs);
+            return true;
         }
     }
 
@@ -3066,6 +3371,11 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     auto  savedRef       = refParams_;
     auto  savedDispose   = disposeStack_;
     auto  savedLoop      = loopStack_;
+    // #2281 / §31.2: an accessor is a separate function. Preserve the caller's
+    // active try/finally frames across this nested emission; keep the parallel
+    // finally-body stack depth-aligned per §29.7.
+    auto  savedFinally   = finallyStack_;
+    auto  savedFinBodies = finallyBodyStack_;
     auto* savedUnwind    = unwindTarget_;
     auto* savedProp      = propagateBB_;
     auto* savedCaught    = currentCaughtExc_;
@@ -3087,7 +3397,7 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     paramSlots_.clear();
     refParams_.clear();
     disposeStack_.clear();
-    loopStack_.clear(); finallyStack_.clear();
+    loopStack_.clear(); finallyStack_.clear(); finallyBodyStack_.clear();
     unwindTarget_       = nullptr;
     propagateBB_        = nullptr;
     currentCaughtExc_   = nullptr;
@@ -3331,6 +3641,8 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     refParams_          = std::move(savedRef);
     disposeStack_       = std::move(savedDispose);
     loopStack_          = std::move(savedLoop);
+    finallyStack_       = std::move(savedFinally);      // #2281 / §31.2
+    finallyBodyStack_   = std::move(savedFinBodies);    // #2281 / §29.7
     unwindTarget_       = savedUnwind;
     propagateBB_        = savedProp;
     currentCaughtExc_   = savedCaught;
@@ -3752,15 +4064,90 @@ const ast::PropertyAccessor* Emitter::computedSetterOf(const ast::Expr& target) 
 bool Emitter::lowerPropertySet(const ast::Expr& target, const ast::Expr& value) {
     if (!computedSetterOf(target)) return false;
     llvm::Value* v = lowerExpr(value);
-    return v ? lowerPropertySetValue(target, v) : false;
+    // fix #2568: thread `value` through as valueExpr so lowerPropertySetValue
+    // can release a +1 producer passed directly to a CLASS-owned computed
+    // setter (see the comment on the lambda above). The `ref`/`out` write-
+    // back call site that uses lowerPropertySetValue with a pre-loaded `v`
+    // (no source expression in scope) is the emitAccessorRefArgWriteBacks
+    // call, which deliberately passes nullptr — leak-over-UAF is the safe
+    // direction there, identical to #2540's nullptr-NAMED-LOCAL choice for
+    // lowerIndexerSet.
+    return v ? lowerPropertySetValue(target, v, &value) : false;
 }
 
 
-bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
+bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
+                                    const ast::Expr* valueExpr) {
     const ast::PropertyAccessor* setter = computedSetterOf(target);
     if (!setter || !v) return false;
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(target));
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+    // fix #2568 (§23.3/§28.9/§4.6, v0.236): the LOCAL non-virtual computed-
+    // property setter path's missing producer release. The virtual/interface
+    // analogue `lowerVirtualPropertySet` (LlvmBackend_Exprs.cpp ~5106-5128) has
+    // emitted producer release since #2490/#2500/#2506; the indexer analogue
+    // `lowerIndexerSet` got the same lambda in #2548/#2567. This function (the
+    // block-setter / static-setter / compound-property / increment-property
+    // path) was the lone holdout: a +1 PRODUCER RHS (`"abc" + i.ToString()`,
+    // string interpolation, a closure-return method call, a box-return call to
+    // an Object/interface property target) passed directly to a CLASS-OWNED
+    // computed setter's inlined body is retained (the setter body stores it
+    // into the backing field, which routes through `lowerStringFieldStore`'s
+    // ARC — emitStringRetain/emitClosureRetain/emitBoxRetain), but no caller-
+    // side release fired to balance the retain, so the producer's +1 leaked
+    // out from under the caller's own reference. LSan-confirmed: 100
+    // iterations of `s.Name := "abc" + i.ToString();` against a non-virtual
+    // class computed property `set => _name := value;` leaked 3200 byte(s)
+    // direct + 590 byte(s) indirect (100 bz_string headers + 100 payload
+    // substrings), i.e. 32 + 5.9 ≈ 37 byte(s) per iteration, exactly the
+    // per-iteration pattern the issue brief observed. Pre-fix, every loop
+    // iteration leaked. Fix mirrors lowerIndexerSet's inline-body
+    // emitProducerRelease (`recvDecl->kind == Class` gate, applied below
+    // after the setter body) exactly: gated Class-only because a RECORD's
+    // setter body keeps the PLAIN STORE (§9/§9.7 — a record's reference
+    // fields are borrows with no independent +1 and no disposer), so the
+    // callee never retained and releasing here would drop the field's only
+    // reference (UAF, the live failure #2490/#2506/#2548 caught for the
+    // sibling sites).
+    //
+    // The lambda below is the single emitProducerRelease used by both the
+    // static and instance branches. Same predicates as
+    // lowerVirtualPropertySet's / lowerIndexerSet's / lowerIndexerCompound's
+    // / lowerImportedPropertySetValue's: isPlusOneStringProducer /
+    // isPlusOneClosureProducer / isUserMethodClosureReturnCall /
+    // isUserMethodBoxReturnCall, plus the §8.6 box target check.
+    auto emitProducerRelease = [&] {
+        if (valueExpr && isPlusOneStringProducer(valueExpr))
+            emitStringRelease(v);
+        else if (valueExpr && (isPlusOneClosureProducer(valueExpr) ||
+                               isUserMethodClosureReturnCall(valueExpr)))
+            emitClosureRelease(v);
+        else if (valueExpr && v && v->getType()->isPointerTy()) {
+            // fix #2500 (§23.3/§28.9, v0.236): the box twin of the string/
+            // closure release above — same isProducer predicate as
+            // lowerBoxFieldStore / lowerImportedPropertySetValue. Gated on the
+            // TARGET being Object/interface (and v a ptr): a value-typed
+            // property's source may be boxable in isolation but is not boxed
+            // here.
+            const sema::TypeRef* tgtTy = ctx_.exprType(target);
+            if (tgtTy && isObjectOrInterfaceTarget(tgtTy)) {
+                const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+                if ((srcTy && (isBoxableValueType(srcTy) ||
+                               isNullableValueTy(srcTy))) ||
+                    isUserMethodBoxReturnCall(valueExpr))
+                    emitBoxRelease(v);
+            }
+        }
+    };
+    // CLASS-OWNED PROPERTY gate (§9/§9.7): only release the producer on the
+    // CLASS path. Records' setter bodies plain-store, so the callee never
+    // retained and dropping the producer here would UAF the field's only ref.
+    // The static branch below has `ps->parent` set to the declaring class (a
+    // STATIC property's `parent` is its declaring type), so the same gate
+    // covers it. ENUM properties are blocked by `computedSetterOf` for
+    // non-block setters (#2499) and are not an active path here.
+    bool classOwned = ps->parent &&
+                      ps->parent->kind == ast::TypeDeclKind::Class;
     // per §23.3 / §13 / #476: a STATIC property has no receiver (`this`).
     // Mirrors the static-getter path in LlvmBackend_Exprs.cpp (the
     // "isStaticProp" branch). For static properties, skip receiver resolution
@@ -3786,6 +4173,13 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
         inlinedAccessorEnd_ = savedAccEnd;
         if (!term) builder_.CreateBr(accEndBB);
         builder_.SetInsertPoint(accEndBB);
+        // fix #2568: release the producer's +1 the static setter's body
+        // doubled via its field store. A static property's `ps->parent` is its
+        // declaring type (a class for `static` properties on a class), so
+        // classOwned already disambiguates class-vs-record for the static
+        // path. Records cannot have static properties per §10.5 anyway, so
+        // the gate is conservative-on-leak, correct-on-UAF.
+        if (classOwned) emitProducerRelease();
         return true;
     }
     // fix #2498 (§9.2/§9.4/§23, v0.236): mirrors lowerImportedPropertySetValue's
@@ -3868,6 +4262,11 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v) {
     if (!term) builder_.CreateBr(accEndBB);
     builder_.SetInsertPoint(accEndBB);
     currentThis_ = savedThis;
+    // fix #2568 (§23.3/§28.9/§4.6, v0.236): the INSTANCE-PATH twin of the
+    // static-path emitProducerRelease above. Same gate (classOwned) for the
+    // same record-UAF reason. See the long comment above the static branch
+    // for the full rationale and LSan reproduction.
+    if (classOwned) emitProducerRelease();
     return true;
 }
 
@@ -4119,7 +4518,81 @@ bool Emitter::lowerPropertyCompound(const ast::AssignmentStmt& as) {
         isUnsignedTargetExpr(*as.target),
         isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
         isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
-    return res ? lowerPropertySetValue(*as.target, res) : false;
+    // fix #2576 (§23.3/§28.9/§4.6, v0.236): the COMPOUND-PROPERTY twin of
+    // lowerIndexerCompound's #2567 fix (this file, line ~2531-2542), mirrored
+    // EXACTLY. `lowerPropertyCompound` desugars `s.Name OP= rhs` to
+    // `s.Name := s.Name OP rhs`:
+    //   * line 4349: `rhs = lowerExpr(*as.value)` — a +1 string when the AST
+    //     is a producer (e.g. BinaryExpr `+` `"abc" + i.ToString()`), a BORROW
+    //     when the AST is a named local (`s.Name += t`).
+    //   * line 4353: `res = emitCompoundOp(op, cur, rhs, ...)` — for a string
+    //     target emitCompoundOp dispatches to emitStringConcat (line ~204),
+    //     which ALWAYS mints a fresh rc=1 string (per #422), memcpy'ing both
+    //     operands' bytes into a distinct header. So `res` is +1 regardless of
+    //     whether `rhs` is a producer or a borrow.
+    //   * lowerPropertySetValue inlines the setter body, which stores `res`
+    //     into the backing field via lowerStringFieldStore's ARC — retain(res)
+    //     doubles res's +1 for a CLASS-owned property (§9/§23.3).
+    //
+    // TWO +1 producers can escape here, and #2568's valueExpr-based release
+    // (threading `as.value` so emitProducerRelease fires inside
+    // lowerPropertySetValue) closes only HALF the gap:
+    //   (1) `res`'s +1 — #2568 releases it ONLY when `isPlusOneStringProducer
+    //       (as.value)` is true, i.e. only for a PRODUCER rhs. For a BORROW rhs
+    //       (`s.Name += local`), as.value is a named IdentifierExpr (not a
+    //       producer), so #2568's release does NOT fire, yet res is still +1
+    //       from emitStringConcat — so res's doubled +1 leaks (LSan-confirmed:
+    //       100 iterations of `s.Name += local` leak 3200 byte(s) direct +
+    //       15250 byte(s) indirect, the accumulated field string never freed
+    //       because each displaced value's refcount was 2 not 1). This is the
+    //       compound-path gap #2567 closed for indexers by releasing `newVal`
+    //       UNCONDITIONALLY on (classOwned && pointer), NOT gated on the rhs
+    //       predicate.
+    //   (2) `rhs`'s +1 — a producer rhs (`"abc" + i.ToString()`) is a SECOND
+    //       orphan +1: emitStringConcat memcpy's rhs's bytes into res and
+    //       leaves rhs's own +1 untouched (LSan-confirmed: 37 byte(s)/iter on
+    //       top of the res leak — 3200 direct + 590 indirect for the producer
+    //       shape when the res release is also missing).
+    //
+    // The fix mirrors lowerIndexerCompound's #2567 structure EXACTLY: pass
+    // `nullptr` as valueExpr so #2568's narrower producer-only release does
+    // NOT fire inside lowerPropertySetValue (avoiding a double-release of res
+    // for the producer-rhs case), then release BOTH producers here after the
+    // setter body returns:
+    //   * `res` — released when classOwned && pointer (the emitStringConcat
+    //     +1; unconditional for any string compound, producer OR borrow rhs,
+    //     because emitStringConcat always mints +1).
+    //   * `rhs` — released when classOwned && pointer && isPlusOneString
+    //     Producer(as.value) (only a producer rhs carries its own +1; a borrow
+    //     rhs's +1 belongs to its own slot and must not be released).
+    // CLASS-only gate (§9/§9.7): a record's setter body plain-stores `res`,
+    // so res's +1 is the field's own reference — releasing would UAF the
+    // field (the live failure #2490/#2506/#2548 caught for sibling sites).
+    // The record-side compound leak is the §9/§9.7 auto-property gap tracked
+    // by #2577; do NOT widen this gate to records. res and rhs are DISTINCT
+    // allocations (emitStringConcat allocates a fresh header), so releasing
+    // rhs cannot UAF res or the field.
+    if (!res) return false;
+    // nullptr valueExpr: see the long comment above — #2576 handles res's
+    // release itself (mirroring #2567) rather than relying on #2568's
+    // narrower producer-only valueExpr release inside lowerPropertySetValue.
+    bool handled = lowerPropertySetValue(*as.target, res, nullptr);
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*as.target));
+    bool classOwned = ps && ps->parent &&
+                      ps->parent->kind == ast::TypeDeclKind::Class;
+    if (classOwned) {
+        if (res && res->getType()->isPointerTy())
+            emitStringRelease(res);  // release the OP-result's +1 (emitStringConcat)
+        // For string `+=`, rhs is `lowerExpr(*as.value)` — a +1 string when
+        // the AST is a producer (e.g. BinaryExpr("+", ...)) but a BORROW when
+        // the AST is a named local. Check the AST shape, not the LLVM pointer
+        // type: only release when rhs is itself a +1 producer. Mirrors
+        // lowerIndexerCompound line ~2539.
+        if (rhs && rhs->getType()->isPointerTy() && as.value.get() &&
+            isPlusOneStringProducer(as.value.get()))
+            emitStringRelease(rhs);  // release the rhs's orphan +1 (producer)
+    }
+    return handled;
 }
 
 
@@ -4200,8 +4673,8 @@ bool Emitter::argsCanFill(const std::vector<ast::Param>& params,
 llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         llvm::Value* v, const sema::TypeRef* targetTy,
         const ast::Expr* srcExpr, bool ownLazyPipeline,
-        bool* outOwningWrap) {
-    if (outOwningWrap) *outOwningWrap = false;
+        bool* outWrapMade, bool srcOwnedByCallee) {
+    if (outWrapMade) *outWrapMade = false;
     if (!v || !targetTy || !srcExpr) return v;
     if (!(targetTy->kind == sema::TypeRef::Kind::Named &&
           !targetTy->declaration && targetTy->astNode &&
@@ -4225,7 +4698,7 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // the ARGUMENT position (a BORROWED callee param) needs a call-site
     // temporary-disposal contract and is deferred (#1916).
     if (ownLazyPipeline && isLazyEnumerableType(actualTy)) {
-        if (outOwningWrap) *outOwningWrap = true;
+        if (outWrapMade) *outWrapMade = true;
         return drainLazyPipelineToOwnedIEnumerable(v, targetTy);
     }
     std::string_view an;
@@ -4270,8 +4743,23 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         // — a Stack<T> OUTER container traverses pop order, and a Stack<T>
         // ELEMENT's leaf wrap reuses #2471's reverse machinery — so this
         // dispatch is correct as-is for the nested shape too.
-        if (nestedIEnumViewNeeded(actualTy, targetTy))
+        if (nestedIEnumViewNeeded(actualTy, targetTy)) {
+            if (outWrapMade) *outWrapMade = true;
+            // fix #2299 / §28.9: callee-owned source → use the OWNING
+            // nested-array enumerator (its slot-1 Dispose frees BOTH the
+            // wrapper frame and the backing array exactly once). For
+            // borrowed source, keep the plain wrap.
+            if (srcOwnedByCallee) {
+                // The nested wrap currently doesn't have an owning variant;
+                // free the source immediately and return the plain wrap. The
+                // caller will dispose the wrapper frame (free(self)).
+                llvm::Value* wrap =
+                    wrapNestedArrayAsIEnumerable(v, actualTy, targetTy);
+                freeCollectionSourceNow(v);
+                return wrap;
+            }
             return wrapNestedArrayAsIEnumerable(v, actualTy, targetTy);
+        }
         // #2486 (stdlib §4.11 "Iteration order" v0.195; language spec §29.1,
         // agreeing with #2472's for-loop fix and #2471's explicit
         // .GetEnumerator() fix): a Stack<T>/OwningStack<T> widened to a pure
@@ -4283,12 +4771,29 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         // rather than minting a third implementation, so this path's element
         // order is structurally the SAME code as the explicit-GetEnumerator
         // and for-loop paths, not just independently re-derived to agree.
-        // The wrap stays a plain BORROW (mirrors wrapArrayAsIEnumerable's
-        // existing contract for this branch, unchanged by this fix): the
-        // source Stack remains the sole owner, so `outOwningWrap` is
-        // correctly left false for both Array/Queue and Stack here — no
-        // ownership question is introduced that wasn't already present for
-        // Array's identical borrowing wrap at this same call site.
+        // fix #2298 / §28.9: report `outWrapMade = true` so the caller
+        // (buildOrderedArgs) registers the scope-end iterEnumDispose that
+        // frees the wrapper frame (slot-1 Dispose = `free(self)` for both
+        // Array and Stack — only the frame, never the shared backing).
+        // fix #2299 / §28.9: at the RETURN coercion, a callee-owned Array/
+        // Queue source is wrapped in an OWNING enumerator (slot-1 Dispose
+        // frees the wrapper frame AND the backing array — the caller
+        // disposes the enumerator exactly once). A Stack/OwningStack source
+        // has no OWNING-wrap variant in this fix; the borrowing wrap is
+        // kept and the source is freed immediately after the wrap is built
+        // (the wrap's slot-1 Dispose is still `free(self)` on the caller's
+        // side, freeing only the wrapper frame — the backing was already
+        // reclaimed). A borrowed source keeps the plain wrap (the source's
+        // owner retains the disposal obligation).
+        if (outWrapMade) *outWrapMade = true;
+        if (srcOwnedByCallee) {
+            if (an == "Stack" || an == "OwningStack") {
+                llvm::Value* wrap = wrapStackAsIEnumerator(v, targetTy);
+                freeCollectionSourceNow(v);
+                return wrap;
+            }
+            return wrapOwnedArrayAsIEnumerable(v, targetTy);
+        }
         if (an == "Stack" || an == "OwningStack")
             return wrapStackAsIEnumerator(v, targetTy);
         return wrapArrayAsIEnumerable(v, targetTy);
@@ -4298,22 +4803,40 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
     // snapshot. Reuses the tested §389 Set lazy source (bz_lazy_from_set, which
     // snapshots the key table) and the #1916 drain (bz_lazy_to_array, which
     // materialises the array AND disposes the lazy source), so the only new
-    // object is the snapshot the returned enumerator owns. The SOURCE set is
-    // untouched — no element is retained, released, or disposed here, so an
-    // owning set still disposes each element exactly once at its own binder's
-    // scope end. `outOwningWrap` tells the caller it must dispose the enumerator.
+    // object is the snapshot the returned enumerator owns. fix #2299 / §28.9:
+    // the SOURCE set is no longer needed once the snapshot is taken (the
+    // snapshot is independent, owning its own key table) — the caller
+    // returns the OWNING-enumerator snapshot, while the source set is freed
+    // right here at the RETURN site. (Registering the free at scope end
+    // would race the caller's use of the returned wrapper.) The source local's
+    // normal reclaim is suppressed by §28.3, so this free is exactly-once.
     if (actualTy && (an == "Set" || an == "OwningSet")) {
         uint64_t ksz = 0;
         if (genericBackingType(actualTy, 0, /*isSet=*/true, &ksz)) {
             auto* setFn = declareC("bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
             llvm::Value* lazy = builder_.CreateCall(
                 setFn, {v, builder_.getInt64((int64_t)ksz)}, "setenum.lazy");
-            if (outOwningWrap) *outOwningWrap = true;
+            if (outWrapMade) *outWrapMade = true;
+            // fix #2299 / §28.9: free the source set right after the snapshot.
+            if (srcOwnedByCallee)
+                freeDictSourceNow(v);
             return drainLazyPipelineToOwnedIEnumerable(lazy, targetTy);
         }
     }
-    if (actualTy && isLinkedListTypeName(actualTy))
+    // fix #2298 / §28.9: LinkedList<T> widened to `IEnumerable<T>` here uses
+    // the plain borrow wrap (slot-1 Dispose = `free(self)`, the wrapper frame
+    // only). fix #2299 / §28.9: LinkedList has no OWNING-wrap variant in
+    // this fix; for a callee-owned return, free the source immediately after
+    // the wrap is built (the caller disposes the wrap frame only).
+    if (actualTy && isLinkedListTypeName(actualTy)) {
+        if (outWrapMade) *outWrapMade = true;
+        if (srcOwnedByCallee) {
+            llvm::Value* wrap = wrapLinkedListAsIEnumerable(v, targetTy);
+            freeLinkedListSourceNow(v);
+            return wrap;
+        }
         return wrapLinkedListAsIEnumerable(v, targetTy);
+    }
     // A user class implementing IEnumerable<T> (declaration-carrying). A source
     // whose type is ALREADY a declaration-less IEnumerable (an alias / another
     // wrapped value) has no declaration and passes through unchanged.
@@ -4322,6 +4845,146 @@ llvm::Value* Emitter::wrapAsIEnumerableForTarget(
         return wrapUserClassAsIEnumerable(v, actualTy->declaration, targetTy);
     return v;
 }
+
+// fix #2299 / §28.9: emit an immediate bz_array_free(v, null) for the
+// source Array-family collection, right at the RETURN coercion (NOT at
+// scope end — the return is about to hand the wrapping enumerator to the
+// caller, and any scope-end disposal would fire before the caller
+// finishes iterating the wrap and free the source out from under it).
+// Caller MUST only invoke when srcOwnedByCallee was true (a parameter/
+// field/already-IEnumerable source must stay borrowed — its owner keeps
+// the disposal obligation). The wrapper's slot-1 Dispose runs on the
+// caller's side and frees only the wrapper frame (the backing was
+// already reclaimed here).
+void Emitter::freeCollectionSourceNow(llvm::Value* v) {
+    if (!v) return;
+    auto* fn = declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy()});
+    builder_.CreateCall(fn, {v, llvm::ConstantPointerNull::get(ptrTy())});
+}
+
+// fix #2299 / §28.9: emit an immediate bz_dict_free(v, null) for the
+// source dict-backed Set after the snapshot.
+void Emitter::freeDictSourceNow(llvm::Value* v) {
+    if (!v) return;
+    auto* fn = declareC("bz_dict_free", llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy()});
+    builder_.CreateCall(fn, {v, llvm::ConstantPointerNull::get(ptrTy())});
+}
+
+// fix #2299 / §28.9: emit an immediate bz_llist_free(v, null) for the
+// source LinkedList after the wrap.
+void Emitter::freeLinkedListSourceNow(llvm::Value* v) {
+    if (!v) return;
+    auto* fn = declareC("bz_llist_free", llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy()});
+    builder_.CreateCall(fn, {v, llvm::ConstantPointerNull::get(ptrTy())});
+}
+
+// fix #2299 / §28.9: at the RETURN coercion, decide whether the source
+// expression is a callee-OWNED producer whose ownership transfer on `return`
+// must be honoured by the wrap site. Mirrors `registerIterableSourceDisposal`'s
+// `ownsSource` gate (the local-decl path's #943/#1911/#1069 sibling, §29.11):
+//   * a `new T(...)` for any reference type → owned (§28.3 K1).
+//   * a `move e` → owned (§28.8.1 transfer mark).
+//   * an IdentifierExpr naming a LOCAL whose initializer was a producer form
+//     (NewExpr, CallExpr) → owned — the local's `+1` flows out via §28.3.
+// Anything else (a parameter read, a field read, a method-call result whose
+// declared return is not `owned`, a borrow-init local, an IndexExpr, an
+// arbitrary shape) is a BORROW; we do not register the source-disposal here.
+// Conservative: only NEW-of-ref and producer-init LOCAL classify as Owned
+// (a wider net risks UAF on borrowed collections that share the slot with
+// another owner).
+bool Emitter::returnSourceIsCalleeOwnedCollection(const ast::Expr* src) const {
+    if (!src) return false;
+    // fix #2299: a fresh-owned producer. `new T(...)` of a CLASS (or interface)
+    // is a +1 producer; the new T(...) shorthand (`new(...)`) is the same
+    // NewExpr with `type` null but sema has recorded the resolved target as
+    // the NewExpr's exprType, so type-class is checked via exprType here.
+    // Array<T> is a borrowing collection (no ownable backing — stdlib §4.4),
+    // but the wrapped RESULT is what we own (the NewExpr mints a fresh
+    // bz_array_t); callee-ownership is recognized by the fact that the source
+    // is a class-typed NewExpr (a class has +1 disposal obligation at the
+    // allocation site). For non-class types (records, value builtins) we
+    // fall through — they have no ownership to transfer (no disposal site).
+    if (dynamic_cast<const ast::NewExpr*>(src)) {
+        const sema::TypeRef* rt = ctx_.exprType(*src);
+        if (rt && rt->kind == sema::TypeRef::Kind::Named) {
+            // Class or interface declaration → owned. For decl-NULL (builtin
+            // collection types — Array<T>, Set<T>, LinkedList<T>, etc.) we
+            // recognize them by name. Both cases are "fresh +1 producers
+            // where the wrapper must take ownership of the allocation".
+            if (rt->declaration) {
+                if (rt->declaration->kind == ast::TypeDeclKind::Class ||
+                    rt->declaration->kind == ast::TypeDeclKind::Interface)
+                    return true;
+            } else if (rt->astNode && rt->astNode->name &&
+                       !rt->astNode->name->parts.empty()) {
+                std::string_view n = rt->headName();
+                // Borrowing-family builtins (whose allocation is the source's
+                // sole bz_array_t / bz_llist_t) and the dict-backed Set. These
+                // are the cases the wrapAsIEnumerableForTarget branches handle
+                // (Array/Stack/Queue wrap, LinkedList wrap, dict-backed Set
+                // snapshot). Match them here so the OWNING/early-free logic
+                // in the wrap function applies.
+                if (n == "Array" || n == "OwningArray" || n == "OwningBuffer" ||
+                    n == "Stack" || n == "OwningStack" ||
+                    n == "Queue" || n == "OwningQueue" ||
+                    n == "LinkedList" || n == "OwningLinkedList" ||
+                    n == "Set" || n == "OwningSet" || n == "SortedSet" ||
+                    n == "Dictionary" || n == "OwningDictionary" ||
+                    n == "SortedDictionary")
+                    return true;
+            }
+        }
+        // Value-type NewExpr (record / built-in value type / non-collection
+        // class) is Borrowed — no ownership to transfer; falls through.
+        return false;
+    }
+    // `move e` — the §28.8.1 transfer mark moves ownership into the
+    // destination (here: the return wrapper), so the source local is freed
+    // exactly once at scope end (the UnwindIneligibleWalker suppresses the
+    // moved-from local's normal reclaim). The wrap can reuse that disposal:
+    // if `e` is a callee-owned local the underlying array/llist is the freed
+    // target. Conservatively only return true when the moved operand is
+    // itself a NEW or producer-init LOCAL (the cases that own something).
+    if (auto* un = dynamic_cast<const ast::UnaryExpr*>(src)) {
+        if (un->op == "move" && un->operand)
+            return returnSourceIsCalleeOwnedCollection(un->operand.get());
+        return false;
+    }
+    // An IdentifierExpr naming a local: the local is owned if and only if its
+    // initializer was a producer form (NewExpr/CallExpr). The bare-identifier
+    // alias case (`return b;` where `b` was `var b := a;`) is intentionally
+    // classified Borrowed — `a` still owns and disposes the collection, and
+    // registering a disposal here would double-free. The same shared predicate
+    // registerIterableSourceDisposal uses (`isCall || isNew`) for the local-
+    // decl `ownsSource` gate, so the two sites agree.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(src)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*id);
+        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym)) {
+            const ast::LocalDecl* ld =
+                dynamic_cast<const ast::LocalDecl*>(ls->decl);
+            if (!ld || !ld->initializer) return false;
+            if (dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                return true;
+            if (dynamic_cast<const ast::CallExpr*>(ld->initializer.get()))
+                return true;
+            return false;
+        }
+        // A ParameterSymbol, FieldSymbol, PropertySymbol, or a synthetic
+        // (sema-created) symbol is a BORROW by definition (§28.3 storage-
+        // lends + §28.6 no transfer without an explicit move mark).
+        return false;
+    }
+    // Method-call results, member-access, index, ternary, etc. — the
+    // narrower forms above already cover the typical RETURN shapes; a deeper
+    // ownership analysis (call-return-is-owned) is deliberately out of scope
+    // for this fix — err on the BORROW side.
+    return false;
+}
+
+// §29.2 (#437): generate a type-specific, vtable-backed array enumerator.
 
 // §29.2 (#437): generate a type-specific, vtable-backed array enumerator.
 // Layout:  { ptr vtable, ptr arr, i64 idx, i64 esz }
@@ -6134,6 +6797,11 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
     auto  savedRef      = refParams_;
     auto  savedDispose  = disposeStack_;
     auto  savedLoop     = loopStack_;
+    // #2281 / §31.2: the expression-getter thunk is a separate function.
+    // Preserve the caller's active try/finally frames across nested emission;
+    // finallyBodyStack_ stays depth-aligned per §29.7.
+    auto  savedFinally   = finallyStack_;
+    auto  savedFinBodies = finallyBodyStack_;
     auto* savedUnwind   = unwindTarget_;
     auto* savedProp     = propagateBB_;
     auto* savedCaught   = currentCaughtExc_;
@@ -6146,6 +6814,7 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
     currentThis_       = &*fn->args().begin();
     locals_.clear(); paramSlots_.clear(); refParams_.clear();
     disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+    finallyBodyStack_.clear();
     unwindTarget_      = nullptr; propagateBB_ = nullptr;
     currentCaughtExc_  = nullptr; unwindScopeDepth_ = 0;
     diverged_          = false; genericSubst_.clear();
@@ -6166,6 +6835,8 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
     refParams_         = std::move(savedRef);
     disposeStack_      = std::move(savedDispose);
     loopStack_         = std::move(savedLoop);
+    finallyStack_      = std::move(savedFinally);       // #2281 / §31.2
+    finallyBodyStack_  = std::move(savedFinBodies);     // #2281 / §29.7
     unwindTarget_      = savedUnwind;
     propagateBB_       = savedProp;
     currentCaughtExc_  = savedCaught;
@@ -6842,8 +7513,13 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
     // #1918 / §28.3: slots of bare owned local/param arguments transferred to an
     // `owned` parameter — nulled below at the "call about to run" point when
     // `nullTransferredOwned` is set (the ordinary user-method call path). See the
-    // discharge block and the header comment.
-    std::vector<llvm::AllocaInst*> transferredOwnedArgSlots;
+    // discharge block and the header comment. #2310 / §29.8 / §30.1 (#973a
+    // residual): keep the source EXPRESSION alongside each slot so the same
+    // "about to run" point can also null the FRAME capture slot of an `owned`
+    // state-machine parameter — covering forms 3 (`M(owned p)`) and 6
+    // (`new Ctor(owned p)`). // per §28.3, §29.8, §30.1
+    std::vector<std::pair<llvm::AllocaInst*, const ast::Expr*>>
+        transferredOwnedArgSlots;
     for (const auto& a : args) {
         std::size_t idx = params.size();
         if (a.name.empty()) {
@@ -6878,7 +7554,8 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                     eligible = (ps->modifier == "owned");
                 if (eligible)
                     if (llvm::AllocaInst* s = localSlot(*id)) {
-                        transferredOwnedArgSlots.push_back(s);
+                        transferredOwnedArgSlots.emplace_back(
+                            s, a.value.get());
                         // #1990 / #1992 / §28.3: a bare owned local/param whose
                         // ownership transfers into an `owned` argument has its
                         // auto-dispose registered by registerUnwindOwnedLocal /
@@ -7276,21 +7953,33 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // fix #1069 / stdlib §4.10: the SAME contract now also covers a
             // DICT-backed `Set<T>` argument — its wrap snapshots the key table
             // into a fresh array behind an OWNING enumerator, a caller temporary
-            // with the identical disposal obligation. `owningArgWrap` is the
-            // wrap's own report of "this result is owned"; it is true for exactly
-            // the lazy-pipeline case (so the pre-existing behaviour is unchanged)
-            // and the new set-snapshot case. A CLASS-element set takes the
-            // BORROWING array wrap and reports false — nothing extra to dispose.
-            bool owningArgWrap = false;
+            // with the identical disposal obligation. `wrapMade` is the wrap's
+            // own report of "this call allocated a fresh wrapper the caller must
+            // dispose"; it is true for the lazy-pipeline case (owning), the
+            // dict-backed-set snapshot case (owning), and the Array/Stack/Queue/
+            // LinkedList wrap cases (borrowing — slot-1 Dispose is `free(self)`,
+            // the wrapper frame only, NEVER the shared backing). A CLASS-element
+            // set takes the BORROWING array wrap and reports true here so the
+            // wrapper frame is freed exactly once. fix #2298 / §28.9: before
+            // this, only the OWNING cases registered the iterEnumDispose, so
+            // every borrowing wrap leaked its 32-byte frame — silently unbounded
+            // in loops. Now both shapes share the same scope-end disposal, and
+            // the non-owning slot-1 Dispose (free(self) only, NEVER the shared
+            // backing) preserves the source's own ownership.
+            bool wrapMade = false;
             v = wrapAsIEnumerableForTarget(v, formalTy, a.value.get(),
                                            /*ownLazyPipeline=*/lazyArgWrapped,
-                                           &owningArgWrap);
-            if (owningArgWrap && v && v->getType()->isPointerTy() &&
+                                           &wrapMade);
+            if (wrapMade && v && v->getType()->isPointerTy() &&
                 !disposeStack_.empty()) {
                 llvm::AllocaInst* eslot = entryAlloca(v->getType());
                 builder_.CreateStore(v, eslot);
                 Disposal d{eslot, nullptr};
-                d.iterEnumDispose = true;  // slot-1 Dispose: free drained array + frame
+                d.iterEnumDispose = true;  // slot-1 Dispose: free wrapper frame
+                                            // (owning cases also free drained
+                                            // array; borrowing cases free only
+                                            // the frame — never the shared
+                                            // backing, exactly-once).
                 disposeStack_.back().push_back(d);
             }
             // §9 / §9.1 (#1759): passing `this` of a record method by value —
@@ -7510,13 +8199,19 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
     // live and the unwind disposal reclaims it (the #1918 leak). Mirrors how an
     // explicit `x.Dispose()` / `_ := x` discharge nulls the slot for the same
     // null-guarded machinery. // per §28.3
-    for (llvm::AllocaInst* slot : transferredOwnedArgSlots) {
+    for (auto& [slot, srcExpr] : transferredOwnedArgSlots) {
         if (!slot) continue;
         llvm::Type* ety = nullptr;
         llvm::Value* addr = boxedStorage(slot, ety);
         if (addr && ety && ety->isPointerTy())
             builder_.CreateStore(
                 llvm::ConstantPointerNull::get(ptrTy()), addr);
+        // #2310 / §29.8 / §30.1 (#973a residual): also null the FRAME capture
+        // slot of an `owned` state-machine PARAMETER this call just consumed —
+        // forms 3 (`M(owned p)`) and 6 (`new Ctor(owned p)`). Self-gating (no-op
+        // outside a state-machine body, for non-parameter sources, for non-owned
+        // parameters). per §29.8 / §30.1
+        nullStateMachineOwnedParamCapture(srcExpr);
     }
     return true;
 }
@@ -7548,6 +8243,15 @@ void Emitter::nullTransferredOwnedLocalSlot(const ast::Expr* argValue) {
     llvm::Value* addr = boxedStorage(slot, ety);
     if (addr && ety && ety->isPointerTy())
         builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
+    // #2310 / §29.8 / §30.1 (#973a residual): when the source is an `owned`
+    // state-machine PARAMETER, also null its FRAME capture slot — so the
+    // frame's terminal-state disposal (null-guarded) skips the just-transferred
+    // parameter on the discharging path. Covers every call site of this helper:
+    // the `y := owned p` assignment marker (form 4) and the owning-collection
+    // element transfer Add / Insert / Set (form 5). Self-gating — no-op outside
+    // a state-machine body, for non-parameter sources, for non-owned parameters.
+    // per §29.8 / §30.1
+    nullStateMachineOwnedParamCapture(argValue);
 }
 
 

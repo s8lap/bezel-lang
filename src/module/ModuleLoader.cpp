@@ -2151,6 +2151,44 @@ static void loadMetadataPass2(
         for (const MetaExtension& me : md.extensions) {
             auto decl = std::make_unique<ast::ExtensionDecl>();
             decl->visibility = fromMetaVisibility(me.visibility);
+            // §26.5 rule 4 (#2329): restore the exporter-stamped declaration
+            // site on the synthetic node. `sourceFile` is separate because the
+            // shared SourceSpan intentionally carries positions only.
+            decl->sourceFile = me.sourceSpan.file;
+            decl->span.begin.line = me.sourceSpan.beginLine;
+            decl->span.begin.column = me.sourceSpan.beginColumn;
+            decl->span.end.line = me.sourceSpan.endLine;
+            decl->span.end.column = me.sourceSpan.endColumn;
+            // The wire payload keeps each constraint as source-like text. Reuse
+            // the language parser to reconstruct GenericConstraint exactly,
+            // rather than duplicating A.3's type/constraint grammar here.
+            if (!me.genericConstraints.empty()) {
+                std::string constraintSource =
+                    "module _2329_imported_extension_constraints; extension int ";
+                for (const std::string& text : me.genericConstraints) {
+                    constraintSource += text;
+                    constraintSource += ' ';
+                }
+                constraintSource += "end;";
+                DiagnosticEngine constraintDiag;
+                Lexer constraintLexer(constraintSource, constraintDiag);
+                Parser constraintParser(constraintLexer, constraintDiag);
+                auto constraintAst = constraintParser.parseCompilationUnit();
+                if (constraintAst && !constraintDiag.hasErrors()) {
+                    for (auto& top : constraintAst->topDecls) {
+                        auto* parsed =
+                            dynamic_cast<ast::ExtensionDecl*>(top.get());
+                        if (!parsed) continue;
+                        decl->genericConstraints =
+                            std::move(parsed->genericConstraints);
+                        break;
+                    }
+                    // GenericConstraint strings and nested Type spellings are
+                    // string_views into this buffer; keep it alive with the
+                    // rest of the imported AST state.
+                    ctx.ownImportedSource(std::move(constraintSource));
+                }
+            }
             auto targetTy = std::make_unique<ast::Type>();
             targetTy->kind = ast::TypeKind::Named;
             targetTy->name = std::make_unique<ast::QualifiedName>();

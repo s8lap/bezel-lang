@@ -1879,7 +1879,12 @@ void Emitter::declareFunctions() {
     // SemaContext's IMPORTED list (not `ctx_.symbols()`), so the loops above —
     // which both declare AND emit bodies — never touched them; this is the only
     // codegen path that engages imports, and only when imports were loaded.
-    if (ctx_.hasImports()) declareImportedFunctions();
+    // §26.5 step 2 (#2573): an extension-only dependency registers its
+    // `public extension` methods in importedSymbols_ but no exported types, so
+    // hasImports() is false — OR in hasImportedExtensions() or the imported
+    // `bz$ext$<T>$<M>` is never declared and the call lowers to a zero/null
+    // value (the latent #2491 "return-value expression failed to lower").
+    if (ctx_.hasImports() || ctx_.hasImportedExtensions()) declareImportedFunctions();
 
     // §2.5 / §2.6 / §28.4 (issue #328 item 1): declare each IMPORTED class's
     // external `bz$<Type>$Dispose` and register it in disposerFns_, so a `using
@@ -6267,7 +6272,10 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             if (v && currentReturnTypeNode_)
                 v = wrapAsIEnumerableForTarget(
                     v, ctx_.resolvedType(*currentReturnTypeNode_), ci.exprBody,
-                    /*ownLazyPipeline=*/true);
+                    /*ownLazyPipeline=*/true,
+                    /*outWrapMade=*/nullptr,
+                    /*srcOwnedByCallee=*/
+                    returnSourceIsCalleeOwnedCollection(ci.exprBody));
             // #694 residue-1 / §4.6 / §28.9 / §28.3: an arrow-body (`=> expr`)
             // string-returning method must mint EXACTLY +1 just like the explicit
             // ReturnStmt path (LlvmBackend_Stmts.cpp line ~750). Without this,
@@ -8057,12 +8065,53 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     }
     std::vector<llvm::Value*> args;
     args.push_back(currentThis_);
-    for (const auto& a : call->args) {
-        if (!a.value) return;
-        llvm::Value* v = lowerExpr(*a.value);
+    // fix #2579 / §22.3: a `ref`/`out` argument to a `base(...)`/`this(...)`
+    // chain call must pass the argument's ADDRESS — the compiled chain-target
+    // ctor's signature uses `ptr` for ref/out params (CG50, isByRefMod) — not
+    // its loaded value. The bare `lowerExpr` here passed the loaded value,
+    // producing malformed IR (`call @ctor(ptr, i32)` against a `(ptr, ptr)`
+    // signature) that `verifyModule` rejects. Mirror lowerCall's imported-
+    // method arg path (LlvmBackend_Calls2.cpp) and the #2319 ctor sites:
+    // `lvalueAddr` for the alias path (local/field/static/§15.1 inline-array
+    // element), the §22.3 copy-in/copy-out bracket (emitAccessorRefArgCopyIn)
+    // for an accessor-mediated location (indexer slot / property), with the
+    // copy-OUT flushed after the chain target runs (see both consuming paths
+    // below). §22.3 puts no restriction on ref/out params in a chain call.
+    std::vector<AccessorRefArg> accessorRefArgs;
+    for (std::size_t ai = 0; ai < call->args.size(); ++ai) {
+        const auto& a = call->args[ai];
+        if (!a.value) {
+            // fix #2579: the call never runs — release any bracket pins
+            // recorded by earlier args so their refcount isn't stranded.
+            emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
+            return;
+        }
+        // The formal modifier lives on the chain TARGET ctor's params.
+        std::string_view formalMod;
+        if (ai < target->params.size())
+            if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    target->params[ai]))
+                formalMod = ps->modifier;
+        llvm::Value* v = nullptr;
+        if (isByRefMod(a.modifier) || isByRefMod(formalMod)) {
+            // §22.3 alias path: a true-alias location has an address the
+            // callee writes through directly.
+            llvm::Type* et = nullptr;
+            v = lvalueAddr(*a.value, et);
+            // §22.3 bracket path: an indexer slot / property has no address
+            // to alias; emit the copy-IN and record the copy-OUT, restricted
+            // to plain ref/out (out owned etc. are not bracket-admitted,
+            // §22.3) — exactly the imported-method fallback in lowerCall.
+            if (!v && (formalMod == "ref" || formalMod == "out"))
+                v = emitAccessorRefArgCopyIn(
+                    *a.value, /*paramTy=*/nullptr,
+                    /*isOut=*/formalMod == "out", accessorRefArgs);
+        } else {
+            v = lowerExpr(*a.value);
+        }
         if (!v) {
-            // #1386: ICE — lowerExpr returned null for a base-ctor argument;
-            // the expression kind is not yet handled by codegen.
+            // #1386: ICE — the expression kind is not yet handled by codegen.
+            emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
             ctx_.diagnostics().report(
                 Severity::Error, a.value->span.begin,
                 "internal: lowerExpr returned null for base-constructor "
@@ -8126,14 +8175,31 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             llvm::Value* subObj = currentThis_;
             auto savedLocals = locals_;
             auto savedParams = paramSlots_;
+            auto savedRefParams = refParams_;  // fix #2579
             llvm::BasicBlock* savedUnwindTarget = unwindTarget_;
             std::size_t savedUnwindDepth = unwindScopeDepth_;
             locals_.clear();
             paramSlots_.clear();
+            // fix #2579 / §22.3: bind the chained ctor's params. A ref/out
+            // param's arg is now the caller's storage ADDRESS (alias path) or
+            // the §22.3 copy-in slot (bracket path) — register it in
+            // refParams_ so the inlined body's reads/writes dereference
+            // through it, exactly as bindParameters does for a compiled ctor's
+            // ref param. Without this the body loaded the pointer itself
+            // (the #2283 shape, on the chain-call inline path). A plain param
+            // keeps the paramSlots_ binding the inline path always used.
             for (std::size_t pi = 0; pi < target->params.size(); ++pi) {
-                auto* slot = entryAlloca(args[pi + 1]->getType());
-                builder_.CreateStore(args[pi + 1], slot);
-                paramSlots_[target->params[pi]] = slot;
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    target->params[pi]);
+                if (ps && isByRefMod(ps->modifier)) {
+                    llvm::Type* elemTy =
+                        ps->declType ? lowerType(ps->declType) : i32();
+                    refParams_[target->params[pi]] = {args[pi + 1], elemTy};
+                } else {
+                    auto* slot = entryAlloca(args[pi + 1]->getType());
+                    builder_.CreateStore(args[pi + 1], slot);
+                    paramSlots_[target->params[pi]] = slot;
+                }
             }
             inlineCtorBody(target, subObj);
             unwindTarget_ = savedUnwindTarget;
@@ -8141,6 +8207,13 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             currentThis_ = subObj;
             locals_ = std::move(savedLocals);
             paramSlots_ = std::move(savedParams);
+            refParams_ = std::move(savedRefParams);
+            // fix #2579 / §22.3: flush the copy-OUT of every accessor-mediated
+            // ref/out argument now that the inlined chain-target body has
+            // returned normally (!diverged_) — skipped on the throw edge per
+            // §22.3's "on an exception exit no write-back occurs". Mirrors
+            // lowerCall's post-call discipline.
+            emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/!diverged_);
             if (restoredSubstForBase) {
                 genericSubst_ = std::move(savedSubstForBase);
                 genericSubstSemaTy_ = std::move(savedSemaTyForBase);
@@ -8154,6 +8227,16 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
     }
     if (args.size() == it->second->arg_size()) {
         builder_.CreateCall(it->second, args);
+        // fix #2579 / §22.3: flush the copy-OUT of every accessor-mediated
+        // ref/out argument now that the chain-target ctor call has returned
+        // normally (!diverged_) — skipped on the throw edge per §22.3's "on
+        // an exception exit no write-back occurs". Mirrors lowerCall's
+        // post-call discipline.
+        emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/!diverged_);
+    } else {
+        // fix #2579: arg-count mismatch — the call never ran, so no §22.3
+        // write-back is owed; release the bracket pins.
+        emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);
     }
 }
 
@@ -13526,6 +13609,66 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
             }
         }
     }
+    // fix #2304 / §11 (properties) / §4.6 / §28.9: an EXPRESSION-BODIED string
+    // PROPERTY read `obj.Tag` (a MemberAccessExpr — NOT a CallExpr) mints +1
+    // through the same path as the property's own getter body. `isUserMethodStringReturnCall`
+    // does not see it (the syntactic form is a MemberAccessExpr, not a CallExpr
+    // to a MethodSymbol), so without this arm the consumer (a `var s := obj.Tag;`
+    // bound local, a ctor-arg, a return-value, a field-store, a WriteLine-arg)
+    // retained the result as if it were a BORROW and never discharged the
+    // producer's +1 — leaking the freshly-allocated bz.string header +
+    // data buffer at scope end (37 bytes / 2 allocations per read, scaling
+    // with any loop over a string property). The shape is matched via the
+    // SAME `computedGetterOf` predicate lowerPropertyRead keys on: an
+    // expression-bodied property (PropertyDecl with bodyKind == Expression,
+    // the `=>` form) OR a block-getter with an expression body (`{ get => expr; }`)
+    // is a +1 string producer iff its body expression is itself a +1 producer.
+    // Recursing isPlusOneStringProducer on the body handles every existing
+    // producer shape (`+`/interpolation/case/if/??/substring/transforming-method/
+    // ToString/user-method) — a block-getter that returns a borrow, an imported
+    // string-returning property, an indexer `obj[i]`, or a property whose body
+    // is not a recognized producer all correctly return false here (the body
+    // arms of isPlusOneStringProducer handle the borrow/imported paths, and
+    // block getters with a statement body return null from computedGetterOf
+    // so the arm never fires — sound, the safe-direction leak remains in those
+    // unfixed shapes, in lockstep with the other `isUserMethodStringReturnCall`
+    // exclusions above). Indexers and non-string properties are excluded by
+    // the type/symbol gate below.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(init)) {
+        sema::Symbol* sym = ctx_.exprSymbol(*ma);
+        if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
+            if (!ps->isIndexer) {
+                const sema::TypeRef* ty = ctx_.exprType(*init);
+                if (ty && ty->kind == sema::TypeRef::Kind::Primitive &&
+                    ty->primitive == sema::PrimitiveType::String &&
+                    !ty->nullable) {
+                    // Inline the predicate that computedGetterOf keys on
+                    // (isPlusOneStringProducer is `const`, but computedGetterOf
+                    // is not — duplicating the small constant-time check here
+                    // keeps this const-correct without widening the API):
+                    // an expression-bodied property, OR a block-getter with an
+                    // expression body.
+                    auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+                    const ast::Expr* getter = nullptr;
+                    if (pd && !pd->isIndexer) {
+                        if (pd->bodyKind == ast::PropertyBodyKind::Expression)
+                            getter = pd->exprBody.get();
+                        else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+                            for (const auto& acc : pd->accessors) {
+                                if (!acc.isSet &&
+                                    acc.bodyKind ==
+                                        ast::PropertyAccessorBodyKind::Expression) {
+                                    getter = acc.exprBody.get();
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (getter && isPlusOneStringProducer(getter)) return true;
+                }
+            }
+        }
+    }
     return false;
 }
 
@@ -13712,6 +13855,51 @@ bool Emitter::lowerStringLocalReassign(const ast::Expr& target,
     if (const sema::TypeRef* tt = ctx_.exprType(target))
         if (tt->nullable) return false;
     llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "strl.old");
+    if (!isPlusOneStringProducer(valueExpr))
+        emitStringRetain(newVal);
+    builder_.CreateStore(newVal, slotAddr);
+    emitStringRelease(oldVal);
+    return true;
+}
+
+
+// #2321 / §22.3 / §28.9: REASSIGNMENT through a string-typed `ref`/`out` PARAMETER.
+// The store through the alias is an ordinary assignment to the caller's slot
+// (per §22.3's "`ref` argument naming a mutable local or writable field is a
+// true alias"), so §28.9 demands the same retain-new (transfer a producer) /
+// release-old balance the local-slot and field-store paths emit. Without this
+// the callee's `s := s + "!"` plain-stores the new heap string into the
+// caller's slot: the caller's previous value is now orphaned (no release) and
+// the new value's +1 leaks (the caller's slot has no other owner). lowerStringLocalReassign
+// does not fire because localSlot(target) returns null for a ref-param (the
+// param lives in refParams_, not locals_/paramSlots_); lowerStringFieldStore does
+// not fire because the target is not a class field. Mirrors lowerStringLocalReassign
+// exactly — same load-old / retain-or-transfer / store-new / release-old order,
+// null-safety from bz_string_retain/release, retain-before-release keeping a
+// self-assignment safe — gated on (a) target being a ref/out string-typed param
+// and (b) elemTy a bare `ptr` (the !nullable restriction matches the local-
+// reassign helper, to keep the surface in step with bind-time arming). The
+// caller-side slot owns the +1; the callee-side refParamAddr simply points at
+// it, so a store through the alias is the same kind of slot ownership change
+// the local-reassign path balances.
+bool Emitter::lowerStringRefParamStore(const ast::Expr& target,
+                                      llvm::Value* slotAddr, llvm::Type* elemTy,
+                                      llvm::Value* newVal,
+                                      const ast::Expr* valueExpr) {
+    if (!slotAddr || !newVal) return false;
+    if (!newVal->getType()->isPointerTy()) return false;
+    if (!elemTy || !elemTy->isPointerTy()) return false;  // not a `ptr` slot
+    if (!isStringExprType(target)) return false;            // not string-typed
+    // Confirm the target is a `ref`/`out` param — a local-slot reassignment
+    // would have been caught by lowerStringLocalReassign; this helper exists
+    // for the ref/out alias shape specifically.
+    if (!dynamic_cast<const ast::IdentifierExpr*>(&target)) return false;
+    sema::Symbol* sym = ctx_.exprSymbol(target);
+    if (!sym) return false;
+    if (refParams_.find(sym) == refParams_.end()) return false;
+    if (const sema::TypeRef* tt = ctx_.exprType(target))
+        if (tt->nullable) return false;  // mirror local-reassign restriction
+    llvm::Value* oldVal = builder_.CreateLoad(ptrTy(), slotAddr, "strrp.old");
     if (!isPlusOneStringProducer(valueExpr))
         emitStringRetain(newVal);
     builder_.CreateStore(newVal, slotAddr);
@@ -15229,7 +15417,8 @@ bool Emitter::lowerClosureFieldStore(const ast::Expr& target,
 bool Emitter::isUserMethodBoxReturnCall(const ast::Expr* init) const {
     auto* call = dynamic_cast<const ast::CallExpr*>(init);
     if (!call || !call->callee) return false;
-    auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(*call->callee));
+    auto* sym = ctx_.exprSymbol(*call->callee);
+    auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
     if (!ms) return false;
     if (ms->isOperator) return false;
     if (ctx_.isImported(ms)) return false;
@@ -15406,12 +15595,19 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     bool collIsOwning =
         collTy && collTy->astNode && collTy->astNode->name &&
         !collTy->astNode->name->parts.empty() &&
-        common::isOwningPrefixedName(collTy->headName());
+        (common::isOwningPrefixedName(collTy->headName()) ||
+         // #2606 / stdlib §4.5: IOwningList<T> is the OWNING list interface,
+         // but isOwningPrefixedName("IOwningList") is false — consult the
+         // interface recognizer (matches owned OwningArray<T>).
+         isOwningListInterfaceName(collTy));
 
     ElementPolicy pol = elementPolicyFor(collElem, collIsOwning);
     llvm::Function* elemDisp = pol.disposerThunk;
     // §28.11: borrowing Array/Stack/Queue<string> co-owns a +1 per element
     // (retainRelease path); use the string-release thunk. Mirrors §2200-§2208.
+    // #2603 / issue #401: IList<T>/IReadOnlyList<T> are array-backed + borrowing
+    // (same bz_array_t* + per-element string +1 as Array<T>), so a string-element
+    // field of those interface types releases its elements through the SAME thunk.
     if (!elemDisp && !isDict &&
             pol.cat == ElementPolicy::Category::RuntimeManaged &&
             collElem &&
@@ -15420,8 +15616,10 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
             !collElem->nullable &&
             collTy && collTy->astNode && collTy->astNode->name &&
             !collTy->astNode->name->parts.empty() &&
-            [](std::string_view n){ return n == "Array" || n == "Stack" ||
-                n == "Queue"; }(collTy->headName()))
+            [](std::string_view n){
+                return n == "Array" || n == "Stack" || n == "Queue" ||
+                       n == "IList" || n == "IReadOnlyList";
+            }(collTy->headName()))
         elemDisp = stringElementReleaseThunk();
 
     llvm::Value* disp = elemDisp
@@ -17396,11 +17594,42 @@ void Emitter::collectSafeViewAliases(
 // Object/interface target boxForTarget never boxes (the local takes the value
 // type directly). Mirrors the boxForTarget gate in lowerLocalDecl exactly.
 bool Emitter::isPlusOneBoxProducer(const ast::LocalDecl* ld) {
-    if (!ld || !ld->type || !ld->initializer) return false;
-    const sema::TypeRef* declTy = ctx_.resolvedType(*ld->type);
-    if (!isObjectOrInterfaceTarget(declTy)) return false;
+    // fix #2304 / §8.6 / §28.9: an INFERRED Object local (`var x := MakeBox(7);`
+    // — no `: Object` annotation) is also a +1 box producer when its initializer
+    // is a box-return method call. The DECLARED-TARGET gate above short-circuits
+    // on inferred locals (ld->type is null), so case (b) below never fires for
+    // them and the local leaks (the box the callee minted) at scope end (a
+    // 24-byte Direct leak per iteration — the half of the #2060 fix the call-
+    // result form was missing). The inferred type IS Object/interface (sema
+    // promotes the call's return type into the local), so it passes
+    // isObjectOrInterfaceTarget's criteria; we use srcTy (the initializer's
+    // static type) AS the target type when no declared target exists. Built-in
+    // string methods (`Equals`/`ToString`/etc), lambda captures, and every
+    // other +1 producer path are unchanged: they always go through
+    // isPlusOneStringProducer (not isPlusOneBoxProducer). Crucially,
+    // isPlusOneStringProducer's `var o: Object := ToString()` / `var o: Object
+    // := Caller()` paths are already covered by case (a)/(b); the NEW case here
+    // is purely the INFERRED-LOCAL FALLBACK for case (b) — it admits the call
+    // when srcTy is Object/interface (case b's two-test pair already accepts
+    // the DECLARED variant). Recognized by the SAME shapes the declared case
+    // keys on (MemberSymbol binding, isImported check, boxReturnMethods_
+    // membership, operator exclusion) so a cross-module call (whose callee
+    // does NOT run THIS module's boxForTarget) is still rejected: the
+    // inferred-target fallback walks the same call-resolution / method-set
+    // paths as the declared variant, no new surface.
+    if (!ld || !ld->initializer) return false;
+    bool inferredTarget = !ld->type;
+    if (!inferredTarget && !ld->type) return false;
+    const sema::TypeRef* declTy = inferredTarget
+        ? nullptr
+        : ctx_.resolvedType(*ld->type);
     const sema::TypeRef* srcTy = ctx_.exprType(*ld->initializer);
     if (!srcTy) return false;
+    // For an inferred local, the declared type IS srcTy (sema promotes the
+    // call's return type into the local). Treating srcTy as the target lets
+    // case (b) admit the call when srcTy is Object/interface — the same
+    // shape isUserMethodBoxReturnCall already validates.
+    if (!isObjectOrInterfaceTarget(inferredTarget ? srcTy : declTy)) return false;
     // Case (a): the initializer itself is a boxable value source.
     if (isBoxableValueType(srcTy) || isNullableValueTy(srcTy)) return true;
     // Case (b): a call to a box-return method (always returns a fresh box).
@@ -18030,6 +18259,12 @@ void Emitter::collectCellFreeEligible(
         // BOTH exit edges). See Disposal::skipCellFreeOnUnwind for why a
         // Spawn-sourced capture needs the unwind edge suppressed.
         std::unordered_set<const void*>& capturedByNonEscapingUnwindUnsafe;
+        // fix #2334: anchors for `using var` initializer CallExprs (form 2
+        // of §28.14 — `using var sub := cs.Token.Register(lambda)`). Populated
+        // by stmt() before the initializer is walked; consulted by expr() to
+        // resolve the bounding object of a scoped callback without mirroring
+        // MethodOwnership::scopedFormalAt's callee matching in full.
+        std::unordered_map<const ast::Expr*, const ast::LocalDecl*> usingInitOf;
 
         // Track whether we're inside a "direct initializer" position for a
         // `var` local that is in closureReleaseEligible_. Only at the TOP
@@ -18379,15 +18614,17 @@ void Emitter::collectCellFreeEligible(
                 } else {
                     expr(c->callee.get(), false);
                 }
-                // fix #2334 / §28.14 / §28.9 (v0.235): a lambda LITERAL passed
-                // directly as the sole argument of `scope.Spawn(...)` — stdlib
-                // §6.10's `scoped` callback parameter — where `scope` is a
-                // `using var`/`await using var` LOCAL of the CURRENT function,
-                // is treated as NON-ESCAPING for cellFreeEligible_ purposes,
-                // exactly like the IIFE case above — though for a DIFFERENT
-                // reason: the closure genuinely outlives the call (§28.14's
-                // storage-bounded admission), it just never outlives the
-                // captured local's own scope.
+                // fix #2334 / §28.14 / §28.9 (v0.236): a lambda LITERAL passed
+                // directly as the sole argument of a stdlib `scoped` register
+                // position — §6.10's `TaskScope.Spawn`, §6.1's
+                // `CancellationToken.Register`, §6.5's
+                // `IEvent<T>.Subscribe` / `EventSource<T>.Add` — where the
+                // receiver is a `using var` / `await using var` LOCAL of the
+                // CURRENT function, is treated as NON-ESCAPING for
+                // cellFreeEligible_ purposes, exactly like the IIFE case
+                // above — though for a DIFFERENT reason: the closure genuinely
+                // outlives the call (§28.14's storage-bounded admission), it
+                // just never outlives the captured local's own scope.
                 //
                 // Soundness: §28.14's admission for a `scoped` argument whose
                 // bounding object is the plain call RECEIVER (form 5, no
@@ -18399,16 +18636,21 @@ void Emitter::collectCellFreeEligible(
                 // ALREADY verified for this program to have reached codegen
                 // at all. So every captured local's own enclosing scope ends
                 // AT OR AFTER `L` (`scope`) does. `scope`'s disposal
-                // (`TaskScope.DisposeAsync`, stdlib §6.10) is contractually
-                // QUIESCENT (§28.14 "Quiescence": disposal must guarantee no
-                // stored callback runs after disposal completes) — the
-                // runtime backs this: bz_task_scope_spawn's per-child
-                // completion callback drops the closure's transferred +1
-                // (bezel_runtime_concurrency.cpp) strictly before the scope's
-                // pending count reaches zero, which is strictly before
-                // Join()/DisposeAsync() settle. So by the time a captured
-                // local's OWN scope-end is reached, the closure has already
-                // run its last invocation.
+                // `L`'s disposal is contractually QUIESCENT (§28.14
+                // "Quiescence": disposal must guarantee no stored callback
+                // runs after disposal completes) — the runtime backs this
+                // PER TYPE:
+                //   * `TaskScope.DisposeAsync` (stdlib §6.10) is a documented
+                //     (#1422) NON-BLOCKING zombie drain on the UNWIND edge,
+                //     so quiescence does not hold there; the free is
+                //     suppressed on the unwind path only (unwindUnsafe=true).
+                //   * `CancellationTokenSource.Dispose` (stdlib §6.1) fires
+                //     registered callbacks synchronously, so quiescence
+                //     holds on every exit path; no suppression needed
+                //     (unwindUnsafe=false).
+                //   * `EventSource<T>.Dispose` (stdlib §6.5) severs the
+                //     subscriber list before reclamation, so quiescence
+                //     holds on every exit path (unwindUnsafe=false).
                 //
                 // Marking the capture non-escaping here routes it through the
                 // EXISTING, already-sound cellFreeEligible_ /
@@ -18431,61 +18673,149 @@ void Emitter::collectCellFreeEligible(
                 // such race: it is governed by lexical program order, not by
                 // when the closure itself happens to drop.
                 //
-                // Narrowed to TaskScope.Spawn specifically, not every
-                // `scoped` call position: the same "declared-before +
-                // quiescent disposal" argument also holds for other §28.14
-                // register positions bound by a using-var (e.g. a `using var
-                // sub := pub.Clicked.Subscribe(h)`), but a `this`-bounded
-                // scoped registration (the common event-handler idiom,
-                // `this._clicked.Add(h)`) has NO current-method-scoped bound
-                // at all — the closure can run for as long as `this` lives,
-                // far past the subscribing method's own return — so blindly
-                // widening this optimization to every `scoped` position would
-                // free a captured local's cell while a long-lived
-                // registration could still invoke the stored callback: a real
-                // use-after-free. Widening beyond TaskScope.Spawn to the
-                // other declared-before-bounded register positions is left to
-                // a follow-up (bounding-object resolution would need to
-                // mirror MethodOwnership::scopedFormalAt's callee matching,
-                // Ownership_Checks.cpp) — filed as issue #2383.
-                bool spawnArgHandled = false;
-                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                        c->callee.get())) {
-                    if (ma->member == "Spawn" && ma->target &&
-                            c->args.size() == 1 && c->args[0].value) {
-                        if (auto* spawnLam =
-                                dynamic_cast<const ast::LambdaExpr*>(
-                                    c->args[0].value.get())) {
-                            // Mirrors MethodOwnership::typeRefIsTaskScope's
-                            // name resolution (Ownership_Checks.cpp);
-                            // duplicated here since that helper lives on a
-                            // different pass and is not reachable from this
-                            // codegen pre-scan.
-                            const sema::TypeRef* rt = ctx.exprType(*ma->target);
-                            bool isTaskScope =
-                                rt && rt->kind == sema::TypeRef::Kind::Named &&
-                                (rt->declaration
-                                     ? rt->declaration->name == "TaskScope"
-                                     : (rt->astNode && rt->astNode->name &&
-                                                !rt->astNode->name->parts
-                                                     .empty()
-                                            ? rt->headName() == "TaskScope"
-                                            : rt->importedName ==
-                                                  "TaskScope"));
-                            if (isTaskScope) {
-                                if (auto* loc =
-                                        dynamic_cast<sema::LocalSymbol*>(
-                                            ctx.exprSymbol(*ma->target))) {
-                                    if (auto* ld = dynamic_cast<
-                                            const ast::LocalDecl*>(
-                                                loc->decl)) {
-                                        if (ld->isUsing) {
-                                            collectLambdaCaptures(
-                                                spawnLam, em,
-                                                /*isNonEscaping=*/true,
-                                                /*unwindUnsafe=*/true);
-                                            spawnArgHandled = true;
-                                        }
+                // Narrowed to the stdlib `scoped` register positions whose
+                // RECEIVER is a `using var` local (form 5) — NOT every
+                // `scoped` call position. A `this`-bounded scoped
+                // registration (the common event-handler idiom,
+                // `this._clicked.Add(h)`) has NO current-method-scoped
+                // bound at all — the closure can run for as long as `this`
+                // lives, far past the subscribing method's own return — so
+                // blindly widening this optimization to every `scoped`
+                // position would free a captured local's cell while a
+                // long-lived registration could still invoke the stored
+                // callback: a real use-after-free. Form-2/3/4
+                // (using-var-initializer / owned-field / member-chain)
+                // widening is left to a follow-up — filed as issue #2383.
+                //
+                // Receiver type matching is name-based and STRICT — only the
+                // stdlib `scoped` register positions named in §28.14
+                // (§6.10's `TaskScope.Spawn`, §6.1's
+                // `CancellationToken.Register`, §6.5's
+                // `IEvent<T>.Subscribe` / `EventSource<T>.Add`) qualify. A
+                // user method that happens to be named `Register` or
+                // `Subscribe` on a non-stdlib receiver type is NOT a §28.14
+                // register position (it has no §28.14 admission), so it
+                // deliberately stays in the default (escaping) classification
+                // — its cell-free safety rests on the call-bounded default
+                // of §28.14, not on the using-var-bound argument above.
+                bool scopedCallArgHandled = false;
+                if (c->args.size() == 1 && c->args[0].value) {
+                    if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(
+                            c->args[0].value.get())) {
+                        if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                                c->callee.get())) {
+                            if (ma->target) {
+                                // Determine the bounding object: form 2
+                                // (using-var initializer) takes priority, then
+                                // form 5 (receiver is a using-var local).
+                                // Both routes land the lambda's captures in
+                                // the same non-escaping set; the form-2 case
+                                // is needed for the §6.1 / §6.5 idiom
+                                // `using var sub := cs.Token.Register(h)`
+                                // and `using var sub := ev.Subscribe(h)`,
+                                // whose receivers are NOT using-vars (they
+                                // are getter / method-call results on
+                                // using-var storage).
+                                const ast::LocalDecl* boundingLd = nullptr;
+                                auto uit = usingInitOf.find(c);
+                                if (uit != usingInitOf.end())
+                                    boundingLd = uit->second;
+                                if (!boundingLd) {
+                                    auto* loc = dynamic_cast<sema::LocalSymbol*>(
+                                        ctx.exprSymbol(*ma->target));
+                                    boundingLd = loc ? dynamic_cast<const ast::LocalDecl*>(
+                                                          loc->decl)
+                                                     : nullptr;
+                                    if (boundingLd && !boundingLd->isUsing)
+                                        boundingLd = nullptr;
+                                }
+                                if (boundingLd) {
+                                    // Bounding type must be one of the
+                                    // stdlib §28.14 storage-bounded
+                                    // positions. For form 2 the bounding
+                                    // object's TYPE is the call's RETURN
+                                    // type (the owned Subscription /
+                                    // etc.); for form 5 the bounding
+                                    // object's type is the RECEIVER's
+                                    // static type. Both land in the same
+                                    // stdlib register-position list (the
+                                    // return type of Subscribe / Register
+                                    // is `owned Subscription` and its
+                                    // static type is `Subscription`, a
+                                    // plain builtin — the bound is on the
+                                    // call site, not the return type, so
+                                    // the form-2 check is by METHOD NAME
+                                    // + known receiver-or-bounding-object
+                                    // stdlib type, mirroring
+                                    // MethodOwnership::builtinScopedCallbackFormal).
+                                    std::string_view methodName = ma->member;
+                                    // Receiver type for form 5.
+                                    std::string_view recvName;
+                                    const sema::TypeRef* rt =
+                                        ctx.exprType(*ma->target);
+                                    if (rt && rt->kind ==
+                                                  sema::TypeRef::Kind::Named) {
+                                        if (rt->declaration)
+                                            recvName = rt->declaration->name;
+                                        else if (rt->astNode && rt->astNode->name &&
+                                                 !rt->astNode->name->parts.empty())
+                                            recvName = rt->headName();
+                                        else if (!rt->importedName.empty())
+                                            recvName = rt->importedName;
+                                    }
+                                                                                                    bool unwindUnsafe = false;
+                                    bool match = false;
+                                    if (methodName == "Spawn" &&
+                                        recvName == "TaskScope") {
+                                        // #1422: non-blocking zombie drain
+                                        // on the unwind edge → suppress the
+                                        // free there. Form 5 only — a
+                                        // `using var sub := TaskScope.Spawn()`
+                                        // is a less common form whose
+                                        // return type is `owned TaskScope`
+                                        // (whose own teardown IS the
+                                        // scope), so a form-2 / Spawn is
+                                        // unusual but still safe: the
+                                        // owned TaskScope is disposed at
+                                        // `sub`'s scope end, which IS the
+                                        // scope's quiescence point.
+                                        match = true;
+                                        unwindUnsafe = true;
+                                    } else if (methodName == "Register" &&
+                                               recvName == "CancellationToken") {
+                                        // §6.1: synchronous-cancel
+                                        // quiescence holds. Admitted
+                                        // under BOTH form 5 (`cs.Token`
+                                        // is a using-var CancellationToken
+                                        // — uncommon) and form 2
+                                        // (`using var sub := cs.Token.Register(h)` —
+                                        // the idiomatic form).
+                                        match = true;
+                                        unwindUnsafe = false;
+                                    } else if ((methodName == "Subscribe" ||
+                                                methodName == "Add") &&
+                                               (recvName == "EventSource" ||
+                                                recvName == "AsyncEventSource" ||
+                                                recvName == "IEvent" ||
+                                                recvName == "IAsyncEvent")) {
+                                        // §6.5: dispose-severs-subscribers
+                                        // quiescence holds. Admitted
+                                        // under BOTH form 5 (`eh` is a
+                                        // using-var EventSource — uncommon)
+                                        // and form 2 (`using var sub :=
+                                        // eh.Subscribe(h)` — the idiomatic
+                                        // form, including the property-hop
+                                        // shape `using var sub := pub.Clicked.Subscribe(h)`
+                                        // per stdlib §6.5's event pattern).
+                                        match = true;
+                                        unwindUnsafe = false;
+                                    }
+                                    if (match) {
+                                        collectLambdaCaptures(
+                                            lam, em,
+                                            /*isNonEscaping=*/true,
+                                            unwindUnsafe);
+                                        scopedCallArgHandled = true;
                                     }
                                 }
                             }
@@ -18493,7 +18823,7 @@ void Emitter::collectCellFreeEligible(
                     }
                 }
                 for (std::size_t ai = 0; ai < c->args.size(); ++ai) {
-                    if (spawnArgHandled && ai == 0) continue;
+                    if (scopedCallArgHandled && ai == 0) continue;
                     expr(c->args[ai].value.get(), false);
                 }
                 return; }
@@ -18540,6 +18870,13 @@ void Emitter::collectCellFreeEligible(
             if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
                 bool nonEsc = !ld->isUsing &&
                     closureNonEscaping.count(static_cast<const void*>(ld));
+                // fix #2334: anchor `using var` initializers that are CallExpr
+                // (form 2 of §28.14) so the CallExpr handling in expr() can
+                // resolve the bounding object. The map is consulted inside the
+                // CallExpr arm and routes the captures through the same
+                // collectLambdaCaptures path the form-5 receiver case uses.
+                if (ld->isUsing && ld->initializer)
+                    usingInitOf[ld->initializer.get()] = ld;
                 if (ld->initializer)
                     expr(ld->initializer.get(), nonEsc);
                 return;

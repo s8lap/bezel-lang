@@ -533,29 +533,25 @@ BEZEL_TEST(string_span_883, slice_wrong_arity_rejected_971) {
         "end Main; end C;"), true);
 }
 
-// §3.3 / §9.6: a `string` operand must never be DEREFERENCED by the caller to
-// read its length, because the builtin string-method surface still admits an
-// un-narrowed `string?` argument: the sibling `"hello".IndexOf(nullString)`
-// compiles today and returns -1 through bz_str_indexof's null guard. The span
-// family must behave identically rather than fault — an earlier draft of this
-// lowering read the operand's length with loadStringLen before the call and
-// segfaulted on the null. 100 + (-1) == 99 for IndexOf; every predicate false.
-// (The un-narrowed `string?` argument is itself a pre-existing nullability hole
-// in the builtin surface — a user method declaring `string` rejects it — and is
-// reported separately; this test pins only that the span family matches the
-// established behavior of its sibling.)
+// §3.3 / §9.6 / §7 (#2581): an un-narrowed `string?` operand to a
+// ReadOnlyStringSpan search/compare method is now REJECTED at compile time —
+// the same §7 nullable->non-nullable rule a user `method Take(x: string)`
+// enforces, and the same rule #2315 closed for the primitive `string` instance
+// family. Previously this was an ACCEPT-TRAP (the builtin span path had no
+// MethodSymbol, so the per-argument assignability check never ran): the operand
+// reached codegen and the runtime helper's accidental null guard converted the
+// type error into a "not found"/wrong answer (100 + (-1) == 99). An earlier
+// draft of this test pinned that buggy runtime value (99); #2581 closes the
+// hole in sema, so the span family now MATCHES its sibling by rejecting too.
 BEZEL_TEST(string_span_883, null_string_operand_matches_string_family_971) {
-    BEZEL_EXPECT_EQ(run(
+    BEZEL_EXPECT_EQ(rejectedWith(
         "module M; class C public static method Main(): int "
         "  var n: string? := null; "
         "  var sp := \"hello\".AsSpan(); "
         "  var r := 100 + sp.IndexOf(n); "
-        "  if sp.Contains(n) then r := r + 1000; end; "
-        "  if sp.StartsWith(n) then r := r + 2000; end; "
-        "  if sp.EndsWith(n) then r := r + 4000; end; "
-        "  if sp.SequenceEqual(n) then r := r + 8000; end; "
         "  return r; "
-        "end Main; end C;"), 99);
+        "end Main; end C;",
+        "is nullable but the target type is non-nullable"), true);
 }
 
 // §3.3 (v0.109): `CopyTo(destination: Span<char>)` is DECLARED but not yet

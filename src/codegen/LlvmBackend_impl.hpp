@@ -1290,6 +1290,19 @@ private:
     // collections (e.g. OwningArray<OwningArray<R>>). Keyed by the TypeRef* of
     // the inner collection element type (unique per sema type).
     std::map<const sema::TypeRef*, llvm::Function*> nestedCollectionDisposerThunks_;
+    // #2279 (§30.5 Pattern A, v0.236): per-result-collection-type thunks for the
+    // intrinsic-collection case `Task<intrinsic-coll>` — when a Pattern A task
+    // produces an Array<T>/Set<T>/Dictionary<K,V>/LinkedList<T>/OwningBuffer<T>/
+    // OwningArray<T>/... etc. as its class-typed result, the existing
+    // elementPolicyFor-based path returns a null disposer (the element is a
+    // value/string/etc., not a class), so the produced collection's backing
+    // storage was never reclaimed at task disposal (an LSan leak of the
+    // bz_array_t*/bz_dict_t*/bz_llist_t* header+data). This cache holds the
+    // per-collection-kind thunks that free the collection via the appropriate
+    // runtime call (bz_array_free / bz_dict_free / bz_llist_free / bz_buffer_free)
+    // with the right per-element disposer, exactly mirroring the `using var`
+    // collection disposal path. Keyed on the result-collection TypeRef*.
+    std::map<const sema::TypeRef*, llvm::Function*> patternAResultCollectionDisposers_;
     // #429 / §4.6 / §28.9: the cached per-element string-release thunk (built
     // lazily) for a borrowing Array<string>'s co-owned string elements.
     llvm::Function* stringElementReleaseThunk_ = nullptr;
@@ -3573,8 +3586,15 @@ private:
     // OwningDictionary) the displaced slot/value is disposed exactly once before
     // the new (owned) one is stored (§4.5 / §4.9); a borrowing collection just
     // overwrites. `val` is the already-lowered RHS. Returns true if handled.
+    // `valIsFreshPlusOneString` (fix #2596): when true, the caller guarantees
+    // `val` is ALREADY a +1 string producer (e.g. a compound-assignment OP-
+    // result from emitStringConcat, which always mints rc=1 per #422), so the
+    // borrowing-Dictionary<K,string> co-ownership retain (§28.9 / #429) is
+    // SKIPPED — the +1 transfers into the slot. Only the dict compound path
+    // sets this; the plain-set path derives +1-ness from `valueExpr`.
     bool lowerCollectionIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
-                                   const ast::Expr* valueExpr = nullptr);
+                                   const ast::Expr* valueExpr = nullptr,
+                                   bool valIsFreshPlusOneString = false);
 
     // CG15: collect a class's instance fields in layout order —
     // base-class fields FIRST (prefix layout: a `Derived*` aliases a
@@ -3745,7 +3765,8 @@ private:
     // already gives an ordinary method call (LlvmBackend_Calls2.cpp), or it
     // leaks.
     bool lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
-                                 const ast::Expr* valueExpr = nullptr);
+                                 const ast::Expr* valueExpr = nullptr,
+                                 bool valueIsPlusOne = false);
 
     // §23.4: emit (or retrieve cached) a standalone LLVM function for a
     // BLOCK-form indexer getter body (`property [i: …]: T get => do…end;`).
@@ -3802,7 +3823,15 @@ private:
     // `v` (the `value` parameter). Shared by the plain `obj.P := …` path and
     // the compound-assignment read-modify-write path. Returns false when
     // `target` is not a block-setter property.
-    bool lowerPropertySetValue(const ast::Expr& target, llvm::Value* v);
+    //
+    // fix #2568 (§23.3/§28.9, v0.236): `valueExpr` (default nullptr for the
+    // `ref`/`out` write-back call site and the increment-stmt call site that
+    // have no original source expression) is the source ast::Expr `v` was
+    // lowered from — see lowerVirtualPropertySet's comment for why a
+    // caller-side post-call release is needed now that the inlined setter
+    // body mints its own +1 on the class path.
+    bool lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
+                               const ast::Expr* valueExpr = nullptr);
 
     // fix #2400 (§2.8.2/§2.8.3 rule 4, §11.2, §23; v0.235): a DIRECT
     // (non-itable, non-virtual) cross-module property SET — `importedObj.Prop
@@ -5252,17 +5281,60 @@ private:
     // dense element array, so it takes the plain (BORROWING) array enumerator; a
     // DICT-backed set (value/record/string element) is a hash table with no dense
     // element array, so it is snapshotted (bz_lazy_from_set → bz_lazy_to_array)
-    // into a fresh array behind an OWNING enumerator. `outOwningWrap`, when
-    // non-null, reports whether the returned value is such an OWNING enumerator
-    // the CALLER must dispose exactly once (true for both the lazy-pipeline drain
-    // and the dict-backed-set snapshot). A RETURN site can ignore it — the caller
-    // owns a returned enumerator by construction (#1916); the ARGUMENT site must
-    // consult it and register the scope-end iterEnumDispose (#1923).
+    // into a fresh array behind an OWNING enumerator. `outWrapMade`, when
+    // non-null, reports whether the returned value is a freshly allocated
+    // enumerator wrapper the CALLER must dispose exactly once — true for the
+    // lazy-pipeline drain (#1916), the dict-backed-set snapshot (#1069), AND
+    // the plain borrowing Array/Stack/Queue/LinkedList wraps whose slot-1
+    // Dispose is `free(self)` (the wrapper frame only, never the shared
+    // backing, exactly like the local-decl `wrappedHere` path #943/#1911).
+    // A RETURN site can ignore it — the caller owns a returned enumerator by
+    // construction (#1916); the ARGUMENT site must consult it and register
+    // the scope-end iterEnumDispose (#1923, #2298).
+    // `srcOwnedByCallee`, when true, signals that the source expression is a
+    // callee-owned local whose underlying collection (Array/Stack/Queue/
+    // LinkedList/dict-backed-Set) the wrap only BORROWS — fix #2299 / §28.9:
+    // the wrap's slot-1 Dispose frees the wrapper frame but NEVER the backing,
+    // and the source local's scope-end reclaim is suppressed by §28.3
+    // ownership-transfer on `return`. This registers a scope-end disposal for
+    // the source so the RETURN produces no leak — the wrapper frame is freed
+    // first (LIFO), then the source collection. Caller MUST have verified
+    // callee-ownership (a NewExpr, a producer-initialized local, or a move);
+    // parameter/field/already-IEnumerable sources stay false to avoid freeing
+    // someone else's collection.
     llvm::Value* wrapAsIEnumerableForTarget(llvm::Value* v,
                                             const sema::TypeRef* targetTy,
                                             const ast::Expr* srcExpr,
                                             bool ownLazyPipeline = false,
-                                            bool* outOwningWrap = nullptr);
+                                            bool* outWrapMade = nullptr,
+                                            bool srcOwnedByCallee = false);
+    // fix #2299 / §28.9 (RETURN-coercion source-ownership probe): is `src`
+    // the OWNED producer of a heap-allocated collection whose RETURN transfer
+    // moves ownership into the callee? Returns true for `new Array<int>()`,
+    // `new LinkedList<int>()`, `new Set<int>()` etc. (a NewExpr for a class
+    // type — §28.3 K1 — or a move expression), and for an IdentifierExpr
+    // naming a LOCAL whose initializer was a producer form (NewExpr/CallExpr)
+    // — mirrors producerState's "Owned" verdict at the OWNERSHIP pass. A bare
+    // parameter/field read, a method-call result whose declared return is not
+    // `owned`, and any initializer that is itself a borrow (an IdentifierExpr
+    // naming another local, a MemberAccess, an IndexExpr — §28.3 "storage
+    // lends") return false. Conservative: a shape we cannot classify without
+    // a deeper ownership analysis defaults to false (do NOT free — better
+    // leak a non-confirmed transfer than risk a UAF).
+    bool returnSourceIsCalleeOwnedCollection(const ast::Expr* src) const;
+
+    // fix #2299 / §28.9: emit an immediate free on the source collection
+    // right at the RETURN coercion (NOT at scope end — scope-end disposal
+    // would race the caller's iteration of the wrapping enumerator and
+    // free the source out from under it). Only safe when the caller has
+    // already established srcOwnedByCallee (the source is no longer needed
+    // because the wrap takes its slot-1 backing; for Array-family the
+    // OWNING wrap owns the source via its slot-1 Dispose; for Stack and
+    // LinkedList the source is freed here and the caller disposes only the
+    // wrapper frame; for dict-backed Set the snapshot is independent).
+    void freeCollectionSourceNow(llvm::Value* v);
+    void freeDictSourceNow(llvm::Value* v);
+    void freeLinkedListSourceNow(llvm::Value* v);
 
     // #1916 / #1911 / stdlib §5 / §29.11: drain a lazy LINQ pipeline (bz_lazy_t*)
     // once into a fresh owned Array<T> (bz_lazy_to_array also disposes the
@@ -6365,6 +6437,12 @@ private:
             if (isCollectionTypeName(rt)) return rt;
             if (isLinkedListTypeName(rt)) return rt;
             if (isDictTypeName(rt)) return rt;
+            // #2603: an owned IList<T>/IReadOnlyList<T> captured primary-ctor
+            // parameter is array-backed + borrowing (issue #401) — same path as
+            // the FieldDecl arm below. #2606: IOwningList<T> (owning) is also
+            // admitted; collIsOwning at the disposal sites marks it owning.
+            if (isBorrowingListInterfaceName(rt)) return rt;
+            if (isOwningListInterfaceName(rt)) return rt;
             return nullptr;
         }
         if (!hasOwnedModifier(fs)) return nullptr;
@@ -6400,6 +6478,23 @@ private:
         // They own their V values for the OwningDictionary case; emitOwnedFieldDisposals
         // and lowerOwnedCollectionFieldStore detect isDict and use genericArgs[1].
         if (isDictTypeName(rt)) return rt;
+        // #2603 / §28.9 / issue #401: an owned IList<T> / IReadOnlyList<T> field
+        // is array-backed (same bz_array_t* as Array<T>) and borrowing, so it
+        // routes through the SAME collection-disposal path as owned Array<T> —
+        // emitOwnedFieldDisposals / lowerOwnedCollectionFieldStore free its
+        // backing via bz_array_free with the element disposer from
+        // elementPolicyFor (stringElementReleaseThunk for a string element).
+        // isCollectionTypeName only admits CONCRETE builtin names, so the
+        // borrowing list interfaces must be admitted explicitly. #2606: an
+        // owned IOwningList<T> field is the OWNING sibling — array-backed (same
+        // bz_array_t* as OwningArray<T>, the only implementer per stdlib §4.5)
+        // and owning, so it routes through the same path with collIsOwning=TRUE
+        // (the disposal sites consult isOwningListInterfaceName to mark it
+        // owning, since isOwningPrefixedName("IOwningList") is false). All
+        // three helpers require declaration==nullptr, so a user class literally
+        // named IList/IOwningList keeps the existing class-instance path.
+        if (isBorrowingListInterfaceName(rt)) return rt;
+        if (isOwningListInterfaceName(rt)) return rt;
         return nullptr;
     }
 
@@ -7070,6 +7165,20 @@ private:
     // separately in LlvmBackend_Disposal.cpp). Shared by emitAsyncMethod and
     // emitAsyncLambda.
     llvm::Function* patternAResultDisposerFor(const sema::TypeRef* taskTypeRef);
+
+    // #2279 (§30.5 Pattern A, v0.236): when the result type of a Pattern A
+    // `Task<T:class>` is itself an INTRINSIC COLLECTION (Array<T> / Set<T> /
+    // Dictionary<K,V> / LinkedList<T> / Stack<T> / Queue<T> / OwningBuffer<T> /
+    // Owning* collections), the task owns the result directly, and disposing
+    // the task must free the collection's backing storage (a bz_array_t*,
+    // bz_dict_t*, bz_llist_t*, or bz_buffer_t*). Returns the per-result-
+    // collection-type `void(void*)` thunk that frees the collection via the
+    // appropriate runtime call with the right per-element disposer, mirroring
+    // the `using var` collection disposal path. Cached. Returns null when
+    // `resultCollTy` is not an intrinsic collection (the existing
+    // class-typed-result path is then correct).
+    llvm::Function* patternAResultCollectionDisposer(
+        const sema::TypeRef* resultCollTy);
 
     // §30.6 (#488): emit the async state machine for an `async` LAMBDA. Called
     // from lowerLambda after the closure entry function `fn(env, params...)` is
@@ -8064,6 +8173,19 @@ private:
     bool lowerStringLocalReassign(const ast::Expr& target, llvm::Value* slotAddr,
                                   llvm::Type* elemTy, llvm::Value* newVal,
                                   const ast::Expr* valueExpr);
+    // #2321 / §22.3 / §28.9: REASSIGNMENT through a string-typed `ref`/`out`
+    // PARAMETER (the assignment is an ordinary store through the alias, not a
+    // local-slot reassignment). The caller's slot owns an INDEPENDENT +1 that
+    // the local-slot escape walk (stringReleaseEligible_) does not cover, so
+    // a plain `CreateStore` leaves the heap string leaked — the new value is
+    // an independent producer the caller has no other release for, and the
+    // displaced previous value had its +1 in this slot. Emit the same retain-
+    // new (transfer a producer) / store / release-old pair lowerStringLocalReassign
+    // does, against the `refParamAddr` pointer the caller already resolved.
+    // Mirrors lowerStringLocalReassign; returns true when handled.
+    bool lowerStringRefParamStore(const ast::Expr& target, llvm::Value* slotAddr,
+                                 llvm::Type* elemTy, llvm::Value* newVal,
+                                 const ast::Expr* valueExpr);
     // #429 / §4.6 / §28.9: the set of `var` string LocalDecl nodes whose
     // initializer is a BORROW (NOT a +1 producer) and which the escape walk
     // proved non-escaping — these are RETAINED at bind and RELEASED at scope end
@@ -9508,6 +9630,40 @@ private:
     static bool isListInterfaceName(const sema::TypeRef* rt,
                                     bool* outOwning = nullptr);
 
+    // #2603 / §28.9 / issue #401: the BORROWING list interfaces — IList<T> and
+    // IReadOnlyList<T>. Both are array-backed (same bz_array_t* as Array<T>) and
+    // borrowing (the holder does not own the elements, except the runtime-
+    // managed string +1 co-ownership), so an `owned` field of either static type
+    // routes through the IDENTICAL collection-disposal path as `owned Array<T>`:
+    // bz_array_free with the element disposer from elementPolicyFor (and the
+    // string-element-release thunk for a string element). IOwningList<T> is
+    // EXCLUDED here — it is the OWNING variant (its elements are owned by the
+    // holder) and is covered by isOwningListInterfaceName below (#2606).
+    static bool isBorrowingListInterfaceName(const sema::TypeRef* rt) {
+        bool owning = false;
+        return isListInterfaceName(rt, &owning) && !owning;
+    }
+
+    // #2606 / §28.11 / stdlib §4.5 / issue #401: the OWNING list interface —
+    // IOwningList<T>. It is array-backed (same bz_array_t* as OwningArray<T> —
+    // the only implementer per stdlib §4.5) AND owning: its elements are owned
+    // by the holder and disposed on the collection's Dispose (stdlib §4.5
+    // "Disposing an OwningArray<T> automatically disposes every element"). So an
+    // `owned` field of this static type routes through the collection-disposal
+    // path with collIsOwning=TRUE — bz_array_free frees the backing and the
+    // class-element disposer from elementPolicyFor(elem, owning=true) disposes
+    // each element, IDENTICAL to `owned OwningArray<T>`. (String elements are
+    // rejected at instantiation for owning collections per stdlib §4.4, so the
+    // borrowing-family string-element-release gate never applies here.) The
+    // `isOwningPrefixedName("IOwningList")` check used at the collIsOwning
+    // derivation sites returns FALSE (the prefix is "Owning", but the head
+    // starts with "I"), so this helper is also consulted there to mark the
+    // family owning.
+    static bool isOwningListInterfaceName(const sema::TypeRef* rt) {
+        bool owning = false;
+        return isListInterfaceName(rt, &owning) && owning;
+    }
+
     // fix #853 / stdlib §4.1–§4.3: the *non-list* collection interfaces
     // (IReadOnlyCollection<T>, ICollection<T>, IOwningCollection<T>). These are
     // genuinely polymorphic — implemented by collections with incompatible
@@ -9663,6 +9819,33 @@ private:
     // §3: instance method calls on Array<T>, Dictionary<K,V>, etc.
     // Called from lowerCall before the normal method-symbol dispatch.
     llvm::Value* tryLowerCollectionInstanceCall(const ast::CallExpr& call);
+
+    // fix #2513 / spec §35.2 (v0.236): the stdlib §2.20 `Result<T, E>` carries
+    // four compiler-provided per-instantiation combinators (Map / MapError /
+    // AndThen / UnwrapOr) — only admissible where the receiver AND result
+    // instantiation are value-like (§35.4 rule 3). These members have NO
+    // MethodSymbol (they are compiler-provided; the prelude body injection that
+    // the previous lane attempted aborts on a choice-shaped return's PHI in
+    // lowerCaseExpr). The dedicated codegen path emits the inline body — a
+    // switch on the Ok/Error discriminator tag + branch-specific bodies — and
+    // returns null when the call is not a Result combinator (the regular
+    // method-symbol dispatch then runs unchanged).
+    llvm::Value* tryLowerResultCombinatorCall(const ast::CallExpr& call);
+
+    // fix #2513 helper: invoke the function-typed expression `arg` (a lambda
+    // or function parameter) with the single payload value `val`. Mirrors
+    // lowerCall's closure-call arm's fn-ptr / env-ptr / retTy derivation.
+    llvm::Value* invokeClosureOnValue(const ast::Expr& arg, llvm::Value* val,
+                                      llvm::Type* valLL,
+                                      const sema::TypeRef* retSemTy);
+    // fix #2513 helper: build a choice struct value { i32 tag, ok_payload,
+    // err_payload } with the active case's payload filled from `okPayload`
+    // or `errPayload`. Inactive slots stay undef (per §35.4 choice values
+    // carry no per-slot moved-from state). Used by every combinator branch.
+    llvm::Value* buildChoiceStructValue(const sema::TypeSymbol* choiceTy,
+                                        unsigned activeTag,
+                                        llvm::Value* okPayload,
+                                        llvm::Value* errPayload);
     // per §4.6/§4.7: lower LinkedList<T>/OwningLinkedList<T> instance calls
     // (Add*/Remove*/Find/Count/First/Last/etc.) and LinkedListNode<T> property
     // accesses (.Value/.Next/.Previous) via the bz_llist_* runtime.
@@ -10195,11 +10378,15 @@ private:
     // temporarily bound to the evaluated `ne.args` values and the chain-call
     // arg expressions are evaluated and stored into the base's slots.
     // Recursive: the base class itself is also processed if needed.
+    // `ctorArgsByRefAbi` is true only at the top-level `new`-expression call
+    // site, where ctorArgVals[i] is the caller's storage ADDRESS for a
+    // ref/out param (CG50); the recursion passes lowered VALUES. fix #2584.
     void prePopulateBasePositionalFields(
         const sema::TypeSymbol* t,
         llvm::Value* obj,
         const std::vector<llvm::Value*>& ctorArgVals,  // already-evaluated ctor args
-        const sema::ConstructorSymbol* cs);             // null if no explicit ctor
+        const sema::ConstructorSymbol* cs,             // null if no explicit ctor
+        bool ctorArgsByRefAbi = false);
 };
 
 }  // namespace bezel::codegen

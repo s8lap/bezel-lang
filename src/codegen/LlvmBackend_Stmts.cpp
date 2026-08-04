@@ -285,8 +285,46 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             isUnsignedTargetExpr(*as->target),
                             isCharTargetExpr(*as->target),      // §6.6/§5.2 #1961
                             isUnsignedTargetExpr(*as->value));  // §6.2 #2140 rUns
-                        if (res && lowerVirtualPropertySet(*as->target, res))
+                        // fix #2586 (§23.3/§28.9/§4.6, v0.236): the VIRTUAL/
+                        // INTERFACE compound-assign twin of #2576's non-virtual
+                        // fix (lowerPropertyCompound). For a string target,
+                        // emitCompoundOp dispatches to emitStringConcat which
+                        // ALWAYS mints a fresh rc=1 `res` (memcpy of both
+                        // operands' bytes), and `rhs = lowerExpr(*as->value)`
+                        // is a SECOND +1 when the AST is a producer. The dynamic
+                        // setter (lowerVirtualPropertySet) retains `res` for a
+                        // CLASS-backed property, but was called with no valueExpr
+                        // — so its internal emitProducerRelease did not fire for
+                        // `res`. Pass valueIsPlusOne=true so lowerVirtualPropertySet
+                        // releases `res` itself on the retaining (class-backed)
+                        // path, using its OWN owner-kind flag branching (so a
+                        // boxed RECORD's plain-store setter — which never
+                        // retained res — is NOT double-released; res's +1 is the
+                        // record field's only ref, §9/§9.7). `rhs`'s orphan +1
+                        // (a producer rhs like `"abc" + i.ToString()`) is
+                        // released at THIS call site: rhs's +1 is NOT stored
+                        // anywhere (emitStringConcat memcpy's its bytes into res
+                        // and leaves rhs's own +1 untouched), so releasing rhs
+                        // is safe for ALL backings — class vtable, class-backed
+                        // iface, AND record-backed iface (a borrow rhs — e.g. a
+                        // named local — is not +1; the producer predicate gates
+                        // it). `cur` (the getter read) is a BORROW — the getter
+                        // accessor body returns a field load with no retain — so
+                        // it is deliberately NOT released (releasing a borrow
+                        // would UAF the field's own ref). Mirrors #2576's
+                        // structure in lowerPropertyCompound exactly.
+                        if (res && lowerVirtualPropertySet(*as->target, res,
+                                                           nullptr,
+                                                           /*valueIsPlusOne=*/true)) {
+                            // Release rhs's orphan +1 (producer only). Safe for
+                            // all backings — rhs is a distinct allocation from
+                            // res (emitStringConcat memcpy's into a fresh header),
+                            // and its +1 is never stored anywhere.
+                            if (rhs->getType()->isPointerTy() &&
+                                isPlusOneStringProducer(as->value.get()))
+                                emitStringRelease(rhs);
                             return false;
+                        }
                     }
                 }
                 if (lowerPropertyCompound(*as)) return false;
@@ -607,6 +645,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                           as->value.get());
                 if (!handled && currentFn_ == stringReleaseEligibleFn_)
                     handled = lowerStringLocalReassign(*as->target, addr, elemTy,
+                                                       rhs, as->value.get());
+                // #2321 / §22.3 / §28.9: a `ref`/`out` string param has no
+                // localSlot (lives in refParams_) and is not a class field, so
+                // the helpers above both returned false — without this the
+                // callee's `s := s + "!"` plain-stored the new heap string and
+                // the caller's previous value's +1 leaked (and so did the new
+                // value's +1 in the caller's slot, for a different reason — the
+                // local-slot escape walk does not cover ref-aliased slots).
+                // Mirror lowerStringLocalReassign's retain-new (transfer a
+                // producer) / store / release-old. Gated on the helper returning
+                // true (which requires a ref-param, string-typed, non-nullable,
+                // bare-ptr target) so a non-ref-param target cannot accidentally
+                // reach here.
+                if (!handled)
+                    handled = lowerStringRefParamStore(*as->target, addr, elemTy,
                                                        rhs, as->value.get());
                 // #429 (closure FIELD-STORE category) / §27.5 / §28.9: a store
                 // into a CLASS closure (function-typed) field / auto-property
@@ -2017,7 +2070,10 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         if (v && rs->value && currentReturnTypeNode_)
             v = wrapAsIEnumerableForTarget(
                 v, ctx_.resolvedType(*currentReturnTypeNode_), rs->value.get(),
-                /*ownLazyPipeline=*/true);
+                /*ownLazyPipeline=*/true,
+                /*outWrapMade=*/nullptr,
+                /*srcOwnedByCallee=*/
+                returnSourceIsCalleeOwnedCollection(rs->value.get()));
         // #429 (RETURN-escape category) / §4.6 / §28.9 / §28.3: a method whose
         // declared return type is (non-nullable) `string` mints EXACTLY +1 for
         // the returned value, transferring ownership of one reference to the
@@ -2314,6 +2370,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         builder_.SetInsertPoint(dispBB);
                         emitDisposeAndReclaim(obj);
                         builder_.CreateStore(nullVal, slotAddr);
+                        // #2310 / §29.8 / §30.1 (#973a residual): also null the
+                        // FRAME capture slot of an `owned` state-machine parameter
+                        // this `_ := p` discard just consumed (no-op outside a
+                        // state-machine body, for non-parameter sources, for
+                        // non-owned parameters). per §29.8 / §30.1
+                        nullStateMachineOwnedParamCapture(ds->value.get());
                         builder_.CreateBr(contBB);
                         builder_.SetInsertPoint(contBB);
                     }
@@ -6360,10 +6422,10 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
 
     // §29.7 (#623): register the enumerator for disposal on all exit paths
     // (break / return / exception / normal exhaustion).  Use a dedicated scope
-    // around the loop so emitLoopDisposals(outerDepth) on `break` disposes it.
-    // The iterator vtable has Dispose at slot 1 (not slot 2 like class vtables),
-    // so we use iterEnumDispose rather than dynamicDispose.
-    std::size_t outerDepth = disposeStack_.size();
+    // around the loop so the loop body / `continue` reads from slots owned by
+    // MY scope, not the enclosing one (the wrapper/enumerator must outlive
+    // every continue). The iterator vtable has Dispose at slot 1 (not slot 2
+    // like class vtables), so we use iterEnumDispose rather than dynamicDispose.
     disposeStack_.emplace_back();
     {
         Disposal d{enumSlot, nullptr};
@@ -6509,10 +6571,17 @@ bool Emitter::lowerIEnumerableBuiltinFor(const ast::ForStmt& fs) {
     emitPendingCheck();  // TakeCurrent may raise IOE (#1349)
     builder_.CreateStore(curVal, varSlot);
 
-    // §29.7 (#623): loopScopeDepth = outerDepth (BEFORE enumerator scope push)
-    // so that emitLoopDisposals on `break` disposes both the body scope AND
-    // the enumerator scope (calls Dispose on the iterator frame).
-    loopStack_.push_back({condBB, endBB, outerDepth});
+    // §29.7 (#623) / fix #2556 (v0.236): scopeDepth = MY scope's index (after
+    // push), not outerDepth (before push). The prior `outerDepth` form made
+    // emitLoopDisposals on `continue` walk the loop's wrapper/enumerator scope
+    // too — `iterEnumDispose` nulls the enumSlot, then condBB re-loads via
+    // `Load(enumSlot)` and dereferences NULL → SEGV. Matches the existing
+    // lowerIEnumerableForSortedSet (#2553): `disposeStack_.size()` here, since
+    // the scope was just pushed via `disposeStack_.emplace_back()` a few
+    // lines up — the current size IS the new scope's index. The wrapper/
+    // enumerator resources must outlive every continue; `break` / normal
+    // exhaustion still dispose them via the endBB / outer-scope paths.
+    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
     lowerForBody(fs);
     loopStack_.pop_back();
     if (!builder_.GetInsertBlock()->getTerminator())
@@ -6775,7 +6844,6 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                                   enumPtr, "ien.enown"),
             enumDisposeSlot);
     }
-    std::size_t outerDepth = disposeStack_.size();
     disposeStack_.emplace_back();
     // fix #2424 (§28 preamble/§28.9, §29.1, v0.235): a genuinely UNOWNED
     // temporary iterable source (`for var x in new IntRange(...) do ... end`
@@ -6901,10 +6969,15 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
         }
     }
 
-    // §29.7 (#972): loopScopeDepth = outerDepth (BEFORE enumerator scope push)
-    // so that emitLoopDisposals on `break` disposes both the body scope AND
-    // the enumerator scope (calls Dispose on the user class enumerator).
-    loopStack_.push_back({condBB, endBB, outerDepth});
+    // §29.7 (#972) / fix #2556 (v0.236): scopeDepth = MY scope's index (after
+    // push), not outerDepth (before push). See the sibling comment in
+    // lowerIEnumerableBuiltinFor: `outerDepth` made `continue` walk the
+    // enumerator's slot to dispose, nulling it, and condBB's `Load(enumSlot)`
+    // then dereferenced NULL → SEGV. Matches lowerIEnumerableForSortedSet's
+    // existing `disposeStack_.size()` (after push). The enumerator/wrapper
+    // remain loop-scope resources that must outlive every continue; `break` /
+    // normal exhaustion still dispose them via the endBB path.
+    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
     bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(condBB);
@@ -7243,7 +7316,11 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     // scope around the loop — the iterator frame's Dispose is at vtable slot 1, so
     // use iterEnumDispose. Previously the frame was disposed only at endBB (normal
     // completion), leaking it when the body threw / returned / broke out.
-    std::size_t outerDepth = disposeStack_.size();
+    // fix #2566 (v0.236): the loop stack entry below uses `disposeStack_.size()`
+    // (AFTER this emplace_back), not a pre-push `outerDepth`. The pre-push form
+    // made `continue` walk the enumerator's slot to dispose, which FREEs the
+    // iterator frame; the next condBB then reads freed memory → heap-use-after-
+    // free. See the matching comment at the loopStack_.push_back below.
     disposeStack_.emplace_back();
     {
         Disposal d{enumOwnSlot, nullptr};
@@ -7327,9 +7404,20 @@ bool Emitter::lowerAwaitFor(const ast::ForStmt& fs) {
     emitPendingCheck();  // TakeCurrent may raise IOE on OwnedAsync path (#1349)
     builder_.CreateStore(curVal, varSlot);
 
-    // #792 / §29.7: loopScopeDepth = outerDepth (BEFORE the enumerator scope) so
-    // `break`/`return` out of the loop disposes the iterator frame too.
-    loopStack_.push_back({condBB, endBB, outerDepth});
+    // #792 / §29.7 / fix #2566 (v0.236): scopeDepth = MY scope's index (after
+    // push), not outerDepth (before push). The prior `outerDepth` form made
+    // emitLoopDisposals on `continue` walk the enumerator's slot to dispose,
+    // which (with `iterEnumDispose`) FREES the iterator frame; the next condBB
+    // re-loads the frame's enum slot and reads freed memory → heap-use-after-
+    // free (`READ` in `bz$async$Main$Resume`, `free` in
+    // `bz$asynciter$Gen$Dispose`). Matches the existing
+    // lowerIEnumerableForSortedSet (#2553) and the post-#2556 form in
+    // lowerIEnumerableFor / lowerIEnumerableBuiltinFor: `disposeStack_.size()`
+    // here, since the scope was just pushed via `disposeStack_.emplace_back()`
+    // a few lines up — the current size IS the new scope's index. The wrapper/
+    // enumerator resources must outlive every continue; `break` / normal
+    // exhaustion still dispose them via the endBB path.
+    loopStack_.push_back({condBB, endBB, disposeStack_.size()});
     bool term = lowerForBody(fs);
     loopStack_.pop_back();
     if (!term) builder_.CreateBr(condBB);
@@ -7617,6 +7705,17 @@ bool Emitter::tryLowerAtomicValueSet(const ast::AssignmentStmt& as) {
     }
 
     // Widen newVal to i64 for bz_atomic_store's uint64_t parameter.
+    // #2605 / §7.4: a flow-narrowed `T?` RHS (proved non-null by a preceding
+    // null-check) lowers to its tagged-optional {i8,T} struct; unwrap to the
+    // bare T payload before widening — same defect/fix as the
+    // Exchange/CompareExchange/Add path in tryLowerAtomicCall
+    // (LlvmBackend_Calls3.cpp). sema admits the narrowed `T?` to the Value
+    // setter via the §7.4 narrowing exception; without this unwrap the
+    // bz_atomic_store call gets {i8,i32} where i64 is expected and fails
+    // verifyModule. unwrapNarrowedNullable is a no-op for a plain primitive.
+    if (recvTy && !recvTy->genericArgs.empty() && recvTy->genericArgs[0])
+        if (auto* tTy = lowerTypeRef(recvTy->genericArgs[0]))
+            newVal = unwrapNarrowedNullable(newVal, tTy);
     llvm::Value* v64 = newVal;
     if (newVal->getType()->isIntegerTy() && !newVal->getType()->isIntegerTy(64))
         v64 = builder_.CreateZExt(newVal, i64(), "aset.v64");

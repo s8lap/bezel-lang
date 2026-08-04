@@ -2157,9 +2157,78 @@ llvm::Value* Emitter::boxLocalSlot(llvm::AllocaInst* slot,
     auto it = cellVars_.find(slot);
     if (it != cellVars_.end()) {
         // Already boxed: the slot is already a ptr-alloca holding the cell.
+        //
+        // fix #2303 / §27.5: the cell allocation is emitted at the FIRST
+        // boxLocalSlot call site, behind a null-check guard. A SUBSEQUENT call
+        // (a second lambda capturing the same local) used to return the slot
+        // value directly, assuming the first call's alloc had run. That is
+        // sound only when the first call's basic block is always reached at
+        // runtime — which is NOT the case when the first lambda lives behind
+        // a conditional the runtime did not take. The second lambda then
+        // stored the entry-block zero into its env, and the body dereferenced
+        // address 0 → SEGV.
+        //
+        // Emit the guard HERE too: null-check the cell-holder, and if it is
+        // still null (first alloc was skipped), allocate now from the
+        // original-slot sync entry. The cell is then guaranteed to exist
+        // before any lambda uses it, regardless of which capture path the
+        // runtime took. The branch is predictable (non-null after the first
+        // lambda runs), so the cost is one load + compare + predictable
+        // branch per capture — well within the noise floor.
+        //
+        // `wasGuardedBoxing` stays FALSE: the cell was already allocated by
+        // the first call (the caller is the SECOND+ capture, and the lower
+        // lambda's additional-capture retain for strings/closures — #672,
+        // lines ~1365-1376 — must still fire to balance the N envdtor
+        // releases; that retain is gated on `!wasGuardedLocal`). Setting the
+        // flag true here would suppress the retain → over-release / double
+        // free on multi-lambda string/closure captures (the
+        // `spec_27_5_28_9_672_string_two_lambda_capture_no_uaf` and three-
+        // lambda siblings, which were green on base). The cell-free / box-
+        // release branches the flag would otherwise gate are all in the
+        // `!alreadyBoxed` path and are skipped for this call regardless.
         newSlot = slot;
-        if (wasGuardedBoxing) *wasGuardedBoxing = false; // treat as non-guarded (already boxed)
-        return builder_.CreateLoad(ptrTy(), slot, "cell");
+        if (wasGuardedBoxing) *wasGuardedBoxing = false;
+
+        llvm::Type* valTy = it->second;
+        llvm::Function* fn = currentFn_;
+        auto* allocBB = llvm::BasicBlock::Create(llvm_, "cell.alloc", fn);
+        auto* doneBB  = llvm::BasicBlock::Create(llvm_, "cell.done",  fn);
+
+        llvm::Value* existingCell = builder_.CreateLoad(
+            ptrTy(), newSlot, "cell.existing");
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            existingCell, llvm::ConstantPointerNull::get(ptrTy()),
+            "cell.isnull");
+        builder_.CreateCondBr(isNull, allocBB, doneBB);
+
+        // Allocation branch: first pass (or previous alloc was skipped).
+        builder_.SetInsertPoint(allocBB);
+        llvm::Value* cellSize = builder_.CreatePtrToInt(
+            builder_.CreateGEP(valTy,
+                               llvm::ConstantPointerNull::get(ptrTy()),
+                               {builder_.getInt32(1)}),
+            i64());
+        llvm::Value* cell = builder_.CreateCall(
+            callocFn(), {builder_.getInt64(1), cellSize});
+        // Read the original slot's value (tracked in cellVarSyncSlot_) to
+        // initialise the cell. If the sync entry is missing for any reason,
+        // the cell stays at its calloc zero (the safe default for a value
+        // type — the lambda will read 0, which is observably wrong but
+        // never a crash; the spec's normal-edge release + the envdtor's
+        // null-safe release keep the bookkeeping sound).
+        auto syncIt = cellVarSyncSlot_.find(newSlot);
+        if (syncIt != cellVarSyncSlot_.end()) {
+            llvm::Value* cur = builder_.CreateLoad(
+                valTy, syncIt->second, "preboxed");
+            builder_.CreateStore(cur, cell);
+        }
+        builder_.CreateStore(cell, newSlot);
+        builder_.CreateBr(doneBB);
+
+        // Done: cell ptr is in *newSlot.
+        builder_.SetInsertPoint(doneBB);
+        return builder_.CreateLoad(ptrTy(), newSlot, "cell");
     }
     llvm::Type* valTy = slot->getAllocatedType();
 
@@ -2683,6 +2752,11 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     auto savedRefParams = refParams_;
     auto savedDisposeStack = disposeStack_;
     auto savedLoopStack = loopStack_;
+    // #2281 / §31.2: the method thunk is a separate function. Preserve the
+    // caller's active try/finally frames across this nested emission; keep the
+    // parallel finally-body stack depth-aligned per §29.7.
+    auto savedFinallyStack = finallyStack_;
+    auto savedFinallyBodies = finallyBodyStack_;
     llvm::BasicBlock* savedUnwind = unwindTarget_;
     llvm::BasicBlock* savedProp = propagateBB_;
     llvm::Value* savedCaught = currentCaughtExc_;
@@ -2693,6 +2767,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     currentThis_ = nullptr;
     locals_.clear(); paramSlots_.clear(); refParams_.clear();
     disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+    finallyBodyStack_.clear();
     unwindTarget_ = nullptr; propagateBB_ = nullptr;
     currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
     builder_.SetInsertPoint(
@@ -2818,6 +2893,8 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
     loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);          // #2281 / §31.2
+    finallyBodyStack_ = std::move(savedFinallyBodies);     // #2281 / §29.7
     unwindTarget_ = savedUnwind; propagateBB_ = savedProp;
     currentCaughtExc_ = savedCaught; unwindScopeDepth_ = savedUnwindDepth;
     diverged_ = savedDiverged;
@@ -3108,6 +3185,11 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     auto savedRefParams = refParams_;
     auto savedDisposeStack = disposeStack_;
     auto savedLoopStack = loopStack_;
+    // #2281 / §31.2: the property thunk is a separate function. Preserve the
+    // caller's active try/finally frames across this nested emission; keep the
+    // parallel finally-body stack depth-aligned per §29.7.
+    auto savedFinallyStack = finallyStack_;
+    auto savedFinallyBodies = finallyBodyStack_;
     llvm::BasicBlock* savedUnwind = unwindTarget_;
     llvm::BasicBlock* savedProp = propagateBB_;
     llvm::Value* savedCaught = currentCaughtExc_;
@@ -3120,6 +3202,7 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     currentThis_ = nullptr;
     locals_.clear(); paramSlots_.clear(); refParams_.clear();
     disposeStack_.clear(); loopStack_.clear(); finallyStack_.clear();
+    finallyBodyStack_.clear();
     unwindTarget_ = nullptr; propagateBB_ = nullptr;
     currentCaughtExc_ = nullptr; unwindScopeDepth_ = 0; diverged_ = false;
     builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", thunk));
@@ -3349,6 +3432,8 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
     refParams_ = std::move(savedRefParams);
     disposeStack_ = std::move(savedDisposeStack);
     loopStack_ = std::move(savedLoopStack);
+    finallyStack_ = std::move(savedFinallyStack);          // #2281 / §31.2
+    finallyBodyStack_ = std::move(savedFinallyBodies);     // #2281 / §29.7
     unwindTarget_ = savedUnwind; propagateBB_ = savedProp;
     currentCaughtExc_ = savedCaught; unwindScopeDepth_ = savedUnwindDepth;
     diverged_ = savedDiverged;

@@ -248,8 +248,15 @@ static unsigned countAwaits(const std::vector<std::unique_ptr<ast::Stmt>>& stmts
         }
         else if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s.get()))
             n += countAwaitsInExpr(lc->value.get());
-        else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s.get()))
+        else if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s.get())) {
             n += countAwaitsInExpr(as->value.get());
+        }
+        // fix #2333: `_ := await …` parses as DiscardStmt, not AssignmentStmt;
+        // the resume switch must count the await in its `value` or the post-
+        // await continuation lands on the default (return) and the outer task
+        // never completes — the same hang shape as #441 for try-body awaits.
+        else if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s.get()))
+            n += countAwaitsInExpr(ds->value.get());
         else if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s.get()))
             n += countAwaitsInExpr(es->expr.get());
         else if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s.get()))
@@ -346,6 +353,147 @@ static unsigned countAwaitsInStmt(const ast::Stmt* s) {
     if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s))
         return countAwaitsInExpr(rs->value.get());
     return 0;
+}
+
+
+// §29.7 (#2574): the async counterpart of collectYieldStatesForOwnedLocals
+// (LlvmBackend_Iterators.cpp, fix #2306). Same linear-scan contract — record
+// per-LocalDecl the (establishedAtState, transferredAtState) window — but the
+// async state machine numbers BOTH yields AND awaits as suspend states
+// (smNextSuspendState_ is pre-incremented for each, §30.7), so the scan must
+// advance `state` for awaits too. Without this, an await between a local's
+// declaration and its transfer-yield shifts the actual runtime states, and the
+// yield-only window would either miss a live await-state (leak) or over-fire
+// (double-free). The scan counts awaits in every simple-statement expression
+// position via countAwaitsInExpr, recurses through try bodies and do/end
+// blocks (matching the sync version), and ABORTS on any non-linear shape
+// (IfStmt / WhileStmt / ForStmt / lambdas), on `await using var` (its implicit
+// dispose-await at scope-end is a suspend point whose position the linear walk
+// cannot statically place), and on try statements with awaits in catch arms or
+// finally (the finally body is lowered TWICE — normal exit + unwind — doubling
+// its await count, making the linear scan's state numbering unreliable). A
+// try with catches/finally that have NO awaits is safe: they consume zero
+// suspend states, so the try body's yields+awaits fully determine the state
+// counter for code after the try. Aborting leaves the legacy bounded leak in
+// place rather than risking a double-free.
+static void collectAsyncSuspendStatesForOwnedLocals(
+    sema::SemaContext& ctx,
+    const std::vector<std::unique_ptr<ast::Stmt>>& stmts,
+    unsigned& state,
+    std::unordered_map<const ast::LocalDecl*,
+        std::pair<unsigned, unsigned>>& out,
+    bool& ok) {
+    // (decl → (establishedAtState, transferredAtState))
+    for (const auto& s : stmts) {
+        if (!s) continue;
+        if (!ok) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s.get())) {
+            // `await using var` carries an implicit `await DisposeAsync()` at
+            // scope end — a suspend point whose position depends on the scope
+            // exit, not the linear walk. The linear scan cannot statically
+            // place it, so abort to avoid a state-numbering mismatch. This MUST
+            // precede the `isUsing` skip below: `isAwaitUsing` implies
+            // `isUsing` (ast/Node.hpp), so checking `isUsing` first would
+            // `continue` past this abort, silently mis-counting the scope-end
+            // await instead of bailing out.
+            if (ld->isAwaitUsing) { ok = false; return; }
+            if (ld->isUsing || ld->autoDropAtScopeEnd) continue;
+            auto oit = out.find(ld);
+            if (oit != out.end()) { ok = false; return; }
+            out[ld] = {state + 1, 0};
+            // Count awaits in the initializer — they consume suspend states
+            // BEFORE the next yield, advancing the state counter.
+            state += countAwaitsInExpr(ld->initializer.get());
+            continue;
+        }
+        // Simple statements whose expression positions may contain awaits.
+        // Each await consumes a suspend state, advancing `state`.
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s.get())) {
+            state += countAwaitsInExpr(lc->value.get());
+            continue;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s.get())) {
+            state += countAwaitsInExpr(as->value.get());
+            continue;
+        }
+        // fix #2333: `_ := await …` parses as DiscardStmt, not AssignmentStmt.
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s.get())) {
+            state += countAwaitsInExpr(ds->value.get());
+            continue;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s.get())) {
+            state += countAwaitsInExpr(es->expr.get());
+            continue;
+        }
+        if (auto* rs = dynamic_cast<const ast::ReturnStmt*>(s.get())) {
+            state += countAwaitsInExpr(rs->value.get());
+            continue;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s.get())) {
+            if (ys->isBreak || !ys->value) { ok = false; return; }
+            // §30.7 (#437): `yield return await Expr` contains an await in the
+            // value expression that suspends BEFORE the yield. Count it first.
+            state += countAwaitsInExpr(ys->value.get());
+            // Process the yield transfer (mirrors sync #2306).
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                ys->value.get());
+            if (id && (id->name == "this" || id->name == "base")) {
+                ok = false; return;
+            }
+            sema::Symbol* sym = id ? ctx.exprSymbol(*id) : nullptr;
+            auto* loc = dynamic_cast<sema::LocalSymbol*>(sym);
+            if (id && (!loc || !loc->decl || loc->isUsing)) {
+                ok = false; return;
+            }
+            if (loc && loc->decl) {
+                auto* ldDecl = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+                if (!ldDecl) { ok = false; return; }
+                auto oit = out.find(ldDecl);
+                if (oit == out.end()) { ok = false; return; }
+                if (oit->second.second != 0) { ok = false; return; }
+                oit->second.second = state + 1;
+            }
+            ++state;
+            continue;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s.get())) {
+            // Recurse into the protected body only (§29.6 forbids `yield` in
+            // catches / finally, so no yield-position transfer occurs there).
+            collectAsyncSuspendStatesForOwnedLocals(
+                ctx, ts->body, state, out, ok);
+            if (!ok) return;
+            // Catches and finally with awaits consume suspend states in a
+            // non-linear order (the finally body is lowered TWICE, doubling
+            // its await count). If any await is present, abort — the linear
+            // scan's state numbering would be unreliable past this point.
+            for (const auto& arm : ts->catches) {
+                if (arm.guard && countAwaitsInExpr(arm.guard.get()) > 0) {
+                    ok = false; return;
+                }
+                const ast::Stmt* ab = arm.body.get();
+                unsigned armAwaits = ab
+                    ? (dynamic_cast<const ast::DoEndBlock*>(ab)
+                         ? countAwaits(
+                               dynamic_cast<const ast::DoEndBlock*>(ab)->body)
+                         : countAwaitsInStmt(ab))
+                    : 0;
+                if (armAwaits > 0) { ok = false; return; }
+            }
+            if (ts->hasFinally && countAwaits(ts->finallyBody) > 0) {
+                ok = false; return;
+            }
+            continue;
+        }
+        if (auto* db = dynamic_cast<const ast::DoEndBlock*>(s.get())) {
+            collectAsyncSuspendStatesForOwnedLocals(
+                ctx, db->body, state, out, ok);
+            continue;
+        }
+        // IfStmt / WhileStmt / ForStmt / lambdas / anything else has
+        // data-dependent state ordering — abort the linear scan.
+        ok = false;
+        return;
+    }
 }
 
 
@@ -603,6 +751,17 @@ bool Emitter::suspendInTryPosition(
 //     set), but the two call sites would then disagree about WHO owns the
 //     decision, so this function deliberately excludes it.
 // Shared by emitAsyncMethod and emitAsyncLambda.
+// §30.5 / #2279 (v0.236): when T is itself an INTRINSIC COLLECTION
+// (Array<T>/Set<T>/Dictionary<K,V>/LinkedList<T>/Stack<T>/Queue<T>/
+// OwningBuffer<T>/Owning* collections), the task owns the collection's
+// backing storage directly — the elementPolicyFor path returns a null
+// per-element disposer (the element is a value/string/etc., not a class),
+// so the produced collection was never reclaimed at task disposal (an
+// LSan leak of the bz_array_t*/bz_dict_t*/bz_llist_t* header+data —
+// #2279's repro leaks 104 bytes from bz_array_alloc per async_body exit).
+// patternAResultCollectionDisposer (declared in impl.hpp, defined in
+// Disposal.cpp alongside the matching `using var` collection path) fills
+// that gap with a per-collection-kind free thunk.
 llvm::Function* Emitter::patternAResultDisposerFor(
     const sema::TypeRef* taskTypeRef) {
     // isTaskTypeName is the established Task/OwningTask recognizer (used by
@@ -619,8 +778,15 @@ llvm::Function* Emitter::patternAResultDisposerFor(
     if (name != "Task") return nullptr;  // excludes OwningTask (Pattern B)
     if (taskTypeRef->genericArgs.empty() || !taskTypeRef->genericArgs[0])
         return nullptr;
-    ElementPolicy pol =
-        elementPolicyFor(taskTypeRef->genericArgs[0], /*owningFamily=*/true);
+    const sema::TypeRef* tElem = taskTypeRef->genericArgs[0];
+    // #2279: try the intrinsic-collection result path first. If T is a
+    // recognized intrinsic collection, the per-collection-kind free thunk
+    // frees it at task disposal (with the right per-element disposer
+    // internally). Returns null when T is not an intrinsic collection, in
+    // which case we fall through to the existing class-instance path.
+    if (llvm::Function* collDisp = patternAResultCollectionDisposer(tElem))
+        return collDisp;
+    ElementPolicy pol = elementPolicyFor(tElem, /*owningFamily=*/true);
     return pol.cat == ElementPolicy::Category::ClassOwned ? pol.disposerThunk
                                                            : nullptr;
 }
@@ -1638,7 +1804,22 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                 rn = retRef->headName();
             else if (!retRef->importedName.empty())
                 rn = retRef->importedName;
-            isOwningIter = (rn == "IOwningAsyncEnumerable");
+            // §29.1 v0.236 / #2591: recognize BOTH owning async iterator heads.
+            // IOwningAsyncEnumerable<T> is the spec-sanctioned iterator return
+            // (§30.7); IOwningAsyncEnumerator<T> is the enumerator-direct return
+            // form (the owning sibling of the IAsyncEnumerator<T>-direct form
+            // fixed under #759), reached via `await using var en := Gen();`
+            // where Gen's declared return type is IOwningAsyncEnumerator<T>.
+            // Pre-#2591 this head fell through here, so the codegen treated the
+            // frame as the BORROWING form: Current was non-destructive and the
+            // Dispose path never disposed the yielded current_val — an owning
+            // iterator that leaked every yielded value. Recognizing it makes
+            // TakeCurrent (vtable slot 3), the disposeYieldedVal pass in
+            // emitFreeAndReturn, and the owned-local scan below all apply, so
+            // the frame implements the §29.1 owning contract (an advanced-but-
+            // untaken value is disposed by Dispose).
+            isOwningIter = (rn == "IOwningAsyncEnumerable" ||
+                            rn == "IOwningAsyncEnumerator");
         }
     }
     // The per-advance MoveNextAsync result is Task<bool>; the await-result type
@@ -1669,6 +1850,57 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
 
     bool isInstance = !isStaticMethod(ms);
     std::string prefix = std::string("bz$asynciter$") + std::string(ms->name) + "$";
+
+    // §29.7 (#2574): the LOCAL counterpart of the async iterator's owned-
+    // parameter scan. Restricted to IOwningAsyncEnumerable iterators — a bare-
+    // identifier `yield return L;` only transfers a local in the owning form
+    // (#1863); for an IAsyncEnumerable<owned T> iterator the bare-identifier
+    // yield is a borrow and the local's disposal is bounded by sema's never-
+    // discharged auto-drop or unwind (no Abandoned-state-keyed gap analogous
+    // to the bug). The scan counts BOTH yields AND awaits (async suspend
+    // states) so the (establishedAtState, transferredAtState) window matches
+    // the runtime smNextSuspendState_ numbering. On any non-linear shape the
+    // scan returns ok=false and the legacy bounded-leak path keeps working.
+    struct AsyncLocalKeyedDisposal {
+        unsigned establishedAtState = 0;
+        unsigned transferredAtState = 0;   // 0 = not transferred (legacy fallback)
+        unsigned frameField = 0;
+    };
+    std::unordered_map<const ast::LocalDecl*, AsyncLocalKeyedDisposal>
+        asyncOwnedLocalDisposals;
+    if (isOwningIter) {
+        bool lscanOk = true;
+        unsigned lscanState = 0;
+        std::unordered_map<const ast::LocalDecl*,
+            std::pair<unsigned, unsigned>> lscanOut;
+        collectAsyncSuspendStatesForOwnedLocals(
+            ctx_, *ci.stmts, lscanState, lscanOut, lscanOk);
+        if (lscanOk && !lscanOut.empty()) {
+            bool allTransferred = true;
+            for (auto& [ld, pr] : lscanOut) {
+                if (pr.second == 0) {
+                    allTransferred = false;
+                    break;
+                }
+                if (!unwindOwnedLocalClass(ld)) {
+                    allTransferred = false;
+                    break;
+                }
+            }
+            if (allTransferred) {
+                asyncOwnedLocalDisposals.clear();
+                for (auto& [ld, pr] : lscanOut) {
+                    AsyncLocalKeyedDisposal info;
+                    info.establishedAtState = pr.first;
+                    info.transferredAtState = pr.second;
+                    auto fit = frame.localFields.find(ld);
+                    if (fit != frame.localFields.end())
+                        info.frameField = fit->second;
+                    asyncOwnedLocalDisposals[ld] = info;
+                }
+            }
+        }
+    }
 
     // --- MoveNextAsync(ptr self) -> ptr (Task<bool>) ---
     auto* moveNextTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
@@ -1894,6 +2126,35 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             }
             gb.CreateStore(gb.getInt32(-3), sourceStateField);
         }
+        // fix #2609 / §27.5 / §28.9 (v0.236), retain 2-of-2 (the CLONE):
+        // the memcpy above ALIASED every closure-cell pointer into the clone,
+        // and — unlike the sync iterator, which emits a SEPARATE clone vtable
+        // whose Dispose runs with releaseClosures=false — the async iterator has
+        // ONE vtable, so the clone's Dispose is the very same function as the
+        // source's and will run the release loop too. Give the clone its own +1
+        // here so each frame releases exactly the reference it holds; without
+        // this, one `await for` (clone Dispose + source Dispose) would release
+        // the same cell twice — a double-free/UAF, strictly worse than the leak
+        // being fixed. Emitted through `gb` (this vtable body's OWN builder),
+        // never `builder_`, which points at a different function (the same
+        // cross-function-reference hazard the IOE block above documents);
+        // declareC only touches the module, so it is safe here.
+        {
+            auto* retainFnGE = declareC("bz_closure_retain",
+                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            for (std::size_t i = 0; i < frame.captures.size(); ++i) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    frame.captures[i].first);
+                if (!ps) continue;                   // 'this' capture — skip
+                sema::TypeRef* pt = paramTypeOf(ps);
+                if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                llvm::Value* fptr =
+                    gb.CreateStructGEP(stateStructTy, clone, fieldIdx);
+                llvm::Value* cl = gb.CreateLoad(ptrTy(), fptr, "gae.clcap");
+                gb.CreateCall(retainFnGE, {cl});     // null-safe
+            }
+        }
         gb.CreateRet(clone);
     }
 
@@ -1921,6 +2182,30 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             builder_.CreateStructGEP(stateStructTy, st, STATE_FIELD);
         builder_.CreateStore(builder_.getInt32(0), stateField);
         emitFrameCaptureStores(frame, st);
+        // fix #2609 / §27.5 / §28.9 (v0.236), retain 1-of-2 (the SOURCE frame):
+        // the async sibling of the sync iterator's capture-store retain (#1864,
+        // LlvmBackend_Iterators.cpp). A function-typed (`func`) parameter stored
+        // into the frame is a BORROW the frame must be able to invoke across
+        // every MoveNextAsync, i.e. it must outlive the producing call — so the
+        // frame takes its OWN +1 on the closure cell here, and the Dispose tail
+        // (emitFreeAndReturn's release loop) drops exactly that +1. Without the
+        // retain, releasing at Dispose would drop a reference the frame never
+        // owned (a UAF), which is why the call-site ARGUMENT-PASS release in
+        // lowerCall was previously scoped to sync-iterator callees only.
+        // bz_closure_retain is null-safe.
+        for (std::size_t ci = 0; ci < frame.captures.size(); ++ci) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                frame.captures[ci].first);
+            if (!ps) continue;                       // 'this' capture — skip
+            sema::TypeRef* pt = paramTypeOf(ps);
+            if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+            unsigned fieldIdx = frame.captureStart + (unsigned)ci;
+            llvm::Value* fptr =
+                builder_.CreateStructGEP(stateStructTy, st, fieldIdx);
+            llvm::Value* cl =
+                builder_.CreateLoad(ptrTy(), fptr, "asynciter.clcap");
+            emitClosureRetain(cl);
+        }
         builder_.CreateRet(st);
     }
 
@@ -2201,6 +2486,59 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
 
         llvm::Value* self = &*disposeFn->arg_begin();
 
+        // fix #2612 / §28.2 / §29.7 (v0.236): idempotent disposal — the ENTRY
+        // GUARD, the async sibling of the sync iterator Dispose's (#1107 rework,
+        // LlvmBackend_Iterators.cpp). §28.2 models idempotency as a
+        // "per-instance disposed flag"; as on the sync path we encode that flag
+        // as a distinct STATE SENTINEL that ONLY Dispose ever writes, and check
+        // it before any cleanup runs, so a Dispose re-entered from within its
+        // own cleanup (a finally body, or an owned param/local destructor, that
+        // reaches this same frame) returns immediately instead of running the
+        // sweeps a second time and, at the end, free()ing the spill area and the
+        // frame AGAIN — a double-free of the frame.
+        //
+        // The sentinel MUST be distinct from `-1`. The pre-fix code stored `-1`
+        // here and its comment claimed that made "re-entrant Dispose a no-op",
+        // but (a) nothing ever tested it, and (b) `-1` is also what Resume
+        // writes on natural exhaustion (the stores in emitResumeDispatch's done
+        // edges), which means "iteration complete, frame still allocated and
+        // STILL OWES DISPOSAL" — so guarding on `-1` would make the FIRST,
+        // legitimate Dispose after full consumption no-op before the owned-param
+        // (§29.8) / owned-local (§29.7) / yielded-value (§29.1) sweeps and the
+        // frame free, turning this fix into a leak. That is exactly the
+        // mis-predication #1107 shipped and the #1107 rework corrected on the
+        // sync path; `-2` is taken from there verbatim. The async state space is
+        // otherwise 0..N (suspension states), `-1` (exhausted) and `-3` (an
+        // owned-param source claimed by GetAsyncEnumerator), so `-2` collides
+        // with nothing and no live frame can present it before its first
+        // Dispose.
+        //
+        // SCOPE, stated plainly: this closes the RE-ENTRANT window — a nested
+        // Dispose that arrives while the first is still running, before the
+        // frame is freed. It does NOT make a SECOND, sequential Dispose safe:
+        // the first one free()s the frame, so a later call reads freed memory
+        // whatever it finds there. The sync guard has the same limit. Both
+        // sequential-double-dispose shapes reachable from source today (an
+        // `await using var` binding plus `await for` over the same enumerator;
+        // an explicit `.Dispose()` plus the scope-end disposal) are already
+        // handled upstream by the call-site null guard — verified under ASan.
+        {
+            llvm::Value* stateGEP0 = builder_.CreateStructGEP(
+                stateStructTy, self, STATE_FIELD);
+            llvm::Value* curState0 =
+                builder_.CreateLoad(i32(), stateGEP0, "dsp.entrystate");
+            llvm::Value* isDisposed = builder_.CreateICmpEQ(
+                curState0, builder_.getInt32(-2), "dsp.isdisposed");
+            auto* earlyRet =
+                llvm::BasicBlock::Create(llvm_, "dsp.idem", disposeFn);
+            auto* proceed =
+                llvm::BasicBlock::Create(llvm_, "dsp.proceed", disposeFn);
+            builder_.CreateCondBr(isDisposed, earlyRet, proceed);
+            builder_.SetInsertPoint(earlyRet);
+            builder_.CreateRetVoid();
+            builder_.SetInsertPoint(proceed);
+        }
+
         // Restore captures so finally bodies can access `this` / params.
         emitFrameCaptureRestores(frame, self);
 
@@ -2217,9 +2555,56 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             locals_[node] = slot;
         }
 
+        // §29.7 (#2574): load the suspension state ONCE, before any branch
+        // sets it to -1, so disposeOwnedLocals (inside emitFreeAndReturn) can
+        // test the live window (establishedAtState <= state < transferredAtState).
+        llvm::Value* disposeState = builder_.CreateLoad(
+            i32(),
+            builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD),
+            "dsp.curstate");
+
         auto* freeFn2 = declareC("free", llvm::Type::getVoidTy(llvm_), {ptrTy()});
 
         auto emitFreeAndReturn = [&]() {
+            // §29.1 v0.236 / #2591: the async sibling of the sync iterator's
+            // disposeYieldedVal (§29 / #1120, LlvmBackend_Iterators.cpp:1719).
+            // For an IOwningAsyncEnumerable<T> / IOwningAsyncEnumerator<T>
+            // iterator whose element type is a reference type, current_val holds
+            // the last yielded OWNED value. TakeCurrent (vtable slot 3, the
+            // Current path above) nulls the slot when the consumer takes the
+            // value, so a NON-NULL current_val at Dispose time means the
+            // consumer abandoned after a successful MoveNextAsync WITHOUT
+            // calling TakeCurrent — the §29.1 "advanced-but-untaken" pending
+            // value. Dispose it exactly once (null-guarded) and null the slot.
+            // Mirrors the sync isOwningIter branch (unconditional dispose of a
+            // non-null current_val): the async frame carries no current_val_owned
+            // flag (there is no IAsyncEnumerable<owned T> flag form — only the
+            // owning interfaces transfer ownership per §29.1), so only the
+            // owning form (isOwningIter) with a pointer element type is handled.
+            // Null-guarded so full consumption (TakeCurrent already nulled the
+            // slot) and a re-entrant Dispose are no-ops — never a double-free.
+            // Runs BEFORE the owned-param/local sweeps, matching the sync
+            // Dispose's ordering (disposeYieldedVal → disposeOwnedParams → …);
+            // current_val is a dedicated trailing field that never aliases any
+            // param/local slot, so the ordering introduces no double-free.
+            if (isOwningIter && elemTy->isPointerTy()) {
+                llvm::Value* cvField = builder_.CreateStructGEP(
+                    stateStructTy, self, CURRENT_VAL_FIELD);
+                llvm::Value* yv = builder_.CreateLoad(elemTy, cvField, "aity.yv");
+                llvm::Value* isNull = builder_.CreateICmpEQ(
+                    yv, llvm::ConstantPointerNull::get(ptrTy()), "aity.yvnull");
+                auto* nonNullBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.yv.nonnull", disposeFn);
+                auto* contBB = llvm::BasicBlock::Create(
+                    llvm_, "aity.yv.cont", disposeFn);
+                builder_.CreateCondBr(isNull, contBB, nonNullBB);
+                builder_.SetInsertPoint(nonNullBB);
+                emitDisposeAndReclaim(yv);
+                builder_.CreateStore(
+                    llvm::ConstantPointerNull::get(ptrTy()), cvField);
+                builder_.CreateBr(contBB);
+                builder_.SetInsertPoint(contBB);
+            }
             // §29.8 (#973b): dispose never-discharged `owned` parameters captured
             // in the frame BEFORE freeing it — the async analogue of the sync
             // iterator's disposeOwnedParams (LlvmBackend_Iterators.cpp). Runs on
@@ -2272,6 +2657,98 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                 builder_.CreateBr(contBB);
                 builder_.SetInsertPoint(contBB);
             }
+            // §29.7 (#2574): the LOCAL counterpart of the owned-parameter
+            // sweep above — the async sibling of the sync iterator's
+            // disposeOwnedLocals (#2306, LlvmBackend_Iterators.cpp). For each
+            // plain `var L` local of an owned-class type whose pre-pass
+            // produced a (establishedAtState, transferredAtState, frameField)
+            // tuple, dispose L's frame slot iff the current state is in L's
+            // live window:
+            //   establishedAtState <= state < transferredAtState
+            // The null guard handles "never reached (state 0)" — the calloc-
+            // zeroed slot is null because MoveNextAsync never ran past the
+            // declaration. Reverse establishment order matches §28.4's
+            // reverse-declaration destructor rule. Runs AFTER owned-param
+            // disposal and BEFORE the spill/frame free — no double-free with
+            // anything downstream. Only registered locals are visited, so the
+            // loop is a no-op (zero IR) for body shapes the pre-pass could
+            // not statically pin — preserving the existing bounded leak for
+            // those shapes rather than risking a double-free.
+            if (!asyncOwnedLocalDisposals.empty()) {
+                for (auto bit = frame.bodyLocals.rbegin();
+                     bit != frame.bodyLocals.rend(); ++bit) {
+                    const ast::Node* node = bit->first;
+                    auto* ld = dynamic_cast<const ast::LocalDecl*>(node);
+                    if (!ld) continue;
+                    auto oit = asyncOwnedLocalDisposals.find(ld);
+                    if (oit == asyncOwnedLocalDisposals.end()) continue;
+                    const AsyncLocalKeyedDisposal& info = oit->second;
+                    if (info.establishedAtState == 0 ||
+                        info.transferredAtState == 0 ||
+                        info.frameField == 0)
+                        continue;
+                    unsigned fieldIdx = info.frameField;
+                    llvm::Value* fptr = builder_.CreateStructGEP(
+                        stateStructTy, self, fieldIdx);
+                    llvm::Value* obj = builder_.CreateLoad(
+                        ptrTy(), fptr, "aitl.obj");
+                    llvm::Value* nonNull = builder_.CreateICmpNE(
+                        obj, llvm::ConstantPointerNull::get(ptrTy()),
+                        "aitl.nonnull");
+                    llvm::Value* established = builder_.CreateICmpSGE(
+                        disposeState,
+                        builder_.getInt32((int)info.establishedAtState),
+                        "aitl.estab");
+                    llvm::Value* beforeMove = builder_.CreateICmpSLT(
+                        disposeState,
+                        builder_.getInt32((int)info.transferredAtState),
+                        "aitl.beforemove");
+                    llvm::Value* shouldDispose = builder_.CreateAnd(
+                        nonNull,
+                        builder_.CreateAnd(established, beforeMove),
+                        "aitl.shoulddispose");
+                    auto* ldispBB = llvm::BasicBlock::Create(
+                        llvm_, "aitl.dispose", disposeFn);
+                    auto* lcontBB = llvm::BasicBlock::Create(
+                        llvm_, "aitl.cont", disposeFn);
+                    builder_.CreateCondBr(shouldDispose, ldispBB, lcontBB);
+                    builder_.SetInsertPoint(ldispBB);
+                    emitDisposeAndReclaim(obj);
+                    builder_.CreateStore(
+                        llvm::ConstantPointerNull::get(ptrTy()), fptr);
+                    builder_.CreateBr(lcontBB);
+                    builder_.SetInsertPoint(lcontBB);
+                }
+            }
+            // fix #2609 / §27.5 / §28.9 (v0.236): drop THIS frame's +1 on each
+            // function-typed (`func`) parameter capture — the async sibling of
+            // the sync iterator's releaseClosureCaptures (#1864,
+            // LlvmBackend_Iterators.cpp:1715). Paired 1:1 with the two retains
+            // above (construction entry for the source frame, GetAsyncEnumerator
+            // for each clone), so every frame that reaches Dispose releases
+            // exactly the one reference it took. Runs AFTER the owned-param and
+            // owned-local sweeps and BEFORE the spill/frame free, matching the
+            // sync Dispose's ordering. The field is NOT nulled: unlike an owned
+            // object, a released closure cell may still be live (another frame
+            // or the caller can hold a reference) and the slot is dead the
+            // instant the frame is freed on the next two lines. Owned-class
+            // params (the iteratorAutoDispose loop above) and function-typed
+            // params are DISJOINT sets — an `owned` parameter has a Named class
+            // type, never Kind::Function — so the two loops never touch the same
+            // field. bz_closure_release is null-safe, so a capture the frame
+            // never received (null slot) is a no-op.
+            for (std::size_t i = frame.captures.size(); i-- > 0;) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    frame.captures[i].first);
+                if (!ps) continue;                   // 'this' capture — skip
+                sema::TypeRef* pt = paramTypeOf(ps);
+                if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                llvm::Value* fptr =
+                    builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
+                llvm::Value* cl = builder_.CreateLoad(ptrTy(), fptr, "aitc.cl");
+                emitClosureRelease(cl);   // null-safe
+            }
             // Free the spill area first (null-safe: free(null) is a no-op).
             llvm::Value* spillField2 =
                 builder_.CreateStructGEP(stateStructTy, self, SPILL_PTR_FIELD);
@@ -2300,15 +2777,21 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             // cleanup — mark done and free.
             llvm::Value* stateGEP2 =
                 builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
-            builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            // fix #2612: the DISPOSED sentinel (-2), not the exhaustion value
+            // (-1) — see the entry guard above for why they must differ.
+            builder_.CreateStore(builder_.getInt32(-2), stateGEP2);
             emitFreeAndReturn();
         } else {
             auto* doneBB = llvm::BasicBlock::Create(llvm_, "dsp.done", disposeFn);
             llvm::Value* stateGEP2 =
                 builder_.CreateStructGEP(stateStructTy, self, STATE_FIELD);
             llvm::Value* curState = builder_.CreateLoad(i32(), stateGEP2);
-            // Mark done immediately so re-entrant Dispose is a no-op.
-            builder_.CreateStore(builder_.getInt32(-1), stateGEP2);
+            // Mark done immediately — BEFORE the finally chains run — so a
+            // Dispose re-entered from inside one of them no-ops at the entry
+            // guard. fix #2612: the DISPOSED sentinel (-2), not the exhaustion
+            // value (-1). The switch below dispatches on the already-loaded
+            // `curState`, so overwriting the field here is safe.
+            builder_.CreateStore(builder_.getInt32(-2), stateGEP2);
             std::set<unsigned> states;
             for (auto& kv : smIterCleanupAtState_) states.insert(kv.first);
             auto* sw = builder_.CreateSwitch(curState, doneBB,

@@ -767,10 +767,25 @@ struct MetaFunction {
 // PROPERTY has no exported accessor symbol at all (§26.1 properties are
 // inlined at the use site). Those shapes are not exported, so the importer
 // keeps its existing clean "no member" reject rather than mis-dispatching.
+struct MetaSourceSpan {
+    std::string file;
+    std::uint32_t beginLine = 0;
+    std::uint32_t beginColumn = 0;
+    std::uint32_t endLine = 0;
+    std::uint32_t endColumn = 0;
+
+    bool operator==(const MetaSourceSpan&) const = default;
+};
+
 struct MetaExtension {
     MetaType target;                  // §26.1 the extended type
     MetaVisibility visibility = MetaVisibility::Public;
     std::vector<MetaMember> members;  // §26.3 methods (this increment)
+    // §26.5 rule 4 (#2329): diagnostic identity for a nameless block. The
+    // constraints use their source-like `where T: ...` spelling because the
+    // importer needs to reconstruct the AST list, not resolve a second API.
+    MetaSourceSpan sourceSpan;
+    std::vector<std::string> genericConstraints;
 
     bool operator==(const MetaExtension&) const;
 };

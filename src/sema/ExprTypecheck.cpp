@@ -161,7 +161,13 @@ void ExprTC::run(const ast::SourceFile& src) {
     // §2.2 v0.164 collision rule (#1365): same as TypeResolution — track which
     // module first introduced each bare name; on collision, remove from scope
     // and record as ambiguous.
-    if (ctx_.hasImports()) {
+    // §26.5 step 2 (#2573): the gate also admits an extension-only dependency —
+    // one whose public surface registers `public extension` blocks but no
+    // exported types. Such a module never populates importedByModule_, so
+    // hasImports() alone would skip this loop and leave importedExtensions_
+    // empty, hiding the extension from lookupExtensionMember. OR in
+    // hasImportedExtensions() so the block below still populates extensions.
+    if (ctx_.hasImports() || ctx_.hasImportedExtensions()) {
         std::unordered_set<std::string_view> localNames;
         for (const auto& [name, _sym] : moduleScope_->names)
             localNames.insert(name);
@@ -3871,6 +3877,51 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
             return;
         }
     }
+    auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(*as.target));
+    if (!fs) return;
+    // §9.1 / §9.4 (v0.236, #2309): a positional RECORD's auto-generated
+    // property is read-only — "Properties auto-generated from positional
+    // fields are read-only" (§9.4). The readonly modifier branch below
+    // fires only on a user-written `readonly` modifier; the record's
+    // generated property carries no modifier (its read-onlyness is
+    // structural), so without this branch the assignment was silently
+    // accepted and codegen wrote straight into the backing storage — a
+    // wrong-value miscompile that printed the new value via the same
+    // getter (the issue's own repro: `r.X := 99;` then `r.X` returned 99).
+    //
+    // THIS BRANCH RUNS BEFORE THE BROAD `inConstructor_` EARLY-RETURN
+    // BELOW because that carve-out does NOT track WHICH type's constructor
+    // we're in — it returns early for any constructor body, which would
+    // allow, e.g., a `class C` constructor to write `r.X := 5` where `r`
+    // is a positional record instance. The carve-out here is intentionally
+    // narrower: only an instance OR body constructor of THE DECLARING
+    // record (so a combined-form record like `record R(X: int)
+    // constructor(v: int) X := v; end;` still initializes its positional
+    // field, the §9.2 example). Class primary-constructor parameters
+    // (`fs->posParam` set, `parent->kind == Class`) are NOT covered —
+    // they are parameters (§22.10), not auto-generated properties, and
+    // the spec says nothing to forbid their mutation. Confirmed
+    // mechanical: a `class C(name: string)` body method that does `name
+    // := n` still mutates and the read returns the new value.
+    if (fs->posParam && fs->parent &&
+        fs->parent->kind == ast::TypeDeclKind::Record) {
+        // Narrow construction-window carve-out: only the declaring
+        // record's constructor may initialize a positional field. The
+        // existing readonly modifier branch keeps its broader
+        // construction-window carve-out (a long-standing pattern, not
+        // changed here).
+        bool inDeclaringCtor = inConstructor_ && currentType_ == fs->parent;
+        if (!inDeclaringCtor) {
+            std::string nm = std::string(fs->name);
+            ctx_.diagnostics().report(
+                Severity::Error, as.span.begin,
+                std::string("cannot assign to the auto-generated property `") +
+                nm + "` of a positional record — a record's positional-field "
+                "properties are read-only (§9.1 / §9.4); use a `with` "
+                "expression to produce a new value (§9.5)");
+        }
+        return;
+    }
     if (inConstructor_) return;
     // §22.8 (#747 R42): a readonly field may be assigned only in a field
     // initializer or a constructor body; assignment anywhere else is a compile
@@ -3879,8 +3930,6 @@ void ExprTC::checkReadonlyAssignment(const ast::AssignmentStmt& as) {
     // matched only `this.f`, so an instance- or type-qualified readonly write
     // (e.g. `Config.MaxSize := 50` in a normal method) slipped through and was
     // silently dropped at runtime.
-    auto* fs = dynamic_cast<FieldSymbol*>(ctx_.exprSymbol(*as.target));
-    if (!fs) return;
     // Check the readonly modifier on the field's MemberSymbol.
     for (auto mod : fs->modifiers) {
         if (mod == "readonly") {
@@ -3946,12 +3995,38 @@ void ExprTC::checkLValueChainNotCallBased(const ast::Expr& target) {
 // §22.3 "ref and out argument locations" (v0.184, #1682). See the header for
 // the full contract; this covers the DECLARATION-based categories only (the
 // dataflow-based owned-state exclusion is MethodOwnership::
-// checkRefOutOwnedOperand in the ownership pass).
-void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a) {
+// checkRefOutOwnedOperand in the ownership pass). `formalParamModifier` is the
+// callee's parameter modifier for `a`'s slot when known ("" when not), and is
+// used to specialize the §22.3/§22.4 rule for the OWNED output variant — "for
+// `out owned`, the accepted forms remain exactly the inline `out using var
+// x` / `out owned var x` of §22.4", so an indexer slot / property / bare
+// local recipient against an `out owned` parameter is a clean rejection
+// instead of leaking through to codegen's #1386 fallback (#2320).
+void ExprTC::checkRefOutOperandCategory(const ast::CallArgument& a,
+                                        std::string_view formalParamModifier) {
     if (!a.value) return;
     if (a.modifier != "ref" && a.modifier != "out") return;
     const ast::Expr& target = *a.value;
     const char* kind = (a.modifier == "ref") ? "ref" : "out";
+    // §22.3 / §22.4 / fix #2320: when the formal parameter is `out owned`,
+    // the call-site recipient must be an INLINE declaration — `out using var
+    // x` / `out owned var x`. Any other shape (an indexer slot, a property,
+    // a pre-existing local, a discard) reaches the callee through a path
+    // §22.4 does not bless: codegen's accessor-ref-arg bracket (#1302) was
+    // deliberately narrowed to plain `ref`/`out` precisely so an `out owned`
+    // indexer slot wouldn't silently become a write-into-a-borrowing-slot
+    // (§28.6 leak prevention / §28.11 "collections do not own elements");
+    // the result is the `internal: … — #1386` fallback at buildOrderedArgs.
+    // Reject upfront with the §22.3/§22.4 citation so the user sees a clear
+    // "must be `out using var x` / `out owned var x`" instead of an internal
+    // error message. Inline `out using var` / `out owned var` declarations
+    // (modifier == "out using var" / "out owned var") keep working — those
+    // declare a fresh local, no pre-existing-location question.
+    if (formalParamModifier == "out owned") {
+        std::string msg = std::string("an `out owned` argument must be an inline `out using var x` or `out owned var x` declaration (§22.3 / §22.4); a pre-existing storage location has no place to discharge the value the callee produces");
+        ctx_.diagnostics().report(Severity::Error, target.span.begin, msg);
+        return;
+    }
 
     // Structural shape (§6.6 / A.6's lvalue shape, reused from
     // checkLValueChainNotCallBased): strip `.field` / `[index]` / postfix
@@ -4091,6 +4166,27 @@ void ExprTC::checkRefOutFieldOperand(FieldSymbol& fs, const ast::Expr& target,
     for (auto mod : fs.modifiers) {
         if (mod == "readonly") isReadonly = true;
         else if (mod == "static") isStatic = true;
+    }
+    // §9.1 / §9.4 (v0.236, #2309): a positional RECORD's auto-generated
+    // property is read-only and is never a ref/out target — the
+    // readonly-modifier branch below only fires on a user-written
+    // `readonly` modifier; the positional-record case has no modifier.
+    // Apply the SAME narrow construction-window carve-out as the
+    // `:=`-target check (the declaring record's constructor only) —
+    // without it a class C constructor could `ref r.X` where `r` is a
+    // positional record, an aliasing write through read-only storage.
+    if (fs.posParam && fs.parent &&
+        fs.parent->kind == ast::TypeDeclKind::Record) {
+        bool inDeclaringCtor = inConstructor_ && currentType_ == fs.parent;
+        if (!inDeclaringCtor) {
+            ctx_.diagnostics().report(
+                Severity::Error, target.span.begin,
+                std::string("a `") + kind + "` argument may not be the "
+                "auto-generated property `" + std::string(fs.name) +
+                "` of a positional record — a record's positional-field "
+                "properties are read-only (§9.1 / §9.4 / §22.3)");
+        }
+        return;
     }
     // §22.8: a readonly field is assignable only in a field initializer or
     // the declaring class's constructor — `inConstructor_` covers both
@@ -5799,12 +5895,9 @@ static std::string spellExtHeadTypeRef(const TypeRef* t) {
 
 // §26.5 rule 4 (#1307): a printable spelling of an AST type node, used for the
 // `where` clause of a rule-4 ambiguity candidate. Read directly from the AST
-// (ExtensionDecl::genericConstraints) rather than a resolved TypeRef, because
-// an imported extension's synthesized AST (ModuleLoader.cpp Pass 4) never
-// reconstructs genericConstraints — module metadata does not currently
-// serialize a block's `where` clause — so spellExtWhereClause below
-// intentionally returns "" for an imported candidate rather than fabricating
-// text; see the diagnostic-site comment for the recorded follow-up.
+// (ExtensionDecl::genericConstraints). Imported synthetic declarations are
+// reconstructed from MetaExtension's source-like constraint payload (#2329),
+// so local and imported candidates use the same spelling path.
 static std::string spellExtWhereAstType(const ast::Type& t) {
     std::string s;
     if (t.name)
@@ -5853,7 +5946,8 @@ Symbol* ExprTC::lookupExtensionMember(
     std::string_view name,
     std::vector<std::pair<std::string, TypeRef*>>* outBinding,
     SourceLocation loc,
-    bool reportAmbiguity) {
+    bool reportAmbiguity,
+    std::ptrdiff_t arity) {
     if (!receiver) return nullptr;
     // §26.5 step 2: "the compiler searches the current module AND all imported
     // modules for extension blocks on x's type". The candidate set is this
@@ -5965,6 +6059,16 @@ Symbol* ExprTC::lookupExtensionMember(
             target && target->kind == TypeRef::Kind::Named && !target->declaration;
         for (Symbol* m : ext->members) {
             if (!m || m->name != name) continue;
+            // fix #2328 (§26.5, v0.236): per-call arity filter on extension
+            // methods (the relevant kind for an arity-mismatched call — extension
+            // PROPERTYs are bare references and exempt). Skipping a non-matching
+            // member drops it from the candidate set; the per-block scan
+            // continues to the next name match.
+            if (arity >= 0) {
+                auto* ms = dynamic_cast<MethodSymbol*>(m);
+                if (ms && ms->params.size() != static_cast<std::size_t>(arity))
+                    continue;
+            }
             if (!freeVars.empty() && !targetIsBuiltin) {
                 // User-declared generic extension (#773): skip methods whose
                 // signatures reference a free type variable — that case is
@@ -5986,16 +6090,42 @@ Symbol* ExprTC::lookupExtensionMember(
                 // Collect T→concrete mapping positionally from matched ancestor.
                 collectFreeVarBinding(target, matchedAnc, freeVars, binding);
             }
-            // §26.5 (pre-existing, unchanged by #1307): the first same-named
-            // member within ONE block wins — per-block overload selection by
-            // arity/argument type is a separate, unimplemented gap (member
-            // access is typed independent of the enclosing call's argument
-            // list throughout this front-end), not touched here.
+            // fix #2328 (§26.5, v0.236): per-block same-name overloads are
+            // arity-filtered ABOVE (when `arity >= 0`), so the first surviving
+            // member within ONE block is the arity-correct candidate. A bare
+            // reference (`arity == -1`, the default) still picks the first
+            // same-named member per block — that gap is unchanged: per-block
+            // argument-type disambiguation for a name-matched, arity-matched
+            // overload set is a separate concern that §26.5 step 2 explicitly
+            // defers (the pre-#2328 comment in this slot). Adding a per-block
+            // arity/argument-type tie-break here would be out of scope for the
+            // fix; the call site can still surface an ambiguity in step 2.
             found.push_back({m, matchedAnc, target, ext, decl, std::move(binding)});
             break;
         }
     }
-    if (found.empty()) return nullptr;
+    if (found.empty()) {
+        // fix #2328 (§26.5, v0.236): a non-negative `arity` filters out same-
+        // named extension members whose parameter list has a different
+        // arity (see the per-block loop above). The lookup itself stays
+        // SILENT on no-match — the caller (resolveMemberAccess) decides
+        // whether to emit an arity-specific diagnostic, depending on the
+        // receiver's permissiveness. A permissive `Object`-typed
+        // receiver (§3 / #605) accepts any member name and the no-arity
+        // lookups are intentionally non-rejecting, so the "Object.
+        // Unknown()" idiom that several codegen tests rely on (a
+        // permissive member access whose only failure is the codegen
+        // zero-init warning) must not be rejected here. Emitting in the
+        // lookup would also break the "no member" reject's existing
+        // `knownCompleteUserType` gate — for a permissive receiver the
+        // caller would have fired its own diagnostic (or, as today,
+        // chosen not to); the lookup's silent null return lets the
+        // caller keep that decision. The per-call arity-specific
+        // diagnostic for the non-permissive (known-complete-type)
+        // case is added by the caller, which has the receiver
+        // `targetType` and the per-block arities in scope.
+        return nullptr;
+    }
     if (found.size() == 1) {
         if (outBinding) *outBinding = found[0].binding;
         return found[0].member;
@@ -6059,14 +6189,22 @@ Symbol* ExprTC::lookupExtensionMember(
                                        : std::string();
             if (!where.empty()) head += " " + where;
             std::string site;
-            if (c.decl && c.decl->span.begin.line != 0)
-                site = "declared at line " +
-                       std::to_string(c.decl->span.begin.line) + ", column " +
-                       std::to_string(c.decl->span.begin.column);
-            else
-                // §1307 follow-up: an imported extension's synthesized AST
-                // carries no source span (module metadata doesn't serialize
-                // cross-module positions) — say so rather than print 0:0.
+            if (c.decl && c.decl->span.begin.line != 0) {
+                site = "declared at ";
+                if (!c.decl->sourceFile.empty())
+                    site += c.decl->sourceFile + ":";
+                else
+                    site += "line ";
+                site += std::to_string(c.decl->span.begin.line);
+                if (!c.decl->sourceFile.empty())
+                    site += ":" + std::to_string(c.decl->span.begin.column);
+                else
+                    site += ", column " +
+                            std::to_string(c.decl->span.begin.column);
+            } else
+                // A dependency produced before #2329 has no source-span
+                // payload. Keep the established explicit degradation instead
+                // of fabricating 0:0.
                 site = "declaration site not tracked across module imports";
             msg += "\n  " + head + " — module `" + moduleName + "`, " + site;
         }
@@ -11689,6 +11827,182 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                 "` — `using var` is implicitly non-reassignable "
                                 "and `" + std::string(is->op) +
                                 "` reassigns it (§28.10 / §17.6)");
+                    }
+                }
+            }
+        }
+        // §9.1 / §9.4 (v0.236, #2309): `r.X++` / `r.X--` on a positional
+        // RECORD's auto-generated property is a write to read-only
+        // storage — `++`/`--` desugars to a reassignment (§17.6). This
+        // is the IncrementStmt sibling of the AssignmentStmt check above
+        // and the ref/out operand check in checkRefOutFieldOperand; the
+        // IncrementStmt path never reaches either, so without this
+        // branch `r.X++` was silently accepted and codegen wrote the
+        // increment straight to the backing field. Same narrow
+        // construction-window carve-out as the AssignmentStmt branch
+        // (the declaring record's constructor only — a class C
+        // constructor must not be able to write to a positional record's
+        // property via `++` either).
+        if (is->target) {
+            if (auto* fs = dynamic_cast<FieldSymbol*>(
+                    ctx_.exprSymbol(*is->target))) {
+                if (fs->posParam && fs->parent &&
+                    fs->parent->kind == ast::TypeDeclKind::Record) {
+                    bool inDeclaringCtor =
+                        inConstructor_ && currentType_ == fs->parent;
+                    if (!inDeclaringCtor) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, is->target->span.begin,
+                            std::string("cannot increment/decrement the "
+                            "auto-generated property `") +
+                            std::string(fs->name) +
+                            "` of a positional record — a record's "
+                            "positional-field properties are read-only "
+                            "(§9.1 / §9.4 / §17.6)");
+                    }
+                }
+            }
+        }
+        // §17.6 (v0.236, #2585 / #2599): the increment/decrement operators
+        // are defined on exactly three operand categories — (1) a value-type
+        // operand whose type T overloads `operator ++`, (2) a built-in numeric
+        // type, (3) a reference-type operand whose type overloads the operator
+        // (§4.6: string, classes, interfaces, function types, and heap-array
+        // builtins are reference types). Any operand in NONE of those three
+        // must be rejected at the front end; without this check the operand
+        // reaches codegen, which has no built-in `++` for it and emits
+        // malformed IR (`ConstantInt::get(<non-numeric-type>, 1)` -> a
+        // degenerate constant fed to `sadd.with.overflow` on a pointer or
+        // record struct) in the "Built-in numeric increment/decrement" branch
+        // of LlvmBackend_Stmts.cpp's IncrementStmt handler (ICE: `s.P++`/`s++`
+        // on a string local or property (#2585, on `ptr`); `r++` on a record
+        // local without an overload (#2599, on `%record.R`)).
+        //
+        // #2585 covered reference-type operands. #2599 closes the value-type
+        // RECORD gap: a record is a value type (§9) that is NOT a built-in
+        // numeric, so §17.6's category (1) is the ONLY clause that could
+        // admit `r++` — and it applies IFF the record overloads `operator ++`.
+        // A record without the overload therefore matches none of §17.6's
+        // three categories and is invalid by exhaustion. The value-type
+        // numeric primitives (int/long/double/char/...) keep their built-in
+        // `++` (§17.6 category (2), skipped here); enums are left to their
+        // own rule (§17.6 does not govern enums — #2585 left them and #2599
+        // follows). The operator-overload lookup mirrors codegen's own
+        // (LlvmBackend_Stmts.cpp ~line 1158), so a type that DOES overload
+        // `++`/`--` (the §17.6 `Counter` example, §25.3) still compiles.
+        if (is->target) {
+            if (const sema::TypeRef* targetTy =
+                    ctx_.exprType(*is->target)) {
+                // §4.6 reference type, IGNORING nullability — a `string?` is
+                // still a reference type that does not overload `++`.
+                bool isRefType = false;
+                switch (targetTy->kind) {
+                    case sema::TypeRef::Kind::Function:
+                        isRefType = true;
+                        break;
+                    case sema::TypeRef::Kind::Primitive:
+                        isRefType =
+                            (targetTy->primitive ==
+                             sema::PrimitiveType::String) ||
+                            (targetTy->primitive ==
+                             sema::PrimitiveType::Object);
+                        break;
+                    case sema::TypeRef::Kind::Named:
+                        // A Named TypeRef with no declaration is an
+                        // imported/builtin reference type (a collection
+                        // wrapper `Array<T>`/`OwningArray<T>`, `Task`, ...)
+                        // — same reasoning as isNonNullableReferenceType.
+                        if (!targetTy->declaration)
+                            isRefType = true;
+                        else
+                            isRefType =
+                                targetTy->declaration->kind ==
+                                    ast::TypeDeclKind::Class ||
+                                targetTy->declaration->kind ==
+                                    ast::TypeDeclKind::Interface;
+                        break;
+                    default:
+                        break;  // numeric/char/bool primitive, record, enum,
+                                // inline array, unit, error — not a reference
+                                // type
+                }
+                // §17.6 / #2599: a value-type RECORD operand. A record is a
+                // value type (§9) but NOT a built-in numeric, so without a
+                // user-declared `operator ++` it falls in none of §17.6's
+                // three categories (exhaustion). Nullability ignored — a
+                // record optional `R?` is not itself incrementable either.
+                bool isValueTypeRecord =
+                    targetTy->kind == sema::TypeRef::Kind::Named &&
+                    targetTy->declaration &&
+                    targetTy->declaration->kind ==
+                        ast::TypeDeclKind::Record;
+                if (isRefType || isValueTypeRecord) {
+                    // Look for a user-defined `operator ++`/`operator --` on
+                    // the target's Named type (§25 overload resolution).
+                    // Both reference types and value-type records resolve
+                    // through the same overload lookup (a record's
+                    // `operator ++` admits it under §17.6 category (1)).
+                    bool hasOverload = false;
+                    if (targetTy->kind == sema::TypeRef::Kind::Named &&
+                        targetTy->declaration) {
+                        for (sema::Symbol* m :
+                             targetTy->declaration->members) {
+                            auto* ms =
+                                dynamic_cast<sema::MethodSymbol*>(m);
+                            if (ms && ms->isOperator &&
+                                ms->operatorToken == is->op &&
+                                ms->params.size() == 1) {
+                                hasOverload = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!hasOverload) {
+                        // Format the type name for the diagnostic. headName()
+                        // covers Named types; the String/Object primitives
+                        // spell themselves; fall back to a generic label.
+                        std::string tyName;
+                        if (targetTy->kind ==
+                                sema::TypeRef::Kind::Primitive &&
+                            targetTy->primitive ==
+                                sema::PrimitiveType::String)
+                            tyName = "string";
+                        else if (targetTy->kind ==
+                                    sema::TypeRef::Kind::Primitive &&
+                                 targetTy->primitive ==
+                                    sema::PrimitiveType::Object)
+                            tyName = "Object";
+                        else if (targetTy->kind ==
+                                    sema::TypeRef::Kind::Function)
+                            tyName = "function type";
+                        else if (std::string_view h =
+                                     targetTy->headName();
+                                 !h.empty())
+                            tyName = std::string(h);
+                        else
+                            tyName = isValueTypeRecord ? "record"
+                                                       : "reference type";
+                        // §17.6 diagnostic: the clause wording is category-
+                        // specific (reference type vs value-type record), but
+                        // both name §17.6 and the missing overload.
+                        std::string categoryWord =
+                            isValueTypeRecord ? "record type"
+                                              : "reference type";
+                        std::string clauseWord =
+                            isValueTypeRecord
+                                ? "on a value-type record"
+                                : "on a reference type";
+                        std::string overloadWord =
+                            isValueTypeRecord ? "the record"
+                                              : "the type";
+                        ctx_.diagnostics().report(
+                            Severity::Error, is->target->span.begin,
+                            std::string("`") + std::string(is->op) +
+                            "` is not defined on " + categoryWord + " `" +
+                            tyName + "` — per §17.6, `++`/`--` " + clauseWord +
+                            " apply only when " + overloadWord +
+                            " overloads the operator (and `" + tyName +
+                            "` does not)");
                     }
                 }
             }

@@ -70,6 +70,17 @@ BEZEL_TEST(async_task_collection_literal_result_1289, elements_round_trip) {
 
 // §30.2/§30.5: the same defect was reachable through a proper `await`, not only
 // through the `.Result` escape hatch — the result SLOT was empty either way.
+// (Pre-#2279 this used `var arr := await C.MakeAsync();` to bind the
+// awaited result to a local. With the #2279 Pattern A result-disposal fix
+// that path now actually frees the task's storage at task disposal; the
+// escape-of-borrow shape (a `var` binding of an unbound-producer await
+// result) is precisely what §30.5 rejects as "the borrow produced by the
+// await must have a source whose lifetime the compiler can bound", so the
+// post-#2279 behavior is to UAF on the freed array. The canonical admitted
+// form is `using var` (the result's owner is the using-var local), so we
+// use that here — the await still reads the borrow at the same full
+// expression, the storage is freed at the using-var's scope end, and the
+// borrow never outlives its source.)
 BEZEL_TEST(async_task_collection_literal_result_1289, consumed_by_await) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -78,7 +89,8 @@ BEZEL_TEST(async_task_collection_literal_result_1289, consumed_by_await) {
         "    return [3, 9, 3, 1]; "
         "  end MakeAsync; "
         "  public static async method Main(): Task<int> "
-        "    var arr := await C.MakeAsync(); "
+        "    using var t := C.MakeAsync(); "
+        "    var arr := await t; "
         "    return arr.Count; "  // 4
         "  end Main; "
         "end C;"), 4);

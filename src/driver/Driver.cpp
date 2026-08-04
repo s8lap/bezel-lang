@@ -452,7 +452,7 @@ CompileResult Driver::compileExecutableObject(
                 // the artifact as executable-kind so an importer rejects it as a
                 // dependency (§2.8.4 rule 4).
                 bezel::module::embedModuleMetadata(*module, semaCtx, source,
-                                                   /*isExecutable=*/true);
+                                                   /*isExecutable=*/true, path);
             }
             std::string err;
             if (!module || !codegen::emitObjectFile(*module, objectPath, err,
@@ -563,7 +563,9 @@ CompileResult Driver::compileObject(const std::string& path,
             // §2.6 step 4: embed the public-interface metadata so an importer's
             // loader can read this object's interface (issue #328 inc 1/2/3).
             // §14 / #662c: pass `source` for ctor/dtor body export.
-            if (module) bezel::module::embedModuleMetadata(*module, semaCtx, source);
+            if (module)
+                bezel::module::embedModuleMetadata(*module, semaCtx, source,
+                                                   /*isExecutable=*/false, path);
             std::string err;
             if (!module || !codegen::emitObjectFile(*module, objectPath, err)) {
                 // Print codegen diagnostics (e.g. "not yet implemented") before

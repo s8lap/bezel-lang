@@ -271,6 +271,10 @@ std::uint64_t semanticHash(const ModuleMetadata& md) {
         for (const MetaExtension& ext : md.extensions) {
             hashType(h, ext.target);
             hashByte(h, static_cast<std::uint8_t>(ext.visibility));
+            if (!ext.genericConstraints.empty()) {
+                hashU64(h, ext.genericConstraints.size());
+                for (const std::string& c : ext.genericConstraints) hashStr(h, c);
+            }
             hashU64(h, ext.members.size());
             for (const MetaMember& m : ext.members) hashMember(h, m);
         }
@@ -418,7 +422,8 @@ bool MetaConstant::operator==(const MetaConstant& o) const {
 
 bool MetaExtension::operator==(const MetaExtension& o) const {
     return target == o.target && visibility == o.visibility &&
-           members == o.members;
+           members == o.members && sourceSpan == o.sourceSpan &&
+           genericConstraints == o.genericConstraints;
 }
 
 bool ModuleMetadata::operator==(const ModuleMetadata& o) const {
@@ -665,13 +670,23 @@ void emitFunction(llvm::BitstreamWriter& w, const MetaFunction& fn) {
 // then the target type, then the members) so the reader is symmetric.
 void emitExtension(llvm::BitstreamWriter& w, const MetaExtension& ext) {
     w.EnterSubblock(EXTENSION_BLOCK, 4);
-    llvm::SmallVector<std::uint64_t, 2> sc{
+    // §26.5 rule 4 (#2329): the trailing five scalars are additive diagnostic
+    // metadata (span + constraint count). A pre-#2329 reader consumes only the
+    // first two and skips the trailing strings when it finishes this block.
+    llvm::SmallVector<std::uint64_t, 7> sc{
         static_cast<std::uint64_t>(ext.visibility),
         ext.members.size(),
+        ext.sourceSpan.beginLine,
+        ext.sourceSpan.beginColumn,
+        ext.sourceSpan.endLine,
+        ext.sourceSpan.endColumn,
+        ext.genericConstraints.size(),
     };
     w.EmitRecord(REC_SCALARS, sc);
     emitType(w, ext.target);
     for (const MetaMember& m : ext.members) emitMember(w, m);
+    emitString(w, ext.sourceSpan.file);
+    for (const std::string& c : ext.genericConstraints) emitString(w, c);
     w.ExitBlock();
 }
 
@@ -1283,14 +1298,30 @@ bool readConstant(Reader& r, MetaConstant& c) {
 
 // §26 (#735): the inverse of emitExtension.
 bool readExtensionBody(Reader& r, MetaExtension& ext) {
-    llvm::SmallVector<std::uint64_t, 2> sc;
+    llvm::SmallVector<std::uint64_t, 7> sc;
     if (!expectScalars(r, sc) || sc.size() < 2) return false;
     ext.visibility = static_cast<MetaVisibility>(sc[0]);
     std::uint64_t nMembers = sc[1];
+    // §26.5 rule 4 (#2329): absent on older blobs, where all fields retain
+    // their reject-conservative/default diagnostic values.
+    const bool hasDiagnosticMetadata = sc.size() >= 7;
+    if (hasDiagnosticMetadata) {
+        ext.sourceSpan.beginLine = static_cast<std::uint32_t>(sc[2]);
+        ext.sourceSpan.beginColumn = static_cast<std::uint32_t>(sc[3]);
+        ext.sourceSpan.endLine = static_cast<std::uint32_t>(sc[4]);
+        ext.sourceSpan.endColumn = static_cast<std::uint32_t>(sc[5]);
+    }
+    const std::uint64_t nConstraints = hasDiagnosticMetadata ? sc[6] : 0;
     if (!readType(r, ext.target)) return false;
     ext.members.resize(nMembers);
     for (std::uint64_t i = 0; i < nMembers; ++i) {
         if (!readMember(r, ext.members[i])) return false;
+    }
+    if (hasDiagnosticMetadata) {
+        if (!expectString(r, ext.sourceSpan.file)) return false;
+        ext.genericConstraints.resize(nConstraints);
+        for (std::uint64_t i = 0; i < nConstraints; ++i)
+            if (!expectString(r, ext.genericConstraints[i])) return false;
     }
     return finishBlock(r);
 }

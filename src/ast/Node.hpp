@@ -1311,6 +1311,11 @@ struct ExtensionDecl : TopDecl {
     std::unique_ptr<Type> targetType;
     std::vector<GenericConstraint> genericConstraints;
     std::vector<std::unique_ptr<Member>> members;
+    // §26.5 rule 4 (#2329): populated for synthetic imported declarations so
+    // ambiguity diagnostics can identify the original artifact's declaration
+    // site. Local declarations leave this empty; the driver already knows the
+    // current source path and their parser-stamped span supplies line/column.
+    std::string sourceFile;
 };
 
 // A.3 `ExternDecl ::= Visibility? "method" Identifier "(" ParamList? ")"

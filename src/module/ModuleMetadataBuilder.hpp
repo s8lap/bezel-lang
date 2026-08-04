@@ -66,8 +66,11 @@ inline constexpr const char* kMetadataGlobalName = "__bezel_module_metadata";
 // class constructors and destructors with bodies have their source text extracted
 // (via AST span offsets) and stored in ctorBodyText / dtorBodyText (#662c).
 // When empty, those fields stay empty and the §14 gate is not lifted.
+// `sourceFile` — optional source path carried only on exported extension blocks
+// for §26.5 rule-4 declaration-site diagnostics (#2329).
 ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
-                                   std::string_view source = {});
+                                   std::string_view source = {},
+                                   std::string_view sourceFile = {});
 
 // Emit hook (§2.6 step 4): build the metadata from `ctx`, serialize it
 // (Increment 1's LLVM bitstream), and embed the bytes into `module` as a
@@ -85,6 +88,7 @@ ModuleMetadata buildModuleMetadata(sema::SemaContext& ctx,
 // rule 4).
 std::size_t embedModuleMetadata(llvm::Module& module, sema::SemaContext& ctx,
                                 std::string_view source = {},
-                                bool isExecutable = false);
+                                bool isExecutable = false,
+                                std::string_view sourceFile = {});
 
 }  // namespace bezel::module

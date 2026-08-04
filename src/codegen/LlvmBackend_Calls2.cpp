@@ -2649,6 +2649,23 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
             llvm::Value* closure =
                 lowerEventHandlerClosure(call.args[0].value.get(), payload);
             if (!closure) return std::optional<llvm::Value*>(nullptr);
+            // fix #2334 / §28.14 / §6.5: lowerEventHandlerClosure ->
+            // lowerLambda just populated lastLambdaCapturedCells_ for any
+            // cellFreeEligible_ captures IFF the argument is a lambda LITERAL
+            // on a `using var` / `await using var` IEvent<T>/EventSource<T>
+            // receiver (collectCellFreeEligible's IEvent.Subscribe /
+            // EventSource.Add special case, mirroring the TaskScope.Spawn
+            // and CancellationToken.Register arms' own consume calls in
+            // LlvmBackend_Calls.cpp). A method-reference argument does not
+            // go through lowerLambda and would leave the vector
+            // stale/empty from whatever lambda last ran elsewhere in this
+            // function — guard on the AST shape here, exactly like those
+            // arms, so this never consumes an unrelated lambda's cells.
+            // Consuming is a harmless no-op when the pre-scan did not flag
+            // anything (an ordinary capture-free Subscribe / Add lambda, or
+            // one whose receiver isn't a using-var local).
+            if (dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()))
+                consumeLastLambdaCapturedCells();
             if (isSubscribe) {
                 auto* subFn =
                     declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
@@ -2741,6 +2758,22 @@ std::optional<llvm::Value*> Emitter::tryLowerEventCall(const ast::CallExpr& call
         llvm::Value* closure =
             lowerEventHandlerClosure(call.args[0].value.get(), payload);
         if (!closure) return std::optional<llvm::Value*>(nullptr);
+        // fix #2334 / §28.14 / §6.5: lowerEventHandlerClosure -> lowerLambda
+        // just populated lastLambdaCapturedCells_ for any cellFreeEligible_
+        // captures IFF the argument is a lambda LITERAL on a `using var` /
+        // `await using var` IEvent<T> receiver (collectCellFreeEligible's
+        // IEvent.Subscribe special case, mirroring the TaskScope.Spawn and
+        // CancellationToken.Register arms' own consume calls in
+        // LlvmBackend_Calls.cpp). A method-reference argument does not go
+        // through lowerLambda and would leave the vector stale/empty from
+        // whatever lambda last ran elsewhere in this function — guard on
+        // the AST shape here, exactly like those arms, so this never
+        // consumes an unrelated lambda's cells. Consuming is a harmless
+        // no-op when the pre-scan did not flag anything (an ordinary
+        // capture-free Subscribe lambda, or one whose receiver isn't a
+        // using-var local).
+        if (dynamic_cast<const ast::LambdaExpr*>(call.args[0].value.get()))
+            consumeLastLambdaCapturedCells();
         auto* subFn =
             declareC("bz_event_subscribe", ptrTy(), {ptrTy(), ptrTy()});
         return std::optional<llvm::Value*>(
@@ -3196,6 +3229,14 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         }
     }
     // §3: stdlib collection instance methods: arr.Add, arr.Get, dict.TryGetValue, etc.
+    // fix #2513 / spec §35.2 (v0.236): the stdlib §2.20 `Result<T, E>`
+    // compiler-provided combinators (Map/MapError/AndThen/UnwrapOr) are
+    // dispatched before the method-symbol path: they have NO MethodSymbol,
+    // and the previous-lane prelude-body injection attempt aborts on the
+    // choice-shaped return's PHI in lowerCaseExpr. tryLowerResultCombinator
+    // emits the inline body and returns null for non-Result combinators, so
+    // the regular dispatch runs unchanged for everything else.
+    if (auto* v = tryLowerResultCombinatorCall(call)) return v;
     if (auto* v = tryLowerCollectionInstanceCall(call)) return v;
     // stdlib §3.2: Encoding.Utf8.GetBytes(s) / Encoding.Utf8.GetString(bytes).
     if (auto* v = tryLowerEncodingCall(call)) return v;
@@ -3282,36 +3323,107 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             // order. Extra/missing args are a sema error — assume arity
             // matches (a mismatch was a sema compile error that should
             // have stopped codegen already).
-            std::size_t argCount = 0;
-            for (const auto& a : call.args) if (a.value) ++argCount;
-            // §A.6 CallExpr's `args` carry positional arguments only (named
-            // args are not in this surface). Bind positionally.
-            std::vector<llvm::Value*> payloadFields;
-            std::size_t argIdx = 0;
-            for (const auto& pf : cc->caseDecl->payload) {
-                (void)pf;
-                if (argIdx < call.args.size() && call.args[argIdx].value) {
-                    payloadFields.push_back(
-                        lowerExpr(*call.args[argIdx].value));
-                } else {
-                    // Defensive — sema should have rejected an under-bound
-                    // call. Use undef of the right type.
-                    auto* pty = st->getElementType(1 + tag);
-                    if (auto* payloadStruct =
-                            llvm::dyn_cast<llvm::StructType>(pty)) {
-                        auto idx = payloadFields.size();
-                        if (idx < payloadStruct->getNumElements()) {
-                            payloadFields.push_back(llvm::UndefValue::get(
-                                payloadStruct->getElementType(idx)));
-                        } else {
-                            payloadFields.push_back(llvm::UndefValue::get(
-                                i32()));
+            // §22.5 / #2268 (v0.236): named arguments on a choice case
+            // construction bind by payload field NAME, not by source
+            // position — `ast::CallArgument::name` carries the §22.5
+            // `name := expr` prefix (Node.hpp:95) and sema already accepts
+            // it (bindArgsToParams, ExprTypecheck_Calls.cpp:7996), but the
+            // codegen below indexed payload fields positionally and so
+            // stored each supplied arg into the slot at the same source
+            // index instead of the slot the name named — a
+            // wrong-field/miscompile on every reorder. Mirror the record
+            // path at LlvmBackend_Exprs2.cpp:5292-5350 (#540): build a
+            // payloadArg[] lookup keyed on the case's payload declaration
+            // order, fill it from named or positional args, then lower
+            // payload-by-payload through the lookup.
+            std::vector<const ast::CallArgument*> payloadArg(
+                cc->caseDecl->payload.size(), nullptr);
+            bool allPositional = true;
+            for (const auto& a : call.args)
+                if (!a.name.empty()) { allPositional = false; break; }
+            bool mappingOk = true;
+            if (allPositional) {
+                std::size_t argIdx = 0;
+                for (std::size_t fi = 0; fi < cc->caseDecl->payload.size();
+                     ++fi) {
+                    if (argIdx < call.args.size() &&
+                        call.args[argIdx].value)
+                        payloadArg[fi] = &call.args[argIdx];
+                    ++argIdx;
+                }
+            } else {
+                // §22.5: a named arg matches the payload field of the same
+                // name; every payload field must be supplied (sema already
+                // rejects arity mismatches above). A positional arg in a
+                // named-arg mix is rejected by sema as well.
+                for (std::size_t ai = 0; ai < call.args.size(); ++ai) {
+                    const ast::CallArgument& a = call.args[ai];
+                    if (a.name.empty()) { mappingOk = false; break; }
+                    bool found = false;
+                    for (std::size_t fi = 0;
+                         fi < cc->caseDecl->payload.size(); ++fi) {
+                        if (cc->caseDecl->payload[fi].name == a.name) {
+                            payloadArg[fi] = &a;
+                            found = true;
+                            break;
                         }
-                    } else {
+                    }
+                    if (!found) { mappingOk = false; break; }
+                }
+                if (mappingOk) {
+                    for (std::size_t fi = 0;
+                         fi < cc->caseDecl->payload.size(); ++fi)
+                        if (!payloadArg[fi]) { mappingOk = false; break; }
+                }
+            }
+            std::vector<llvm::Value*> payloadFields;
+            payloadFields.reserve(cc->caseDecl->payload.size());
+            if (!mappingOk) {
+                // Defensive — sema should have rejected the arg shape that
+                // prevented mapping; use undef for every payload slot so
+                // codegen still terminates with a defined LLVM value.
+                auto* pty = st->getElementType(1 + tag);
+                if (auto* payloadStruct =
+                        llvm::dyn_cast<llvm::StructType>(pty)) {
+                    for (std::size_t i = 0; i < cc->caseDecl->payload.size();
+                         ++i) {
+                        if (i < payloadStruct->getNumElements())
+                            payloadFields.push_back(llvm::UndefValue::get(
+                                payloadStruct->getElementType(i)));
+                        else
+                            payloadFields.push_back(
+                                llvm::UndefValue::get(i32()));
+                    }
+                } else {
+                    for (std::size_t i = 0; i < cc->caseDecl->payload.size();
+                         ++i)
                         payloadFields.push_back(llvm::UndefValue::get(pty));
+                }
+            } else {
+                for (std::size_t fi = 0; fi < cc->caseDecl->payload.size();
+                     ++fi) {
+                    const ast::CallArgument* a = payloadArg[fi];
+                    if (a && a->value) {
+                        payloadFields.push_back(lowerExpr(*a->value));
+                    } else {
+                        // Defensive — sema should reject; use undef of the
+                        // right type so the InsertValue below stays well-
+                        // typed.
+                        auto* pty = st->getElementType(1 + tag);
+                        if (auto* payloadStruct =
+                                llvm::dyn_cast<llvm::StructType>(pty)) {
+                            if (fi < payloadStruct->getNumElements())
+                                payloadFields.push_back(llvm::UndefValue::get(
+                                    payloadStruct->getElementType(fi)));
+                            else
+                                payloadFields.push_back(
+                                    llvm::UndefValue::get(i32()));
+                        } else {
+                            payloadFields.push_back(
+                                llvm::UndefValue::get(pty));
+                        }
                     }
                 }
-                ++argIdx;
             }
             // Build the case's payload struct value.
             auto* payloadTy = st->getElementType(1 + tag);
@@ -3809,6 +3921,37 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         } else if (fs->posParam && fs->posParam->type) {
             rt = ctx_.resolvedType(*fs->posParam->type);
         }
+        // fix #2300 (§2.8.2/§28.9, v0.236): an IMPORTED class field has no
+        // ast::FieldDecl — the importer (ModuleLoader) reconstructs a
+        // FieldSymbol from dependency metadata, so neither branch above
+        // resolves (fs->decl is not a FieldDecl and posParam is null for a
+        // body field). The resolved type rides the importedMemberType side
+        // table (set by ModuleLoader from MetaMember::type); consult it here,
+        // mirroring every other imported-field read site (LlvmBackend_Exprs.cpp
+        // ~L4844 for property reads, LlvmBackend_Layout.cpp ~L1032 for storage
+        // layout). Without this, `h.F(10)` on an imported function-typed field
+        // left rt=null, skipped the `rt->kind == Function` dispatch below, and
+        // fell through to the #2477 "cannot dispatch" zero-init fallback —
+        // silently returning 0 (garbage) instead of the call result. Binding
+        // to a local first (`g := h.F; g(10)`) worked because that dispatches
+        // through the LocalSymbol path with the field read supplying the
+        // closure pointer; only the FieldSymbol callee path missed the type.
+        //
+        // Gated on a CLASS receiver: an imported RECORD function-typed field
+        // has a SEPARATE, deeper pre-existing defect — the cross-module field
+        // READ itself yields a bad closure pointer (the local-bind workaround
+        // `g := r.F; g(n)` segfaults on an imported record on origin/main,
+        // independent of this fix). Routing the record direct-invoke through
+        // emitClosureCall here would only turn that case's silent zero-init
+        // into a segfault without fixing the underlying read. The record
+        // field-read ABI is filed separately and out of scope for #2300
+        // (which is class-specific); leave the record direct-invoke on its
+        // pre-fix #2477 zero-init path until that lands.
+        if (!rt && fs->parent &&
+            fs->parent->kind == ast::TypeDeclKind::Class) {
+            if (sema::TypeRef* it = ctx_.importedMemberType(fs))
+                rt = it;
+        }
         if (rt && rt->kind != sema::TypeRef::Kind::Function) {
             // Declared type isn't itself a function — but for a generic-param
             // field the substitution at the call site may have made it one.
@@ -3822,6 +3965,81 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         if (rt && rt->kind == sema::TypeRef::Kind::Function) {
             llvm::Value* closurePtr = lowerExpr(*call.callee);
             return emitClosureCall(closurePtr, rt);
+        }
+    }
+    // fix #2589 (§23.1/§23/§2.8.2/§28.9, v0.236): directly invoking a
+    // function-typed auto-PROPERTY — `obj.P(args)` where `P` is declared
+    // `property P: (int) -> int := lambda(x) => x + 1;` — silently
+    // miscompiled, returning 0 (the #2477 zero-init fallback) instead of the
+    // call result. Binding the property to a local first (`var g := obj.P;
+    // g(args)`) was a complete workaround and produced the correct value, so
+    // the property READ (the backing-field load) was always correct — only
+    // the direct callee dispatch was broken.
+    //
+    // Root cause: lowerCall had closure-dispatch arms for ParameterSymbol,
+    // LocalSymbol, and FieldSymbol callees (#2300 added the imported-field
+    // type resolution), but NO PropertySymbol arm at all. `obj.P(args)`
+    // resolves `calleeSym` to a PropertySymbol, missed every dispatch arm,
+    // and fell through to the #2477 "cannot dispatch member 'P'" zero-init
+    // fallback — silently returning 0 (garbage) instead of the call result.
+    // This is a different root cause from #2300 (which is the FieldSymbol
+    // arm's imported-type resolution); the property defect has no arm, so it
+    // bites locally too (single-module), not just across --import.
+    //
+    // The fix adds the PropertySymbol arm, mirroring the FieldSymbol arm
+    // directly above: resolve the property's function TypeRef `rt` from the
+    // PropertyDecl's declared type (or, for an IMPORTED property that has no
+    // AST decl, from the ctx_.importedMemberType side table — exactly the
+    // #2300 fallback for imported fields), then read the closure pointer by
+    // lowering the callee MemberAccess (`lowerExpr(*call.callee)` dispatches
+    // the property GET — for an auto-property the CG8 field-read path loads
+    // the backing-field closure value; for a computed/block property the
+    // getter yields it directly), and emitClosureCall on that pointer.
+    //
+    // Gated on a CLASS or INTERFACE receiver for the imported-type fallback.
+    // An imported RECORD function-typed property read shares the separate
+    // deeper defect filed as #2590 (the cross-module field/closure READ
+    // yields a bad pointer): verified empirically, opening this gate to
+    // Record segfaults the imported-record direct-invoke (exit 139) — the
+    // same ABI defect #2300's record gate guards against for fields. The
+    // LOCAL record case (which has an AST decl and a sound read path) is
+    // covered by the `pd->type` branch above. Interface is included because
+    // the imported interface property read dispatches through the itable
+    // (lowerVirtualPropertyGet), which yields a sound closure pointer —
+    // verified: `i.F(10)` on an imported `IFunc` returns 11, no segfault.
+    // The `rt->kind == Function` guard still gates dispatch, so a non-
+    // function-typed property read (`obj.N`, an int) is wholly unaffected —
+    // it never enters this arm's dispatch.
+    if (auto* ps = dynamic_cast<sema::PropertySymbol*>(calleeSym)) {
+        if (!ps->isIndexer) {
+            sema::TypeRef* rt = nullptr;
+            if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+                if (pd->type) rt = ctx_.resolvedType(*pd->type);
+            } else if (ps->parent &&
+                       (ps->parent->kind == ast::TypeDeclKind::Class ||
+                        ps->parent->kind == ast::TypeDeclKind::Interface)) {
+                // Imported class/interface property: no ast::PropertyDecl
+                // (the importer reconstructs the PropertySymbol from
+                // dependency metadata), so the resolved type rides the
+                // importedMemberType side table — mirroring #2300's
+                // imported-field fallback and every other imported-property
+                // read site (LlvmBackend_Exprs.cpp ~L4844
+                // lowerVirtualPropertyGet, ~L5028 lowerPropertyLvalue).
+                if (sema::TypeRef* it = ctx_.importedMemberType(ps))
+                    rt = it;
+            }
+            if (rt && rt->kind != sema::TypeRef::Kind::Function) {
+                // Declared type isn't itself a function — but for a generic-
+                // param property the call-site substitution may have made it
+                // one (same fallback as the FieldSymbol arm above).
+                if (sema::TypeRef* sub = ctx_.exprType(*call.callee);
+                    sub && sub->kind == sema::TypeRef::Kind::Function)
+                    rt = sub;
+            }
+            if (rt && rt->kind == sema::TypeRef::Kind::Function) {
+                llvm::Value* closurePtr = lowerExpr(*call.callee);
+                return emitClosureCall(closurePtr, rt);
+            }
         }
     }
     // fix #507 / §27.3: IIFE — the callee is a LambdaExpr invoked directly at
@@ -6176,6 +6394,17 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                                 builder_.CreateStore(
                                     llvm::ConstantPointerNull::get(ptrTy()),
                                     slot);
+                            // #2310 / §29.8 / §30.1 (#973a residual): also null
+                            // the FRAME capture slot of an `owned` STATE-MACHINE
+                            // parameter this discharge just consumed — so the
+                            // frame's terminal-state disposal (null-guarded) skips
+                            // it on the discharging path. The alloca-null above
+                            // is the sync-method / owned-local piece; the frame
+                            // slot is the state-machine piece. nullStateMachine-
+                            // OwnedParamCapture is self-gating (no-op outside a
+                            // state-machine body, for non-parameter sources, for
+                            // non-owned parameters). // per §29.8 / §30.1
+                            nullStateMachineOwnedParamCapture(ma->target.get());
                             builder_.CreateBr(cont);
                             builder_.SetInsertPoint(cont);
                         } else if (isFreshOwnedClassProducer(ma->target.get())) {
@@ -7109,18 +7338,35 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // reference must therefore be released once the call returns — otherwise the
     // cell leaks (LSan: 40 bytes, #1864) after the frame that borrowed-and-
     // retained it is torn down. This is the closure analogue of the #429 string
-    // ARGUMENT-PASS release below, scoped to sync-iterator callees — the only
-    // closure sink whose frame-capture retain this fix arms (an async iterator
-    // or a closure-returning method is left as-is; its capture/return is not
-    // retained here, so releasing would UAF). Snapshot the closure values BEFORE
+    // ARGUMENT-PASS release below, scoped to ITERATOR callees — the only closure
+    // sink whose frame-capture retain is armed (a closure-returning method is
+    // left as-is; its return is not retained here, so releasing would UAF).
+    // Snapshot the closure values BEFORE
     // emitMethodCall (which may rewrite `args` for nullable widening) and release
     // AFTER, on the normal path only (an exception path leaks the temporary — the
     // safe direction, matching the string block's `!diverged_` guard).
+    //
+    // fix #2609 / §27.5 / §28.9 (v0.236): the ASYNC iterator is now armed too.
+    // Its frame takes the same +1 at construction and each GetAsyncEnumerator
+    // clone takes its own, and the async Dispose tail
+    // (LlvmBackend_Async.cpp emitFreeAndReturn) drops it — so the producer's
+    // transient reference is now exactly the reference nothing else drops, and
+    // releasing it here is what closes the 52-byte leak (cell + env + captured
+    // cell) the async path had. The callee predicate MUST match
+    // Emitter::emitMethod's async-iterator ROUTING exactly (LlvmBackend_Setup.cpp
+    // rules 1 and 2) — `async` + Block body + (a yield OR an async-iterator
+    // return type) — because rule 2 routes a yield-less `async … :
+    // IAsyncEnumerable<T>` body to emitAsyncIteratorMethod too, and that frame
+    // carries the retain. A plain (non-iterator) async method is still excluded:
+    // its frame does NOT retain, so releasing here would UAF.
     std::vector<llvm::Value*> syncIterClosureArgs;
     if (auto* mdIt = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-        if (!isAsyncMethod(ms) &&
-                mdIt->bodyKind == ast::MethodBodyKind::Block &&
-                containsYield(mdIt->stmts)) {
+        const bool isIterCallee =
+            mdIt->bodyKind == ast::MethodBodyKind::Block &&
+            (isAsyncMethod(ms) ? (containsYield(mdIt->stmts) ||
+                                  returnsAsyncIteratorType(ms))
+                               : containsYield(mdIt->stmts));
+        if (isIterCallee) {
             std::size_t clOffset = isStaticMethod(ms) ? 0 : 1;
             for (std::size_t ai = clOffset;
                  ai < args.size() && ai < argExprs.size(); ++ai)
@@ -7272,16 +7518,34 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             }
         }
     }
-    // fix #1073 release site (2/2) — the EXCEPTION/UNWIND edge. Install the
-    // cleanup as `unwindTarget_` for the duration of the call only, so every
-    // unwind edge `emitMethodCall` emits (the callee's propagate, a static-init
-    // guard, an inlined generic body's uncaught throw) drops the same temporaries
-    // on its way to the enclosing catch/propagate boundary. Restored immediately
-    // after, so no later unwind edge can reach it. See
-    // Emitter::closureArgUnwindCleanup for the exactly-once argument.
+    // fix #1073 / #2305 release site (2/2) — the EXCEPTION/UNWIND edge.
+    // Install the cleanup as `unwindTarget_` for the duration of the call only,
+    // so every unwind edge `emitMethodCall` emits (the callee's propagate, a
+    // static-init guard, an inlined generic body's uncaught throw) drops the
+    // same temporaries on its way to the enclosing catch/propagate boundary.
+    // Restored immediately after, so no later unwind edge can reach it. The
+    // #2305 commit extends the cleanup to BOTH vector sets (the #1864
+    // sync-iterator release is a #2305 residual, its normal-edge-only release
+    // was widened to the unwind edge here too). The two vectors are disjoint
+    // — syncIterClosureArgs is gated to an ITERATOR callee (sync, or, per #2609,
+    // async), and the call-bounded arm excludes BOTH (`!isSyncIterCallee` drops
+    // the sync iterators, `!isAsyncMethod(ms)` drops every async callee, async
+    // iterators included) — so combining them
+    // never double-releases. See Emitter::closureArgUnwindCleanup for the
+    // exactly-once argument.
     llvm::BasicBlock* savedClArgUnwind = unwindTarget_;
-    if (!callBoundedClosureArgs.empty())
-        unwindTarget_ = closureArgUnwindCleanup(callBoundedClosureArgs);
+    if (!syncIterClosureArgs.empty() || !callBoundedClosureArgs.empty()) {
+        std::vector<llvm::Value*> allClosureArgs;
+        allClosureArgs.reserve(syncIterClosureArgs.size() +
+                               callBoundedClosureArgs.size());
+        allClosureArgs.insert(allClosureArgs.end(),
+                              syncIterClosureArgs.begin(),
+                              syncIterClosureArgs.end());
+        allClosureArgs.insert(allClosureArgs.end(),
+                              callBoundedClosureArgs.begin(),
+                              callBoundedClosureArgs.end());
+        unwindTarget_ = closureArgUnwindCleanup(allClosureArgs);
+    }
     llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs);
     unwindTarget_ = savedClArgUnwind;
     if (!diverged_) {
@@ -7290,8 +7554,6 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // code in the pending check's `cont` block, with no branch between the
         // producer's evaluation and here, so it runs exactly once per evaluation
         // of the call and is mutually exclusive with the unwind cleanup above.
-        // (The #1864 sync-iterator block keeps its historical normal-edge-only
-        // behaviour; extending it is out of this fix's scope.)
         for (llvm::Value* cl : callBoundedClosureArgs) emitClosureRelease(cl);
     }
     // Record the concrete subst that drives the RESULT local's layout so that
@@ -8280,6 +8542,11 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     bool savedDiverged = diverged_;
     auto savedLoop = loopStack_;
     auto savedDispose = disposeStack_;
+    // #2281 / §31.2: a lazy specialization is a separate function. Clear its
+    // finally state, but preserve the caller's active try/finally frames across
+    // this emitter re-entry; finallyBodyStack_ stays depth-aligned per §29.7.
+    auto savedFinally = finallyStack_;
+    auto savedFinBodies = finallyBodyStack_;
     llvm::Function* savedFn = currentFn_;
     // fix #1483 / §28.3: registerUnwindOwnedParam (and the sibling unwind-local
     // registration sites) gate on `currentFn_ == unwindIneligibleFn_`, consulting
@@ -8450,7 +8717,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     currentCaughtExc_ = nullptr;
     unwindScopeDepth_ = 0;
     diverged_ = false;
-    loopStack_.clear(); finallyStack_.clear();
+    loopStack_.clear(); finallyStack_.clear(); finallyBodyStack_.clear();
     disposeStack_.clear();
 
     // fix #1483 / §28.3: populate unwindIneligible_ for THIS specialized
@@ -8506,7 +8773,10 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
             if (rv && ci.returnType)
                 rv = wrapAsIEnumerableForTarget(
                     rv, ctx_.resolvedType(*ci.returnType), ci.exprBody,
-                    /*ownLazyPipeline=*/true);
+                    /*ownLazyPipeline=*/true,
+                    /*outWrapMade=*/nullptr,
+                    /*srcOwnedByCallee=*/
+                    returnSourceIsCalleeOwnedCollection(ci.exprBody));
             // #2491 (twin of #2434): expression-body return failed to lower —
             // emitReturn's `v ? v : null` fallback would silently substitute a
             // zero/null return. See the ReturnStmt site in
@@ -8539,6 +8809,8 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     diverged_ = savedDiverged;
     loopStack_ = std::move(savedLoop);
     disposeStack_ = std::move(savedDispose);
+    finallyStack_ = std::move(savedFinally);          // #2281 / §31.2
+    finallyBodyStack_ = std::move(savedFinBodies);    // #2281 / §29.7
     unwindIneligible_ = std::move(savedUnwindIneligible);  // fix #1483
     unwindIneligibleFn_ = savedUnwindIneligibleFn;          // fix #1483
     currentReturnTypeNode_ = savedRetNode;
@@ -8794,6 +9066,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     llvm::Value* savedThis = currentThis_;
     auto savedLocals = locals_;
     auto savedParams = paramSlots_;
+    auto savedRefParams = refParams_;  // fix #2588
     llvm::BasicBlock* savedProp = propagateBB_;
     llvm::BasicBlock* savedUnwind = unwindTarget_;
     llvm::Value* savedCaught = currentCaughtExc_;
@@ -8839,11 +9112,30 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     diverged_ = false;
     // Bind user params (skip leading `this`).
     std::size_t paramStart = isStaticMethod(ms) ? 0 : 1;
+    // fix #2588 / §22.3: a `ref`/`out` param's arg is the caller's storage
+    // ADDRESS (alias path via lvalueAddr) or the §22.3 copy-in slot (bracket
+    // path) — register it in refParams_ so the inlined expression body's
+    // reads/writes dereference through it, exactly as bindParameters does
+    // for a compiled method's ref param (CG50) and as #2283 did for the
+    // inline ctor paths. Binding it in paramSlots_ instead left the body
+    // loading the pointer itself (`add ptr, i32` — malformed IR), the same
+    // shape as #2283 on the generic expression-bodied METHOD inline path.
+    // Block-bodied generic methods are unaffected: they go through
+    // emitGenericSpecialization -> buildSpecializedMethodFn -> bindParameters
+    // (which already routes ref/out through refParams_), so only the
+    // expression-bodied inline path had this gap.
     for (std::size_t pi = 0; pi < ms->params.size() &&
          pi + paramStart < args.size(); ++pi) {
-        auto* slot = entryAlloca(args[pi + paramStart]->getType());
-        builder_.CreateStore(args[pi + paramStart], slot);
-        paramSlots_[ms->params[pi]] = slot;
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(ms->params[pi]);
+        if (ps && isByRefMod(ps->modifier)) {
+            llvm::Type* elemTy =
+                ps->declType ? lowerType(ps->declType) : i32();
+            refParams_[ms->params[pi]] = {args[pi + paramStart], elemTy};
+        } else {
+            auto* slot = entryAlloca(args[pi + paramStart]->getType());
+            builder_.CreateStore(args[pi + paramStart], slot);
+            paramSlots_[ms->params[pi]] = slot;
+        }
     }
 
     // Emit the body.
@@ -8871,9 +9163,16 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
             // #1916: ownLazyPipeline=true — this is a RETURN position (the caller
             // owns the inlined result), so a lazy pipeline returned as
             // IEnumerable<T> is drained into an OWNING enumerator (leak-free).
+            // fix #2299 / §28.9: srcOwnedByCallee honours the §28.3 ownership
+            // transfer on `return` of a callee-owned local whose underlying
+            // collection the wrap only borrows (registers a scope-end
+            // bz_array_free / bz_dict_free / bz_llist_free for the source).
             result = wrapAsIEnumerableForTarget(
                 result, ctx_.resolvedType(*ci.returnType), ci.exprBody,
-                /*ownLazyPipeline=*/true);
+                /*ownLazyPipeline=*/true,
+                /*outWrapMade=*/nullptr,
+                /*srcOwnedByCallee=*/
+                returnSourceIsCalleeOwnedCollection(ci.exprBody));
         }
     } else if (ci.bodyKind == ast::MethodBodyKind::Block) {
         // Block body: compile a specialized function and call it.
@@ -8887,6 +9186,7 @@ llvm::Value* Emitter::emitInlineGenericMethod(sema::MethodSymbol* ms,
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
+    refParams_ = std::move(savedRefParams);  // fix #2588
     propagateBB_ = savedProp;
     unwindTarget_ = savedUnwind;
     currentCaughtExc_ = savedCaught;
@@ -9025,6 +9325,12 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                 if (!checkedDisposal_)
                     builder_.CreateStore(
                         llvm::ConstantPointerNull::get(ptrTy()), slot);
+                // #2310 / §29.8 / §30.1 (#973a residual): also null the FRAME
+                // capture slot of an `owned` state-machine parameter this
+                // discharge just consumed (no-op outside a state-machine body,
+                // for non-parameter sources, for non-owned parameters).
+                // per §29.8 / §30.1
+                nullStateMachineOwnedParamCapture(nm.target.get());
             } else {
                 emitDynamicDispose(recvD);
             }

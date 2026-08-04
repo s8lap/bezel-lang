@@ -100,3 +100,24 @@ BEZEL_TEST(ref_out_arg_type_match_1756, ref_exact_match_accepted_22_3) {
         "  end Main; "
         "end C;"), 6);
 }
+
+// §14.5 / §14.2 (v0.236, #2280): exact generic ref/out unification applies
+// when a method type parameter is nested in an inline-array element type. With
+// explicit T=int, `[4]long` must not alias the `[4]int` parameter location.
+// Pre-fix containsMethodTypeParam skipped arrayElement, so this compiled clean.
+BEZEL_TEST(ref_out_arg_type_match_1756,
+           inline_array_nested_method_type_param_exactness_unsoundness_rejected_2280_14_5) {
+    auto r = runJit(
+        "module M; static class U "
+        "  public static method Fill<T>(ref r: [4]T) "
+        "    r[0] := default(T); "
+        "  end Fill; "
+        "end U; class C "
+        "  public static method Main(): int "
+        "    var arr: [4]long; U.Fill<int>(ref arr); return 0; "
+        "  end Main; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(diagContains(r, "does not unify exactly"));
+    BEZEL_EXPECT_TRUE(diagContains(r, "§14.5"));
+}
