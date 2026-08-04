@@ -15629,6 +15629,17 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     // per §4.6/§4.7: LinkedList/OwningLinkedList free via bz_llist_free.
     // §28.5/§28.11, #894: OwningDictionary fields free via bz_dict_free.
     bool isLL = collTy && isLinkedListTypeName(collTy);
+    // #2608: drop-on-overwrite twin of the scope-end site in
+    // LlvmBackend_Disposal.cpp. The DISPLACED backing of an `owned` field typed
+    // by a borrowing list interface may itself be owning (stdlib §4.3 — the
+    // read-only list interfaces are shared by both hierarchies), so consult the
+    // construction-time header disposer rather than assuming borrowing.
+    if (!isLL && !isDict && !elemDisp && isBorrowingListInterfaceName(collTy)) {
+        auto* dynFn = declareC("bz_array_free_dynamic",
+                               llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(dynFn, {oldVal});
+        return true;
+    }
     const char* freeName = isLL   ? "bz_llist_free"
                           : isDict ? "bz_dict_free"
                           :          "bz_array_free";

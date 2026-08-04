@@ -636,6 +636,24 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
             // per §4.6/§4.7: LinkedList fields free via bz_llist_free.
             // §28.5/§28.11, #893: OwningDictionary fields free via bz_dict_free.
             bool isLL = isLinkedListTypeName(it->collTy);
+            // #2608 / stdlib §4.3: an `owned` field typed by a BORROWING list
+            // interface (IReadOnlyList<T>/IList<T>) is array-backed, but those
+            // interfaces are the read-only view shared by BOTH hierarchies, so
+            // the dynamic backing may be a borrowing `Array<T>` (elements must
+            // NOT be disposed) or an owning `OwningArray<T>` (elements MUST be).
+            // The static type cannot tell them apart, and guessing "owning" here
+            // would double-free the borrowing case. When no static element
+            // disposer was derived, defer to the disposer the OWNING collection
+            // stamped into its header at construction: bz_array_free_dynamic.
+            // An untagged (borrowing) backing yields NULL there, i.e. exactly
+            // the `bz_array_free(val, null)` this replaces — never a UAF.
+            if (!isLL && !isDict && !elemDisp &&
+                isBorrowingListInterfaceName(it->collTy)) {
+                auto* dynFn = declareC("bz_array_free_dynamic",
+                                       llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(dynFn, {val});
+                continue;
+            }
             const char* freeName = isLL   ? "bz_llist_free"
                                   : isDict ? "bz_dict_free"
                                   :          "bz_array_free";

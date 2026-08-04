@@ -3039,6 +3039,35 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // was always allocated, so `.Capacity` could not reflect the
                 // requested reservation. A non-positive request falls back to 16.
                 auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                // #2608 / §28.11 / stdlib §4.3: record the element disposer of an
+                // OWNING array-backed collection in its header at CONSTRUCTION.
+                // Element ownership is otherwise a purely static property, chosen
+                // at the free site from the collection's static type. That fails
+                // for an `owned` field typed by a read-only interface SHARED by
+                // both hierarchies (IReadOnlyList<T>/IReadOnlyCollection<T> are
+                // common ancestors of Array<T> AND OwningArray<T> per stdlib
+                // §4.3), where the same static type can carry either backing and
+                // the free site cannot tell which. The concrete type IS known
+                // here, so stamp the disposer now; bz_array_free_dynamic reads it
+                // back at the erased free site. Borrowing collections are never
+                // tagged (NULL = today's behavior), so this cannot over-dispose.
+                auto tagOwningElems = [&](llvm::Value* arr) -> llvm::Value* {
+                    if (!arr || !common::isOwningPrefixedName(colName)) return arr;
+                    const sema::TypeRef* elem =
+                        rt->genericArgs.empty() ? nullptr : rt->genericArgs[0];
+                    // #816: inside a specialized body the element may still be a
+                    // generic parameter — resolve it so elementPolicyFor can build
+                    // the thunk (a no-op outside a substitution).
+                    elem = resolveTypeParamRef(elem);
+                    llvm::Function* d = elementPolicyFor(elem, /*owning=*/true)
+                                            .disposerThunk;
+                    if (!d) return arr;   // value/unknown elements: nothing to run
+                    auto* setFn = declareC("bz_array_set_elem_disposer",
+                                           llvm::Type::getVoidTy(llvm_),
+                                           {ptrTy(), ptrTy()});
+                    builder_.CreateCall(setFn, {arr, d});
+                    return arr;
+                };
                 if (!ne.args.empty() && ne.args[0].value) {
                     llvm::Value* capArg = lowerExpr(*ne.args[0].value);
                     if (capArg) {
@@ -3058,12 +3087,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         llvm::Value* one = builder_.getInt64(1);
                         llvm::Value* useArg = builder_.CreateICmpSGT(capArg, one);
                         llvm::Value* cap = builder_.CreateSelect(useArg, capArg, one);
-                        return builder_.CreateCall(allocFn,
-                            {builder_.getInt64(elemSize), cap}, "col.cap.init");
+                        return tagOwningElems(builder_.CreateCall(allocFn,
+                            {builder_.getInt64(elemSize), cap}, "col.cap.init"));
                     }
                 }
-                return builder_.CreateCall(allocFn,
-                    {builder_.getInt64(elemSize), builder_.getInt64(16)});
+                return tagOwningElems(builder_.CreateCall(allocFn,
+                    {builder_.getInt64(elemSize), builder_.getInt64(16)}));
             }
             if (colName == "Dictionary" || colName == "OwningDictionary" ||
                 // stdlib §4.17 (#1354, #1406): SortedDictionary<K,V> shares
