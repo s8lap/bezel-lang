@@ -6040,13 +6040,53 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         auto saveNullNarrowed = nullNarrowed_;
         auto saveNarrowings = narrowings_;
         auto saveFieldNarrowed = fieldNarrowed_;
-        fieldNarrowed_.erase(fieldNarrowed_.lower_bound({1u, 0u}),
-                             fieldNarrowed_.end());  // drop local-rooted
-        nullNarrowed_.clear();   // §27.5 (#2259): captured locals are
-        narrowings_.clear();     // by-reference cells the enclosing scope may
-                                 // rebind between closure creation and
-                                 // invocation — drop on the way IN, matching
-                                 // the field set's local-rooted drop above
+        // §7.4 (v0.236, fix #2597): drop every local-rooted fact on the way IN
+        // — EXCEPT one rooted in a `const` local, which §7.4 exempts by name:
+        // "A `const` local's narrowing (§21.1), once established, is never
+        // invalidated: no invalidating form can apply to it — it cannot be
+        // reassigned, cannot be passed as `ref` or `out`, and cannot be mutably
+        // captured (assignment to a `const` is a compile error everywhere,
+        // lambda bodies included)."
+        //
+        // The drop above exists because §27.5's capture is by REFERENCE, so the
+        // enclosing scope can rebind a captured `var`'s cell between closure
+        // creation and invocation (#2259: the captured read returned null and
+        // SIGSEGV'd). A `const` has no such writer: it is the ONE root for which
+        // the rebind that motivates the drop cannot happen. Both halves of that
+        // premise are enforced by this compiler, not merely asserted by the
+        // spec — assigning a const inside a lambda body is rejected ("cannot
+        // assign to const local ... (§21.1)") and passing one as a `ref`/`out`
+        // argument is rejected ("a `out` argument may not be a const local ...
+        // (§22.3 / §21.1)"). So preserving a const-rooted fact admits exactly
+        // the code §7.4 says is well-typed and admits nothing #2259 closed.
+        //
+        // All three sets keep the same boundary policy, as before — the field
+        // set's local-rooted entries are filtered by the same predicate on
+        // their ROOT (a `local._f` fact rides its root; the field segment is
+        // `readonly`, which has no writer outside its construction window, so a
+        // const root makes the whole path final). Ambient-rooted (rootId 0)
+        // field facts continue to ride in untouched. The OUT-side restore below
+        // is unchanged: a fact established INSIDE the body still must not leak.
+        auto isConstLocal = [](const Symbol* s) {
+            auto* ls = dynamic_cast<const LocalSymbol*>(s);
+            return ls != nullptr && ls->isConst;
+        };
+        for (auto it = fieldNarrowed_.lower_bound({1u, 0u});
+             it != fieldNarrowed_.end();) {
+            const Symbol* root = it->first < narrowFactIdSyms_.size()
+                                     ? narrowFactIdSyms_[it->first]
+                                     : nullptr;
+            if (isConstLocal(root)) ++it;
+            else it = fieldNarrowed_.erase(it);
+        }
+        for (auto it = nullNarrowed_.begin(); it != nullNarrowed_.end();) {
+            if (isConstLocal(*it)) ++it;
+            else it = nullNarrowed_.erase(it);
+        }
+        for (auto it = narrowings_.begin(); it != narrowings_.end();) {
+            if (isConstLocal(it->first)) ++it;
+            else it = narrowings_.erase(it);
+        }
         currentScope_ = &lamScope;
         // §27.3 (v0.217, #2101): with a return-type ascription the body is
         // checked exactly as a method body against a declared return type —
