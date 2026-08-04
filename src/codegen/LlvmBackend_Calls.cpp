@@ -6350,6 +6350,15 @@ llvm::Value* Emitter::buildChoiceStructValue(
 // declaration in LlvmBackend_impl.hpp for the correctness argument; the short
 // form is that this must match the set of expressions that MINT a buffer, not
 // the set that merely HAS FFI-buffer type.
+//
+// ⚠ RawBytes.FromForeign(p, length, freeOnDispose) (stdlib §10.3) is a fifth
+// `owned`-returning static and is DELIBERATELY NOT in this table: its buffer is
+// FOREIGN, so bz_rawbytes_free would free memory Bezel never allocated. Anyone
+// widening this predicate must widen it by ENUMERATION, never by a rule of the
+// shape "any owned-returning factory" — that phrasing admits FromForeign and
+// turns this reclaim into a free of foreign memory. (Noted by the #2728 review;
+// FromForeign has no handler in tryLowerBuiltinClassCall today, so the hazard is
+// latent rather than live.)
 bool Emitter::isFfiBufferFactoryCall(const ast::Expr& e, bool& isRawBytes) {
     isRawBytes = false;
     auto* call = dynamic_cast<const ast::CallExpr*>(&e);

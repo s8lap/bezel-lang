@@ -2447,10 +2447,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // iterations leaked 64 allocations / 13120 B).
         //
         // Why this is a SEPARATE arm from #2655's above, not a widening of it:
-        // that arm's flag is set only for §21.9's `ownedProduced` set, and the
-        // ownership pass classifies the FFI factories **Borrowed**
-        // (src/ownership/Ownership.cpp), so `disposeOwnedValue` is false here and
-        // the arm above already returned. Equally important, this must NOT use
+        // that arm's flag is set only for §21.9's `ownedProduced` set, so
+        // `disposeOwnedValue` is false here and the arm above already returned.
+        // ⚠ For an ExpressionStmt that flag's ONLY setter is §21.9's walk in
+        // src/sema/ExprTypecheck.cpp:9718 — NOT the ownership pass, which sets
+        // the DiscardStmt flag (Ownership.cpp:2537). An earlier draft of this
+        // comment attributed it to the ownership pass; the conclusion held (the
+        // shape leaked rather than crashing through dynamicDispose) but the
+        // mechanism named was wrong. Corrected per the #2728 review. Equally important, this must NOT use
         // `dynamicDispose`: an FFI buffer is a raw malloc with no object header,
         // so a vtable dispatch would read the first bytes of the marshalled string
         // data as a function pointer. It runs no user code — there is no user type

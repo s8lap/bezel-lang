@@ -826,6 +826,15 @@ BEZEL_TEST(codegen_ffi_types, cstring_from_discard_statement_temporary_freed_spe
 // ("hello-2728") proves the buffer was intact at the boundary, and `ran` proves
 // no abort. Deliberately `runAot`, not `runAotChecked`: the value assertion has
 // to hold without a sanitizer underneath it.
+//
+// ⚠ THE NAME OVERCLAIMS, per the #2728 review — read this before trusting it as
+// a premature-free oracle. `runAot` has no sanitizer and glibc does not scrub
+// freed memory, so hoisting the free before `strdup` would still very likely
+// read back an intact "hello-2728" and yield strlen == 10. What this case
+// genuinely detects is a DOUBLE FREE (glibc aborts, clearing `ran`). The actual
+// premature-free coverage comes from the ASan-linked runAotChecked cases above.
+// Kept under this name so the #2728 filter stays stable; do not add a second
+// case relying on plain runAot to catch an early free.
 BEZEL_TEST(codegen_ffi_types, cstring_from_argument_temporary_not_freed_early_spec_28_3_2728) {
     auto r = runAot(
         "module M; "

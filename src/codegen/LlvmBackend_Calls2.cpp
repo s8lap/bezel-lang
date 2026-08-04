@@ -3811,11 +3811,28 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // expression has completed" — the call was the temporary's only use, and
         // an unnamed buffer is reachable from nothing else in the expression —
         // and it is the placement #2222 already established for the identical
-        // buffer kind three lines above. The one shape where the two placements
-        // would differ is an extern that RETURNS an alias of its own argument;
-        // that is already outside the model (§32.10, above) and equally broken
-        // under a `using var`-free-at-scope-end reading, so it is not a reason to
-        // hold the buffer longer. Recorded as a choice, per CLAUDE.md rule 4.
+        // buffer kind three lines above.
+        //
+        // ⚠ CORRECTION (review of #2728): the two justifications originally
+        // recorded here for that placement are BOTH FALSE at v0.240, and the
+        // placement is a KNOWN DEFECT tracked as #2733 — not a settled choice.
+        //   * "already outside the model (§32.10)" — §32.10 is about NATIVE
+        //     RETENTION of an address past the call. An extern that RETURNS an
+        //     alias of its own argument is unaddressed anywhere in §32.1-§32.14.
+        //     §32.6 covers the neighbouring case and points the OTHER way: such a
+        //     return should be declared IntPtr.
+        //   * "equally broken under a `using var`" — false. That spelling keeps
+        //     the buffer alive to scope end and the same program is correct.
+        // §28.3's boundary is a FIXED POINT, not an upper bound ("Disposal runs
+        // AFTER the borrowing use, so the receiver is live for the duration of
+        // the call"); the "after every use has completed" clause is a CONJUNCT of
+        // "at the end of the full expression", not an alternative to it. So
+        // `strlen(strchr(CString.From("hello"), 101))` frees the inner buffer
+        // before the outer CreateCall reads it — a leak pre-fix, a UAF post-fix.
+        // This is NOT new here: #2222's flush three lines above has the identical
+        // placement, so the class already shipped. #2733's fix — register on the
+        // establishment-ordered cleanup stack — closes this face and the
+        // unwind-path gap together, and both reclaims must move at once.
         for (const auto& [tmpSlot, tmpIsRawBytes] : ffiTempSlots)
             emitFfiBufferTempFree(tmpSlot, tmpIsRawBytes);
         llvm::Type* canonRet = it->second->getReturnType();
