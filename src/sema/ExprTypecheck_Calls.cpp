@@ -8560,8 +8560,9 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
     }
 }
 
-// §7 / stdlib §4.x (#2582) + §4.14/§4.15 (#2600) + §6.4 (#2602): see the
-// header comment for the full rationale. The collection twin of #2315's
+// §7 / stdlib §4.x (#2582) + §4.14/§4.15 (#2600) + §6.4 (#2602) + §6.6
+// (#2604): see the header comment for the full rationale. The collection twin
+// of #2315's
 // checkBuiltinStringCallArgs. A builtin collection instance method (Array<
 // T>.IndexOf/Contains/…, Set<T>/SortedSet<T>.Add/TryAdd/Contains/Remove,
 // Stack<T>/Queue<T>.Push/Enqueue/Contains, LinkedList<T>.AddFirst/AddLast/
@@ -8569,9 +8570,11 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
 // K,V>.ContainsKey/Contains/Remove, OwningDictionary<K,V>.PopValue/
 // TryPopValue, OwningSet<T>.Take/TryTake), the span-buffer family (#2600:
 // ArraySpan<T>/ReadOnlyArraySpan<T>.IndexOf/Contains/Fill, value-T Span<T>/
-// ReadOnlySpan<T>.IndexOf/Contains/Fill), and the atomic family (#2602:
+// ReadOnlySpan<T>.IndexOf/Contains/Fill), the atomic family (#2602:
 // Atomic<T>.Exchange/CompareExchange, AtomicInteger<T>.Exchange/
-// CompareExchange/Add), has no MethodSymbol — these are synthetic Named
+// CompareExchange/Add), and the task-completion-source family (#2604:
+// TaskCompletionSource<T>.SetResult/TrySetResult — the Owning twin's `owned
+// result: T` is excluded per §22.3), has no MethodSymbol — these are synthetic Named
 // TypeRefs with no user TypeSymbol — so checkCallArity → checkArgsAgainstParams
 // → checkAssignable never fires. An un-narrowed `int?` (or `T?`) argument was
 // silently accepted and reached codegen, where the equality-compare lowering
@@ -8590,8 +8593,9 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
 // genericArgs[0], the keyed collections (Dictionary<K,V>/OwningDictionary<
 // K,V>/SortedDictionary<K,V>) instantiate K at genericArgs[0], the span-buffer
 // family (ArraySpan<T>/ReadOnlyArraySpan<T>/Span<T>/ReadOnlySpan<T>)
-// instantiates its element T at genericArgs[0], and the atomic family
-// (Atomic<T>/AtomicInteger<T>) instantiates its operand T at genericArgs[0].
+// instantiates its element T at genericArgs[0], the atomic family
+// (Atomic<T>/AtomicInteger<T>) instantiates its operand T at genericArgs[0],
+// and TaskCompletionSource<T> (#2604) instantiates its result T there too.
 // The parameter's OWN nullability is the instantiated type's nullability —
 // `Array<int?>` has `IndexOf(item: int?)`, so an `int?` argument is
 // admissible; `Array<int>` has `IndexOf(item: int)`, so an un-narrowed
@@ -8662,8 +8666,28 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     // non-nullable value T — no class-T nullable-param split is needed (unlike
     // the span-buffer family's spanBufferSkipClassT branch).
     bool isAtomic = colName == "Atomic" || colName == "AtomicInteger";
+    // §7 / stdlib §6.6 (#2604): the task-completion-source family. stdlib §6.6
+    // declares `TaskCompletionSource<T>.SetResult(result: T)` and
+    // `TrySetResult(result: T): bool` with a NON-nullable `result: T`, and the
+    // CallExpr handler types them synthetically at L7288 — it sets only the
+    // RESULT type (bool for TrySet*, unit for Set*) and runs no per-argument
+    // check — so this is the same no-MethodSymbol §7 hole as #2582/#2600/#2602
+    // on a family none of the name lists above covered. Unlike those, an
+    // un-narrowed `T?` here does NOT ICE codegen (the SetResult lowering
+    // tolerates the nullable `{ i8, i32 }` representation): it is a SILENT
+    // accept, storing an un-narrowed nullable as the task's non-nullable `T`
+    // result. `OwningTaskCompletionSource<T>` is deliberately EXCLUDED — its
+    // `SetResult(owned result: T)` / `TrySetResult(owned result: T)` carry the
+    // §22.3 `owned` modifier, the same exclusion the owning collections'
+    // `Add(owned item: T)` gets. `SetException`/`TrySetException` take
+    // `owned exception: Exception` on every form (§6.6) and are likewise out
+    // of scope; `SetCancelled`/`TrySetCancelled`/`Dispose` take no arguments.
+    // The non-generic `TaskCompletionSource` (§6.6, void completion) has no
+    // genericArgs and is filtered by the emptiness guard below — its
+    // `SetResult()` takes no argument anyway.
+    bool isTaskSource = colName == "TaskCompletionSource";
     if (!isElementCollection && !isKeyedCollection && !isSpanBuffer &&
-        !isAtomic)
+        !isAtomic && !isTaskSource)
         return;
     if (recvTy->genericArgs.empty() || !recvTy->genericArgs[0]) return;
     TypeRef* itemTy = recvTy->genericArgs[0];  // T (element) or K (key)
@@ -8777,6 +8801,15 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         if (isAtomic && pos == 0 && (
             m == "Exchange" || m == "CompareExchange" ||
             (m == "Add" && colName == "AtomicInteger")))
+            return true;
+        // §7 / stdlib §6.6 (#2604): `TaskCompletionSource<T>.SetResult(result:
+        // T)` / `TrySetResult(result: T): bool` — the sole non-`owned` T-typed
+        // parameter on the family, at pos 0. The Owning twin's `owned result:
+        // T` is excluded by the isTaskSource name gate above (and would also
+        // be skipped by the modifier guard below); the exception setters take
+        // `owned exception: Exception`, not T.
+        if (isTaskSource && pos == 0 &&
+            (m == "SetResult" || m == "TrySetResult"))
             return true;
         // Position-1 item methods.
         if (pos == 1 && (
