@@ -525,6 +525,45 @@ private:
     // lambda body is being emitted (null for methods, ctors, and async lambdas,
     // whose declared return is the outer Task).
     const sema::TypeRef* currentLambdaReturnSemaTy_ = nullptr;
+    // fix #2703 (§23.3 "Block-form properties" / §23.4 "Indexers" / §8.6
+    // "Boxing" / §29.2 "Desugaring of `for`", v0.240): the REPRESENTATION half
+    // of a block-bodied ACCESSOR's return contract.
+    //
+    // `currentReturnTypeNode_` above is a single field encoding TWO independent
+    // things a `return` needs: (a) how the value must be REPRESENTED at the
+    // return edge (box it for an `Object`/interface return, wrap it for an
+    // `IEnumerable<T>` return, materialise a collection literal against it,
+    // coerce it into a nullable-value struct) and (b) whether the callee owes
+    // the caller a +1 for a `string`/closure result. #2694 had to null it
+    // inside a block getter to stop (b) — a getter's read face is +0 by axiom
+    // A4 (spec line 6351, v0.240): "Accessor read faces are lend-only:
+    // property and indexer *types* carry no `owned`, and a getter may not
+    // return a fresh owned value" — and that correctly killed (a) as well,
+    // because the two share one field.
+    //
+    // These two members carry (a) alone, so the mint arms are untouched. The
+    // node is the accessor's OWN declared type (`pd->type`), and it is paired
+    // with the llvm::Function it was registered for: `returnReprTypeNode()`
+    // hands it out only while `currentFn_` IS that function. That pairing is
+    // the same "scope it to the function that owns it" guard `emitReturn`
+    // already uses for `ensuresFn_`, and it is what makes a nested emission
+    // (a lambda body, a lazily built generic specialisation, an async resume
+    // function) unable to inherit an accessor's node: each sets its own
+    // `currentFn_` first.
+    const ast::Type* accessorReturnTypeNode_ = nullptr;
+    llvm::Function*  accessorReturnTypeFn_   = nullptr;
+    // fix #2703: the node the REPRESENTATION arms of a `return` must use.
+    // `currentReturnTypeNode_` wins whenever it is set (an ordinary method, a
+    // specialisation, the ensures epilogue) — so this is strictly additive and
+    // changes nothing that already fires. It falls back to the accessor node
+    // only inside the accessor function that registered it.
+    const ast::Type* returnReprTypeNode() const {
+        if (currentReturnTypeNode_) return currentReturnTypeNode_;
+        if (accessorReturnTypeNode_ && accessorReturnTypeFn_ &&
+            currentFn_ == accessorReturnTypeFn_)
+            return accessorReturnTypeNode_;
+        return nullptr;
+    }
     // §22.16 (v0.203, #2053) Slice 4b: the ensures single-exit epilogue state
     // for the method/ctor currently being emitted. When `ensuresFn_` is
     // non-null, `emitReturn(fn, v)` redirects the return into
@@ -7625,6 +7664,14 @@ private:
         // --- return contract (#2694) ---
         const ast::Type*     retNode_;
         const sema::TypeRef* lamRet_;
+        // --- accessor representation face (#2703) ---
+        // Reset for the same reason as retNode_: a nested body must not
+        // represent ITS return against an enclosing accessor's declared type.
+        // (The currentFn_ pairing in returnReprTypeNode() already makes that
+        // impossible; resetting here keeps the invariant local to this guard
+        // rather than depending on a second mechanism.)
+        const ast::Type*     accessorRetNode_;
+        llvm::Function*      accessorRetFn_;
         // --- suspend/resume frame (#2170 + #2701 + #2702) ---
         SuspendKind          smKind_;
         llvm::StructType*    smStateStruct_;

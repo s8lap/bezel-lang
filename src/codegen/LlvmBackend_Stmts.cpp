@@ -1874,8 +1874,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     asyncResumeFn_ && currentFn_ == asyncResumeFn_ &&
                     asyncResultSemaType_)
                     retTargetTy = asyncResultSemaType_;
-                else if (currentReturnTypeNode_)
-                    retTargetTy = ctx_.resolvedType(*currentReturnTypeNode_);
+                // fix #2703 (§15.1 "Inline arrays" / §23.3, v0.240): use the
+                // REPRESENTATION node, which inside a block-bodied accessor
+                // falls back to the accessor's own declared type. Without it a
+                // `property A: [3]int get => do return [11,22,33]; end` left
+                // `retTargetTy` null, so `v` stayed null and the getter
+                // returned a SILENT ZERO (reproduced: exit 0 for an expected
+                // 66, with only the #2491 warning).
+                else if (const ast::Type* rn = returnReprTypeNode())
+                    retTargetTy = ctx_.resolvedType(*rn);
                 if (const sema::TypeRef* rrt = retTargetTy) {
                     // §15.3 (#781): a `return [e1, …]` whose declared return
                     // type is an INLINE array (`[N owned]T?` / `[N]T`) builds
@@ -2092,9 +2099,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         }
         // §8.6: box a value-typed `return expr` whose declared return type is
         // Object/interface, so the caller's is/as/virtual dispatch sees a box.
-        if (v && rs->value && currentReturnTypeNode_)
-            v = boxForTarget(v, ctx_.resolvedType(*currentReturnTypeNode_),
-                             rs->value.get());
+        // fix #2703 (§8.6 "Boxing" / §23.3, v0.240): keyed on the
+        // REPRESENTATION node so a block-bodied accessor boxes against ITS OWN
+        // declared type. Pre-fix an `Object`-typed block getter returning an
+        // `int` emitted `ret i32` from a `ptr`-returning function and the
+        // module failed IR verification.
+        if (const ast::Type* rn = returnReprTypeNode())
+            if (v && rs->value)
+                v = boxForTarget(v, ctx_.resolvedType(*rn), rs->value.get());
         // §29.2 / §4.3 (#1310): a value returned as `IEnumerable<T>` must be a
         // vtable-backed enumerator, not a raw bz_array_t* / class instance — the
         // caller's for-in and its scope-end iterEnumDispose both dispatch through
@@ -2103,13 +2115,27 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // ownLazyPipeline=true — a lazy LINQ pipeline returned as IEnumerable<T>
         // is drained into an OWNING enumerator (the caller owns and disposes the
         // returned value, so an owning wrapper is leak-free).
-        if (v && rs->value && currentReturnTypeNode_)
-            v = wrapAsIEnumerableForTarget(
-                v, ctx_.resolvedType(*currentReturnTypeNode_), rs->value.get(),
-                /*ownLazyPipeline=*/true,
-                /*outWrapMade=*/nullptr,
-                /*srcOwnedByCallee=*/
-                returnSourceIsCalleeOwnedCollection(rs->value.get()));
+        // fix #2703 (§29.2 "Desugaring of `for`" / §23.3, v0.240): keyed on the
+        // REPRESENTATION node for the block-bodied-accessor case. Pre-fix, a
+        // `property E: IEnumerable<int>` whose body returned an `Array<int>`
+        // field handed the caller a raw `bz_array_t*` and the caller's for-in
+        // drove it through the §29.11 enumerator vtable — reproduced as a
+        // SIGSEGV (exit 139), the worst live symptom in this family. The
+        // wrapper frame this mints is disposed by the reader, not leaked: a
+        // for-in whose source is a NON-auto property is classified
+        // `!sourceIsNamedLocal` (see lowerForIn, #1840/#2485 — "every other
+        // property — expression-body, BLOCK-body … is the COMPUTED,
+        // fresh-value case") and registers the loop-end iterEnumDispose. This
+        // is therefore the same wrap/dispose round trip the expression-bodied
+        // sibling has always had, not a new ownership obligation.
+        if (const ast::Type* rn = returnReprTypeNode())
+            if (v && rs->value)
+                v = wrapAsIEnumerableForTarget(
+                    v, ctx_.resolvedType(*rn), rs->value.get(),
+                    /*ownLazyPipeline=*/true,
+                    /*outWrapMade=*/nullptr,
+                    /*srcOwnedByCallee=*/
+                    returnSourceIsCalleeOwnedCollection(rs->value.get()));
         // #429 (RETURN-escape category) / §4.6 / §28.9 / §28.3: a method whose
         // declared return type is (non-nullable) `string` mints EXACTLY +1 for
         // the returned value, transferring ownership of one reference to the
@@ -2182,6 +2208,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             !isUserMethodClosureReturnCall(rs->value.get()) &&
             !returnedClosureLocalOwnsPlusOne(rs->value.get()))
             emitClosureRetain(v);
+        // ⚠ fix #2703 (v0.240) — THIS ARM DELIBERATELY KEEPS `currentReturnType
+        // Node_` AND MUST NOT BE MOVED TO `returnReprTypeNode()`. It is a +1
+        // MINT, not a representation conversion: it hands the caller an owned
+        // reference the caller is expected to release. Axiom A4 (spec line
+        // 6351, v0.240) — "Accessor read faces are lend-only: property and
+        // indexer *types* carry no `owned`, and a getter may not return a fresh
+        // owned value" — makes +0 MANDATORY for an accessor read face, and both
+        // read call sites implement exactly that (LlvmBackend_Exprs.cpp ~4342
+        // and the indexer path in LlvmBackend_Assign.cpp hand the result back
+        // as a BORROW; #2304's producer recogniser deliberately excludes a
+        // statement-bodied block getter). #2694 proved the consequence of
+        // getting this wrong in the leak direction — an inherited mint no call
+        // site discharges (LSan: 20 strings / 20 iterations). Minting here and
+        // teaching the call sites to release would be the double-free
+        // direction. `currentReturnTypeNode_` is never set inside an accessor
+        // body, so keying on it IS the suppression.
         if (v && rs->value && currentReturnTypeNode_ &&
             v->getType()->isPointerTy()) {
             const sema::TypeRef* declRet =
@@ -2217,6 +2259,9 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // Otherwise (a param read, a field read, an identifier borrow not owning
         // a +1) the value is a BORROW → RETAIN via emitClosureRetain to mint
         // the +1. bz_closure_retain is null-safe (a null closure is a no-op).
+        // ⚠ fix #2703 (v0.240): the CLOSURE twin of the string mint above, and
+        // it keeps `currentReturnTypeNode_` for the identical axiom-A4 reason —
+        // see the note there. Do not move this arm to `returnReprTypeNode()`.
         if (v && rs->value && currentReturnTypeNode_ &&
             v->getType()->isPointerTy()) {
             const sema::TypeRef* declRet =
@@ -2264,9 +2309,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // the param's bare struct → IR-verify failure). A non-generic nullable
         // value return already lowers correctly through the same struct, so this
         // is a no-op there (v already IS the struct).
-        if (v && currentReturnTypeNode_) {
-            if (const sema::TypeRef* declRet =
-                    ctx_.resolvedType(*currentReturnTypeNode_)) {
+        // fix #2703 (§7 / §14.1 / §23.3, v0.240): keyed on the REPRESENTATION
+        // node — the same arm #2716 reports for the LAMBDA body form. A plain
+        // `int?` block getter happens to survive without this (emitReturn has
+        // its own exact-width nullable-prim fallback), but the shapes with no
+        // such backstop do not: `property L: long? … return 42;` failed IR
+        // verification pre-fix ("ret i32 42" against `{ i8, i64 }`), because
+        // only this call site performs the #843 narrower-numeric widen before
+        // the wrap. The `T?`-through-monomorphisation and layout-identical
+        // record-payload shapes reach only this arm too.
+        if (const ast::Type* rn = v ? returnReprTypeNode() : nullptr) {
+            if (const sema::TypeRef* declRet = ctx_.resolvedType(*rn)) {
                 // #1767 / §19.2: the returned expression's own sema type is a
                 // nullable REFERENCE (`Object?`) — e.g. an all-null `case … end`,
                 // whose `null` arms default to `Object?` — while the declared

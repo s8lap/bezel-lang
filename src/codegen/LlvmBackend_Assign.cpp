@@ -3497,6 +3497,8 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     : e_(e),
       retNode_(e.currentReturnTypeNode_),
       lamRet_(e.currentLambdaReturnSemaTy_),
+      accessorRetNode_(e.accessorReturnTypeNode_),   // #2703
+      accessorRetFn_(e.accessorReturnTypeFn_),       // #2703
       smKind_(e.smKind_),
       smStateStruct_(e.smStateStruct_),
       smSelf_(e.smSelf_),
@@ -3530,6 +3532,8 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     // state by `std::move`, so clear each explicitly.
     e.currentReturnTypeNode_     = nullptr;
     e.currentLambdaReturnSemaTy_ = nullptr;
+    e.accessorReturnTypeNode_    = nullptr;              // #2703
+    e.accessorReturnTypeFn_      = nullptr;              // #2703
     e.smKind_                    = SuspendKind::Yield;   // no neutral value
     e.smStateStruct_             = nullptr;
     e.smSelf_                    = nullptr;
@@ -3567,6 +3571,8 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
 Emitter::NestedBodyScope::~NestedBodyScope() {
     e_.currentReturnTypeNode_     = retNode_;
     e_.currentLambdaReturnSemaTy_ = lamRet_;
+    e_.accessorReturnTypeNode_    = accessorRetNode_;   // #2703
+    e_.accessorReturnTypeFn_      = accessorRetFn_;     // #2703
     e_.smKind_                    = smKind_;
     e_.smStateStruct_             = smStateStruct_;
     e_.smSelf_                    = smSelf_;
@@ -3710,6 +3716,35 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     currentCaughtExc_   = nullptr;
     unwindScopeDepth_   = 0;
     diverged_           = false;
+    // fix #2703 (§23.3 / §8.6 / §29.2 / §15.1, v0.240): register the getter's
+    // OWN declared type as the REPRESENTATION node for its `return`s. #2694
+    // nulled `currentReturnTypeNode_` here to stop the +1 mint a getter's read
+    // face must not perform (axiom A4, spec line 6351: "Accessor read faces are
+    // lend-only … a getter may not return a fresh owned value"), and that is
+    // still exactly right — this pair does not touch it. But the SAME field
+    // also gates four purely-representational arms of `lowerReturn`, which have
+    // nothing to do with ownership and are simply wrong when the node is
+    // absent. All four were reproduced on the parent commit:
+    //   * §8.6 boxing — `property O: Object get => do return _n; end` emitted
+    //     `ret i32` from a `ptr`-returning function: "Function return type does
+    //     not match operand type of return inst!" — a hard build failure.
+    //   * §29.2 IEnumerable wrapping — `property E: IEnumerable<int>` whose
+    //     body returns an `Array<int>` field handed the caller a raw
+    //     `bz_array_t*`; the caller's for-in drove it through the §29.11
+    //     enumerator vtable and SIGSEGV'd (confirmed, exit 139).
+    //   * `coerceReturnToNullableValue` — `property L: long? … return 42;`
+    //     failed IR verification ("ret i32 42" vs `{ i8, i64 }`). (A plain
+    //     `int?` getter happens to survive: emitReturn has its own exact-width
+    //     nullable-prim fallback. The widening/`T?`-monomorphisation/
+    //     layout-identical-record shapes have no such backstop.)
+    //   * collection-literal materialisation — `property A: [3]int … return
+    //     [11,22,33];` left `v` null and returned a SILENT ZERO (exit 0 where
+    //     11+22+33=66 was expected), with only the #2491 warning. The worst of
+    //     the four: no crash, no diagnostic that fails the build.
+    // `accessorReturnTypeFn_` pairs the node with THIS function so a nested
+    // emission cannot inherit it; see the member's note in LlvmBackend_impl.hpp.
+    accessorReturnTypeNode_ = pd->type.get();
+    accessorReturnTypeFn_   = fn;
 
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
@@ -3732,8 +3767,9 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     unwindScopeDepth_   = savedUD;
     diverged_           = savedDiv;
     genericSubst_       = std::move(savedGSubst);
-    // smKind_/smStateStruct_ (#2170) and currentReturnTypeNode_/
-    // currentLambdaReturnSemaTy_ (#2694) are restored by ~NestedBodyScope.
+    // smKind_/smStateStruct_ (#2170), currentReturnTypeNode_/
+    // currentLambdaReturnSemaTy_ (#2694) and the #2703 accessor-representation
+    // pair are restored by ~NestedBodyScope.
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
 
     return fn;
@@ -4034,6 +4070,17 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                                      : llvm::Constant::getNullValue(valTy));
             }
         } else if (blockGet) {
+            // fix #2703 (§23.3 / §13 "Visibility"-independent vtable face,
+            // v0.240): the VIRTUAL/interface face of the same block getter. This
+            // emitter builds an independent function for the vtable/itable slot
+            // and lowers the SAME user statement body, so it needs the same
+            // representation node — otherwise a `property O: Object` block
+            // getter read through an interface reference still emits `ret i32`
+            // from a `ptr`-returning function even after the direct-read
+            // emitters are fixed. Registered only on the GETTER face: a setter
+            // returns void and has no return-representation contract.
+            accessorReturnTypeNode_ = pd->type.get();
+            accessorReturnTypeFn_   = fn;
             lowerScopedBlock(blockGet->stmts);
             if (!builder_.GetInsertBlock()->getTerminator())
                 emitImplicitReturn(fn);
@@ -4309,6 +4356,14 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
         builder_.CreateStore(&a, slot);
         paramSlots_[ps->indexerParams[k]] = slot;
     }
+    // fix #2703 (§23.4 "Indexers", v0.240): the INDEXER spelling of the
+    // representation-node registration in ensurePropertyBlockGetter — see the
+    // long note there for the four arms this re-enables, the evidence for each,
+    // and why the +1-mint arms (#2694 / axiom A4) stay off. `pd->type` is the
+    // same node this emitter already built the signature's `retTy` from, so the
+    // body is now represented against exactly the type it must `ret`.
+    accessorReturnTypeNode_ = pd->type.get();
+    accessorReturnTypeFn_   = fn;
 
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
