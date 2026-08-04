@@ -13,7 +13,41 @@ extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
 
 namespace bezel::codegen {
 
+// fix #2733 / §28.3 *Unbound owned temporaries* (v0.240): the K8 full-expression
+// boundary hook. `lowerExprInner` (below) is the real lowering; this wrapper
+// tracks nesting depth so that the OUTERMOST lowerExpr call — which is exactly a
+// K8 full expression, since every statement expression, initializer, condition,
+// `for` source and `case` scrutinee reaches lowering as a fresh top-level call —
+// discharges the FFI buffer temporaries produced inside it. Hooking here rather
+// than at statement granularity is what gives K8.2 ("Each **evaluation** of a
+// condition, `when` arm condition, or pattern guard is its own boundary … so
+// condition temporaries are disposed per evaluation and never accumulate across
+// iterations") for free: a loop condition is its own top-level lowerExpr.
+// A NESTED FUNCTION BODY is a boundary too, and finding that out cost a real
+// leak: `lambda(): int => strlen(CString.From(s))` is lowered while the ENCLOSING
+// expression is still open, so nothing in the lambda's own function ever sees
+// depth 0. Measured at 64 x 85 B leaked before this clause was added — the
+// disposeStack_ backstop does not cover it either, because a nested-function
+// emitter does not leave the enclosing scope stack in place for the body.
+// Detecting it needs no hook at any of the ~95 `currentFn_ =` sites: a lowerExpr
+// frame whose function differs from its PARENT frame's is by construction the
+// outermost expression of a different function, hence that function's own K8
+// boundary. `fullExprFn_` carries the parent frame's function down.
 llvm::Value* Emitter::lowerExpr(const ast::Expr& e) {
+    llvm::Function* parentFn = fullExprFn_;
+    llvm::Function* thisFn = currentFn_;
+    fullExprFn_ = thisFn;
+    ++fullExprDepth_;
+    llvm::Value* v = lowerExprInner(e);
+    --fullExprDepth_;
+    fullExprFn_ = parentFn;
+    if (!ffiExprTemps_.empty() &&
+        (fullExprDepth_ == 0 || parentFn != thisFn))
+        flushFfiExprTemps();
+    return v;
+}
+
+llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     diverged_ = false;  // CG40: cleared per expression; a `throw` sets it
     // §27.6 (v0.184, #1758): inside a primitive-intrinsic thunk body, a synthetic
     // argument node lowers to the thunk's incoming parameter (see

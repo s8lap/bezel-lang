@@ -2042,6 +2042,21 @@ private:
         return tmp.CreateAlloca(ty);
     }
 
+    // fix #2733: an entry-block pointer alloca that is ALSO null-initialized in
+    // the entry block, so it dominates every path — including one that reaches a
+    // disposal pass WITHOUT having executed the site's own store (a sibling
+    // branch, or an unwind out of an argument evaluated BEFORE the store). A
+    // slot whose disposal is registered on disposeStack_ must be null on such a
+    // path or the pass frees an undef pointer. `entryAlloca`'s bare alloca is
+    // only safe for a slot whose every reader is dominated by its store.
+    llvm::AllocaInst* entryAllocaNullPtr() {
+        llvm::BasicBlock& entry = currentFn_->getEntryBlock();
+        llvm::IRBuilder<> tmp(&entry, entry.begin());
+        auto* a = tmp.CreateAlloca(ptrTy());
+        tmp.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), a);
+        return a;
+    }
+
     // CG50: a `ref` / `out` parameter is passed by reference (its LLVM type
     // is a pointer to the value type, and the caller passes an address).
     // v0.160: `out owned var` replaces the former bare `out owned` call-site
@@ -9000,6 +9015,77 @@ private:
     // in `slot` — free() for CString/WString, bz_rawbytes_free (buffer + the
     // {ptr,len} struct) for RawBytes, matching emitDisposals' ffiBuffer arm.
     void emitFfiBufferTempFree(llvm::AllocaInst* slot, bool isRawBytes);
+
+    // fix #2733 / §28.3 *Unbound owned temporaries* (v0.240): an FFI buffer
+    // temporary minted in EXTERN-ARGUMENT position — either implicitly by the
+    // §32.6 `string`→`CString` marshal (#2222) or explicitly by a written
+    // `CString.From(...)` factory (#2728). Both used to be freed by a
+    // straight-line loop emitted immediately after the callee's CreateCall,
+    // which is NOT §28.3's boundary:
+    //
+    //   "Such a temporary is disposed at the **end of the full expression** in
+    //    which it is produced, after every use of it within that expression has
+    //    completed" … "Disposal runs *after* the borrowing use, so the receiver
+    //    is live for the duration of the call."
+    //
+    // The boundary is a FIXED POINT, not an upper bound — "after every use has
+    // completed" is a conjunct of "at the end of the full expression", not an
+    // alternative — so a post-call free is premature whenever the extern's
+    // return aliases its own argument and an OUTER call in the same full
+    // expression reads it (`strlen(strchr(CString.From("hello"), 101))`: the
+    // inner free is emitted before the outer CreateCall — a use-after-free).
+    // The post-call loop was also normal-path only, so an argument evaluated
+    // LATER that threw leaked the already-produced buffer, against §28.3's
+    // "every already-produced, not-yet-consumed unbound owned temporary is
+    // disposed during unwinding … each temporary's disposal is established at
+    // its production, so the pass runs in reverse order of production on the
+    // establishment-ordered cleanup stack".
+    //
+    // Both are one defect and take one fix: register the reclaim at PRODUCTION
+    // on the establishment-ordered cleanup stack (disposeStack_), and discharge
+    // it at the full-expression boundary. `registerFfiExprTemp` does the
+    // registration; `flushFfiExprTemps` is the boundary discharge.
+    struct FfiExprTemp {
+        llvm::AllocaInst* slot = nullptr;
+        bool rawBytes = false;
+        // The function the slot's alloca belongs to. A nested function body
+        // (a lambda lowered mid-expression) swaps currentFn_, so the boundary
+        // flush must never emit a free for a foreign function's alloca.
+        //
+        // ⚠ Such an entry is KEPT QUEUED, not dropped — see the retain in
+        // flushFfiExprTemps (LlvmBackend_Calls.cpp:6475), which says the same.
+        // An earlier draft of this comment claimed the opposite ("dropped
+        // unflushed and reclaimed instead by its own disposeStack_
+        // registration"), which is the INVERSE of what the code does and would
+        // have read as licence to drop it. Dropping would leak the ENCLOSING
+        // function's temp, because the entry belongs to the enclosing boundary
+        // and merely passed through while a nested function was being emitted.
+        llvm::Function* fn = nullptr;
+    };
+    std::vector<FfiExprTemp> ffiExprTemps_;
+    // lowerExpr nesting depth. Depth 0 is a K8 full expression: every statement
+    // expression, initializer, condition, `for` source, and `case` scrutinee
+    // reaches lowerExpr as a fresh top-level call, so hooking the depth-0 exit
+    // covers all of K8's enumerated positions with one hook — including K8.2's
+    // "each evaluation of a condition … is its own boundary", which a
+    // statement-granular hook would miss for a loop condition.
+    unsigned fullExprDepth_ = 0;
+    // The function of the ENCLOSING lowerExpr frame. A frame whose currentFn_
+    // differs from it is the outermost expression of a nested function body (a
+    // lambda lowered mid-expression), which is that function's own K8 boundary —
+    // without this, such a body never reaches depth 0 and its FFI buffers leak.
+    llvm::Function* fullExprFn_ = nullptr;
+    // Record an FFI buffer temporary at its production point: registers the
+    // null-guarded reclaim on disposeStack_ (covering the exception edge and
+    // acting as the conservative backstop if no boundary flush reaches it) and
+    // queues it for the next full-expression boundary.
+    void registerFfiExprTemp(llvm::AllocaInst* slot, bool isRawBytes);
+    // The §28.3 full-expression boundary discharge: free each queued buffer and
+    // NULL its slot, so the disposeStack_ registration left behind is a
+    // null-guarded no-op on every later edge (scope end, return, unwind).
+    void flushFfiExprTemps();
+    // lowerExpr's body; lowerExpr is the depth-tracking wrapper around it.
+    llvm::Value* lowerExprInner(const ast::Expr& e);
 
     // #1501 / stdlib §6.7 (line 2884) / §30.10: a synthesized, concrete
     // `Array<Task>` sema::TypeRef for the Task.WhenAny/WhenAll `tasks`

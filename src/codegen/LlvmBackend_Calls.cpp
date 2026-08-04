@@ -6413,6 +6413,94 @@ void Emitter::emitFfiBufferTempFree(llvm::AllocaInst* slot, bool isRawBytes) {
     builder_.SetInsertPoint(contBB);
 }
 
+// fix #2733 / §28.3 (v0.240): establish an extern-argument FFI buffer's reclaim.
+//
+// Two things happen here, and they are the two halves of the one defect:
+//
+// (1) A `ffiBuffer` Disposal is pushed onto disposeStack_.back() AT PRODUCTION.
+//     §28.3: "each temporary's disposal is established at its production, so the
+//     pass runs in reverse order of production on the establishment-ordered
+//     cleanup stack". This is what covers the EXCEPTION edge — the backend's
+//     unwind path (emitPendingCheck → emitUnwindDisposals) is literally a walk
+//     of disposeStack_, so a later argument that throws now disposes this
+//     buffer instead of leaking it.
+//
+//     ⚠ `unwindOnly` is deliberately NOT set. emitDisposals tests `unwindOnly`
+//     BEFORE `ffiBuffer` and each arm `continue`s, so an entry carrying both
+//     would take the unwindOnly arm and reach emitDisposeAndReclaim — a VTABLE
+//     DISPATCH through the first bytes of a raw malloc'd buffer (it has no
+//     object header). Leaving it a plain `ffiBuffer` entry also makes it fire
+//     on the normal scope-exit edge, which is the deliberate conservative
+//     BACKSTOP: if no full-expression boundary ever reaches this temp (a
+//     lowering path that produces it below depth 0 — e.g. inside a lambda body
+//     lowered mid-expression), it is still freed exactly once at its own scope
+//     end. Later than §28.3's boundary, never earlier: a bounded over-live, not
+//     a use-after-free.
+//
+// (2) The temp is queued for the next full-expression boundary, where
+//     flushFfiExprTemps frees it and NULLS the slot — after which the entry
+//     from (1) is a null-guarded no-op on every subsequent edge.
+//
+// ⚠ LATENT INVARIANT THIS DESIGN RESTS ON, undocumented before the #2733 review:
+// a LEAF THUNK must never call lowerExpr. The ~45 leaf thunks and trampolines
+// (LINQ, box ToString/Equals/GetHashCode, sort comparators, spawn adapters,
+// widening thunks) do not touch disposeStack_, which is safe ONLY because none
+// of them lowers a user expression, so this function never runs under one. If
+// one ever did, (1) would push a Disposal holding a FOREIGN function's alloca
+// onto the enclosing function's live disposeStack_ — malformed IR. Every emitter
+// that DOES lower user code under a swapped currentFn_ (the lambda body, the six
+// property/indexer accessor emitters, buildSpecializedMethodFn, the three
+// Layout.cpp thunks, genericInstSfinitFn, the specialized disposers) saves,
+// clears and restores disposeStack_, which is what keeps (1) per-function.
+void Emitter::registerFfiExprTemp(llvm::AllocaInst* slot, bool isRawBytes) {
+    if (!slot) return;
+    if (!disposeStack_.empty()) {
+        Disposal d{slot, nullptr};
+        d.ffiBuffer = true;
+        d.rawBytes = isRawBytes;
+        disposeStack_.back().push_back(d);
+    }
+    ffiExprTemps_.push_back({slot, isRawBytes, currentFn_});
+}
+
+// fix #2733 / §28.3 (v0.240): the full-expression boundary discharge. Called
+// from lowerExpr when nesting depth returns to 0 — i.e. once the whole K8 full
+// expression has been lowered and "every use of it within that expression has
+// completed", which is precisely where §28.3 puts the disposal. Emitting here
+// instead of after the callee's CreateCall is what keeps the buffer live across
+// an OUTER call that reads an alias the extern returned.
+void Emitter::flushFfiExprTemps() {
+    // A terminated block means the full expression diverged (a `throw`); the
+    // unwind edge's disposeStack_ walk has already reclaimed these, and emitting
+    // after a terminator would be invalid IR. Drop the queue: entry (1) above
+    // still guards every remaining edge.
+    llvm::BasicBlock* bb = builder_.GetInsertBlock();
+    bool live = currentFn_ && bb && !bb->getTerminator();
+    std::vector<FfiExprTemp> keep;
+    for (const auto& t : ffiExprTemps_) {
+        // Never emit a free against another function's alloca (see
+        // FfiExprTemp::fn), and — this is the part that matters — do not DROP it
+        // either. A nested-function boundary fires while the ENCLOSING
+        // expression is still open (`f(CString.From(x), lambda …)`), so the
+        // outer function's temps are still owed a reclaim at the outer boundary.
+        // Keeping them queued is what makes that boundary still find them.
+        if (t.fn != currentFn_) { keep.push_back(t); continue; }
+        // Diverged: the block is terminated, the unwind edge's disposeStack_
+        // walk already reclaimed this, and emitting after a terminator would be
+        // invalid IR. Drop without emitting.
+        if (!live) continue;
+        emitFfiBufferTempFree(t.slot, t.rawBytes);
+        // Discharge, exactly as buildOrderedArgs nulls transferredOwnedArgSlots:
+        // the disposeStack_ entry established at production stays registered but
+        // now loads null, so scope end / return / unwind are all no-ops. This is
+        // what makes the reclaim exactly-once on every path, and it is also what
+        // makes a LOOP correct — the slot is an entry-block alloca reused by
+        // every iteration, and each iteration's flush re-arms it.
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), t.slot);
+    }
+    ffiExprTemps_.swap(keep);
+}
+
 llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());

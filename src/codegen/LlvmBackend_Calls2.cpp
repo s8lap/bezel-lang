@@ -3639,10 +3639,11 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // fix #2222: each CString param that takes the width>1 path allocates
         // a fresh malloc'd UTF-8 buffer via bz_string_to_utf8z. The C callee
         // reads but does not own it (caller-owns per section 32.6), so the
-        // buffer must be freed AFTER the call. Each such parameter gets an
-        // entryAlloca slot, null-initialized; the slot is set to encData in
-        // the wnBB block and free'd (null-guarded) after the call.
-        std::vector<llvm::AllocaInst*> cstrBufSlots;
+        // buffer must be reclaimed by the caller. fix #2733: that reclaim is now
+        // established on disposeStack_ at PRODUCTION and discharged at §28.3's
+        // full-expression boundary (registerFfiExprTemp / flushFfiExprTemps) —
+        // it used to be a straight-line free emitted after the CreateCall, which
+        // is neither §28.3's boundary nor reachable from the unwind edge.
         // fix #2728 (§32.6 + §28.3 *Unbound owned temporaries*, v0.240): the
         // SIBLING leak of #2222. #2222 covered the buffer the compiler mints
         // implicitly when a Bezel `string` is passed to a `CString` parameter;
@@ -3673,7 +3674,15 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // hazard no rule in this chapter can track — validity ends at a disposal
         // the native side is never told about." A `using var` binding has the
         // same exposure, one scope later; the remedy there is the remedy here.
-        std::vector<std::pair<llvm::AllocaInst*, bool>> ffiTempSlots;
+        //
+        // fix #2733: WHEN the reclaim runs was wrong for both of the above, and
+        // is corrected together. See registerFfiExprTemp (LlvmBackend_Calls.cpp)
+        // for the §28.3 argument; the short form is that a post-call free is
+        // premature — an extern RETURNING an alias of its own argument
+        // (`strlen(strchr(CString.From("hello"), 101))`) reads freed memory —
+        // and it is unreachable from the unwind edge, so a later argument that
+        // throws leaks the buffer. Both reclaims are now established here, at
+        // production, and discharged at the full-expression boundary.
         for (const auto& a : call.args) {
             if (!a.value) return nullptr;
             llvm::Value* v = lowerExpr(*a.value);
@@ -3683,13 +3692,18 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
             {
                 bool argIsRawBytes = false;
                 if (isFfiBufferFactoryCall(*a.value, argIsRawBytes)) {
-                    // No null pre-init is needed (unlike cstrBufSlots, whose
-                    // store is inside one arm of a width branch): this store is
-                    // straight-line before the call, so every path that reaches
-                    // the reclaim below has executed it.
-                    auto* tmpSlot = entryAlloca(ptrTy());
+                    // fix #2733: the slot is now null-initialized in the ENTRY
+                    // block, not merely stored here. #2728's note ("no null
+                    // pre-init is needed — this store is straight-line before
+                    // the call") held only while the sole reader was the
+                    // post-call loop, which this store dominates. The reclaim is
+                    // now also reachable from the UNWIND edge of an argument
+                    // evaluated BEFORE this one, and from a sibling branch that
+                    // never ran this store at all — neither is dominated by it,
+                    // and both would otherwise free an undef pointer.
+                    auto* tmpSlot = entryAllocaNullPtr();
                     builder_.CreateStore(v, tmpSlot);
-                    ffiTempSlots.emplace_back(tmpSlot, argIsRawBytes);
+                    registerFfiExprTemp(tmpSlot, argIsRawBytes);
                 }
             }
             // fix #1720 (§32.5, v0.186): marshal a RawBytes argument to its two
@@ -3716,10 +3730,19 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                 const sema::TypeRef* at = ctx_.exprType(*a.value);
                 if (at && at->kind == sema::TypeRef::Kind::Primitive &&
                     at->primitive == sema::PrimitiveType::String) {
-                    auto* bufSlot = entryAlloca(ptrTy());
+                    // fix #2733: entry-block null init (the local pre-store below
+                    // stays — it re-arms the slot per evaluation so the width-1
+                    // ASCII fast path, which stores nothing, reclaims nothing).
+                    auto* bufSlot = entryAllocaNullPtr();
                     builder_.CreateStore(
                         llvm::ConstantPointerNull::get(ptrTy()), bufSlot);
-                    cstrBufSlots.push_back(bufSlot);
+                    // fix #2733: establish #2222's reclaim on the cleanup stack
+                    // at PRODUCTION, discharged at the §28.3 full-expression
+                    // boundary — replacing the post-call flush this loop used to
+                    // feed. Both FFI-buffer reclaims move together: they are the
+                    // same buffer kind (bz_string_to_utf8z + free) and the same
+                    // two defects (premature free, no unwind reclaim).
+                    registerFfiExprTemp(bufSlot, /*isRawBytes=*/false);
                     llvm::Value* strPtr = v;
                     llvm::Value* w = loadStringWidth(strPtr);
                     llvm::Value* isW1 = builder_.CreateICmpEQ(
@@ -3787,54 +3810,16 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         // function returns a different type than the user's extern declared.
         // E.g. malloc returns ptr but user declared IntPtr (i64): ptrtoint.
         llvm::Value* result = builder_.CreateCall(it->second, args);
-        // fix #2222: free every transient CString buffer allocated by the
-        // cstringParamAt bz_string_to_utf8z path (null-guarded so the
-        // width-1 ASCII fast path is a no-op).
-        for (llvm::AllocaInst* bufSlot : cstrBufSlots) {
-            llvm::Value* buf = builder_.CreateLoad(ptrTy(), bufSlot, "cstr.buf");
-            llvm::Value* isNull = builder_.CreateICmpEQ(
-                buf, llvm::ConstantPointerNull::get(ptrTy()), "cstr.buf.isnull");
-            auto* frBB  = llvm::BasicBlock::Create(llvm_, "cstr.buf.free", currentFn_);
-            auto* contBB = llvm::BasicBlock::Create(llvm_, "cstr.buf.cont", currentFn_);
-            builder_.CreateCondBr(isNull, contBB, frBB);
-            builder_.SetInsertPoint(frBB);
-            builder_.CreateCall(freeFn(), {buf});
-            builder_.CreateBr(contBB);
-            builder_.SetInsertPoint(contBB);
-        }
-        // fix #2728: and free every EXPLICITLY-minted FFI buffer temporary
-        // (`f(CString.From(s))`) at the same point, for the same §32.6
-        // caller-owns reason. Placement note (§28.3's boundary is the end of the
-        // FULL EXPRESSION, which may be later than this): the reclaim is emitted
-        // immediately post-call rather than at the syntactic end of the full
-        // expression. That satisfies §28.3's "after every use of it within that
-        // expression has completed" — the call was the temporary's only use, and
-        // an unnamed buffer is reachable from nothing else in the expression —
-        // and it is the placement #2222 already established for the identical
-        // buffer kind three lines above.
-        //
-        // ⚠ CORRECTION (review of #2728): the two justifications originally
-        // recorded here for that placement are BOTH FALSE at v0.240, and the
-        // placement is a KNOWN DEFECT tracked as #2733 — not a settled choice.
-        //   * "already outside the model (§32.10)" — §32.10 is about NATIVE
-        //     RETENTION of an address past the call. An extern that RETURNS an
-        //     alias of its own argument is unaddressed anywhere in §32.1-§32.14.
-        //     §32.6 covers the neighbouring case and points the OTHER way: such a
-        //     return should be declared IntPtr.
-        //   * "equally broken under a `using var`" — false. That spelling keeps
-        //     the buffer alive to scope end and the same program is correct.
-        // §28.3's boundary is a FIXED POINT, not an upper bound ("Disposal runs
-        // AFTER the borrowing use, so the receiver is live for the duration of
-        // the call"); the "after every use has completed" clause is a CONJUNCT of
-        // "at the end of the full expression", not an alternative to it. So
-        // `strlen(strchr(CString.From("hello"), 101))` frees the inner buffer
-        // before the outer CreateCall reads it — a leak pre-fix, a UAF post-fix.
-        // This is NOT new here: #2222's flush three lines above has the identical
-        // placement, so the class already shipped. #2733's fix — register on the
-        // establishment-ordered cleanup stack — closes this face and the
-        // unwind-path gap together, and both reclaims must move at once.
-        for (const auto& [tmpSlot, tmpIsRawBytes] : ffiTempSlots)
-            emitFfiBufferTempFree(tmpSlot, tmpIsRawBytes);
+        // fix #2733 (§28.3, v0.240): NO post-call reclaim is emitted here for
+        // either FFI-buffer family. Both are now established on the
+        // establishment-ordered cleanup stack at production and discharged at
+        // the full-expression boundary (registerFfiExprTemp above /
+        // flushFfiExprTemps in lowerExpr). Emitting the free at THIS point was
+        // the defect: it is not §28.3's boundary ("Disposal runs *after* the
+        // borrowing use" — and this call is not necessarily the last use, since
+        // an extern can return an alias of its own argument that an OUTER call
+        // in the same full expression reads), and it is on the normal path only,
+        // so an argument evaluated later that threw leaked the buffer.
         llvm::Type* canonRet = it->second->getReturnType();
         llvm::Type* userRet = ed && ed->returnType
                                   ? lowerType(ed->returnType.get())

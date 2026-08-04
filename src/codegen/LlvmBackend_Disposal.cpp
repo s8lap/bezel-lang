@@ -4308,6 +4308,30 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             } else {
                 builder_.CreateCall(freeFn(), {fbuf});
             }
+            // fix #2733 / §28.3 (v0.240): null the slot after reclaiming, exactly
+            // as the `unwindOnly` arm above does. Required now that #2733
+            // registers EXTERN-ARGUMENT buffer temporaries through this arm: it
+            // has no `isUnwind` gate, so one scope can be traversed twice.
+            //
+            // ⚠ THE SHAPE THAT ACTUALLY FORCES THIS is a BINDING ATOM, not the
+            // `catch`-resumes-normally shape an earlier draft named. Review
+            // could not construct the catch shape: emitUnwindDisposals walks only
+            // down to unwindScopeDepth_, and lowerTry sets that floor
+            // (LlvmBackend_Stmts.cpp:3313) BEFORE the body scope is pushed, so on
+            // a throw the body scope is disposed on the unwind edge and its
+            // normal-path scope-end code is not reached on that path. The real
+            // one: lowerBindExpr pushes a dispose scope MID-EXPRESSION
+            // (LlvmBackend_Exprs2.cpp:7137) and runs emitDisposals(isUnwind=false)
+            // at :7176 before popping, so a temp produced in an atom body is
+            // freed at the atom's completion and would then be freed AGAIN by
+            // flushFfiExprTemps at the enclosing boundary — a guaranteed double
+            // free on the same straight-line path. That hazard is INTRODUCED by
+            // #2733 (pre-fix there was no disposeStack_ entry) and closed here.
+            // Harmless for the `using
+            // var` registrations this arm already served (scope end is their last
+            // use); it makes the reclaim idempotent on every path, which is
+            // §28.3's dispose-exactly-once.
+            builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;
