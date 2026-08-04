@@ -204,12 +204,58 @@ bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
 // §21.1 requires the rejection; the rejection removes the leak by removing the
 // program.
 //
+// BOTH INSTANCE-CALL SPELLINGS (fix #2749 item 3). The callee may be a
+// `MemberAccessExpr` (`recv.M(..)`) or a `NullCondMemberExpr` (`recv?.M(..)`) —
+// sibling `Expr` kinds with identical `target`/`member` fields, so the original
+// `dynamic_cast<MemberAccessExpr*>`-only gate missed every `?.` spelling and
+// `const b := s?.Split(",");` was accepted. This is sema's own #2581 precedent
+// (`ExprTC::builtinInstanceCallee`), applied here. `?.` does not change the
+// classification: §21.1 rejects "an `owned`-returning call", `Split` is declared
+// `owned`-returning, and the null path merely adds §28.3's `null` row, which
+// "has no value to own, so it is compatible with either an owned target or a
+// borrowed target" — it cannot demote the non-null path's owned production.
+// The `?(` invocation form (`ast::NullCondCallExpr`) is deliberately NOT
+// covered: it invokes a FUNCTION VALUE, which §28.3 classifies as Borrowed and
+// §21.1 admits.
+//
+// ⚠⚠ THIS WIDENING IS INERT TODAY, AND THAT IS THE POINT — do not delete it as
+// dead code. MEASURED on 6cd9b70 with temporary instrumentation in the body
+// below: with the widening in place the predicate IS now reached for
+// `a?.Sorted()`, `a?.Reversed()`, `a?.Slice(0..1)` and `t?.Split(",")`, with no
+// symbol on the callee (so the narrowness gate passes them) — but every one of
+// them arrives with `ctx.exprType(call) == nullptr`, because SEMA NEVER TYPES A
+// BUILTIN INSTANCE CALL REACHED THROUGH `?.` at all. That is the same defect
+// behind their #2434 codegen degradation, and it is filed separately as #2756.
+// The result-head gate below then fails OPEN, so no rejection is emitted and no
+// program's diagnostics change.
+//
+// It is shipped anyway, deliberately, for a soundness reason rather than a
+// stylistic one: today `const b := s?.Split(",");` is not a leak (the value
+// never lowers — the local degrades to zero-initialized), but the moment #2756
+// lands the lowering, it becomes a REAL accept-and-leak of exactly #2709's
+// shape. A lane whose scope is "make `?.` builtin calls lower" would have no
+// reason to also add the §21.1 rejection. Pre-placing the guard means that fix
+// arrives already covered instead of re-opening the defect. The tripwire test
+// `const_nullcond_materializer_2749.residual_*_pending_2756` pins the current
+// state and is MEANT to go red when #2756 lands; the correct response is to flip
+// it into a rejection assertion.
+//
 // NARROWNESS (a false reject here breaks working code). Recognized only when
 // sema attached NO SYMBOL AT ALL to the callee — `ctx.exprSymbol(callee) ==
 // nullptr`. The result type must additionally be a declaration-less builtin
 // `Array` / `Set` / `Dictionary` head. A USER method named `ToArray` keeps the
 // ordinary user-call rules; a borrow-returning one stays admissible as a
 // `const` initializer, which §21.1 explicitly permits.
+//
+// ⚠ That narrowness had to be RE-ESTABLISHED for `?.`, not assumed, because the
+// null-conditional form is typed by a separate function with its own resolution
+// mirror. `ExprTC::resolveNullCondMember` calls `setExprSymbol(&nm, member)`
+// unconditionally once `lookupMember`/`lookupExtensionMember` resolved one, and
+// returns early attaching NOTHING when neither did — the builtin case. So a user
+// method reached as `obj?.Sorted()` attaches a MethodSymbol and a function-typed
+// field reached as `cfg?.Split(line)` attaches a FieldSymbol, and the single
+// `exprSymbol == nullptr` line excludes both, exactly as it does for their `.`
+// spellings.
 //
 // ⚠ DO NOT "restore consistency" with `isOwningCollectionDrainAliasCall`'s
 // `dynamic_cast<sema::MethodSymbol*>` gate. That is what this predicate shipped

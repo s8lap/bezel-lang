@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "ast/Node.hpp"
@@ -292,13 +293,32 @@ bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
     return false;
 }
 
+// fix #2749 item 3: a builtin INSTANCE-call callee is EITHER a
+// `MemberAccessExpr` (`recv.M(..)`) OR a `NullCondMemberExpr` (`recv?.M(..)`).
+// The two are SIBLING `Expr` kinds — not one a subclass of the other — that
+// share identical `target`/`member` fields, so a `dynamic_cast<
+// MemberAccessExpr*>`-only gate silently misses every `?.` spelling.
+//
+// This is sema's own precedent, added for #2581 for exactly this reason
+// (`ExprTC::builtinInstanceCallee`, sema/ExprTypecheck_Calls.cpp) — duplicated
+// rather than shared because that one is a file-local static inside the sema
+// translation unit. Returns the (target, member) pair, or (nullptr, {}) when
+// the callee is neither kind. // per §7.5, #2581, #2749
+static std::pair<const ast::Expr*, std::string_view> builtinInstanceCallee(
+    const ast::Expr* callee) {
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee))
+        return {ma->target.get(), ma->member};
+    if (auto* ncm = dynamic_cast<const ast::NullCondMemberExpr*>(callee))
+        return {ncm->target.get(), ncm->member};
+    return {nullptr, {}};
+}
+
 bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
                                     const sema::SemaContext& ctx) {
     // See the header contract. // per §21.1 v0.201, stdlib §5 / §4.4 / §9.6,
-    // #2709
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
-    if (!ma || !ma->target) return false;
-    std::string_view mm = ma->member;
+    // #2709, #2749
+    auto [maTarget, mm] = builtinInstanceCallee(call.callee.get());
+    if (!maTarget) return false;
     // The stdlib's `owned`-returning materializer members, each verified to
     // leak under `const` before being added (100-of-100 under LSan):
     //   stdlib §5   ToArray / ToSet / ToDictionary  (LINQ terminals)
@@ -349,6 +369,20 @@ bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
     // An `owned`-marked function-typed slot is a different matter and is
     // already Owned via producerState's `funcReturnOwned` arm — §21.1's FIRST
     // branch, not this one. // per §28.3, §21.1, #2709
+    //
+    // ⚠ THE SAME NARROWNESS ARGUMENT HOLDS ON THE `?.` PATH, and that is what
+    // makes #2749 item 3's widening safe rather than a false-reject risk. The
+    // null-conditional form is typed by a SEPARATE function with its own
+    // resolution mirror (`ExprTC::resolveNullCondMember`,
+    // sema/ExprTypecheck_Calls.cpp), so the premise had to be re-established
+    // there rather than assumed: it calls `setExprSymbol(&nm, member)`
+    // UNCONDITIONALLY once `lookupMember` (or `lookupExtensionMember`) resolved
+    // one, and returns EARLY without attaching anything when neither did — which
+    // is exactly the builtin case. So `obj?.Sorted()` over a USER method gets a
+    // MethodSymbol, `cfg?.Split(line)` over a function-typed FIELD gets a
+    // FieldSymbol, and both are excluded here by the same one line that excludes
+    // their `.` spellings; only the compiler-known builtins arrive symbol-less.
+    // // per §7.5, §28.3, §21.1, #2581, #2749
     if (call.callee && ctx.exprSymbol(*call.callee) != nullptr)
         return false;
     // The RESULT must be a declaration-less BUILTIN collection head. This is
