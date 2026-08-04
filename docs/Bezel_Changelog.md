@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.239 — August 2026**
+**Companion to the Bezel Language Specification, v0.240 — August 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -7333,3 +7333,14 @@ Rationale §3.3 is rewritten as the recorded reversal it is: the #1373 ruling's 
 **Kernel classification (the v0.198 obligation):** none — rationale prose only; no normative text touched.
 
 **Migration.** Doc-only; no program changes meaning. No grammar, anchor, or section moves; the guides are untouched and keep their pins; the conformance corpus is untouched.
+
+### v0.240 changelog (v0.239 → v0.240)
+
+**The ceremony-announces-effects principle gains its wider presence (owner-directed 2026-08-04).** v0.239 recorded the full argument in rationale §5.28; the owner ruled it worth surfacing where readers actually meet the ceremony. Two placements, honoring the documents' division of labor — the spec says *what* and points at *why*; the guide teaches the posture:
+
+- **Spec §28.9** gains one principle sentence at the exemption's definition: the ceremony announces observable disposal *effects*, a trivial-dispose class's disposal has none to announce, and that is why the exemption's boundary is exactly the runs-no-user-code line and extends no further (pointer to rationale §5.28). No rule changes; the sentence names the boundary's reason, not a new boundary.
+- **Guide 1 §2** teaches it in both homes: the four-spellings paragraph's "how loudly" now says what loudness is for (disposing a resource is an effect — a file closes, a lock releases — and the spellings mark where effects fire), and the trivial-dispose block's lead-in states the contrapositive (a class whose disposal provably has no effects has nothing to announce, rationale §5.28). Guide 1's pin is unchanged (v0.238 — no normative rule moved at v0.239 or here; the additions were traced against the v0.238 text).
+
+**Kernel classification (the v0.198 obligation):** none — one explanatory sentence in §28.9's prose and guide teaching; no rule text touched.
+
+**Migration.** Doc-only; no program changes meaning. No grammar, anchor, or section moves; the conformance corpus is untouched.
