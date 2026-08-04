@@ -2117,6 +2117,35 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             !isPlusOneStringProducer(rs->value.get()) &&
             !returnedStringLocalOwnsPlusOne(rs->value.get()))
             emitStringRetain(v);
+        // fix #2691 / §27.3 / §27.5 / §28.9 (v0.240): the CLOSURE sibling of the
+        // string mint immediately above — the category #2688 did not cover. The
+        // closure branch further down keys on currentReturnTypeNode_, which
+        // #2515 nulls inside a lambda body, so a BLOCK-bodied lambda whose
+        // return type is a FUNCTION type handed back a +0 borrow while its
+        // EXPRESSION-bodied twin minted +1 (LlvmBackend_Exprs2.cpp, keyed on
+        // retSemaTy). The consumer that makes the difference fatal is the
+        // lambda ENVIRONMENT DESTRUCTOR: when the returned closure is bound to a
+        // local that is then CAPTURED, the capturing env's dtor releases that
+        // cell keyed purely on its function type (LlvmBackend_Exprs2.cpp
+        // envdtor, `ce.semaTy->kind == Kind::Function`), on the invariant that a
+        // closure local's slot owns +1. The expression form established that +1;
+        // the block form did not, so the same program was sound or a
+        // heap-use-after-free depending on nothing but which body form the
+        // author wrote:
+        //     var f := lambda(): () -> int => do return inner; end;
+        //     var g := f();            // +0 pre-fix, +1 for the expr sibling
+        //     return lambda() => g();  // envdtor releases g -> UAF on `inner`
+        // Mirror the expression-body predicate EXACTLY — same three transfer
+        // exclusions, and, as there, NO `!nullable` gate (the closure category
+        // has never had one, unlike the string category above): agreement
+        // between the two body forms is the invariant #2688 established.
+        if (v && rs->value && !currentReturnTypeNode_ && lamRet &&
+            v->getType()->isPointerTy() &&
+            lamRet->kind == sema::TypeRef::Kind::Function &&
+            !isPlusOneClosureProducer(rs->value.get()) &&
+            !isUserMethodClosureReturnCall(rs->value.get()) &&
+            !returnedClosureLocalOwnsPlusOne(rs->value.get()))
+            emitClosureRetain(v);
         if (v && rs->value && currentReturnTypeNode_ &&
             v->getType()->isPointerTy()) {
             const sema::TypeRef* declRet =
