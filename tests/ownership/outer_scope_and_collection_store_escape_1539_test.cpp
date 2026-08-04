@@ -302,3 +302,140 @@ BEZEL_TEST(collection_store_escape_1539, owning_collection_add_unaffected) {
         "end Fill; end C;");
     BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
 }
+
+// =============================================================================
+// (c) issue #2656 — the TRIVIAL-DISPOSE-class variant of the same §28.11 rule.
+//
+// Every fixture above binds `Res`, a DESTRUCTOR-BEARING class, so strictly
+// they pin only the non-trivial case. The rule itself is about BORROW
+// LIFETIME, not about disposal work, so it should not care whether the stored
+// element's class is trivial-dispose (§28.9) — but nothing pinned that, and
+// the distinction is live in the implementation.
+//
+// ⚠ THESE PIN TODAY'S BEHAVIOUR DELIBERATELY. Read before changing them.
+//
+// The rejection below is CURRENT behaviour, verified on this revision. It is
+// load-bearing for proposal 0077's silent-tracking reading (docs/proposals/
+// 0077-silent-tracking.md, tracking issue #2653): a scope-local trivial
+// instance is still TRACKED for borrow lifetime even though its disposal is a
+// no-op. A silent regression toward ADMITTING these stores would change the
+// language's de-facto semantics unobserved — which is exactly why the pin
+// exists rather than being left to the destructor-bearing fixtures above.
+//
+// The implementation has NOT decided the general question. The §28.3/§28.11
+// suspend-local carve-out in src/ownership/Ownership.cpp records that whether
+// §28.9's "implementation-defined reclaim" carries zero leak risk for an
+// arbitrary trivial-dispose class "is a separate, NOT-YET-DECIDED design
+// question this fix declines to resolve silently (tracked #2332)".
+//
+// What would justify changing these tests: a ruling on #2332, or a proposal
+// 0077 (#2653) graduation that explicitly relaxes §28.11 for trivial-dispose
+// elements — with the spec amended first. NOT an implementation convenience,
+// and not a drive-by "trivial classes need no tracking" simplification. If a
+// future change makes these fail, that is the pin working; resolve it against
+// the spec revision in force, not by deleting the assertion.
+//
+// §28.11 "Storing a borrow" (v0.180, quoted in full at the head of this file)
+// draws its line at the SCOPE of the collection versus the scope of the
+// borrow's source, with no trivial-dispose qualification anywhere in the rule.
+// §28.9's trivial-dispose section likewise grants only weaker DISCHARGE
+// requirements — never weaker BORROW-LIFETIME requirements.
+// =============================================================================
+
+// A trivial-dispose class (§28.9): no destructor, no `owned` field, no
+// owning-inline-array field, no base. Its `Dispose()` is provably a no-op.
+constexpr const char* kTrivialBox =
+    "class Box public constructor() end constructor; "
+    "  public Value: int := 1; end Box; ";
+
+// The probe-C shape named by issue #2656: a scope-local trivial `Box` `Add`ed
+// into an `Array<Box>` that lives in an ENCLOSING scope. Rejected today, with
+// the same §28.11 diagnostic the destructor-bearing twin
+// (`loop_local_into_outer_collection_rejected`, above) draws — the element
+// class's trivial-dispose status does not enter the rule.
+BEZEL_TEST(collection_store_escape_2656, trivial_class_loop_local_into_outer_collection_rejected) {
+    auto r = parseAndCheckOwnership(
+        std::string("module M; ") + kTrivialBox +
+        "class C public static method Main(count: int): int "
+        "  var pool := new Array<Box>(); "
+        "  var i := 0; "
+        "  while i < count do "
+        "    var b := new Box(); "
+        "    pool.Add(b); "
+        "    i := i + 1; "
+        "  end; "
+        "  return pool.Count; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(rejectsCollectionBorrowStoreEscape(r, "pool", "b"));
+}
+
+// The same shape with the element bound by `using var`. §28.9: "`using var` on
+// a trivial-dispose class is permitted and has no observable effect other than
+// scope limitation" — so this is the explicitly-scope-limited spelling of the
+// test above, and it must be rejected on the same footing.
+BEZEL_TEST(collection_store_escape_2656, trivial_class_using_var_loop_local_into_outer_collection_rejected) {
+    auto r = parseAndCheckOwnership(
+        std::string("module M; ") + kTrivialBox +
+        "class C public static method Main(count: int): int "
+        "  using var pool := new Array<Box>(); "
+        "  var i := 0; "
+        "  while i < count do "
+        "    using var b := new Box(); "
+        "    pool.Add(b); "
+        "    i := i + 1; "
+        "  end; "
+        "  return pool.Count; "
+        "end Main; end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(rejectsCollectionBorrowStoreEscape(r, "pool", "b"));
+}
+
+// The collection is a FIELD — it always outlives a method-scope local. The
+// trivial twin of `field_collection_rejected` above.
+BEZEL_TEST(collection_store_escape_2656, trivial_class_field_collection_rejected) {
+    auto r = parseAndCheckOwnership(
+        std::string("module M; ") + kTrivialBox +
+        "class C "
+        "  private owned _pool: Array<Box>; "
+        "  public constructor() _pool := new Array<Box>(); end constructor; "
+        "  public method Fill() "
+        "    var b := new Box(); "
+        "    _pool.Add(b); "
+        "  end Fill; "
+        "end C;");
+    BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(rejectsCollectionBorrowStoreEscape(r, "_pool", "b"));
+}
+
+// NO OVER-REJECTION control. `pool` and `b` are declared at the same depth, so
+// the collection does not PROVABLY outlive `b`'s scope and the structural
+// check admits the store (residual trust, per §28.11) — exactly as it does for
+// the destructor-bearing `same_scope_store_accepted` above. Without this, the
+// three rejections could be satisfied by a blanket "reject every trivial-class
+// collection store", which is not the rule.
+BEZEL_TEST(collection_store_escape_2656, trivial_class_same_scope_store_accepted) {
+    auto r = parseAndCheckOwnership(
+        std::string("module M; ") + kTrivialBox +
+        "class C public static method Main(): int "
+        "  var pool := new Array<Box>(); "
+        "  var b := new Box(); "
+        "  pool.Add(b); "
+        "  return pool.Count; "
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
+
+// NO OVER-REJECTION control 2. A PARAMETER-sourced trivial element stored into
+// a method-scope collection is admitted (§28.11: parameter-sourced borrows are
+// admitted) — the trivial twin of `parameter_sourced_element_accepted`.
+BEZEL_TEST(collection_store_escape_2656, trivial_class_parameter_sourced_element_accepted) {
+    auto r = parseAndCheckOwnership(
+        std::string("module M; ") + kTrivialBox +
+        "class C public static method Fill(item: Box): int "
+        "  var pool := new Array<Box>(); "
+        "  pool.Add(item); "
+        "  return pool.Count; "
+        "end Fill; end C;");
+    BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
+}
