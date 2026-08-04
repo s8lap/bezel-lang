@@ -157,11 +157,20 @@ BEZEL_TEST(own_value_builtin_434, cancellation_token_source_using_var_clean) {
 }
 
 // §28.3 v0.150: a user-defined class local without disposal auto-drops at scope
-// end (must-use warning), no error.
+// end (must-use warning), no error. This is the counterweight to the value-type
+// cases above — #434's contract is "no-over, no-under", and this is the
+// no-UNDER half.
+//
+// §28.9 (v0.237, #2654): `T` declares a DESTRUCTOR so it is NON-trivial-
+// dispose, which is what makes it the "OWNED class local" the file header
+// names. A trivial-dispose class is exempt from this very warning ("A `new`
+// expression of a trivial-dispose class type … does *not* produce the standard
+// ownership-discharge warning"), so the previous bare `class T end T;` made
+// this fixture assert the opposite of what §28.9 requires.
 BEZEL_TEST(own_value_builtin_434, user_class_still_owned) {
     auto r = parseAndCheckOwnership(
         "module M; "
-        "class T end T; "
+        "class T destructor end destructor; end T; "
         "class C "
         "  public static method Main(): int "
         "    var x := new T(); "
@@ -173,10 +182,12 @@ BEZEL_TEST(own_value_builtin_434, user_class_still_owned) {
 }
 
 // §28.3: `using var` for a user class IS implicitly discharged — clean.
+// `T` is destructor-bearing (see above), so this is a real discharge of a real
+// obligation rather than a vacuous pass on a §28.9-exempt trivial class.
 BEZEL_TEST(own_value_builtin_434, user_class_using_var_clean) {
     auto r = parseAndCheckOwnership(
         "module M; "
-        "class T end T; "
+        "class T destructor end destructor; end T; "
         "class C "
         "  public static method Main(): int "
         "    using var x := new T(); "

@@ -22,6 +22,61 @@
 
 namespace bezel::common {
 
+// §28.9 "Trivial-dispose classes" (v0.237) / §22.5 (#1684) — see the header.
+// Relocated VERBATIM from ExprTC::isNonTrivialDisposeClass (#2654); not one
+// line of classification logic changed, so every existing sema consumer keeps
+// byte-identical behaviour and the ownership pass's §28.3 auto-drop gate now
+// shares this single copy.
+bool isNonTrivialDisposeClass(sema::TypeSymbol* decl) {
+    bool reject = false;
+    std::unordered_set<const sema::TypeSymbol*> visitedBase;
+    const std::size_t kMaxWalk = 4096;  // defensive; base chains are shallow
+    std::size_t walked = 0;
+    for (sema::TypeSymbol* cur = decl; cur && !reject;) {
+        if (++walked > kMaxWalk) break;
+        if (!visitedBase.insert(cur).second) break;  // cycle guard (#1624)
+        for (sema::Symbol* m : cur->members) {
+            if (dynamic_cast<sema::DestructorSymbol*>(m)) {
+                reject = true;
+                break;
+            }
+            auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+            if (!fs) continue;
+            if (fs->posParam) {
+                if (fs->parent &&
+                    fs->parent->kind == ast::TypeDeclKind::Class &&
+                    fs->posParam->modifier == "owned" &&
+                    fs->posParamBodyRef && !fs->posParamInitRef) {
+                    reject = true;
+                    break;
+                }
+                continue;
+            }
+            // A `static owned` field (§22.12 rule 4) is disposed at
+            // process-exit order (§22.13), not by this instance's Dispose()
+            // — exclude it, or a class whose only `owned` member is static
+            // would be wrongly classified non-trivial-dispose here.
+            bool isStatic = false, isOwned = false;
+            for (auto mod : fs->modifiers) {
+                if (mod == "static") isStatic = true;
+                if (mod == "owned") isOwned = true;
+            }
+            if (isOwned && !isStatic) {
+                reject = true;
+                break;
+            }
+        }
+        sema::TypeSymbol* nextBase = nullptr;
+        for (sema::TypeSymbol* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) {
+                nextBase = b;
+                break;
+            }
+        cur = nextBase;
+    }
+    return reject;
+}
+
 const ast::MethodDecl* calleeMethodDecl(const ast::CallExpr& call,
                                         const sema::SemaContext& ctx) {
     // The callee → MethodSymbol → user MethodDecl navigation that both

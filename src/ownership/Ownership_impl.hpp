@@ -303,6 +303,15 @@ public:
     bool exprIsTemporary(const ast::Expr& e) const;
     bool rhsIsVacuousBorrowPin(const ast::Expr& e) const;
     bool rhsIsDisposableClassType(const sema::TypeRef* rt);
+    // §28.9 (v0.237) trivial-dispose discharge-warning exemption (#2654):
+    // is `ld` a plain `var` bound to `new T(...)` where T is a trivial-dispose
+    // CLASS? Consulted ONLY to suppress the §28.3 auto-drop WARNING — the
+    // `autoDropAtScopeEnd` flag and the emitted scope-end free are unaffected.
+    bool localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld);
+    // §15.1.1 / §28.9 (#2654): does `decl`'s class chain declare a field of
+    // owning-inline-array type (`[N owned]T?`)? Such a field excludes the
+    // class from trivial-dispose, and the shared predicate does not test it.
+    bool classChainHasOwningInlineArrayField(sema::TypeSymbol* decl);
 
 private:
     sema::SemaContext& ctx_;

@@ -8214,59 +8214,15 @@ void ExprTC::runMethodBody(
 // (declared, or a captured `owned` primary-constructor parameter, §22.10),
 // anywhere from `decl` up through its base classes? This is the same test
 // visitStmt's ExpressionStmt arm applies inline for the §21.9 bare-discard
-// check (below in this file); duplicated here as a standalone predicate
-// rather than shared, since that walk is not exposed as a callable, but both
-// apply the same §28.9 trivial-dispose classification. Cycle-guarded
-// (mirrors the #1624 precedent) so a malformed base-type graph that
-// survives error recovery cannot hang the compiler.
+// check (below in this file).
+//
+// #2654: the walk itself now lives in `common::isNonTrivialDisposeClass`
+// (src/common/OwnershipFacts.cpp) so the ownership pass's §28.3 auto-drop
+// warning gate consults the SAME classification rather than a third inlined
+// copy. This member is a thin delegating wrapper — every call site here is
+// unchanged, and the relocated body is verbatim.
 bool ExprTC::isNonTrivialDisposeClass(TypeSymbol* decl) const {
-    bool reject = false;
-    std::unordered_set<const TypeSymbol*> visitedBase;
-    const std::size_t kMaxWalk = 4096;  // defensive; base chains are shallow
-    std::size_t walked = 0;
-    for (TypeSymbol* cur = decl; cur && !reject;) {
-        if (++walked > kMaxWalk) break;
-        if (!visitedBase.insert(cur).second) break;  // cycle guard (#1624)
-        for (Symbol* m : cur->members) {
-            if (dynamic_cast<DestructorSymbol*>(m)) {
-                reject = true;
-                break;
-            }
-            auto* fs = dynamic_cast<FieldSymbol*>(m);
-            if (!fs) continue;
-            if (fs->posParam) {
-                if (fs->parent &&
-                    fs->parent->kind == ast::TypeDeclKind::Class &&
-                    fs->posParam->modifier == "owned" &&
-                    fs->posParamBodyRef && !fs->posParamInitRef) {
-                    reject = true;
-                    break;
-                }
-                continue;
-            }
-            // A `static owned` field (§22.12 rule 4) is disposed at
-            // process-exit order (§22.13), not by this instance's Dispose()
-            // — exclude it, or a class whose only `owned` member is static
-            // would be wrongly classified non-trivial-dispose here.
-            bool isStatic = false, isOwned = false;
-            for (auto mod : fs->modifiers) {
-                if (mod == "static") isStatic = true;
-                if (mod == "owned") isOwned = true;
-            }
-            if (isOwned && !isStatic) {
-                reject = true;
-                break;
-            }
-        }
-        TypeSymbol* nextBase = nullptr;
-        for (TypeSymbol* b : cur->baseTypes)
-            if (b && b->kind == ast::TypeDeclKind::Class) {
-                nextBase = b;
-                break;
-            }
-        cur = nextBase;
-    }
-    return reject;
+    return common::isNonTrivialDisposeClass(decl);
 }
 
 // §22.5 v0.184 (issue #1684): is `e` a fresh owned-producing expression —

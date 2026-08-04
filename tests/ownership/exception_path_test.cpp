@@ -17,9 +17,16 @@ using bezel::test::parseAndCheckOwnership;
 
 namespace {
 
+// §28.9 (v0.237, #2654): `T` declares a DESTRUCTOR so it is NON-trivial-
+// dispose. This file's subject is §28.3 discharge on EXCEPTION/throw paths. A
+// trivial-dispose class is exempt from the must-use auto-drop warning ("A
+// `new` expression of a trivial-dispose class type … does *not* produce the
+// standard ownership-discharge warning"), so with a bare `class T end T;` the
+// must-use assertions here would test that exemption instead of the
+// throw-path analysis, and the ABSENCE assertions would pass vacuously.
 std::string wrap(const std::string& body) {
     return std::string("module M; "
-        "class T end T; "
+        "class T destructor end destructor; end T; "
         "class Error end Error; "
         "class C public method M() ") + body + " end M; end C;";
 }
@@ -78,7 +85,11 @@ BEZEL_TEST(own_exc, throw_after_dispose_is_clean) {
 // omits checkOwnership, so this ownership-pass flag is asserted at the sema level.)
 BEZEL_TEST(own_exc, nested_block_owned_local_before_throw_auto_dropped_1257) {
     auto r = parseAndCheckOwnership(
-        "module M; class E end E; class R end R; "
+        // §28.9 (#2654): `R` is destructor-bearing (NON-trivial-dispose) so
+        // the auto-drop obligation asserted below is real, not an artifact of
+        // which code path happens to reach the §28.9 exemption.
+        "module M; class E end E; "
+        "class R destructor end destructor; end R; "
         "class C public static method Main(): int "
         "  try "
         "    do var r := new R(); end; "
@@ -95,7 +106,13 @@ BEZEL_TEST(own_exc, nested_block_owned_local_before_throw_auto_dropped_1257) {
 // auto-disposing would double-free. No auto-drop warning for `r` here.
 BEZEL_TEST(own_exc, nested_block_moved_local_not_auto_dropped_1257) {
     auto r = parseAndCheckOwnership(
-        "module M; class R end R; "
+        // §28.9 (#2654): `R` MUST be destructor-bearing here. This fixture
+        // asserts the ABSENCE of the auto-drop warning to prove the MOVE
+        // discharged `r` (auto-dropping a moved-from local would double-free).
+        // With a trivial-dispose `R` the §28.9 exemption would suppress the
+        // warning regardless, so the assertion would pass even if the
+        // move-discharge logic regressed — a vacuous test.
+        "module M; class R destructor end destructor; end R; "
         "class C "
         "  public static method Take(owned x: R): int return 0; end Take; "
         "  public static method Main(): int "

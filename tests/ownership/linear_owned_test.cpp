@@ -16,9 +16,20 @@ namespace {
 // Wrap a method body with a preamble declaring the helper classes used
 // in tests, so type resolution and identifier resolution don't emit
 // unrelated diagnostics.
+//
+// §28.9 (v0.237, #2654): `T` and `U` declare a DESTRUCTOR so that they are
+// NON-trivial-dispose. This file's subject is the §28.3 linear discharge
+// obligation, not §28.9's trivial-dispose classification: a trivial-dispose
+// class is exempt from the must-use auto-drop warning ("A `new` expression of
+// a trivial-dispose class type … does *not* produce the standard ownership-
+// discharge warning"), so with the previous bare `class T end T;` every
+// must-use assertion below would silently test the exemption instead of the
+// discharge analysis it was written for. The destructors keep the obligation
+// real and these fixtures on their intended subject.
 std::string wrap(const std::string& body, const std::string& sig = "M()") {
     return std::string("module M; "
-        "class T end T; class U end U; "
+        "class T destructor end destructor; end T; "
+        "class U destructor end destructor; end U; "
         "class Source public method Read(): T => new T(); end Source; "
         "class C "
         "  public source: Source := null; "

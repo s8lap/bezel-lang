@@ -16,10 +16,18 @@ using bezel::test::parseAndCheckOwnership;
 
 namespace {
 
+// §28.9 (v0.237, #2654): `Stream` declares a DESTRUCTOR so it is NON-trivial-
+// dispose. This file's subject is the §28 CFG/dataflow discharge analysis. A
+// trivial-dispose class is exempt from the must-use auto-drop warning ("A
+// `new` expression of a trivial-dispose class type … does *not* produce the
+// standard ownership-discharge warning"), so a bare `class Stream` with no
+// destructor would make the auto-drop assertions below test that exemption
+// rather than the dataflow analysis they were written for.
 std::string wrap(const std::string& body) {
     return std::string("module M; "
         "class T end T; "
         "class Stream "
+        "  destructor end destructor; "
         "  public Inner: Stream := null; "
         "  public Other: Stream := null; "
         "end Stream; "

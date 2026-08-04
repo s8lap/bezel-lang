@@ -25,7 +25,17 @@ namespace {
 // class used as the produced/owned type.
 std::string wrap(const std::string& method) {
     return std::string("module M; "
-        "class R end R; class Resource end Resource; "
+        // §28.9 (v0.237, #2654): `R` declares a DESTRUCTOR so it is NON-
+        // trivial-dispose. This file's subject is §22.4/§28.3 `out owned`
+        // discharge; a trivial-dispose class is exempt from the must-use
+        // auto-drop warning ("A `new` expression of a trivial-dispose class
+        // type … does *not* produce the standard ownership-discharge
+        // warning"), so a bare `class R end R;` would make
+        // `unmoved_owned_local_still_diagnosed` — which exists precisely to
+        // prove the out-param fix "must not silence the local leak" — pass for
+        // the wrong reason, or fail.
+        "class R destructor end destructor; end R; "
+        "class Resource end Resource; "
         "class C ") + method + " end C;";
 }
 
