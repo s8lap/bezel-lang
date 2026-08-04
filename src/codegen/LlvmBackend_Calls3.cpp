@@ -2217,10 +2217,37 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llElemPol.cat == ElementPolicy::Category::ClassOwned ||
         llElemPol.cat == ElementPolicy::Category::ClassBorrow;
 
+    // fix #2686 / #602 / §28.11 / §28.9: a BORROWING `LinkedList<string>` co-owns
+    // a +1 per stored element — §28.11's element-slot table puts a `string` in a
+    // borrowing collection in the runtime-managed row, and the disposal side
+    // already acts on that (`buildCollectionTempDisposal` and
+    // `patternAResultCollectionDisposer` both install stringElementReleaseThunk
+    // for it). No insert path took that +1, so a temp `LinkedList<string>`
+    // released a reference it never retained: ASan SEGV in bz_string_release
+    // under bz$strElemRelease under bz_llist_free. The predicate is a verbatim
+    // mirror of the Array/Stack/Queue element arm of
+    // materializeHeapCollectionLiteral (`litIsStrArr`): OwningLinkedList is
+    // excluded (its element parameter is `owned` — a transfer, and
+    // elementPolicyFor puts an owning-family string in the Value row), `string?`
+    // is excluded, and a fresh +1 producer TRANSFERS via isPlusOneStringProducer
+    // instead of double-retaining.
+    bool llIsStrElem =
+        !isOwning && llElemRef && !llElemRef->nullable &&
+        llElemRef->kind == sema::TypeRef::Kind::Primitive &&
+        llElemRef->primitive == sema::PrimitiveType::String &&
+        llElemPol.cat == ElementPolicy::Category::RuntimeManaged;
+    // Take the list's +1 on the element about to be stored into a new node.
+    // `argExpr` is the element argument (arg 0 for AddFirst/AddLast, arg 1 for
+    // AddBefore/AddAfter, whose arg 0 is the anchor node).
+    auto llRetainElem = [&](llvm::Value* v, const ast::Expr* argExpr) {
+        if (llIsStrElem && !isPlusOneStringProducer(argExpr)) emitStringRetain(v);
+    };
+
     // --- AddFirst(item): LinkedListNode<T> ---
     if (m == "AddFirst" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
+        llRetainElem(v, call.args[0].value.get());   // fix #2686
         llvm::AllocaInst* slot = entryAlloca(v->getType());
         builder_.CreateStore(v, slot);
         auto* fn = declareC("bz_llist_add_first", ptrTy(),
@@ -2245,6 +2272,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "AddLast" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
+        llRetainElem(v, call.args[0].value.get());   // fix #2686
         llvm::AllocaInst* slot = entryAlloca(v->getType());
         builder_.CreateStore(v, slot);
         auto* fn = declareC("bz_llist_add_last", ptrTy(),
@@ -2265,6 +2293,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* node = lowerExpr(*call.args[0].value);
         llvm::Value* v    = lowerExpr(*call.args[1].value);
         if (!node || !v) return nullptr;
+        llRetainElem(v, call.args[1].value.get());   // fix #2686
         llvm::AllocaInst* slot = entryAlloca(v->getType());
         builder_.CreateStore(v, slot);
         auto* fn = declareC("bz_llist_add_before", ptrTy(),
@@ -2285,6 +2314,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* node = lowerExpr(*call.args[0].value);
         llvm::Value* v    = lowerExpr(*call.args[1].value);
         if (!node || !v) return nullptr;
+        llRetainElem(v, call.args[1].value.get());   // fix #2686
         llvm::AllocaInst* slot = entryAlloca(v->getType());
         builder_.CreateStore(v, slot);
         auto* fn = declareC("bz_llist_add_after", ptrTy(),

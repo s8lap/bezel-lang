@@ -10955,6 +10955,25 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 common::isOwningPrefixedName(llTy->headName());
             d.collectionElemDisposer =
                 elementPolicyFor(llEl, llIsOwning).disposerThunk;
+            // fix #2686 / §28.9 / §28.11: release the +1 a borrowing
+            // `LinkedList<string>` took on each element at insert. Every insert
+            // path now retains (`.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter`
+            // via `llIsStrElem` in LlvmBackend_Calls3.cpp, and the literal arm
+            // via `llitIsStrElem` in materializeHeapCollectionLiteral), so this
+            // is the balanced half — the same fallback the sibling array branch
+            // below and buildCollectionTempDisposal already apply. Without it a
+            // `using var`/auto-drop `LinkedList<string>` local would LEAK one
+            // reference per element now that construction retains.
+            // OwningLinkedList is excluded by construction: elementPolicyFor puts
+            // an owning-family string in the Value row (no retain at insert —
+            // the element is `owned`, a transfer), so `llIsOwning` must be false.
+            if (!d.collectionElemDisposer && !llIsOwning && llEl &&
+                !llEl->nullable &&
+                llEl->kind == sema::TypeRef::Kind::Primitive &&
+                llEl->primitive == sema::PrimitiveType::String &&
+                elementPolicyFor(llEl, /*owning=*/false).cat ==
+                    ElementPolicy::Category::RuntimeManaged)
+                d.collectionElemDisposer = stringElementReleaseThunk();
         }
         disposeStack_.back().push_back(d);
         return;
@@ -20215,10 +20234,29 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     // Otherwise the literal fell through to the inline-array GEP path and the
     // LinkedList consumers (.Count, scope-end disposal) misread a bz_array_t* as
     // a bz_llist_t* — a runtime free() of an invalid pointer (empty `[]`) or a
-    // malformed element GEP (non-empty). Like `.AddLast`, no string-retain.
+    // malformed element GEP (non-empty).
     if (isLinkedListTypeName(collTy)) {
         const sema::TypeRef* er =
             (!collTy->genericArgs.empty()) ? collTy->genericArgs[0] : nullptr;
+        // fix #2686 / §15.4 / §28.9 / §28.11: take the list's +1 on a string
+        // element, exactly as the Array/Stack/Queue arm below (`litIsStrArr`)
+        // and `.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter`
+        // (LlvmBackend_Calls3.cpp, `llIsStrElem`) now do. A borrowing
+        // `LinkedList<string>` co-owns its elements per §28.11's element-slot
+        // table, and the disposal side already released one
+        // (buildCollectionTempDisposal / patternAResultCollectionDisposer) — this
+        // literal arm was one of the five insert paths that never took it, so a
+        // literal in call-argument position (which becomes an owned temp)
+        // double-freed the string. OwningLinkedList is excluded (owned element =
+        // transfer, Value row in elementPolicyFor); `string?` is excluded; a
+        // fresh +1 producer TRANSFERS rather than double-retaining.
+        bool llitIsStrElem =
+            er && !er->nullable &&
+            er->kind == sema::TypeRef::Kind::Primitive &&
+            er->primitive == sema::PrimitiveType::String &&
+            !common::isOwningPrefixedName(collTy->headName()) &&
+            elementPolicyFor(er, /*owning=*/false).cat ==
+                ElementPolicy::Category::RuntimeManaged;
         llvm::Type* elTy = er ? lowerTypeRef(er) : i32();
         int64_t es = collectionElemSize(collTy);
         auto* allocFn = declareC("bz_llist_alloc", ptrTy(), {i64()});
@@ -20254,6 +20292,8 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
             } else if (ev->getType() != elTy) {
                 ev = coerceNumericToType(ev, elTy, isUnsignedTargetExpr(*elemPtr));
             }
+            if (llitIsStrElem && !isPlusOneStringProducer(elemPtr.get()))
+                emitStringRetain(ev);   // fix #2686
             llvm::AllocaInst* slot = entryAlloca(ev->getType());
             builder_.CreateStore(ev, slot);
             builder_.CreateCall(addFn, {ll, slot, builder_.getInt64(es)});
