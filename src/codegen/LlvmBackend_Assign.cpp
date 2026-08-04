@@ -3643,9 +3643,32 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     // #2170 / §30.5: an accessor (block getter/setter) built during vtable
     // emission may also be reached from an async body; the saved/restored
     // smKind_/smStateStruct_ here ensures the accessor's `return` does not
-    // accidentally trip the async-complete path on its parent.
-    auto  savedSmKind    = smKind_;
-    auto* savedSmStruct  = smStateStruct_;
+    // accidentally trip the async-complete path on its parent. (Both fields,
+    // and the rest of the per-body set, are now owned by NestedBodyScope.)
+    //
+    // #2708 (§23.3/§28.9, v0.240) — HARDENING, NOT A BUG FIX. #2708 reported
+    // that this emitter still inherits the caller's RETURN CONTRACT
+    // (`currentReturnTypeNode_`/`currentLambdaReturnSemaTy_`), the pair #2694
+    // closed on the two direct-read emitters, and predicted the #2694 leak for
+    // a `string` property read through an interface. That premise does NOT hold
+    // today: unlike the two block getters, this emitter is never reached from
+    // the middle of a method body. Every one of its call sites lives in a pass
+    // that runs BEFORE the body loop — `declareVtables()`,
+    // `emitExportedPropertyGetters()`, `emitExportedPropertySetters()` and
+    // `setupBoxDescriptors()` (LlvmBackend_impl.hpp ~290/~294/~298/~339, all
+    // above the `for (auto& [sym, fn] : methodFns_) emitFunctionBody(...)` loop
+    // at ~346), and none of them is reachable from `lowerExpr`/`lowerStmt`, so
+    // nesting cannot re-enter this function either. Instrumenting the entry and
+    // compiling #2708's own interface-dispatch repro confirmed it: the state is
+    // entirely default here, `currentFn_` included. There is therefore no
+    // observable defect to regression-test, and none is claimed.
+    //
+    // The guard is adopted anyway because the invariant should hold by
+    // CONSTRUCTION rather than by an accident of pass ordering: this emitter is
+    // one moved call site away from the #2701/#2702 failure mode, and the whole
+    // point of NestedBodyScope is that the next per-body field is handled in one
+    // place. Today it is a no-op here.
+    NestedBodyScope nestedScope(*this);
 
     currentFn_          = fn;
     builder_.SetInsertPoint(entryBB);
@@ -3661,8 +3684,6 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     currentCaughtExc_   = nullptr;
     unwindScopeDepth_   = 0;
     diverged_           = false;
-    smKind_             = SuspendKind::Yield;
-    smStateStruct_      = nullptr;
 
     // §28.2 v0.134 / issue #601: checked disposal mode guard for property
     // accessors. Class properties only (enum properties are NOT disposable,
@@ -3907,8 +3928,10 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     unwindScopeDepth_   = savedUD;
     diverged_           = savedDiv;
     genericSubst_       = std::move(savedGSubst);
-    smKind_             = savedSmKind;
-    smStateStruct_      = savedSmStruct;
+    // smKind_/smStateStruct_ (#2170) are restored by ~NestedBodyScope, which
+    // runs after this block. currentEnumMethod_ stays this function's own (it is
+    // SET to `cls` for an enum above, #574) — the guard deliberately does not
+    // touch it; see the guard's definition for why.
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
 
     return fn;
