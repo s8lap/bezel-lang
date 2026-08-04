@@ -292,6 +292,84 @@ bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
     return false;
 }
 
+bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
+                                    const sema::SemaContext& ctx) {
+    // See the header contract. // per §21.1 v0.201, stdlib §5 / §4.4 / §9.6,
+    // #2709
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || !ma->target) return false;
+    std::string_view mm = ma->member;
+    // The stdlib's `owned`-returning materializer members, each verified to
+    // leak under `const` before being added (100-of-100 under LSan):
+    //   stdlib §5   ToArray / ToSet / ToDictionary  (LINQ terminals)
+    //   stdlib §4.4 Sorted / Reversed / Slice       (Array copy-forms)
+    //   stdlib §9.6 Split                           (string)
+    //   stdlib §7   GetBytes                        (Encoding; the
+    //               `(s, destination: Span<byte>): int` overload returns a
+    //               value type and is excluded by the result-head gate below)
+    // `ToList` is NOT here: stdlib §5 states "There is no `ToList()` because
+    // Bezel does not have a dynamic-array type named `List<T>`".
+    //
+    // NOT EXHAUSTIVE, and knowingly so — see #2749. Grepping the stdlib for
+    // `owned Array` returns also finds ToCharArray, ToByteArray, ToBytes,
+    // CopyToArray, ReadAll / ReadAllBytes / ReadAllLines, GetFiles and
+    // GetDirectories, which are the same shape but were not individually
+    // measured here. The list is deliberately measurement-gated rather than
+    // grep-gated — but note the rationale precisely, because an earlier draft of
+    // this comment stated it wrongly. §21.1 rejects "an `owned`-returning call",
+    // and the STDLIB DECLARATION is the authority for that, NOT whether today's
+    // codegen happens to leak: a `const` binding of `ToCharArray()` is illegal
+    // per spec whether or not it leaks. So the measurement is evidence of
+    // SEVERITY, not of APPLICABILITY, and this list UNDER-APPROXIMATES the rule
+    // rather than tracking it. Under-approximating is the right call for a
+    // diagnostic-only change — the residual names are filed as #2749, one of
+    // them (`ToBytes`) additionally needs a result-head widening to
+    // `owned OwningBuffer<byte>`, and the file-I/O names are hard to probe.
+    if (mm != "ToArray" && mm != "ToSet" && mm != "ToDictionary" &&
+        mm != "Sorted" && mm != "Reversed" && mm != "Slice" &&
+        mm != "Split" && mm != "GetBytes")
+        return false;
+    // BUILTIN only, and the test is "NO symbol at all" — not "no MethodSymbol".
+    // The builtin member-call typing path in sema lives entirely inside
+    // `if (!calleeSym)` (ExprTypecheck_Calls.cpp), so every one of the eight
+    // above reaches its declaration-less collection return type with NOTHING
+    // attached to the callee. Anything sema DID resolve is therefore, by
+    // construction, not one of these builtins.
+    //
+    // A `MethodSymbol`-only cast (which is what isOwningCollectionDrainAliasCall
+    // uses, and what this predicate first copied) is too weak: it lets a
+    // FUNCTION-TYPED FIELD through. `public Split: (string) -> Array<string>;`
+    // attaches a `FieldSymbol` — not a MethodSymbol — and the call is typed
+    // from the field's `funcReturn`, whose plain `Array<string>` slot is
+    // declaration-less, so the result-head gate below passes too. §28.3's
+    // producers table classifies a function-value invocation with a
+    // non-`owned` concrete return as BORROWED, and §21.1 admits borrows
+    // verbatim ("Admitted: […] and **borrows**"), so `const parts :=
+    // cfg.Split(line);` over such a field is LEGAL and must keep compiling.
+    // An `owned`-marked function-typed slot is a different matter and is
+    // already Owned via producerState's `funcReturnOwned` arm — §21.1's FIRST
+    // branch, not this one. // per §28.3, §21.1, #2709
+    if (call.callee && ctx.exprSymbol(*call.callee) != nullptr)
+        return false;
+    // The RESULT must be a declaration-less BUILTIN collection head. This is
+    // the second half of the narrowness: it excludes any user type reached
+    // through a symbol-less callee, and the owning families (`OwningArray`,
+    // …), which the stdlib gives no value copy-form at all ("OwningArray<T>
+    // deliberately has **no** value copy-forms — neither `Reversed`/`Sorted`
+    // nor `ToArray`", stdlib §4.4).
+    const sema::TypeRef* rt = ctx.exprType(call);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    std::string_view head;
+    if (!rt->aliasResolvedHead.empty())
+        head = rt->aliasResolvedHead;
+    else if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
+        head = rt->headName();
+    else if (!rt->importedName.empty())
+        head = rt->importedName;
+    return head == "Array" || head == "Set" || head == "Dictionary";
+}
+
 namespace {
 
 // Recursively scan every `return EXPR;` reachable in statement `s` (the same

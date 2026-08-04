@@ -175,6 +175,72 @@ bool isBuiltinOwnedTransferCall(const ast::CallExpr& call,
 bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
                                       const sema::SemaContext& ctx);
 
+// §21.1 (v0.201) / stdlib §5, §4.4, §9.6 (fix #2709): a BUILTIN COLLECTION
+// MATERIALIZER call — `recv.ToArray()`, `.ToSet()`, `.ToDictionary(…)`,
+// `.Slice(r)`, `Encoding.GetBytes(s)`,
+// `.Sorted(…)`, `.Reversed()`, `s.Split(…)`. Every one is declared
+// `owned`-returning by the stdlib ("`ToArray()` returns a fresh `Array<T>` …
+// The return is `owned` — the caller is responsible for disposing it", stdlib
+// §5; likewise §4.4 for `Sorted`/`Reversed` and §9.6 for `Split`), so §21.1's
+// const rejection names them: "Rejected […]: a fresh `new`, an
+// `owned`-returning call […]".
+//
+// WHY THIS IS NOT `producerState`. These are compiler-known members with no
+// user `MethodDecl`, so `producerState`'s `returnOwned` authority never sees
+// them and they fall through to `Borrowed`. That verdict is deliberate and
+// LOAD-BEARING — `producerState` is the free-deciding input at
+// `handleLocalDecl` (Ownership.cpp), and codegen already reclaims these values
+// on its own recognition for both bindable spellings (a plain `var` via
+// `isFreshBorrowingArrayMaterializerLocal`, a `using var` via
+// `registerUsingDisposal`). Reclassifying them `Owned` would register a SECOND
+// free on top of codegen's — the double-free direction. This predicate is
+// therefore a pure DIAGNOSTIC-side second opinion, consulted only where §21.1
+// asks "is this initializer an owned production?"; it changes no disposal.
+//
+// The gap it closes: a `const` local is neither a `LocalDecl` (so codegen's
+// plain-`var` materializer reclaim never sees it) nor a `using var`, so NOTHING
+// frees it — measured at 100-of-100 leaked objects per materializer under LSan.
+// §21.1 requires the rejection; the rejection removes the leak by removing the
+// program.
+//
+// NARROWNESS (a false reject here breaks working code). Recognized only when
+// sema attached NO SYMBOL AT ALL to the callee — `ctx.exprSymbol(callee) ==
+// nullptr`. The result type must additionally be a declaration-less builtin
+// `Array` / `Set` / `Dictionary` head. A USER method named `ToArray` keeps the
+// ordinary user-call rules; a borrow-returning one stays admissible as a
+// `const` initializer, which §21.1 explicitly permits.
+//
+// ⚠ DO NOT "restore consistency" with `isOwningCollectionDrainAliasCall`'s
+// `dynamic_cast<sema::MethodSymbol*>` gate. That is what this predicate shipped
+// first, and it FALSELY REJECTED a legal program: a call through a
+// FUNCTION-TYPED FIELD named one of these (e.g. `public Split: (string) ->
+// Array<string>;`) attaches a FieldSymbol, not a MethodSymbol, so the
+// MethodSymbol-only cast let it through — and §28.3 classifies a function-value
+// invocation with a non-`owned` concrete return as BORROWED, which §21.1
+// admits. `isOwningCollectionDrainAliasCall` has the same hole latently; it is
+// unfixed there only because `Drain` is a less plausible field name.
+//
+// The `exprSymbol == nullptr` form is sound because sema's builtin member-call
+// typing path lives entirely inside `if (!calleeSym)`
+// (sema/ExprTypecheck_Calls.cpp:2873, block extent 2873-8103), and every site
+// that attaches a symbol to a MemberAccessExpr requires a RESOLVED declaration.
+// ⚠ That is also what keeps the CROSS-MODULE case safe by one line:
+// ModuleLoader reconstructs a real MethodSymbol into the imported type's
+// members, so an imported `Sorted(): Array<int>` — whose importer-side TypeRef
+// is byte-identical to the builtin shape this predicate accepts — is excluded
+// by the symbol check alone. There is no test pinning that; add one if you
+// touch this.
+//
+// Deliberately NOT unified with codegen's same-named recognizers
+// (`isFreshBorrowingArrayMaterializerLocal` / `isFreshOwnerlessDictMaterializer
+// Expr`, LlvmBackend_Setup.cpp): those answer "must codegen free this
+// temporary?" and exclude `ToSet` on purpose (its temporary is reclaimed on
+// another path — a second free would double-free). This answers the different
+// question "does the stdlib declare this return `owned`?", for which `ToSet`
+// belongs. Sharing one list would fuse two questions with different answers.
+bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
+                                    const sema::SemaContext& ctx);
+
 // §28.3 "Factory methods and sourceless returns" / Appendix C.3 (fix #1499): a
 // STATIC method returning a plain class/interface type with NO `owned`
 // annotation has no STRUCTURAL borrow source — a static call has no receiver —

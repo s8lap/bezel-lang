@@ -637,6 +637,34 @@ private:
     // initial ownership state (slice O1 producer table — minimal).
     OwnershipState producerState(const ast::Expr& e);
 
+    // §21.1 (v0.201), fix #2709: THE authority for "would §21.1 reject this as
+    // a `const` local's initializer?". Exactly two callers, and they are the
+    // whole point of it existing:
+    //   * visitStmt's `LocalConstDecl` arm, as the OUTER GATE on the whole
+    //     rejection — the branches inside it only select a message;
+    //   * handleLocalDecl's #2073 vacuous-`using var` lint guard, whose two
+    //     messages both END in "use `const x := …;`" and so may fire only
+    //     where that remedy actually compiles (#2695).
+    // Routing the DECISION (not merely the disjuncts) through one function is
+    // what makes them incapable of disagreeing. #2695 established that
+    // property for the `producerState == Owned` arm alone, leaving §21.1's
+    // other two named categories matched by SEPARATELY MAINTAINED tests on the
+    // two sides — the drain-alias producer (closed only by coincidence: both
+    // sides happened to spell the same predicate) and the builtin
+    // `owned`-returning materializers (not matched on the const side at all,
+    // which is #2709's leak).
+    //
+    // The `LocalConstDecl` arm's message-selecting branches are made TOTAL by
+    // a trailing `else` carrying §21.1's general wording, so a disjunct added
+    // here without a matching branch still REJECTS (with a less specific
+    // message) instead of silently accepting — the accept-and-leak shape
+    // #2709 was filed for.
+    //
+    // It is DIAGNOSTIC-ONLY. It never feeds a disposal, a retain, or a
+    // dataflow state — `producerState` remains the sole input to those, and is
+    // unchanged. // per §21.1, §28.10, §29.11, #2695, #2709
+    bool constInitializerRejected(const ast::Expr& e);
+
     // SB01-A (§28.3 "Task-family calls produce owned frames", v0.190, SB-01,
     // #1786): the GENERIC GUARD for the caller-side task-family classification.
     // True when the callee `md`'s DECLARED (pre-substitution) return type is a
