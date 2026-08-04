@@ -700,6 +700,12 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         const std::vector<ast::GenericConstraint>* savedConstraints =
             currentMethodConstraints_;
         currentMethodConstraints_ = &md->genericConstraints;
+        // #2713: expose this method's OWN generic parameters for the same
+        // save/restore lifetime, so the owning-element obligation can tell a
+        // name bound HERE from one bound by the enclosing type it shadows.
+        const std::vector<ast::GenericParam>* savedMethodParams =
+            currentMethodGenericParams_;
+        currentMethodGenericParams_ = &md->genericParams;
         Scope methodScope;
         methodScope.parent = parent;
         for (const auto& g : md->genericParams) {
@@ -784,6 +790,7 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             if (c.expr) resolveTypesInExpr(*c.expr, &methodScope);
         }
         currentMethodConstraints_ = savedConstraints;  // §28.1 (v0.196, #1817)
+        currentMethodGenericParams_ = savedMethodParams;  // #2713
     } else if (auto* od =
                    dynamic_cast<const ast::OperatorDecl*>(&m)) {
         // §28.1 (v0.196, #1817): an operator carries no own generic constraints
@@ -794,6 +801,13 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
         const std::vector<ast::GenericConstraint>* savedConstraints =
             currentMethodConstraints_;
         currentMethodConstraints_ = nullptr;
+        // #2713: an operator declares no generic parameters (OperatorDecl has
+        // no genericParams list), so null this for the same reason the
+        // constraints are nulled — a prior method's parameters must not leak in
+        // and mask an enclosing-type name here.
+        const std::vector<ast::GenericParam>* savedMethodParams =
+            currentMethodGenericParams_;
+        currentMethodGenericParams_ = nullptr;
         Scope methodScope;
         methodScope.parent = parent;
         for (const auto& p : od->params) {
@@ -823,6 +837,7 @@ void Resolver::resolveMember(const ast::Member& m, Scope* parent) {
             resolveTypesInExpr(*od->exprBody, &methodScope);
         }
         currentMethodConstraints_ = savedConstraints;  // §28.1 (v0.196, #1817)
+        currentMethodGenericParams_ = savedMethodParams;  // #2713
     } else if (auto* cd =
                    dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         Scope ctorScope;
@@ -1385,62 +1400,54 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 if (ownedSlot != static_cast<std::size_t>(-1) &&
                     ownedSlot < ref.genericArgs.size()) {
                     const TypeRef* el = ref.genericArgs[ownedSlot];
-                    std::string badDesc;
-                    if (el) {
-                        switch (el->kind) {
-                        case TypeRef::Kind::Primitive:
-                            // All primitives are rejected: value types and
-                            // `string` (runtime-managed, no dispose).
-                            badDesc = el->primitive == PrimitiveType::String
-                                ? "`string` (a runtime-managed reference type)"
-                                : "a primitive value type";
-                            break;
-                        case TypeRef::Kind::Function:
-                            badDesc = "a function value";
-                            break;
-                        case TypeRef::Kind::Unit:
-                            badDesc = "the unit type `()`";
-                            break;
-                        case TypeRef::Kind::InlineArray:
-                            badDesc = "an inline array value type";
-                            break;
-                        case TypeRef::Kind::Named: {
-                            const TypeSymbol* ts = el->declaration;
-                            if (ts) {
-                                if (ts->isValueBuiltin)
-                                    badDesc = "a value-type builtin";
-                                else if (ts->kind ==
-                                         ast::TypeDeclKind::Record)
-                                    badDesc = "a record (value type)";
-                                else if (ts->kind ==
-                                         ast::TypeDeclKind::Enum)
-                                    badDesc = "an enum (value type)";
-                                // Class or Interface → admitted; badDesc empty.
-                            } else {
-                                // No TypeSymbol: builtin type or generic param.
-                                // DateTime/TimeSpan/DateOnly/TimeOnly/Guid/
-                                // CancellationToken intentionally keep
-                                // declaration=null (so lowerNew() fires for
-                                // `new T(...)`; see ~line 1040).  Use the shared
-                                // isValueBuiltinByName() predicate (#1463) so
-                                // the complete set is maintained in one place
-                                // and does not diverge here as new value-
-                                // builtins are added.  Class/interface builtins
-                                // and generic type parameters remain admitted
-                                // (declaration=null, name not in the predicate).
-                                if (el->astNode && el->astNode->name &&
-                                    el->astNode->name->parts.size() == 1) {
-                                    std::string_view nm =
-                                        el->headName();
-                                    if (isValueBuiltinByName(nm))
-                                        badDesc = "a value-type builtin";
+                    // #2713: the decision itself lives in ONE place, shared with
+                    // the per-instantiation Pass 2 below, so the two sites cannot
+                    // give different answers for the same element type.
+                    std::string badDesc = owningElementBadDesc(el);
+                    // #2713 / §3.6 rule 2: an unresolved generic parameter is
+                    // admitted here (owningElementBadDesc returns "") because no
+                    // concrete type is known at a declaration site.  Record the
+                    // site so checkOwningElementInstantiations() can re-run the
+                    // same predicate against the binding each instantiation of
+                    // the enclosing generic type supplies.  Only a BARE
+                    // single-part parameter name is recordable: a composite or
+                    // concrete element (`OwningArray<Foo>`,
+                    // `OwningLinkedList<OwningArray<C>>`) was already decided
+                    // above and carries no deferred obligation.
+                    if (badDesc.empty() && el &&
+                        el->kind == TypeRef::Kind::Named && !el->declaration &&
+                        el->astNode && el->astNode->name &&
+                        el->astNode->name->parts.size() == 1 &&
+                        el->genericArgs.empty() && currentOuterType_) {
+                        // #2713: the name must be one the ENCLOSING TYPE binds.
+                        // A generic method may declare a parameter of the same
+                        // name, SHADOWING the type's — `class Box<T>` with
+                        // `method M<T>()` — and nothing forbids it (Appendix
+                        // A.3's `GenericParam ::= Variance? Identifier` imposes
+                        // no uniqueness; there is no shadowing diagnostic in
+                        // sema or the parser). Inside such a method the name
+                        // denotes the METHOD's parameter, whose binding the
+                        // enclosing type's instantiations know nothing about,
+                        // so recording it would validate the method's `T`
+                        // against `Box`'s and FALSELY REJECT a legal program.
+                        // A method parameter that does not shadow is skipped by
+                        // the same test, which is correct for the same reason:
+                        // generic-method bindings are not in instantiations_ at
+                        // all. That residual is filed as #2736(a); a false
+                        // reject would be strictly worse than carrying it.
+                        bool boundByMethod = false;
+                        if (currentMethodGenericParams_) {
+                            for (const ast::GenericParam& gp :
+                                 *currentMethodGenericParams_) {
+                                if (gp.name == el->headName()) {
+                                    boundByMethod = true;
+                                    break;
                                 }
                             }
-                            break;
                         }
-                        default:  // Kind::Error — suppress cascade diagnostics
-                            break;
-                        }
+                        if (!boundByMethod)
+                            owningElementSites_.push_back(
+                                {first, el->headName(), &t, currentOuterType_});
                     }
                     if (!badDesc.empty()) {
                         ctx_.diagnostics().report(
@@ -1867,6 +1874,10 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
         inst.type = tsym;
         inst.enclosingType = currentOuterType_;  // body this site sits in
         inst.site = &t;
+        // #2713: record which names the ENCLOSING METHOD binds here, so a
+        // chained owning-element obligation re-keying through this site can
+        // tell a name bound by the method from one bound by enclosingType.
+        inst.methodGenericParams = currentMethodGenericParams_;
         for (std::size_t i = 0; i < ref.genericArgs.size(); ++i) {
             inst.argRefs.push_back(ref.genericArgs[i]);
             inst.argAsts.push_back(t.genericArgs[i].get());

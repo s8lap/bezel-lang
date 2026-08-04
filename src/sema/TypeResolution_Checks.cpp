@@ -10,6 +10,8 @@
 #include <algorithm>
 #include <cctype>
 #include <functional>
+#include <set>
+#include <tuple>
 #include <unordered_set>
 
 namespace bezel::sema {
@@ -1872,6 +1874,242 @@ void Resolver::checkHashContainerKeys() {
                 " type, but the type argument " + keyName +
                 " is not equality-bearing (\xC2\xA7""3.6/\xC2\xA7""8.3): " +
                 reasonClause(concreteKey));
+        }
+    }
+}
+
+// stdlib §4.2 / spec §14.4 (#1327/#1463/#2713) — THE predicate deciding whether
+// a type may be an owning collection's owned element. Shared verbatim by the
+// declaration-site check in resolveType() (TypeResolution_Names.cpp) and by the
+// per-instantiation Pass 2 below, so the two can never give different answers
+// for the same element type (the #1463 name-list-skew lesson, generalized).
+//
+// Spec §14.4 (heading "`owned` and generic type arguments"), bolded paragraph
+// "Class-only restriction on owning generics" (v0.240): the owning
+// types "restrict their element type T to **class and interface types**. Value
+// types are rejected at the instantiation site. … the standard-library owning
+// types are compiler-enforced to reject the runtime-managed reference types
+// (`string`, function values)."
+//
+// Nullability is a FLAG on TypeRef, not a Kind, so `Foo?` reaches the Named arm
+// with declaration = Foo and is admitted — matching §14.4's "Nullable class
+// types and interfaces are admitted. The owning-type instantiation rule checks
+// the *underlying* type, not the nullable-wrapper."
+std::string Resolver::owningElementBadDesc(const TypeRef* el) {
+    if (!el) return {};
+    switch (el->kind) {
+    case TypeRef::Kind::Primitive:
+        // All primitives are rejected: value types, and `string` — a
+        // runtime-managed reference (§28.9) with no disposal obligation.
+        return el->primitive == PrimitiveType::String
+                   ? "`string` (a runtime-managed reference type)"
+                   : "a primitive value type";
+    case TypeRef::Kind::Function:
+        return "a function value";
+    case TypeRef::Kind::Unit:
+        return "the unit type `()`";
+    case TypeRef::Kind::InlineArray:
+        return "an inline array value type";
+    case TypeRef::Kind::Named: {
+        const TypeSymbol* ts = el->declaration;
+        if (ts) {
+            if (ts->isValueBuiltin) return "a value-type builtin";
+            if (ts->kind == ast::TypeDeclKind::Record)
+                return "a record (value type)";
+            if (ts->kind == ast::TypeDeclKind::Enum)
+                return "an enum (value type)";
+            // Class or Interface (and, unchanged from the pre-#2713 behaviour,
+            // Choice) → admitted; empty description.
+            return {};
+        }
+        // No TypeSymbol: a builtin type or a generic parameter.
+        // DateTime/TimeSpan/DateOnly/TimeOnly/Guid/CancellationToken keep
+        // declaration=null intentionally (so lowerNew() fires for `new T(...)`),
+        // so the shared isValueBuiltinByName() predicate (#1463) is what
+        // recognises them. Class/interface BUILTINS (Array<T>, OwningArray<T>,
+        // …) stay admitted, which is what keeps a nested owning collection such
+        // as `OwningLinkedList<OwningArray<C>>` legal.
+        //
+        // An unresolved generic PARAMETER also lands here and is admitted: no
+        // concrete type is known at a declaration site. That admission is
+        // PROVISIONAL — checkOwningElementInstantiations() re-runs this same
+        // predicate on the type each instantiation actually binds (#2713).
+        if (el->astNode && el->astNode->name &&
+            el->astNode->name->parts.size() == 1 &&
+            isValueBuiltinByName(el->headName()))
+            return "a value-type builtin";
+        return {};
+    }
+    default:  // Kind::Error — suppress cascade diagnostics
+        return {};
+    }
+}
+
+// True iff `bound` is a BARE generic-parameter binding rather than a concrete
+// type: a single-part Named ref with no declaration naming neither a primitive
+// nor a builtin. Hoisted from checkDeferredNestedConstraints' local lambda
+// (#2111) so it and the #2713 owning-element closure share ONE definition —
+// two copies of this predicate is exactly the skew #1463 was about. Excluding
+// primitives and builtins by name is what keeps `Array<T>`, `Object`, and the
+// value builtins out of the "chained" arm.
+bool Resolver::isBareGenericParamBinding(const TypeRef* bound,
+                                         const ast::Type* boundAst) {
+    return bound && boundAst && !bound->declaration &&
+           bound->kind == TypeRef::Kind::Named &&
+           boundAst->kind == ast::TypeKind::Named && boundAst->name &&
+           boundAst->name->parts.size() == 1 &&
+           primitiveFromName(boundAst->name->parts.front()) ==
+               PrimitiveType::None &&
+           builtinTypeArity(boundAst->name->parts.front()) == kNotBuiltin;
+}
+
+// stdlib §4.2 / spec §14.4 / §3.6 rule 2 (#2713) — Pass 2 for the owning-
+// collection element check.
+//
+// Spec §3.6 rule 2 "Per-instantiation evaluation for generics" (v0.240): "For a
+// generic type or member, the property is evaluated at each instantiation, after
+// substituting the type arguments. A generic body type-checks under the weakest
+// assumption its constraints establish; an instantiation that violates a
+// property-dependent requirement is rejected *at the instantiation site*, with a
+// diagnostic naming the property, the offending type argument, and the
+// structural reason (§28.5's generic-owned-field check and **the
+// owning-collection element restriction of §14.4** follow this pattern)."
+//
+// The declaration-site check admits `OwningLinkedList<T>` inside `class H<T>`
+// because T is a placeholder there. Without this pass nothing ever re-checked
+// the binding, so `H<string>` was admitted — and that is not merely cosmetic:
+// codegen's elementPolicyFor() falls back to the Value row for a runtime-managed
+// element in the owning family (LlvmBackend_ElementPolicy.cpp:238-250), so the
+// collection stores the pointer WITHOUT taking a reference while the `owned`
+// argument transfer still releases the caller's, leaving a dangling slot. Reading
+// the element back out is a heap-use-after-free (measured; see the #2713 test).
+//
+// Modelled on checkHashContainerKeys()'s Pass 2 — the existing, working
+// precedent for exactly this shape.
+void Resolver::checkOwningElementInstantiations() {
+    // One diagnostic per (instantiation site, container, parameter). The
+    // interior site is deliberately NOT part of the key: a field spelled
+    // `private owned _l: OwningLinkedList<T> := new OwningLinkedList<T>();`
+    // records TWO interior sites (the annotation and the `new`) for one user
+    // error, and §3.6 rule 2 asks for one diagnostic at the instantiation site.
+    // Container and parameter ARE in the key, so a body that misuses two
+    // different parameters still reports each one.
+    std::set<std::tuple<const ast::Type*, std::string_view, std::string_view>>
+        reported;
+    for (const OwningElementSite& s : owningElementSites_) {
+        if (!s.enclosingType) continue;
+        // Index of the recorded parameter within the enclosing type's list.
+        std::size_t paramIdx = s.enclosingType->genericParams.size();
+        for (std::size_t i = 0; i < s.enclosingType->genericParams.size(); ++i) {
+            if (s.enclosingType->genericParams[i] &&
+                s.enclosingType->genericParams[i]->name == s.paramName) {
+                paramIdx = i;
+                break;
+            }
+        }
+        // Not a type parameter of the enclosing TYPE — e.g. a generic METHOD's
+        // own parameter, whose bindings are not recorded in instantiations_.
+        // Nothing to re-check, and (deliberately) nothing to reject: silently
+        // dropping the obligation is preferable to a false reject here, and the
+        // gap is recorded in the issue tracker rather than guessed at.
+        if (paramIdx >= s.enclosingType->genericParams.size()) continue;
+
+        // A binding may be another generic's parameter rather than a concrete
+        // type: `class Outer<U>` holding `private owned g: Inner<U>`, where it
+        // is INNER that holds the owning collection. The only instantiation of
+        // Inner is then `Inner<U>` — argument unresolved — and no `Inner<string>`
+        // node ever exists, so a single pass over instantiations_ of the
+        // recording type sees nothing concrete and #2713's use-after-free
+        // returns at one extra level of composition. Close it with a worklist
+        // that RE-KEYS the obligation to (enclosingType, that parameter) and
+        // iterates, exactly as checkDeferredNestedConstraints does for §14.2
+        // constraints (the `isBareGenericParamBinding` arm below).
+        struct Pending {
+            TypeSymbol* type;
+            std::string_view paramName;
+            std::size_t idx;
+        };
+        std::vector<Pending> work{{s.enclosingType, s.paramName, paramIdx}};
+        // (type, param) visited set: a recursive generic (`class A<T>` holding
+        // an `A<T>`) or a diamond of instantiation sites must not re-enqueue.
+        std::set<std::pair<TypeSymbol*, std::string_view>> seen;
+        while (!work.empty()) {
+            Pending p = work.back();
+            work.pop_back();
+            if (!seen.insert({p.type, p.paramName}).second) continue;
+            for (const GenericInstantiation& inst : instantiations_) {
+                if (inst.type != p.type) continue;
+                if (p.idx >= inst.argRefs.size()) continue;
+                const TypeRef* arg = inst.argRefs[p.idx];
+                const ast::Type* argAst = (p.idx < inst.argAsts.size())
+                                              ? inst.argAsts[p.idx] : nullptr;
+                // Kind::Error → resolution already failed; suppress the cascade.
+                if (!arg || arg->kind == TypeRef::Kind::Error) continue;
+
+                if (isBareGenericParamBinding(arg, argAst)) {
+                    // Chained: re-key to the body this site sits in.
+                    if (!inst.enclosingType) continue;
+                    std::string_view nextName = argAst->name->parts.front();
+                    // Same misattribution guard as the recorder: if the METHOD
+                    // enclosing this site binds that name, it is not
+                    // enclosingType's parameter and its bindings are not
+                    // tracked — `class Outer<U>` with `method M<U>()` holding
+                    // an `Inner<U>` must NOT be validated against Outer's `U`.
+                    bool boundByMethod = false;
+                    if (inst.methodGenericParams) {
+                        for (const ast::GenericParam& gp :
+                             *inst.methodGenericParams) {
+                            if (gp.name == nextName) {
+                                boundByMethod = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (boundByMethod) continue;
+                    std::size_t nextIdx = inst.enclosingType->genericParams.size();
+                    for (std::size_t i = 0;
+                         i < inst.enclosingType->genericParams.size(); ++i) {
+                        if (inst.enclosingType->genericParams[i] &&
+                            inst.enclosingType->genericParams[i]->name ==
+                                nextName) {
+                            nextIdx = i;
+                            break;
+                        }
+                    }
+                    // Not a parameter of that type either — nothing to track.
+                    if (nextIdx >= inst.enclosingType->genericParams.size())
+                        continue;
+                    work.push_back({inst.enclosingType, nextName, nextIdx});
+                    continue;
+                }
+
+                std::string badDesc = owningElementBadDesc(arg);
+                if (badDesc.empty()) continue;
+                if (!reported.insert({inst.site, s.container, s.paramName})
+                         .second)
+                    continue;
+                // The message names the type that DECLARES the owning
+                // collection (s.enclosingType) and its parameter, not p.type —
+                // through a chain those differ, and it is the declaring site
+                // the reader must go fix. The location is the instantiation
+                // that made the binding concrete, per §3.6 rule 2.
+                ctx_.diagnostics().report(
+                    Severity::Error,
+                    inst.site ? inst.site->span.begin : SourceLocation{},
+                    std::string("`") + std::string(s.container) +
+                    "` requires a class or interface element type "
+                    "(stdlib \xC2\xA7""4.2 / spec \xC2\xA7""14.4, #1327) "
+                    "\xE2\x80\x94 at this instantiation, `" +
+                    std::string(s.enclosingType->name) +
+                    "`'s type parameter `" + std::string(s.paramName) +
+                    "`, used as its owning-collection element type, is bound "
+                    "to " + badDesc +
+                    ", which has no disposal obligation and cannot be owned in "
+                    "an owning collection (\xC2\xA7""3.6 rule 2 \xE2\x80\x94 the "
+                    "property is evaluated at each instantiation). Use `" +
+                    std::string(s.container.substr(6)) +
+                    "<\xE2\x80\xA6>` for value elements.");
+            }
         }
     }
 }
@@ -5363,15 +5601,11 @@ void Resolver::checkDeferredNestedConstraints() {
     // A binding that is itself an in-scope generic parameter (not a primitive,
     // not a built-in, no resolved user declaration) — i.e. a chained
     // deferral that must re-key to the enclosing type's parameter.
-    auto isGenericParamBinding = [&](TypeRef* bound,
-                                     const ast::Type* boundAst) -> bool {
-        return bound && boundAst && !bound->declaration &&
-               bound->kind == TypeRef::Kind::Named &&
-               boundAst->kind == ast::TypeKind::Named && boundAst->name &&
-               boundAst->name->parts.size() == 1 &&
-               primitiveFromName(boundAst->name->parts.front()) ==
-                   PrimitiveType::None &&
-               builtinTypeArity(boundAst->name->parts.front()) == kNotBuiltin;
+    // #2713: delegates to the shared predicate so this pass and the
+    // owning-element closure cannot drift apart.
+    auto isGenericParamBinding = [](TypeRef* bound,
+                                    const ast::Type* boundAst) -> bool {
+        return isBareGenericParamBinding(bound, boundAst);
     };
 
     std::vector<Pending> work;

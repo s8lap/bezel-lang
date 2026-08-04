@@ -318,6 +318,11 @@ void Resolver::run(const ast::SourceFile& src) {
     // §3.6 / §8.3 (v0.158, #1338): hash-container keys/elements must be
     // equality-bearing (runs after all member types are resolved).
     checkHashContainerKeys();
+    // stdlib §4.2 / §14.4 / §3.6 rule 2 (#2713): an owning collection whose
+    // element slot is a bare generic parameter is re-checked against the type
+    // each instantiation of the enclosing generic binds (runs after all member
+    // types are resolved, so every instantiation has been recorded).
+    checkOwningElementInstantiations();
     // Slice S17: class-level modifier mutual-exclusions.
     checkClassModifierCombinations();
     // Slice S19: overloads must differ in signature.
