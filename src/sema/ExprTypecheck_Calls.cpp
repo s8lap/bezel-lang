@@ -8528,12 +8528,20 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
         // overload (pos 0 is the char|string search value, handled above);
         // LastIndexOf has no integer parameter at all (only char/string).
         // Insert(startIndex: int, value: string) (#2581) has its int at pos 0.
+        // §9.6 (#2614): `AsSpan(start: int)` and `AsSpan(start: int, length:
+        // int)` declare NON-nullable `int` at BOTH positions. Without this the
+        // un-narrowed `"s".AsSpan(n)` for `n: int?` reached codegen, where the
+        // #2614 unwrap would read the payload out of a possibly-null box and
+        // use it as the span start — a SILENT WRONG VALUE. The fourth overload
+        // `AsSpan(r: Range<int>)` passes a Named (non-primitive) argument and
+        // is skipped by the Primitive guard in the loop below, so admitting
+        // AsSpan here cannot false-reject the Range form.
         bool intPos =
             (pos == 0 && (m == "Substring" || m == "Remove" || m == "Insert" ||
                           m == "PadLeft" || m == "PadRight" ||
-                          m == "PadCenter")) ||
+                          m == "PadCenter" || m == "AsSpan")) ||
             (pos == 1 && (m == "Substring" || m == "Remove" ||
-                          m == "IndexOf"));
+                          m == "IndexOf" || m == "AsSpan"));
         if (intPos) return PT::Int;
         // PadLeft/Right/Center paddingChar (second param) is char.
         if (pos == 1 && (m == "PadLeft" || m == "PadRight" || m == "PadCenter"))
@@ -8893,7 +8901,21 @@ void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
     } else if (!recvTy->declaration->decl) {
         spanName = recvTy->declaration->name;
     }
-    if (spanName != "ReadOnlyStringSpan") return;
+    // §3.3 (#2601) covers ReadOnlyStringSpan. §4.14/§4.15 (#2614): the span-
+    // BUFFER families declare the same NON-nullable `int` start/length on
+    // `Slice`, and NOTHING checked them — `checkBuiltinCollectionCallArgs`'s
+    // isItemPosition explicitly excludes range params (see its comment), and
+    // this helper returned early on the name. An un-narrowed `int?` therefore
+    // reached codegen, where the #2614 unwrap read the payload out of a
+    // possibly-null box and used it as the slice start: a SILENT WRONG VALUE
+    // (`sp.Slice(null, 2)` returned element 0). Only `Slice`'s int positions
+    // are added for these families; their `value: T` / `item: T` positions stay
+    // with #2600's collection helper, so this cannot false-reject a T operand.
+    const bool isStringSpan = (spanName == "ReadOnlyStringSpan");
+    const bool isBufferSpan =
+        spanName == "Span" || spanName == "ReadOnlySpan" ||
+        spanName == "ArraySpan" || spanName == "ReadOnlyArraySpan";
+    if (!isStringSpan && !isBufferSpan) return;
     // Map (method, position, argPrimitiveKind) → the declared NON-nullable
     // primitive parameter kind, or None when this position is not a primitive
     // char/string slot. §3.3: IndexOf/Contents have char|string overloads;
@@ -8910,6 +8932,11 @@ void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
         // verifyModule failure (the same defect shape #2581 closed for
         // `string.Insert` pos 0 via the intPos set in the string helper).
         if (m == "Slice" && (pos == 0 || pos == 1)) return PT::Int;
+        // #2614: for the span-BUFFER families only `Slice` is covered here;
+        // their remaining primitive positions belong to #2600's collection
+        // helper. Falling through would apply ReadOnlyStringSpan's char/string
+        // overload map to them and false-reject a legitimate `value: T`.
+        if (!isStringSpan) return PT::None;
         if (pos != 0) return PT::None;  // every covered method takes one operand
         if (m == "IndexOf" || m == "Contains") {
             if (argKind == PT::String) return PT::String;
@@ -8934,9 +8961,13 @@ void ExprTC::checkBuiltinSpanCallArgs(const ast::CallExpr& ce) {
         PrimitiveType declared = paramKind(i, argTy->primitive);
         if (declared == PrimitiveType::None) continue;
         TypeRef* paramTy = ctx_.primitiveTypeRef(declared, /*nullable=*/false);
+        // The receiver's own head name keeps the diagnostic accurate now that
+        // this helper serves the span-buffer families too (#2614); for
+        // ReadOnlyStringSpan the text is byte-identical to before.
         checkAssignable(
             argTy, paramTy, a.value->span.begin,
-            std::string("argument to `ReadOnlyStringSpan.") + std::string(m) + "`",
+            std::string("argument to `") + std::string(spanName) + "." +
+                std::string(m) + "`",
             a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
     }
 }
