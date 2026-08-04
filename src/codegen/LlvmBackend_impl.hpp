@@ -5957,6 +5957,47 @@ private:
                      : llvm::ConstantPointerNull::get(ptrTy());
     }
 
+    // #2608 / #2635 / §28.11 / stdlib §4.3: record an OWNING array-backed
+    // collection's element disposer in its `bz_array_t` header at CONSTRUCTION,
+    // so an erased free site can recover it (bz_array_free_dynamic).
+    //
+    // Element ownership is otherwise a purely STATIC property, chosen at the
+    // free site from the collection's static type. That fails for an `owned`
+    // field typed by a read-only interface SHARED by both hierarchies
+    // (stdlib §4.3: "The two hierarchies share `IEnumerable<T>`,
+    // `IReadOnlyCollection<T>`, and `IReadOnlyList<T>` as common ancestors"),
+    // where one static type legitimately carries EITHER backing and the free
+    // site cannot tell which. The concrete type IS known at construction.
+    //
+    // WHY THIS IS A SHARED MEMBER RATHER THAN #2608's FUNCTION-LOCAL LAMBDA
+    // (#2635): #2608 inlined the stamp as a `[&]` lambda inside lowerNew's
+    // array arm, capturing that arm's `colName`/`rt`. It was therefore
+    // unreachable from the OTHER construction sites, which call
+    // `bz_array_alloc` directly and silently produced UNTAGGED owning arrays —
+    // a residual element leak, mechanically confirmed. Pairing the allocation
+    // with the tag in one callable is what stops the next construction site
+    // from skipping it.
+    //
+    // NEVER over-disposes: `owning` is the caller's CONCRETE-type test, a
+    // borrowing collection is never tagged, and an untagged header holds NULL,
+    // which is exactly the pre-#2608 behaviour.
+    void stampOwningElemDisposer(llvm::Value* arr,
+                                 const sema::TypeRef* elemTy,
+                                 bool owning) {
+        if (!arr || !owning) return;
+        // #816: inside a specialized body the element may still be a generic
+        // parameter — resolve it so elementPolicyFor can build the thunk (a
+        // no-op outside a substitution).
+        llvm::Function* d =
+            elementPolicyFor(resolveTypeParamRef(elemTy), /*owningFamily=*/true)
+                .disposerThunk;
+        if (!d) return;   // value/unknown elements: nothing to run
+        auto* setFn = declareC("bz_array_set_elem_disposer",
+                               llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), ptrTy()});
+        builder_.CreateCall(setFn, {arr, d});
+    }
+
     // #362 / stdlib §4.5: a module-level `void(void*)` thunk that runs an
     // owning collection element's destructor via dynamic dispatch (vtable
     // slot 1), null-checking the element first. Suitable as the `dispose_elem`

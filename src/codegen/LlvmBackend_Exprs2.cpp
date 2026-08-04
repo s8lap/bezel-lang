@@ -3051,21 +3051,18 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // here, so stamp the disposer now; bz_array_free_dynamic reads it
                 // back at the erased free site. Borrowing collections are never
                 // tagged (NULL = today's behavior), so this cannot over-dispose.
+                // #2635: the stamp itself now lives in the shared
+                // stampOwningElemDisposer member (LlvmBackend_impl.hpp) rather
+                // than in this lambda, because two OTHER construction sites
+                // call bz_array_alloc directly and were silently skipping it
+                // (materializeHeapCollectionLiteral /
+                // materializeArrayBackedSetLiteral). This lambda is now just
+                // the value-passthrough wrapper this arm's `return` style needs.
                 auto tagOwningElems = [&](llvm::Value* arr) -> llvm::Value* {
-                    if (!arr || !common::isOwningPrefixedName(colName)) return arr;
-                    const sema::TypeRef* elem =
-                        rt->genericArgs.empty() ? nullptr : rt->genericArgs[0];
-                    // #816: inside a specialized body the element may still be a
-                    // generic parameter — resolve it so elementPolicyFor can build
-                    // the thunk (a no-op outside a substitution).
-                    elem = resolveTypeParamRef(elem);
-                    llvm::Function* d = elementPolicyFor(elem, /*owning=*/true)
-                                            .disposerThunk;
-                    if (!d) return arr;   // value/unknown elements: nothing to run
-                    auto* setFn = declareC("bz_array_set_elem_disposer",
-                                           llvm::Type::getVoidTy(llvm_),
-                                           {ptrTy(), ptrTy()});
-                    builder_.CreateCall(setFn, {arr, d});
+                    stampOwningElemDisposer(
+                        arr,
+                        rt->genericArgs.empty() ? nullptr : rt->genericArgs[0],
+                        common::isOwningPrefixedName(colName));
                     return arr;
                 };
                 if (!ne.args.empty() && ne.args[0].value) {
