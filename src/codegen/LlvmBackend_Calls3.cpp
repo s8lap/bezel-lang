@@ -2247,13 +2247,16 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     // disposer that `bz_llist_remove_first/_last/_node` invokes EXACTLY ONCE on
     // the element of the node it unlinks, so releasing there consumes exactly the
     // +1 `llRetainElem` (or a transferred +1 producer) put in at insert. Before
-    // #2686 no insert path retained and this had to stay null; now all five do
-    // (`.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter` above and the
-    // `bz_llist_add_last` arm of materializeHeapCollectionLiteral), which are the
-    // ONLY ways an element enters a bz_llist_t — the runtime exposes no other
+    // #2686 no insert path retained and this had to stay null; now all SIX do
+    // (`.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter` above, the
+    // `bz_llist_add_last` arm of materializeHeapCollectionLiteral, and — since
+    // #2693 — the `new LinkedList<T>(source)` arm of lowerNew, which appends the
+    // drained source with the same unconditional per-element retain), which are
+    // the ONLY ways an element enters a bz_llist_t — the runtime exposes no other
     // insert and codegen has exactly two `bz_llist_alloc` sites (that literal arm
-    // and `new LinkedList<T>()`, which allocates EMPTY). So the release is
-    // provably paired. This is a verbatim mirror of the Array/Stack/Queue arm
+    // and `new LinkedList<T>(…)`, whose no-arg form allocates EMPTY and whose
+    // source form populates through the retaining append above). So the release
+    // is provably paired. This is a verbatim mirror of the Array/Stack/Queue arm
     // (`if (!elemDisp && arrIsStringElem) elemDisp = stringElementReleaseThunk();`
     // at .RemoveAt/.Remove/.Clear in LlvmBackend_Calls.cpp), which has released a
     // borrowing `Array<string>`'s elements on removal since #602.

@@ -2977,7 +2977,150 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // in each node — same sizing as bz_array_t (4 for int/float, 8 otherwise).
             if (colName == "LinkedList" || colName == "OwningLinkedList") {
                 auto* allocFn = declareC("bz_llist_alloc", ptrTy(), {i64()});
-                return builder_.CreateCall(allocFn, {builder_.getInt64(elemSize)});
+                auto allocEmpty = [&]() -> llvm::Value* {
+                    return builder_.CreateCall(allocFn,
+                                               {builder_.getInt64(elemSize)});
+                };
+                if (ne.args.empty() || !ne.args[0].value) return allocEmpty();
+                // fix #2693 / stdlib §4.6 (v0.240): the SOURCE constructor.
+                // §4.6 declares exactly two constructors on `LinkedList<T>`:
+                //   public constructor();
+                //   public constructor(source: IEnumerable<T>);
+                // and stdlib §5 recommends the second by name ("use `new
+                // LinkedList<T>(source)` if a linked list is wanted"). Codegen
+                // never read `ne.args`, so the second silently produced an EMPTY
+                // list — a wrong value on a documented API with no diagnostic.
+                //
+                // §4.7 declares only `constructor()` on `OwningLinkedList<T>`,
+                // so the source form is NOT specified there and is REJECTED
+                // rather than invented: taking elements out of an `IEnumerable<T>`
+                // into an owning list would have to either alias (two owners →
+                // double dispose) or consume the borrowed source, and the stdlib
+                // document answers neither. Same for a second argument on either
+                // type — no such constructor exists.
+                if (colName == "OwningLinkedList" || ne.args.size() != 1) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ne.span.begin,
+                        "no such constructor: stdlib " +
+                        std::string(colName == "OwningLinkedList" ? "§4.7"
+                                                                  : "§4.6") +
+                        " declares " +
+                        std::string(colName == "OwningLinkedList"
+                                        ? "only 'constructor()' on "
+                                          "'OwningLinkedList<T>'"
+                                        : "'constructor()' and "
+                                          "'constructor(source: IEnumerable<T>)' "
+                                          "on 'LinkedList<T>'"));
+                    return allocEmpty();
+                }
+                // The source is BORROWED (`source: IEnumerable<T>` carries no
+                // `owned` marker, spec §22.1). lowerToLazyEnumerator is the one
+                // backing-agnostic normalizer — it covers Array/OwningArray/
+                // Stack/Queue/OwningBuffer (bz_array_t*), LinkedList
+                // (bz_lazy_from_llist), Set/Dictionary, Range, a lazy LINQ
+                // pipeline, IGrouping, and a vtable-backed IEnumerable<T>.
+                //
+                // ⚠ We dispose the source NOWHERE, which is why no double
+                // dispose is possible. The "dispose only if it was a temporary"
+                // rule lives ONLY in lowerToLazyEnumerator's vtable path
+                // (materializeVtableIEnumerableToArray); the array path is a
+                // pure borrow (bz_lazy_from_array) that delegates temp-reclaim
+                // to the caller through its `outRecvArr` out-param, which we do
+                // not pass. Any temp-source leak here is inherited verbatim from
+                // the ToArray convention, not introduced by this arm.
+                sema::TypeRef* srcElemRef = nullptr;
+                llvm::Value* lazy =
+                    lowerToLazyEnumerator(*ne.args[0].value, srcElemRef);
+                // Element-type guard, mirroring OwningSet.ExceptWith's: reading
+                // the snapshot at the list's stride is only sound when the
+                // source's element lowers to the same LLVM type. Sema has no
+                // constructor model for the builtin collections (they have no
+                // TypeSymbol), so an ill-typed `new LinkedList<int>(42)` reaches
+                // codegen — diagnose it here instead of reading at a wrong
+                // stride or falling back to the silently-empty list.
+                if (!lazy || !srcElemRef || rt->genericArgs.empty() ||
+                    !rt->genericArgs[0] ||
+                    lowerTypeRef(srcElemRef) != lowerTypeRef(rt->genericArgs[0])) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ne.span.begin,
+                        "stdlib §4.6: 'new LinkedList<T>(source)' requires an "
+                        "enumerable source whose element type is T");
+                    return allocEmpty();
+                }
+                // Drain the pipeline once into a snapshot array, then append in
+                // source order. §4.6 fixes the orientation for the sibling
+                // literal form ("textual order is head-to-tail"); the source
+                // form follows the same convention, so element 0 of the source
+                // becomes `First` and the last becomes `Last`.
+                auto* toArrFn =
+                    declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+                llvm::Value* snap = builder_.CreateCall(
+                    toArrFn, {lazy, builder_.getInt64(elemSize)}, "ll.ctor.snap");
+                llvm::Value* list = allocEmpty();
+                // fix #2686/#2692 invariant: this is a SIXTH insert path into a
+                // bz_llist_t, so it must take the same +1 per `string` element
+                // that `.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter` and the
+                // collection-literal arm take — otherwise bz_llist_free's
+                // bz$strElemRelease over-releases (the ASan SEGV #2686 fixed).
+                // The predicate is a verbatim mirror of Calls3.cpp's
+                // `llIsStrElem`, minus its isPlusOneStringProducer escape: that
+                // guard exists because an `.AddLast($"…")` argument is a fresh +1
+                // being TRANSFERRED, whereas every element here is loaded out of
+                // a snapshot slot and is never a syntactic producer, so the
+                // retain is unconditional. bz_lazy_to_array itself does not
+                // retain (ToArray has to call bz_array_retain_strings after it),
+                // so the snapshot holds BORROWED references throughout.
+                const ElementPolicy ctorPol =
+                    elementPolicyFor(rt->genericArgs[0], /*owningFamily=*/false);
+                const bool ctorRetainStr =
+                    rt->genericArgs[0]->kind == sema::TypeRef::Kind::Primitive &&
+                    rt->genericArgs[0]->primitive == sema::PrimitiveType::String &&
+                    !rt->genericArgs[0]->nullable &&
+                    ctorPol.cat == ElementPolicy::Category::RuntimeManaged;
+                auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+                auto* ptrFn = declareC("bz_array_ptr_at", ptrTy(),
+                                       {ptrTy(), i64(), i64()});
+                auto* addLastFn = declareC("bz_llist_add_last", ptrTy(),
+                                           {ptrTy(), ptrTy(), i64()});
+                llvm::Value* snapLen =
+                    builder_.CreateCall(lenFn, {snap}, "ll.ctor.n");
+                auto* idxSlot = entryAlloca(i64());
+                builder_.CreateStore(builder_.getInt64(0), idxSlot);
+                auto* cBB = llvm::BasicBlock::Create(llvm_, "ll.ctor.c", currentFn_);
+                auto* bBB = llvm::BasicBlock::Create(llvm_, "ll.ctor.b", currentFn_);
+                auto* eBB = llvm::BasicBlock::Create(llvm_, "ll.ctor.e", currentFn_);
+                builder_.CreateBr(cBB);
+                builder_.SetInsertPoint(cBB);
+                llvm::Value* idx = builder_.CreateLoad(i64(), idxSlot, "ll.ctor.i");
+                builder_.CreateCondBr(
+                    builder_.CreateICmpSLT(idx, snapLen), bBB, eBB);
+                builder_.SetInsertPoint(bBB);
+                {
+                    llvm::Value* ep = builder_.CreateCall(
+                        ptrFn, {snap, idx, builder_.getInt64(elemSize)},
+                        "ll.ctor.ep");
+                    if (ctorRetainStr) {
+                        llvm::Value* sv =
+                            builder_.CreateLoad(ptrTy(), ep, "ll.ctor.s");
+                        emitStringRetain(sv);
+                    }
+                    // bz_llist_add_last memcpy's elemSize bytes FROM ep, so the
+                    // snapshot slot address can be handed over directly.
+                    builder_.CreateCall(
+                        addLastFn, {list, ep, builder_.getInt64(elemSize)});
+                    builder_.CreateStore(
+                        builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
+                    builder_.CreateBr(cBB);
+                }
+                builder_.SetInsertPoint(eBB);
+                // The snapshot never took ownership of the elements it copied —
+                // free its shell only, with a NULL disposer (the same "consumed
+                // snapshot" idiom ExceptWith/IntersectWith use).
+                auto* freeSnapFn = declareC("bz_array_free",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                builder_.CreateCall(freeSnapFn,
+                    {snap, llvm::ConstantPointerNull::get(ptrTy())});
+                return list;
             }
             if (colName == "Array" || colName == "OwningArray" ||
                 // §4.14: OwningBuffer<T> uses the same bz_array_t* backing.
