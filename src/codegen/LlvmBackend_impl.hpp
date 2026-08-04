@@ -7539,6 +7539,10 @@ private:
         std::unordered_map<std::string_view, llvm::Type*> lastCallGenericSubst_;
         llvm::BasicBlock*    inlinedAccessorEnd_;
         bool                 asyncChainedReturn_;   // #2731 item 1
+        // --- root-scope registration channels (#2731 item 3) ---
+        std::vector<std::pair<sema::Symbol*, llvm::AllocaInst*>>
+                             pendingOwnedParams_;
+        std::optional<Disposal> pendingArgsDisposal_;
         // --- SAVED AND RESTORED BUT DELIBERATELY NOT CLEARED (see the .cpp) ---
         std::unordered_map<std::string_view, const sema::TypeRef*>
                              genericSubstSemaTy_;

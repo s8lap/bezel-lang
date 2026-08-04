@@ -3247,6 +3247,29 @@ const ast::PropertyAccessor* Emitter::blockGetterOf(sema::Symbol* sym) {
 //     plain oracle, through both ensurePropertyBlockGetter and
 //     ensureIndexerBlockGetter (an expression-bodied getter is inlined, so it
 //     does not reach this window).
+//   * pendingOwnedParams_ / pendingArgsDisposal_ — fix #2731 item 3. Not a
+//     per-call channel but a ROOT-SCOPE REGISTRATION channel: `bindParameters`
+//     (LlvmBackend_Setup.cpp ~8579) fills pendingOwnedParams_ with the method's
+//     `owned` parameters BEFORE any scope exists, and the FIRST root-scope
+//     `lowerScopedBlock` (Setup.cpp ~21701/~21711, both gated on
+//     `disposeStack_.size() == 1`) moves them out and registers each for §28.3
+//     auto-drop. Every emitter here CLEARS `disposeStack_` before lowering, so
+//     the nested body's own block IS a root scope and consumes the caller's
+//     pending set. Setup.cpp ~21699 states the invariant this breaks in so many
+//     words — "a lambda/thunk body that opens its own root scope inherits an
+//     empty pendingOwnedParams_ unless its own bindParameters filled it".
+//     The consumption is SILENT rather than a cross-function IR reference,
+//     because `registerUnwindOwnedParam` (Setup.cpp ~11916) then bails on
+//     `currentFn_ != unwindIneligibleFn_` — so the registration is dropped on
+//     the floor and the caller's own `lowerScopedBlock` later finds the set
+//     already empty. The `owned` parameter is then never disposed: a LEAK, and
+//     one the compiler has already promised not to have ("owned parameter `r`
+//     is implicitly disposed at the end of the method (§28.3 auto-drop)").
+//     REACHED by a `requires` clause that reads a block-bodied property —
+//     `emitRequiresPrologue` lowers that user expression (Setup.cpp ~4556)
+//     between `bindParameters` and the body's own `lowerScopedBlock`
+//     (Setup.cpp ~6348). That shape parses and typechecks; verified, and
+//     verified to leak.
 //   * inlinedAccessorEnd_ — a `BasicBlock*` in the CALLER's function; a bare
 //     `return;` inside a nested body branches to it (LlvmBackend_Stmts.cpp
 //     ~1777). Latent (sema rejects a valueless return in a value-returning
@@ -3312,6 +3335,8 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
       lastCallGenericSubst_(std::move(e.lastCallGenericSubst_)),
       inlinedAccessorEnd_(e.inlinedAccessorEnd_),
       asyncChainedReturn_(e.asyncChainedReturn_),
+      pendingOwnedParams_(std::move(e.pendingOwnedParams_)),
+      pendingArgsDisposal_(std::move(e.pendingArgsDisposal_)),
       genericSubstSemaTy_(e.genericSubstSemaTy_) {   // COPY: inherited, not cleared
     // The moved-from containers above are left in a valid-but-unspecified
     // state by `std::move`, so clear each explicitly.
@@ -3343,6 +3368,8 @@ Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
     e.lastCallGenericSubst_.clear();
     e.inlinedAccessorEnd_        = nullptr;
     e.asyncChainedReturn_        = false;
+    e.pendingOwnedParams_.clear();
+    e.pendingArgsDisposal_.reset();
     // genericSubstSemaTy_ is intentionally left as-is (see the note above):
     // saved so a nested body's writes do not desynchronise it from
     // genericSubst_, but NOT cleared, because the body must resolve its type
@@ -3378,6 +3405,8 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
     e_.lastCallGenericSubst_      = std::move(lastCallGenericSubst_);
     e_.inlinedAccessorEnd_        = inlinedAccessorEnd_;
     e_.asyncChainedReturn_        = asyncChainedReturn_;
+    e_.pendingOwnedParams_        = std::move(pendingOwnedParams_);
+    e_.pendingArgsDisposal_       = std::move(pendingArgsDisposal_);
     e_.genericSubstSemaTy_        = std::move(genericSubstSemaTy_);
 }
 
