@@ -4544,8 +4544,47 @@ void MethodOwnership::handleLocalDecl(const ast::LocalDecl& ld) {
     // steering, not rejection. Suppressed in generic bodies (the classification
     // varies per instantiation, §28.10's reason for the uniform admissibility).
     // // per §28.10, #2073
+    //
+    // #2695 / §21.1 (v0.201), v0.240: BOTH messages below end in "use `const
+    // x := …;`", so the lint may only fire where that remedy actually
+    // COMPILES. §21.1 rejects a `const` local whose initializer is an owned
+    // production — visitStmt's LocalConstDecl arm, same file: "a `const` local
+    // (`x`) must not take an owned production — the binding never takes a
+    // disposal obligation; bind owned values with `using var` (§21.1 /
+    // §28.3)". That arm's test is exactly `producerState(init) == Owned`, so
+    // reusing the SAME classifier here makes the two sites incapable of
+    // disagreeing: the lint fires iff its own advice is legal.
+    //
+    // Before this guard, `using var d := new Dictionary<string, string>();`
+    // produced advice the compiler then rejected, and the §28.3 auto-drop
+    // hint on the plain-`var` spelling pointed straight back at `using var`
+    // ("declare it `using var` to make the scope-bound disposal explicit") —
+    // a three-way loop with NO warning-free spelling for a fresh borrowing-
+    // collection producer. `using var` IS the correct spelling for a fresh
+    // production (§28.10), which is what the pre-existing negative control
+    // `fresh_owned_producer_load_bearing_no_warn_spec_28_10` already asserts
+    // for a destructor-bearing class; rework 3c carved the trivial-dispose
+    // collections back OUT of it on the strength of "`Dispose()` is a no-op",
+    // which is true of `Dispose()` (§28.11's element-slot table: a borrowing
+    // collection's `Dispose()` does "no user-visible work") but says nothing
+    // about whether an alternative spelling exists. None does.
+    //
+    // Note the premise was independently wrong for a string-element
+    // instantiation: `Dictionary<K, string>`'s scope-end work is the
+    // per-element release that #2682/#2686 added to `registerUsingDisposal`,
+    // so "no disposal obligation" misdescribes it. That is not what this
+    // guard turns on, though — it turns on the availability of the remedy,
+    // which is decidable and covers `Dictionary<K, int>` equally.
+    //
+    // Deliberately placed on the OUTER guard so it covers Case B as well.
+    // Case B cannot currently fire on a production (rhsIsVacuousBorrowPin
+    // classifies only identifier and field-chain shapes, both Borrowed), but
+    // its message carries the identical `const` remedy, so scoping the
+    // invariant to the whole lint keeps a future Case B widening honest.
+    // // per §21.1, §28.10, §28.3, v0.240, #2695
     if (ld.isUsing && ld.initializer && !ld.initializerHasOwnedMarker &&
-        !isGenericBody_) {
+        !isGenericBody_ &&
+        producerState(*ld.initializer) != OwnershipState::Owned) {
         // Case A: inert RHS. Value-typed or runtime-managed types carry no
         // disposal obligation (§28.9), so the scope-end `Dispose()` a `using
         // var` would call is a no-op; the only effect is the reassignment lock

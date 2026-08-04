@@ -961,15 +961,29 @@ BEZEL_TEST(vacuous_pin_lint_2073,
 
 // ============================================================================
 // rework 3c — positive controls for the borrowing-collection TRIVIAL-DISPOSE
-// carve-out. Per §28.11 (v0.215) the borrowing family (Array/Stack/Queue/Set/
-// SortedSet/Dictionary/SortedDictionary/LinkedList) has a no-op `Dispose()`,
-// so a `using var` over `new Array<int>()` etc. is genuinely vacuous — the
-// §21.1 `const` alias is the correct spelling. These tests pin the
-// §28.10/§28.11 narrowing of the disposable-types list: a future rework
-// that adds borrowing collections to `rhsIsDisposableClassType` (a regression
-// to the pre-v0.215 surface) would silence these inert warnings, breaking
-// the test — making the carve-out structural, not just commented.
-// // per §28.10 / §28.11 / §21.1, #2073 (rework 3c)
+// carve-out. Per §28.11 (v0.240) the borrowing family (Array/Stack/Queue/Set/
+// SortedSet/Dictionary/SortedDictionary/LinkedList) does "no user-visible
+// work" in `Dispose()`, so pinning one with `using var` states a disposal
+// obligation the type does not have — the §21.1 `const` alias is the correct
+// spelling. These tests pin the §28.10/§28.11 narrowing of the disposable-
+// types list: a future rework that adds borrowing collections to
+// `rhsIsDisposableClassType` (a regression to the pre-v0.215 surface) would
+// silence these inert warnings, breaking the test — making the carve-out
+// structural, not just commented.
+//
+// ⚠ AMENDED for #2695 (v0.240): the RHS is now a READ of an already-bound
+// collection local, not a `new` expression. The original form
+// (`using var a := new Array<int>();`) asserted a diagnostic whose own remedy
+// the compiler REJECTS — §21.1 refuses `const a := new Array<int>();` ("a
+// `const` local (`a`) must not take an owned production"), so the advice was
+// unfollowable and the shape had NO warning-free spelling. #2695 scopes the
+// lint to RHSs whose `const` remedy compiles. Reading a bound local keeps the
+// RHS's static type exactly the borrowing-collection type this carve-out is
+// about — `rhsIsDisposableClassType` sees the identical `TypeRef`, so the
+// regression this test was built to catch is caught verbatim — while the
+// remedy (`const p := a;`) is legal, which
+// `vacuous_lint_const_remedy_2695_test.cpp` asserts directly.
+// // per §28.10 / §28.11 / §21.1, #2073 (rework 3c), #2695
 // ============================================================================
 BEZEL_TEST(vacuous_pin_lint_2073,
            borrowing_collections_inert_rhs_warns_spec_28_11) {
@@ -980,11 +994,13 @@ BEZEL_TEST(vacuous_pin_lint_2073,
     const char* names[] = {"a", "s", "q", "set", "sorted", "dict",
                            "sortedDict", "list"};
     for (std::size_t i = 0; i < std::size(cases); ++i) {
+        // `src` is the owned binding; `names[i]` is the vacuous pin over it.
         std::string source =
-            std::string("module M; class C public method M(): int using var ") +
-            names[i] + " := new " + cases[i] + "(); return 0; end M; "
+            std::string("module M; class C public method M(): int var src := new ") +
+            cases[i] + "(); using var " + names[i] + " := src; return 0; end M; "
             "public static method Main(): int return 0; end Main; end C;";
         auto r = parseAndCheckOwnership(source);
+        BEZEL_EXPECT_FALSE(r.diagnostics.hasErrors());
         BEZEL_EXPECT_TRUE(hasInertRhsWarning(r, names[i]));
     }
 }
