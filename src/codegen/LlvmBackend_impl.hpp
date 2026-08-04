@@ -7474,6 +7474,74 @@ private:
     std::unordered_map<const ast::Node*, unsigned> smForInSrcFields_;
     // Maps alloca slot → frame field index (spill at suspend, restore at state entry).
     std::unordered_map<llvm::AllocaInst*, unsigned> smAllocaToField_;
+
+    // fix #2702 (§23.3/§23.4/§30.5/§28.14, v0.240): ONE place that saves,
+    // neutralises and restores the emitter state a NESTED body emission must
+    // not inherit. `ensurePropertyBlockGetter`, `ensureIndexerBlockGetter` and
+    // `ensurePropertyAccessorFn` each lower a user statement body into a
+    // SEPARATE, MEMOIZED function from the middle of another function's
+    // emission; any per-body field they forget leaks the caller's context into
+    // the callee and is then frozen module-wide by the memoisation. #2170
+    // (smKind_/smStateStruct_), #2274/#2281 (finallyStack_/finallyBodyStack_)
+    // and #2694 (currentReturnTypeNode_/currentLambdaReturnSemaTy_) each had to
+    // patch this by hand, field by field, at two or three sites; #2701/#2702
+    // are the next three omissions of the same shape. This guard exists so the
+    // NEXT per-body field is added in one place instead of three.
+    //
+    // The exact reset list, and the members deliberately INHERITED (with the
+    // reason each is correct to inherit), are documented on the constructor's
+    // definition in LlvmBackend_Assign.cpp. Read that before adding a field.
+    //
+    // It does NOT touch the emitter-specific entry state — `currentFn_`,
+    // `currentThis_`, the parameter slots and the builder insert point — which
+    // each emitter must still set for itself because each sets them
+    // differently (an indexer getter spills index parameters, a property
+    // accessor binds an implicit `value`).
+    struct NestedBodyScope {
+        explicit NestedBodyScope(Emitter& e);
+        ~NestedBodyScope();
+        NestedBodyScope(const NestedBodyScope&) = delete;
+        NestedBodyScope& operator=(const NestedBodyScope&) = delete;
+
+        Emitter& e_;
+        // --- return contract (#2694) ---
+        const ast::Type*     retNode_;
+        const sema::TypeRef* lamRet_;
+        // --- suspend/resume frame (#2170 + #2701 + #2702) ---
+        SuspendKind          smKind_;
+        llvm::StructType*    smStateStruct_;
+        llvm::Value*         smSelf_;
+        llvm::Value*         smStateGEP_;
+        std::vector<llvm::BasicBlock*> smStateBBs_;
+        llvm::BasicBlock*    smDoneBB_;
+        unsigned             smNextSuspendState_;
+        std::unordered_map<const ast::Node*, unsigned>     smLocalFields_;
+        std::unordered_map<const ast::Node*, unsigned>     smForInSrcFields_;
+        std::unordered_map<llvm::AllocaInst*, unsigned>    smAllocaToField_;
+        // --- iterator-specific frame state ---
+        unsigned             iterCurrentValField_;
+        llvm::Type*          iterElemTy_;
+        const sema::TypeRef* iterElemSemaTy_;
+        bool                 iterElemIsOwnedClass_;
+        unsigned             iterCurrentValOwnedField_;
+        // --- async-specific frame state ---
+        unsigned             asyncOuterTaskField_;
+        unsigned             asyncPendingTaskField_;
+        unsigned             asyncSpillPtrField_;
+        // --- destructor-body context (#2702 item 2) ---
+        bool                 emittingDisposerBody_;
+        llvm::Value*         disposerEntryExc_;
+        // --- catch/guard-arm context ---
+        std::string_view     currentCaughtName_;
+        llvm::BasicBlock*    caughtExcArmTarget_;
+        // --- narrow per-call channels ---
+        const sema::TypeRef* expectedFunctionType_;
+        std::unordered_map<std::string_view, llvm::Type*> lastCallGenericSubst_;
+        llvm::BasicBlock*    inlinedAccessorEnd_;
+        // --- SAVED AND RESTORED BUT DELIBERATELY NOT CLEARED (see the .cpp) ---
+        std::unordered_map<std::string_view, const sema::TypeRef*>
+                             genericSubstSemaTy_;
+    };
     // ---- Yield-specific live state (used only when smKind_ == Yield) ----
     unsigned iterCurrentValField_ = 0;
     llvm::Type* iterElemTy_ = nullptr;

@@ -3158,6 +3158,201 @@ const ast::PropertyAccessor* Emitter::blockGetterOf(sema::Symbol* sym) {
 }
 
 
+// fix #2702 (§23.3 "Block-form properties" / §23.4 "Indexers" / §30.5 /
+// §28.14, v0.240): save + neutralise the emitter state that a NESTED body
+// emission must not inherit; the destructor restores it.
+//
+// WHY A GUARD AND NOT ANOTHER FIELD-BY-FIELD PATCH. The three adopters below
+// (`ensurePropertyBlockGetter`, `ensureIndexerBlockGetter`,
+// `ensurePropertyAccessorFn`) lower a user statement body into a SEPARATE,
+// MEMOISED function from the middle of another function's emission. Any
+// per-body field they fail to reset leaks the CALLER's context into the callee
+// — and because the function is cached, whichever caller happened to be lowered
+// first freezes that body for the whole module (the body loop iterates
+// `std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_`,
+// LlvmBackend_impl.hpp ~346/~565 — POINTER-HASH order, not declaration order).
+// #2170, #2274/#2281 and #2694 each closed two fields of this set by hand at
+// two or three sites; #2701 and #2702 are the next omissions. Putting the
+// decision in one place is what stops the family from producing a new member
+// every time a per-body field is added.
+//
+// ── RESET (the caller's value is provably wrong inside a separate function) ──
+// Each entry below was CONFIRMED to be inherited in practice, by instrumenting
+// every emitter's entry and compiling probe programs (not by code reading):
+//   * currentReturnTypeNode_ / currentLambdaReturnSemaTy_ — #2694's pair. The
+//     getter's `return` carries its OWN contract, never the reader's.
+//   * smKind_ / smStateStruct_ / smStateGEP_ / smSelf_ / smDoneBB_ /
+//     smStateBBs_ / smNextSuspendState_ / smLocalFields_ / smForInSrcFields_ /
+//     smAllocaToField_ — the suspend/resume frame of the CALLER's state
+//     machine. A getter is never a state machine. Confirmed inherited by
+//     compiling a block-bodied getter read from an `async` body: every one of
+//     these was live at the emitter's entry. `smStateGEP_` is the sharpest:
+//     LlvmBackend_Stmts.cpp ~3699 stores through it on EVERY `try`'s unwind
+//     edge gated on `smStateGEP_` ALONE, so nulling `smStateStruct_` (#2170)
+//     does not protect it — that store lands in the caller's function and the
+//     module fails IR verification ("Referring to an instruction in another
+//     function!"). smKind_ is reset to `Yield` following #2170; `SuspendKind`
+//     has no neutral value, and `Yield` is what OPENS the second gate at
+//     ~3620 (`smStateGEP_ && (smKind_ == Yield || smKind_ == AsyncYield)`) —
+//     which is exactly why smStateGEP_ must be nulled here rather than relying
+//     on the kind. smDoneBB_ has no read reachable from lowering (verified);
+//     it is reset with the rest of the frame because leaving one member of a
+//     frame behind is how this family keeps recurring.
+//   * iterCurrentValField_ / iterElemTy_ / iterElemSemaTy_ /
+//     iterElemIsOwnedClass_ / iterCurrentValOwnedField_ — the yield-specific
+//     half of that frame. `iterElemIsOwnedClass_` pairs with `smKind_` at
+//     LlvmBackend_Stmts.cpp ~2829 (`smKind_ == Yield && iterElemIsOwnedClass_`),
+//     and this guard FORCES `smKind_ == Yield`, so a stale `true` is a live
+//     combination. These three were saved nowhere in the codebase before.
+//   * asyncOuterTaskField_ / asyncPendingTaskField_ / asyncSpillPtrField_ —
+//     frame field indices of the caller's async frame.
+//   * emittingDisposerBody_ / disposerEntryExc_ — CONFIRMED inherited by
+//     compiling a block getter whose first toucher is a `destructor` body.
+//     `disposerEntryExc_` is a `CreateLoad` in the DESTRUCTOR's entry block
+//     (LlvmBackend_Disposal.cpp ~126); `emitPendingCheck` (~1312) compares
+//     against it after any call, so a getter body containing a call would
+//     reference a value defined in another function.
+//   * currentCaughtName_ / caughtExcArmTarget_ — the caller's catch-arm
+//     binding. Benign today only because `currentCaughtExc_` is already nulled
+//     by each emitter; resetting these makes that non-accidental rather than
+//     a coincidence two guards apart.
+//   * expectedFunctionType_ — describes an ARGUMENT POSITION in the caller;
+//     `lowerLambda` reads it to infer a lambda's parameter/return types.
+//   * lastCallGenericSubst_ — a transient `lowerExpr` → `lowerStmt` channel
+//     (a call publishes, the next `var` decl consumes). A nested body's last
+//     call would otherwise be consumed by the CALLER's next local declaration.
+//   * inlinedAccessorEnd_ — a `BasicBlock*` in the CALLER's function; a bare
+//     `return;` inside a nested body branches to it (LlvmBackend_Stmts.cpp
+//     ~1777). Latent (sema rejects a valueless return in a value-returning
+//     accessor) but a cross-function `br` if ever reached.
+//
+// ── DELIBERATELY INHERITED (resetting these would be a NEW bug) ──
+// This list is the reason this guard is not simply "reset everything". Each
+// was confirmed live at a nested emitter's entry too — but its value is
+// CORRECT there:
+//   * genericSubst_ — NOT cleared, and not even saved here (each emitter still
+//     saves/restores it). The memoised getter's SIGNATURE is built by
+//     `lowerType(pd->type.get())` BEFORE this guard runs, under the caller's
+//     substitution; clearing the map would lower the BODY under a different
+//     substitution than the signature it must satisfy. A generic class's block
+//     getter would stop resolving `T` at all.
+//   * genericSubstSemaTy_ — genericSubst_'s sema-level twin, read on the same
+//     paths. Saved and restored here (it was saved by NONE of the emitters,
+//     so a `new Foo<T>()` inside a getter body desynchronised the two halves)
+//     but likewise NOT cleared, for the same reason.
+//   * currentEnumMethod_ — `enumTypeOf` (LlvmBackend_Setup.cpp ~288) falls back
+//     to it to resolve a bare `this` in an enum member. The correct value
+//     inside a block getter is the getter's OWN owning type when that type is
+//     an enum (which is precisely what `ensurePropertyAccessorFn` sets for
+//     itself, #574) and null otherwise — NOT null unconditionally. The two
+//     block-getter entry points do not receive the owning `TypeSymbol`, so
+//     resetting it blind here would break a block-bodied ENUM property read
+//     from inside an enum member, which works today. Left inherited on
+//     purpose; #2702 item 3 stays open for the set-from-owner fix.
+//   * currentSpecMethodSymbol_ / emittingGenericTemplateBody_ /
+//     templateGenericParamNames_ — same shape as currentEnumMethod_: the right
+//     value depends on whether the getter's OWN owner is an unspecialised
+//     generic template, which is not knowable from these call sites. Confirmed
+//     inherited (a block getter first touched from an unspecialised template
+//     body enters with `emittingGenericTemplateBody_` true), so #2702 items 4
+//     and 5 are real — they are left open rather than guessed at here.
+Emitter::NestedBodyScope::NestedBodyScope(Emitter& e)
+    : e_(e),
+      retNode_(e.currentReturnTypeNode_),
+      lamRet_(e.currentLambdaReturnSemaTy_),
+      smKind_(e.smKind_),
+      smStateStruct_(e.smStateStruct_),
+      smSelf_(e.smSelf_),
+      smStateGEP_(e.smStateGEP_),
+      smStateBBs_(std::move(e.smStateBBs_)),
+      smDoneBB_(e.smDoneBB_),
+      smNextSuspendState_(e.smNextSuspendState_),
+      smLocalFields_(std::move(e.smLocalFields_)),
+      smForInSrcFields_(std::move(e.smForInSrcFields_)),
+      smAllocaToField_(std::move(e.smAllocaToField_)),
+      iterCurrentValField_(e.iterCurrentValField_),
+      iterElemTy_(e.iterElemTy_),
+      iterElemSemaTy_(e.iterElemSemaTy_),
+      iterElemIsOwnedClass_(e.iterElemIsOwnedClass_),
+      iterCurrentValOwnedField_(e.iterCurrentValOwnedField_),
+      asyncOuterTaskField_(e.asyncOuterTaskField_),
+      asyncPendingTaskField_(e.asyncPendingTaskField_),
+      asyncSpillPtrField_(e.asyncSpillPtrField_),
+      emittingDisposerBody_(e.emittingDisposerBody_),
+      disposerEntryExc_(e.disposerEntryExc_),
+      currentCaughtName_(e.currentCaughtName_),
+      caughtExcArmTarget_(e.caughtExcArmTarget_),
+      expectedFunctionType_(e.expectedFunctionType_),
+      lastCallGenericSubst_(std::move(e.lastCallGenericSubst_)),
+      inlinedAccessorEnd_(e.inlinedAccessorEnd_),
+      genericSubstSemaTy_(e.genericSubstSemaTy_) {   // COPY: inherited, not cleared
+    // The moved-from containers above are left in a valid-but-unspecified
+    // state by `std::move`, so clear each explicitly.
+    e.currentReturnTypeNode_     = nullptr;
+    e.currentLambdaReturnSemaTy_ = nullptr;
+    e.smKind_                    = SuspendKind::Yield;   // no neutral value
+    e.smStateStruct_             = nullptr;
+    e.smSelf_                    = nullptr;
+    e.smStateGEP_                = nullptr;
+    e.smStateBBs_.clear();
+    e.smDoneBB_                  = nullptr;
+    e.smNextSuspendState_        = 0;
+    e.smLocalFields_.clear();
+    e.smForInSrcFields_.clear();
+    e.smAllocaToField_.clear();
+    e.iterCurrentValField_       = 0;
+    e.iterElemTy_                = nullptr;
+    e.iterElemSemaTy_            = nullptr;
+    e.iterElemIsOwnedClass_      = false;
+    e.iterCurrentValOwnedField_  = 0;
+    e.asyncOuterTaskField_       = 0;
+    e.asyncPendingTaskField_     = 0;
+    e.asyncSpillPtrField_        = 0;
+    e.emittingDisposerBody_      = false;
+    e.disposerEntryExc_          = nullptr;
+    e.currentCaughtName_         = {};
+    e.caughtExcArmTarget_        = nullptr;
+    e.expectedFunctionType_      = nullptr;
+    e.lastCallGenericSubst_.clear();
+    e.inlinedAccessorEnd_        = nullptr;
+    // genericSubstSemaTy_ is intentionally left as-is (see the note above):
+    // saved so a nested body's writes do not desynchronise it from
+    // genericSubst_, but NOT cleared, because the body must resolve its type
+    // parameters under the same substitution its signature was built with.
+}
+
+Emitter::NestedBodyScope::~NestedBodyScope() {
+    e_.currentReturnTypeNode_     = retNode_;
+    e_.currentLambdaReturnSemaTy_ = lamRet_;
+    e_.smKind_                    = smKind_;
+    e_.smStateStruct_             = smStateStruct_;
+    e_.smSelf_                    = smSelf_;
+    e_.smStateGEP_                = smStateGEP_;
+    e_.smStateBBs_                = std::move(smStateBBs_);
+    e_.smDoneBB_                  = smDoneBB_;
+    e_.smNextSuspendState_        = smNextSuspendState_;
+    e_.smLocalFields_             = std::move(smLocalFields_);
+    e_.smForInSrcFields_          = std::move(smForInSrcFields_);
+    e_.smAllocaToField_           = std::move(smAllocaToField_);
+    e_.iterCurrentValField_       = iterCurrentValField_;
+    e_.iterElemTy_                = iterElemTy_;
+    e_.iterElemSemaTy_            = iterElemSemaTy_;
+    e_.iterElemIsOwnedClass_      = iterElemIsOwnedClass_;
+    e_.iterCurrentValOwnedField_  = iterCurrentValOwnedField_;
+    e_.asyncOuterTaskField_       = asyncOuterTaskField_;
+    e_.asyncPendingTaskField_     = asyncPendingTaskField_;
+    e_.asyncSpillPtrField_        = asyncSpillPtrField_;
+    e_.emittingDisposerBody_      = emittingDisposerBody_;
+    e_.disposerEntryExc_          = disposerEntryExc_;
+    e_.currentCaughtName_         = currentCaughtName_;
+    e_.caughtExcArmTarget_        = caughtExcArmTarget_;
+    e_.expectedFunctionType_      = expectedFunctionType_;
+    e_.lastCallGenericSubst_      = std::move(lastCallGenericSubst_);
+    e_.inlinedAccessorEnd_        = inlinedAccessorEnd_;
+    e_.genericSubstSemaTy_        = std::move(genericSubstSemaTy_);
+}
+
+
 llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
                                           const ast::PropertyAccessor* acc) {
     auto it = propBlockGetterFns_.find(pd);
@@ -3205,14 +3400,17 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     auto  savedUD        = unwindScopeDepth_;
     auto  savedDiv       = diverged_;
     auto  savedGSubst    = genericSubst_;
-    // #2170 / §30.5: a block-getter accessed from an async body must not
-    // inherit the caller's state-machine mode — the getter's `return` is
-    // ordinary (its `ret i32` terminates the getter), and the async return
-    // path's gate `smKind_ == Await && smStateStruct_` (LlvmBackend_Stmts.cpp
-    // ~line 1510) would otherwise emit bz_task_complete / spill-free /
-    // frame-free into the getter's body. Save+null+restore.
-    auto  savedSmKind    = smKind_;
-    auto* savedSmStruct  = smStateStruct_;
+    // fix #2702 (§23.3/§30.5/§28.14, v0.240): everything a nested body emission
+    // must not inherit — the #2170 state-machine pair (smKind_/smStateStruct_),
+    // the #2694 return-contract pair, and the members those two fixes missed
+    // (smStateGEP_ and the rest of the suspend frame, the destructor-body pair,
+    // the catch-arm pair, and the narrow per-call channels) — is saved,
+    // neutralised and restored by ONE guard. See its definition above for the
+    // full list, the evidence for each member, and — importantly — the members
+    // deliberately left INHERITED and why resetting them would be a new bug.
+    // The guard's destructor runs last, after the explicit restores below, so
+    // it always has the final say on the fields it owns.
+    NestedBodyScope nestedScope(*this);
     // fix #2694 / §23.3 / §28.9 (v0.240): the SAME "a getter must not inherit
     // the caller's emission mode" reasoning as #2170 immediately above, for the
     // two RETURN-CONTRACT fields. This getter is MEMOIZED (propBlockGetterFns_)
@@ -3249,8 +3447,8 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     // `ret i32` from a `ptr`-returning function whenever the first-touching
     // caller does not itself return Object), so this change only makes that
     // failure deterministic. Filed separately rather than fixed here.
-    auto* savedRetNode   = currentReturnTypeNode_;
-    auto* savedLamRet    = currentLambdaReturnSemaTy_;
+    // (Both fields are now saved/nulled/restored by NestedBodyScope above,
+    // together with the rest of the per-body set — fix #2702.)
 
     // --- Switch into the getter function ---
     currentFn_          = fn;
@@ -3266,10 +3464,6 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     currentCaughtExc_   = nullptr;
     unwindScopeDepth_   = 0;
     diverged_           = false;
-    smKind_             = SuspendKind::Yield;
-    smStateStruct_      = nullptr;
-    currentReturnTypeNode_    = nullptr;   // fix #2694 / §28.9
-    currentLambdaReturnSemaTy_ = nullptr;  // fix #2694 / §27.3 / §28.9
 
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
@@ -3292,10 +3486,8 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     unwindScopeDepth_   = savedUD;
     diverged_           = savedDiv;
     genericSubst_       = std::move(savedGSubst);
-    smKind_             = savedSmKind;
-    smStateStruct_      = savedSmStruct;
-    currentReturnTypeNode_     = savedRetNode;   // fix #2694 / §28.9
-    currentLambdaReturnSemaTy_ = savedLamRet;    // fix #2694 / §27.3 / §28.9
+    // smKind_/smStateStruct_ (#2170) and currentReturnTypeNode_/
+    // currentLambdaReturnSemaTy_ (#2694) are restored by ~NestedBodyScope.
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
 
     return fn;
