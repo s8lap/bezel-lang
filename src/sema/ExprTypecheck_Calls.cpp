@@ -8714,6 +8714,17 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     // (`m` is bound at the top of the function by builtinInstanceCallee —
     // #2594; it covers both the `coll.M(..)` and `coll?.M(..)` callee kinds.)
 
+    // §7 / stdlib §4.8 (#2592): `Dictionary<K, V>.Add(key: K, value: V)`
+    // declares TWO non-nullable slots of DIFFERENT types. #2582's single-type
+    // model checked only the key against `genericArgs[0]`; the VALUE at pos 1
+    // is typed `V` = `genericArgs[1]` and had no check at all, so an
+    // un-narrowed `V?` was silently accepted and stored as the map's
+    // non-nullable `V`. Like every other slot in this helper the check is
+    // against the INSTANTIATED type, so `Dictionary<string, int?>` — where V
+    // is itself nullable — keeps accepting an un-narrowed `int?`.
+    TypeRef* valueTy = recvTy->genericArgs.size() >= 2 ? recvTy->genericArgs[1]
+                                                       : nullptr;
+
     // §4.14 vs §4.15 parameter-nullability split for the span-buffer family.
     // ArraySpan<T>/ReadOnlyArraySpan<T> declare `value: T` for EVERY T (Array<T>
     // slots do not wrap class T in T? — stdlib §4.15 line 2881), so the param
@@ -8845,6 +8856,31 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         return false;
     };
 
+    // §7 / stdlib §4.8 (#2592): the ONE parameter in this helper's surface
+    // whose declared type is `V` rather than the `genericArgs[0]` element/key
+    // type — `Dictionary<K, V>.Add(key: K, value: V)` at pos 1 (stdlib §4.8
+    // line 1850). Gated to `Dictionary` deliberately:
+    //   * `SortedDictionary<K, V>` (§4.17 line 2999-3017) declares NO
+    //     `Add(key, value)` at all — its write surface is the indexer-set —
+    //     which is also why #2582 left it out of the pos-0 `Add` name gate;
+    //   * `OwningDictionary<K, V>.Add(key: K, owned value: V)` (§4.9 line
+    //     1930) marks the value `owned`, so §22.3 governs that transfer, not
+    //     §7 — the modifier guard in the loop below skips it, and naming it
+    //     here would only produce a misleading diagnostic when a caller
+    //     forgets the marker;
+    //   * `GetOrAdd(key, factory)` takes a function, and the entry-shaped
+    //     `Add(entry)`/`Contains(entry)`/`Remove(entry)` ICollection forms
+    //     (§4.8 line 1896) take a `DictionaryEntry<K, V>`, not a bare `V`.
+    // The OTHER write path, the indexer-set `dict[key] := value` (§4.8), is a
+    // separate Expr kind (not a CallExpr) and out of this helper's reach — but
+    // it needs nothing: it already rejects an un-narrowed `V?` through the
+    // ordinary assignment check ("the assigned value is nullable but the
+    // target type is non-nullable (§7)"), verified by probe. `Add` was the
+    // only unguarded value slot.
+    auto isDictValuePosition = [&](std::size_t pos) -> bool {
+        return pos == 1 && valueTy && m == "Add" && colName == "Dictionary";
+    };
+
     for (std::size_t i = 0; i < ce.args.size(); ++i) {
         const auto& a = ce.args[i];
         if (!a.value || a.isDiscard) continue;
@@ -8855,7 +8891,13 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         // owned item: T)` / etc. — the caller writes the `owned` marker, and
         // the parameter's nullability is governed by the §22.3 transfer rule.
         if (!a.modifier.empty()) continue;
-        if (!isItemPosition(i)) continue;
+        // §7 / stdlib §4.8 (#2592): pick the slot's DECLARED type — the
+        // element/key type for every position this helper covered before, and
+        // `V` for `Dictionary<K, V>.Add`'s value at pos 1.
+        TypeRef* paramTy = nullptr;
+        if (isItemPosition(i))            paramTy = itemTy;
+        else if (isDictValuePosition(i))  paramTy = valueTy;
+        else continue;
         // §4.14 (#2600): class-T Span/ReadOnlySpan declare `value: T?`
         // (nullable) for IndexOf/Contains — an un-narrowed `T?` argument is
         // admissible, so skip the §7 check for that case (would false-reject).
@@ -8863,7 +8905,7 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         TypeRef* argTy = ctx_.exprType(*a.value);
         if (!argTy) continue;
         checkAssignable(
-            argTy, itemTy, a.value->span.begin,
+            argTy, paramTy, a.value->span.begin,
             std::string("argument to `") + std::string(colName) + "<T>." +
             std::string(m) + "`",
             a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
