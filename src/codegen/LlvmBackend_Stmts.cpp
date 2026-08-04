@@ -2287,6 +2287,58 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         return true;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        // fix #2655 / §21.9 / §28.3 / §28.9 (v0.237): a BARE owned-producer
+        // statement (`new Box();`) is an unbound owned temporary whose K8
+        // boundary is the end of this statement (§28.3: "in an expression
+        // statement, 'end of the full expression' and 'end of the statement'
+        // coincide"). Free it here, exactly as the §17.13 discard spelling of
+        // the same statement does — this branch is a verbatim copy of the
+        // DiscardStmt::disposeOwnedValue branch below, keyed to the flag the
+        // ownership pass sets under the identical producerState == Owned gate.
+        // Before this, the value was produced and dropped on the floor with no
+        // free emitted anywhere and no diagnostic (§21.9 hard-errors only the
+        // non-trivial-dispose case), so every bare trivial `new` leaked.
+        if (es->expr && es->disposeOwnedValue) {
+            // The value is the sole owner (sema admitted only §21.9's
+            // `ownedProduced` shapes — `new`, an `owned`-returning user call, an
+            // owning-collection drain — never a borrow), so it is freed EXACTLY
+            // once: no leak, no double-free. dynamicDispose dispatches
+            // Dispose+reclaim through the object's own vtable, null-guarded; the
+            // class is trivial-dispose (sema's gate), so that disposer runs no
+            // user code — precisely §28.9's "mechanism … that runs no user
+            // code".
+            //
+            // ORDER MATTERS: lower the expression FIRST, in the enclosing block
+            // scope, and only THEN open the one-entry dispose scope. Opening it
+            // first (the shape #1009's discard arm uses) would RE-HOME every
+            // disposal that expression lowering itself pushes onto
+            // `disposeStack_.back()` — notably the `ensureOutVarSlots` /
+            // `ensureCtorOutVarSlots` registrations for an inline `out owned var`
+            // argument (LlvmBackend_Calls2.cpp) — from the block scope into this
+            // STATEMENT scope, so `new T(out owned var x);` would dispose `x` and
+            // null its slot at end of statement while `x` is still live for the
+            // rest of the block. Lowering first leaves those registrations where
+            // they belong.
+            //
+            // No unwind-edge entry is needed: between the store below and
+            // emitDisposals nothing throwable is emitted (an alloca and a store),
+            // and a throw from the producer itself is covered independently by
+            // emitNewPendingCheck / emitUnwindDisposals (LlvmBackend_Disposal.cpp)
+            // — which is why this arm does not claim both-edge coverage it does
+            // not provide.
+            llvm::Value* v = lowerExpr(*es->expr);
+            if (!diverged_ && v) {
+                llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                builder_.CreateStore(v, slot);
+                disposeStack_.emplace_back();
+                Disposal d{slot, nullptr};
+                d.dynamicDispose = true;
+                disposeStack_.back().push_back(d);
+                emitDisposals(disposeStack_.back());
+                disposeStack_.pop_back();
+            }
+            return diverged_;
+        }
         if (es->expr) lowerExpr(*es->expr);  // side effects only (CG3: none)
         return diverged_;  // CG40: a throw-expression terminated the block
     }

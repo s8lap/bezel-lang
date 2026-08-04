@@ -2413,6 +2413,15 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        // fix #2655 / §21.9 / §28.3 / §28.9 (v0.237): the end-of-statement free
+        // for a bare owned-producer statement is decided in SEMA, not here —
+        // see ExpressionStmt::disposeOwnedValue and its one setter in
+        // ExprTypecheck.cpp's §21.9 walk. That walk is the only place that
+        // computes the trivial-dispose verdict this free must be scoped to, and
+        // deciding it here instead would need a fourth copy of that predicate
+        // (rhsIsDisposableClassType below documents why sema's copy cannot be
+        // called from this pass: it would make the ownership pass depend on
+        // sema circularly). // per §21.9, §28.9
         if (es->expr) handleDischarge(*es->expr);
         return;
     }
