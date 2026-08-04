@@ -1668,6 +1668,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         llvm::Function* savedSetLiteralFreeEligFn = setLiteralFreeEligibleFn_;
         auto savedDictLiteralFreeElig = dictLiteralFreeEligible_;
         llvm::Function* savedDictLiteralFreeEligFn = dictLiteralFreeEligibleFn_;
+        // fix #2660: same protection for the nested-literal aggregate set —
+        // emitAsyncLambda recomputes it for the lambda body, and without the
+        // restore the enclosing body's later aggregate roots would consult the
+        // LAMBDA's set. (That direction only loses a free — a leak — but the
+        // set must track its guard, dictLiteralFreeEligibleFn_, which IS
+        // restored two lines below.)
+        auto savedLiteralTreeAggElig = literalTreeAggregateEligible_;
 
         emitAsyncLambda(lam, fn, paramSyms, asyncResultElemSemaTy,
                        asyncDeclaredTaskTy);
@@ -1690,6 +1697,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         setLiteralFreeEligibleFn_ = savedSetLiteralFreeEligFn;             // #2142
         dictLiteralFreeEligible_ = std::move(savedDictLiteralFreeElig);    // #2143
         dictLiteralFreeEligibleFn_ = savedDictLiteralFreeEligFn;           // #2143
+        literalTreeAggregateEligible_ =
+            std::move(savedLiteralTreeAggElig);                            // #2660
         smKind_ = savedSmKind;
         smStateStruct_ = savedSmStateStruct;
         smSelf_ = savedSmSelf;

@@ -8117,9 +8117,62 @@ private:
     // (#2143) — the materializer path already reclaims via the sibling set.
     std::unordered_set<const void*> dictLiteralFreeEligible_;
     llvm::Function* dictLiteralFreeEligibleFn_ = nullptr;
+    // fix #2660 / §15.4 / §28.9 / §28.11: the NESTED-literal analog of the three
+    // flat sets above. A `var`/`using var` local whose initializer is a
+    // collection literal each of whose element/value NODES is itself a fresh
+    // nested collection literal — §15.4's own `groups`/`config` examples — owns
+    // a TREE of heap collections, not one. The flat reclaim frees only the root;
+    // the interior nodes have no releaser at all, so they leak (measured: 224 B
+    // for the two-`Array<int>` `groups` example, 837 B for `config`). This set
+    // holds the roots for which freeing the whole tree with the root is PROVEN
+    // exactly-once. Membership requires all three of:
+    //   (a) the root never escapes — the same StringEscapeWalker the flat
+    //       #1871/#2142/#2143 family uses;
+    //   (b) EVERY node of the tree is a fresh nested literal, recursively (a
+    //       BORROWED element — `["a": [1], "b": cached]` — is never an aggregate
+    //       member per proposal 0077 §3, and freeing it would double-free the
+    //       binding that owns it);
+    //   (c) no INTERIOR-node alias can outlive the root's scope
+    //       (literalTreeInteriorAliasSafe — a default-deny walk, because the
+    //       StringEscapeWalker tracks only the root identifier and classifies
+    //       `var inner := groups["primes"];` as a safe read).
+    // A root failing any of the three keeps today's behaviour exactly: the
+    // interior nodes leak. That is the deliberate safe direction — a bounded
+    // leak, never a use-after-free.
+    std::unordered_set<const void*> literalTreeAggregateEligible_;
+    // fix #2660: true if every node of `lit` (recursively, through the
+    // element/value type `collTy`) is a fresh nested collection literal —
+    // condition (b) above. False for a flat literal (nothing to free) and for
+    // any literal with a borrowed / call-produced node member.
+    bool isLiteralTreeAggregate(const ast::CollectionLiteralExpr* lit,
+                                const sema::TypeRef* collTy);
+    // fix #2660: condition (c) — true if NO value read out of `ld` can outlive
+    // `ld`'s scope. DEFAULT-DENY: every mention of `ld` must sit in one of two
+    // whitelisted shapes (`ld[i]` used only as the target of a further index or
+    // member access, or a member access on `ld` naming a non-node-producing
+    // member), and any statement/expression kind the walk does not enumerate
+    // returns false. Unrecognised shapes therefore LEAK, never dangle.
+    bool literalTreeInteriorAliasSafe(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const ast::LocalDecl* ld) const;
+    // fix #2660: the `void(void*)` thunk that reclaims ONE interior node of a
+    // literal-tree aggregate whose node type is `nodeTy` (bz_array_free /
+    // bz_dict_free / bz_llist_free, with the node's OWN element disposer derived
+    // recursively). Null when `nodeTy` is not a node shape this can express as a
+    // single thunk — the caller then registers no interior free (a leak, the
+    // safe direction). Cached per node type.
+    llvm::Function* collectionNodeFreeThunk(const sema::TypeRef* nodeTy);
+    std::unordered_map<const sema::TypeRef*, llvm::Function*>
+        collectionNodeFreeThunks_;
+    // fix #2660: if `declNode` is a proven literal-tree aggregate root of type
+    // `collTy`, return the interior-node disposer to install on the root's
+    // Disposal; null otherwise. Single entry point for the three registration
+    // sites (plain-`var` sequence literal, plain-`var` dict literal, `using var`).
+    llvm::Function* literalTreeNodeDisposerFor(const ast::Node* declNode,
+                                               const sema::TypeRef* collTy);
     // Compute borrowingArrayFreeEligible_ (and #1930 groupingFreeEligible_, #2142
-    // setLiteralFreeEligible_, #2143 dictLiteralFreeEligible_) for a block body
-    // (see the .cpp).
+    // setLiteralFreeEligible_, #2143 dictLiteralFreeEligible_, #2660
+    // literalTreeAggregateEligible_) for a block body (see the .cpp).
     void collectBorrowingArrayFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
     // #1930 / stdlib §5 / §28.9: true if `ld` is a plain `var g := <expr>` whose

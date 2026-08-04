@@ -6044,6 +6044,15 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // #2143: Dictionary<K,V>-literal eligibility, populated by the same pass.
     dictLiteralFreeEligible_.clear();
     dictLiteralFreeEligibleFn_ = fn;
+    // fix #2660: nested-literal aggregate roots, populated by the same pass.
+    // This site pins dictLiteralFreeEligibleFn_ (which #2660 reuses as its
+    // staleness guard) WITHOUT calling collectBorrowingArrayFreeEligible, so
+    // the set must be cleared here too or the guard would admit a previous
+    // body's entries. Not exploitable today — the set is keyed on
+    // `const ast::LocalDecl*`, unique per AST node, and a decl is emitted in
+    // exactly one function — but the invariant the disposer comment states
+    // must actually hold.
+    literalTreeAggregateEligible_.clear();
     // #422 / §27.5 / §28.9: which `var` closure (function-typed) locals may be
     // released at scope end (mirrors stringReleaseEligible_).
     closureReleaseEligible_.clear();
@@ -8743,6 +8752,13 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         !disposeStack_.empty()) {
                         Disposal d{slot, nullptr};
                         d.collection = true;  // per-element disposer null
+                        // fix #2660 / §15.4: `var xs: Array<Array<int>> :=
+                        // [[1,2],[3]]` — the root's free above reclaims only the
+                        // outer bz_array_t; install the interior-node free when
+                        // (and only when) the tree is a proven aggregate.
+                        if (llvm::Function* nodeFree =
+                                literalTreeNodeDisposerFor(declNode, collTy))
+                            d.collectionElemDisposer = nodeFree;
                         disposeStack_.back().push_back(d);
                     }
                     // fix #2142 / §28.9 / §28.11 (v0.220): reclaim the backing of
@@ -8832,8 +8848,19 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         dictLiteralFreeEligible_.count(
                             static_cast<const void*>(declNode)) &&
                         !disposeStack_.empty()) {
-                        disposeStack_.back().push_back(
-                            buildCollectionTempDisposal(slot, dictTy));
+                        Disposal dd = buildCollectionTempDisposal(slot, dictTy);
+                        // fix #2660 / §15.4: `var groups: Dictionary<string,
+                        // Array<int>> := ["primes": […]]` — the root free above
+                        // reclaims only the bz_dict_t; install the interior-node
+                        // free for a proven aggregate. buildCollectionTempDisposal
+                        // yields a null value disposer for a collection-typed V
+                        // (it is neither a record box, nor a string, nor an
+                        // owning-family element), so nothing is displaced.
+                        if (!dd.dictValueDisposer && !dd.dictStringKeys)
+                            if (llvm::Function* nodeFree =
+                                    literalTreeNodeDisposerFor(declNode, dictTy))
+                                dd.dictValueDisposer = nodeFree;
+                        disposeStack_.back().push_back(dd);
                     }
                     return;
                 }
@@ -11007,6 +11034,16 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                     d.collectionElemDisposer = stringElementReleaseThunk();
                 }
             }
+            // fix #2660 / §15.4: a `using var xs: Array<Array<int>> := [[…],[…]]`
+            // literal tree — free the interior nodes with the root. Only
+            // installed for a PROVEN aggregate root (see
+            // literalTreeNodeDisposerFor); the policy-derived disposer above is
+            // null for exactly these shapes (a borrowing collection element),
+            // so nothing is being displaced.
+            if (!d.collectionElemDisposer)
+                if (llvm::Function* nodeFree =
+                        literalTreeNodeDisposerFor(ld, collTy))
+                    d.collectionElemDisposer = nodeFree;
             disposeStack_.back().push_back(d);
             return;
         }
@@ -11081,6 +11118,16 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                 }
             }
         }
+        // fix #2660 / §15.4: a `using var groups: Dictionary<string, Array<int>>
+        // := ["primes": […]]` literal tree — §15.4's own motivating example, and
+        // the form the conformance corpus writes (spec_0060.bzl). Free the
+        // interior nodes with the root. Only for a PROVEN aggregate root; the
+        // three value-disposer derivations above all yield null for a
+        // collection-typed value, so nothing is displaced.
+        if (!d.dictValueDisposer && !d.dictStringKeys)
+            if (llvm::Function* nodeFree =
+                    literalTreeNodeDisposerFor(ld, dictTy))
+                d.dictValueDisposer = nodeFree;
         disposeStack_.back().push_back(d);
         return;
     }
@@ -17273,14 +17320,31 @@ void Emitter::collectBorrowingArrayFreeEligible(
     groupingFreeEligible_.clear();          // #1930
     setLiteralFreeEligible_.clear();        // #2142
     dictLiteralFreeEligible_.clear();       // #2143
+    literalTreeAggregateEligible_.clear();  // #2660
     std::vector<const ast::LocalDecl*> candidates;
     std::vector<const ast::LocalDecl*> dictCandidates;  // #1028
     std::vector<const ast::LocalDecl*> groupingCandidates;  // #1930
     std::vector<const ast::LocalDecl*> setLiteralCandidates;   // #2142
     std::vector<const ast::LocalDecl*> dictLiteralCandidates;  // #2143
+    std::vector<const ast::LocalDecl*> aggregateCandidates;    // #2660
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            // fix #2660 / §15.4: an INDEPENDENT candidacy test (not part of the
+            // if/else chain below — a nested dict literal is simultaneously a
+            // #2143 flat-reclaim candidate and an aggregate root, and needs
+            // both). Unlike the four flat recognizers this one ADMITS
+            // `using var`: §15.4's own nested examples are all written with it,
+            // and the using form's root disposal comes from
+            // registerUsingDisposal rather than the eligibility sets.
+            if (ld->initializer && ld->type) {
+                if (auto* lit = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        ld->initializer.get())) {
+                    if (const sema::TypeRef* rt = ctx_.resolvedType(*ld->type))
+                        if (isLiteralTreeAggregate(lit, rt))
+                            aggregateCandidates.push_back(ld);
+                }
+            }
             // #1930: a plain `var g := <src>.GroupBy(sel).First()/…` — a bare-GroupBy
             // element-returning terminal binding the returned IGrouping. A `using var`
             // never reaches here (IGrouping has no user Dispose; it is a plain `var`).
@@ -17420,6 +17484,30 @@ void Emitter::collectBorrowingArrayFreeEligible(
         if (!w.escaped)
             dictLiteralFreeEligible_.insert(static_cast<const void*>(ld));
     }
+    // fix #2660 / §15.4 / §28.9 / §28.11: the nested-literal aggregate roots.
+    // Candidacy already established condition (b) (every node is a fresh nested
+    // literal). Two more must hold before the interior nodes may be freed with
+    // the root:
+    //   (a) the ROOT never escapes — the same conservative walk the flat family
+    //       uses, in borrowingArrayMode (a for-in over the root borrows its
+    //       backing). If the root escapes, its whole tree escapes with it and
+    //       nothing here may free anything.
+    //   (c) no INTERIOR node read out of the root may outlive the scope — the
+    //       default-deny InteriorAliasWalker. StringEscapeWalker cannot answer
+    //       this: it tracks the root identifier only, and treats
+    //       `var inner := groups["primes"];` as a safe read of `groups`.
+    // Failing either leaves the interior nodes leaking exactly as today.
+    for (const ast::LocalDecl* ld : aggregateCandidates) {
+        std::unordered_set<const void*> safeViews;
+        collectSafeViewAliases(body, ld, safeViews);
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.borrowingArrayMode = true;
+        w.safeViewAliases = &safeViews;
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (w.escaped) continue;
+        if (!literalTreeInteriorAliasSafe(body, ld)) continue;
+        literalTreeAggregateEligible_.insert(static_cast<const void*>(ld));
+    }
 }
 
 
@@ -17511,6 +17599,417 @@ bool Emitter::isBorrowingDictLiteralLocal(const ast::LocalDecl* ld) const {
     bool emptyLiteral = lit->keys.empty() && lit->elements.empty();
     if (!lit->isDict && !emptyLiteral) return false;
     return true;
+}
+
+
+// fix #2660 / §15.4 / §28.9: condition (b) of the literal-tree aggregate — is
+// `lit`, targeting `collTy`, a literal whose element/value NODES are ALL fresh
+// nested collection literals, recursively?
+//
+// §15.4 (v0.237) is explicit that this shape is well-formed and why: "A fresh
+// producer of trivial-dispose class type remains admissible: it has no disposal
+// obligation to dangle — its storage is reclaimed with the instance by §28's
+// implementation-defined mechanism … which is what keeps this section's own
+// nested-literal examples well-formed: in the `groups` and `config` examples
+// below, the nested `Array<int>` and `Dictionary<string, int>` values are fresh
+// producers of trivial-dispose type (§28.9)." "Reclaimed with the instance" is
+// exactly the obligation this predicate identifies the extent of.
+//
+// Requirements, each of which is a soundness condition, not a convenience:
+//   * the OUTER must be borrowing-family. An `OwningDictionary`/`OwningArray`
+//     literal already owns its values; its own cascade frees them, so adding an
+//     interior free would double-free.
+//   * the NODE type must be a borrowing-family collection. An owning node would
+//     likewise be freed by its own cascade; and §15.4 rejects a fresh producer
+//     of NON-trivial-dispose type in a borrowing-family literal outright.
+//   * EVERY member must be a nested CollectionLiteralExpr. A borrowed member
+//     (`["a": [1], "b": cached]`) belongs to the binding that owns it —
+//     proposal 0077 §3: "borrowed elements … are never members and are never
+//     freed with it" — and freeing it here would double-free.
+bool Emitter::isLiteralTreeAggregate(const ast::CollectionLiteralExpr* lit,
+                                     const sema::TypeRef* collTy) {
+    if (!lit || !collTy) return false;
+    auto headOf = [](const sema::TypeRef* t) -> std::string_view {
+        return (t && t->astNode && t->astNode->name &&
+                !t->astNode->name->parts.empty())
+                   ? t->headName()
+                   : std::string_view{};
+    };
+    // A user-declared type is never one of the runtime-backed builtins below.
+    auto isBorrowingNodeColl = [&](const sema::TypeRef* t) {
+        if (!t || t->declaration || t->nullable) return false;
+        if (common::isOwningPrefixedName(headOf(t))) return false;
+        return isDictTypeName(t) || isLinkedListTypeName(t) ||
+               isCollectionTypeName(t);
+    };
+    if (collTy->declaration || common::isOwningPrefixedName(headOf(collTy)))
+        return false;
+    // The node position: a dictionary's VALUE, a sequence's ELEMENT.
+    const sema::TypeRef* nodeTy =
+        isDictTypeName(collTy)
+            ? ((collTy->genericArgs.size() > 1) ? collTy->genericArgs[1]
+                                                : nullptr)
+            : (!collTy->genericArgs.empty() ? collTy->genericArgs[0] : nullptr);
+    if (!isBorrowingNodeColl(nodeTy)) return false;  // no interior storage
+    if (lit->elements.empty()) return false;         // nothing to free
+    for (const auto& m : lit->elements) {
+        auto* nested =
+            dynamic_cast<const ast::CollectionLiteralExpr*>(m.get());
+        if (!nested) return false;  // a borrow / call result — not a member
+        // Recurse only where the node itself has collection-typed children; a
+        // leaf node (`Array<int>`) needs no interior free of its own, so an
+        // all-literal check one level down would be vacuous.
+        const sema::TypeRef* innerTy =
+            isDictTypeName(nodeTy)
+                ? ((nodeTy->genericArgs.size() > 1) ? nodeTy->genericArgs[1]
+                                                    : nullptr)
+                : (!nodeTy->genericArgs.empty() ? nodeTy->genericArgs[0]
+                                                : nullptr);
+        if (isBorrowingNodeColl(innerTy) &&
+            !isLiteralTreeAggregate(nested, nodeTy))
+            return false;
+    }
+    return true;
+}
+
+
+namespace {
+// fix #2660 / §15.4 / §28.6: condition (c) of the literal-tree aggregate — can
+// any INTERIOR node read out of the root outlive the root's scope?
+//
+// This is a SEPARATE walk from StringEscapeWalker on purpose. That walker tracks
+// only the root identifier and has no notion of values read out of it: it
+// classifies `var inner := groups["primes"];` and `return groups["primes"];` as
+// safe READS of `groups` (LlvmBackend_Setup.cpp, its IndexExpr arm hard-codes
+// safeRead=true for the receiver and does not propagate the incoming flag). Both
+// are verified to compile today with no diagnostic, so relying on that walker
+// alone would turn today's interior LEAK into a use-after-free.
+//
+// DEFAULT-DENY in both directions:
+//   * any mention of the root outside two whitelisted shapes ⇒ not safe;
+//   * any statement or expression kind this walk does not enumerate ⇒ not safe.
+// The consequence of a false negative is therefore a leak (today's behaviour),
+// never a dangle. `BindExpr` and `MarkedTransferExpr` — the two node kinds the
+// sibling walkers silently ignore — are simply not enumerated here, so they
+// deny.
+struct InteriorAliasWalker {
+    const sema::SemaContext& ctx;
+    const void* target;
+    bool safe = true;
+    // fix #2660: "does THIS expression's own value alias an interior node?",
+    // answered from the resolved expression TYPE. Supplied by the Emitter,
+    // whose collection-name predicates are private statics. Contract:
+    // DEFAULT-DENY — an unresolved or unrecognised type must answer true. A
+    // null callable is treated as "always yes" at every call site.
+    std::function<bool(const ast::Expr*)> mayYieldNode;
+
+    bool isTarget(const ast::Expr* e) const {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return false;
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
+        return loc && loc->decl &&
+               static_cast<const void*>(loc->decl) == target;
+    }
+
+    // Members of the ROOT that cannot yield an interior node. Deliberately
+    // excludes `Values` (yields the nodes) and every mutator (`Add`, `Insert`,
+    // `Remove`, `Clear`, the indexer set) — a mutator would grow or shrink the
+    // aggregate after construction, which proposal 0077 §3 resolution 5 forbids ("Aggregate
+    // membership never grows"), so denying here keeps membership == the literal.
+    static bool rootMemberCannotYieldNode(std::string_view m) {
+        return m == "Count" || m == "Length" || m == "IsEmpty" ||
+               m == "ContainsKey" || m == "ContainsValue" || m == "Contains" ||
+               m == "Keys";
+    }
+    // Members of an INTERIOR NODE that read a scalar and cannot retain the node.
+    static bool nodeMemberIsScalarRead(std::string_view m) {
+        return m == "Count" || m == "Length" || m == "IsEmpty";
+    }
+
+    // `nodeOk` is true only in a position where an interior-node VALUE is
+    // immediately consumed as a borrow that cannot outlive the statement: the
+    // target of a further index (`groups["a"][2]`) or of a scalar-read member
+    // (`groups["a"].Count`).
+    void expr(const ast::Expr* e, bool nodeOk) {
+        if (!e || !safe) return;
+        // Leaves: no identifiers, nothing to deny.
+        if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+            dynamic_cast<const ast::FloatLiteralExpr*>(e) ||
+            dynamic_cast<const ast::CharLiteralExpr*>(e) ||
+            dynamic_cast<const ast::StringLiteralExpr*>(e) ||
+            dynamic_cast<const ast::VerbatimStringExpr*>(e) ||
+            dynamic_cast<const ast::BoolLiteralExpr*>(e) ||
+            dynamic_cast<const ast::NullLiteralExpr*>(e) ||
+            dynamic_cast<const ast::UnitExpr*>(e) ||
+            dynamic_cast<const ast::TypeOfExpr*>(e) ||
+            dynamic_cast<const ast::NameOfExpr*>(e) ||
+            dynamic_cast<const ast::DefaultExpr*>(e))
+            return;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            // A BARE mention of the root: passed, aliased, returned, captured —
+            // the interior nodes go with it. Deny.
+            if (isTarget(id)) safe = false;
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            if (isTarget(ix->target.get())) {
+                // `root[k]`: for an aggregate root the element/value type IS a
+                // collection (isLiteralTreeAggregate requires it), so this
+                // always produces an interior node.
+                if (!nodeOk) { safe = false; return; }
+            } else {
+                // An index BASE is a borrow position: a node there is consumed
+                // to index through and is not retained, so it is admissible.
+                expr(ix->target.get(), /*nodeOk=*/true);
+                // …but THIS index's OWN result may itself be an interior node,
+                // and the branch above never sees it. With a CHAINED index the
+                // producing level's target is another index rather than the
+                // root identifier: at depth 3, `deep["x"]["a"]` is an interior
+                // `Array<int>` produced by the OUTER index. Deciding by
+                // syntactic position alone (the target of a further index) is
+                // only sound at depth 2 — it silently admitted
+                // `return deep["x"]["a"];`, which the aggregate free then
+                // reclaimed under the caller (verified: an ASan SEGV, not a
+                // quiet bad read). Gate on the result TYPE instead, which is
+                // depth-independent. DEFAULT-DENY: mayYieldNode answers "yes"
+                // for an unresolved type.
+                if (!nodeOk && (!mayYieldNode || mayYieldNode(e))) {
+                    safe = false;
+                    return;
+                }
+            }
+            for (auto& a : ix->indices) expr(a.value.get(), /*nodeOk=*/false);
+            return;
+        }
+        if (auto* m = dynamic_cast<const ast::MemberAccessExpr*>(e)) {
+            if (isTarget(m->target.get())) {
+                if (!rootMemberCannotYieldNode(m->member)) safe = false;
+                return;
+            }
+            expr(m->target.get(), nodeMemberIsScalarRead(m->member));
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            expr(c->callee.get(), /*nodeOk=*/false);
+            for (auto& a : c->args) expr(a.value.get(), /*nodeOk=*/false);
+            return;
+        }
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            expr(b->left.get(), false);
+            expr(b->right.get(), false);
+            return;
+        }
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(u->operand.get(), false);
+            return;
+        }
+        if (auto* cd = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(cd->condition.get(), false);
+            expr(cd->thenValue.get(), false);
+            expr(cd->elseValue.get(), false);
+            return;
+        }
+        if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {
+            expr(r->lo.get(), false);
+            expr(r->hi.get(), false);
+            expr(r->step.get(), false);
+            return;
+        }
+        if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(pb->operand.get(), false);
+            return;
+        }
+        if (auto* tt = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(tt->operand.get(), false);
+            return;
+        }
+        if (auto* isx = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            for (auto& part : isx->parts) expr(part.expr.get(), false);
+            return;
+        }
+        if (auto* ne = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : ne->args) expr(a.value.get(), false);
+            return;
+        }
+        if (auto* clx = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& k : clx->keys) expr(k.get(), false);
+            for (auto& el : clx->elements) expr(el.get(), false);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ast::ThrowExpr*>(e)) {
+            expr(th->operand.get(), false);
+            return;
+        }
+        // Every other expression kind — lambdas (capture), `case` expressions,
+        // `with`, binding atoms, `owned` transfer markers, null-conditional
+        // forms — denies. See the struct comment.
+        safe = false;
+    }
+
+    void stmts(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+        for (auto& s : body) { stmt(s.get()); if (!safe) return; }
+    }
+
+    // fix #2660 (send-back item 3): a `case` arm PATTERN is a container of
+    // expressions (ConstantPattern's alternatives, RangePattern's range,
+    // RelOpPattern's operand), and an unwalked container is allow-by-omission
+    // in a walk whose contract is "any mention outside the whitelisted shapes
+    // denies". No pattern that RETAINS an interior node is constructible today,
+    // so this closes a contract hole rather than a live defect — but the
+    // contract is the thing that makes the walk reviewable. Enumerated
+    // default-deny, same as expr()/stmt().
+    void pattern(const ast::Pattern* p) {
+        if (!p || !safe) return;
+        if (dynamic_cast<const ast::DiscardPattern*>(p) ||
+            dynamic_cast<const ast::NullPattern*>(p) ||
+            dynamic_cast<const ast::BindingPattern*>(p) ||
+            dynamic_cast<const ast::NamedPattern*>(p) ||
+            dynamic_cast<const ast::TypePattern*>(p))
+            return;  // carry no sub-expressions
+        if (auto* cp = dynamic_cast<const ast::ConstantPattern*>(p)) {
+            for (auto& c : cp->constants) expr(c.get(), /*nodeOk=*/false);
+            return;
+        }
+        if (auto* rp = dynamic_cast<const ast::RangePattern*>(p)) {
+            expr(rp->rangeExpr.get(), /*nodeOk=*/false);
+            return;
+        }
+        if (auto* rop = dynamic_cast<const ast::RelOpPattern*>(p)) {
+            expr(rop->expr.get(), /*nodeOk=*/false);
+            return;
+        }
+        if (auto* ap = dynamic_cast<const ast::AltPattern*>(p)) {
+            for (auto& m : ap->members) { pattern(m.get()); if (!safe) return; }
+            return;
+        }
+        if (auto* dp = dynamic_cast<const ast::DestructuringPattern*>(p)) {
+            for (auto& sp : dp->subPatterns) {
+                pattern(sp.pattern.get());
+                if (!safe) return;
+            }
+            return;
+        }
+        safe = false;  // unknown pattern kind — deny
+    }
+
+    void stmt(const ast::Stmt* s) {
+        if (!s || !safe) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            expr(ld->initializer.get(), false);
+            return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get(), false);
+            return;
+        }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            expr(r->value.get(), false);
+            return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get(), false);
+            return;
+        }
+        if (auto* th = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(th->value.get(), false);
+            return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // The LHS is walked with nodeOk=false on purpose: `groups["a"] := v`
+            // replaces an aggregate member, which membership-fixed-at-
+            // construction forbids (proposal 0077 §3, resolution 5) — deny.
+            expr(as->target.get(), false);
+            expr(as->value.get(), false);
+            return;
+        }
+        if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(s)) {
+            expr(inc->target.get(), false);
+            return;
+        }
+        if (auto* ds = dynamic_cast<const ast::DiscardStmt*>(s)) {
+            expr(ds->value.get(), false);
+            return;
+        }
+        if (auto* ys = dynamic_cast<const ast::YieldStmt*>(s)) {
+            expr(ys->value.get(), false);
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get(), false);
+            stmts(is->ifBranch.body);
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get(), false);
+                stmts(br.body);
+            }
+            stmts(is->elseBody);
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get(), false);
+            stmts(ws->body);
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            // Iterating the root binds each VALUE (an interior node) to the loop
+            // variable, which the walk cannot bound — nodeOk=false denies it.
+            expr(fs->iterable.get(), false);
+            expr(fs->withExpr.get(), false);
+            stmts(fs->body);
+            return;
+        }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            stmts(d->body);
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            stmts(ts->body);
+            for (auto& c : ts->catches) {
+                expr(c.guard.get(), false);
+                stmt(c.body.get());
+                if (!safe) return;
+            }
+            stmts(ts->finallyBody);
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get(), false);
+            for (auto& arm : cs->arms) {
+                pattern(arm.pattern.get());
+                expr(arm.guard.get(), false);
+                expr(arm.exprBody.get(), false);
+                stmts(arm.stmts);
+                if (!safe) return;
+            }
+            return;
+        }
+        if (dynamic_cast<const ast::BreakStmt*>(s) ||
+            dynamic_cast<const ast::ContinueStmt*>(s))
+            return;
+        safe = false;  // unknown statement kind — deny
+    }
+};
+}  // namespace
+
+bool Emitter::literalTreeInteriorAliasSafe(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const ast::LocalDecl* ld) const {
+    InteriorAliasWalker w{ctx_, static_cast<const void*>(ld)};
+    // fix #2660 (send-back): the depth-independent half of the gate. An
+    // expression aliases an interior node when its RESOLVED TYPE is one of the
+    // runtime-backed borrowing collections an aggregate node can be. Anything
+    // unresolved answers YES, per the walker's default-deny contract; a
+    // user-declared type answers NO because isLiteralTreeAggregate admits only
+    // declaration-less builtins as nodes.
+    w.mayYieldNode = [this](const ast::Expr* e) -> bool {
+        if (!e) return true;
+        const sema::TypeRef* t = ctx_.exprType(*e);
+        if (!t) return true;
+        if (t->declaration) return false;
+        return isDictTypeName(t) || isLinkedListTypeName(t) ||
+               isCollectionTypeName(t);
+    };
+    w.stmts(body);
+    return w.safe;
 }
 
 
@@ -19730,10 +20229,12 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         for (const auto& elemPtr : cl->elements) {
             if (!elemPtr) continue;
             llvm::Value* ev = nullptr;
+            // fix #2660: shared dispatcher (see the Array branch below) so a
+            // nested DICTIONARY element of a LinkedList literal materializes
+            // too, not only a nested sequence element. // per §15.4
             if (auto* nested = dynamic_cast<const ast::CollectionLiteralExpr*>(
                     elemPtr.get())) {
-                if (!nested->isDict && er)
-                    ev = materializeHeapCollectionLiteral(nested, er);
+                if (er) ev = materializeCollectionLiteralForArg(nested, er);
             }
             if (!ev) ev = lowerExpr(*elemPtr);
             if (!ev) {
@@ -19837,10 +20338,15 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
         // outer element type (genericArgs[0]). The inner array is a fresh owned
         // heap object stored (as a ptr) into the outer's slot, exactly as an
         // `inner` named local added via `.Add(inner)` would be.
+        // fix #2660: route through the shared dispatcher rather than
+        // materializeHeapCollectionLiteral directly, so a nested DICTIONARY
+        // element (`Array<Dictionary<string,int>> := [["a": 1]]`) materializes
+        // too — the old `!nested->isDict` guard declined it, leaving it to
+        // `lowerExpr` (null) and the #1386 guard below. Same §15.4 gap as the
+        // dictionary-value position, one level out.
         if (auto* nested =
                 dynamic_cast<const ast::CollectionLiteralExpr*>(elemPtr.get())) {
-            if (!nested->isDict && elemRef)
-                ev = materializeHeapCollectionLiteral(nested, elemRef);
+            if (elemRef) ev = materializeCollectionLiteralForArg(nested, elemRef);
         }
         if (!ev) ev = lowerExpr(*elemPtr);
         if (!ev) {
@@ -20520,7 +21026,28 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
     for (std::size_t i = 0; i < cl->keys.size(); ++i) {
         if (!cl->keys[i] || !cl->elements[i]) continue;
         llvm::Value* k = lowerExpr(*cl->keys[i]);
-        llvm::Value* v = lowerExpr(*cl->elements[i]);
+        // fix #2660 / §15.4: a NESTED collection literal in dictionary VALUE
+        // position — §15.4's own motivating examples, `Dictionary<string,
+        // Array<int>> := ["primes": [2,3,5,7]]` and `Dictionary<string,
+        // Dictionary<string,int>> := ["server": ["port": 8080]]`. `lowerExpr`
+        // returns null for a CollectionLiteralExpr (it is not a general
+        // expression value — it needs a target type), so the value fell
+        // straight into the #1386 internal-error guard below and the whole
+        // program failed to compile. Materialize the inner heap collection
+        // here against the outer's VALUE type (genericArgs[1]), exactly as the
+        // sequence-literal materializer already does for a nested sequence
+        // element (#465, materializeHeapCollectionLiteral). The shared
+        // dispatcher is used rather than a per-shape reimplementation so the
+        // inner node is bit-for-bit what `new` + `.Add` (or a named local of
+        // the same literal) builds: it routes a dict literal to this same
+        // function recursively and every sequence form to
+        // materializeHeapCollectionLiteral.
+        llvm::Value* v = nullptr;
+        if (auto* nestedVal = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                cl->elements[i].get())) {
+            if (valTy) v = materializeCollectionLiteralForArg(nestedVal, valTy);
+        }
+        if (!v) v = lowerExpr(*cl->elements[i]);
         if (!k || !v) {
             // #1386: ICE — lowerExpr returned null for a dict literal key or
             // value; the expression kind is not yet handled by codegen.
