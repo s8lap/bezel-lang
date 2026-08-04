@@ -2126,6 +2126,35 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             }
             gb.CreateStore(gb.getInt32(-3), sourceStateField);
         }
+        // fix #2609 / §27.5 / §28.9 (v0.236), retain 2-of-2 (the CLONE):
+        // the memcpy above ALIASED every closure-cell pointer into the clone,
+        // and — unlike the sync iterator, which emits a SEPARATE clone vtable
+        // whose Dispose runs with releaseClosures=false — the async iterator has
+        // ONE vtable, so the clone's Dispose is the very same function as the
+        // source's and will run the release loop too. Give the clone its own +1
+        // here so each frame releases exactly the reference it holds; without
+        // this, one `await for` (clone Dispose + source Dispose) would release
+        // the same cell twice — a double-free/UAF, strictly worse than the leak
+        // being fixed. Emitted through `gb` (this vtable body's OWN builder),
+        // never `builder_`, which points at a different function (the same
+        // cross-function-reference hazard the IOE block above documents);
+        // declareC only touches the module, so it is safe here.
+        {
+            auto* retainFnGE = declareC("bz_closure_retain",
+                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+            for (std::size_t i = 0; i < frame.captures.size(); ++i) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    frame.captures[i].first);
+                if (!ps) continue;                   // 'this' capture — skip
+                sema::TypeRef* pt = paramTypeOf(ps);
+                if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                llvm::Value* fptr =
+                    gb.CreateStructGEP(stateStructTy, clone, fieldIdx);
+                llvm::Value* cl = gb.CreateLoad(ptrTy(), fptr, "gae.clcap");
+                gb.CreateCall(retainFnGE, {cl});     // null-safe
+            }
+        }
         gb.CreateRet(clone);
     }
 
@@ -2153,6 +2182,30 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
             builder_.CreateStructGEP(stateStructTy, st, STATE_FIELD);
         builder_.CreateStore(builder_.getInt32(0), stateField);
         emitFrameCaptureStores(frame, st);
+        // fix #2609 / §27.5 / §28.9 (v0.236), retain 1-of-2 (the SOURCE frame):
+        // the async sibling of the sync iterator's capture-store retain (#1864,
+        // LlvmBackend_Iterators.cpp). A function-typed (`func`) parameter stored
+        // into the frame is a BORROW the frame must be able to invoke across
+        // every MoveNextAsync, i.e. it must outlive the producing call — so the
+        // frame takes its OWN +1 on the closure cell here, and the Dispose tail
+        // (emitFreeAndReturn's release loop) drops exactly that +1. Without the
+        // retain, releasing at Dispose would drop a reference the frame never
+        // owned (a UAF), which is why the call-site ARGUMENT-PASS release in
+        // lowerCall was previously scoped to sync-iterator callees only.
+        // bz_closure_retain is null-safe.
+        for (std::size_t ci = 0; ci < frame.captures.size(); ++ci) {
+            auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                frame.captures[ci].first);
+            if (!ps) continue;                       // 'this' capture — skip
+            sema::TypeRef* pt = paramTypeOf(ps);
+            if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+            unsigned fieldIdx = frame.captureStart + (unsigned)ci;
+            llvm::Value* fptr =
+                builder_.CreateStructGEP(stateStructTy, st, fieldIdx);
+            llvm::Value* cl =
+                builder_.CreateLoad(ptrTy(), fptr, "asynciter.clcap");
+            emitClosureRetain(cl);
+        }
         builder_.CreateRet(st);
     }
 
@@ -2613,6 +2666,35 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
                     builder_.CreateBr(lcontBB);
                     builder_.SetInsertPoint(lcontBB);
                 }
+            }
+            // fix #2609 / §27.5 / §28.9 (v0.236): drop THIS frame's +1 on each
+            // function-typed (`func`) parameter capture — the async sibling of
+            // the sync iterator's releaseClosureCaptures (#1864,
+            // LlvmBackend_Iterators.cpp:1715). Paired 1:1 with the two retains
+            // above (construction entry for the source frame, GetAsyncEnumerator
+            // for each clone), so every frame that reaches Dispose releases
+            // exactly the one reference it took. Runs AFTER the owned-param and
+            // owned-local sweeps and BEFORE the spill/frame free, matching the
+            // sync Dispose's ordering. The field is NOT nulled: unlike an owned
+            // object, a released closure cell may still be live (another frame
+            // or the caller can hold a reference) and the slot is dead the
+            // instant the frame is freed on the next two lines. Owned-class
+            // params (the iteratorAutoDispose loop above) and function-typed
+            // params are DISJOINT sets — an `owned` parameter has a Named class
+            // type, never Kind::Function — so the two loops never touch the same
+            // field. bz_closure_release is null-safe, so a capture the frame
+            // never received (null slot) is a no-op.
+            for (std::size_t i = frame.captures.size(); i-- > 0;) {
+                auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                    frame.captures[i].first);
+                if (!ps) continue;                   // 'this' capture — skip
+                sema::TypeRef* pt = paramTypeOf(ps);
+                if (!pt || pt->kind != sema::TypeRef::Kind::Function) continue;
+                unsigned fieldIdx = frame.captureStart + (unsigned)i;
+                llvm::Value* fptr =
+                    builder_.CreateStructGEP(stateStructTy, self, fieldIdx);
+                llvm::Value* cl = builder_.CreateLoad(ptrTy(), fptr, "aitc.cl");
+                emitClosureRelease(cl);   // null-safe
             }
             // Free the spill area first (null-safe: free(null) is a no-op).
             llvm::Value* spillField2 =

@@ -7338,18 +7338,35 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // reference must therefore be released once the call returns — otherwise the
     // cell leaks (LSan: 40 bytes, #1864) after the frame that borrowed-and-
     // retained it is torn down. This is the closure analogue of the #429 string
-    // ARGUMENT-PASS release below, scoped to sync-iterator callees — the only
-    // closure sink whose frame-capture retain this fix arms (an async iterator
-    // or a closure-returning method is left as-is; its capture/return is not
-    // retained here, so releasing would UAF). Snapshot the closure values BEFORE
+    // ARGUMENT-PASS release below, scoped to ITERATOR callees — the only closure
+    // sink whose frame-capture retain is armed (a closure-returning method is
+    // left as-is; its return is not retained here, so releasing would UAF).
+    // Snapshot the closure values BEFORE
     // emitMethodCall (which may rewrite `args` for nullable widening) and release
     // AFTER, on the normal path only (an exception path leaks the temporary — the
     // safe direction, matching the string block's `!diverged_` guard).
+    //
+    // fix #2609 / §27.5 / §28.9 (v0.236): the ASYNC iterator is now armed too.
+    // Its frame takes the same +1 at construction and each GetAsyncEnumerator
+    // clone takes its own, and the async Dispose tail
+    // (LlvmBackend_Async.cpp emitFreeAndReturn) drops it — so the producer's
+    // transient reference is now exactly the reference nothing else drops, and
+    // releasing it here is what closes the 52-byte leak (cell + env + captured
+    // cell) the async path had. The callee predicate MUST match
+    // Emitter::emitMethod's async-iterator ROUTING exactly (LlvmBackend_Setup.cpp
+    // rules 1 and 2) — `async` + Block body + (a yield OR an async-iterator
+    // return type) — because rule 2 routes a yield-less `async … :
+    // IAsyncEnumerable<T>` body to emitAsyncIteratorMethod too, and that frame
+    // carries the retain. A plain (non-iterator) async method is still excluded:
+    // its frame does NOT retain, so releasing here would UAF.
     std::vector<llvm::Value*> syncIterClosureArgs;
     if (auto* mdIt = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
-        if (!isAsyncMethod(ms) &&
-                mdIt->bodyKind == ast::MethodBodyKind::Block &&
-                containsYield(mdIt->stmts)) {
+        const bool isIterCallee =
+            mdIt->bodyKind == ast::MethodBodyKind::Block &&
+            (isAsyncMethod(ms) ? (containsYield(mdIt->stmts) ||
+                                  returnsAsyncIteratorType(ms))
+                               : containsYield(mdIt->stmts));
+        if (isIterCallee) {
             std::size_t clOffset = isStaticMethod(ms) ? 0 : 1;
             for (std::size_t ai = clOffset;
                  ai < args.size() && ai < argExprs.size(); ++ai)
@@ -7510,8 +7527,10 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // #2305 commit extends the cleanup to BOTH vector sets (the #1864
     // sync-iterator release is a #2305 residual, its normal-edge-only release
     // was widened to the unwind edge here too). The two vectors are disjoint
-    // — syncIterClosureArgs is gated to a sync-iterator callee, the
-    // call-bounded arm excludes sync-iterator callees — so combining them
+    // — syncIterClosureArgs is gated to an ITERATOR callee (sync, or, per #2609,
+    // async), and the call-bounded arm excludes BOTH (`!isSyncIterCallee` drops
+    // the sync iterators, `!isAsyncMethod(ms)` drops every async callee, async
+    // iterators included) — so combining them
     // never double-releases. See Emitter::closureArgUnwindCleanup for the
     // exactly-once argument.
     llvm::BasicBlock* savedClArgUnwind = unwindTarget_;
