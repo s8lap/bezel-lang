@@ -2824,6 +2824,183 @@ llvm::Function* Emitter::dictValueBoxFreer(const sema::TypeRef* dictTy) {
 }
 
 
+// fix #2660 / §15.4 / §28.9 / §28.11: build (once per node TypeRef, cached) a
+// `void(void*)` thunk that reclaims ONE interior node of a literal-tree
+// aggregate — a nested collection literal that §15.4's own `groups`/`config`
+// examples put in a dictionary VALUE or sequence ELEMENT slot.
+//
+// The argument is the node pointer as the runtime stores it: `bz_dict_free`
+// calls `dispose_val(e.val)` and `bz_array_free` calls
+// `dispose_elem(((void**)arr->data)[i])`, both already null-guarded, and both
+// pass the stored pointer itself (a nested collection is stored by pointer —
+// materializeHeapDictLiteral's `encodeVal` returns a pointer value unchanged).
+//
+// The node's OWN per-element disposer is derived here by exactly the rules
+// buildCollectionTempDisposal applies to a named local of the same type — a
+// string element/value keeps its +1 release, a record value keeps its box free —
+// and RECURSES for a node whose own elements are nodes (`Dictionary<string,
+// Dictionary<string, Array<int>>>`). That recursion is sound only because
+// isLiteralTreeAggregate verified the same tree shape on the AST at the same
+// depths; the two must stay in step.
+//
+// Returns null for any node shape that cannot be expressed as a single thunk —
+// an owning family (its own cascade already frees it: freeing here would be a
+// double free), and a string-keyed `Set` (whose reclaim needs the pre-free
+// dictStringKeys pass, which is a Disposal flag, not a thunk). The caller then
+// installs no interior disposer and the node leaks, which is this whole file's
+// standing safe direction.
+llvm::Function* Emitter::collectionNodeFreeThunk(const sema::TypeRef* nodeTy) {
+    if (!nodeTy || nodeTy->declaration || nodeTy->nullable) return nullptr;
+    auto cached = collectionNodeFreeThunks_.find(nodeTy);
+    if (cached != collectionNodeFreeThunks_.end()) return cached->second;
+
+    std::string_view head =
+        (nodeTy->astNode && nodeTy->astNode->name &&
+         !nodeTy->astNode->name->parts.empty())
+            ? nodeTy->headName()
+            : std::string_view{};
+    if (head.empty() || common::isOwningPrefixedName(head)) return nullptr;
+
+    auto isStrElem = [&](const sema::TypeRef* el) {
+        if (!el || el->nullable) return false;
+        ElementPolicy p = elementPolicyFor(el, /*owning=*/false);
+        return p.cat == ElementPolicy::Category::RuntimeManaged &&
+               el->kind == sema::TypeRef::Kind::Primitive &&
+               el->primitive == sema::PrimitiveType::String;
+    };
+
+    // Which runtime free, and what this node owes for each of its own slots.
+    const char* freeName = nullptr;
+    const sema::TypeRef* childTy = nullptr;
+    bool childIsDictValue = false;
+    if (isLinkedListTypeName(nodeTy)) {
+        freeName = "bz_llist_free";
+        childTy = !nodeTy->genericArgs.empty() ? nodeTy->genericArgs[0] : nullptr;
+    } else if (isDictTypeName(nodeTy)) {
+        freeName = "bz_dict_free";
+        childTy = (nodeTy->genericArgs.size() > 1) ? nodeTy->genericArgs[1]
+                                                   : nullptr;
+        childIsDictValue = true;
+    } else if (isCollectionTypeName(nodeTy)) {
+        const sema::TypeRef* el =
+            !nodeTy->genericArgs.empty() ? nodeTy->genericArgs[0] : nullptr;
+        bool dictBacked = (head == "Set") &&
+            genericBackingType(nodeTy, 0, /*isSet=*/true, nullptr) != nullptr;
+        if (dictBacked) {
+            // A string-element Set stores its elements as KEYS; their +1 release
+            // is Disposal::dictStringKeys, which has no thunk form — decline.
+            if (isStrElem(el)) return nullptr;
+            freeName = "bz_dict_free";
+            childTy = nullptr;
+        } else {
+            freeName = "bz_array_free";
+            childTy = el;
+        }
+    } else {
+        return nullptr;  // not a runtime-backed collection node
+    }
+
+    auto* fnTy = llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy()}, /*isVarArg=*/false);
+    auto* fn = llvm::Function::Create(
+        fnTy, llvm::Function::InternalLinkage,
+        "bz$litNodeFree$" + std::string(head), module_.get());
+    // Register BEFORE deriving the child disposer: a node type reachable from
+    // its own element type would otherwise recurse forever.
+    collectionNodeFreeThunks_[nodeTy] = fn;
+
+    llvm::Function* childDisposer = nullptr;
+    if (childTy) {
+        childDisposer = elementPolicyFor(childTy, /*owning=*/false).disposerThunk;
+        if (!childDisposer && childIsDictValue)
+            childDisposer = dictValueBoxFreer(nodeTy);
+        // A string child gets the +1 release ONLY where the construction side
+        // took a matching retain — pairing a release with a non-retaining
+        // constructor makes the container consume a +1 it never took.
+        //
+        // Which construction arms retain a string child (all in
+        // LlvmBackend_Setup.cpp):
+        //   * Array/Stack/Queue element — `litIsStrArr` in
+        //     materializeHeapCollectionLiteral.            → RETAINS
+        //   * Dictionary/SortedDictionary VALUE —
+        //     `dictIsStringValue` in materializeHeapDictLiteral, added by
+        //     fix #2682.                                   → RETAINS (was not)
+        //   * LinkedList/OwningLinkedList element —
+        //     the bz_llist_add_last arm, which deliberately mirrors `.AddLast`
+        //     (no retain on ANY LinkedList insert path).   → does NOT retain
+        //
+        // fix #2682 REVERTS the #2660 narrowing for the dictionary-value arm.
+        // #2660 had to free an interior `Dictionary<K,string>` node with a NULL
+        // child disposer because the construction side took no retain, so
+        // installing the release here would have made a flat container and an
+        // interior node sharing one string double-free — and that program did
+        // not compile at all before #2660, so it would have been a NEWLY
+        // reachable crash. #2682 fixed the construction side (the interior node
+        // is materialized by the very same materializeHeapDictLiteral), so the
+        // release is now the balanced half of a real retain and the bounded
+        // string leak that narrowing cost is gone.
+        //
+        // LinkedList stays excluded: no LinkedList insert path retains, so a
+        // release here would still be unpaired. That leaves an interior
+        // `LinkedList<string>` node leaking its strings — the same bounded leak,
+        // preferred over a use-after-free, and tracked separately.
+        bool strChildRetainedAtConstruction =
+            !isLinkedListTypeName(nodeTy) &&
+            (childIsDictValue
+                 ? (head == "Dictionary" || head == "SortedDictionary")
+                 : (head == "Array" || head == "Stack" || head == "Queue"));
+        if (!childDisposer && isStrElem(childTy) && strChildRetainedAtConstruction)
+            childDisposer = stringElementReleaseThunk();
+        // The child is itself an aggregate node (`Dictionary<string,
+        // Dictionary<string,int>>`): recurse.
+        if (!childDisposer)
+            childDisposer = collectionNodeFreeThunk(childTy);
+    }
+
+    llvm::Argument* node = &*fn->args().begin();
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+    llvm::IRBuilder<> b(entry);
+    auto* freeFn = declareC(freeName, llvm::Type::getVoidTy(llvm_),
+                            {ptrTy(), ptrTy()});
+    llvm::Value* childArg =
+        childDisposer ? llvm::cast<llvm::Value>(childDisposer)
+                      : llvm::cast<llvm::Value>(
+                            llvm::ConstantPointerNull::get(ptrTy()));
+    // Every one of the three runtime frees no-ops on a null pointer.
+    b.CreateCall(freeFn, {node, childArg});
+    b.CreateRetVoid();
+    return fn;
+}
+
+
+// fix #2660: the single entry point the three literal-root disposal-registration
+// sites use (plain-`var` sequence literal, plain-`var` dictionary literal, and
+// `using var` via registerUsingDisposal). Returns the interior-node disposer to
+// install on the root's Disposal when `declNode` is a PROVEN literal-tree
+// aggregate root, null otherwise. The eligibility set is computed per function
+// body by collectBorrowingArrayFreeEligible, so it is read only while emitting
+// the body it was computed for — the same staleness guard the #2143 flat set
+// carries. `dictLiteralFreeEligibleFn_` is reused as that guard rather than
+// adding a sixth parallel guard member; for that reuse to be honest the
+// aggregate set must be cleared at every site that pins the guard, including
+// the two that pin it WITHOUT running the collect pass (the non-block-body
+// setup in LlvmBackend_Setup.cpp and the expression-bodied-lambda branch in
+// LlvmBackend_Async.cpp), and saved/restored around emitAsyncLambda in
+// LlvmBackend_Exprs2.cpp alongside the flat sets. All four are wired.
+llvm::Function* Emitter::literalTreeNodeDisposerFor(const ast::Node* declNode,
+                                                    const sema::TypeRef* collTy) {
+    if (!declNode || !collTy) return nullptr;
+    if (currentFn_ != dictLiteralFreeEligibleFn_) return nullptr;
+    if (!literalTreeAggregateEligible_.count(static_cast<const void*>(declNode)))
+        return nullptr;
+    const sema::TypeRef* nodeTy =
+        isDictTypeName(collTy)
+            ? ((collTy->genericArgs.size() > 1) ? collTy->genericArgs[1] : nullptr)
+            : (!collTy->genericArgs.empty() ? collTy->genericArgs[0] : nullptr);
+    return collectionNodeFreeThunk(nodeTy);
+}
+
+
 // #816 / §28.5: build (once per instantiation, cached) the specialized CORE
 // disposer for a class `ts` reached as the BASE of a specialized derived class,
 // with the current genericSubst_ active. Mirrors the core half of

@@ -8214,59 +8214,15 @@ void ExprTC::runMethodBody(
 // (declared, or a captured `owned` primary-constructor parameter, §22.10),
 // anywhere from `decl` up through its base classes? This is the same test
 // visitStmt's ExpressionStmt arm applies inline for the §21.9 bare-discard
-// check (below in this file); duplicated here as a standalone predicate
-// rather than shared, since that walk is not exposed as a callable, but both
-// apply the same §28.9 trivial-dispose classification. Cycle-guarded
-// (mirrors the #1624 precedent) so a malformed base-type graph that
-// survives error recovery cannot hang the compiler.
+// check (below in this file).
+//
+// #2654: the walk itself now lives in `common::isNonTrivialDisposeClass`
+// (src/common/OwnershipFacts.cpp) so the ownership pass's §28.3 auto-drop
+// warning gate consults the SAME classification rather than a third inlined
+// copy. This member is a thin delegating wrapper — every call site here is
+// unchanged, and the relocated body is verbatim.
 bool ExprTC::isNonTrivialDisposeClass(TypeSymbol* decl) const {
-    bool reject = false;
-    std::unordered_set<const TypeSymbol*> visitedBase;
-    const std::size_t kMaxWalk = 4096;  // defensive; base chains are shallow
-    std::size_t walked = 0;
-    for (TypeSymbol* cur = decl; cur && !reject;) {
-        if (++walked > kMaxWalk) break;
-        if (!visitedBase.insert(cur).second) break;  // cycle guard (#1624)
-        for (Symbol* m : cur->members) {
-            if (dynamic_cast<DestructorSymbol*>(m)) {
-                reject = true;
-                break;
-            }
-            auto* fs = dynamic_cast<FieldSymbol*>(m);
-            if (!fs) continue;
-            if (fs->posParam) {
-                if (fs->parent &&
-                    fs->parent->kind == ast::TypeDeclKind::Class &&
-                    fs->posParam->modifier == "owned" &&
-                    fs->posParamBodyRef && !fs->posParamInitRef) {
-                    reject = true;
-                    break;
-                }
-                continue;
-            }
-            // A `static owned` field (§22.12 rule 4) is disposed at
-            // process-exit order (§22.13), not by this instance's Dispose()
-            // — exclude it, or a class whose only `owned` member is static
-            // would be wrongly classified non-trivial-dispose here.
-            bool isStatic = false, isOwned = false;
-            for (auto mod : fs->modifiers) {
-                if (mod == "static") isStatic = true;
-                if (mod == "owned") isOwned = true;
-            }
-            if (isOwned && !isStatic) {
-                reject = true;
-                break;
-            }
-        }
-        TypeSymbol* nextBase = nullptr;
-        for (TypeSymbol* b : cur->baseTypes)
-            if (b && b->kind == ast::TypeDeclKind::Class) {
-                nextBase = b;
-                break;
-            }
-        cur = nextBase;
-    }
-    return reject;
+    return common::isNonTrivialDisposeClass(decl);
 }
 
 // §22.5 v0.184 (issue #1684): is `e` a fresh owned-producing expression —
@@ -9612,6 +9568,11 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             if (ownedProduced) {
                 const TypeRef* t = ctx_.exprType(*es->expr);
                 bool reject = subDrop;
+                // fix #2655 / §28.3 / §28.9 (v0.237): set only when the walk
+                // below RUNS and finds the produced class TRIVIAL-dispose —
+                // see the stamp beside the `reject` diagnostic for why this
+                // must be a separate flag rather than plain `!reject`.
+                bool trivialDisposeProducer = false;
                 if (t && t->kind == TypeRef::Kind::InlineArray && t->arrayOwned) {
                     reject = true;
                 } else if (t && !t->nullable &&
@@ -9695,6 +9656,13 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                             }
                         cur = nextBase;
                     }
+                    // fix #2655 / §28.3 / §28.9 (v0.237): the walk above just
+                    // ran to completion on a Named, non-nullable, non-value-
+                    // builtin CLASS and found no destructor and no instance
+                    // `owned` member — i.e. this producer's type is
+                    // TRIVIAL-DISPOSE (§28.9's derived-property computation, as
+                    // this section computes it).
+                    trivialDisposeProducer = !reject;
                 }
                 if (reject) {
                     ctx_.diagnostics().report(
@@ -9704,6 +9672,50 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         "owning array); discarding it as a statement leaks the "
                         "resource — bind it (`using var _ := expression;`), call "
                         "`.Dispose()`, or transfer it (`move`/`return`) (§21.9)");
+                } else if (trivialDisposeProducer) {
+                    // fix #2655 / §21.9 / §28.3 / §28.9 (v0.237): a bare
+                    // owned-producer statement whose value is TRIVIAL-dispose is
+                    // an *unbound owned temporary* (§28.3: "an unnamed owned
+                    // temporary … is reclaimed automatically once the expression
+                    // that produced it is finished with it"), with the boundary
+                    // this very section fixes ("in an expression statement, 'end
+                    // of the full expression' and 'end of the statement'
+                    // coincide"). It leaked outright — codegen lowered side
+                    // effects only — while the SAME statement plus §17.13's
+                    // cosmetic discard sink (`_ := new Box();`) has been freed
+                    // since #1009. Mark it so codegen emits that free.
+                    //
+                    // THE FLAG IS SET HERE, IN §21.9's OWN WALK, ON PURPOSE.
+                    // The free is scoped to trivial-dispose — §28.9 delegates
+                    // exactly those instances' reclaim to "an implementation-
+                    // defined mechanism … that runs no user code", which this
+                    // free is a legal choice of. Deciding it in the ownership
+                    // pass instead (the first draft) gated on
+                    // `producerState == Owned`, which correctly excludes borrows
+                    // but is FAR WIDER than this section's `ownedProduced`: it
+                    // also admits unannotated static factories (#1499), IMPORTED
+                    // `owned` returns (#1415 — `ms->decl` is null so the
+                    // `MethodDecl` cast above yields null), extern/FFI (#1718),
+                    // function-value calls (#1290), `Deserialize`/`TakeCurrent`
+                    // (#1388), Pattern B `await`, operator results (#965), `??`
+                    // (#1029), arm-meet (#1661) and `move x` — each reachable
+                    // because ExpressionStmt is the parser's general fallback for
+                    // any expression + `;`. Since §21.9's hard error does NOT
+                    // fire on those, a non-trivial-dispose class could reach the
+                    // free and `dynamicDispose` would run its USER DESTRUCTOR at
+                    // end of statement — contradicting the §28.9 sentence the fix
+                    // rests on. Deriving the flag from `trivialDisposeProducer`
+                    // makes the freed set a strict SUBSET of what this section
+                    // has already inspected and declined to reject, so the two
+                    // can never disagree; when §21.9's under-rejection is fixed
+                    // (filed separately) both widen together, by construction.
+                    //
+                    // Note `!reject` alone would be wrong: `reject` is also false
+                    // when the walk never ran (a nullable, interface-typed, or
+                    // decl-null producer falls past both arms), and those have no
+                    // trivial-dispose verdict at all. They keep leaking — the
+                    // safe direction — and are part of the same filed defect.
+                    const_cast<ast::ExpressionStmt*>(es)->disposeOwnedValue = true;
                 }
             }
         }

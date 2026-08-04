@@ -286,10 +286,25 @@ BEZEL_TEST(codegen_span_slice_one_arg_2312, range_operand_does_not_miscompile) {
         "  var bad := ros.Slice(1..<3); "
         "  return bad.Length; "));
     if (aotWasSkipped(r)) return;
-    // Not lowered => the slot degrades to zero (#2434). The assertion that
-    // matters is the NEGATIVE one: it must never answer 2 (a truncated range
-    // read as start=1,length=2) or any other plausible slice length.
-    if (r.ran) BEZEL_EXPECT_EQ(r.exitCode, 0);
+    // Pin the CURRENT behaviour precisely rather than accepting anything.
+    //
+    // An earlier draft wrote `if (r.ran) EXPECT_EQ(exitCode, 0);` with no
+    // further assertion, which silently tolerated three different outcomes — a
+    // compile failure, a crash, and the degrade-to-zero — so it would not have
+    // noticed `Slice(Range)` later becoming a hard reject or starting to
+    // segfault. Today it RUNS and answers 0 (the operand does not lower, so the
+    // local degrades to zero per #2434), and that is asserted outright.
+    //
+    // The load-bearing assertion is the NEGATIVE one implied by it: the answer
+    // must never be 2, which is what a `{i32,i32}` Range truncated to its first
+    // field (start=1) and used as a slice start would plausibly produce.
+    //
+    // If #2662 is settled, this test SHOULD fail — that is the point. Replace
+    // it with an assertion on the sliced VALUES if the overload becomes
+    // supported, or with a diagnostic-TEXT assertion if it becomes a reject.
+    // Do not relax it back into accepting every outcome.
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 0);
 }
 
 // ---------------------------------------------------------------------------

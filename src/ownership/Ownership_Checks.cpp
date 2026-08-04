@@ -65,24 +65,90 @@ namespace {
 // mirroring the ConstructorSymbol scan and TypeResolution_Checks' own primary-
 // ctor handling (a user-declared convenience ctor of the same arity takes
 // precedence — it is what overload resolution binds).
-const std::vector<ast::Param>* resolveCtorParams(const ast::NewExpr& ne,
-                                                 sema::SemaContext& ctx) {
-    if (!ne.type) return nullptr;
+//
+// fix #2659 (§22.3 / §2.5, v0.237): the ConstructorSymbol scan below used to
+// require `dynamic_cast<const ast::ConstructorDecl*>(cs->decl)`, which is NULL
+// for EVERY IMPORTED constructor — ModuleLoader reconstructs a
+// `ConstructorSymbol` from dependency metadata with no AST at all, keeping the
+// formals only as `ParameterSymbol`s (see sema::formalParamModifier). The
+// `ast::TypeDecl` fallback is null cross-module for the same reason, so an
+// imported constructor resolved to NOTHING and every consumer of this function
+// behaved as if the type had no `owned` formals. That single null gated BOTH
+// halves of the call-site `owned` logic in handleDischarge:
+//   * `new Imported(owned r)` — the marker was reported spurious (a FALSE
+//     REJECT of code that is legal, and that §22.3 in fact makes MANDATORY on
+//     a named owned binding);
+//   * `new Imported(r)` — the unmarked spelling reached neither the
+//     missing-marker report nor the "bare identifier to an `owned` formal =
+//     implicit transfer" `markMovedByName`, so it compiled CLEAN with the
+//     transfer UNRECORDED: the caller still auto-drops `r` at scope end while
+//     the callee also disposes it. A DOUBLE FREE (observed: SIGSEGV on the
+//     plain AOT path, the second disposal loading a vtable pointer out of
+//     already-`free`d memory).
+// `CtorFormals` therefore abstracts over the three sources a constructor's
+// formal list can have, and is written in the shape of the shared accessor
+// #2374 proposes (`sema::formalParamModifier`), which it calls for the two
+// ConstructorSymbol-backed sources.
+struct CtorFormals {
+    // Local: a user `constructor(...)`'s params, or a class PRIMARY
+    // constructor's positionalFields (#1627 — those live on the TypeDecl and
+    // are never a ConstructorSymbol member).
+    const std::vector<ast::Param>* declParams = nullptr;
+    // Imported (or local-with-decl): the resolved ConstructorSymbol. Read
+    // through sema::formalParamModifier / formalParamName, which prefer the
+    // ast::ConstructorDecl when it exists and fall back to ParameterSymbol.
+    const sema::ConstructorSymbol* ctorSym = nullptr;
+
+    bool valid() const { return declParams || ctorSym; }
+    std::size_t size() const {
+        if (declParams) return declParams->size();
+        return ctorSym ? sema::formalParamCount(*ctorSym) : 0;
+    }
+    std::string_view modifier(std::size_t i) const {
+        if (declParams) return i < declParams->size() ? (*declParams)[i].modifier
+                                                      : std::string_view{};
+        return ctorSym ? sema::formalParamModifier(*ctorSym, i)
+                       : std::string_view{};
+    }
+    std::string_view name(std::size_t i) const {
+        if (declParams)
+            return i < declParams->size() ? (*declParams)[i].name
+                                          : std::string_view{};
+        return ctorSym ? sema::formalParamName(*ctorSym, i)
+                       : std::string_view{};
+    }
+};
+
+CtorFormals resolveCtorParams(const ast::NewExpr& ne, sema::SemaContext& ctx) {
+    if (!ne.type) return {};
     const sema::TypeRef* rt = ctx.resolvedType(*ne.type);
-    if (!rt || !rt->declaration) return nullptr;
+    if (!rt || !rt->declaration) return {};
     const std::size_t nArgs = ne.args.size();
+    // Arity-matched scan, unchanged for a locally declared constructor. An
+    // IMPORTED constructor takes the same arity rule off the reconstructed
+    // ParameterSymbol list — the only way to match it, and the same rule
+    // codegen's ctorForArgs applies.
     for (sema::Symbol* m : rt->declaration->members) {
         if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m)) {
-            auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
-            if (d && d->params.size() == nArgs) return &d->params;
+            if (cs->isStatic) continue;  // §22.7: not part of the call surface
+            if (sema::formalParamCount(*cs) != nArgs) continue;
+            CtorFormals f;
+            if (auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
+                f.declParams = &d->params;
+            else
+                f.ctorSym = cs;
+            return f;
         }
     }
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(rt->declaration->decl)) {
         if (td->kind == ast::TypeDeclKind::Class && td->hasPositionalFields &&
-            td->positionalFields.size() == nArgs)
-            return &td->positionalFields;
+            td->positionalFields.size() == nArgs) {
+            CtorFormals f;
+            f.declParams = &td->positionalFields;
+            return f;
+        }
     }
-    return nullptr;
+    return {};
 }
 
 // §22.5 (v0.184, #1973): the parameter index the argument at source position
@@ -119,6 +185,23 @@ std::size_t boundParamIndex(const std::vector<ast::CallArgument>& args,
     }
     for (std::size_t j = 0; j < params.size(); ++j)
         if (params[j].name == a.name) return j;
+    return params.size();
+}
+
+// #2659: the same §22.5 binding over a resolved CONSTRUCTOR formal list, which
+// may be imported (no ast::Param to index). Identical rule; the only difference
+// is where the formal's name comes from.
+std::size_t boundParamIndex(const std::vector<ast::CallArgument>& args,
+                            std::size_t argIdx, const CtorFormals& params) {
+    const ast::CallArgument& a = args[argIdx];
+    if (a.name.empty()) {
+        std::size_t slot = 0;
+        for (std::size_t k = 0; k < argIdx; ++k)
+            if (args[k].name.empty()) ++slot;
+        return slot;
+    }
+    for (std::size_t j = 0; j < params.size(); ++j)
+        if (params.name(j) == a.name) return j;
     return params.size();
 }
 } // namespace
@@ -174,8 +257,9 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
     if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
         // §28.8 / §22.10: resolve the ctor parameter list to detect implicit
         // owned params — including a class PRIMARY constructor's `owned` params,
-        // which live on the TypeDecl, not a ConstructorSymbol member (#1627).
-        const std::vector<ast::Param>* ctorParams = resolveCtorParams(*ne, ctx_);
+        // which live on the TypeDecl, not a ConstructorSymbol member (#1627) —
+        // and an IMPORTED constructor's, which live on ParameterSymbols (#2659).
+        const CtorFormals ctorParams = resolveCtorParams(*ne, ctx_);
         // §28.13 / stdlib §2.16 (#603): `new Shared<T>(value)` is a builtin
         // type with no user ConstructorDecl. Its sole constructor takes an
         // `owned value: T` at position 0 (per stdlib §2.16). Detect this so
@@ -236,10 +320,11 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
             // §22.5 (v0.184, #1973): key off the BOUND ctor parameter (named-arg
             // binding), not the source position — see boundParamIndex.
             const std::size_t boundPos =
-                ctorParams ? boundParamIndex(ne->args, pos, *ctorParams) : pos;
+                ctorParams.valid() ? boundParamIndex(ne->args, pos, ctorParams)
+                                   : pos;
             const bool ctorOwnedSink =
-                ctorParams && boundPos < ctorParams->size() &&
-                (*ctorParams)[boundPos].modifier == "owned";
+                ctorParams.valid() && boundPos < ctorParams.size() &&
+                ctorParams.modifier(boundPos) == "owned";
             const bool ownedSink =
                 ctorOwnedSink || (isSharedNew && pos == 0);
             // §22.3 (v0.169, #1348): the `owned` marker is only valid on an
@@ -321,7 +406,16 @@ void MethodOwnership::recordMovesIn(const ast::Expr& e) {
         // silent leak (root cause of #2429; found during #2411's adversarial
         // self-pass). Uses the ctorParams-taking overload since a NewExpr
         // has no "callee" Expr to resolve a parameter list from.
-        markOutOwnedArgs(ne->args, ctorParams);
+        //
+        // #2659 scoping note: this passes only the ast-backed formals, so an
+        // IMPORTED constructor's `out owned` recipient is still not marked —
+        // exactly as before this fix (resolveCtorParams returned null for every
+        // imported ctor, so nothing here changes for that shape). Extending it
+        // means threading CtorFormals through markOutOwnedArgsCore and arming
+        // the §28.3 owned-OUT dataflow for a cross-module shape no oracle here
+        // can check for a leak or a double-dispose, so it is left to #2668's
+        // out-owned family rather than done blind. Filed, not silently skipped.
+        markOutOwnedArgs(ne->args, ctorParams.declParams);
         return;
     }
 }
@@ -1124,7 +1218,7 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
         // Without this fallback a NAMED owned local passed to an `owned` primary-
         // ctor parameter (`new Holder(x)`) is never marked moved-from, so both
         // the caller and the constructed object dispose it (double-free).
-        const std::vector<ast::Param>* ctorParams = resolveCtorParams(*ne, ctx_);
+        const CtorFormals ctorParams = resolveCtorParams(*ne, ctx_);
         std::size_t pos = 0;
         for (const auto& a : ne->args) {
             if (!a.value) { ++pos; continue; }
@@ -1137,9 +1231,9 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
             // the consumption logic below is unchanged. An owned sink here is a
             // ctor `owned` (or `out owned`) formal.
             const bool ctorOwnedSink =
-                ctorParams && pos < ctorParams->size() &&
-                ((*ctorParams)[pos].modifier == "owned" ||
-                 (*ctorParams)[pos].modifier == "out owned");
+                ctorParams.valid() && pos < ctorParams.size() &&
+                (ctorParams.modifier(pos) == "owned" ||
+                 ctorParams.modifier(pos) == "out owned");
             if (a.modifier == "owned" && !ctorOwnedSink) {
                 reportSpuriousOwnedMarker(a.value->span.begin,
                                           /*onFreshProducer=*/false);
@@ -1234,10 +1328,10 @@ void MethodOwnership::handleDischarge(const ast::Expr& e) {
                 }
             }
             // §28.8: bare id to an `owned` formal param = implicit transfer.
-            if (!consumed && a.modifier.empty() && ctorParams &&
-                pos < ctorParams->size() &&
-                ((*ctorParams)[pos].modifier == "owned" ||
-                 (*ctorParams)[pos].modifier == "out owned")) {
+            if (!consumed && a.modifier.empty() && ctorParams.valid() &&
+                pos < ctorParams.size() &&
+                (ctorParams.modifier(pos) == "owned" ||
+                 ctorParams.modifier(pos) == "out owned")) {
                 if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(a.value.get())) {
                     // §28.8 (#395): reject a borrow flowing into the owned formal.
                     if (!checkOwnedArgSource(*a.value, id->span.begin))
@@ -2176,18 +2270,18 @@ void MethodOwnership::scanCapturedOwnedConsumeExpr(const ast::Expr& e,
         // Transfer into a constructor `owned` parameter — MARKED
         // `new Holder(owned r)` and UNMARKED `new Holder(r)` alike (#1958).
         if (insideLambda) {
-            const std::vector<ast::Param>* ctorParams =
-                resolveCtorParams(*ne, ctx_);
+            const CtorFormals ctorParams = resolveCtorParams(*ne, ctx_);
             std::size_t pos = 0;
             for (const auto& a : ne->args) {
                 // §22.5 (v0.184, #1973): the BOUND ctor parameter (named-arg
                 // binding), not the source position. See boundParamIndex.
                 const std::size_t boundPos =
-                    ctorParams ? boundParamIndex(ne->args, pos, *ctorParams)
-                               : pos;
+                    ctorParams.valid()
+                        ? boundParamIndex(ne->args, pos, ctorParams)
+                        : pos;
                 const bool ownedSink =
-                    ctorParams && boundPos < ctorParams->size() &&
-                    (*ctorParams)[boundPos].modifier == "owned";
+                    ctorParams.valid() && boundPos < ctorParams.size() &&
+                    ctorParams.modifier(boundPos) == "owned";
                 reportArgConsumeCapturedOwned(a, ownedSink);
                 ++pos;
             }
@@ -4402,7 +4496,7 @@ sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
     // params — including a class PRIMARY constructor's params (§22.10, #1627),
     // which live on the TypeDecl rather than a ConstructorSymbol member; without
     // this an `owned` primary-ctor position would be misclassified as non-owned.
-    const std::vector<ast::Param>* ctorParams = resolveCtorParams(ne, ctx_);
+    const CtorFormals ctorParams = resolveCtorParams(ne, ctx_);
     // §31.2.4 / #811 (v0.162): when the CONSTRUCTED type is itself an
     // exception, an exception-typed argument is the CAUSE position of the
     // snapshot-chaining constructor — "ex borrowed for the ctor call; snapshot
@@ -4421,9 +4515,9 @@ sema::Symbol* MethodOwnership::catchBorrowAmongNonOwnedCtorArgs(
         // new diagnostic for NON-owned parameter positions, which the existing
         // check does not cover. // per §31.1, §28.8
         const bool paramIsOwned =
-            ctorParams && pos < ctorParams->size() &&
-            ((*ctorParams)[pos].modifier == "owned" ||
-             (*ctorParams)[pos].modifier == "out owned");
+            ctorParams.valid() && pos < ctorParams.size() &&
+            (ctorParams.modifier(pos) == "owned" ||
+             ctorParams.modifier(pos) == "out owned");
         // §31.2.4 cause position: skip (see constructedIsException above).
         if (constructedIsException &&
             ownershipIsExceptionClassRef(ctx_.exprType(*a.value))) {
@@ -8772,15 +8866,15 @@ void MethodOwnership::collectOwnedConsumingInExpr(
         // `new T(owned await ...)` — a ctor `owned` param argument. §22.10
         // (#1627): resolve a class PRIMARY constructor's params too (they live on
         // the TypeDecl, not a ConstructorSymbol member — see resolveCtorParams).
-        const std::vector<ast::Param>* ctorParams = resolveCtorParams(*ne, ctx_);
+        const CtorFormals ctorParams = resolveCtorParams(*ne, ctx_);
         std::size_t pos = 0;
         for (const auto& a : ne->args) {
             if (a.value) {
                 if (auto* aw = awaitRoot(*a.value)) {
                     bool ownedSink = a.modifier == "owned" ||
-                        (ctorParams && pos < ctorParams->size() &&
-                         ((*ctorParams)[pos].modifier == "owned" ||
-                          (*ctorParams)[pos].modifier == "out owned"));
+                        (ctorParams.valid() && pos < ctorParams.size() &&
+                         (ctorParams.modifier(pos) == "owned" ||
+                          ctorParams.modifier(pos) == "out owned"));
                     if (ownedSink) out.insert(aw);
                 }
                 collectOwnedConsumingInExpr(*a.value, out);

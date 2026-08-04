@@ -2217,10 +2217,37 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llElemPol.cat == ElementPolicy::Category::ClassOwned ||
         llElemPol.cat == ElementPolicy::Category::ClassBorrow;
 
+    // fix #2686 / #602 / §28.11 / §28.9: a BORROWING `LinkedList<string>` co-owns
+    // a +1 per stored element — §28.11's element-slot table puts a `string` in a
+    // borrowing collection in the runtime-managed row, and the disposal side
+    // already acts on that (`buildCollectionTempDisposal` and
+    // `patternAResultCollectionDisposer` both install stringElementReleaseThunk
+    // for it). No insert path took that +1, so a temp `LinkedList<string>`
+    // released a reference it never retained: ASan SEGV in bz_string_release
+    // under bz$strElemRelease under bz_llist_free. The predicate is a verbatim
+    // mirror of the Array/Stack/Queue element arm of
+    // materializeHeapCollectionLiteral (`litIsStrArr`): OwningLinkedList is
+    // excluded (its element parameter is `owned` — a transfer, and
+    // elementPolicyFor puts an owning-family string in the Value row), `string?`
+    // is excluded, and a fresh +1 producer TRANSFERS via isPlusOneStringProducer
+    // instead of double-retaining.
+    bool llIsStrElem =
+        !isOwning && llElemRef && !llElemRef->nullable &&
+        llElemRef->kind == sema::TypeRef::Kind::Primitive &&
+        llElemRef->primitive == sema::PrimitiveType::String &&
+        llElemPol.cat == ElementPolicy::Category::RuntimeManaged;
+    // Take the list's +1 on the element about to be stored into a new node.
+    // `argExpr` is the element argument (arg 0 for AddFirst/AddLast, arg 1 for
+    // AddBefore/AddAfter, whose arg 0 is the anchor node).
+    auto llRetainElem = [&](llvm::Value* v, const ast::Expr* argExpr) {
+        if (llIsStrElem && !isPlusOneStringProducer(argExpr)) emitStringRetain(v);
+    };
+
     // --- AddFirst(item): LinkedListNode<T> ---
     if (m == "AddFirst" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
+        llRetainElem(v, call.args[0].value.get());   // fix #2686
         llvm::AllocaInst* slot = entryAlloca(v->getType());
         builder_.CreateStore(v, slot);
         auto* fn = declareC("bz_llist_add_first", ptrTy(),
@@ -2245,6 +2272,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "AddLast" && call.args.size() == 1 && call.args[0].value) {
         llvm::Value* v = lowerExpr(*call.args[0].value);
         if (!v) return nullptr;
+        llRetainElem(v, call.args[0].value.get());   // fix #2686
         llvm::AllocaInst* slot = entryAlloca(v->getType());
         builder_.CreateStore(v, slot);
         auto* fn = declareC("bz_llist_add_last", ptrTy(),
@@ -2265,6 +2293,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* node = lowerExpr(*call.args[0].value);
         llvm::Value* v    = lowerExpr(*call.args[1].value);
         if (!node || !v) return nullptr;
+        llRetainElem(v, call.args[1].value.get());   // fix #2686
         llvm::AllocaInst* slot = entryAlloca(v->getType());
         builder_.CreateStore(v, slot);
         auto* fn = declareC("bz_llist_add_before", ptrTy(),
@@ -2285,6 +2314,7 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* node = lowerExpr(*call.args[0].value);
         llvm::Value* v    = lowerExpr(*call.args[1].value);
         if (!node || !v) return nullptr;
+        llRetainElem(v, call.args[1].value.get());   // fix #2686
         llvm::AllocaInst* slot = entryAlloca(v->getType());
         builder_.CreateStore(v, slot);
         auto* fn = declareC("bz_llist_add_after", ptrTy(),
@@ -3036,11 +3066,23 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
     //
     // Therefore the trunc below may NOT assume an integer, and the explicit
     // `isIntegerTy()` tests are load-bearing rather than defensive: they return
-    // null so the failure stays LOUD (the #2434/#2491 `internal:` note, exactly
-    // the behaviour a Range operand has today) instead of emitting
-    // `trunc {i32,i32} to i32` and truncating a struct — which is the same
+    // null instead of emitting `trunc {i32,i32} to i32` and truncating a struct
+    // into a plausible-looking start index — which is the same
     // silent-wrong-value class this issue is about, one level down. Do not drop
     // them on the assumption that sema has already filtered the operand.
+    //
+    // ⚠ RETURNING NULL IS NOT RELIABLY LOUD, and an earlier version of this
+    // comment claimed it was. The #2434/#2491 `internal:` notes are emitted
+    // ONLY from local-decl-shaped and return-shaped positions —
+    // LlvmBackend_Setup.cpp:9408, LlvmBackend_Stmts.cpp:1909 and :6319,
+    // LlvmBackend_Calls2.cpp:8891, LlvmBackend_Assign.cpp:3472 — and NONE of
+    // them covers an expression-statement or a call-argument position. In those
+    // positions a null simply drops the enclosing statement with no diagnostic
+    // at all and `bezelc` still exits 0, which is exactly the #2312 symptom this
+    // branch was written to fix (`Console.WriteLine(ros.Slice(2).Length…)`
+    // printed nothing). So a null here is the LEAST-BAD available outcome, not a
+    // loud one: it forecloses the miscompile but does not guarantee a
+    // diagnostic. #2662 tracks giving the Range operand a real answer.
     if (m == "Slice" && (call.args.size() == 1 || call.args.size() == 2) &&
         call.args[0].value &&
         (call.args.size() == 1 || call.args[1].value)) {

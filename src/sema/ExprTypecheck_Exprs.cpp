@@ -4610,11 +4610,42 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // Resolve callee's parameter list to type out-var locals.
         sema::Symbol* calleeSym2 = ce->callee ? ctx_.exprSymbol(*ce->callee) : nullptr;
         const ast::MethodDecl* calleeMd2 = nullptr;
+        sema::MethodSymbol* calleeMs2 = nullptr;
         sema::TypeSymbol* calleeParent2 = nullptr;
         if (auto* ms2 = dynamic_cast<sema::MethodSymbol*>(calleeSym2)) {
+            calleeMs2 = ms2;
             calleeMd2 = dynamic_cast<const ast::MethodDecl*>(ms2->decl);
             calleeParent2 = ms2->parent;
         }
+        // fix #2657 (§22.4 "Inline `out` declarations" / §2.5, v0.236): an
+        // IMPORTED method has NO `ast::MethodDecl` — ModuleLoader.cpp:337-346
+        // reconstructs a `sema::MethodSymbol` from the artifact's metadata with
+        // no `decl`, and the formal parameter types survive only as
+        // `sema::ParameterSymbol::resolvedDeclType` (ModuleLoader.cpp:258).
+        // The `calleeMd2`-only lookup below therefore left `lsym->declType`
+        // NULL for every `out var` recipient of an imported method, which is
+        // the root of #2657: with no declType the identifier never gets an
+        // exprType (the `if (loc->declType)` guard at ~line 816), so a later
+        // `n.Length` fails to lower (the `internal:` #2491/#2434 notes), AND
+        // codegen's ensureOutVarSlots (LlvmBackend_Calls2.cpp:1505) falls
+        // through its whole cascade to the `i32()` DEFAULT — a 4-byte alloca
+        // the imported callee then writes 8 bytes through for a `string`/`long`
+        // out parameter. Resolve the formal type through the AST decl when
+        // there is one (so local callees are bit-identical) and fall back to
+        // the imported symbol's own parameter type otherwise.
+        auto formalOutParamType2 =
+            [&](std::size_t pos) -> TypeRef* {
+            if (calleeMd2) {
+                if (pos < calleeMd2->params.size() && calleeMd2->params[pos].type)
+                    return ctx_.resolvedType(*calleeMd2->params[pos].type);
+                return nullptr;
+            }
+            if (calleeMs2 && pos < calleeMs2->params.size())
+                if (auto* ps2 = dynamic_cast<ParameterSymbol*>(
+                        calleeMs2->params[pos]))
+                    return ps2->resolvedDeclType;
+            return nullptr;
+        };
         std::size_t pos2 = 0;
         for (const auto& a : ce->args) {
             // §22.4: `out var x` declares x in the current scope.
@@ -4627,10 +4658,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     lsym->name = id->name;
                     lsym->decl = id;
                     // Infer type from the callee's formal parameter.
-                    if (calleeMd2 && pos2 < calleeMd2->params.size() &&
-                        calleeMd2->params[pos2].type) {
-                        lsym->declType = ctx_.resolvedType(
-                            *calleeMd2->params[pos2].type);
+                    // fix #2657: `formalOutParamType2` is the former
+                    // `ctx_.resolvedType(*calleeMd2->params[pos2].type)`
+                    // lookup plus the imported-callee fallback; for a callee
+                    // WITH an ast::MethodDecl it returns exactly what this
+                    // condition used to compute.
+                    if (TypeRef* formalTy2 = formalOutParamType2(pos2)) {
+                        lsym->declType = formalTy2;
                         // §11.8 (v0.176, #807): a STATIC interface member
                         // called through a constrained type parameter
                         // (`T.TryParse(s, out var v)`) declares its out param
@@ -5382,17 +5416,46 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // Resolve the constructed type's single (or arity-matching) constructor
         // to infer the out-var's type from the matching `out` parameter.
         const ast::ConstructorDecl* ctorDecl = nullptr;
+        // partial #2668 (§22.4 "Inline `out` declarations" / §2.5, v0.236): the
+        // CONSTRUCTOR twin of #2657. An IMPORTED constructor has no
+        // `ast::ConstructorDecl` — ModuleLoader.cpp:455-473 reconstructs a
+        // `sema::ConstructorSymbol` whose `ParameterSymbol`s carry
+        // `resolvedDeclType` — so the `dynamic_cast` filter below drops every
+        // imported constructor and leaves `ctorDecl` null. The `out var`
+        // recipient of `new ImportedT(…, out var n)` was therefore never given a
+        // type. #2639's codegen half already sizes the caller's SLOT from the
+        // imported symbol, so the runtime VALUE is correct; what remained is
+        // that sema cannot type-check any read of the recipient, which is a
+        // soundness hole, not a cosmetic one — mechanically confirmed on the
+        // plain path against an imported `constructor(s: string, out n: string)`:
+        //
+        //   return n.NoSuchMemberAtAll;  -> ACCEPTED, compiles clean, returns 0
+        //   var q: int := n;             -> not rejected; malformed IR in the
+        //                                   backend ("Function return type does
+        //                                   not match operand type")
+        //
+        // Track the SYMBOL alongside the decl and fall back to it, using the
+        // same "single, else arity match" rule so local behaviour is identical.
+        // This mirrors #2657's `formalOutParamType2` exactly, and — unlike the
+        // `out owned var` / `out using var` gates below, which stay unfixed in
+        // #2668 — it switches on NO dormant ownership tracking: a plain
+        // `out var` recipient carries no disposal obligation (§22.4 rejects
+        // plain `out var` at an `out owned` parameter outright).
+        const ConstructorSymbol* ctorSym = nullptr;
         if (ne->type) {
             if (auto* rt = ctx_.resolvedType(*ne->type)) {
                 if (rt->kind == TypeRef::Kind::Named && rt->declaration) {
                     std::vector<const ast::ConstructorDecl*> cds;
+                    std::vector<const ConstructorSymbol*> css;
                     for (Symbol* m : rt->declaration->members)
                         if (auto* cs = dynamic_cast<ConstructorSymbol*>(m))
-                            if (!cs->isStatic)
+                            if (!cs->isStatic) {
+                                css.push_back(cs);
                                 if (auto* cd =
                                         dynamic_cast<const ast::ConstructorDecl*>(
                                             cs->decl))
                                     cds.push_back(cd);
+                            }
                     if (cds.size() == 1)
                         ctorDecl = cds[0];
                     else
@@ -5401,9 +5464,36 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                                 ctorDecl = cd;
                                 break;
                             }
+                    if (!ctorDecl) {
+                        if (css.size() == 1)
+                            ctorSym = css[0];
+                        else
+                            for (auto* cs : css)
+                                if (cs->params.size() == ne->args.size()) {
+                                    ctorSym = cs;
+                                    break;
+                                }
+                    }
                 }
             }
         }
+        // partial #2668: the constructor analogue of #2657's
+        // `formalOutParamType2`. Prefers the AST declaration (so a LOCAL
+        // constructor is bit-identical) and falls back to the imported
+        // ConstructorSymbol's own parameter type.
+        auto formalCtorOutParamType =
+            [&](std::size_t pos) -> TypeRef* {
+            if (ctorDecl) {
+                if (pos < ctorDecl->params.size() && ctorDecl->params[pos].type)
+                    return ctx_.resolvedType(*ctorDecl->params[pos].type);
+                return nullptr;
+            }
+            if (ctorSym && pos < ctorSym->params.size())
+                if (auto* ps = dynamic_cast<ParameterSymbol*>(
+                        ctorSym->params[pos]))
+                    return ps->resolvedDeclType;
+            return nullptr;
+        };
         std::size_t posn = 0;
         for (const auto& a : ne->args) {
             if (a.modifier == "out var" && a.value && currentScope_) {
@@ -5412,10 +5502,17 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     auto* lsym = ctx_.makeSymbol<LocalSymbol>();
                     lsym->name = id->name;
                     lsym->decl = id;
-                    if (ctorDecl && posn < ctorDecl->params.size() &&
-                        ctorDecl->params[posn].type) {
-                        lsym->declType = ctx_.resolvedType(
-                            *ctorDecl->params[posn].type);
+                    // partial #2668: `formalCtorOutParamType` is the former
+                    // `ctx_.resolvedType(*ctorDecl->params[posn].type)` lookup
+                    // plus the imported-constructor fallback; for a constructor
+                    // WITH an ast::ConstructorDecl it returns exactly what this
+                    // condition used to compute. Only the PLAIN `out var` gate
+                    // is changed — the `out owned var` / `out using var` gates
+                    // below keep the old `ctorDecl`-only lookup on purpose (see
+                    // #2668: they additionally switch on dormant ownership
+                    // tracking that no oracle here can validate).
+                    if (TypeRef* formalCtorTy = formalCtorOutParamType(posn)) {
+                        lsym->declType = formalCtorTy;
                         // §22.4 / §7.9 (#2409, mirroring #1597's CallExpr
                         // fix): record whether a read of this inline
                         // constructor out var on a path where the `new` call

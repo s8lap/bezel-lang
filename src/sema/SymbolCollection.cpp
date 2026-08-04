@@ -420,6 +420,45 @@ Symbol* collectTopDecl(const ast::TopDecl& decl, SemaContext& ctx,
 
 } // namespace
 
+// §22.3 / §2.5 (v0.237, #2659, #2374): see Symbol.hpp for the contract and for
+// why every constructor-formal consumer must read BOTH sources. The local
+// source is the `ast::ConstructorDecl`'s `params`; the imported source is the
+// reconstructed `ParameterSymbol` list, which is all an imported constructor
+// has (its `decl` is null).
+namespace {
+const ast::Param* ctorDeclParam(const ConstructorSymbol& cs, std::size_t pos) {
+    auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs.decl);
+    if (!d || pos >= d->params.size()) return nullptr;
+    return &d->params[pos];
+}
+
+const ParameterSymbol* ctorSymParam(const ConstructorSymbol& cs,
+                                    std::size_t pos) {
+    if (pos >= cs.params.size()) return nullptr;
+    return dynamic_cast<const ParameterSymbol*>(cs.params[pos]);
+}
+} // namespace
+
+std::string_view formalParamModifier(const ConstructorSymbol& cs,
+                                     std::size_t pos) {
+    if (const ast::Param* p = ctorDeclParam(cs, pos)) return p->modifier;
+    if (const ParameterSymbol* p = ctorSymParam(cs, pos)) return p->modifier;
+    return {};
+}
+
+std::string_view formalParamName(const ConstructorSymbol& cs,
+                                 std::size_t pos) {
+    if (const ast::Param* p = ctorDeclParam(cs, pos)) return p->name;
+    if (const ParameterSymbol* p = ctorSymParam(cs, pos)) return p->name;
+    return {};
+}
+
+std::size_t formalParamCount(const ConstructorSymbol& cs) {
+    if (auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs.decl))
+        return d->params.size();
+    return cs.params.size();
+}
+
 // §9.2 / §22.9: see Symbol.hpp. An auto-property is a non-static, non-indexer
 // property declared in the auto form (`Name: T;` — no expression body, no
 // accessor block). Mirrors codegen's isAutoProperty so both layers classify

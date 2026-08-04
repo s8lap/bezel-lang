@@ -1108,6 +1108,55 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
             else if (par->declType)
                 ce.semaTy = ctx_.resolvedType(*par->declType);
         }
+        // fix #2689 / §28.1 / §28.9 / §27.5: a captured PARAMETER of
+        // runtime-managed type takes a retain at EVERY capture — where a
+        // captured LOCAL takes one only on the 2nd-and-later capture (the
+        // `alreadyBoxed` branch in the captured-locals loop below).
+        //
+        // The asymmetry is not an oversight there; it is the difference between
+        // the two storage classes. A captured local's slot holds a reference
+        // this frame owns, and escape detection SUPPRESSES its scope-end
+        // release, so the first env inherits that suppressed release and only
+        // additional envs must mint. A PARAMETER of `string` or function type
+        // has no such reference to inherit: §28.1 makes the `owned` marker a
+        // compile error on exactly these types — "On any other type — a
+        // primitive, `string`, a function type, an ordinary record, an enum, a
+        // non-owning inline array, or the unit type — `owned` is a compile
+        // error: such values carry no disposal obligation to transfer (§28.9)"
+        // — and erases it at a runtime-managed substitution of a bare type
+        // parameter. So EVERY such parameter is an unmodified BORROW: the
+        // caller owns the reference and releases it, and this frame has no
+        // scope-end release for an env to take over.
+        //
+        // The envdtor nevertheless releases the cell's contents unconditionally
+        // on the sema type (see its emission below). Without a retain here the
+        // VERY FIRST capture therefore over-releases the caller's value — a
+        // use-after-free, not a leak, and reproducible from one lambda over one
+        // borrowed `string` parameter (#2689). N captures ⇒ N retains ⇒ N
+        // envdtor releases, leaving the caller's +1 untouched.
+        //
+        // Emitted per capture-site EXECUTION, which is what also keeps a
+        // capture site inside a LOOP balanced: a parameter always takes
+        // boxLocalSlot's GUARDED path (its slot is written in the prologue, not
+        // in the capture site's block), so ONE cell is reused across
+        // iterations — but each iteration still builds its own closure with its
+        // own envdtor run, so one retain per iteration pairs with one release
+        // per closure. Both helpers are null-safe, so a null cell content is a
+        // no-op. Nullable `string?` is excluded by isStringTypeRefNonNull on
+        // both sides, matching the envdtor exactly — agreement between the
+        // retain and release predicates is the invariant. A captured ref/out
+        // param is a different loop below and stays at semaTy = nullptr: it
+        // borrows the caller's storage and the envdtor releases nothing.
+        if (isStringTypeRefNonNull(ce.semaTy)) {
+            llvm::Value* str =
+                builder_.CreateLoad(ptrTy(), ce.envValue, "str.pcap");
+            emitStringRetain(str);
+        } else if (ce.semaTy &&
+                   ce.semaTy->kind == sema::TypeRef::Kind::Function) {
+            llvm::Value* cl =
+                builder_.CreateLoad(ptrTy(), ce.envValue, "cl.pcap");
+            emitClosureRetain(cl);
+        }
         // §27.5 / §28.9 / #694: free the capture CELL in the envdtor when this
         // PARAMETER is captured by exactly ONE env (singleCaptureLocals_, which
         // keys parameters by Symbol*) and THIS lambda DEFINITELY escapes
@@ -1498,6 +1547,21 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // decisions; the block-body path now matches by carrying no declared node.
     // A lambda's external RC/boxing contract is settled at the CALL SITE from
     // the lambda's function type, not in the body.
+    //
+    // fix #2688 / §27.3 / §28.9: BOXING is settled at the call site, but the
+    // refcount MINT is not — nulling the node also disabled emitReturn's
+    // `string` +1 mint, which left the two body forms of the SAME lambda
+    // disagreeing: `lambda(k) => k` minted +1 (the expr-body path below, keyed
+    // on retSemaTy) while `lambda(k) => do return k; end` returned a +0 borrow.
+    // Every caller that releases the result then double-freed the block-body
+    // form only — a defect whose reachability depended on nothing but which
+    // body form the author wrote. Carry the lambda's OWN return type into
+    // emitReturn so the block-body path mints against retSemaTy exactly as the
+    // expr-body path does. `retSemaTy` is already null for an async lambda
+    // (cleared above — its declared return is the outer Task, minted by the
+    // async machinery), so this is scoped to synchronous lambdas.
+    const sema::TypeRef* savedLambdaRetSemaTy = currentLambdaReturnSemaTy_;
+    currentLambdaReturnSemaTy_ = retSemaTy;
     currentReturnTypeNode_ = nullptr;
     locals_.clear();
     paramSlots_.clear();
@@ -1668,6 +1732,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         llvm::Function* savedSetLiteralFreeEligFn = setLiteralFreeEligibleFn_;
         auto savedDictLiteralFreeElig = dictLiteralFreeEligible_;
         llvm::Function* savedDictLiteralFreeEligFn = dictLiteralFreeEligibleFn_;
+        // fix #2660: same protection for the nested-literal aggregate set —
+        // emitAsyncLambda recomputes it for the lambda body, and without the
+        // restore the enclosing body's later aggregate roots would consult the
+        // LAMBDA's set. (That direction only loses a free — a leak — but the
+        // set must track its guard, dictLiteralFreeEligibleFn_, which IS
+        // restored two lines below.)
+        auto savedLiteralTreeAggElig = literalTreeAggregateEligible_;
 
         emitAsyncLambda(lam, fn, paramSyms, asyncResultElemSemaTy,
                        asyncDeclaredTaskTy);
@@ -1690,6 +1761,8 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         setLiteralFreeEligibleFn_ = savedSetLiteralFreeEligFn;             // #2142
         dictLiteralFreeEligible_ = std::move(savedDictLiteralFreeElig);    // #2143
         dictLiteralFreeEligibleFn_ = savedDictLiteralFreeEligFn;           // #2143
+        literalTreeAggregateEligible_ =
+            std::move(savedLiteralTreeAggElig);                            // #2660
         smKind_ = savedSmKind;
         smStateStruct_ = savedSmStateStruct;
         smSelf_ = savedSmSelf;
@@ -1863,6 +1936,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // --- Restore emitter state ---
     expectedFunctionType_ = savedExpectedFT;  // #731
     currentReturnTypeNode_ = savedCurrentReturnTypeNode;  // #2515
+    currentLambdaReturnSemaTy_ = savedLambdaRetSemaTy;    // fix #2688
     lambdaParamTypeHint_ = std::move(savedLambdaParamHints);
     currentFn_ = savedFn;
     currentThis_ = savedThis;
@@ -4475,13 +4549,88 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // in `buildOrderedArgs`, which this path does not use. Those shapes
         // keep today's behaviour exactly; each is the same silent-no-ctor-call
         // defect and is FILED separately rather than widened into here.
+        // fix #2658 (§17.13 "The discard `_`" / §22.6 / §22.3, v0.236): the
+        // `out _` DISCARD is admitted too, but ONLY against a plain borrowing
+        // `out` formal.
+        //
+        // The admitted set is exactly what §17.13 sanctions and no more.
+        // §17.13's out-argument position reads: "As a positional argument with
+        // the `out` modifier, `_` discards the out-parameter result", and the
+        // section opens "Discard is permitted in three positions; in every
+        // other position `_` is treated as a normal identifier." So `ref _` is
+        // NOT a spec-sanctioned discard form and is deliberately NOT admitted
+        // here — an earlier draft of this fix did admit it and made it work,
+        // which would have committed the backend to a form the spec does not
+        // define. (The parser does set `isDiscard` for `ref _`, so the form
+        // reaches codegen at all; whether it should be rejected in sema is a
+        // separate question, FILED rather than settled here.) It now falls to
+        // the LOUD residual below, which is the honest outcome for a shape this
+        // path cannot lower.
+        //
+        // §17.13 also authorizes the scratch slot the loop below allocates:
+        // "`out _` does not introduce a variable; the receiving slot is
+        // internal to the compiler and is not observable. The argument is
+        // type-inferred from the parameter's declared type."
+        //
+        // An `out owned` formal's discard is likewise NOT admitted, and that is
+        // a decline of a NORMATIVE obligation, recorded as such: §22.6 states
+        // "`out _`. The discard form applies to both parameter kinds: against
+        // `out T` the received value is simply dropped (§17.13); against
+        // `out owned T` the discarded value is an unbound owned temporary
+        // disposed at the end of the full statement (§28.3)." Implementing that
+        // here needs the scratch-slot ownership bookkeeping buildOrderedArgs
+        // performs (`discardOwnedOutSlots_` + the #1833(a) unwind entry), which
+        // this hand-rolled loop does not have; shipping it unverified is not an
+        // option because no oracle available here can see a cross-module leak
+        // or double-free (ASan is blind past `-c`). So it stays unimplemented
+        // but becomes LOUD instead of silent. FILED with the §22.6 target
+        // semantics so the next lane knows what to build.
+        sema::ConstructorSymbol* cs = ctorForArgs(t, ne.args);
+        auto importedFormalMod = [&](std::size_t ai) -> std::string_view {
+            if (cs && ai < cs->params.size())
+                if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                        cs->params[ai]))
+                    return ps->modifier;
+            return {};
+        };
         bool allPositional = true;
-        for (const auto& a : ne.args)
-            if (!a.name.empty() || a.isDiscard ||
-                (!a.modifier.empty() && !isByRefMod(a.modifier)))
+        for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
+            const auto& a = ne.args[ai];
+            if (!a.name.empty()) { allPositional = false; break; }
+            if (a.isDiscard) {
+                if (importedFormalMod(ai) != "out")
+                    { allPositional = false; break; }
+                continue;
+            }
+            // fix #2659 (§22.3 "Parameter modifiers" / §28.8, v0.237): the
+            // by-value `owned` CALL-SITE MARKER against an `owned` formal is
+            // admitted. It has to be: §22.3 makes the marker MANDATORY on a
+            // named owned binding ("Omitting the marker on a named owned
+            // binding is a compile error naming the fix"), so with the ownership
+            // half of #2659 fixed — an imported `owned` formal is finally SEEN
+            // as an owned sink — this is the ONLY spelling that reaches codegen
+            // for `new ImportedT(owned r)`. Leaving it out would trade the old
+            // false reject for a silently default-initialized instance plus a
+            // leaked argument, which is worse.
+            //
+            // Lowering is identical to a plain positional argument: `owned` is
+            // by VALUE, `isByRefMod("owned")` is false, so the loop below takes
+            // its `lowerExpr` path and passes the same pointer a borrow would.
+            // The only extra obligation is #1918's transfer bookkeeping (null
+            // the caller's slot at the "call about to run" point), performed
+            // explicitly at the call below since this hand-rolled path does not
+            // use buildOrderedArgs. `scoped` stays excluded — it is a different
+            // (lifetime, not transfer) obligation and is filed, not guessed at.
+            if (!a.modifier.empty() && !isByRefMod(a.modifier) &&
+                !(a.modifier == "owned" && importedFormalMod(ai) == "owned"))
                 { allPositional = false; break; }
-        if (sema::ConstructorSymbol* cs = ctorForArgs(t, ne.args);
-            cs && allPositional && ne.args.size() == cs->params.size()) {
+        }
+        // fix #2658: whether the `bz$T$ctor` call was actually emitted. Every
+        // path out of the block below that does NOT emit it produces an object
+        // whose constructor body never ran — a silent wrong answer — so the
+        // residual is reported rather than dropped (see the guard after it).
+        bool emittedImportedCtorCall = false;
+        if (cs && allPositional && ne.args.size() == cs->params.size()) {
             llvm::Function* ctorFn = declareImportedCtor(cs);
             std::vector<llvm::Value*> args;
             args.push_back(obj);
@@ -4505,15 +4654,67 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // shapes that have no address to alias.
             std::vector<AccessorRefArg> accessorRefArgs;
             for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
+                // fix #2658 (§17.13 "The discard `_`", v0.236): an `out _`
+                // DISCARD has no destination lvalue — the parser leaves `value`
+                // null with `isDiscard` set, so it MUST be handled before the
+                // `!value` guard below (that guard is what made
+                // `new ImportedT(…, out _)` abort the whole call and emit no
+                // ctor at all, #2658). §17.13: "`out _` does not introduce a
+                // variable; the receiving slot is internal to the compiler and
+                // is not observable. The argument is type-inferred from the
+                // parameter's declared type." So: allocate a throwaway scratch
+                // of the FORMAL's type and pass its address.
+                //
+                // The type comes from the imported
+                // `ParameterSymbol::resolvedDeclType` — the same field
+                // `declareImportedCtor` builds the callee's own signature from,
+                // so the scratch and the formal cannot disagree on width (the
+                // #2639/#2629 wild-write lesson). This mirrors buildOrderedArgs'
+                // #1301 block (LlvmBackend_Assign.cpp:7657), which reads the
+                // ast::Param instead because its callee has a decl.
+                //
+                // ⚠ THE ZERO-STORE GOES IN THE ENTRY BLOCK, NOT HERE. This is
+                // the placement `ensureOutVarSlots` already measured and split
+                // on — see its comment at LlvmBackend_Calls2.cpp:1685-1697 and
+                // the entry-block store it emits at :1702-1704. `entryAlloca`
+                // (LlvmBackend_impl.hpp:2029-2033) hoists the alloca to the
+                // function's entry block, so in a LOOP every iteration shares
+                // ONE slot. A store emitted here — inside the loop body — would
+                // re-null that slot on each iteration, wiping the pointer the
+                // previous iteration left there BEFORE the callee's
+                // release-of-prior on `n := …` (LlvmBackend_Calls2.cpp:1660-1668)
+                // could consume it, leaking one object per iteration. That path
+                // measured 5 objects / 195 B leaked on a 5-iteration loop versus
+                // 1 / 39 B for the entry-block store. Nothing needs a
+                // per-iteration reset here, because unlike a real `out var`
+                // recipient a discard carries NO §7.9 default-value promise —
+                // §17.13 says the slot is "not observable", so no program can
+                // read it and no iteration can observe the leftover. Store once,
+                // next to the alloca, purely so the first call never sees
+                // garbage. (Pre-fix nothing was written at all — no call was
+                // emitted — so a call-site store would be a NEWLY reachable
+                // leak, not a pre-existing one.)
+                if (ne.args[ai].isDiscard) {
+                    llvm::Type* scratchTy = nullptr;
+                    if (ai < cs->params.size())
+                        if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
+                                cs->params[ai]))
+                            if (ps->resolvedDeclType)
+                                scratchTy = lowerTypeRef(ps->resolvedDeclType);
+                    if (!scratchTy) { ok = false; break; }
+                    llvm::AllocaInst* scratch = entryAlloca(scratchTy);
+                    llvm::IRBuilder<> init(scratch->getParent(),
+                                           std::next(scratch->getIterator()));
+                    init.CreateStore(
+                        llvm::Constant::getNullValue(scratchTy), scratch);
+                    args.push_back(scratch);
+                    continue;
+                }
                 if (!ne.args[ai].value) { ok = false; break; }
                 // Determine the formal parameter's ref/out modifier from the
                 // imported ConstructorSymbol (mirrors lowerCall's imported-
                 // method arg path).
-                std::string_view formalMod;
-                if (ai < cs->params.size())
-                    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(
-                            cs->params[ai]))
-                        formalMod = ps->modifier;
+                std::string_view formalMod = importedFormalMod(ai);
                 llvm::Value* v = nullptr;
                 if (isByRefMod(formalMod) || isByRefMod(ne.args[ai].modifier)) {
                     // §22.3 alias path: a true-alias location — local, field,
@@ -4547,8 +4748,28 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 args.push_back(v);
             }
             unwindTarget_ = savedArgUT;
-            if (ok && args.size() == ctorFn->arg_size())
+            if (ok && args.size() == ctorFn->arg_size()) {
+                // fix #2659 / #1918 (§28.3): the "call about to run" point —
+                // every argument has been evaluated and nothing can throw
+                // between here and the call. Null the caller's slot for each
+                // bare owned local / `owned` parameter whose ownership this
+                // call transfers, so the caller's null-guarded unwindOnly
+                // disposal (registerUnwindOwnedLocal / registerUnwindOwnedParam)
+                // skips a value the callee's own `owned`-parameter disposal now
+                // owns — no double free on the ctor's throw edge. This is the
+                // same placement and the same eligibility test buildOrderedArgs
+                // applies via `nullTransferredOwned`; this hand-rolled imported
+                // path never calls buildOrderedArgs, so it is done here.
+                for (std::size_t ai = 0; ai < ne.args.size(); ++ai) {
+                    const auto& a = ne.args[ai];
+                    if (a.value && !a.isDiscard &&
+                        (a.modifier == "owned" ||
+                         importedFormalMod(ai) == "owned"))
+                        nullTransferredOwnedLocalSlot(a.value.get());
+                }
                 builder_.CreateCall(ctorFn, args);
+                emittedImportedCtorCall = true;  // fix #2658
+            }
             // fix #2319 / §22.3: flush the copy-OUT half of every accessor-
             // mediated `ref`/`out` argument. Skipped on the throw edge per
             // §22.3's "on an exception exit no write-back occurs", matching
@@ -4557,6 +4778,59 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             // (the call returned normally) together match the rule.
             emitAccessorRefArgWriteBacks(accessorRefArgs,
                                          /*emit=*/ok && !diverged_);
+        }
+        // fix #2658 (§22.3/§22.4, v0.236): MAKE THE RESIDUAL LOUD. Every exit
+        // from the block above that did not emit `bz$T$ctor` leaves an object
+        // whose CONSTRUCTOR BODY NEVER RAN — the instance is calloc'd and
+        // `bz$T$init` (vtable + field initializers) runs, then the branch falls
+        // to `return obj` and emits nothing further. That was #2639's defect
+        // and it is still reachable for every shape this path does not lower:
+        // an `out owned` discard, a NAMED argument, a by-value `owned` /
+        // `scoped` argument, and any by-ref argument whose `lvalueAddr`
+        // returned null without the #2319 bracket applying (`out owned` is
+        // excluded from that bracket). A silent no-op is the worst failure mode
+        // available here — the program compiles clean and returns a wrong
+        // answer across a module boundary — so report it.
+        //
+        // The predicate cannot fire for a legitimately ctor-less imported type:
+        // `ctorForArgs` returned a constructor, so one exists and was selected
+        // for THESE arguments; the only thing that failed is our ability to
+        // lower the call to it. Warning (not Error) plus the `hasErrors()`
+        // guard follows the established `internal:` degradation convention in
+        // this backend (#2434/#2491), which reports the degradation without
+        // turning a previously-accepted program into a hard reject.
+        //
+        // ⚠ THE PREDICATE IS "THE TYPE HAS A CONSTRUCTOR", NOT "ctorForArgs
+        // RETURNED ONE". An earlier draft keyed this on `cs` and its commit
+        // message claimed it covered "every exit that did not emit the call".
+        // That was FALSE, and the counterexample is instructive:
+        // `ctorForArgs` (LlvmBackend_impl.hpp:7767-7843) reaches an imported
+        // constructor only through its two ARITY-EXACT branches, because its
+        // defaults/`argsCanFill` fallback at :7836-7841 is itself gated on
+        // `dynamic_cast<const ast::ConstructorDecl*>(cs->decl)` — null for
+        // every imported constructor, the same #2374 null-decl bug this whole
+        // family is made of. So an imported constructor with a DEFAULT
+        // parameter, called with fewer arguments, yields `cs == nullptr`: no
+        // call emitted AND, under the old predicate, no warning either. The
+        // loudness guard contained its own instance of the bug it exists to
+        // make loud. Scanning the type's members for any non-static
+        // ConstructorSymbol closes that hole, and still cannot fire for a
+        // genuinely ctor-less imported type (U6/U9 pin both directions).
+        // The `cs == nullptr` case is a REAL residual, not merely an unwarned
+        // one — the defaulted call is still not lowered. That is FILED.
+        bool importedTypeHasCtor = false;
+        if (rt && rt->declaration)
+            for (sema::Symbol* m : rt->declaration->members)
+                if (auto* c = dynamic_cast<sema::ConstructorSymbol*>(m))
+                    if (!c->isStatic) { importedTypeHasCtor = true; break; }
+        if (importedTypeHasCtor && !emittedImportedCtorCall &&
+            !ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Warning, ne.span.begin,
+                "internal: no constructor call could be lowered for this "
+                "imported type, so the constructor body will not run and every "
+                "field it assigns keeps its default (degraded to a "
+                "default-initialized instance) — #2658");
         }
         // §22.9 / §28.3 (FINDING [4]): an imported constructor may throw. As for
         // an in-module ctor, the imported ctor (compiled by this same compiler in

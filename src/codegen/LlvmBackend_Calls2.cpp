@@ -1550,6 +1550,36 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
                     sema::TypeRef* pt =
                         ctx_.resolvedType(*md->params[pos].type);
                     if (pt) slotTy = lowerTypeRef(pt);
+                } else if (!md && pos < ms->params.size()) {
+                    // fix #2657 (§22.4 / §2.5, v0.236): an IMPORTED method has
+                    // NO `ast::MethodDecl` — ModuleLoader.cpp:337-346 builds a
+                    // `sema::MethodSymbol` with a null `decl` whose formals are
+                    // `ParameterSymbol`s carrying `resolvedDeclType`
+                    // (ModuleLoader.cpp:258). Without this arm the cascade fell
+                    // all the way through to the `i32()` DEFAULT at the top of
+                    // this function: a 4-byte integer alloca standing in for
+                    // whatever the imported callee's out parameter really is,
+                    // so `out n: string` had the callee write 8 bytes through a
+                    // 4-byte stack slot (observed SIGSEGV) and `out n: bool`
+                    // produced malformed IR (`br i32`).
+                    //   The companion sema half of this fix
+                    // (ExprTypecheck_Exprs.cpp, `formalOutParamType2`) now sets
+                    // `loc->declType` for this same shape, so in practice the
+                    // FIRST arm above takes it and this one is a belt: it is
+                    // kept because a mis-sized out-var slot is a WILD WRITE by
+                    // the callee, the failure mode #2639 recorded as the reason
+                    // its own two halves had to ship together. Reading the
+                    // imported symbol's parameter type makes the caller's slot
+                    // and the callee's own signature — which
+                    // declareImportedMethod builds from the SAME
+                    // `resolvedDeclType` — derive from one source, so they
+                    // cannot disagree on width. It can only fire where the old
+                    // code produced the bare `i32()` default, so a callee WITH
+                    // an `ast::MethodDecl` is bit-identical.
+                    if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(
+                            ms->params[pos]))
+                        if (ps->resolvedDeclType)
+                            slotTy = lowerTypeRef(ps->resolvedDeclType);
                 }
             }
         } else if (callPrimTy != sema::PrimitiveType::None) {

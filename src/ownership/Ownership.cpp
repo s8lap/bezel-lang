@@ -639,16 +639,29 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     if (auto* ld =
                             dynamic_cast<const ast::LocalDecl*>(ls->decl)) {
                         const_cast<ast::LocalDecl*>(ld)->autoDropAtScopeEnd = true;
-                        ctx_.diagnostics().report(
-                            Severity::Warning,
-                            st.obligationOrigin ? st.obligationOrigin->span.begin
-                                                : SourceLocation{},
-                            std::string("owned value in `") +
-                            std::string(sym->name) +
-                            "` is implicitly disposed at the end of its scope "
-                            "(§28.3 auto-drop); declare it `using var` to make "
-                            "the scope-bound disposal explicit, or `move` / "
-                            "`return` / `.Dispose()` / `_ := …` to discharge it");
+                        // §28.9 (v0.237) trivial-dispose exemption, #2654:
+                        // "A `new` expression of a trivial-dispose class type
+                        // whose result is not stored in an `owned` location or
+                        // `using var` does *not* produce the standard
+                        // ownership-discharge warning. (There is nothing to
+                        // discharge.)"  WARNING ONLY — `autoDropAtScopeEnd` is
+                        // already set above and stays set, so the emitted
+                        // scope-end free is unchanged; only the diagnostic is
+                        // suppressed. (Suppressing the free instead would leak
+                        // the instance's memory, which §28.9 still requires be
+                        // reclaimed.)
+                        if (!localIsTrivialDisposeNewBinding(*ld)) {
+                            ctx_.diagnostics().report(
+                                Severity::Warning,
+                                st.obligationOrigin ? st.obligationOrigin->span.begin
+                                                    : SourceLocation{},
+                                std::string("owned value in `") +
+                                std::string(sym->name) +
+                                "` is implicitly disposed at the end of its scope "
+                                "(§28.3 auto-drop); declare it `using var` to make "
+                                "the scope-bound disposal explicit, or `move` / "
+                                "`return` / `.Dispose()` / `_ := …` to discharge it");
+                        }
                         continue;
                     }
                     // §28.3 / #1387: `out owned var x` inline local — ls->decl is
@@ -2400,6 +2413,15 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
         return;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        // fix #2655 / §21.9 / §28.3 / §28.9 (v0.237): the end-of-statement free
+        // for a bare owned-producer statement is decided in SEMA, not here —
+        // see ExpressionStmt::disposeOwnedValue and its one setter in
+        // ExprTypecheck.cpp's §21.9 walk. That walk is the only place that
+        // computes the trivial-dispose verdict this free must be scoped to, and
+        // deciding it here instead would need a fourth copy of that predicate
+        // (rhsIsDisposableClassType below documents why sema's copy cannot be
+        // called from this pass: it would make the ownership pass depend on
+        // sema circularly). // per §21.9, §28.9
         if (es->expr) handleDischarge(*es->expr);
         return;
     }
@@ -2546,6 +2568,36 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                         isOwningCollectionNameHead(rt->headName()))
                         const_cast<ast::DiscardStmt*>(ds)
                             ->disposeOwnedCollectionValue = true;
+            }
+            // fix #2655 / §17.13 / §28.3 / §28.9 (v0.237): a discard
+            // `_ := new StringBuilder();` — the spec's OWN §17.13 example
+            // ("trivial-dispose (§28.9): cosmetic — Array<T> needs no cleanup"
+            // sits two lines below it in the same block). The disposeOwnedValue
+            // gate above deliberately excludes it: StringBuilder is a decl-null
+            // builtin ("builtin handles … need their own free paths
+            // (deferred)"), and disposeOwnedCollectionValue covers only the
+            // OWNING-collection family. So NO branch fired and the builder's
+            // parts array leaked outright (560 B measured under LSan on the
+            // bare repro), while `using var sb := new StringBuilder();` — the
+            // same allocation, merely named — has been freed since #1185.
+            //
+            // The gate is #1009's, unchanged: producerState == Owned admits only
+            // a fresh producer, so the FLUENT borrow `_ := sb.Append("x");`
+            // (§21.9's "return this" shape — a plain non-`owned` instance-method
+            // return, classified Borrowed by K1.5) is left unmarked and codegen
+            // never frees a builder the receiver still owns. Deliberately scoped
+            // to StringBuilder ALONE rather than to decl-null builtins as a
+            // class: it is the only one with an already-proven free path (the
+            // #1185 `using var` wiring codegen reuses verbatim), and the others
+            // (Task, Subscription, Shared, Stopwatch, …) carry different
+            // ownership contracts — `Task` may not even be discarded (§17.13).
+            // The rest of that deferral stands. // per §17.13, §28.3, §28.9
+            if (producerState(*ds->value) == OwnershipState::Owned) {
+                if (const sema::TypeRef* rt = ctx_.exprType(*ds->value))
+                    if (rt->kind == sema::TypeRef::Kind::Named &&
+                        !rt->declaration && rt->headName() == "StringBuilder")
+                        const_cast<ast::DiscardStmt*>(ds)
+                            ->disposeOwnedBuilderValue = true;
             }
             // §17.13 / §15.3 (#1016): a discard `_ := expr` of a move-only
             // owning inline array (`[N owned]T` / `[N owned]T?`). Permitted per
@@ -4678,15 +4730,125 @@ bool MethodOwnership::rhsIsVacuousBorrowPin(const ast::Expr& e) const {
 // e := src.GetEnumerator();` spelling toward a `const` that would silently
 // drop the disposal and leak the enumerator/wrapper frame.
 // // per §28.10, §28.11, §29.1, #2073 (rework 3c), #2385, #2451
+// §28.9 "Trivial-dispose classes" (v0.237), first bullet — VERBATIM: "A `new`
+// expression of a trivial-dispose class type whose result is not stored in an
+// `owned` location or `using var` does *not* produce the standard ownership-
+// discharge warning. (There is nothing to discharge.)" Restated at Appendix
+// C.3. §28.9's "Trivial-dispose classification is part of the API surface"
+// states the same fact from the other side: promoting a class OUT of trivial-
+// dispose means "an unused instance that dropped silently now draws the
+// must-use auto-drop warning (§28.3)" — i.e. while it IS trivial-dispose, the
+// unused instance drops SILENTLY.
+//
+// True when `ld` is exactly that shape. Used SOLELY to suppress the §28.3
+// auto-drop WARNING: the caller still sets `autoDropAtScopeEnd`, so the
+// emitted scope-end free is bit-for-bit unchanged. That separation is the
+// point — a change to the emitted free here would be a leak or a double-free,
+// not a diagnostic tweak (#2654). Trivial-dispose only makes `Dispose()`
+// provably a no-op; the instance's MEMORY still has to be reclaimed, and
+// §28.9's own wording ("Memory for trivial-dispose instances is reclaimed by
+// an implementation-defined mechanism") is satisfied by keeping exactly the
+// scope-end reclaim this pass already schedules.
+//
+// Deliberately NARROW in three ways, each chosen so a wrong answer is a
+// retained (noisy) warning rather than a suppressed (hidden) obligation:
+//   * `new` expressions only. The spec sentence names the `new` expression
+//     form; a factory call returning `owned T` is not covered by it, so it
+//     keeps today's warning.
+//   * user CLASS declarations only. A builtin with no `TypeDecl`
+//     (`Array<int>`, …) has no member list to walk, so it is not classified
+//     here and keeps today's behaviour. §28.9 does call the borrowing
+//     collections trivial-dispose, so that half of the exemption is a real
+//     residual — filed as #2667 rather than guessed at here.
+//   * an owning-inline-array field (`[N owned]T?` / `[N owned]T`, §15.1.1)
+//     DISQUALIFIES. The spec's trivial-dispose definition excludes such a
+//     field, but the shared `common::isNonTrivialDisposeClass` walk does not
+//     test for it (pre-existing gap, filed as #2666) — testing it here keeps
+//     this suppression sound even while the shared predicate stays
+//     incomplete. Delete this guard when #2666 lands.
+// The `using var` / `owned`-location half of the spec's precondition is
+// structural: `ld.isUsing` is excluded below, and an `owned` LOCATION (field,
+// `owned` parameter) is not an `ast::LocalDecl` at all, so it cannot reach
+// this arm.  // per §28.9, §28.3, v0.237, #2654
+bool MethodOwnership::localIsTrivialDisposeNewBinding(const ast::LocalDecl& ld) {
+    if (ld.isUsing) return false;                      // "…or `using var`"
+    if (!ld.initializer) return false;
+    const auto* ne = dynamic_cast<const ast::NewExpr*>(ld.initializer.get());
+    if (!ne) return false;                             // "A `new` expression…"
+    // Classify the `new` EXPRESSION's own type, never the local's DECLARED
+    // type. The spec sentence is "A `new` expression OF A TRIVIAL-DISPOSE
+    // CLASS TYPE …", and the two differ exactly where it matters:
+    // `var b: Base := new Derived();` with a trivial `Base` and a
+    // destructor-bearing `Derived` allocates a NON-trivial instance carrying a
+    // real §28.3 obligation. Keying on the declared `Base` there would suppress
+    // a warning that is genuinely due — the dangerous direction. Falls back to
+    // the written `new T` type node when the expression type is unavailable
+    // (error recovery).  // per §28.9, v0.237, #2654
+    const sema::TypeRef* t = ctx_.exprType(*ne);
+    if (!t && ne->type) t = ctx_.resolvedType(*ne->type);
+    if (!t || t->kind != sema::TypeRef::Kind::Named) return false;
+    sema::TypeSymbol* d = t->declaration;
+    if (!d || d->kind != ast::TypeDeclKind::Class) return false;
+    if (common::isNonTrivialDisposeClass(d)) return false;
+    if (classChainHasOwningInlineArrayField(d)) return false;
+    return true;
+}
+
+// §15.1.1 / §28.9 (v0.237): does `decl`'s class chain declare a field of
+// OWNING inline-array type? The spec's trivial-dispose definition excludes a
+// class with "no fields of owning-inline-array type (`[N owned]T?` or
+// `[N owned]T`, §15.1.1)", and such a field carries a real per-slot disposal
+// obligation. Walks the same base chain, with the same cycle guard (#1624),
+// as `common::isNonTrivialDisposeClass`. // per §28.9, §15.1.1, #2654
+bool MethodOwnership::classChainHasOwningInlineArrayField(
+    sema::TypeSymbol* decl) {
+    std::unordered_set<const sema::TypeSymbol*> seen;
+    for (sema::TypeSymbol* cur = decl; cur;) {
+        if (!seen.insert(cur).second) break;  // cycle guard (#1624)
+        for (sema::Symbol* m : cur->members) {
+            auto* fs = dynamic_cast<sema::FieldSymbol*>(m);
+            if (!fs) continue;
+            const ast::Type* ty = nullptr;
+            if (fs->posParam) {
+                ty = fs->posParam->type.get();
+            } else if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl)) {
+                ty = fd->type.get();
+            }
+            if (!ty) continue;
+            const sema::TypeRef* tr = ctx_.resolvedType(*ty);
+            if (tr && tr->kind == sema::TypeRef::Kind::InlineArray &&
+                tr->arrayOwned)
+                return true;
+        }
+        sema::TypeSymbol* nextBase = nullptr;
+        for (sema::TypeSymbol* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) {
+                nextBase = b;
+                break;
+            }
+        cur = nextBase;
+    }
+    return false;
+}
+
 bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
     if (!rt) return false;
     if (rt->kind != sema::TypeRef::Kind::Named) return false;
     // Path 1: user class/interface with disposal obligation. Walk the
-    // declaration's members for a destructor or `owned` field (the §28.9
-    // non-trivial-dispose test, inlined here because isNonTrivialDisposeClass
-    // lives in sema::ExprTC and pulling it in would create a circular
-    // dependency between the ownership pass and sema). False for a value
-    // type (record/enum/inline-array) — those are never disposable.
+    // declaration's members for a destructor or `owned` field — a COARSER
+    // relative of the §28.9 non-trivial-dispose test. False for a value type
+    // (record/enum/inline-array) — those are never disposable.
+    //
+    // This walk is deliberately NOT `common::isNonTrivialDisposeClass` (which
+    // this file does call, at the §28.3 auto-drop gate above). It serves the
+    // §28.10 vacuous-pin lint and differs on purpose: it also matches
+    // INTERFACES, it pairs with the builtin head-name table in Path 2 below,
+    // and it does not walk base chains. (A prior version of this comment
+    // claimed the shared predicate could not be called here because it "lives
+    // in sema::ExprTC and pulling it in would create a circular dependency";
+    // #2654 disproved that by relocating the body to `common::` as a free
+    // function, so the reason recorded here is now the real one — the two
+    // predicates answer different questions. Per #2666 / #2671 note 1.)
     if (rt->declaration) {
         if (rt->declaration->kind != ast::TypeDeclKind::Class &&
             rt->declaration->kind != ast::TypeDeclKind::Interface)

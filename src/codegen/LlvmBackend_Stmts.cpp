@@ -2095,6 +2095,28 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         //     below — its single +1 flows out to the caller instead of leaking.
         // Otherwise (a param read, a field read `this.f`, a literal, an alias not
         // owning a +1) the value is a BORROW → RETAIN to mint the +1.
+        // fix #2688 / §27.3 / §28.9: a LAMBDA body carries no declared
+        // return-type NODE (#2515 nulls currentReturnTypeNode_ so the body does
+        // not box/mint against the enclosing METHOD's node), but it does have a
+        // return TYPE — currentLambdaReturnSemaTy_, the same `retSemaTy` the
+        // expression-body path keys its mint off. Without this the two body
+        // forms of the same lambda disagreed: `lambda(k) => k` returned +1 and
+        // `lambda(k) => do return k; end` returned a +0 borrow, so every caller
+        // that releases the result (a `var` bind, `Dictionary.GetOrAdd`'s
+        // store) double-freed the block-body form and only that form. Mirror
+        // the expr-body predicate EXACTLY, including its `!nullable` gate: a
+        // `string?` lambda return does not mint there, so it must not mint here
+        // either — agreement between the two forms is the invariant, and the
+        // method-side `string?` mint (#2196) is a method-contract rule the
+        // lambda call-site ABI does not share.
+        const sema::TypeRef* lamRet = currentLambdaReturnSemaTy_;
+        if (v && rs->value && !currentReturnTypeNode_ && lamRet &&
+            v->getType()->isPointerTy() && !lamRet->nullable &&
+            lamRet->kind == sema::TypeRef::Kind::Primitive &&
+            lamRet->primitive == sema::PrimitiveType::String &&
+            !isPlusOneStringProducer(rs->value.get()) &&
+            !returnedStringLocalOwnsPlusOne(rs->value.get()))
+            emitStringRetain(v);
         if (v && rs->value && currentReturnTypeNode_ &&
             v->getType()->isPointerTy()) {
             const sema::TypeRef* declRet =
@@ -2287,6 +2309,84 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         return true;
     }
     if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(&s)) {
+        // fix #2655 / §21.9 / §28.3 / §28.9 (v0.237): a BARE owned-producer
+        // statement (`new Box();`) is an unbound owned temporary whose K8
+        // boundary is the end of this statement (§28.3: "in an expression
+        // statement, 'end of the full expression' and 'end of the statement'
+        // coincide"). Free it here, exactly as the §17.13 discard spelling of
+        // the same statement does — this branch is a verbatim copy of the
+        // DiscardStmt::disposeOwnedValue branch below, but the FLAG IT READS IS
+        // SET ELSEWHERE: sema sets it inside §21.9's own walk
+        // (src/sema/ExprTypecheck.cpp, the single setter), NOT the ownership
+        // pass, and NOT under `producerState == Owned`.
+        //
+        // ⚠ That distinction is the whole correctness argument, so do not
+        // "simplify" it back. An earlier draft did key on the ownership pass's
+        // `producerState == Owned`, which is far WIDER than §21.9's rejection —
+        // it also admits unannotated static factories, imported `owned` returns
+        // (§21.9's dynamic_cast yields null for a null ms->decl), extern/FFI,
+        // function-value calls, Deserialize/TakeCurrent, `await` Pattern B,
+        // operator overloads, `??`, arm-meet and `move x`, and §21.9 further
+        // requires !nullable && kind == Class. Under that gate this arm ran USER
+        // DESTRUCTOR CODE at end of statement, contradicting §28.9's "runs no
+        // user code" and proposal 0077 §2.2 (demonstrated: the destructor ran).
+        // Deriving the flag inside §21.9's walk makes the freed set a strict
+        // subset of what §21.9 inspected and declined to reject, so the two
+        // cannot disagree by construction.
+        // Before this, the value was produced and dropped on the floor with no
+        // free emitted anywhere and no diagnostic (§21.9 hard-errors only the
+        // non-trivial-dispose case), so every bare trivial `new` leaked.
+        if (es->expr && es->disposeOwnedValue) {
+            // The value is the sole owner (sema admitted only §21.9's
+            // `ownedProduced` shapes — `new`, an `owned`-returning user call, an
+            // owning-collection drain — never a borrow), so it is freed EXACTLY
+            // once: no leak, no double-free. dynamicDispose dispatches
+            // Dispose+reclaim through the object's own vtable, null-guarded.
+            //
+            // Scope of the trivial-dispose claim, stated precisely: §21.9's walk
+            // classifies the STATIC type, while the dispatch is through the
+            // object's vtable, so two shapes can still reach a user destructor —
+            // a factory returning `owned Base` whose runtime value is a
+            // destructor-bearing `Derived`, and a class made non-trivial by an
+            // owning-inline-array field (`[N owned]T`), which the walk does not
+            // detect because it tests only `fs->modifiers` for "owned", never the
+            // field's type. Neither is unsound: the value is the sole owner and
+            // §28.3 K8.1 mandates the reclaim, and the already-shipped `_ := …`
+            // spelling has no trivial-dispose gate at all, so this arm is
+            // strictly narrower than a path live since #1009. It is only the
+            // "runs no user code" phrasing that would overclaim.
+            //
+            // ORDER MATTERS: lower the expression FIRST, in the enclosing block
+            // scope, and only THEN open the one-entry dispose scope. Opening it
+            // first (the shape #1009's discard arm uses) would RE-HOME every
+            // disposal that expression lowering itself pushes onto
+            // `disposeStack_.back()` — notably the `ensureOutVarSlots` /
+            // `ensureCtorOutVarSlots` registrations for an inline `out owned var`
+            // argument (LlvmBackend_Calls2.cpp) — from the block scope into this
+            // STATEMENT scope, so `new T(out owned var x);` would dispose `x` and
+            // null its slot at end of statement while `x` is still live for the
+            // rest of the block. Lowering first leaves those registrations where
+            // they belong.
+            //
+            // No unwind-edge entry is needed: between the store below and
+            // emitDisposals nothing throwable is emitted (an alloca and a store),
+            // and a throw from the producer itself is covered independently by
+            // emitNewPendingCheck / emitUnwindDisposals (LlvmBackend_Disposal.cpp)
+            // — which is why this arm does not claim both-edge coverage it does
+            // not provide.
+            llvm::Value* v = lowerExpr(*es->expr);
+            if (!diverged_ && v) {
+                llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                builder_.CreateStore(v, slot);
+                disposeStack_.emplace_back();
+                Disposal d{slot, nullptr};
+                d.dynamicDispose = true;
+                disposeStack_.back().push_back(d);
+                emitDisposals(disposeStack_.back());
+                disposeStack_.pop_back();
+            }
+            return diverged_;
+        }
         if (es->expr) lowerExpr(*es->expr);  // side effects only (CG3: none)
         return diverged_;  // CG40: a throw-expression terminated the block
     }
@@ -2399,6 +2499,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     builder_.CreateStore(v, slot);
                     Disposal d{slot, nullptr};
                     d.dynamicDispose = true;
+                    disposeStack_.back().push_back(d);
+                }
+                if (!diverged_) emitDisposals(disposeStack_.back());
+                disposeStack_.pop_back();
+            } else if (ds->disposeOwnedBuilderValue) {
+                // fix #2655 / §17.13 / §28.3 / §28.9 (v0.237): the ownership
+                // pass classified this discard's value as a fresh owned
+                // StringBuilder producer — the spec's own §17.13 example
+                // `_ := new StringBuilder();`. A StringBuilder's VALUE *is* a
+                // bz_array_t* of string parts owning a +1 per part (#1185); it
+                // is a decl-null builtin with no vtable, so dynamicDispose
+                // (the class branch above) would misread its first word as a
+                // vtable pointer. Free it through the SAME wiring the `using
+                // var` StringBuilder path has used since #1185:
+                // bz_array_free with the string-element release thunk, which
+                // bz_string_release's each part (null-/sentinel-safe) and frees
+                // the backing array. One-entry dispose scope for both-edge
+                // coverage, exactly as the class branch above.
+                disposeStack_.emplace_back();
+                llvm::Value* v = lowerExpr(*ds->value);
+                if (!diverged_ && v) {
+                    llvm::AllocaInst* slot = entryAlloca(ptrTy());
+                    builder_.CreateStore(v, slot);
+                    Disposal d{slot, nullptr};
+                    d.collection = true;
+                    d.collectionElemDisposer = stringElementReleaseThunk();
                     disposeStack_.back().push_back(d);
                 }
                 if (!diverged_) emitDisposals(disposeStack_.back());

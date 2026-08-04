@@ -27,11 +27,20 @@ namespace {
 
 // Helper classes: Stream is a disposable class; the enclosing class C has
 // an owned-shaped field `source` for the field-reassignment cases.
+//
+// §28.9 (v0.237, #2654): `Stream` declares a DESTRUCTOR, which is what makes
+// it "a disposable class" as this comment has always claimed — i.e. NON-
+// trivial-dispose. Without it, §28.9's exemption ("A `new` expression of a
+// trivial-dispose class type … does *not* produce the standard ownership-
+// discharge warning") would apply and every must-use assertion below would be
+// testing that exemption rather than this file's actual subject, the §28/§28.6
+// loop-fixpoint discharge analysis.
 std::string wrap(const std::string& body,
                  const std::string& sig = "M(cond: bool)") {
     return std::string("module M; "
         "class T end T; "
         "class Stream "
+        "  destructor end destructor; "
         "  public Inner: Stream := null; "
         "end Stream; "
         "class C "

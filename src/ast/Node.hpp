@@ -263,6 +263,29 @@ struct ReturnStmt : Stmt {
 // whose value is discarded (call, increment, …).
 struct ExpressionStmt : Stmt {
     std::unique_ptr<Expr> expr;
+    // fix #2655 / §21.9 / §28.3 / §28.9 (v0.237): set by SEMA — in §21.9's own
+    // bare-discard walk (ExprTypecheck.cpp), its single setter — when `expr` is
+    // one of that section's `ownedProduced` shapes (a `new`, an `owned`-returning
+    // user call, an owning-collection drain; never a borrow) AND the walk
+    // classifies the produced class TRIVIAL-DISPOSE. Codegen then frees the
+    // value at end of statement, per §28.3's unbound-owned-temporary rule ("an
+    // unnamed owned temporary … is reclaimed automatically once the expression
+    // that produced it is finished with it") at the boundary §21.9 fixes ("in an
+    // expression statement, 'end of the full expression' and 'end of the
+    // statement' coincide"). Without it the bare form leaked with zero
+    // diagnostics while `_ := new Box();` — the same statement plus §17.13's
+    // cosmetic discard sink — did not.
+    //
+    // The trivial-dispose gate is load-bearing, not decoration: §28.9 delegates
+    // only trivial instances' reclaim to "an implementation-defined mechanism …
+    // that runs no user code". Setting this from the ownership pass's wider
+    // `producerState == Owned` (the first draft) would let a NON-trivial class
+    // through wherever §21.9 under-rejects, and the free would then run a user
+    // destructor at end of statement. Keeping the setter inside §21.9's walk
+    // makes the freed set a strict subset of what that section inspected and
+    // declined to reject; see the setter's comment for the full list of shapes
+    // that widening admitted.
+    bool disposeOwnedValue = false;
 };
 
 // A.6: `AssignmentStmt ::= AssignTarget AssignOp Expression ";"`. The
@@ -419,6 +442,20 @@ struct DiscardStmt : Stmt {
     // bz_dict_free / bz_llist_free), never dynamicDispose (owning
     // collections have no vtable).
     bool disposeOwnedCollectionValue = false;
+    // fix #2655 / §17.13 / §28.3 / §28.9 (v0.237): set by the ownership pass
+    // when `value` is an owned PRODUCER (producerState == Owned) whose type is
+    // the decl-null builtin `StringBuilder` — the spec's OWN §17.13 example
+    // (`_ := new StringBuilder();`). disposeOwnedValue above excludes it by its
+    // `rt->declaration->decl != nullptr` gate ("builtin handles … need their
+    // own free paths (deferred)"), and disposeOwnedCollectionValue covers only
+    // the owning-collection family, so the builder's parts array leaked
+    // outright. Codegen frees it through the SAME wiring the `using var`
+    // StringBuilder path already uses (#1185): bz_array_free with the
+    // string-element release thunk. Scoped to StringBuilder alone — the other
+    // decl-null handles (Task, Subscription, Shared, Stopwatch, …) have
+    // different ownership contracts and no proven free path, and `Task` may not
+    // be discarded at all (§17.13's carve-out).
+    bool disposeOwnedBuilderValue = false;
 };
 
 // A.6: `YieldStmt ::= "yield" "return" Expression ";" | "yield" "break" ";"`.

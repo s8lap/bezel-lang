@@ -35,10 +35,19 @@ namespace {
 // Wrap a method body in a class with a few resolvable helper methods so the
 // snippet exercises ownership, not unrelated name-resolution diagnostics.
 // `Risky()` stands in for a throwable call inside a try body.
+//
+// §28.9 (v0.237, #2654) — applies to BOTH wrappers below: `T` declares a
+// DESTRUCTOR so it is NON-trivial-dispose. This file's subject is §28.3/§28.6
+// discharge across EXCEPTION edges. A trivial-dispose class is exempt from the
+// must-use auto-drop warning ("A `new` expression of a trivial-dispose class
+// type … does *not* produce the standard ownership-discharge warning"), so the
+// previous bare `class T end T;` would have made the must-use assertions below
+// test that exemption rather than the exception-path analysis they were
+// written for.
 std::string wrap(const std::string& body) {
     return std::string(
         "module M; "
-        "class T end T; "
+        "class T destructor end destructor; end T; "
         "class Error end Error; "
         "class C "
         "  public method Risky() end Risky; "
@@ -52,7 +61,7 @@ std::string wrap(const std::string& body) {
 std::string wrapParam(const std::string& params, const std::string& body) {
     return std::string(
         "module M; "
-        "class T end T; "
+        "class T destructor end destructor; end T; "
         "class Error end Error; "
         "class C "
         "  public method Risky() end Risky; "

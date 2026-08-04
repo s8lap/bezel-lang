@@ -3341,27 +3341,111 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // gives e a builtin-typed receiver; ToString on it must return
                     // string just like any other class.  per §8.5 (v0.134).
                     //
-                    // stdlib §3.3 / #971: EXCEPT a `ReadOnlyStringSpan`
-                    // receiver. That test ("Named TypeRef, no user TypeSymbol")
-                    // also matches the synthetic astNode-backed TypeRef of the
-                    // span view types, so `sp.ToString()` was typed here and
-                    // codegen then dispatched it through vtable slot 3 — but a
-                    // span is a {ptr, i32, i32} STRUCT VALUE with no vtable, so
-                    // the load read the source string's first 8 bytes as a
-                    // vtable pointer and jumped through it (segfault at run
-                    // time, an accept-trap rather than a diagnostic). §3.3
-                    // declares its own `ToString(): string` (materialize the
-                    // span's code points), so let the receiver fall through to
-                    // the ReadOnlyStringSpan member block below, which types
-                    // and lowers it correctly. A builtin exception type's
-                    // TypeRef carries no astNode, so this narrows the test
-                    // without disturbing the #608 case it was written for.
+                    // stdlib §3.3 / #971: a `ReadOnlyStringSpan` receiver is
+                    // EXCLUDED from this rule. That test ("Named TypeRef, no
+                    // user TypeSymbol") also matches the synthetic astNode-
+                    // backed TypeRef of the span view types, and §3.3 DECLARES
+                    // `ToString(): string` for ReadOnlyStringSpan (materialize
+                    // the span's code points), so it must fall through to its
+                    // own member block, which both types and lowers it.
+                    //
+                    // A builtin exception type's TypeRef carries no astNode, so
+                    // keying on the astNode narrows the test without disturbing
+                    // the #608/§8.5 case it was written for (`catch var e:
+                    // Exception` giving a Named TypeRef with no user
+                    // TypeSymbol).
+                    //
+                    // #2311 — THE SPAN-FAMILY `ToString` GAP, and why this is a
+                    // deferral rather than a ruling.
+                    //
+                    // The four buffer/array-backed spans (§4.14/§4.15) declare
+                    // no `ToString` of their own and none is lowered, so the
+                    // call was typed `string` here and then produced NO VALUE:
+                    // the enclosing statement was silently dropped (exit 0, no
+                    // diagnostic). Worse, through an `IReadOnlySpan<T>` receiver
+                    // it took the `isIfaceRecv` branch above and reached real
+                    // VTABLE DISPATCH on a `{ptr,i32,i32}` struct value with no
+                    // vtable — verified: SIGSEGV, ASan reporting `pc points to
+                    // the zero page`, i.e. a wild indirect jump through
+                    // attacker-influenceable bytes. §8.6 makes that receiver
+                    // shape ordinary and sanctioned ("passing a span to a
+                    // parameter of type `IReadOnlySpan<TElement>`"), so it is
+                    // not an exotic path.
+                    //
+                    // Whether these types SHOULD have a `ToString` is genuinely
+                    // unsettled, and this code deliberately does not settle it:
+                    //   * FOR the §8.5 default — §4.14 says outright "`Span<T>`
+                    //     is purely user-level Bezel — no compiler intrinsic.
+                    //     The record machinery … are all standard language
+                    //     features", and §8.5's default `ToString` for
+                    //     positional records IS record machinery. `Span<T>` is
+                    //     declared `public record Span<T>(Buffer:
+                    //     OwningBuffer<T>, Start: int, Length: int)`, exactly
+                    //     the shape §8.5 gives "a representation of fields".
+                    //     Nor does absence from the §4.14 record body prove
+                    //     anything: no stdlib record body lists its
+                    //     compiler-generated members (that body declares no
+                    //     `Equals`/`GetHashCode` either).
+                    //   * AGAINST — the #674 uniform unknown-member rule already
+                    //     treats the span surface as exhaustive.
+                    // Tracked in #2661, together with the two sibling behaviours
+                    // (`$"{sp}"` yields a silent empty string; `Range<int>
+                    // .ToString()` silently drops the statement).
+                    //
+                    // So this follows the #511 `GetType` precedent a few lines
+                    // below: report that it is NOT YET IMPLEMENTED while still
+                    // TYPING the expression `string`. That closes the actual bug
+                    // — the silent wrong value and the wild jump — without
+                    // committing to an answer the evidence does not yet support,
+                    // and typing it keeps secondary "untyped expression"
+                    // cascades from firing and preserves the future
+                    // implementation path. A hard "no member `ToString`"
+                    // rejection was the first version of this fix and was sent
+                    // back for over-committing: it would have made the compiler
+                    // treat differently two things the spec describes
+                    // identically (a user positional record and `Span<T>`).
+                    //
+                    // Head-name resolution mirrors `checkBuiltinSpanCallArgs`:
+                    // synthetic Named (no declaration, astNode set) → headName;
+                    // builtin stub (declaration set, its `decl` null) →
+                    // declaration->name. A REAL user decl resolves to neither,
+                    // so a user-defined type named `Span` is unaffected.
+                    //
+                    // The §4.16 interface needs its own test and does NOT fit
+                    // that pattern: `builtinInterfaceSym("IReadOnlySpan")`
+                    // synthesizes a `decl` (SemaContext.hpp ~977), so the
+                    // `!declaration->decl` arm above skips it — which is exactly
+                    // how the first version of this fix missed the interface
+                    // receiver and left the SIGSEGV in place. Keying on
+                    // `declaration->name` is the pattern already used for this
+                    // very interface elsewhere in this file (the span →
+                    // IReadOnlySpan coercion check, ~L152) and in
+                    // ExprTypecheck.cpp ~L3100.
+                    std::string_view spanHead;
+                    if (recvTy->kind == TypeRef::Kind::Named) {
+                        if (!recvTy->declaration) {
+                            if (recvTy->astNode && recvTy->astNode->name &&
+                                !recvTy->astNode->name->parts.empty())
+                                spanHead = recvTy->headName();
+                        } else if (!recvTy->declaration->decl ||
+                                   recvTy->declaration->name == "IReadOnlySpan") {
+                            spanHead = recvTy->declaration->name;
+                        }
+                    }
+                    // §3.3 — declares and lowers its own ToString; falls through.
+                    const bool isStringSpanRecv =
+                        spanHead == "ReadOnlyStringSpan";
+                    // §4.14/§4.15 concrete spans, plus the §4.16 interface form
+                    // through which §8.6 boxes them — the vtable-dispatch path.
+                    const bool isDeferredSpanRecv =
+                        spanHead == "Span" || spanHead == "ReadOnlySpan" ||
+                        spanHead == "ArraySpan" ||
+                        spanHead == "ReadOnlyArraySpan" ||
+                        spanHead == "IReadOnlySpan";
                     bool isBuiltinExRecv =
                         recvTy->kind == TypeRef::Kind::Named &&
-                        !recvTy->declaration &&
-                        !(recvTy->astNode && recvTy->astNode->name &&
-                          !recvTy->astNode->name->parts.empty() &&
-                          recvTy->headName() == "ReadOnlyStringSpan");
+                        !recvTy->declaration && !isStringSpanRecv &&
+                        !isDeferredSpanRecv;
                     // §8.5 (v0.182, #1579): the unit type's default `ToString`
                     // is its name, `"()"` — previously unstated, and this
                     // universal-ToString dispatch had no case for a
@@ -3369,6 +3453,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // nothing (same gap class as the inline-array case
                     // below).
                     bool isUnitRecv = recvTy->kind == TypeRef::Kind::Unit;
+                    // Checked BEFORE the general branch so that the interface
+                    // form is caught: an `IReadOnlySpan<T>` receiver satisfies
+                    // `isIfaceRecv`, which would otherwise type it `string` and
+                    // hand it to vtable dispatch.
+                    if (isDeferredSpanRecv) {
+                        ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            std::string("`ToString()` on `") +
+                            std::string(spanHead) +
+                            "` is not yet implemented (stdlib \xC2\xA7""4.14/"
+                            "\xC2\xA7""4.15, spec \xC2\xA7""8.5); deferred "
+                            "pending the ruling in #2661 on whether the span "
+                            "family gets the \xC2\xA7""8.5 positional-record "
+                            "default. Materialize explicitly instead — e.g. "
+                            "`ToArray()` (\xC2\xA7""4.14) — or use "
+                            "`ReadOnlyStringSpan`, which declares its own "
+                            "`ToString` (\xC2\xA7""3.3)");
+                        return;
+                    }
                     if (isObjectRecv || isIfaceRecv || isNamedClassRecv ||
                             isBuiltinExRecv || isUnitRecv) {
                         ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));

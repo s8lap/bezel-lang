@@ -65,10 +65,19 @@ namespace {
 // `cond` is a bool parameter; `Stream` is a disposable class; `source` is a
 // field that yields borrows for the borrow-branch cases. `Sink.Take` accepts
 // an `owned` parameter so a branch can transfer ownership out (MovedFrom).
+// §28.9 (v0.237, #2654): `Stream` declares a DESTRUCTOR, which is what makes
+// it "a disposable class" as the comment above has always claimed — i.e. NON-
+// trivial-dispose. This file's subject is the K7.4 branch/join disposal rule.
+// A trivial-dispose class is exempt from the must-use auto-drop warning ("A
+// `new` expression of a trivial-dispose class type … does *not* produce the
+// standard ownership-discharge warning"), so a bare `class Stream` with no
+// destructor would make every auto-drop assertion below test that exemption
+// rather than the per-path join analysis it was written for.
 std::string wrap(const std::string& body) {
     return std::string("module M; "
         "class T end T; "
         "class Stream "
+        "  destructor end destructor; "
         "  public Inner: Stream := null; "
         "  public Other: Stream := null; "
         "end Stream; "

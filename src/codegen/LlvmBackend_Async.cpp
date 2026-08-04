@@ -1552,6 +1552,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             groupingFreeEligible_.clear();
             setLiteralFreeEligible_.clear();   // #2142
             dictLiteralFreeEligible_.clear();  // #2143
+            literalTreeAggregateEligible_.clear();  // fix #2660
         }
         borrowingArrayFreeEligibleFn_ = resumeFn;
         dictMaterializerFreeEligibleFn_ = resumeFn;

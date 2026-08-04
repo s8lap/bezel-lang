@@ -55,6 +55,7 @@ namespace bezel::sema {
 class SemaContext;
 struct TypeRef;
 struct Symbol;
+struct TypeSymbol;
 }  // namespace bezel::sema
 
 namespace bezel::common {
@@ -67,6 +68,34 @@ namespace bezel::common {
 // ref must be returned unchanged. // per §14.1 / fix #567
 using TypeParamResolver =
     std::function<const sema::TypeRef*(const sema::TypeRef*)>;
+
+// §28.9 "Trivial-dispose classes" (v0.237) / §22.5 (#1684, #2654): does
+// `decl`'s class chain make it NON-trivial-dispose — a destructor, or a
+// non-static `owned` field (declared, or a captured `owned` primary-
+// constructor parameter, §22.10), anywhere from `decl` up through its base
+// classes?  The inverse of the spec's trivial-dispose classification: "A
+// class whose `Dispose()` is provably a no-op — it has no destructor, no
+// `owned` fields, … and its base class (if any, other than `Object`) is
+// itself trivial-dispose — is a trivial-dispose class."
+//
+// Relocated here VERBATIM from `ExprTC::isNonTrivialDisposeClass` (#2654) so
+// the sema consumers (§22.5 default-value check, §21.9 bare-discard) and the
+// ownership pass's §28.3 auto-drop warning gate share ONE copy rather than
+// drifting.  `ExprTC::isNonTrivialDisposeClass` is now a delegating wrapper.
+// The body is a pure function of its argument — it reads no ExprTC state —
+// which is what makes the relocation behaviour-preserving.
+//
+// NOT covered (pre-existing gap, filed as #2666): a field of owning-inline-
+// array type `[N owned]T?` (§15.1.1), which the spec's definition also
+// excludes from trivial-dispose.  Callers that need that arm must guard
+// separately; see `classChainHasOwningInlineArrayField` at the §28.3 gate in
+// Ownership.cpp.  A FOURTH independent copy of this classification lives at
+// PureChecker.cpp's `isTrivialDisposeClass` (§22.15) — collapsing it into
+// this one is part of #2666.
+//
+// Cycle-guarded (mirrors the #1624 precedent) so a malformed base-type graph
+// that survives error recovery cannot hang the compiler.
+bool isNonTrivialDisposeClass(sema::TypeSymbol* decl);
 
 // Shared shape-recognition: if the callee of `call` resolves to a user
 // `ast::MethodDecl` (a MethodSymbol whose `decl` is a MethodDecl), return it;
