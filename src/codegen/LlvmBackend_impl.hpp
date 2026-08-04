@@ -3423,10 +3423,25 @@ private:
     // non-nullable target (sema kept its declared {flag,value} layout but
     // accepted the coercion). When `v` is exactly that tagged-optional struct
     // and `targetTy` is its non-nullable value element, extract the value;
-    // otherwise return `v` unchanged. Fires ONLY for an accepted narrowed read
-    // (a genuinely-nullable source is rejected by sema; a force-unwrap is
-    // already an extracted scalar), so it never strips a value that should stay
-    // nullable.
+    // otherwise return `v` unchanged.
+    //
+    // PRECONDITION (#2614 / #2618) — this keys on NULLABILITY (the {flag,value}
+    // shape), NOT on narrowing. It cannot distinguish a sema-proved-non-null
+    // read from a genuinely-nullable one, so it is sound ONLY at a site where a
+    // sema gate already rejects the un-narrowed form. This comment previously
+    // asserted the opposite as a global invariant ("fires ONLY for an accepted
+    // narrowed read; a genuinely-nullable source is rejected by sema") and that
+    // was false: `Span<T>.Slice`, `string.AsSpan` and the `new Atomic<T>(...)`
+    // NewExpr argument each had NO nullability gate, so applying the unwrap
+    // there turned a loud verifyModule ICE into a SILENT WRONG VALUE — the
+    // payload of a possibly-null box. Those three gates now exist
+    // (checkBuiltinSpanCallArgs, checkBuiltinStringCallArgs' intPos set, and
+    // the Atomic NewExpr check).
+    //
+    // Before adding a call site: confirm sema rejects the un-narrowed form
+    // there, and ship a reject control asserting the diagnostic TEXT. If no
+    // gate exists and cannot be added, leave the ICE -- it is strictly better
+    // than a silent miscompile.
     llvm::Value* unwrapNarrowedNullable(llvm::Value* v, llvm::Type* targetTy) {
         if (!v || !targetTy) return v;
         if (auto* st = llvm::dyn_cast<llvm::StructType>(v->getType()))
