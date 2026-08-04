@@ -3439,12 +3439,88 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                             newTR->genericArgs[0])
                             if (auto* tTy = lowerTypeRef(newTR->genericArgs[0]))
                                 raw = unwrapNarrowedNullable(raw, tTy);
+                        // fix #2634 / §7.4 / §5.1 (v0.236): the unwrap above
+                        // requires the box payload to EQUAL T's LLVM type, so it
+                        // covers only `T? -> Atomic<T>`. A narrowed `int?` into
+                        // `Atomic<long>` has payload i32 against T's i64: no
+                        // branch fires, the `{i8,i32}` struct then matches no
+                        // isIntegerTy() test below, and `initVal` keeps its
+                        // getInt64(0) default — the #2618 symptom again, at a
+                        // WIDENING argument type. §5.1 admits that argument
+                        // ("Widening from a signed type to a strictly larger
+                        // signed type"), and `new Atomic<long>(someInt)`
+                        // compiles today, so the narrowed form is reachable.
+                        //
+                        // Unwrap by the box's OWN payload type instead, letting
+                        // the payload feed the widen ladder below rather than
+                        // bypass it.
+                        //
+                        // SOUNDNESS — this is gated on the ARGUMENT's sema type
+                        // being a nullable primitive, which is EXACTLY the
+                        // trigger condition of the #2618 sema gate
+                        // (ExprTypecheck_Exprs.cpp ~2639). That gate checks the
+                        // argument against the non-nullable form of its OWN
+                        // type, so it fires for `int?` regardless of what T is;
+                        // verified mechanically that `new Atomic<long>(n)` with
+                        // an un-narrowed `int? n` reports "the argument to
+                        // `Atomic` constructor is nullable but the target type
+                        // is non-nullable (§7)". So wherever this unwrap fires,
+                        // sema has PROVED the box non-null and the payload read
+                        // is safe. Keying on the sema type rather than on the
+                        // struct shape alone is deliberate: the constructor
+                        // argument is otherwise UNTYPED-CHECKED here (#2618
+                        // declined to re-implement ctor argument typing), so a
+                        // bare shape test could strip a field out of some other
+                        // 2-element aggregate that sema never vetted.
+                        const sema::TypeRef* argSemaTy =
+                            ctx_.exprType(*ne.args[0].value);
+                        const bool argIsPrim =
+                            argSemaTy &&
+                            argSemaTy->kind == sema::TypeRef::Kind::Primitive;
+                        if (argIsPrim && argSemaTy->nullable)
+                            if (auto* st =
+                                    llvm::dyn_cast<llvm::StructType>(
+                                        raw->getType()))
+                                if (st->getNumElements() == 2 &&
+                                    st->getElementType(0) ==
+                                        nullablePrimHasValTy() &&
+                                    st->getElementType(1)->isIntegerTy())
+                                    raw = unwrapNarrowedNullable(
+                                        raw, st->getElementType(1));
                         // Widen to i64 for bz_atomic_new's uint64_t parameter.
+                        //
+                        // fix #2634 / §5.1: widen by SIGNEDNESS. This ladder
+                        // zero-extended unconditionally, so every signed source
+                        // NARROWER than the cell lost its sign — proven, not
+                        // inferred: `new Atomic<long>(x)` with `x: int := -1`
+                        // read back 4294967295, and `new Atomic<int>(x)` with
+                        // `x: sbyte := sbyte(-1)` read back 255. That half is
+                        // PRE-EXISTING (it needs no nullable at all), but it
+                        // must be fixed here: the unwrap above is what lets a
+                        // narrowed `int?` reach this widen, so shipping the
+                        // unwrap alone would turn "silently 0" into "silently
+                        // sign-flipped" for a negative payload. Same pairing,
+                        // and same isUnsignedPrim key (LlvmBackend_impl.hpp
+                        // ~3066), as the sibling site fixed in #2617.
+                        //
+                        // The i1 branch stays FIRST and stays a ZExt: `bool` is
+                        // not in isUnsignedPrim's set, so routing it through the
+                        // signedness branch would SExt `true` to all-ones.
+                        //
+                        // Fallback is the previous ZExt whenever the source is
+                        // not positively known to be a signed primitive (sema
+                        // type absent, or a non-primitive such as IntPtr), so
+                        // behaviour changes ONLY where signedness is proven.
                         if (raw->getType()->isIntegerTy(1)) {
                             initVal = builder_.CreateZExt(raw, i64());
                         } else if (raw->getType()->isIntegerTy() &&
                                    !raw->getType()->isIntegerTy(64)) {
-                            initVal = builder_.CreateZExt(raw, i64());
+                            const bool srcSigned =
+                                argIsPrim &&
+                                !isUnsignedPrim(argSemaTy->primitive);
+                            initVal = srcSigned
+                                          ? builder_.CreateSExt(raw, i64())
+                                          : builder_.CreateZExt(raw, i64());
                         } else if (raw->getType()->isIntegerTy(64)) {
                             initVal = raw;
                         }
