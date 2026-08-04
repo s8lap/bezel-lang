@@ -14098,9 +14098,24 @@ void Emitter::armStringLocalRefcount(const void* declNode,
 // the +1 leaks (safe). `ref`/`out` string parameters are excluded: they alias
 // the caller's slot, which genuinely owns its value, and their store goes
 // through lowerStringRefParamStore (#2321), whose release-old is correct.
+//
+// fix #2712 / §23.3 (v0.240): `setterValueAnchor` extends all of the above to an
+// INLINED accessor's implicit `value` parameter. §23.3 gives it the same
+// ownership as a by-value `string` parameter — "the setter's implicit `value`
+// parameter has no modifier by default and takes a BORROW of the property's
+// declared type" — but it is not IN `params`: sema anchors its LocalSymbol on
+// the PropertyDecl and codegen binds it into `locals_[pd]`, so it reaches the
+// release through localSlot()'s LocalSymbol branch instead of its
+// ParameterSymbol branch, and armStringLocalRefcount never sees it either (that
+// is keyed on a LocalDecl node, reached only from lowerLocalDecl). Same missing
+// +1, same drop-on-overwrite release, same use-after-free — mechanically
+// reproduced for `value := …` inside a block-bodied indexer setter and inside a
+// block-bodied instance and static property setter. A `ref`/`out` SetterParamSpec
+// is excluded for the same aliasing reason as a `ref`/`out` parameter.
 void Emitter::retainAssignedStringParams(
     const std::vector<std::unique_ptr<ast::Stmt>>& body,
-    const std::vector<sema::Symbol*>& params) {
+    const std::vector<sema::Symbol*>& params,
+    const ast::PropertyDecl* setterValueAnchor) {
     // 0. CO-GATE WITH THE RELEASE. Both drop-on-overwrite releases this retain
     //    pairs are gated on `currentFn_ == stringReleaseEligibleFn_`
     //    (LlvmBackend_Stmts.cpp — the `:=` call site, which is the ONLY caller
@@ -14131,20 +14146,53 @@ void Emitter::retainAssignedStringParams(
         if (paramSlots_.find(s) == paramSlots_.end()) continue;
         candidates.insert(s);
     }
-    if (candidates.empty()) return;
+    // 1b. fix #2712: the same candidacy test for the implicit `value`. Its slot
+    //     lives in locals_ keyed on the PropertyDecl (the caller must already
+    //     have bound it); a `ref`/`out` SetterParamSpec is excluded exactly as a
+    //     `ref`/`out` parameter is above, and `set(owned)` (§23.3) is excluded
+    //     because an owned-taking setter genuinely OWNS its `value` — its
+    //     drop-on-overwrite release is already correct and a retain would leak.
+    //     (§28.1 makes `owned` on a `string` a compile error, so for the type
+    //     this function acts on the exclusion is belt-and-braces.) The TYPE test
+    //     is deferred to step 3, where the assigning identifier's own
+    //     LocalSymbol is in hand.
+    llvm::AllocaInst* valueSlot = nullptr;
+    if (setterValueAnchor) {
+        bool byRefValue = false;
+        for (const auto& a : setterValueAnchor->accessors)
+            if (a.isSet && (a.setterParamMod == "ref" ||
+                            a.setterParamMod == "out" ||
+                            a.setterParamMod == "owned"))
+                byRefValue = true;
+        auto vit = locals_.find(setterValueAnchor);
+        if (!byRefValue && vit != locals_.end() && vit->second &&
+            vit->second->getAllocatedType()->isPointerTy())
+            valueSlot = vit->second;
+    }
+    if (candidates.empty() && !valueSlot) return;
 
     // 2. Does the body assign to one? Both `:=` and the compound forms count —
     //    they are one AssignmentStmt node (op) and BOTH release the displaced
     //    value (LlvmBackend_Setup.cpp lowerStringLocalReassign / the §4.6
     //    string `+=` branch in LlvmBackend_Stmts.cpp).
     std::unordered_set<const sema::Symbol*> assigned;
+    const sema::LocalSymbol* assignedValue = nullptr;   // fix #2712
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
             if (auto* id =
                     dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
-                if (sema::Symbol* sym = ctx_.exprSymbol(*id))
+                if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
                     if (candidates.count(sym)) assigned.insert(sym);
+                    // fix #2712: `value := …` — the setter's implicit parameter,
+                    // recognised by its anchor, NOT by the name `value` (a
+                    // SetterParamSpec may rename it, §A.4).
+                    if (valueSlot)
+                        if (auto* ls = dynamic_cast<sema::LocalSymbol*>(sym))
+                            if (ls->decl ==
+                                static_cast<const ast::Node*>(setterValueAnchor))
+                                assignedValue = ls;
+                }
         }
         // Mirrors collectStringReleaseEligible's recursion (NOT into lambdas).
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
@@ -14178,6 +14226,23 @@ void Emitter::retainAssignedStringParams(
         llvm::AllocaInst* slot = paramSlots_[const_cast<sema::Symbol*>(sym)];
         if (!slot) continue;
         emitStringRetain(builder_.CreateLoad(ptrTy(), slot, "str.parm"));
+    }
+    // 3b. fix #2712: the same +1 for an assigned-to implicit `value`. The type
+    //     test runs here because the LocalSymbol sema built for it carries the
+    //     RESOLVED type; the PropertyDecl's syntactic `: Type` is the fallback.
+    //     A generic `property P: T` whose T is `string` under substitution is
+    //     conservatively NOT retained (neither type reads as a Primitive
+    //     String), which leaves that shape exactly as it behaves today.
+    if (assignedValue && valueSlot) {
+        const sema::TypeRef* vty =
+            assignedValue->declType
+                ? assignedValue->declType
+                : (setterValueAnchor->type
+                       ? ctx_.resolvedType(*setterValueAnchor->type)
+                       : nullptr);
+        if (isStringTypeRefNonNull(vty))
+            emitStringRetain(
+                builder_.CreateLoad(ptrTy(), valueSlot, "str.value"));
     }
 }
 

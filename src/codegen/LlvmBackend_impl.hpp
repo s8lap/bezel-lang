@@ -8059,9 +8059,16 @@ private:
     // reference instead of the caller's borrow. Call right after
     // bindParameters, with the body statements and the member's parameter
     // symbols (see the .cpp for the full argument).
+    //
+    // fix #2712 / §23.3: `setterValueAnchor` extends the same treatment to an
+    // INLINED accessor's implicit `value` parameter, which sema anchors on the
+    // PropertyDecl and codegen binds into locals_ (not paramSlots_) — pass the
+    // PropertyDecl after `locals_[pd]` has been bound; null for every non-
+    // accessor caller.
     void retainAssignedStringParams(
         const std::vector<std::unique_ptr<ast::Stmt>>& body,
-        const std::vector<sema::Symbol*>& params);
+        const std::vector<sema::Symbol*>& params,
+        const ast::PropertyDecl* setterValueAnchor = nullptr);
 
     // fix #2115 / §28.9 / §35.4: the set of `var` value-like choice LocalDecl
     // nodes whose initializer is a choice construction every string payload arg

@@ -6212,6 +6212,17 @@ llvm::Value* Emitter::buildRecordValue(
                 paramSlots_[cs->params[pi]] = pslot;
             }
         }
+        // fix #2712 / §28.1 / §28.9 / §9 (v0.240): the INLINED RECORD-CONSTRUCTOR
+        // member of the #2696 family (recorded on #2707) — the identical shape to
+        // `inlineCtorBody`: this body is lowered into the ENCLOSING function with
+        // `currentFn_` untouched, so the drop-on-overwrite release fires on the
+        // constructor's own `string` parameter with no compensating +1 and frees
+        // the CALLER's string. Reproduced mechanically (`new Rec($"v-{i}")` where
+        // the record ctor does `s := s + "-x"`, and the caller reads the string
+        // afterwards): `heap-use-after-free`, frames `bz_string_release <- main`.
+        // Folded in here rather than filed because it is literally this one call
+        // and the alternative was leaving a proven use-after-free in the tree.
+        retainAssignedStringParams(cd->body, cs->params);
         lowerScopedBlock(cd->body);
         currentThis_ = savedThis;
         locals_ = std::move(savedLocals);

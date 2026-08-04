@@ -1746,6 +1746,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                                     builder_.CreateStore(newVal,
                                                                          vslot);
                                                     locals_[pd] = vslot;
+                                                    // fix #2712 / §28.1 /
+                                                    // §28.9 / §23.4 (v0.240):
+                                                    // the `++`/`--` twin of
+                                                    // lowerIndexerSet's retain
+                                                    // — this setter body is
+                                                    // inlined into the
+                                                    // enclosing function the
+                                                    // same way, and `t[s]++`
+                                                    // on an indexer whose
+                                                    // block setter reassigns
+                                                    // its own `string` index
+                                                    // parameter reproduced the
+                                                    // same use-after-free.
+                                                    if (setterStmts)
+                                                        retainAssignedStringParams(
+                                                            *setterStmts,
+                                                            ps->indexerParams,
+                                                            pd);
                                                     if (setterExpr)
                                                         lowerExpr(*setterExpr);
                                                     else if (setterStmts)

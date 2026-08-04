@@ -2132,6 +2132,23 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         builder_.CreateStore(val, slot);
         locals_[pd] = slot;
     }
+    // fix #2712 / §28.1 / §28.9 / §23.4 (v0.240): the INLINED-SETTER twin of
+    // #2696's `inlineCtorBody` retain, and the site #2712 was filed against.
+    // This body is lowered into the ENCLOSING function — nothing here touches
+    // `currentFn_` — so when that enclosing body is the analyzed one the
+    // drop-on-overwrite `bz_string_release` that `k := k + "-x"` (or `value :=
+    // …`) emits DOES fire, on a slot this frame gave no +1: it frees the
+    // CALLER's string. Reproduced as `heap-use-after-free`, frames
+    // `bz_string_release <- main`. Emitted after BOTH binds and before the body,
+    // so it dominates every assignment. The helper's own co-gate
+    // (`currentFn_ != stringReleaseEligibleFn_ -> return`) makes it a no-op when
+    // this setter is itself inlined into a body lowered outside
+    // emitFunctionBody, exactly as the release is a no-op there — no call-site
+    // audit needed. Only the BLOCK-bodied setter can contain an assignment
+    // statement (the parser stores even the bare `set => k := e;` form as
+    // `stmts`, Parser_Decls.cpp); an `exprBody` setter needs nothing.
+    if (setterStmts)
+        retainAssignedStringParams(*setterStmts, ps->indexerParams, pd);
     if (setterExpr) {
         lowerExpr(*setterExpr);
     } else if (setterStmts) {
@@ -2507,6 +2524,13 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
         builder_.CreateStore(newVal, vslot);
         locals_[pd] = vslot;
     }
+    // fix #2712 / §28.1 / §28.9 / §23.4 (v0.240): the COMPOUND-ASSIGNMENT twin
+    // of lowerIndexerSet's retain — this setter body is inlined into the
+    // enclosing function the same way, and `t[s] += 1` on an indexer whose
+    // block setter reassigns its own `string` index parameter reproduced the
+    // same `heap-use-after-free`. See lowerIndexerSet for the full argument.
+    if (setterStmts)
+        retainAssignedStringParams(*setterStmts, ps->indexerParams, pd);
     if (setterExpr) lowerExpr(*setterExpr);
     else if (setterStmts) lowerScopedBlock(*setterStmts);
     // fix #2567 (§23.4/§28.9/§4.6, v0.236): the COMPOUND-ASSIGNMENT twin of
@@ -4212,6 +4236,14 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
         llvm::AllocaInst* slot = entryAlloca(v->getType());
         builder_.CreateStore(v, slot);
         locals_[pd] = slot;
+        // fix #2712 / §23.3 / §28.9 (v0.240): the STATIC-property twin of the
+        // inlined-indexer-setter retain — found by sweeping the shape rather
+        // than listed on the issue, and reproduced mechanically (`value := "zz"`
+        // inside `static property P: string`'s block setter freed the caller's
+        // string: `heap-use-after-free`, frames `bz_string_release <- main`).
+        // `ps->indexerParams` is empty for a named property, so this call is
+        // about `value` alone. See lowerIndexerSet for the full argument.
+        retainAssignedStringParams(setter->stmts, ps->indexerParams, pd);
         // §22.9 (#739): inline the setter body with an accessor-end target so a
         // `return;` ends the setter rather than the enclosing method.
         llvm::BasicBlock* savedAccEnd = inlinedAccessorEnd_;
@@ -4298,6 +4330,11 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     llvm::AllocaInst* slot = entryAlloca(v->getType());
     builder_.CreateStore(v, slot);
     locals_[pd] = slot;
+    // fix #2712 / §23.3 / §28.9 (v0.240): the INSTANCE-property twin of the
+    // static branch's retain immediately above — same inlined body, same
+    // unpaired drop-on-overwrite release, reproduced the same way. See
+    // lowerIndexerSet for the full argument.
+    retainAssignedStringParams(setter->stmts, ps->indexerParams, pd);
     llvm::Value* savedThis = currentThis_;
     currentThis_ = recv;
     // §22.9 (#739): accessor-end target — a `return;` ends the setter, not the
