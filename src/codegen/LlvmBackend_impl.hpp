@@ -7475,7 +7475,7 @@ private:
     // Maps alloca slot → frame field index (spill at suspend, restore at state entry).
     std::unordered_map<llvm::AllocaInst*, unsigned> smAllocaToField_;
 
-    // fix #2702 (§23.3/§23.4/§30.5/§28.14, v0.240): ONE place that saves,
+    // fix #2702 (§23.3/§23.4/§30.5/§28.4, v0.240): ONE place that saves,
     // neutralises and restores the emitter state a NESTED body emission must
     // not inherit. `ensurePropertyBlockGetter`, `ensureIndexerBlockGetter` and
     // `ensurePropertyAccessorFn` each lower a user statement body into a

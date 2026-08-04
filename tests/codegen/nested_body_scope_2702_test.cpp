@@ -193,7 +193,7 @@ BEZEL_TEST(codegen_nested_body_scope_2702, finally_still_runs_inside_block_gette
 // a call, which is the shape that reaches that comparison.
 // The destructor folds the getter's value into a static so the result is
 // observable: Owner.N is 3 + 4 = 7, so Main returns 7 - 7 + 5 = 5.
-// §23.3 + §28.14 (destructor bodies).
+// §23.3 + §28.4 (destructor bodies).
 static const char* kGetterFirstTouchedFromDestructor =
     "module M; "
     "class Leaf "
@@ -250,13 +250,21 @@ BEZEL_TEST(codegen_nested_body_scope_2702,
 // against a different substitution than its signature). If a future edit adds
 // either map to the reset list, this case stops compiling or returns the wrong
 // value. §14.2 (constraints/instantiation) + §23.3.
+//
+// ⚠ THE FIELD AND THE PROPERTY MUST BOTH BE `T`, NOT `int`. An earlier version
+// of this case declared `_v: int` / `V: int`, so `T` appeared only in the class
+// header and at the instantiation site and NOTHING in the getter resolved a
+// type parameter — it could not distinguish "map inherited" from "map cleared"
+// and was a plain smoke test wearing a control's name. Review of #2702 caught
+// that. Keep `T` in the getter's own signature and body, or this case silently
+// stops guarding the inherit decision.
 // Box<int>.V returns 21; Main returns 21 - 18 = 3.
 static const char* kGenericBlockGetterControl =
     "module M; "
     "class Box<T> "
-    "  private _v: int; "
-    "  public constructor(v: int) _v := v; end constructor; "
-    "  public property V: int "
+    "  private _v: T; "
+    "  public constructor(v: T) _v := v; end constructor; "
+    "  public property V: T "
     "    get => do "
     "      return _v; "
     "    end; "

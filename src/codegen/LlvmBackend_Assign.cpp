@@ -3159,7 +3159,7 @@ const ast::PropertyAccessor* Emitter::blockGetterOf(sema::Symbol* sym) {
 
 
 // fix #2702 (§23.3 "Block-form properties" / §23.4 "Indexers" / §30.5 /
-// §28.14, v0.240): save + neutralise the emitter state that a NESTED body
+// §28.4, v0.240): save + neutralise the emitter state that a NESTED body
 // emission must not inherit; the destructor restores it.
 //
 // WHY A GUARD AND NOT ANOTHER FIELD-BY-FIELD PATCH. The three adopters below
@@ -3400,7 +3400,7 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     auto  savedUD        = unwindScopeDepth_;
     auto  savedDiv       = diverged_;
     auto  savedGSubst    = genericSubst_;
-    // fix #2702 (§23.3/§30.5/§28.14, v0.240): everything a nested body emission
+    // fix #2702 (§23.3/§30.5/§28.4, v0.240): everything a nested body emission
     // must not inherit — the #2170 state-machine pair (smKind_/smStateStruct_),
     // the #2694 return-contract pair, and the members those two fixes missed
     // (smStateGEP_ and the rest of the suspend frame, the destructor-body pair,
@@ -3652,19 +3652,40 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     // closed on the two direct-read emitters, and predicted the #2694 leak for
     // a `string` property read through an interface. That premise does NOT hold
     // today: unlike the two block getters, this emitter is never reached from
-    // the middle of a method body. Every one of its call sites lives in a pass
-    // that runs BEFORE the body loop — `declareVtables()`,
-    // `emitExportedPropertyGetters()`, `emitExportedPropertySetters()` and
-    // `setupBoxDescriptors()` (LlvmBackend_impl.hpp ~290/~294/~298/~339, all
-    // above the `for (auto& [sym, fn] : methodFns_) emitFunctionBody(...)` loop
-    // at ~346), and none of them is reachable from `lowerExpr`/`lowerStmt`, so
-    // nesting cannot re-enter this function either. Instrumenting the entry and
-    // compiling #2708's own interface-dispatch repro confirmed it: the state is
-    // entirely default here, `currentFn_` included. There is therefore no
-    // observable defect to regression-test, and none is claimed.
+    // the middle of a method body.
     //
-    // The guard is adopted anyway because the invariant should hold by
-    // CONSTRUCTION rather than by an accident of pass ordering: this emitter is
+    // ⚠ THE PASS-ORDERING ARGUMENT IS NOT THE REASON, and must not be recorded
+    // as one: `declareVtables()` (LlvmBackend_impl.hpp ~290) ITSELF lowers user
+    // statement bodies — via the accessor calls at LlvmBackend_Setup.cpp
+    // ~3699/~3706/~3826 and `ensureIndexer{Getter,Setter}Fn` at ~3824-3825 —
+    // and it runs BEFORE `emitExportedPropertyGetters()` (~294),
+    // `emitExportedPropertySetters()` (~298) and `setupBoxDescriptors()`
+    // (~339). So "every call site precedes the body loop at ~346" does NOT
+    // establish that no user code has been lowered yet.
+    //
+    // The real reason the two fields #2708 is about are clean at every entry is
+    // that `currentReturnTypeNode_` and `currentLambdaReturnSemaTy_` are
+    // BALANCED-WRITE at every writer — `emitFunctionBody`,
+    // `buildSpecializedMethodFn` (Calls2.cpp ~8707 -> restored ~8957),
+    // `genericInstSfinitFn` (Setup.cpp ~1104/~1110 -> ~1340), Setup.cpp
+    // ~4670-4671 -> ~4676, and `lowerLambda` all save and restore. This emitter
+    // pre-guard neither set nor saved them; it only READ them through the body
+    // it lowered, so it could not leave them dirty either. Both start null at
+    // the driver and every excursion returns them to null. Instrumenting the
+    // entry on #2708's own interface-dispatch repro is consistent with that.
+    //
+    // (One wording caveat on that instrumentation: the entry state is not
+    // "entirely default" from the SECOND sibling call onward — `:3911` restores
+    // the builder insert point only under `if (savedBB)`, so on the first call
+    // in a module nothing is restored. No live hazard: every consumer sets its
+    // own insert point before emitting.)
+    //
+    // There is therefore no observable defect to regression-test, and none is
+    // claimed.
+    //
+    // The guard is adopted anyway because it RESETS AT ENTRY rather than merely
+    // restoring at exit, which is what makes the emitter robust independently of
+    // both pass ordering and any future unbalanced writer: this emitter is
     // one moved call site away from the #2701/#2702 failure mode, and the whole
     // point of NestedBodyScope is that the next per-body field is handled in one
     // place. Today it is a no-op here.
