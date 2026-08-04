@@ -2915,32 +2915,40 @@ llvm::Function* Emitter::collectionNodeFreeThunk(const sema::TypeRef* nodeTy) {
         if (!childDisposer && childIsDictValue)
             childDisposer = dictValueBoxFreer(nodeTy);
         // A string child gets the +1 release ONLY where the construction side
-        // took a matching retain. That is exactly the array-backed
-        // Array/Stack/Queue arm (`litIsStrArr` in
-        // materializeHeapCollectionLiteral): the dictionary-value and
-        // LinkedList arms store a string WITHOUT retaining it, so pairing them
-        // with a release makes the container consume a +1 it never took.
+        // took a matching retain — pairing a release with a non-retaining
+        // constructor makes the container consume a +1 it never took.
         //
-        // That asymmetry is PRE-EXISTING and is reachable today with no nested
-        // literal at all — two flat `Dictionary<string,string>` locals holding
-        // the same runtime-built string double-free (verified: an ASan
-        // Deallocate SEGV over 20 iterations, on code this fix does not touch;
-        // filed separately). One container alone is balanced by accident,
-        // which is why it has gone unnoticed.
+        // Which construction arms retain a string child (all in
+        // LlvmBackend_Setup.cpp):
+        //   * Array/Stack/Queue element — `litIsStrArr` in
+        //     materializeHeapCollectionLiteral.            → RETAINS
+        //   * Dictionary/SortedDictionary VALUE —
+        //     `dictIsStringValue` in materializeHeapDictLiteral, added by
+        //     fix #2682.                                   → RETAINS (was not)
+        //   * LinkedList/OwningLinkedList element —
+        //     the bz_llist_add_last arm, which deliberately mirrors `.AddLast`
+        //     (no retain on ANY LinkedList insert path).   → does NOT retain
         //
-        // #2660 must not make that crash reachable through a NEW site: with the
-        // release installed here, a flat container and an interior node sharing
-        // one string crash, and before this fix that program did not compile at
-        // all. So the interior node is freed with a NULL child disposer — its
-        // backing IS reclaimed (the obligation #2660 exists to discharge) and
-        // the string's +1 is left alone. The cost is a bounded string leak on
-        // an interior `Dictionary<K,string>` / `LinkedList<string>` node; the
-        // alternative is a use-after-free, and a leak is the direction this
-        // file takes every time. Reverting this narrowing is correct once the
-        // retain/release asymmetry itself is fixed at the construction sites.
+        // fix #2682 REVERTS the #2660 narrowing for the dictionary-value arm.
+        // #2660 had to free an interior `Dictionary<K,string>` node with a NULL
+        // child disposer because the construction side took no retain, so
+        // installing the release here would have made a flat container and an
+        // interior node sharing one string double-free — and that program did
+        // not compile at all before #2660, so it would have been a NEWLY
+        // reachable crash. #2682 fixed the construction side (the interior node
+        // is materialized by the very same materializeHeapDictLiteral), so the
+        // release is now the balanced half of a real retain and the bounded
+        // string leak that narrowing cost is gone.
+        //
+        // LinkedList stays excluded: no LinkedList insert path retains, so a
+        // release here would still be unpaired. That leaves an interior
+        // `LinkedList<string>` node leaking its strings — the same bounded leak,
+        // preferred over a use-after-free, and tracked separately.
         bool strChildRetainedAtConstruction =
-            !childIsDictValue && !isLinkedListTypeName(nodeTy) &&
-            (head == "Array" || head == "Stack" || head == "Queue");
+            !isLinkedListTypeName(nodeTy) &&
+            (childIsDictValue
+                 ? (head == "Dictionary" || head == "SortedDictionary")
+                 : (head == "Array" || head == "Stack" || head == "Queue"));
         if (!childDisposer && isStrElem(childTy) && strChildRetainedAtConstruction)
             childDisposer = stringElementReleaseThunk();
         // The child is itself an aggregate node (`Dictionary<string,

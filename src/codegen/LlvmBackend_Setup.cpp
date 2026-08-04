@@ -20964,6 +20964,39 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
     const sema::TypeRef* valTy =
         (dictTy->genericArgs.size() > 1) ? dictTy->genericArgs[1] : nullptr;
 
+    // fix #2682 / #602 / #429 / §15.4 / §28.9 / §28.11: a borrowing
+    // Dictionary<K,string> (or SortedDictionary<K,string>) CO-OWNS a +1 per
+    // stored string value — every release site says so (registerUsingDisposal's
+    // dictionary branch and buildCollectionTempDisposal both install
+    // stringElementReleaseThunk, and .Clear/.Remove/indexer-overwrite pass it to
+    // the disposing runtime entries). The insert side took that +1 on `.Add(k,v)`
+    // (LlvmBackend_Calls.cpp, `dictIsStringValue` guard) and on `d[k] := s`
+    // (LlvmBackend_Assign.cpp, `isStrVal` guard) — but NOT here, so a literal-
+    // built dictionary released a +1 it never took. One such dictionary survived
+    // by accident (it consumed the initializing local's +1); TWO dictionaries
+    // sharing one runtime-built string double-freed it (ASan SEGV in
+    // bz_string_release under bz_dict_free; `free(): invalid pointer` without
+    // ASan). A string LITERAL hid the defect completely: it folds to an
+    // RC-sentinel on which bz_string_release is a no-op.
+    //
+    // The predicate is a verbatim mirror of `.Add`'s `dictIsStringValue`, so the
+    // literal path and the `.Add` path now agree element-for-element:
+    // OwningDictionary is excluded (its value parameter is `owned` — transfer,
+    // and no release site installs the thunk for it), `string?` is excluded, and
+    // a fresh +1 producer TRANSFERS rather than double-retaining
+    // (isPlusOneStringProducer), exactly as the Array/Stack/Queue element arm of
+    // materializeHeapCollectionLiteral and materializeHeapSetLiteral already do.
+    bool dictValIsOwning =
+        dictTy->astNode && dictTy->astNode->name &&
+        !dictTy->astNode->name->parts.empty() &&
+        common::isOwningPrefixedName(dictTy->headName());
+    bool dictIsStringValue =
+        !dictValIsOwning && valTy && !valTy->nullable &&
+        valTy->kind == sema::TypeRef::Kind::Primitive &&
+        valTy->primitive == sema::PrimitiveType::String &&
+        elementPolicyFor(valTy, /*owning=*/false).cat ==
+            ElementPolicy::Category::RuntimeManaged;
+
     // --- 1. Allocate the backing hash table (same as lowerNew Dictionary). ---
     llvm::Value* dict = nullptr;
     if (keyTy) {
@@ -21059,6 +21092,11 @@ llvm::Value* Emitter::materializeHeapDictLiteral(
                 "key or value — #1386");
             continue;
         }
+        // fix #2682: take the dictionary's +1 BEFORE encoding (v is still the raw
+        // bz_string*; encodeVal returns a pointer value unchanged). Mirrors the
+        // retain-before-encode ordering of the `.Add(k,v)` lowering.
+        if (dictIsStringValue && !isPlusOneStringProducer(cl->elements[i].get()))
+            emitStringRetain(v);
         llvm::Value* vPtr = encodeVal(v);
         if (keyTy) {
             auto* fn = declareC("bz_dict_set_gen", llvm::Type::getVoidTy(llvm_),
