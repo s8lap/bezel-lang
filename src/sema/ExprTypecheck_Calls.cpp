@@ -6620,12 +6620,80 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                             // Slice returns same span type (writable → writable,
                             // read-only → read-only) with same element type.
-                            auto* tr = ctx_.makeTypeRef();
-                            tr->kind = TypeRef::Kind::Named;
-                            tr->declaration = nullptr;
-                            tr->astNode = recvTy->astNode;  // same synthetic node
-                            tr->genericArgs.push_back(recvTy->genericArgs[0]);
-                            ctx_.setExprType(&ce, tr);
+                            //
+                            // stdlib §4.14/§4.15 declare exactly two overloads on
+                            // every one of the four buffer/array-backed spans:
+                            //   `Slice(start: int, length: int)` and — since
+                            //   v0.195 — `Slice(start: int)`
+                            //     (`=> Slice(start, Length - start)`).
+                            // There is NO `Slice(r: Range<int>)` on a span (that
+                            // one is `Array<T>.Slice`, stdlib §4.4), and no other
+                            // arity.
+                            //
+                            // #2312: this branch typed EVERY `Slice` call as the
+                            // span type regardless of arity or operand type, while
+                            // codegen lowered only the two-`int` form. Anything
+                            // else fell through to `return nullptr` and the value
+                            // was simply never produced — the enclosing statement
+                            // was silently dropped, or (in a local-decl / return
+                            // position) degraded to zero with only an `internal:`
+                            // note (#2434/#2491) while `bezelc` still exited 0.
+                            // Verified on e87d868: `ros.Slice(2).Length` printed
+                            // nothing at all and `return ros.Slice(2).Length`
+                            // returned 0, not 3.
+                            //
+                            // Only the ARITY is gated here, and that is a
+                            // deliberate, narrower choice than it first appears.
+                            //
+                            // The codegen lowering needs an INTEGER operand, so
+                            // the tempting companion gate is "reject every
+                            // non-primitive operand". That would be a FALSE
+                            // REJECT: `span.Slice(r: Range<int>)` is undeclared
+                            // in §4.14/§4.15 (the Range-taking `Slice` is
+                            // `Array<T>.Slice`, stdlib §4.4) yet is accepted
+                            // today and RELIED ON by the ownership suite —
+                            // tests/ownership/consume_site_freeze_span_1726_test
+                            // .cpp:144 (`var t := s.Slice(0..<4);`) and
+                            // consume_site_freeze_span_reassign_1741_test.cpp:152
+                            // (`s := s.Slice(0..<4);`) both need it to type as a
+                            // span for the borrow-liveness diagnostic under test.
+                            // Whether the stdlib should DECLARE that overload or
+                            // sema should reject it is a real question, but it is
+                            // not this issue's, and settling it silently here
+                            // would break two other issues' tests. Filed instead.
+                            //
+                            // So a `Range<int>` operand keeps exactly the
+                            // behaviour it has today: it types as a span and then
+                            // fails to lower, which the codegen `isIntegerTy()`
+                            // guard keeps LOUD (null value → the #2434/#2491
+                            // `internal:` note) rather than truncating a struct.
+                            // A clean loud failure is the correct half-state; a
+                            // silent wrong value would not be.
+                            //
+                            // Primitive operands are NOT checked here either:
+                            // they are already owned by
+                            // `checkBuiltinSpanCallArgs`' §7 / assignability gate
+                            // (#2614), which reports the narrowing-aware
+                            // diagnostic. Verified that an un-narrowed `int?`
+                            // draws exactly ONE diagnostic, from that gate.
+                            bool sliceOk = true;
+                            if (ce.args.size() != 1 && ce.args.size() != 2) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string("`Slice` on `") +
+                                    std::string(rcn) +
+                                    "<T>` takes `(start)` or `(start, length)` "
+                                    "(stdlib \xC2\xA7""4.14/\xC2\xA7""4.15)");
+                                sliceOk = false;
+                            }
+                            if (sliceOk) {
+                                auto* tr = ctx_.makeTypeRef();
+                                tr->kind = TypeRef::Kind::Named;
+                                tr->declaration = nullptr;
+                                tr->astNode = recvTy->astNode;  // same synthetic node
+                                tr->genericArgs.push_back(recvTy->genericArgs[0]);
+                                ctx_.setExprType(&ce, tr);
+                            }
                         } else if (m == "AsReadOnly" && isWritable &&
                                    !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
                             // ArraySpan<T>.AsReadOnly() → ReadOnlyArraySpan<T>;

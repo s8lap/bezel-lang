@@ -3013,34 +3013,79 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         return builder_.CreateICmpEQ(loadLen(), builder_.getInt32(0), "sp.empty");
     }
 
-    // -- Slice(start: int, length: int) ----------------------------------------
-    if (m == "Slice" && call.args.size() == 2 &&
-        call.args[0].value && call.args[1].value) {
+    // -- Slice(start: int, length: int) / Slice(start: int) --------------------
+    // stdlib §4.14/§4.15: both overloads, on all four buffer/array-backed spans.
+    // The v0.195 one-arg form is defined as `Slice(start, Length - start)`.
+    //
+    // #2312: this branch required `args.size() == 2`, so the one-arg form fell
+    // through to the function's `return nullptr` and its value was never
+    // produced — the enclosing statement was silently DROPPED (verified on
+    // e87d868: `Console.WriteLine(ros.Slice(2).Length…)` printed nothing, and
+    // `return ros.Slice(2).Length` returned 0 instead of 3, with `bezelc`
+    // exiting 0 either way). Modelled on the ReadOnlyStringSpan.Slice site
+    // above, which #971/9036830 already fixed the same way.
+    //
+    // THE OPERAND PRECONDITION, and where it does and does NOT come from.
+    // `checkBuiltinSpanCallArgs` (#2614) rejects a PRIMITIVE operand that is not
+    // assignable to `int` (including an un-narrowed `int?`), and sema's span
+    // `Slice` typing branch now rejects every arity other than 1 or 2. Neither
+    // rejects a NON-primitive operand: `span.Slice(r: Range<int>)` is undeclared
+    // in §4.14/§4.15 but is accepted today and relied on by the ownership suite
+    // (consume_site_freeze_span_1726 / _reassign_1741), so rejecting it would be
+    // a false reject outside this issue's scope — filed, not swept in.
+    //
+    // Therefore the trunc below may NOT assume an integer, and the explicit
+    // `isIntegerTy()` tests are load-bearing rather than defensive: they return
+    // null so the failure stays LOUD (the #2434/#2491 `internal:` note, exactly
+    // the behaviour a Range operand has today) instead of emitting
+    // `trunc {i32,i32} to i32` and truncating a struct — which is the same
+    // silent-wrong-value class this issue is about, one level down. Do not drop
+    // them on the assumption that sema has already filtered the operand.
+    if (m == "Slice" && (call.args.size() == 1 || call.args.size() == 2) &&
+        call.args[0].value &&
+        (call.args.size() == 1 || call.args[1].value)) {
         llvm::Value* src  = loadSource();
         llvm::Value* base = loadStart();
         llvm::Value* slen = loadLen();
         // #2614 / §7.4: unwrap a flow-narrowed `int?` start/length to its bare
         // payload before the truncs below — see the ReadOnlyStringSpan.Slice
         // site above; identical shape, identical defect.
+        // Lower BOTH operands before any guard, preserving the pre-#2312
+        // left-to-right argument-evaluation order of the two-arg form: a side
+        // effect in `length` must still happen before an out-of-range `start`
+        // throws, exactly as it did before this branch grew the one-arg case.
         llvm::Value* start = unwrapNarrowedNullableOperand(
             lowerExpr(*call.args[0].value), call.args[0].value.get());
-        llvm::Value* slen2 = unwrapNarrowedNullableOperand(
-            lowerExpr(*call.args[1].value), call.args[1].value.get());
-        if (!start || !slen2) return nullptr;
+        if (!start || !start->getType()->isIntegerTy()) return nullptr;
+        llvm::Value* explicitLen = nullptr;
+        if (call.args.size() == 2) {
+            explicitLen = unwrapNarrowedNullableOperand(
+                lowerExpr(*call.args[1].value), call.args[1].value.get());
+            if (!explicitLen || !explicitLen->getType()->isIntegerTy())
+                return nullptr;
+            if (!explicitLen->getType()->isIntegerTy(32))
+                explicitLen = builder_.CreateTrunc(explicitLen, i32());
+        }
         if (!start->getType()->isIntegerTy(32))
             start = builder_.CreateTrunc(start, i32());
-        if (!slen2->getType()->isIntegerTy(32))
-            slen2 = builder_.CreateTrunc(slen2, i32());
         // bounds check against this span's length
         llvm::Value* startNeg = builder_.CreateICmpSLT(start, builder_.getInt32(0));
         llvm::Value* startOOB = builder_.CreateICmpSGT(start, slen);
         emitGuardThrow(builder_.CreateOr(startNeg, startOOB),
                        "IndexOutOfRangeException");
         llvm::Value* avail = builder_.CreateSub(slen, start);
-        llvm::Value* slen2Neg = builder_.CreateICmpSLT(slen2, builder_.getInt32(0));
-        llvm::Value* slen2OOB = builder_.CreateICmpSGT(slen2, avail);
-        emitGuardThrow(builder_.CreateOr(slen2Neg, slen2OOB),
-                       "IndexOutOfRangeException");
+        // v0.195 one-arg form: to the end of the span. `avail` is exactly
+        // `Length - start`, and the guard above has established
+        // `0 <= start <= Length`, so it is in range by construction and needs
+        // no second bounds check.
+        llvm::Value* slen2 = avail;
+        if (explicitLen) {
+            slen2 = explicitLen;
+            llvm::Value* slen2Neg = builder_.CreateICmpSLT(slen2, builder_.getInt32(0));
+            llvm::Value* slen2OOB = builder_.CreateICmpSGT(slen2, avail);
+            emitGuardThrow(builder_.CreateOr(slen2Neg, slen2OOB),
+                           "IndexOutOfRangeException");
+        }
         llvm::Value* newStart = builder_.CreateAdd(base, start, "sl.newst");
         return buildArraySpan(src, newStart, slen2);
     }

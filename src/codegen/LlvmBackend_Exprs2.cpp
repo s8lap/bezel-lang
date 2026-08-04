@@ -4440,9 +4440,45 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     }
 
     if (ctx_.isImported(t)) {
+        // fix #2639 (§22.3 "Parameter modifiers" / §22.4, v0.236): a BY-REF
+        // argument modifier does not make an argument non-positional. This
+        // predicate is the branch's only admission gate and it originally
+        // rejected ANY non-empty `a.modifier`, i.e. every `ref` / `out` /
+        // `out var` / `out owned var` / `out using var` argument. The branch's
+        // only other exit is the `return obj` below, which emits NOTHING — so
+        // `new ImportedT("x", out var n)` allocated the instance, ran
+        // `bz$T$init` (vtable + field initializers) and then SILENTLY SKIPPED
+        // the `bz$T$ctor` call entirely. The constructor body never ran: every
+        // ctor-assigned field kept its zero/default, and the `out` recipient
+        // was never written. No diagnostic (an `internal:` #2491 note appears
+        // only if the recipient is later read in a position that then fails to
+        // lower). Read off `BEZEL_DUMP_IR` for the issue's own repro: `main`
+        // contains `call void @"bz$XLib.Widget$init"(ptr %2)` and no `$ctor`
+        // call at all, while the same class with a plain `constructor(a: int)`
+        // correctly emits `call void @"bz$YLib.Gadget$ctor"(ptr %2, i32 2)`.
+        //
+        // Everything the by-ref case needs is ALREADY implemented inside the
+        // branch and was simply unreachable for a `new`: the per-argument loop
+        // reads `formalMod` off the imported ConstructorSymbol and takes either
+        // §22.3's alias path (`lvalueAddr`) or its bracket path
+        // (`emitAccessorRefArgCopyIn` / `emitAccessorRefArgWriteBacks`, #2319),
+        // and `declareImportedCtor` (LlvmBackend_Setup.cpp:2715) already types
+        // a by-ref parameter as `ptrTy()`. The guard predates that work
+        // (it arrived verbatim with the f291057 TU split, before #2283/#2319
+        // added the by-ref handling), so the two never met.
+        //
+        // Deliberately NARROW: only `isByRefMod` modifiers are admitted here.
+        // A NAMED argument and an `out _` DISCARD stay excluded — this loop is
+        // positional and records no `discardOwnedOutSlots_` entry, so neither
+        // is handled — as do the by-value ownership modifiers `owned` /
+        // `scoped`, whose transfer bookkeeping (`nullTransferredOwned`) lives
+        // in `buildOrderedArgs`, which this path does not use. Those shapes
+        // keep today's behaviour exactly; each is the same silent-no-ctor-call
+        // defect and is FILED separately rather than widened into here.
         bool allPositional = true;
         for (const auto& a : ne.args)
-            if (!a.name.empty() || !a.modifier.empty() || a.isDiscard)
+            if (!a.name.empty() || a.isDiscard ||
+                (!a.modifier.empty() && !isByRefMod(a.modifier)))
                 { allPositional = false; break; }
         if (sema::ConstructorSymbol* cs = ctorForArgs(t, ne.args);
             cs && allPositional && ne.args.size() == cs->params.size()) {

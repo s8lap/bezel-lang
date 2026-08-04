@@ -1749,17 +1749,45 @@ void Emitter::ensureCtorOutVarSlots(const ast::NewExpr& ne,
     // out-parameter types — mirrors checkNewExprArgs / the sema out-var path.
     const ast::ConstructorDecl* ctorDecl = nullptr;
     std::vector<const ast::ConstructorDecl*> cds;
+    // fix #2639 (§2.5 import resolution / §22.4, v0.236): an IMPORTED
+    // constructor has NO `ast::ConstructorDecl` — ModuleLoader.cpp:455-473
+    // reconstructs a `sema::ConstructorSymbol` from the artifact's metadata
+    // whose `params` are `ParameterSymbol`s carrying an already-resolved
+    // `resolvedDeclType` (there is no syntactic ast::Type to attach). The
+    // `dynamic_cast<const ast::ConstructorDecl*>(cs->decl)` filter below
+    // therefore drops every imported constructor, leaving `ctorDecl` null,
+    // `pt` null, and `slotTy` at its `i32()` DEFAULT — a 4-byte integer alloca
+    // standing in for whatever the parameter's real type is. For
+    // `out n: string` the imported callee would then write an 8-byte pointer
+    // through a 4-byte stack slot. (That write was unreachable until the
+    // companion fix in LlvmBackend_Exprs2.cpp — the imported-`new` path
+    // skipped the whole ctor call for any by-ref argument, so the slot was
+    // mis-sized but never written. It is reachable now, which is exactly why
+    // this half must land in the SAME change.) Track the SYMBOL alongside the
+    // decl and fall back to it, using the same "single, else arity match"
+    // rule so local behaviour is bit-identical.
+    std::vector<const sema::ConstructorSymbol*> css;
     for (sema::Symbol* m : rt->declaration->members)
         if (auto* cs = dynamic_cast<sema::ConstructorSymbol*>(m))
-            if (!cs->isStatic)
+            if (!cs->isStatic) {
+                css.push_back(cs);
                 if (auto* cd =
                         dynamic_cast<const ast::ConstructorDecl*>(cs->decl))
                     cds.push_back(cd);
+            }
     if (cds.size() == 1)
         ctorDecl = cds[0];
     else
         for (auto* cd : cds)
             if (cd->params.size() == ne.args.size()) { ctorDecl = cd; break; }
+    const sema::ConstructorSymbol* ctorSym = nullptr;
+    if (!ctorDecl) {
+        if (css.size() == 1)
+            ctorSym = css[0];
+        else
+            for (auto* cs : css)
+                if (cs->params.size() == ne.args.size()) { ctorSym = cs; break; }
+    }
 
     std::size_t pos = 0;
     for (const auto& a : ne.args) {
@@ -1929,8 +1957,19 @@ void Emitter::ensureCtorOutVarSlots(const ast::NewExpr& ne,
         if (ctorDecl && pos < ctorDecl->params.size() &&
             ctorDecl->params[pos].type) {
             pt = ctx_.resolvedType(*ctorDecl->params[pos].type);
-            if (pt) slotTy = lowerTypeRef(pt);
+        } else if (ctorSym && pos < ctorSym->params.size()) {
+            // fix #2639: the IMPORTED constructor's parameter type, read from
+            // the reconstructed ParameterSymbol (see the ctorSym resolution at
+            // the top of this function). `resolvedDeclType` is the same field
+            // `declareImportedCtor` (LlvmBackend_Setup.cpp:2714) uses to build
+            // the callee's own signature, so the caller's slot and the
+            // callee's formal are now derived from ONE source and cannot
+            // disagree on width.
+            if (auto* ps = dynamic_cast<const sema::ParameterSymbol*>(
+                    ctorSym->params[pos]))
+                pt = ps->resolvedDeclType;
         }
+        if (pt) slotTy = lowerTypeRef(pt);
         llvm::AllocaInst* slot = entryAlloca(slotTy);
         // §7.9 "Default initialization" / §22.4 (v0.235, #2402 mirroring
         // #2395): the constructor analogue of ensureOutVarSlots' own fix —
