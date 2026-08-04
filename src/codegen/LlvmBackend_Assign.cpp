@@ -1429,6 +1429,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         }
         auto* fnTy = fn->getFunctionType();
         std::vector<llvm::Value*> callArgs;
+        std::vector<llvm::Value*> idxArgVals;   // fix #2717
         callArgs.push_back(obj);
         for (std::size_t k = 0; k < ps->indexerParams.size() &&
              k < ix.indices.size() &&
@@ -1438,9 +1439,12 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
             if (!argVal) return nullptr;
             callArgs.push_back(
                 coerceNumericToType(argVal, fnTy->getParamType(k + 1), false));
+            idxArgVals.push_back(argVal);
         }
         llvm::Value* r = builder_.CreateCall(fnTy, fn, callArgs);
         emitPendingCheck();
+        releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
+                                       /*accessorResultEscapes=*/true);
         return r;
     }
     // #730 / §13 / §23.4: an indexer accessed through an INTERFACE-typed receiver
@@ -1534,6 +1538,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
                                        {builder_.getInt32(gsIt->second)}),
                     "idxget");
                 std::vector<llvm::Value*> callArgs;
+                std::vector<llvm::Value*> idxArgVals;   // fix #2717
                 callArgs.push_back(obj);
                 for (std::size_t k = 0; k < pd->indexerParams.size() &&
                      k < ix.indices.size(); ++k) {
@@ -1542,9 +1547,12 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
                     if (!argVal) return nullptr;
                     callArgs.push_back(
                         coerceNumericToType(argVal, paramTys[k + 1], false));
+                    idxArgVals.push_back(argVal);
                 }
                 llvm::Value* r = builder_.CreateCall(gFnTy, fnPtr, callArgs);
                 emitPendingCheck();
+                releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
+                                               /*accessorResultEscapes=*/true);
                 return r;
             }
         }
@@ -1587,6 +1595,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
             obj = tmp;
         }
         std::vector<llvm::Value*> callArgs;
+        std::vector<llvm::Value*> idxArgVals;   // fix #2717: parallel to indices
         callArgs.push_back(obj);
         for (std::size_t k = 0; k < ps->indexerParams.size() &&
              k < ix.indices.size(); ++k) {
@@ -1594,6 +1603,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
             llvm::Value* argVal = lowerExpr(*ix.indices[k].value);
             if (!argVal) return nullptr;
             callArgs.push_back(argVal);
+            idxArgVals.push_back(argVal);
         }
         llvm::Function* fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
         llvm::Value* res =
@@ -1602,6 +1612,11 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         // exception set and returns; route it to the enclosing unwind target,
         // exactly as an ordinary method call does.
         emitPendingCheck();
+        // fix #2717: after emitPendingCheck, so the release sits on the normal
+        // path only — on a throw edge the temporary leaks, which is #429's own
+        // (`!diverged_`) discipline and the safe direction.
+        releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
+                                       /*accessorResultEscapes=*/true);
         return res;
     }
 
@@ -1659,6 +1674,13 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         paramSlots_[ps->indexerParams[k]] = slot;
     }
     llvm::Value* result = lowerExpr(*getterExpr);
+    // fix #2717: release a `+1` string producer index temporary now the getter
+    // body has read it. The helper's element-type gate is what makes this safe
+    // on the GETTER side: an inlined `get => k;` lowers to a bare load of the
+    // index (no minting return), so a `string`-typed indexer is excluded and
+    // `result` can never alias what this releases.
+    releaseIndexArgStringProducers(ix, ps, recvDecl, argVals,
+                                   /*accessorResultEscapes=*/true);
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
@@ -1666,6 +1688,135 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     return result;
 }
 
+
+// fix #2717 / §23.4 / §23.5 / §28.1 / §28.9 (v0.240): release a `+1` string
+// PRODUCER passed directly as an INDEX ARGUMENT. See the declaration comment
+// (LlvmBackend_impl.hpp) for the shape; this is the soundness argument.
+//
+// WHY A RELEASE IS OWED. §23.5 "Restrictions": "`ref` and `out` parameters are
+// not allowed in indexer parameter lists"; §28.1: on a `string`, `owned` "is a
+// compile error". An index argument is therefore ALWAYS an unmodified by-value
+// borrow — the accessor never consumes it — and a producer temporary
+// (`t[$"v-{i}"] := i`) is bound to no local, so no scope-end release covers it
+// either. That is exactly #429's ARGUMENT-PASS category for an ordinary call
+// (LlvmBackend_Calls2.cpp ~7834, which releases the identical shape after the
+// call); the indexer call site simply never grew the same step.
+//
+// WHY IT CANNOT OVER-RELEASE. The gate is `isPlusOneStringProducer`, the same
+// predicate #429 uses, and it is precisely the "a temporary this expression
+// minted" test: it matches interpolation, string `+`, a non-nullable `??`, a
+// string range slice, a primitive `.ToString()`, and an arm-meet `case`/`if`
+// (whose lowering normalizes every arm to +1). It does NOT match an
+// IdentifierExpr, so a CALLER-OWNED LOCAL passed as an index (`var s := …;
+// t[s] := i;`) is never released here — that shape is the escape-walk half of
+// #2717 (StringEscapeWalker's IndexExpr arm), where the local keeps its own +1
+// and discharges it at scope end. The two halves are disjoint by construction:
+// one releases only values no local owns, the other only arms the owner's own
+// scope-end release. An over-correction in either direction shows up as a
+// double-free, not silence.
+//
+// THE TWO EXCLUSIONS, both keeping the pre-existing leak (the safe direction):
+//   * a RECORD receiver — §9/§9.7: a record's reference fields are borrows with
+//     no independent +1 and no disposer, so an accessor that stores the index
+//     into a field ALIASES this reference and releasing it would dangle the
+//     field. Same discriminant as `emitProducerRelease`'s `recvDecl->kind ==
+//     Class` gate below (#2548) and #2535/#2540's property/indexer-SET walker
+//     gate. An INTERFACE receiver is excluded by the same test, because the
+//     runtime implementor may be record-backed and — unlike #2540's *value*
+//     relaxation — there is no paired call-site retain for the INDEX on the
+//     record-backed itable branch.
+//   * a `string`-typed indexer ELEMENT, and ONLY where the accessor's RESULT
+//     can reach the caller (`accessorResultEscapes`, i.e. the four
+//     lowerIndexerGet branches). An accessor may yield the index itself
+//     (`get => k;`), and an INLINED expression-bodied getter lowers that to a
+//     bare load, with none of the minting a compiled `return k;` would do
+//     (#429/#694 return logic) — releasing then hands the caller a freed
+//     pointer. On the pure SET path no getter runs at all, and on the
+//     compound / `++` paths the getter's result is consumed by emitCompoundOp
+//     BEFORE this release and never escapes the statement, so neither needs the
+//     exclusion: a `[k: string]: string` setter's index is released normally.
+//     (Because the gate now applies only in value position, `ctx_.exprType(ix)`
+//     is always populated where it is consulted.)
+//
+// ⚠ THE §22.3 SUPPRESSION. `emitAccessorRefArgCopyIn` (this file) lowers a
+// `ref`/`out` argument whose LOCATION is an indexer slot — `C.Bump(ref t[k])`,
+// which §22.3 admits — by evaluating each index ONCE and PINNING it in
+// `exprValueOverride_`, then driving lowerIndexerGet (the copy-in) and, after
+// the call, lowerIndexerSet (the write-back). Both of those now call this
+// helper, and the pin is still live across both, so without the check below the
+// SAME producer would be released TWICE (emitStringRelease is null/sentinel-safe
+// but NOT idempotent) and the write-back setter would read the freed index:
+// a double free plus a use-after-free. Confirmed mechanically — the shape leaks
+// 731 B / 40 allocations on 2a990de and SEGVs inside ASan's Deallocate with the
+// releases unsuppressed. §22.3 owns that value's lifetime for the whole
+// copy-in/copy-out bracket, so this helper must not touch it; the pre-existing
+// leak stays on that path (the safe direction), tracked in #2746.
+//
+// NOTE the §23.5 rule ("`ref` and `out` parameters are not allowed in indexer
+// parameter lists") does NOT cover this: it governs the indexer's OWN parameter
+// list, a different construct from an argument whose LOCATION is an indexer
+// slot. Conflating the two is what hid this case initially.
+//
+// RESIDUAL, recorded not hidden: a CLASS accessor that stores the index into a
+// RECORD-typed field (a plain store per §9/§9.7) would still alias it. That is
+// the identical residual #429's ARGUMENT-PASS release and #1430's escape-walk
+// relaxation already carry for an ordinary method argument; it is not widened
+// here, and closing it needs the callee-side record-field analysis neither has.
+void Emitter::releaseIndexArgStringProducers(
+        const ast::IndexExpr& ix, const sema::PropertySymbol* ps,
+        const sema::TypeSymbol* recvDecl,
+        const std::vector<llvm::Value*>& argVals,
+        bool accessorResultEscapes) {
+    if (!ps || !recvDecl) return;
+    if (recvDecl->kind != ast::TypeDeclKind::Class) return;
+    // Mirrors #429's own `!diverged_` guard (LlvmBackend_Calls2.cpp ~7834): on a
+    // path the accessor body diverged from (`get => throw …`) the temporary
+    // leaks rather than having a release emitted into unreachable — or
+    // already-terminated — IR.
+    if (diverged_) return;
+    // The indexer's element type is the IndexExpr's own type. Consulted ONLY
+    // where the accessor's result can reach the caller — see the header note.
+    //
+    // FAIL-CLOSED (round 3). This test used to be "is the element `string`?",
+    // which was fail-OPEN: every element type that is pointer-shaped but not
+    // spelled `string` fell THROUGH into the release while an inlined
+    // `get => k;` handed the caller the very pointer being freed. Confirmed
+    // reachable — `[k: string]: Object` with `get => k;` (`Object` accepts any
+    // source, ExprTypecheck.cpp ~2964, and no conversion is emitted between the
+    // body and this release) was an ASan `heap-use-after-free` in `main`, where
+    // 2a990de merely leaked. Three more shapes had the same hole:
+    // `IEquatable<string>` / `IComparable<string>` (accepted via
+    // primitiveBoxesIntoBuiltinIface, which excludes only `Bool` — `Kind::Named`,
+    // so the old test missed it); a bare generic `T` reached through a
+    // `this` receiver (no substitution is installed for that receiver, so the
+    // type stays an unresolved `Kind::Named` with a null declaration); and a
+    // NULL `exprType` (an imported indexer with no side-table entry), which the
+    // old `if (const TypeRef* …)` form let fall straight into the release.
+    //
+    // So: resolve a type parameter first, then release ONLY for an element that
+    // provably cannot BE the index — a non-nullable scalar primitive, or unit.
+    // `nullptr`, `string`, `Object`, ANY `Kind::Named` (class / interface /
+    // record / enum / unresolved type parameter), `Function`, `InlineArray` and
+    // `Error` all keep the pre-existing leak, which is the safe direction. This
+    // matches the discipline the rest of this helper already follows (a
+    // non-Class receiver, a pinned index, and a diverged path all decline).
+    if (accessorResultEscapes &&
+        !indexerElementCannotAliasIndex(resolveTypeParamRef(ctx_.exprType(ix))))
+        return;
+    for (std::size_t k = 0; k < ps->indexerParams.size() &&
+         k < ix.indices.size() && k < argVals.size(); ++k) {
+        const ast::Expr* ie = ix.indices[k].value.get();
+        if (!ie || !argVals[k] || !argVals[k]->getType()->isPointerTy())
+            continue;
+        // §22.3 (see the header note): this index is PINNED by an accessor
+        // `ref`/`out` copy-in/copy-out bracket, which owns its lifetime across
+        // BOTH the copy-in getter and the write-back setter. Releasing here
+        // would double-free it and dangle the write-back's read.
+        if (exprValueOverride_.count(ie)) continue;
+        if (!isPlusOneStringProducer(ie)) continue;
+        emitStringRelease(argVals[k]);   // null/sentinel-safe, NOT idempotent
+    }
+}
 
 bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
                               const ast::Expr* valueExpr) {
@@ -1743,6 +1894,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
         }
         auto* fnTy = fn->getFunctionType();
         std::vector<llvm::Value*> callArgs;
+        std::vector<llvm::Value*> idxArgVals;   // fix #2717
         callArgs.push_back(obj);
         for (std::size_t k = 0; k < ps->indexerParams.size() &&
              k < ix.indices.size() &&
@@ -1752,12 +1904,15 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
             if (!argVal) return false;
             callArgs.push_back(
                 coerceNumericToType(argVal, fnTy->getParamType(k + 1), false));
+            idxArgVals.push_back(argVal);
         }
         if (fnTy->getNumParams() == 0) return false;
         llvm::Type* valTy = fnTy->getParamType(fnTy->getNumParams() - 1);
         callArgs.push_back(coerceNumericToType(val, valTy, false));
         builder_.CreateCall(fnTy, fn, callArgs);
         emitPendingCheck();
+        releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
+                                       /*accessorResultEscapes=*/false);
         return true;
     }
     // fix #2548 (§23.4/§28.9/§4.6, v0.236): the INDEXER twin of
@@ -2014,6 +2169,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
                                        {builder_.getInt32(ssIt->second)}),
                     "idxset");
                 std::vector<llvm::Value*> callArgs;
+                std::vector<llvm::Value*> idxArgVals;   // fix #2717
                 callArgs.push_back(obj);
                 for (std::size_t k = 0; k < pd->indexerParams.size() &&
                      k < ix.indices.size(); ++k) {
@@ -2022,10 +2178,13 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
                     if (!argVal) return false;
                     callArgs.push_back(
                         coerceNumericToType(argVal, paramTys[k + 1], false));
+                    idxArgVals.push_back(argVal);
                 }
                 callArgs.push_back(coerceNumericToType(val, valTy, false));
                 builder_.CreateCall(sFnTy, fnPtr, callArgs);
                 emitPendingCheck();
+                releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
+                                               /*accessorResultEscapes=*/false);
                 // fix #2548 (§23.4/§28.9/§4.6, v0.236): the CLASS-VTABLE
                 // twin of the interface-dispatch classBB emitProducerRelease
                 // above. The class-vtable path is unconditional-class-backed
@@ -2189,6 +2348,13 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     // returned true first), so no itable flag read is needed here.
     if (recvDecl->kind == ast::TypeDeclKind::Class)
         emitProducerRelease();
+    // fix #2717: the INDEX-argument twin of the value-side emitProducerRelease
+    // above. Emitted here — after the setter body, before the caller's
+    // locals_/paramSlots_ are restored — so it dominates every use the body
+    // makes of the index, and releases the ORIGINAL producer SSA value rather
+    // than whatever #2712's retain/drop-on-overwrite pair left in the slot.
+    releaseIndexArgStringProducers(ix, ps, recvDecl, argVals,
+                                   /*accessorResultEscapes=*/false);
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
@@ -2287,6 +2453,7 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
         // --- Spill each index param ONCE; shared by getter and setter. ---
         auto* getFnTy = getFn->getFunctionType();
         std::vector<llvm::AllocaInst*> idxSlots;
+        std::vector<llvm::Value*> idxArgVals;   // fix #2717: original SSA values
         idxSlots.reserve(ps->indexerParams.size());
         for (std::size_t k = 0; k < ps->indexerParams.size() &&
              k < ix->indices.size() &&
@@ -2297,6 +2464,7 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
             llvm::AllocaInst* slot = entryAlloca(argVal->getType());
             builder_.CreateStore(argVal, slot);
             idxSlots.push_back(slot);
+            idxArgVals.push_back(argVal);
         }
 
         // --- Call getter with the shared receiver and indices. ---
@@ -2350,6 +2518,11 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
         setArgs.push_back(coerceNumericToType(newVal, valTy, false));
         builder_.CreateCall(setFnTy, setFn, setArgs);
         emitPendingCheck();
+        // fix #2717: the index was evaluated ONCE and shared by the getter and
+        // the setter, so its producer +1 is discharged once, HERE — after the
+        // setter, the last consumer of the index on this path.
+        releaseIndexArgStringProducers(*ix, ps, recvDecl, idxArgVals,
+                                       /*accessorResultEscapes=*/false);
         return true;
     }
 
@@ -2431,15 +2604,25 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     // Spill each index param into a slot; the getter and setter bodies will
     // read back from paramSlots_ which we rebuild identically for each call.
     std::vector<llvm::AllocaInst*> idxSlots;
+    std::vector<llvm::Value*> idxArgVals;   // fix #2717: original SSA values
     idxSlots.reserve(ps->indexerParams.size());
     for (std::size_t k = 0; k < ps->indexerParams.size() &&
          k < ix->indices.size(); ++k) {
-        if (!ix->indices[k].value) { idxSlots.push_back(nullptr); continue; }
+        if (!ix->indices[k].value) {
+            idxSlots.push_back(nullptr);
+            idxArgVals.push_back(nullptr);
+            continue;
+        }
         llvm::Value* argVal = lowerExpr(*ix->indices[k].value);
-        if (!argVal) { idxSlots.push_back(nullptr); continue; }
+        if (!argVal) {
+            idxSlots.push_back(nullptr);
+            idxArgVals.push_back(nullptr);
+            continue;
+        }
         llvm::AllocaInst* slot = entryAlloca(argVal->getType());
         builder_.CreateStore(argVal, slot);
         idxSlots.push_back(slot);
+        idxArgVals.push_back(argVal);
     }
 
     // --- Call getter (inline expr-body or standalone block-body function). ---
@@ -2584,6 +2767,11 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
             isPlusOneStringProducer(as.value.get()))
             emitStringRelease(rhs);      // release the rhs's +1 (producer)
     }
+    // fix #2717: the INDEX-argument twin of the two value-side releases above.
+    // The index was lowered ONCE (shared by the getter and the setter), so its
+    // producer +1 is discharged once, after the setter — the last consumer.
+    releaseIndexArgStringProducers(*ix, ps, recvDecl, idxArgVals,
+                                   /*accessorResultEscapes=*/false);
     currentThis_ = savedThis;
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);

@@ -15011,9 +15011,117 @@ struct StringEscapeWalker {
             return;
         }
         // Indexing `s[i]`: receiver is a read; indices escape (defensive).
+        //
+        // fix #2717 / §23.4 / §23.5 / §28.1 / §28.9 (v0.240): EXCEPT for a bare
+        // string local in the INDEX-ARGUMENT position of a user-defined
+        // CLASS indexer, which is the INDEXER-ACCESS form of #1430's
+        // call-bounded-borrow relaxation in walkCallArgs above — the same
+        // extension #2023 made for the `new T(args)` constructor-call form and
+        // #2535/#2540 made for the property/indexer SET *value* position.
+        //
+        // §23.5 "Restrictions" states the premise outright: "`ref` and `out`
+        // parameters are not allowed in indexer parameter lists", and §28.1
+        // makes `owned` a compile error on a `string`. An indexer index
+        // argument is therefore ALWAYS an unmodified by-value borrow whose one
+        // reference belongs to the caller — structurally the plain-parameter
+        // position #1430 already relaxes for an ordinary method call. The
+        // accessor body is lowered under the same string refcount discipline,
+        // so every path by which it could extend the index's lifetime mints its
+        // OWN +1 (a class field store retains via lowerStringFieldStore — the
+        // #429 argpass cardinal canary; a return of the param mints; a closure
+        // capture retains; an onward pass repeats this rule one level down).
+        // The caller's scope-end release therefore never strands the accessor.
+        //
+        // Without this the local was tainted ESCAPED and its scope-end release
+        // never armed: `var s := $"v-{i}"; t[s] := i;` in a loop leaked one
+        // string per iteration (731 bytes / 40 allocations per 20 iterations
+        // under LSan on 2a990de — #2717's measured figure), and the identical
+        // leak reproduced through the getter (`t[s]`), the compound
+        // (`t[s] += 1`), and the `++`/`--` forms, which all route their index
+        // through this one arm.
+        //
+        // SOUNDNESS — the discriminant is the SAME `ps->parent->kind == Class`
+        // gate #2535's property-SET relaxation documents at length below, for
+        // the same reason and with the same two exclusions:
+        //   * CLASS parent  ⇒ an accessor that stores the index into a field
+        //     goes through the retaining class field store, minting the field's
+        //     own independent +1 and leaving the local's untouched ⇒ safe read.
+        //   * RECORD parent ⇒ §9/§9.7: a record's reference fields are borrows
+        //     with no independent +1 and no disposer, so a store would ALIAS
+        //     the local's only reference and a scope-end release would dangle
+        //     it (UAF) ⇒ stays a conservative escape (the local's +1 leaks,
+        //     which is the safe direction).
+        //   * INTERFACE parent ⇒ the runtime implementor may be class-backed
+        //     (retains) or record-backed (plain store), a fact this static walk
+        //     cannot see. #2535/#2540 could extend to interfaces because they
+        //     paired the relaxation with a call-site retain on the runtime
+        //     record-backed branch (lowerVirtualPropertySet / lowerIndexerSet's
+        //     itable `ifaceIdxNamedLocalEligible`); there is NO such paired
+        //     retain for the INDEX argument, so an interface-typed receiver
+        //     stays a conservative escape here. Recorded, not silently chosen.
+        // Gated on stringReleaseMode (the #1997 narrowing), like every other
+        // relaxation in this walker: the dict-materializer (#1028), grouping
+        // (#1930), value-like-choice (#2115), and borrowing-`Array` walks share
+        // this walker and have no counterpart retain discipline.
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
             expr(ix->target.get(), /*safeRead=*/true);
-            for (auto& a : ix->indices) expr(a.value.get(), /*safeRead=*/false);
+            const sema::PropertySymbol* idxPs = nullptr;
+            // fix #2717 (round 4): the ELEMENT-TYPE gate, shared verbatim with
+            // the producer-release half via indexerElementCannotAliasIndex
+            // (LlvmBackend_impl.hpp — ONE definition, see its comment). Without
+            // it this relaxation had NO element gate at all and converted a leak
+            // into a use-after-free on exactly the element types the release
+            // half excludes: an accessor whose element is pointer-shaped can
+            // hand the index straight back (`[k: string]: string`, `get => k;`),
+            // and if the caller then stores that result somewhere that does NOT
+            // retain — a `string?` slot or a non-string target, both of which
+            // lowerStringLocalReassign declines (this file, its `tt->nullable`
+            // and non-string-target exits) leaving a plain `CreateStore` — the
+            // sink outlives the local and the scope-end release this relaxation
+            // ARMS frees the value the sink still points at. Reproduced:
+            // `var last: string? := null; … last := e[s];` was an ASan
+            // `heap-use-after-free`, where 2a990de merely leaked 694 B / 38
+            // allocations. The `Object`-element variant is the same defect
+            // without needing nullability.
+            //
+            // UNCONDITIONAL here, unlike the release half's `escapes` parameter:
+            // this one walker arm serves BOTH the get and the set forms (and a
+            // compound runs both), so there is no position to distinguish. That
+            // re-opens the named-local leak for a `[k: string]: string` SETTER —
+            // accepted deliberately, leak over UAF, recorded in #2746.
+            //
+            // No `resolveTypeParamRef` is needed (unlike the release half): an
+            // unresolved bare `T` is `Kind::Named`, which the predicate already
+            // answers "may alias" — the safe direction, structurally.
+            if (stringReleaseMode &&
+                indexerElementCannotAliasIndex(ctx.exprType(*ix))) {
+                if (auto* ps = dynamic_cast<sema::PropertySymbol*>(
+                        ctx.exprSymbol(*ix))) {
+                    if (ps->isIndexer && ps->parent &&
+                        ps->parent->kind == ast::TypeDeclKind::Class)
+                        idxPs = ps;
+                }
+            }
+            for (std::size_t k = 0; k < ix->indices.size(); ++k) {
+                bool safeIdx = false;
+                // Both the ARGUMENT side and the PARAMETER side must be plain,
+                // matching #1430's walkCallArgs and #2023's NewExpr arm exactly.
+                // This is not merely defensive: per the AST comment on
+                // `IndexExpr::indices` (ast/Node.hpp) the indices "share the
+                // call ArgList grammar … admitting modifiers, named args, and
+                // the `_` discard", so a non-plain index argument is spellable
+                // and the positional `indexerParams[k]` mapping this relaxation
+                // relies on would be wrong for one.
+                const ast::CallArgument& ia = ix->indices[k];
+                if (idxPs && k < idxPs->indexerParams.size() &&
+                    ia.modifier.empty() && ia.name.empty() && !ia.isDiscard &&
+                    isTargetIdent(ia.value.get())) {
+                    auto* pp = dynamic_cast<sema::ParameterSymbol*>(
+                        idxPs->indexerParams[k]);
+                    if (pp && pp->modifier.empty()) safeIdx = true;
+                }
+                expr(ix->indices[k].value.get(), safeIdx);
+            }
             return;
         }
         // `s!` forwards s onward — inherit the parent position.

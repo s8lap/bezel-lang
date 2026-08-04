@@ -4333,12 +4333,13 @@ void ExprTC::checkRefOutPropertyOperand(PropertySymbol& ps,
     // for an IndexExpr (`d[i]`), and is therefore not widened for ref/out
     // here (it would false-reject the spec-LEGAL write-only-as-`out`
     // case). Mirror #2461's `kind == "ref"` guard so `out` is correctly
-    // admitted (§22.3: no getter call for `out`). The indexer coverage
-    // becomes uniform once ExprTypecheck_Exprs.cpp's IndexExpr visit
-    // attaches the resolved PropertySymbol — without that, this branch's
-    // exact message shape only fires for a LOCAL write-only INDEXER and a
-    // LOCAL write-only named PROPERTY reachable via `obj[i]` is still
-    // gated only by the original (IndexedExpr-doesn't-apply) read gate.
+    // admitted (§22.3: no getter call for `out`). (STALE NOTE CORRECTED,
+    // #2717 round 3: this used to say the coverage "becomes uniform once
+    // ExprTypecheck_Exprs.cpp's IndexExpr visit attaches the resolved
+    // PropertySymbol". It does attach it — ExprTypecheck_Exprs.cpp ~1918,
+    // `ctx_.setExprSymbol(&e, ps)`, landed with #2530 — and deliberately
+    // ONLY for the user-defined-indexer branch, so a builtin collection
+    // index still yields no PropertySymbol here.)
     // hasGetter mirrors propertyDeclIsSetOnly's INVERSE exactly:
     //   * Expression / Auto bodyKinds always have a getter (auto-derived).
     //   * Block bodyKind has a getter iff any accessor is a `get` arm

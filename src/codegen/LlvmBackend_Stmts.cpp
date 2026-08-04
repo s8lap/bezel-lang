@@ -1625,6 +1625,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                         // both getter and setter to avoid double
                                         // evaluation (§23.4 single-evaluation).
                                         std::vector<llvm::AllocaInst*> idxSlots;
+                                        // fix #2717: original index SSA values
+                                        std::vector<llvm::Value*> idxArgVals;
                                         idxSlots.reserve(ps->indexerParams.size());
                                         bool ok = true;
                                         for (std::size_t k = 0;
@@ -1632,17 +1634,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                              k < ix->indices.size(); ++k) {
                                             if (!ix->indices[k].value) {
                                                 idxSlots.push_back(nullptr);
+                                                idxArgVals.push_back(nullptr);
                                                 ok = false; break;
                                             }
                                             llvm::Value* av =
                                                 lowerExpr(*ix->indices[k].value);
                                             if (!av) {
                                                 idxSlots.push_back(nullptr);
+                                                idxArgVals.push_back(nullptr);
                                                 ok = false; break;
                                             }
                                             auto* sl = entryAlloca(av->getType());
                                             builder_.CreateStore(av, sl);
                                             idxSlots.push_back(sl);
+                                            idxArgVals.push_back(av);
                                         }
                                         if (ok) {
                                             // --- Call getter ---
@@ -1769,6 +1774,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                                                     else if (setterStmts)
                                                         lowerScopedBlock(
                                                             *setterStmts);
+                                                    // fix #2717: the index was
+                                                    // lowered ONCE and shared by
+                                                    // the getter and setter, so
+                                                    // its producer +1 is
+                                                    // discharged once, here —
+                                                    // after the setter, the last
+                                                    // consumer of the index.
+                                                    releaseIndexArgStringProducers(
+                                                        *ix, ps,
+                                                        targetTy2->declaration,
+                                                        idxArgVals,
+                                                        /*accessorResultEscapes=*/
+                                                        false);
                                                     currentThis_ = savedThis;
                                                     locals_ =
                                                         std::move(savedLocals);

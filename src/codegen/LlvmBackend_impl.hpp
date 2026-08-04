@@ -46,6 +46,67 @@
 
 namespace bezel::codegen {
 
+// fix #2717 / §23.4 / §28.9 (v0.240): can an indexer whose ELEMENT type is `t`
+// yield a value that IS the `string` index argument passed to it?
+//
+// ONE DEFINITION, TWO CONSUMERS, deliberately in this shared header rather than
+// duplicated: `releaseIndexArgStringProducers` (LlvmBackend_Assign.cpp) uses it
+// to decide whether to RELEASE a `+1` producer index after an escaping-result
+// accessor, and StringEscapeWalker's `IndexExpr` arm (LlvmBackend_Setup.cpp)
+// uses it to decide whether a named string LOCAL in an index position may be
+// treated as a call-bounded borrow (and so released at ITS scope end). The two
+// halves free different values but share exactly one hazard — the accessor
+// handing its own index back to the caller — so they must share exactly one
+// predicate. (This repo's recorded sentinel-defect pattern is two copies of one
+// predicate drifting apart; #2556/#2566 was the last instance.)
+//
+// FAIL-CLOSED. Answers TRUE only for an element that provably cannot hold a
+// pointer to the index — a non-nullable scalar primitive, or unit. Everything
+// else, INCLUDING an unknown (null) type, answers FALSE and keeps the
+// pre-existing leak, which is the safe direction.
+//
+// `string` and `Object` are both `PrimitiveType` here (§4 makes `Object` "a
+// primitive lookup key", TypeRef.hpp) and both lower to `ptrTy()`
+// (LlvmBackend_Layout.cpp), so an `Object`-typed getter returning its `string`
+// index is a silent alias `verifyModule` cannot see. Every `Kind::Named`
+// element — a class, interface (`IEquatable<string>`), record, enum, or an
+// UNRESOLVED bare type parameter — is rejected; that is what makes a bare `T`
+// reached through a `this` receiver (no substitution installed) safe
+// STRUCTURALLY rather than incidentally, and it is why the walker consumer
+// needs no `resolveTypeParamRef` of its own. An enum element is rejected too —
+// over-conservative, a benign missed release. `default:` rejects, so a future
+// `PrimitiveType` enumerator lands on the safe side. A nullable primitive is
+// excluded: its lowering differs and an `int?`-valued indexer does not justify
+// reasoning about it here.
+inline bool indexerElementCannotAliasIndex(const sema::TypeRef* t) {
+    if (!t) return false;                                   // unknown → may alias
+    if (t->kind == sema::TypeRef::Kind::Unit) return true;  // no value at all
+    if (t->kind != sema::TypeRef::Kind::Primitive) return false;
+    if (t->nullable) return false;
+    switch (t->primitive) {
+        // Each of these lowers to a non-pointer LLVM type: `Char` is an i32
+        // code point (not a string), `Decimal` a 128-bit value struct.
+        case sema::PrimitiveType::Bool:
+        case sema::PrimitiveType::Char:
+        case sema::PrimitiveType::Byte:
+        case sema::PrimitiveType::SByte:
+        case sema::PrimitiveType::Short:
+        case sema::PrimitiveType::UShort:
+        case sema::PrimitiveType::Int:
+        case sema::PrimitiveType::UInt:
+        case sema::PrimitiveType::Long:
+        case sema::PrimitiveType::ULong:
+        case sema::PrimitiveType::Float:
+        case sema::PrimitiveType::Double:
+        case sema::PrimitiveType::Decimal:
+            return true;
+        // String (the alias itself), Object (the root — accepts any source and
+        // is pointer-shaped), None.
+        default:
+            return false;
+    }
+}
+
 // Parse a Bezel integer literal lexeme to its value. Slice CG1 handles
 // decimal and the `0x` / `0b` / `0o` bases, with `_` digit separators
 // stripped and any trailing type-suffix letters ignored. Returns 0 on a
@@ -3636,6 +3697,48 @@ private:
     // write the result back. Returns true if handled (user-defined indexer
     // target); false to let the caller fall through to other paths.
     bool lowerIndexerCompound(const ast::AssignmentStmt& as);
+
+    // fix #2717 / §23.4 / §23.5 / §28.1 / §28.9 (v0.240): the INDEXER twin of
+    // #429's ARGUMENT-PASS release (LlvmBackend_Calls2.cpp ~7834). A `+1` string
+    // PRODUCER used directly as an INDEX ARGUMENT (`t[$"v-{i}"] := i`) holds an
+    // independent rc=1 reference that nothing owns: §23.5 forbids `ref`/`out` in
+    // an indexer parameter list and §28.1 forbids `owned` on a `string`, so the
+    // accessor takes the index as a plain by-value BORROW and never consumes it,
+    // while the caller bound it to no local. Pre-fix it leaked once per access,
+    // unbounded under iteration. Release it once the accessor is done with it.
+    //
+    // `argVals` is parallel to `ix.indices` (entries may be null — skipped).
+    // The value released is the ORIGINAL producer SSA value, never a reload of
+    // the param slot: an inlined block setter that assigns to its own index
+    // param (`k := k + "-x"`) has #2712's retain/drop-on-overwrite pair leave a
+    // DIFFERENT string in the slot, and it is the producer's own +1 this
+    // discharges.
+    //
+    // TWO GATES, both required (see the definition for the full argument):
+    //   * `recvDecl->kind == Class` — a class accessor that stores the index
+    //     into a field retains it (lowerStringFieldStore), so the field owns an
+    //     independent +1 and this release is balanced. A RECORD's reference
+    //     fields are borrows with no independent +1 (§9/§9.7), so a store would
+    //     ALIAS this reference and releasing would dangle it: excluded.
+    //   * `accessorResultEscapes` (the four lowerIndexerGet branches) AND the
+    //     indexer's ELEMENT type is a `string` — otherwise an accessor that
+    //     yields the index itself (`get => k;`, inlined as a bare load with no
+    //     minting return) would hand the caller a pointer this release frees.
+    //     Pass FALSE on the set / compound / `++` paths, where no accessor
+    //     result reaches the caller, so a `[k: string]: string` SETTER's index
+    //     is still released.
+    // Both exclusions keep the pre-existing leak, which is the safe direction.
+    //
+    // A THIRD, per-index suppression is unconditional: an index PINNED in
+    // `exprValueOverride_` belongs to a §22.3 accessor `ref`/`out`
+    // copy-in/copy-out bracket, which drives BOTH lowerIndexerGet and
+    // lowerIndexerSet over that one pinned value — releasing here would
+    // double-free it and dangle the write-back's read. See the definition.
+    void releaseIndexArgStringProducers(
+        const ast::IndexExpr& ix, const sema::PropertySymbol* ps,
+        const sema::TypeSymbol* recvDecl,
+        const std::vector<llvm::Value*>& argVals,
+        bool accessorResultEscapes);
 
     // fix #508 / stdlib §4.4 / §4.5 / §17.15: compound assignment `arr[i] OP= v`
     // on a HEAP-collection Array<T>/OwningArray<T>/Dictionary<K,V> indexer.
