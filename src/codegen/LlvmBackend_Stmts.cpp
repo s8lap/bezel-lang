@@ -2318,8 +2318,42 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // only this call site performs the #843 narrower-numeric widen before
         // the wrap. The `T?`-through-monomorphisation and layout-identical
         // record-payload shapes reach only this arm too.
-        if (const ast::Type* rn = v ? returnReprTypeNode() : nullptr) {
-            if (const sema::TypeRef* declRet = ctx_.resolvedType(*rn)) {
+        // fix #2716 (§27.3 "Lambda expressions" / §7.1, v0.240): the LAMBDA half
+        // of this same arm — the third body-form asymmetry after #2688
+        // (`string`) and #2691 (closure). `lowerLambda` nulls
+        // `currentReturnTypeNode_` (#2515) and a lambda has no declared
+        // return-type NODE at all, so a BLOCK-bodied lambda reached this arm
+        // with nothing to key on while its EXPRESSION-bodied twin performs the
+        // identical promotion from `retSemaTy` (the #541 branch,
+        // LlvmBackend_Exprs2.cpp ~1866-1883, numeric widen included).
+        // `currentLambdaReturnSemaTy_` is exactly that `retSemaTy` — the field
+        // #2688 introduced for the same reason — so the two forms now agree,
+        // which is the invariant #2688 established.
+        //
+        // ⚠ This is the ONLY arm of the four that gets the lambda fallback.
+        // Neither lambda body form ever calls `boxForTarget` or
+        // `wrapAsIEnumerableForTarget` (zero occurrences on the expression
+        // path), so adding those here would BREAK the agreement rather than
+        // restore it. And the two +1-mint arms are untouched: they key on
+        // `currentReturnTypeNode_`, and the lambda mints already have their own
+        // arms above keyed on `!currentReturnTypeNode_ && lamRet`.
+        //
+        // ⚠ The issue's filed repro is STALE: `lambda(): int? => do return 3;
+        // end` compiles and returns 3 on HEAD, because `emitReturn` has an
+        // exact-width nullable-prim fallback. The real repro is the WIDENING
+        // shape — `lambda(): long? => do return 42; end` — which fails IR
+        // verification ("ret i32 42" against `{ i8, i64 }`), since the #843
+        // narrower-numeric widen happens only inside
+        // `coerceReturnToNullableValue`.
+        const sema::TypeRef* nullCoerceRet = nullptr;
+        if (v) {
+            if (const ast::Type* rn = returnReprTypeNode())
+                nullCoerceRet = ctx_.resolvedType(*rn);
+            else if (lamRet)
+                nullCoerceRet = lamRet;      // fix #2716
+        }
+        {
+            if (const sema::TypeRef* declRet = nullCoerceRet) {
                 // #1767 / §19.2: the returned expression's own sema type is a
                 // nullable REFERENCE (`Object?`) — e.g. an all-null `case … end`,
                 // whose `null` arms default to `Object?` — while the declared
