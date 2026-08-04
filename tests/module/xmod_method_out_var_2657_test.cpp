@@ -133,10 +133,13 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
 #include <sys/wait.h>
+#include <unistd.h>
 #include <vector>
 
 #include "driver/Driver.hpp"
@@ -192,7 +195,16 @@ const char* kLib2657 =
     "  public constructor() "
     "    v := 1; "
     "  end; "
-    "end W5;";
+    "end W5; "
+    // §26.1: an imported EXTENSION method (T12). Built by a different
+    // ModuleLoader path than the class's own methods, with the receiver on the
+    // ExtensionDecl rather than in `params` — but `decl` is left null there
+    // too, so the same blind spot is reached by another route.
+    "public extension W5 "
+    "  public method Fetch(out n: string): bool "
+    "    n := \"mnopqr\"; return true; "
+    "  end Fetch; "
+    "end;";
 
 // Build the dependency object, compile the app against it, run the app in a
 // SEPARATE process (fork-isolated, per tests/README.md). Returns the child's
@@ -240,7 +252,8 @@ int runImported2657(const std::string& mainBody, const std::string& moduleTag) {
 // ever executed on this path, so `success == false` can only come from a
 // front-end diagnostic.
 int compileImported2657(const std::string& mainBody,
-                        const std::string& moduleTag) {
+                        const std::string& moduleTag,
+                        std::string* errOut = nullptr) {
     namespace fs = std::filesystem;
     auto dir = fs::temp_directory_path();
     std::string stem = "bz2657c_" + moduleTag + "_" + std::to_string(std::rand());
@@ -270,7 +283,26 @@ int compileImported2657(const std::string& mainBody,
     d.metadataPath = aObj.path;
     d.objectPath = aObj.path;
     deps.push_back(d);
-    auto res = driver.compileFile(bSrc.path, bExe.path, deps);
+    // Capture the compile's stderr when asked: `CompileResult` carries only a
+    // bool + a count, and the diagnostic TEXT is what makes a must-reject case
+    // non-vacuous (an unrelated failure would satisfy the count alone).
+    bezel::CompileResult res;
+    if (errOut) {
+        TempFile2657 bErr((dir / (stem + "_b.err")).string());
+        std::fflush(stderr);
+        int saved = ::dup(STDERR_FILENO);
+        int sink = ::open(bErr.path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (sink >= 0) { ::dup2(sink, STDERR_FILENO); ::close(sink); }
+        res = driver.compileFile(bSrc.path, bExe.path, deps);
+        std::fflush(stderr);
+        if (saved >= 0) { ::dup2(saved, STDERR_FILENO); ::close(saved); }
+        std::ifstream in(bErr.path);
+        std::ostringstream ss;
+        ss << in.rdbuf();
+        *errOut = ss.str();
+    } else {
+        res = driver.compileFile(bSrc.path, bExe.path, deps);
+    }
     std::remove(bExe.path.c_str());
     return (res.success && res.errorCount == 0) ? 1 : 0;
 }
@@ -467,12 +499,54 @@ BEZEL_TEST(xmod_method_out_var_2657,
 // ===========================================================================
 BEZEL_TEST(xmod_method_out_var_2657,
            imported_method_out_var_recipient_is_type_checked) {
+    std::string err;
     int ok = compileImported2657(
         "    var e := W5.MakeStr(\"x\", out var n); "
         "    _ := e; "
-        "    return n.NoSuchMemberAtAll; ", "T11");
+        "    return n.NoSuchMemberAtAll; ", "T11", &err);
     if (ok == -2) return;
     BEZEL_EXPECT_EQ(ok, 0);  // 0 == front end reported an error
+    // Asserting the error COUNT alone would pass on any unrelated compile
+    // failure — the vacuity trap. Pin the actual member name so the rejection
+    // has to be the one this fix causes.
+    BEZEL_EXPECT_TRUE(err.find("NoSuchMemberAtAll") != std::string::npos);
+}
+
+// ===========================================================================
+// T12 — an imported EXTENSION method's inline `out var` (§26.1). Not merely a
+// bonus shape: an imported extension method's `sema::MethodSymbol` is built by
+// a DIFFERENT ModuleLoader path (ModuleLoader.cpp:2205-2225, the
+// `registerImportedExtension` loop) than an ordinary imported method, and it
+// too leaves `decl` null while filling `params` via `convertParams` — so it has
+// the same blind spot, reached by another route. §26.1 puts the receiver on the
+// `ExtensionDecl` rather than in the parameter list, so the argument positions
+// line up with `params` exactly as for a static method and the same positional
+// fallback applies.
+//
+// This row was NOT in the original submission and is added because a reviewer
+// suspected the fix reached it. Measured rather than assumed — the full matrix
+// on this program, by selectively disabling each half:
+//
+//     both halves disabled   SIGSEGV (exit 139)
+//     sema half only         6
+//     codegen half only      6
+//     both halves (shipped)  6
+//
+// So the shape WAS broken (and broken in its dangerous form, a wild write, not
+// merely a wrong value), and either half repairs it — the same relationship the
+// header records for T1-T7 rather than a new one.
+// ===========================================================================
+BEZEL_TEST(xmod_method_out_var_2657,
+           imported_extension_method_inline_out_var_receives_value) {
+    int rc = runImported2657(
+        "    var w := new W5(); "
+        "    var e := w.Fetch(out var n); "
+        "    _ := e; "
+        "    var r := n.Length; "
+        "    w.Dispose(); "
+        "    return r; ", "T12");
+    if (rc == -2) return;
+    BEZEL_EXPECT_EQ(rc, 6);
 }
 
 }  // namespace bezel::module
