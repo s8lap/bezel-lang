@@ -4610,11 +4610,42 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // Resolve callee's parameter list to type out-var locals.
         sema::Symbol* calleeSym2 = ce->callee ? ctx_.exprSymbol(*ce->callee) : nullptr;
         const ast::MethodDecl* calleeMd2 = nullptr;
+        sema::MethodSymbol* calleeMs2 = nullptr;
         sema::TypeSymbol* calleeParent2 = nullptr;
         if (auto* ms2 = dynamic_cast<sema::MethodSymbol*>(calleeSym2)) {
+            calleeMs2 = ms2;
             calleeMd2 = dynamic_cast<const ast::MethodDecl*>(ms2->decl);
             calleeParent2 = ms2->parent;
         }
+        // fix #2657 (§22.4 "Inline `out` declarations" / §2.5, v0.236): an
+        // IMPORTED method has NO `ast::MethodDecl` — ModuleLoader.cpp:337-346
+        // reconstructs a `sema::MethodSymbol` from the artifact's metadata with
+        // no `decl`, and the formal parameter types survive only as
+        // `sema::ParameterSymbol::resolvedDeclType` (ModuleLoader.cpp:258).
+        // The `calleeMd2`-only lookup below therefore left `lsym->declType`
+        // NULL for every `out var` recipient of an imported method, which is
+        // the root of #2657: with no declType the identifier never gets an
+        // exprType (the `if (loc->declType)` guard at ~line 816), so a later
+        // `n.Length` fails to lower (the `internal:` #2491/#2434 notes), AND
+        // codegen's ensureOutVarSlots (LlvmBackend_Calls2.cpp:1505) falls
+        // through its whole cascade to the `i32()` DEFAULT — a 4-byte alloca
+        // the imported callee then writes 8 bytes through for a `string`/`long`
+        // out parameter. Resolve the formal type through the AST decl when
+        // there is one (so local callees are bit-identical) and fall back to
+        // the imported symbol's own parameter type otherwise.
+        auto formalOutParamType2 =
+            [&](std::size_t pos) -> TypeRef* {
+            if (calleeMd2) {
+                if (pos < calleeMd2->params.size() && calleeMd2->params[pos].type)
+                    return ctx_.resolvedType(*calleeMd2->params[pos].type);
+                return nullptr;
+            }
+            if (calleeMs2 && pos < calleeMs2->params.size())
+                if (auto* ps2 = dynamic_cast<ParameterSymbol*>(
+                        calleeMs2->params[pos]))
+                    return ps2->resolvedDeclType;
+            return nullptr;
+        };
         std::size_t pos2 = 0;
         for (const auto& a : ce->args) {
             // §22.4: `out var x` declares x in the current scope.
@@ -4627,10 +4658,13 @@ void ExprTC::visitChildren(const ast::Expr& e) {
                     lsym->name = id->name;
                     lsym->decl = id;
                     // Infer type from the callee's formal parameter.
-                    if (calleeMd2 && pos2 < calleeMd2->params.size() &&
-                        calleeMd2->params[pos2].type) {
-                        lsym->declType = ctx_.resolvedType(
-                            *calleeMd2->params[pos2].type);
+                    // fix #2657: `formalOutParamType2` is the former
+                    // `ctx_.resolvedType(*calleeMd2->params[pos2].type)`
+                    // lookup plus the imported-callee fallback; for a callee
+                    // WITH an ast::MethodDecl it returns exactly what this
+                    // condition used to compute.
+                    if (TypeRef* formalTy2 = formalOutParamType2(pos2)) {
+                        lsym->declType = formalTy2;
                         // §11.8 (v0.176, #807): a STATIC interface member
                         // called through a constrained type parameter
                         // (`T.TryParse(s, out var v)`) declares its out param
