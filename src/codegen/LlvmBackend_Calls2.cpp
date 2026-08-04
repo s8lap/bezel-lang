@@ -8302,6 +8302,177 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
         // emitGenericSpecialization with concrete `ptr` args) have a real `ptr`
         // receiver and reach the dispatch correctly.
         if (!recv->getType()->isPointerTy()) return nullptr;
+        // fix #2752 / §4.6 / stdlib §9.6 + §2.9: `string` really does implement
+        // these interfaces — stdlib §9.6 declares
+        //   `public class String: IEnumerable<char>, IComparable<string>,
+        //    IEquatable<string>`
+        // — so sema is right to admit a string into an IEquatable<string> /
+        // IComparable<string> slot (ExprTC::primitiveBoxesIntoBuiltinIface).
+        // But a string is a §4.6 runtime-managed REFERENCE ("A reference type
+        // with content-based equality"), not a boxable value: the slot holds a
+        // bare `bz_string*` whose word 0 is `char* data`, NOT a vtable (see
+        // bezel_runtime.h's bz_obj_is_string contract, §8.6/§12.7 #417). The
+        // itable dispatch below loads vptr[1] — i.e. `data[1]` — reading 8
+        // bytes past the end of the payload buffer: a heap-buffer-overflow
+        // that segfaults in practice.
+        //
+        // Discriminate at run time with the same helper lowerObjectEquals uses
+        // for an Object-typed receiver, and route a string receiver to the
+        // §9.6 string content intrinsics.
+        //
+        // ⚠ EXACTLY HOW FAR the discriminator is sound. bz_obj_is_string is a
+        // whitelist NEGATION (bezel_runtime_refcounting.cpp): it answers "not a
+        // string" only when word 0 appears in the emitted vtable table, and
+        // that table OMITS several vtable kinds — codegen's iterator and
+        // collection-adapter vtables, and runtime-owned statics such as
+        // bz_lazy_vtable (every lazy LINQ pipeline), plus raw runtime shapes
+        // like bz_array_t that carry no vtable word at all. So it is NOT a
+        // general "is this an object?" test.
+        //
+        // Sound for the DOCUMENT-BACKED shapes: in an IEquatable<string> /
+        // IComparable<string> slot (stdlib §9.6) the only values admitted are a
+        // string and a type declaring that interface — a user class, a boxed
+        // primitive, or a boxed value-builtin — and every one of those has its
+        // vtable registered (user and imported classes alike; see
+        // LlvmBackend_Setup.cpp's registration). Those shapes are exactly what
+        // this issue is about, and they are covered.
+        //
+        // NOT sound in general, and deliberately so: primitiveBoxesIntoBuiltinIface
+        // also admits Object -> IEquatable<Object>/IComparable<Object>, and
+        // `Object` accepts ANYTHING (ExprTypecheck.cpp, "the root — accepts
+        // anything, never flag"). Under that acceptance the RECEIVER may be any
+        // heap value at all, including the unregistered-vtable runtime shapes
+        // listed above, and bz_obj_is_string would then misreport it as a
+        // string. Receiver reachability is NOT determined by what the object
+        // declares — it is determined by what `Object` admits, which is
+        // everything. That is the same reasoning applied to the argument below,
+        // and it applies to the receiver under identical typing.
+        //
+        // Why that is nonetheless not a regression: every such receiver ALREADY
+        // wild-read before this fix (it took the itmap load at vptr[1] with a
+        // word-0 value that is not a vtable), so this change makes no previously
+        // correct program incorrect. #2765 governs whether the Object
+        // acceptance should exist at all; fixing it there removes the hazard at
+        // its source rather than by guessing here.
+        //
+        // ⚠ DO NOT COPY THIS DIAMOND TO A WIDER ITABLE SITE. Every OLDER
+        // bz_obj_is_string call site is written so that a false positive still
+        // yields a correct answer (see LlvmBackend_Exprs2.cpp, which says so
+        // explicitly). This site has NO such property — a false positive
+        // dereferences a real object as a bz_string. At a site where
+        // IEnumerable-shaped receivers genuinely arrive, that is a wild read on
+        // a shape that previously dispatched correctly, i.e. a real regression
+        // rather than the status quo above.
+        //
+        // BOTH operands must be checked, not just the receiver. emitStringEq /
+        // emitStringOrdCmp dereference `l` AND `r` as bz_string (loadStringLen
+        // reads offset 8, loadStringData offset 0), so a non-string ARGUMENT
+        // would have its vtable pointer read as `char* data`. That is reachable
+        // through the IEquatable<Object>/IComparable<Object> acceptance (#2765):
+        // there the argument is statically Object and need not be a string. For
+        // the document-backed IEquatable<string>/IComparable<string> shapes the
+        // argument is statically `string`, so the extra test always passes and
+        // behaviour is unchanged.
+        //
+        // The static gate below only decides whether to EMIT the tests; what
+        // the operands actually are remains a runtime question.
+        bool strRecvPossible =
+            isIfaceMethod && ms->parent && args.size() == 2 && args[1] &&
+            args[1]->getType()->isPointerTy() &&
+            ((ms->parent->name == "IEquatable"  && ms->name == "Equals") ||
+             (ms->parent->name == "IComparable" && ms->name == "CompareTo")) &&
+            descArray_.count(ms->parent) != 0;
+        llvm::BasicBlock* strDispBB = nullptr;
+        llvm::BasicBlock* dispEndBB = nullptr;
+        llvm::BasicBlock* strDispEnd = nullptr;
+        llvm::BasicBlock* strNeBB = nullptr;
+        llvm::Value* strDispVal = nullptr;
+        if (strRecvPossible) {
+            bool isEqualsMethod = ms->name == "Equals";
+            strDispBB = llvm::BasicBlock::Create(llvm_, "ifc.str", currentFn_);
+            auto* objDispBB =
+                llvm::BasicBlock::Create(llvm_, "ifc.obj", currentFn_);
+            dispEndBB = llvm::BasicBlock::Create(llvm_, "ifc.end", currentFn_);
+            auto* isStrFn =
+                declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* rIsStr = builder_.CreateICmpNE(
+                builder_.CreateCall(isStrFn, {recv, vtableTablePtr()},
+                                    "ifc.risstr"),
+                builder_.getInt32(0));
+            llvm::Value* aIsStr = builder_.CreateICmpNE(
+                builder_.CreateCall(isStrFn, {args[1], vtableTablePtr()},
+                                    "ifc.aisstr"),
+                builder_.getInt32(0));
+            llvm::Value* bothStr =
+                builder_.CreateAnd(rIsStr, aIsStr, "ifc.bothstr");
+            // A string receiver with a NON-string argument is a real shape under
+            // the Object acceptance, and the two methods differ in whether any
+            // document answers it.
+            auto* mixedBB =
+                llvm::BasicBlock::Create(llvm_, "ifc.mixed", currentFn_);
+            strNeBB = llvm::BasicBlock::Create(
+                llvm_, isEqualsMethod ? "ifc.strne" : "ifc.strtrap", currentFn_);
+            builder_.CreateCondBr(bothStr, strDispBB, mixedBB);
+            builder_.SetInsertPoint(mixedBB);
+            builder_.CreateCondBr(rIsStr, strNeBB, objDispBB);
+            builder_.SetInsertPoint(strNeBB);
+            if (isEqualsMethod) {
+                // §9.6 answers this directly. `String` declares
+                //   public pure override method Equals(other: Object?): bool;
+                //     // content-based, not reference-based
+                // so a string compared against a non-string Object is simply
+                // FALSE. Neither operand is dereferenced, and this does not fall
+                // into the itable path (which, for a string receiver, is the
+                // out-of-bounds read this issue is about). The PHI supplies the
+                // `false`.
+            } else {
+                // CompareTo: §9.6 declares only
+                //   public pure method CompareTo(other: string): int  // ordinal
+                // and spec §4.6 confines ordinal comparison to string operands,
+                // so there is NO ordering to return here and inventing one would
+                // be a silent fabrication.
+                //
+                // Trap instead of falling through to the itable path. The
+                // fall-through is NOT a "loud failure": bz_itable_lookup walks
+                // `itmap` pairwise until a null word — here `itmap` is the
+                // string payload's data[1], i.e. arbitrary memory — and the
+                // caller then calls through itab[k], an indirect call through an
+                // arbitrary pointer. The SIGSEGV that happens to result today is
+                // luck, not a guarantee. A trap invents no ordering, costs one
+                // block, and is strictly defined.
+                //
+                // This arm is reachable ONLY through the IComparable<Object>
+                // acceptance that #2765 questions; for IComparable<string> the
+                // argument is statically a string, so it is dead there.
+                // Resolving #2765 is what removes the arm entirely.
+                builder_.CreateCall(
+                    declareC("abort", llvm::Type::getVoidTy(llvm_), {}), {});
+            }
+            builder_.CreateBr(dispEndBB);
+            // Both operands are strings: §9.6 content equality / ordinal
+            // comparison. emitStringEq is null-safe on both operands;
+            // emitStringOrdCmp requires non-null, which §4.6 guarantees for an
+            // ordering operand ("Ordering requires non-nullable operands") —
+            // the same premise the direct `s.CompareTo(t)` lowering rests on.
+            builder_.SetInsertPoint(strDispBB);
+            if (ms->name == "Equals") {
+                strDispVal = emitStringEq(recv, args[1]);
+            } else if (llvm::Value* c = emitStringOrdCmp(recv, args[1])) {
+                strDispVal = c->getType()->isIntegerTy(32)
+                    ? c
+                    : builder_.CreateTrunc(c, i32(), "ifc.str.cmp");
+            }
+            // Match the itable slot's return type so the merge PHI is
+            // well-typed (Equals → i1, CompareTo → i32).
+            llvm::Type* retTy = fnTy->getReturnType();
+            if (strDispVal && strDispVal->getType() != retTy &&
+                strDispVal->getType()->isIntegerTy() && retTy->isIntegerTy())
+                strDispVal = builder_.CreateZExtOrTrunc(strDispVal, retTy,
+                                                        "ifc.str.ret");
+            strDispEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(dispEndBB);
+            builder_.SetInsertPoint(objDispBB);
+        }
         llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
         llvm::Value* fnPtr = nullptr;
         if (isIfaceMethod) {
@@ -8359,6 +8530,47 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             }
         }
         llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, args);
+        // fix #2752: merge the string-receiver arm back in. Only reached when
+        // the diamond above was emitted; strDispVal is non-null there because
+        // both intrinsics return a value for pointer operands.
+        if (strRecvPossible && strDispVal && strDispEnd &&
+            strDispVal->getType() == r->getType()) {
+            llvm::BasicBlock* objDispEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(dispEndBB);
+            builder_.SetInsertPoint(dispEndBB);
+            auto* phi = builder_.CreatePHI(r->getType(), strNeBB ? 3 : 2,
+                                           "ifc.res");
+            phi->addIncoming(strDispVal, strDispEnd);
+            // §9.6 mixed-operand arm. For Equals this is the ANSWER — string vs
+            // non-string is false, and getNullValue is `false` for the i1
+            // return type. For CompareTo the arm traps before reaching here, so
+            // the incoming value is unreachable and exists only to keep the PHI
+            // well-formed.
+            if (strNeBB)
+                phi->addIncoming(llvm::Constant::getNullValue(r->getType()),
+                                 strNeBB);
+            phi->addIncoming(r, objDispEnd);
+            r = phi;
+        } else if (strRecvPossible) {
+            // Defensive: the arms disagreed on type (should not happen for the
+            // two gated signatures). Keep the CFG well-formed by joining both
+            // arms and taking the itable result — never leave a dangling block.
+            llvm::BasicBlock* objDispEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(dispEndBB);
+            if (strDispEnd && !strDispEnd->getTerminator()) {
+                builder_.SetInsertPoint(strDispEnd);
+                builder_.CreateBr(dispEndBB);
+            }
+            builder_.SetInsertPoint(dispEndBB);
+            auto* phi = builder_.CreatePHI(r->getType(), strNeBB ? 3 : 2,
+                                           "ifc.res");
+            phi->addIncoming(llvm::UndefValue::get(r->getType()), strDispEnd);
+            if (strNeBB)
+                phi->addIncoming(llvm::Constant::getNullValue(r->getType()),
+                                 strNeBB);
+            phi->addIncoming(r, objDispEnd);
+            r = phi;
+        }
         emitPendingCheck();  // CG20: a callee may have thrown
         return r;
     }
