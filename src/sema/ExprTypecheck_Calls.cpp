@@ -8653,7 +8653,71 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     else if (recvTy->astNode && recvTy->astNode->name &&
              !recvTy->astNode->name->parts.empty())
         colName = recvTy->headName();
-    if (colName.empty()) return;
+    // §7 / stdlib §5 (#2593): the LINQ operator surface applies to ANY
+    // `IEnumerable<T>`, and stdlib §5 declares the quantifier
+    // `Contains(value: T)` with a NON-nullable `T`. Two receiver shapes reach
+    // it without a head name the concrete-family lists below recognise:
+    //   (a) the LAZY sentinel — the result of a chained LINQ operator such as
+    //       `xs.Where(…)` — a Named TypeRef carrying NEITHER a declaration NOR
+    //       an astNode, with the element type at genericArgs[0], so `colName`
+    //       comes out EMPTY and the old `if (colName.empty()) return;` bailed.
+    //       This predicate is byte-for-byte the `isLazyRecv` test typeCall
+    //       uses (L3667) to dispatch the whole §5 operator surface: a receiver
+    //       sema already types `Contains` on AS the LINQ quantifier is exactly
+    //       the receiver whose argument belongs to `T`.
+    //   (b) a source-spelled collection INTERFACE (`IEnumerable<T>` and the
+    //       single-element-parameter kin that extend it), whose head name is
+    //       not a concrete collection family. `IDictionary`/`IReadOnlyDictionary`
+    //       are excluded: they take TWO type parameters and their element is a
+    //       `DictionaryEntry<K, V>`, not `genericArgs[0]`.
+    // `IGrouping<TKey, T>` is likewise NOT covered — its element type is
+    // genericArgs[1] (genericArgs[0] is TKey), so the single-type-arg model
+    // here would check against the wrong type. Filed as #2643, which records
+    // the fix sketch (#2592 already added a second declared-type source to
+    // this helper, so the shape exists). NOTE the exclusion is only a MISSED
+    // rejection for the LOCALLY-synthesised grouping (which carries an
+    // astNode); an IMPORTED one is astNode-less and would be a FALSE reject
+    // without the importedName guard below — see #2643.
+    //
+    // ⚠ The `importedName.empty()` term is LOAD-BEARING, not defensive.
+    // §2.5 / §29.3 (#495): ModuleLoader reconstructs a TypeRef for every
+    // imported generic whose `lookupNamed` fails — every builtin, i.e.
+    // `Span<T>`, `Array<T>`, `Dictionary<K, V>`, `IGrouping<TKey, T>`, … —
+    // as Named + declaration=null + astNode=null + genericArgs, recording the
+    // name ONLY in `importedName` (ModuleLoader.cpp:186). That is the same
+    // shape as the lazy sentinel, and `colName` above cannot tell them apart
+    // because it reads `headName()` only when `astNode` is non-null. Without
+    // this term an imported class-`T` `Span<T>`/`ReadOnlySpan<T>` receiver —
+    // whose `Contains(value: T?)` / `IndexOf(value: T?)` are NULLABLE per
+    // stdlib §4.14 lines 2464/2612 — would be checked against a non-nullable
+    // `genericArgs[0]` and REJECT LEGAL CODE, because the
+    // `spanBufferSkipClassT` exemption below keys on a `colName` that is
+    // empty for the imported form. Both sibling copies of this predicate
+    // carry the same term for the same reason: `isLazyEnumerableType` in
+    // LlvmBackend_Calls3.cpp:38-39 and the copy in DefiniteAssignment.cpp:691
+    // ("Must match isLazyEnumerableType() in codegen"). Keep all three in
+    // step.
+    //
+    // Restricted to `Contains` by NAME, not by arity. stdlib §5 declares
+    // exactly one operator whose parameter is the bare element type —
+    // `Contains(value: T)`; every other §5 operator takes a predicate, a
+    // selector, an `int` count, or another sequence. The shared pos-0 name
+    // list below (IndexOf/LastIndexOf/ContainsKey/Find/Remove/PopValue/
+    // TryPopValue) fires with NO family guard, so without this term the lazy
+    // sentinel would take a §7 diagnostic on members §5 does not declare —
+    // double-reporting alongside the unknown-member error. The INTERFACE
+    // forms are deliberately not so restricted: §4.1 genuinely declares
+    // `ICollection<T>.Contains/Remove` and `IReadOnlyList<T>.IndexOf`.
+    bool isLazyEnumerable =
+        colName.empty() && !recvTy->astNode && !recvTy->genericArgs.empty() &&
+        recvTy->importedName.empty() && m == "Contains";
+    bool isEnumerableIface =
+        colName == "IEnumerable" || colName == "IList" ||
+        colName == "ICollection" || colName == "IReadOnlyList" ||
+        colName == "IReadOnlyCollection" || colName == "ISet" ||
+        colName == "IReadOnlySet";
+    bool isLinqEnumerable = isLazyEnumerable || isEnumerableIface;
+    if (colName.empty() && !isLazyEnumerable) return;
     bool isElementCollection =
         colName == "Array" || colName == "OwningArray" ||
         colName == "Set" || colName == "OwningSet" ||
@@ -8707,7 +8771,7 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
     // `SetResult()` takes no argument anyway.
     bool isTaskSource = colName == "TaskCompletionSource";
     if (!isElementCollection && !isKeyedCollection && !isSpanBuffer &&
-        !isAtomic && !isTaskSource)
+        !isAtomic && !isTaskSource && !isLinqEnumerable)
         return;
     if (recvTy->genericArgs.empty() || !recvTy->genericArgs[0]) return;
     TypeRef* itemTy = recvTy->genericArgs[0];  // T (element) or K (key)
@@ -8843,6 +8907,27 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         if (isTaskSource && pos == 0 &&
             (m == "SetResult" || m == "TrySetResult"))
             return true;
+        // §7 / stdlib §5 + §4.1 (#2593): NO entry is needed here for the LINQ
+        // / interface receivers. The position-0 block at the TOP of this
+        // lambda already returns true for `Contains` (and IndexOf/LastIndexOf/
+        // ContainsKey/Find/Remove/PopValue/TryPopValue) with no family guard,
+        // and it runs first — so admitting those receivers past the family
+        // gate above is what turns the check on, and a second entry here would
+        // be dead code asserting an invariant the code that actually fires
+        // does not hold. The real enabled surface is therefore:
+        //   * lazy §5 sentinel — `Contains` ONLY (narrowed at the
+        //     isLazyEnumerable term above, since §5 declares no other
+        //     element-typed operator);
+        //   * §4.1 interfaces — all eight pos-0 names. Three are genuinely
+        //     declared (`ICollection<T>.Contains/Remove`,
+        //     `IReadOnlyList<T>.IndexOf`); the other five are unknown members
+        //     on those interfaces, where a §7 diagnostic merely accompanies
+        //     the unknown-member error on already-invalid code.
+        // Two §4.1 slots stay UNcovered, both in the safe direction (a missed
+        // rejection, never a false one): `ICollection<T>.Add(item: T)` — the
+        // pos-0 `Add` block is name-gated to the concrete families — and
+        // `IList<T>.Insert(index, item: T)`, whose pos-1 block is gated to
+        // `Array`. Recorded in #2643 with the IGrouping residual.
         // Position-1 item methods.
         if (pos == 1 && (
             // Array<T>.Insert(index: int, item: T) — stdlib §4.4.
@@ -8904,9 +8989,13 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         if (spanBufferSkipClassT) continue;
         TypeRef* argTy = ctx_.exprType(*a.value);
         if (!argTy) continue;
+        // #2593: the lazy IEnumerable<T> sentinel has no head name to print —
+        // name it by the §5 receiver interface it stands for.
+        std::string_view diagName =
+            colName.empty() ? std::string_view("IEnumerable") : colName;
         checkAssignable(
             argTy, paramTy, a.value->span.begin,
-            std::string("argument to `") + std::string(colName) + "<T>." +
+            std::string("argument to `") + std::string(diagName) + "<T>." +
             std::string(m) + "`",
             a.value.get());  // §7.4 / §27.6 (#1191) — narrowing-aware
     }
