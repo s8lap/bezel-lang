@@ -3189,6 +3189,44 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     // frame-free into the getter's body. Save+null+restore.
     auto  savedSmKind    = smKind_;
     auto* savedSmStruct  = smStateStruct_;
+    // fix #2694 / §23.3 / §28.9 (v0.240): the SAME "a getter must not inherit
+    // the caller's emission mode" reasoning as #2170 immediately above, for the
+    // two RETURN-CONTRACT fields. This getter is MEMOIZED (propBlockGetterFns_)
+    // and emitted LAZILY from expression lowering, and the body loop that
+    // decides which call site lowers first iterates
+    // `std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_`
+    // (LlvmBackend_impl.hpp ~346/~565) — POINTER-HASH order, not declaration
+    // order. So without this save+null the getter's `return <expr>` reached
+    // emitReturn's `string` +1 mint (LlvmBackend_Stmts.cpp ~2113) carrying
+    // whichever *caller's* return contract happened to hash first, and the
+    // getter's ABI — baked once into the cached function — became a function of
+    // hash-map iteration order. A `string`-typed block getter first touched
+    // inside a `string`-returning METHOD (currentReturnTypeNode_) or, since
+    // #2688, inside a block-bodied `string`-returning LAMBDA
+    // (currentLambdaReturnSemaTy_) minted a +1 INSIDE the getter that neither
+    // call site discharges: both the property-read path
+    // (LlvmBackend_Exprs.cpp ~4342) and the indexer-read path (~1598 below)
+    // hand the call result straight back as a BORROW, and #2304's producer
+    // recognizer (LlvmBackend_Setup.cpp ~13703) deliberately does NOT classify
+    // a statement-bodied block getter as a +1 producer. The getter's contract
+    // is therefore +0, and NULL is the value that yields it — confirmed
+    // mechanically: the identical program with two reader methods declared in
+    // swapped order emitted the getter with and without `bz_string_retain`,
+    // and only the retaining order leaked (LSan, 20 strings / 20 iterations).
+    //
+    // NULL rather than `pd->type.get()` (the getter's OWN return node) is
+    // deliberate: pointing the field at the property's own type would make the
+    // getter mint +1 for every `string` property read, which no call site
+    // releases — a systematic leak, strictly worse than the order-dependence it
+    // would replace. §8.6 boxing / §29.2 IEnumerable wrapping of a block
+    // getter's returned value is the separate pre-existing defect that a
+    // non-null node WOULD address; it fails IR verification today regardless of
+    // this change (an `Object`-typed block getter returning an `int` emits
+    // `ret i32` from a `ptr`-returning function whenever the first-touching
+    // caller does not itself return Object), so this change only makes that
+    // failure deterministic. Filed separately rather than fixed here.
+    auto* savedRetNode   = currentReturnTypeNode_;
+    auto* savedLamRet    = currentLambdaReturnSemaTy_;
 
     // --- Switch into the getter function ---
     currentFn_          = fn;
@@ -3206,6 +3244,8 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     diverged_           = false;
     smKind_             = SuspendKind::Yield;
     smStateStruct_      = nullptr;
+    currentReturnTypeNode_    = nullptr;   // fix #2694 / §28.9
+    currentLambdaReturnSemaTy_ = nullptr;  // fix #2694 / §27.3 / §28.9
 
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
@@ -3230,6 +3270,8 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     genericSubst_       = std::move(savedGSubst);
     smKind_             = savedSmKind;
     smStateStruct_      = savedSmStruct;
+    currentReturnTypeNode_     = savedRetNode;   // fix #2694 / §28.9
+    currentLambdaReturnSemaTy_ = savedLamRet;    // fix #2694 / §27.3 / §28.9
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
 
     return fn;
@@ -3715,6 +3757,13 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     auto  savedUD        = unwindScopeDepth_;
     auto  savedDiv       = diverged_;
     auto  savedGSubst    = genericSubst_;
+    // fix #2694 / §23.4 / §28.9 (v0.240): the same memoized-getter-inherits-the-
+    // caller's-return-contract hole as ensurePropertyBlockGetter — see the long
+    // note there for the reasoning, the +0 call-site contract (the read path at
+    // ~line 1598 above hands this call's result straight back as a borrow), and
+    // why NULL rather than the indexer's own return node is the right value.
+    auto* savedRetNode   = currentReturnTypeNode_;
+    auto* savedLamRet    = currentLambdaReturnSemaTy_;
 
     // --- Switch into the getter function ---
     currentFn_          = fn;
@@ -3729,6 +3778,8 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     currentCaughtExc_   = nullptr;
     unwindScopeDepth_   = 0;
     diverged_           = false;
+    currentReturnTypeNode_     = nullptr;  // fix #2694 / §28.9
+    currentLambdaReturnSemaTy_ = nullptr;  // fix #2694 / §27.3 / §28.9
 
     // arg 0 is `this`; args 1.. are the index params. Spill each index param to
     // a stack slot so localSlot() resolves the body's identifier reads.
@@ -3764,6 +3815,8 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     unwindScopeDepth_   = savedUD;
     diverged_           = savedDiv;
     genericSubst_       = std::move(savedGSubst);
+    currentReturnTypeNode_     = savedRetNode;   // fix #2694 / §28.9
+    currentLambdaReturnSemaTy_ = savedLamRet;    // fix #2694 / §27.3 / §28.9
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
 
     return fn;
