@@ -1,6 +1,6 @@
 # Bezel: Revision Changelog
 
-**Companion to the Bezel Language Specification, v0.236 — July 2026**
+**Companion to the Bezel Language Specification, v0.237 — August 2026**
 
 This document is the single narrative history of the normative Bezel documents — the language specification, the standard library specification, and the design rationale. One entry per revision, oldest first. Entries are normative for migration (each records what a revision made newly rejected, newly defined, newly warned, or doc-only) but are not part of the language definition: the current rule on any point is always the latest text of the specification itself, never an old entry here.
 
@@ -7296,3 +7296,14 @@ Rationale §3.3 is rewritten as the recorded reversal it is: the #1373 ruling's 
 **Kernel classification (the v0.198 obligation):** none — a non-normative guide teaching landed rules; no normative text touched.
 
 **Migration.** Doc-only; no program changes meaning. Guide 2's revalidation pin moves to v0.236; every new example traces against the landed rules (the pipelines mirror stdlib §2.20's definitional examples verbatim in shape; the config idiom uses the §2.4 renamed surface and the §1 tier contract). Guides 1 and 3 are untouched and keep their pins; the spec, stdlib, and rationale texts are unchanged and the changelog gains only this entry (headers in lockstep). No grammar, anchor, or section moves; the conformance corpus is untouched.
+
+### v0.237 changelog (v0.236 → v0.237)
+
+**Rationale front matter rewritten (owner-directed 2026-08-04) — the intro and §1 "The big picture."** Editorial, rationale-only: the spec and stdlib are textually unchanged (headers move in lockstep; the changelog gains this entry). Readers hit these pages first, and the owner directed a rewrite to the standard the rest of the document holds.
+
+- **The intro** no longer names any other programming language. It now states the document's role in the project's own terms — the recorded form of "why doesn't Bezel just do Y?", with each answer naming the alternative, what it would buy, and why it was declined — plus the decisions-recorded-with-reasoning discipline and the settled-convention carve-out, without attribution.
+- **§1** drops the three-things-at-once framing sentence and reframes around two commitments: the performance of a compiled language (native code, no collector, costs that follow from the source) and memory management that is predictable and checked — single ownership of resource-holding objects with the `owned`/`using var` spellings named, disposal exactly once, and the price triaged with the pre-rewrite's quantifiers kept: *most* mistakes rejected at compile time, *most* of the remainder deterministic `DisposedAccessException` faults in checked disposal mode, the *few* individually-recorded trust admissions named as such (spec §28.3), and unchecked release builds stated plainly as undefined behavior (spec §28.2). The no-ceremony tier (strings, boxed values, function values, resource-free classes) is noted with linked pointers to §4/§5.9. The Rust comparison compresses to the recorded form: the ownership model bears some similarity, deliberately — and differs in how much the checker demands (no lifetime annotations, no exclusive-writer rule; data-race freedom comes from serial domains with transfer or immutable sharing at their boundaries, §12) — yielding more freedom in how code is written without the common pitfalls of manual management. The named-language inheritance paragraph is retired; the closing keeps and extends the document's framing sentence (each chapter records what a stricter rule would buy, what it would cost, and why the balance landed where it did). The train's adversarial pass drove the final shape: the dichotomy a draft stated exhaustively was re-hedged to the spec's own triage, and the draft's mechanism claims (no background collector activity) were dropped as unsupported by §28's scoping.
+
+**Kernel classification (the v0.198 obligation):** none — rationale prose only; no normative text touched.
+
+**Migration.** Doc-only; no program changes meaning. No grammar, anchor, or section moves — the §1 anchor, heading, and Contents list are unchanged (the intro contains no anchors of its own). The guides are untouched and keep their pins; the conformance corpus is untouched.
