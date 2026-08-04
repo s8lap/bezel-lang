@@ -2604,6 +2604,62 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                             "(stdlib \xC2\xA7""6.4, #647)");
                     }
                 }
+                // §7 / stdlib §6.4 (#2618): `new Atomic<T>(initial)` /
+                // `new AtomicInteger<T>(initial)` — check the ARGUMENT against
+                // the declared NON-nullable `initial: T`.
+                //
+                // #2602 gated the atomic INSTANCE methods, but that gate lives
+                // in checkBuiltinCollectionCallArgs and runs only on the
+                // CallExpr path; a constructor is a NewExpr, whose only sema
+                // check here was the T-restriction above. So an un-narrowed
+                // `T?` initial passed sema entirely unchecked and reached
+                // codegen, where it was silently discarded and the cell
+                // initialized to 0 (#2618's own report says this). With the
+                // #2618 codegen unwrap in place it would instead read the
+                // payload out of a possibly-null box — either way a SILENT
+                // WRONG VALUE. This closes the pair the way #2601/#2602 do:
+                // sema REJECTS the un-narrowed form, codegen UNWRAPS the
+                // narrowed one. checkAssignable is narrowing-aware (§7.4), so
+                // a null-checked `T?` still compiles.
+                //
+                // SCOPE: this gate checks NULLABILITY ONLY — it fires solely
+                // when the argument's own type is a NULLABLE primitive and T is
+                // not — and it checks against the non-nullable form of THAT
+                // type, not against T. It deliberately does NOT re-implement
+                // constructor argument typing: a first draft compared the
+                // argument to T directly and false-rejected the legal
+                // `new Atomic<byte>(0)`, because the literal `0` is typed `int`
+                // and the int->byte constant conversion is not a checkAssignable
+                // conversion. A false reject breaks working code and is worse
+                // than the bug being closed, so the check is confined to the one
+                // question this issue is about: did a possibly-null value reach
+                // a non-nullable slot? Everything else about the argument keeps
+                // its existing (unchecked) behavior — widening, literal
+                // narrowing, and the T-restriction above are untouched.
+                if (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+                    rt->astNode && rt->astNode->name &&
+                    !rt->astNode->name->parts.empty() &&
+                    (rt->headName() == "Atomic" ||
+                     rt->headName() == "AtomicInteger") &&
+                    !rt->genericArgs.empty() && rt->genericArgs[0] &&
+                    !rt->genericArgs[0]->nullable &&
+                    ne->args.size() == 1 && ne->args[0].value &&
+                    !ne->args[0].isDiscard && ne->args[0].modifier.empty()) {
+                    TypeRef* argTy = ctx_.exprType(*ne->args[0].value);
+                    if (argTy && argTy->kind == TypeRef::Kind::Primitive &&
+                        argTy->nullable) {
+                        // checkAssignable is narrowing-aware (§7.4 / #1191), so
+                        // a null-checked `T?` still compiles and only the
+                        // genuinely un-narrowed argument is reported.
+                        TypeRef* nonNull = ctx_.primitiveTypeRef(
+                            argTy->primitive, /*nullable=*/false);
+                        checkAssignable(
+                            argTy, nonNull, ne->args[0].value->span.begin,
+                            std::string("argument to `") +
+                                std::string(rt->headName()) + "` constructor",
+                            ne->args[0].value.get());
+                    }
+                }
                 // issue #545: `new Buffer<T>(n)` — T-restriction check.
                 // Buffer<T> requires T to be a value-type primitive in this revision:
                 // {bool, char, byte, sbyte, short, ushort, int, uint, long, ulong,

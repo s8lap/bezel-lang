@@ -3391,6 +3391,25 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (!ne.args.empty() && ne.args[0].value) {
                     llvm::Value* raw = lowerExpr(*ne.args[0].value);
                     if (raw) {
+                        // #2618 / §7.4: a flow-narrowed `T?` initial value
+                        // (proved non-null by a preceding null-check) is
+                        // admitted by sema as the non-nullable `initial: T`
+                        // parameter (stdlib §6.4) but keeps its tagged-optional
+                        // {i8 hasVal; T payload} layout. Unwrap to the bare T
+                        // payload before the widen ladder below — otherwise the
+                        // struct fails every isIntegerTy() branch, `initVal`
+                        // stays getInt64(0), and the cell is SILENTLY
+                        // initialized to 0 (a wrong value, not a verifyModule
+                        // ICE). Same root cause and same one-line unwrap as the
+                        // atomic instance-method sites fixed in #2605
+                        // (LlvmBackend_Calls3.cpp / LlvmBackend_Stmts.cpp);
+                        // unwrapNarrowedNullable is a no-op for a plain
+                        // primitive, so every existing plain-T `new Atomic<T>(k)`
+                        // is unchanged.
+                        if (newTR && !newTR->genericArgs.empty() &&
+                            newTR->genericArgs[0])
+                            if (auto* tTy = lowerTypeRef(newTR->genericArgs[0]))
+                                raw = unwrapNarrowedNullable(raw, tTy);
                         // Widen to i64 for bz_atomic_new's uint64_t parameter.
                         if (raw->getType()->isIntegerTy(1)) {
                             initVal = builder_.CreateZExt(raw, i64());
