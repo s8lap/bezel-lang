@@ -626,8 +626,25 @@ void Emitter::emitOwnedFieldDisposals(const sema::TypeSymbol* ts) {
                         // through the SAME stringElementReleaseThunk. IOwningList
                         // is owning and never reaches this string gate (owning-
                         // family disposer runs via elementPolicyFor instead).
+                        //
+                        // fix #2692: LinkedList joins the list. It is llist-
+                        // backed rather than array-backed (the `isLL` switch
+                        // below picks bz_llist_free), but the ELEMENT obligation
+                        // is identical — a borrowing `LinkedList<string>` co-owns
+                        // a +1 per element (§28.11's element-slot table), and
+                        // since #2686 all five insert paths take it. It was
+                        // excluded only because none of them did, which made a
+                        // release here unpaired; that is no longer true, and the
+                        // exclusion was leaking one reference per element of an
+                        // `owned` LinkedList<string> field. OwningLinkedList
+                        // cannot reach this gate: elementPolicyFor puts an
+                        // owning-family string in the Value row, so the
+                        // RuntimeManaged test above already fails (and sema
+                        // rejects `OwningLinkedList<string>` outright — stdlib
+                        // §4.2 / §14.4, #1327).
                         return n == "Array" || n == "Stack" || n == "Queue" ||
-                               n == "IList" || n == "IReadOnlyList";
+                               n == "IList" || n == "IReadOnlyList" ||
+                               n == "LinkedList";
                     }(it->collTy->headName()))
                 elemDisp = stringElementReleaseThunk();
             llvm::Value* disp = elemDisp
@@ -2648,7 +2665,23 @@ llvm::Function* Emitter::patternAResultCollectionDisposer(
             elemDisposer = elemPol.disposerThunk;
         } else if (elemPol.cat == ElementPolicy::Category::RuntimeManaged &&
                    elemForDisposer->kind == sema::TypeRef::Kind::Primitive &&
-                   elemForDisposer->primitive == sema::PrimitiveType::String) {
+                   elemForDisposer->primitive == sema::PrimitiveType::String &&
+                   // fix #2692 / §28.11: `!nullable` — every one of the retain
+                   // guards on the construction side excludes a NULLABLE string
+                   // element (`litIsStrArr` / `llitIsStrElem` in
+                   // materializeHeapCollectionLiteral, `dictIsStringValue` in
+                   // materializeHeapDictLiteral, `llIsStrElem` in
+                   // LlvmBackend_Calls3.cpp, `arrIsStringElem` in
+                   // LlvmBackend_Calls.cpp), because elementPolicyFor does NOT
+                   // look at `nullable` and still reports RuntimeManaged for a
+                   // `string?`. This site was the only release site WITHOUT the
+                   // matching guard, so an `Array<string?>` / `LinkedList<string?>`
+                   // Pattern-A task result released a +1 nothing retained — an
+                   // unpaired release, i.e. the double-free direction. Dropping
+                   // it leaves a `string?` element leaking instead, which is the
+                   // standing safe direction of this file. Pre-existing and
+                   // family-wide; found while completing #2692's LinkedList half.
+                   !elemForDisposer->nullable) {
             // Borrowing Array<string> / Dictionary<string, int> / etc. —
             // release each string element. Mirrors the
             // collectionElemDisposer wiring in LlvmBackend_Setup.cpp
@@ -2925,30 +2958,34 @@ llvm::Function* Emitter::collectionNodeFreeThunk(const sema::TypeRef* nodeTy) {
         //   * Dictionary/SortedDictionary VALUE —
         //     `dictIsStringValue` in materializeHeapDictLiteral, added by
         //     fix #2682.                                   → RETAINS (was not)
-        //   * LinkedList/OwningLinkedList element —
-        //     the bz_llist_add_last arm, which deliberately mirrors `.AddLast`
-        //     (no retain on ANY LinkedList insert path).   → does NOT retain
+        //   * LinkedList element — the bz_llist_add_last arm of
+        //     materializeHeapCollectionLiteral (`llitIsStrElem`), added by
+        //     fix #2686.                                   → RETAINS (was not)
         //
-        // fix #2682 REVERTS the #2660 narrowing for the dictionary-value arm.
-        // #2660 had to free an interior `Dictionary<K,string>` node with a NULL
-        // child disposer because the construction side took no retain, so
-        // installing the release here would have made a flat container and an
-        // interior node sharing one string double-free — and that program did
-        // not compile at all before #2660, so it would have been a NEWLY
-        // reachable crash. #2682 fixed the construction side (the interior node
-        // is materialized by the very same materializeHeapDictLiteral), so the
-        // release is now the balanced half of a real retain and the bounded
-        // string leak that narrowing cost is gone.
+        // fix #2682 REVERTED the #2660 narrowing for the dictionary-value arm,
+        // and fix #2692 now reverts it for the LinkedList arm on exactly the
+        // same grounds. #2660 had to free an interior `Dictionary<K,string>` /
+        // `LinkedList<string>` node with a NULL child disposer because the
+        // construction side took no retain, so installing the release here
+        // would have made a flat container and an interior node sharing one
+        // string double-free — and that program did not compile at all before
+        // #2660, so it would have been a NEWLY reachable crash. #2682 fixed the
+        // dictionary construction side and #2686 fixed the LinkedList one (both
+        // interior forms are materialized by the very same
+        // materializeHeapDictLiteral / materializeHeapCollectionLiteral that
+        // this thunk frees), so each release is now the balanced half of a real
+        // retain and the bounded string leak those narrowings cost is gone.
         //
-        // LinkedList stays excluded: no LinkedList insert path retains, so a
-        // release here would still be unpaired. That leaves an interior
-        // `LinkedList<string>` node leaking its strings — the same bounded leak,
-        // preferred over a use-after-free, and tracked separately.
+        // OwningLinkedList is not a question here: `isOwningPrefixedName(head)`
+        // already returned null at the top of this function, and sema rejects
+        // `OwningLinkedList<string>` outright anyway (stdlib §4.2 / §14.4,
+        // #1327 — a runtime-managed element has no disposal obligation and
+        // cannot be owned), so no owning-family LinkedList reaches this arm.
         bool strChildRetainedAtConstruction =
-            !isLinkedListTypeName(nodeTy) &&
-            (childIsDictValue
-                 ? (head == "Dictionary" || head == "SortedDictionary")
-                 : (head == "Array" || head == "Stack" || head == "Queue"));
+            childIsDictValue
+                ? (head == "Dictionary" || head == "SortedDictionary")
+                : (head == "Array" || head == "Stack" || head == "Queue" ||
+                   head == "LinkedList");
         if (!childDisposer && isStrElem(childTy) && strChildRetainedAtConstruction)
             childDisposer = stringElementReleaseThunk();
         // The child is itself an aggregate node (`Dictionary<string,

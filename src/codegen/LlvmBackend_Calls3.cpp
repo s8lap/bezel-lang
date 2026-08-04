@@ -2242,6 +2242,30 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     auto llRetainElem = [&](llvm::Value* v, const ast::Expr* argExpr) {
         if (llIsStrElem && !isPlusOneStringProducer(argExpr)) emitStringRetain(v);
     };
+    // fix #2692 / §28.11 / §28.9: the RELEASE half of the same co-ownership, for
+    // the removal operations. Every removal below hands the runtime a per-element
+    // disposer that `bz_llist_remove_first/_last/_node` invokes EXACTLY ONCE on
+    // the element of the node it unlinks, so releasing there consumes exactly the
+    // +1 `llRetainElem` (or a transferred +1 producer) put in at insert. Before
+    // #2686 no insert path retained and this had to stay null; now all five do
+    // (`.AddFirst`/`.AddLast`/`.AddBefore`/`.AddAfter` above and the
+    // `bz_llist_add_last` arm of materializeHeapCollectionLiteral), which are the
+    // ONLY ways an element enters a bz_llist_t — the runtime exposes no other
+    // insert and codegen has exactly two `bz_llist_alloc` sites (that literal arm
+    // and `new LinkedList<T>()`, which allocates EMPTY). So the release is
+    // provably paired. This is a verbatim mirror of the Array/Stack/Queue arm
+    // (`if (!elemDisp && arrIsStringElem) elemDisp = stringElementReleaseThunk();`
+    // at .RemoveAt/.Remove/.Clear in LlvmBackend_Calls.cpp), which has released a
+    // borrowing `Array<string>`'s elements on removal since #602.
+    // `.TryPopFirst`/`.TryPopLast` deliberately do NOT use this: `bz_llist_pop_*`
+    // MOVES the element out by value into the caller's out-param, transferring
+    // the reference rather than dropping it.
+    auto llElemDisposer = [&](llvm::Function* owningDisp) -> llvm::Value* {
+        if (!owningDisp && llIsStrElem) owningDisp = stringElementReleaseThunk();
+        return owningDisp ? llvm::cast<llvm::Value>(owningDisp)
+                          : llvm::cast<llvm::Value>(
+                                llvm::ConstantPointerNull::get(ptrTy()));
+    };
 
     // --- AddFirst(item): LinkedListNode<T> ---
     if (m == "AddFirst" && call.args.size() == 1 && call.args[0].value) {
@@ -2395,10 +2419,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "RemoveFirst" && call.args.empty()) {
         // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk (hoisted above).
         // Interface elements now produce a non-null disposerThunk via ClassOwned.
-        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
-        llvm::Value* disp = elemDisp
-            ? llvm::cast<llvm::Value>(elemDisp)
-            : llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* disp =
+            llElemDisposer(isOwning ? llElemPol.disposerThunk : nullptr);
         auto* fn = declareC("bz_llist_remove_first", llvm::Type::getVoidTy(llvm_),
                             {ptrTy(), ptrTy()});
         builder_.CreateCall(fn, {recv, disp});
@@ -2407,10 +2429,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     // --- RemoveLast() ---
     if (m == "RemoveLast" && call.args.empty()) {
         // #602 / §28.11 v0.134: use llElemPol.disposerThunk (hoisted above).
-        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
-        llvm::Value* disp = elemDisp
-            ? llvm::cast<llvm::Value>(elemDisp)
-            : llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* disp =
+            llElemDisposer(isOwning ? llElemPol.disposerThunk : nullptr);
         auto* fn = declareC("bz_llist_remove_last", llvm::Type::getVoidTy(llvm_),
                             {ptrTy(), ptrTy()});
         builder_.CreateCall(fn, {recv, disp});
@@ -2421,10 +2441,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         llvm::Value* node = lowerExpr(*call.args[0].value);
         if (!node) return nullptr;
         // #602 / §28.11 v0.134: use llElemPol.disposerThunk (hoisted above).
-        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
-        llvm::Value* disp = elemDisp
-            ? llvm::cast<llvm::Value>(elemDisp)
-            : llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* disp =
+            llElemDisposer(isOwning ? llElemPol.disposerThunk : nullptr);
         auto* fn = declareC("bz_llist_remove_node", llvm::Type::getVoidTy(llvm_),
                             {ptrTy(), ptrTy(), ptrTy()});
         builder_.CreateCall(fn, {recv, node, disp});
@@ -2504,10 +2522,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     if (m == "Clear" && call.args.empty()) {
         // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk (hoisted above).
         // Interface elements now produce a non-null disposerThunk via ClassOwned.
-        llvm::Function* elemDisp = isOwning ? llElemPol.disposerThunk : nullptr;
-        llvm::Value* disp = elemDisp
-            ? llvm::cast<llvm::Value>(elemDisp)
-            : llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* disp =
+            llElemDisposer(isOwning ? llElemPol.disposerThunk : nullptr);
         // Loop: while (first_node != null) remove_first.
         auto* condBB = llvm::BasicBlock::Create(llvm_, "ll.clr.c", currentFn_);
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "ll.clr.b", currentFn_);
@@ -2593,11 +2609,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         // OwningLinkedList disposes the element; LinkedList borrows, no disposal.
         // #602 / §28.11 v0.135 fix #619: use llElemPol.disposerThunk from policy
         // hoist.  Interface elements now produce a non-null disposerThunk.
-        llvm::Function* elemDisp =
-            isOwning ? llElemPol.disposerThunk : nullptr;
-        llvm::Value* disp = elemDisp
-            ? llvm::cast<llvm::Value>(elemDisp)
-            : llvm::ConstantPointerNull::get(ptrTy());
+        llvm::Value* disp =
+            llElemDisposer(isOwning ? llElemPol.disposerThunk : nullptr);
         auto* remBB  = llvm::BasicBlock::Create(llvm_, "llr.rem", currentFn_);
         auto* contBB = llvm::BasicBlock::Create(llvm_, "llr.cont", currentFn_);
         builder_.CreateCondBr(found, remBB, contBB);

@@ -15683,8 +15683,18 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
             collTy && collTy->astNode && collTy->astNode->name &&
             !collTy->astNode->name->parts.empty() &&
             [](std::string_view n){
+                // fix #2692: LinkedList joins the list — the drop-on-overwrite
+                // twin of the scope-end site in LlvmBackend_Disposal.cpp. Since
+                // #2686 every LinkedList insert path takes the element's +1, so
+                // the DISPLACED list must release it or the overwrite leaks one
+                // reference per element. `isLL` below routes the free itself to
+                // bz_llist_free; only the element obligation is shared.
+                // OwningLinkedList cannot reach here (owning-family string is
+                // the Value row, so the RuntimeManaged test above fails; sema
+                // rejects the instantiation anyway — stdlib §4.2 / §14.4 #1327).
                 return n == "Array" || n == "Stack" || n == "Queue" ||
-                       n == "IList" || n == "IReadOnlyList";
+                       n == "IList" || n == "IReadOnlyList" ||
+                       n == "LinkedList";
             }(collTy->headName()))
         elemDisp = stringElementReleaseThunk();
 
