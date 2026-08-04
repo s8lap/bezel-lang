@@ -10037,9 +10037,31 @@ private:
     // TypeRef with no declaration is either a type parameter (`T`) or one of
     // these reserved builtins; the #568 nullable-type-param lowering must only
     // intercept the former (a builtin nullable like `Subscription?` keeps its own
-    // ptr/value lowering through the switch below). Mirrors the name sets the
-    // lowerTypeRef Named-case branches enumerate. Exception types are recognized
-    // via builtinVtable_, so this is a member (not static).
+    // ptr/value lowering through the switch below). Exception types are
+    // recognized via builtinVtable_, so this is a member (not static).
+    //
+    // SCOPE (fix #2743 — the old wording, "Mirrors the name sets the lowerTypeRef
+    // Named-case branches enumerate", was aspirational and had gone false). A
+    // mechanical grep of every name compared in that Named case
+    // (LlvmBackend_Layout.cpp) against this predicate's three sources yields 26
+    // names it did not cover. 24 are now covered — the registry via
+    // isHeapPointerReferenceBuiltin, plus kNamedCaseDeltas below. The remaining
+    // TWO, `DictionaryEntry` and `DrainedEntry`, are deliberately NOT listed and
+    // must not be added: their Named-case arm requires `genericArgs.size() >= 2`,
+    // and the only caller that can misread them — isBareTypeParamRef — already
+    // bails on `!genericArgs.empty()`, so they are STRUCTURALLY excluded.
+    // Listing them would instead change the generic-argument INFERENCE site that
+    // also consults this predicate (LlvmBackend_Calls2.cpp), with no test
+    // covering the difference.
+    //
+    // ⚠ THIS PREDICATE HAS THREE CONSUMERS, not one: lowerTypeRef's #568
+    // nullable-type-param branch, isBareTypeParamRef, and the generic-argument
+    // inference binding in LlvmBackend_Calls2.cpp (`if (cn.empty() ||
+    // !isBuiltinTypeRefName(cn)) return;`). Widening it therefore widens what
+    // INFERENCE binds, not only what lowering intercepts. That is per that
+    // site's own stated intent ("only a genuine unresolved type-parameter name
+    // is skipped"), but it is a real behavior change — weigh all three when
+    // editing this list.
     bool isBuiltinTypeRefName(std::string_view name) const {
         static const std::unordered_set<std::string_view> kBuiltins = {
             "IntPtr", "UIntPtr", "CString", "WString", "RawBytes",
@@ -10098,6 +10120,27 @@ private:
             "Buffer",
         };
         if (kBuiltins.count(name)) return true;
+        // fix #2743: the list ABOVE had drifted from the sets lowerTypeRef's
+        // Named case actually enumerates — it was missing all 17 registry names
+        // this predicate's own contract claims to mirror (Stopwatch, FileStream,
+        // TaskScope, SortedDictionary/SortedSet, the IEvent/EventSource family,
+        // and the 8 serializer names) plus the Named case's explicit deltas.
+        // Consult the registry directly rather than re-listing it: a duplicated
+        // list is the miss-a-list class #1414 stage 3 centralized this set to
+        // end. A missing name is not benign — the caller below treats "not a
+        // builtin" as "a bare type parameter", so `Stopwatch?` took the {i8,i32}
+        // placeholder and its `bz_stopwatch_t*` payload was passed as `i32` to
+        // bz_stopwatch_is_running (IR-verify failure — measured, not inferred).
+        if (common::isHeapPointerReferenceBuiltin(name)) return true;
+        // The Named case's explicit non-registry deltas, in its own order:
+        // OwningBuffer (astNode-path-only ptr, LlvmBackend_Layout.cpp), the
+        // {ptr,i32,i32} span shapes, the JsonOptions value record, the
+        // DateOnly/TimeOnly i32 value builtins, and §31.4's ExceptionInfo triple.
+        static const std::unordered_set<std::string_view> kNamedCaseDeltas = {
+            "OwningBuffer", "Span", "ReadOnlySpan", "ReadOnlyStringSpan",
+            "JsonOptions", "DateOnly", "TimeOnly", "ExceptionInfo",
+        };
+        if (kNamedCaseDeltas.count(name)) return true;
         // §31.4: a built-in exception type (Exception / a subtype).
         return builtinVtable_.find(std::string(name)) != builtinVtable_.end();
     }
@@ -10339,6 +10382,39 @@ private:
         out = *c;
         out.nullable = true;
         return true;
+    }
+
+    // fix #2743 / §14.1 / §7.1: is `t` a BARE GENERIC TYPE-PARAMETER reference
+    // (`T`) — a single-part Named ref with no declaration that is not one of the
+    // reserved builtin names? `nullableTypeParamConcrete` reports success for a
+    // substitution that maps one type parameter onto ANOTHER, still-unbound one
+    // (`T → U`, which happens when a specialization of an inner generic is built
+    // lazily from inside an OUTER generic's unspecialized template body). Such a
+    // resolution is NOT concrete, so callers that branch on
+    // `isNullableValueTy(resolved)` must not treat a false answer as "resolved to
+    // a reference type" — it is the unresolved/template case, and the placeholder
+    // lowering applies. Recognizes both TypeRef shapes a parameter reaches
+    // codegen in: the parsed `astNode` form and the cross-module `importedName`
+    // form (see resolveTypeParamRef / lowerTypeRef's Named case, #428).
+    //
+    // ⚠ This is a NEGATIVE name test, so its correctness depends on
+    // `isBuiltinTypeRefName` naming EVERY type the Named case lowers specially.
+    // A builtin missing from that list is classified here as a type parameter,
+    // and a concrete `Stopwatch` bound to `T` then takes the {i8,i32}
+    // placeholder where it must be a `ptr`. That list had drifted by 17 registry
+    // names plus the Named-case deltas when this predicate was added (#2743);
+    // it now consults common::isHeapPointerReferenceBuiltin directly. Any new
+    // Named-case branch must extend `isBuiltinTypeRefName` in the same commit.
+    bool isBareTypeParamRef(const sema::TypeRef* t) const {
+        if (!t || t->kind != sema::TypeRef::Kind::Named || t->declaration)
+            return false;
+        const bool astShape = t->astNode && t->astNode->name &&
+                              t->astNode->name->parts.size() == 1;
+        const bool importedShape = t->astNode == nullptr &&
+                                   !t->importedName.empty();
+        if (!astShape && !importedShape) return false;
+        if (!t->genericArgs.empty()) return false;  // `Foo<X>`, not a bare param
+        return !isBuiltinTypeRefName(t->headName());
     }
 
     // issues D3 / D8 / §8.3: build C-ABI trampolines over an ARBITRARY

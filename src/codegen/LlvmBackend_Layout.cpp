@@ -516,6 +516,23 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             sema::TypeRef nv;
             if (nullableTypeParamConcrete(rt, nv)) {
                 if (isNullableValueTy(&nv)) return nullableValueStructTy(&nv);
+                // fix #2743 / §14.1: the substitution may map this parameter onto
+                // ANOTHER, still-unbound type parameter (`T → U`). That happens
+                // when a specialization of an inner generic is built lazily from
+                // inside an OUTER generic's unspecialized TEMPLATE body — e.g.
+                // `Outer<U>.Head(): U?` forwarding `return g.Head();` to
+                // `Inner<T>.Head(): T?` builds `Inner$Head$spec` under {T → U}.
+                // `nv` is then not a value type, but it is NOT a reference type
+                // either: T's concrete form is still unknown, so the TEMPLATE rule
+                // applies exactly as in the no-binding branch below. Falling
+                // through instead resolved `T` to U's PLACEHOLDER LLVM type (i32)
+                // and DROPPED the nullability — the pseudo-specialization was
+                // typed `i32` while its body's `return null` emitted `ret ptr null`
+                // (IR-verify failure, `bezelc -c` exit 1). The same placeholder
+                // struct the template `bz$M.Inner$Head` already uses keeps the
+                // signature and every return in that body consistent.
+                if (isBareTypeParamRef(&nv))
+                    return nullablePrimStructTy(sema::PrimitiveType::Int);
                 // resolved to a reference type → plain ptr `?` lowering.
             } else {
                 // a type param with no active binding — fall to template rule.
