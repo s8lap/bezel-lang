@@ -8625,9 +8625,21 @@ void ExprTC::checkBuiltinStringCallArgs(const ast::CallExpr& ce) {
 // below, but the name gate keeps the diagnostic precise when a caller
 // forgets the marker).
 void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get());
-    if (!ma || !ma->target) return;
-    TypeRef* recvTy = ctx_.exprType(*ma->target);
+    // §7 / §7.5 (#2594): a builtin collection instance call is EITHER a
+    // MemberAccessExpr (`coll.M(..)`) OR a NullCondMemberExpr (`coll?.M(..)`)
+    // — two separate Expr kinds that share identical `target`/`member` fields.
+    // The `dynamic_cast<MemberAccessExpr*>`-only gate this function used
+    // skipped the §7 check on the null-conditional form ENTIRELY, so
+    // `coll?.IndexOf(unNarrowedInt)` compiled while the plain
+    // `coll.IndexOf(unNarrowedInt)` was correctly rejected — the same
+    // MemberAccessExpr-only omission #2581 fixed for the string/span gates.
+    // Reuse that fix's shared extractor rather than a second dispatch. §7.5
+    // makes `?.` a receiver-nullability form only: it says nothing about the
+    // ARGUMENT's type, which stays governed by the ordinary §7 assignability
+    // rule — so a legitimate `coll?.IndexOf(7)` still compiles.
+    auto [recvExpr, m] = builtinInstanceCallee(ce.callee.get());
+    if (!recvExpr) return;
+    TypeRef* recvTy = ctx_.exprType(*recvExpr);
     if (!recvTy || recvTy->kind != TypeRef::Kind::Named ||
         recvTy->declaration)  // user types have a MethodSymbol → checkCallArity ran
         return;
@@ -8699,7 +8711,8 @@ void ExprTC::checkBuiltinCollectionCallArgs(const ast::CallExpr& ce) {
         return;
     if (recvTy->genericArgs.empty() || !recvTy->genericArgs[0]) return;
     TypeRef* itemTy = recvTy->genericArgs[0];  // T (element) or K (key)
-    const auto& m = ma->member;
+    // (`m` is bound at the top of the function by builtinInstanceCallee —
+    // #2594; it covers both the `coll.M(..)` and `coll?.M(..)` callee kinds.)
 
     // §4.14 vs §4.15 parameter-nullability split for the span-buffer family.
     // ArraySpan<T>/ReadOnlyArraySpan<T> declare `value: T` for EVERY T (Array<T>
