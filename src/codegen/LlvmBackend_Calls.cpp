@@ -4801,9 +4801,112 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* len = builder_.CreateCall(lenFn, {recv});
             return builder_.CreateICmpEQ(len, builder_.getInt64(0), "arr.empty");
         }
-        // per §3: .AddRange(other: Array<T>) — append all elements from another array
+        // stdlib §4.4 (v0.240) declares on `Array<T>`:
+        //     public method AddRange(items: IEnumerable<T>);
+        // and stdlib §4.5 declares the sibling owning overload on `OwningArray<T>`:
+        //     public method AddRange(owned items: OwningArray<T>);   // drains items into self
         if (m == "AddRange" && call.args.size() == 1 && call.args[0].value) {
-            llvm::Value* other = lowerExpr(*call.args[0].value);
+            // fix #2721 / stdlib §4.4 (v0.240): `items` is declared
+            // `IEnumerable<T>`, NOT `Array<T>` — so the lowered argument is only
+            // a `bz_array_t*` when the source happens to be array-backed. For a
+            // lazy LINQ pipeline it is a `bz_lazy_t*`, and for an interface-typed
+            // source it is an iterator-vtable object; reading either with
+            // `bz_array_len`/`bz_array_ptr_at` silently appended the wrong
+            // elements (`xs.AddRange(ys.Where(…))` yielded a wrong Count with no
+            // diagnostic, no crash and no ASan report — it read a length out of a
+            // struct of a different shape).
+            //
+            // Same remedy as #2693's `new LinkedList<T>(source)`: drain the
+            // source once through lowerToLazyEnumerator, the one backing-agnostic
+            // normalizer (already used by ToArray/ToSet/ExceptWith), into a
+            // snapshot array and run the existing per-element append loop over
+            // THAT. It covers array-backed collections, bz_llist, Set/Dictionary,
+            // Range, lazy pipelines and vtable `IEnumerable<T>` in one call, and
+            // carries the "dispose the source only if it was a temporary" rule.
+            //
+            // SCOPE. The normalizer is taken only for a BORROWING receiver with a
+            // non-array-backed source, which is exactly the set of shapes that is
+            // broken today; every shape that already works (any array-backed
+            // source, and the whole owning family) keeps the byte-identical raw
+            // path below. Two reasons this restriction is deliberate rather than
+            // conservatism: (a) §4.5's owning overload takes `owned items:
+            // OwningArray<T>` — a concrete array-backed source by declaration, so
+            // there is no lazy shape to normalize; and (b) copying borrowed
+            // element pointers out of a snapshot into an OWNING array would give
+            // two owners for one element (§28.11), so widening the normalizer to
+            // the owning receiver would trade a wrong Count for a double dispose.
+            //
+            // ⚠ `isArrayBackedCollectionName` is NOT usable on its own here.
+            // `kArrayBackedCollections` (BuiltinRegistry.cpp) lists the whole
+            // SET family — `Set`, `OwningSet`, `SortedSet` — even though
+            // lowerNew builds them with `bz_dict_alloc_generic` whenever
+            // `genericBackingType` is non-null, i.e. for every record,
+            // non-nullable primitive, enum and string element (#2726). Trusting
+            // that list pointed `bz_array_len`/`bz_array_ptr_at` at a
+            // `bz_dict_t*` — the very defect this fix exists to remove. It hid
+            // because `bz_array_t{void* data; int64_t count; …}` and
+            // `bz_dict_t{bz_entry_t* buckets; int64_t count; …}` put `count` at
+            // the SAME offset, so the Count aliased correctly while the elements
+            // did not: `bz_array_ptr_at` indexes the bucket array at the
+            // receiver's stride, but `bz_dict_set_gen` stores a malloc'd copy of
+            // the key and puts that POINTER in `buckets[i].key`, so the loop
+            // read `bz_entry_t` header bytes. Measured: `Set<int>{7,8}` gave
+            // Count 2 but `b[0] <> 7`, and `Set<string>` lost the contents.
+            //
+            // So the fast path is taken only for a name that is provably
+            // `bz_array_t*`-backed. The set family is excluded and goes through
+            // lowerToLazyEnumerator, which re-decides with the SAME
+            // `genericBackingType` discriminator lowerNew constructs with:
+            // dict-backed sets take `bz_lazy_from_set`, and a class-element
+            // `Set`/`OwningSet` (for which `genericBackingType` is null, and
+            // which lowerNew therefore really does build as an array) falls
+            // through to the normalizer's own array path. `SortedSet` is
+            // excluded for the same honesty but is NOT thereby fixed — the
+            // normalizer's set branch tests only `Set`/`OwningSet`, so a
+            // `SortedSet` source is still misread there; that is #2726's blast
+            // radius (it also governs ToArray/ToSet/ExceptWith/for-in) and is
+            // deliberately not widened from here.
+            const sema::TypeRef* srcTy = ctx_.exprType(*call.args[0].value);
+            std::string_view srcHead =
+                (srcTy && srcTy->astNode && srcTy->astNode->name &&
+                 !srcTy->astNode->name->parts.empty())
+                    ? srcTy->headName() : std::string_view{};
+            bool srcIsSetFamily = srcHead == "Set" || srcHead == "OwningSet" ||
+                                  srcHead == "SortedSet";
+            bool srcIsArrayBacked =
+                !srcHead.empty() && !srcIsSetFamily &&
+                common::isArrayBackedCollectionName(srcHead);
+            llvm::Value* other = nullptr;
+            llvm::Value* snapToFree = nullptr;   // non-null ⇒ free the shell below
+            if (arrIsOwning || srcIsArrayBacked) {
+                other = lowerExpr(*call.args[0].value);
+            } else {
+                sema::TypeRef* srcElemRef = nullptr;
+                llvm::Value* lazy =
+                    lowerToLazyEnumerator(*call.args[0].value, srcElemRef);
+                if (!lazy) return nullptr;
+                // Element-type guard, mirroring OwningSet.ExceptWith's: reading
+                // the snapshot at the receiver's stride is only sound when the
+                // source's element lowers to the same LLVM type. Sema has no
+                // method model for the builtin collections (they have no
+                // TypeSymbol), so an ill-typed source reaches codegen unchecked.
+                // Only a POSITIVE mismatch is diagnosed — when the source element
+                // is unknown the raw path trusted the argument completely, and
+                // widening that into a rejection would be a false reject.
+                if (srcElemRef && arrElemRef &&
+                    lowerTypeRef(srcElemRef) != lowerTypeRef(arrElemRef)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, call.span.begin,
+                        "stdlib §4.4: 'Array<T>.AddRange(items: IEnumerable<T>)' "
+                        "requires an enumerable source whose element type is T");
+                    return llvm::ConstantInt::get(i32(), 0);
+                }
+                auto* toArrFn =
+                    declareC("bz_lazy_to_array", ptrTy(), {ptrTy(), i64()});
+                other = builder_.CreateCall(
+                    toArrFn, {lazy, builder_.getInt64(esz)}, "ar.snap");
+                snapToFree = other;
+            }
             if (!other) return nullptr;
             llvm::Type* elemTy = getElemTy();
             auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
@@ -4824,6 +4927,11 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             // borrowing Array<string> takes an INDEPENDENT +1 per appended element
             // (the source `other` keeps its own +1). The element is always RETAINED
             // (a borrowed copy from `other`). arrIsStringElem derived from arrElemPol.
+            // fix #2721: unchanged on the snapshot path. `bz_lazy_to_array` does
+            // NOT retain (the ToArray terminal calls bz_array_retain_strings
+            // separately), so a snapshot slot holds exactly the same BORROWED
+            // reference the raw source slot did — the same single +1 per appended
+            // element, consumed by the receiver's own release-on-removal thunk.
             if (arrIsStringElem) {
                 llvm::Value* elemVal = builder_.CreateLoad(ptrTy(), ep, "ar.elem");
                 emitStringRetain(elemVal);
@@ -4834,6 +4942,17 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(builder_.CreateAdd(idx, builder_.getInt64(1)), idxSlot);
             builder_.CreateBr(condBB);
             builder_.SetInsertPoint(endBB);
+            // fix #2721: the snapshot never took ownership of the (borrowed)
+            // elements it copied out of the source, and each one it handed to the
+            // receiver was retained above — so free its SHELL only, with a NULL
+            // disposer. This is the "consumed snapshot" idiom ExceptWith /
+            // IntersectWith use for their own bz_lazy_to_array snapshots.
+            if (snapToFree) {
+                auto* freeSnapFn = declareC("bz_array_free",
+                    llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                builder_.CreateCall(freeSnapFn,
+                    {snapToFree, llvm::ConstantPointerNull::get(ptrTy())});
+            }
             return llvm::ConstantInt::get(i32(), 0);
         }
         // per §3/§25.2: .Contains(item: T): bool — first element that Equals
