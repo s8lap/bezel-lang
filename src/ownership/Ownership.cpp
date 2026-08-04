@@ -2447,11 +2447,48 @@ void MethodOwnership::visitStmt(const ast::Stmt& s) {
                     "materializer returns a fresh `owned` collection (stdlib "
                     "§5) that the binding would never dispose, so the value "
                     "would leak; bind it with `using var` (§21.1 / §28.3)");
+            } else if (auto* rix =
+                           dynamic_cast<const ast::IndexExpr*>(lc->value.get());
+                       rix &&
+                       common::isBuiltinArrayRangeSliceIndex(*rix, ctx_)) {
+                // fix #2749 item 2 / §21.1 (v0.240). §28.3's producers table
+                // has an explicit row for this form: "Range slice `arr[r]` on
+                // `Array<T>` (§15.6) | Owned — a fresh `Array<T>`, the
+                // compiler-recognized `Slice(r: Range<int>): owned Array<T>`
+                // form (stdlib §4.4); **not** the indexer row above." So the
+                // spec treats `arr[0..2]` and `arr.Slice(0..2)` as ONE
+                // operation, and §21.1's "an `owned`-returning call" reaches
+                // both — but the branch above is keyed on a `CallExpr`, so
+                // #2709 rejected the method spelling and left the INDEXER
+                // spelling accepted. That was a live remedy loop and the more
+                // idiomatic half of it: measured on 0b9693e,
+                // `using var s := arr[0..2];` drew the #2073 vacuous lint
+                // ("use `const x := …;`") and `const s := arr[0..2];` was then
+                // accepted.
+                //
+                // ⚠ The message names §21.1's mandated remedy ("Rejected, with
+                // a diagnostic naming this rule and the `using var` remedy"),
+                // but be aware that for THIS form the `using var` spelling
+                // still leaks today — codegen reclaims `arr.Slice(r)` and
+                // reclaims nothing for `arr[r]`, in any binding spelling
+                // (measured 64-of-64 under LSan; filed as #2753). This branch
+                // is the §21.1 half only: it removes the `const` binding, which
+                // by construction has no free path at all, and stops the lint
+                // from advertising it. // per §21.1, §28.3, §15.6, v0.240,
+                // #2749, #2753
+                ctx_.diagnostics().report(
+                    Severity::Error, lc->value->span.begin,
+                    std::string("a `const` local (`") + std::string(lc->name) +
+                    "`) must not take an owned production — a range slice "
+                    "`arr[r]` produces a fresh `owned` Array<T> (§28.3, the "
+                    "compiler-recognized `Slice(r)` form) that the binding "
+                    "would never dispose, so the value would leak; bind it "
+                    "with `using var` (§21.1 / §28.3)");
             } else {
                 // UNREACHABLE TODAY, and structural rather than defensive: the
                 // outer gate is `constInitializerRejected`, whose disjuncts are
-                // exactly the three branches above, so falling here means a
-                // fourth disjunct was added to the predicate without a message.
+                // exactly the four branches above, so falling here means a
+                // fifth disjunct was added to the predicate without a message.
                 // Without this arm that combination would REJECT-BUT-SAY-
                 // NOTHING — the initializer accepted in silence while the lint
                 // (which consults the same predicate) also stays quiet: the
@@ -3472,11 +3509,12 @@ bool MethodOwnership::checkBareBorrowLoopCarriedEscape(
     return false;
 }
 
-// §21.1 (v0.201), fix #2709. See the header contract in Ownership_impl.hpp.
-// The three disjuncts are exactly the three categories the `LocalConstDecl` arm
-// of visitStmt reports on, in the same order — that arm selects a MESSAGE, this
-// function answers the yes/no the lint needs, and neither may grow a category
-// the other lacks. Diagnostic-only: no disposal, no retain, no state.
+// §21.1 (v0.201), fix #2709, extended by #2749. See the header contract in
+// Ownership_impl.hpp. The disjuncts are exactly the categories the
+// `LocalConstDecl` arm of visitStmt reports on, in the same order — that arm
+// selects a MESSAGE, this function answers the yes/no the lint needs, and
+// neither may grow a category the other lacks. Diagnostic-only: no disposal, no
+// retain, no state.
 bool MethodOwnership::constInitializerRejected(const ast::Expr& e) {
     if (producerState(e) == OwnershipState::Owned) return true;
     if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
@@ -3486,6 +3524,16 @@ bool MethodOwnership::constInitializerRejected(const ast::Expr& e) {
         // `producerState` cannot see (#2709).
         if (common::isBuiltinOwnedMaterializerCall(*ce, ctx_)) return true;
     }
+    // §28.3's "Range slice `arr[r]` on `Array<T>`" producer row (#2749 item 2).
+    // The spec makes the two spellings ONE operation — the row reads "Owned — a
+    // fresh `Array<T>`, the compiler-recognized `Slice(r: Range<int>): owned
+    // Array<T>` form (stdlib §4.4)" — but `arr[r]` is an `ast::IndexExpr`, so
+    // neither `producerState` (no IndexExpr arm) nor either CallExpr disjunct
+    // above could see it. #2709 therefore left `arr.Slice(0..2)` rejected and
+    // `arr[0..2]` accepted, with the #2073 lint still steering authors into the
+    // accepted-and-leaking one. // per §28.3, §15.6, §21.1, #2749
+    if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
+        if (common::isBuiltinArrayRangeSliceIndex(*ix, ctx_)) return true;
     return false;
 }
 

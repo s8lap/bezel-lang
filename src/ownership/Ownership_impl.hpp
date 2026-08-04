@@ -660,9 +660,19 @@ private:
     // message) instead of silently accepting — the accept-and-leak shape
     // #2709 was filed for.
     //
+    // #2749 item 2 added the FOURTH disjunct, `common::
+    // isBuiltinArrayRangeSliceIndex` — §28.3's "Range slice `arr[r]` on
+    // `Array<T>` → Owned" row, an `ast::IndexExpr` that neither `producerState`
+    // (no IndexExpr arm) nor the two CallExpr disjuncts could see. It was the
+    // SAME live remedy loop #2709 fixed, reachable through the more idiomatic
+    // spelling: the spec makes `arr[r]` and `arr.Slice(r)` one operation, so
+    // rejecting only the second was an inconsistency #2709 introduced. Note the
+    // residual it does NOT fix: `using var s := arr[r]` still leaks (#2753) —
+    // that is a disposal defect, not a diagnostic one.
+    //
     // It is DIAGNOSTIC-ONLY. It never feeds a disposal, a retain, or a
     // dataflow state — `producerState` remains the sole input to those, and is
-    // unchanged. // per §21.1, §28.10, §29.11, #2695, #2709
+    // unchanged. // per §21.1, §28.3, §28.10, §29.11, #2695, #2709, #2749
     bool constInitializerRejected(const ast::Expr& e);
 
     // SB01-A (§28.3 "Task-family calls produce owned frames", v0.190, SB-01,

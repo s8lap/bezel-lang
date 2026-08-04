@@ -44,6 +44,7 @@ namespace bezel::ast {
 struct Expr;
 struct Stmt;
 struct CallExpr;
+struct IndexExpr;
 struct MethodDecl;
 struct BindExpr;
 struct LocalDecl;
@@ -240,6 +241,75 @@ bool isOwningCollectionDrainAliasCall(const ast::CallExpr& call,
 // belongs. Sharing one list would fuse two questions with different answers.
 bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
                                     const sema::SemaContext& ctx);
+
+// §28.3 producers table, "Range slice" row (v0.240) / §15.6 (fix #2749 item 2):
+// the RANGE-SLICE INDEXER form `arr[r]` on a builtin `Array<T>`. The spec row is
+// verbatim:
+//
+//   | Range slice `arr[r]` on `Array<T>` (§15.6) | Owned — a fresh `Array<T>`,
+//   | the compiler-recognized `Slice(r: Range<int>): owned Array<T>` form
+//   | (stdlib §4.4); **not** the indexer row above. |
+//
+// So the spec treats `arr[0..2]` and `arr.Slice(0..2)` as ONE operation, and
+// §21.1's "Rejected […]: a fresh `new`, an `owned`-returning call" therefore
+// covers both spellings identically.
+//
+// WHY IT NEEDS ITS OWN PREDICATE. #2709's `isBuiltinOwnedMaterializerCall` is
+// keyed on an `ast::CallExpr`; `arr[0..2]` is an `ast::IndexExpr` and cannot
+// reach it, and `producerState` has no `IndexExpr` arm either. The consequence
+// was a LIVE REMEDY LOOP, measured on 0b9693e: `using var s := arr[0..2];` drew
+// the #2073 vacuous lint ("use `const x := …;`") and `const s := arr[0..2];` was
+// then ACCEPTED — #2709's exact defect, reachable through the more idiomatic
+// spelling, and an inconsistency #2709 itself introduced by fixing only
+// `.Slice(r)`.
+//
+// WHAT IT RECOGNIZES, and why that cannot over-fire. It mirrors the ONE sema arm
+// that produces this classification (`ExprTypecheck_Exprs.cpp`, the
+// `if (isRangeIdx && cn == "Array") ctx_.setExprType(&e, tt);` line) on all
+// three of its conditions, AND cross-checks sema's own verdict by pointer:
+//   (a) the RECEIVER types as a declaration-less builtin `Array` head with a
+//       non-empty generic-argument list — which excludes `OwningArray<T>` (where
+//       §15.6 slicing is rejected outright), the span families (`Span`,
+//       `ReadOnlySpan`, `ArraySpan`, `ReadOnlyArraySpan` — sema types a range
+//       index on those as the ELEMENT, and their stdlib `Slice` overloads return
+//       span heads, not owned arrays), `string`, inline arrays `[N]T`, the
+//       dictionaries, and every USER type (whose TypeRef carries a
+//       `declaration`, including a user class that shadows the name `Array`);
+//   (b) the first index is a range — a syntactic `RangeExpr` (`arr[0..2]`) or a
+//       `Range`-typed value (`var r := 0..2; arr[r]`, #1079), the same two forms
+//       sema accepts — which leaves the single-element read `arr[i]` alone; it
+//       is §28.3's *indexer* row, a Borrow, which §21.1 admits verbatim;
+//   (c) sema in fact typed the whole index expression as the receiver's OWN
+//       TypeRef object. That pointer identity is unique to the range-slice arm:
+//       every other IndexExpr arm sets a DIFFERENT TypeRef (an element, a
+//       dictionary value, a primitive), and no TypeRef can be its own generic
+//       argument. It is what keeps a `Span<Array<int>>` element read — whose
+//       result head is a declaration-less `Array` too — out of this predicate.
+//
+// All three are AND-ed and every one of them FAILS OPEN: a shape this cannot
+// type, or one sema types differently than the mirror expects, is ACCEPTED, not
+// rejected. That is the deliberate polarity #2709 chose for its own null-
+// `exprType` gate — a missing rejection is a leak already filed, while a false
+// reject breaks a legal program.
+//
+// DIAGNOSTIC-ONLY, exactly like `isBuiltinOwnedMaterializerCall`: it is reached
+// only through `MethodOwnership::constInitializerRejected`, changes no disposal,
+// retain, or dataflow state, and the code generated for every program that still
+// compiles is what it was.
+//
+// ⚠ THE `arr[r]` SLICE ALSO LEAKS UNDER THE REMEDIES, and that is a SEPARATE,
+// larger defect this predicate does not touch — filed as #2753. Measured on
+// 0b9693e (64-iteration amplified probe, LSan, values pinned through exit
+// codes): `const`, `using var` AND plain `var` bindings of `arr[0..2]` each
+// leaked 64 of 64 `bz_array_slice` allocations, while the equivalent
+// `arr.Slice(0..2)` under `using var` ran clean. So codegen reclaims the CALL
+// spelling and reclaims nothing for the INDEX spelling. This predicate is the
+// §21.1 half only: it removes the `const` binding (which has no free path at
+// all, by construction) and stops the lint from advertising it. It does NOT make
+// `using var arr[r]` reclaim — do not "finish the job" here by reclassifying,
+// which is the double-free direction #2709 declined for enumerated reasons.
+bool isBuiltinArrayRangeSliceIndex(const ast::IndexExpr& ix,
+                                   const sema::SemaContext& ctx);
 
 // §28.3 "Factory methods and sourceless returns" / Appendix C.3 (fix #1499): a
 // STATIC method returning a plain class/interface type with NO `owned`

@@ -370,6 +370,57 @@ bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
     return head == "Array" || head == "Set" || head == "Dictionary";
 }
 
+bool isBuiltinArrayRangeSliceIndex(const ast::IndexExpr& ix,
+                                   const sema::SemaContext& ctx) {
+    // See the header contract. // per §28.3 producers "Range slice" row, §15.6,
+    // §21.1, v0.240, #2749 item 2
+    if (!ix.target) return false;
+    const sema::TypeRef* rt = ctx.exprType(*ix.target);
+    // (a) The RECEIVER must be a declaration-less builtin `Array` head with a
+    // generic argument — the exact shape sema's own range-slice arm requires
+    // (`ExprTypecheck_Exprs.cpp`: `tt->kind == Named && !tt->declaration &&
+    // tt->astNode && !tt->astNode->name->parts.empty()`, then
+    // `cn == "Array"`). `declaration == nullptr` is what makes this BUILTIN-only:
+    // a user type — including a user class that shadows the name `Array`, and
+    // any user type with a range-taking indexer — carries a declaration and is
+    // excluded here. `OwningArray<T>` is excluded by the head (§15.6 rejects
+    // slicing on it outright, and that rejection stands on its own); so are the
+    // span families, whose stdlib `Slice` overloads return span heads rather
+    // than owned arrays and whose range index sema types as the ELEMENT.
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
+        return false;
+    if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
+        return false;
+    if (rt->headName() != "Array") return false;
+    if (rt->genericArgs.empty() || !rt->genericArgs[0]) return false;
+    // (b) The index must be a RANGE, in either of the two forms sema accepts: a
+    // syntactic range literal `arr[0..2]`, or a `Range`-typed value
+    // `var r := 0..2; arr[r]` (#1079). A single-element read `arr[i]` is
+    // §28.3's *indexer* row — a Borrow, which §21.1 admits verbatim
+    // ("Admitted: […] and **borrows**") — and must keep compiling as a `const`
+    // initializer.
+    if (ix.indices.empty() || !ix.indices[0].value) return false;
+    const ast::Expr* idx = ix.indices[0].value.get();
+    if (!dynamic_cast<const ast::RangeExpr*>(idx)) {
+        const sema::TypeRef* it = ctx.exprType(*idx);
+        if (!it || it->kind != sema::TypeRef::Kind::Named || !it->declaration ||
+            it->declaration->name != "Range")
+            return false;
+    }
+    // (c) And sema must in fact have typed the whole index expression as the
+    // RECEIVER'S OWN TypeRef object. That pointer identity is the range-slice
+    // arm's signature — it is the only IndexExpr arm that writes `tt` itself
+    // rather than a derived TypeRef (an element `tt->genericArgs[0]`, a
+    // dictionary value `tt->genericArgs[1]`, an inline-array element, a
+    // primitive), and no TypeRef can be its own generic argument. This is what
+    // excludes an element read of a `Span<Array<int>>`, whose result head is a
+    // declaration-less `Array` too but is a DIFFERENT object from the span's
+    // TypeRef. It is a cross-check on (a)+(b), not a substitute: if sema ever
+    // stops setting this arm's type by identity the predicate goes SILENT
+    // (accepting), never over-wide.
+    return ctx.exprType(ix) == rt;
+}
+
 namespace {
 
 // Recursively scan every `return EXPR;` reachable in statement `s` (the same
