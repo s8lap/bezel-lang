@@ -186,6 +186,29 @@ void bz_array_pop_at(void* arrp, int64_t idx, void* out, int64_t elem_size) {
     bz_array_remove_at(arrp, idx, elem_size);
 }
 
+// #2608 / §28.11 / stdlib §4.3: record an OWNING array-backed collection's
+// element disposer in the header at CONSTRUCTION. Called by codegen only for a
+// concrete owning collection (`new OwningArray<T>()` etc.) whose element policy
+// yields a disposer thunk; never for a borrowing collection, which leaves the
+// calloc-zeroed NULL in place. Idempotent and null-safe.
+void bz_array_set_elem_disposer(void* arrp, void (*dispose_elem)(void*)) {
+    if (!arrp) return;
+    ((bz_array_t*)arrp)->elem_disposer = dispose_elem;
+}
+
+// #2608: free an array whose element ownership is not statically known at the
+// free site — an `owned` field typed by one of the read-only interfaces SHARED
+// by the borrowing and owning collection hierarchies (stdlib §4.3), where the
+// dynamic backing may be either `Array<T>` (borrowing — elements must NOT be
+// disposed) or `OwningArray<T>` (owning — elements MUST be disposed). The
+// recorded header disposer is the only sound discriminator; an untagged
+// (borrowing) array yields NULL and this degenerates EXACTLY to today's
+// `bz_array_free(arr, nullptr)`, so this path can never over-dispose.
+void bz_array_free_dynamic(void* arrp) {
+    if (!arrp) return;
+    bz_array_free(arrp, ((bz_array_t*)arrp)->elem_disposer);
+}
+
 void bz_array_free(void* arrp, void (*dispose_elem)(void*)) {
     if (!arrp) return;
     auto* arr = (bz_array_t*)arrp;

@@ -7743,8 +7743,75 @@ bool Emitter::tryLowerFileStreamPositionSet(const ast::AssignmentStmt& as) {
     if (!fs) return true;   // handled (suppress the lvalue fallthrough)
     llvm::Value* pos = lowerExpr(*as.value);
     if (!pos) return true;
-    if (pos->getType()->isIntegerTy() && !pos->getType()->isIntegerTy(64))
-        pos = builder_.CreateSExt(pos, i64(), "fs.pos64");
+    // fix #2617 / §7.4 ("Member access on nullable values" — flow narrowing) /
+    // stdlib §7.1 (`Position: long`): a §7.4-narrowed `T?` RHS — one sema
+    // proved non-null by a preceding null test and therefore admitted for the
+    // NON-nullable `long` property — keeps its declared tagged-optional
+    // `{i8 hasVal; T}` layout at lowering. Unwrap it to the bare `T` payload
+    // before the widen, with the same unwrapNarrowedNullable helper the
+    // argument / return / local-assignment paths use (#914,
+    // LlvmBackend_impl.hpp:3430) — the identical defect and fix as #2605's
+    // atomic intrinsics. Without it the `{i8,T}` struct is handed to
+    // bz_filestream_set_position's i64 parameter (the isIntegerTy widen guard
+    // skips the struct) and verifyModule fails: "Call parameter type does not
+    // match function signature!" — a codegen ICE on a legal §7.4 idiom.
+    //
+    // The payload type comes from the LOWERED value's own optional shape rather
+    // than a hardcoded i64, because the admissible narrowed RHS is not only a
+    // `long?` read. All three of these ICEd on origin/main and are covered:
+    //   * a narrowed `long?`  -> `{i8, i64}` (the issue's repro);
+    //   * a narrowed `int?`   -> `{i8, i32}`, admitted through §6's `S → T → T?`
+    //     numeric widening — a shape the issue as filed did not name;
+    //   * a §7.11 LIFTED-operator result over a narrowed operand (`p + 1L`),
+    //     whose value is an `insertvalue {i8, i64}` the sema expression type
+    //     does not report as a nullable primitive.
+    // After the unwrap the bare payload takes the existing widen below, exactly
+    // as the corresponding plain `int`/`long` RHS does.
+    //
+    // Soundness of the unconditional shape test: sema admits only a value
+    // implicitly convertible to the non-nullable `long`, and it rejects a
+    // nullable one — both confirmed mechanically on this very statement form
+    // ("the assigned value has a type that is not implicitly convertible to the
+    // target type (§5.1)" for a `record`; "the assigned value is nullable but
+    // the target type is non-nullable (§7)" for both an un-narrowed `long?` and
+    // an un-narrowed lifted `s + 1L`). So the only tagged optional that can
+    // reach here is one sema PROVED non-null, and the unwrap can never strip a
+    // value that is actually null. The integer-payload requirement keeps the
+    // test to the numeric optionals that are actually admissible. A no-op for
+    // every plain primitive RHS (not a struct).
+    if (auto* st = llvm::dyn_cast<llvm::StructType>(pos->getType()))
+        if (st->getNumElements() == 2 && st->getElementType(1)->isIntegerTy())
+            pos = unwrapNarrowedNullable(pos, st->getElementType(1));
+    // fix #2617 / §5.1 (v0.236): widen by SIGNEDNESS, not unconditionally.
+    // §5.1's implicit-conversion table admits `byte`, `ushort`, `uint`, and
+    // `char` -> `long` ("Widening from unsigned to a strictly larger signed
+    // type … is permitted because no value is lost"), and each lowers to an
+    // integer NARROWER than i64. A blanket CreateSExt sign-extends those: a
+    // `byte` of 200 (i8 0xC8) became -56, so `fs.Position := b` seeked to a
+    // negative offset.
+    //
+    // PRE-EXISTING vs NEWLY REACHABLE — the distinction that makes this part
+    // of the same commit rather than a separate concern:
+    //   * for a PLAIN unsigned RHS (`var b: byte := byte(200);`) the bug is
+    //     pre-existing: the SExt has always been the only widen here;
+    //   * for a NARROWED unsigned nullable (`byte?`/`ushort?`/`uint?`/`char?`)
+    //     the unwrap added above is what lets the value reach this widen at
+    //     all. On origin/main that shape died loudly at verifyModule. Shipping
+    //     the unwrap WITHOUT this would have converted a loud ICE into a
+    //     silent wrong seek offset — trading a crash for silent bad data, so
+    //     the two changes must land together.
+    // Keyed on the source's sema type via isUnsignedPrim, the convention this
+    // codebase already uses for exactly this choice (LlvmBackend_Stmts.cpp
+    // ~2686, the iterator element widen); this site was the outlier. Falls
+    // back to SExt when the sema type is unavailable, preserving the previous
+    // behaviour for anything not positively known to be unsigned.
+    if (pos->getType()->isIntegerTy() && !pos->getType()->isIntegerTy(64)) {
+        const sema::TypeRef* srcSemaTy = ctx_.exprType(*as.value);
+        bool srcUnsigned =
+            srcSemaTy && isUnsignedPrim(srcSemaTy->primitive);
+        pos = srcUnsigned ? builder_.CreateZExt(pos, i64(), "fs.pos64")
+                          : builder_.CreateSExt(pos, i64(), "fs.pos64");
+    }
     auto* fn = declareC("bz_filestream_set_position",
                         llvm::Type::getVoidTy(llvm_), {ptrTy(), i64()});
     builder_.CreateCall(fn, {fs, pos});

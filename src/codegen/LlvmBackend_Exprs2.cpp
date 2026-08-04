@@ -3039,6 +3039,32 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // was always allocated, so `.Capacity` could not reflect the
                 // requested reservation. A non-positive request falls back to 16.
                 auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+                // #2608 / §28.11 / stdlib §4.3: record the element disposer of an
+                // OWNING array-backed collection in its header at CONSTRUCTION.
+                // Element ownership is otherwise a purely static property, chosen
+                // at the free site from the collection's static type. That fails
+                // for an `owned` field typed by a read-only interface SHARED by
+                // both hierarchies (IReadOnlyList<T>/IReadOnlyCollection<T> are
+                // common ancestors of Array<T> AND OwningArray<T> per stdlib
+                // §4.3), where the same static type can carry either backing and
+                // the free site cannot tell which. The concrete type IS known
+                // here, so stamp the disposer now; bz_array_free_dynamic reads it
+                // back at the erased free site. Borrowing collections are never
+                // tagged (NULL = today's behavior), so this cannot over-dispose.
+                // #2635: the stamp itself now lives in the shared
+                // stampOwningElemDisposer member (LlvmBackend_impl.hpp) rather
+                // than in this lambda, because two OTHER construction sites
+                // call bz_array_alloc directly and were silently skipping it
+                // (materializeHeapCollectionLiteral /
+                // materializeArrayBackedSetLiteral). This lambda is now just
+                // the value-passthrough wrapper this arm's `return` style needs.
+                auto tagOwningElems = [&](llvm::Value* arr) -> llvm::Value* {
+                    stampOwningElemDisposer(
+                        arr,
+                        rt->genericArgs.empty() ? nullptr : rt->genericArgs[0],
+                        common::isOwningPrefixedName(colName));
+                    return arr;
+                };
                 if (!ne.args.empty() && ne.args[0].value) {
                     llvm::Value* capArg = lowerExpr(*ne.args[0].value);
                     if (capArg) {
@@ -3058,12 +3084,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         llvm::Value* one = builder_.getInt64(1);
                         llvm::Value* useArg = builder_.CreateICmpSGT(capArg, one);
                         llvm::Value* cap = builder_.CreateSelect(useArg, capArg, one);
-                        return builder_.CreateCall(allocFn,
-                            {builder_.getInt64(elemSize), cap}, "col.cap.init");
+                        return tagOwningElems(builder_.CreateCall(allocFn,
+                            {builder_.getInt64(elemSize), cap}, "col.cap.init"));
                     }
                 }
-                return builder_.CreateCall(allocFn,
-                    {builder_.getInt64(elemSize), builder_.getInt64(16)});
+                return tagOwningElems(builder_.CreateCall(allocFn,
+                    {builder_.getInt64(elemSize), builder_.getInt64(16)}));
             }
             if (colName == "Dictionary" || colName == "OwningDictionary" ||
                 // stdlib §4.17 (#1354, #1406): SortedDictionary<K,V> shares
@@ -3391,12 +3417,107 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 if (!ne.args.empty() && ne.args[0].value) {
                     llvm::Value* raw = lowerExpr(*ne.args[0].value);
                     if (raw) {
+                        // #2618 / §7.4: a flow-narrowed `T?` initial value
+                        // (proved non-null by a preceding null-check) is
+                        // admitted by sema as the non-nullable `initial: T`
+                        // parameter (stdlib §6.4) but keeps its tagged-optional
+                        // {i8 hasVal; T payload} layout. Unwrap to the bare T
+                        // payload before the widen ladder below — otherwise the
+                        // struct fails every isIntegerTy() branch, `initVal`
+                        // stays getInt64(0), and the cell is SILENTLY
+                        // initialized to 0 (a wrong value, not a verifyModule
+                        // ICE). Same root cause and same one-line unwrap as the
+                        // atomic instance-method sites fixed in #2605
+                        // (LlvmBackend_Calls3.cpp / LlvmBackend_Stmts.cpp);
+                        // unwrapNarrowedNullable is a no-op for a plain
+                        // primitive, so every existing plain-T `new Atomic<T>(k)`
+                        // is unchanged.
+                        if (newTR && !newTR->genericArgs.empty() &&
+                            newTR->genericArgs[0])
+                            if (auto* tTy = lowerTypeRef(newTR->genericArgs[0]))
+                                raw = unwrapNarrowedNullable(raw, tTy);
+                        // fix #2634 / §7.4 / §5.1 (v0.236): the unwrap above
+                        // requires the box payload to EQUAL T's LLVM type, so it
+                        // covers only `T? -> Atomic<T>`. A narrowed `int?` into
+                        // `Atomic<long>` has payload i32 against T's i64: no
+                        // branch fires, the `{i8,i32}` struct then matches no
+                        // isIntegerTy() test below, and `initVal` keeps its
+                        // getInt64(0) default — the #2618 symptom again, at a
+                        // WIDENING argument type. §5.1 admits that argument
+                        // ("Widening from a signed type to a strictly larger
+                        // signed type"), and `new Atomic<long>(someInt)`
+                        // compiles today, so the narrowed form is reachable.
+                        //
+                        // Unwrap by the box's OWN payload type instead, letting
+                        // the payload feed the widen ladder below rather than
+                        // bypass it.
+                        //
+                        // SOUNDNESS — this is gated on the ARGUMENT's sema type
+                        // being a nullable primitive, which is EXACTLY the
+                        // trigger condition of the #2618 sema gate
+                        // (ExprTypecheck_Exprs.cpp ~2639). That gate checks the
+                        // argument against the non-nullable form of its OWN
+                        // type, so it fires for `int?` regardless of what T is;
+                        // verified mechanically that `new Atomic<long>(n)` with
+                        // an un-narrowed `int? n` reports "the argument to
+                        // `Atomic` constructor is nullable but the target type
+                        // is non-nullable (§7)". So wherever this unwrap fires,
+                        // sema has PROVED the box non-null and the payload read
+                        // is safe. Keying on the sema type rather than on the
+                        // struct shape alone is deliberate: the constructor
+                        // argument is otherwise UNTYPED-CHECKED here (#2618
+                        // declined to re-implement ctor argument typing), so a
+                        // bare shape test could strip a field out of some other
+                        // 2-element aggregate that sema never vetted.
+                        const sema::TypeRef* argSemaTy =
+                            ctx_.exprType(*ne.args[0].value);
+                        const bool argIsPrim =
+                            argSemaTy &&
+                            argSemaTy->kind == sema::TypeRef::Kind::Primitive;
+                        if (argIsPrim && argSemaTy->nullable)
+                            if (auto* st =
+                                    llvm::dyn_cast<llvm::StructType>(
+                                        raw->getType()))
+                                if (st->getNumElements() == 2 &&
+                                    st->getElementType(0) ==
+                                        nullablePrimHasValTy() &&
+                                    st->getElementType(1)->isIntegerTy())
+                                    raw = unwrapNarrowedNullable(
+                                        raw, st->getElementType(1));
                         // Widen to i64 for bz_atomic_new's uint64_t parameter.
+                        //
+                        // fix #2634 / §5.1: widen by SIGNEDNESS. This ladder
+                        // zero-extended unconditionally, so every signed source
+                        // NARROWER than the cell lost its sign — proven, not
+                        // inferred: `new Atomic<long>(x)` with `x: int := -1`
+                        // read back 4294967295, and `new Atomic<int>(x)` with
+                        // `x: sbyte := sbyte(-1)` read back 255. That half is
+                        // PRE-EXISTING (it needs no nullable at all), but it
+                        // must be fixed here: the unwrap above is what lets a
+                        // narrowed `int?` reach this widen, so shipping the
+                        // unwrap alone would turn "silently 0" into "silently
+                        // sign-flipped" for a negative payload. Same pairing,
+                        // and same isUnsignedPrim key (LlvmBackend_impl.hpp
+                        // ~3066), as the sibling site fixed in #2617.
+                        //
+                        // The i1 branch stays FIRST and stays a ZExt: `bool` is
+                        // not in isUnsignedPrim's set, so routing it through the
+                        // signedness branch would SExt `true` to all-ones.
+                        //
+                        // Fallback is the previous ZExt whenever the source is
+                        // not positively known to be a signed primitive (sema
+                        // type absent, or a non-primitive such as IntPtr), so
+                        // behaviour changes ONLY where signedness is proven.
                         if (raw->getType()->isIntegerTy(1)) {
                             initVal = builder_.CreateZExt(raw, i64());
                         } else if (raw->getType()->isIntegerTy() &&
                                    !raw->getType()->isIntegerTy(64)) {
-                            initVal = builder_.CreateZExt(raw, i64());
+                            const bool srcSigned =
+                                argIsPrim &&
+                                !isUnsignedPrim(argSemaTy->primitive);
+                            initVal = srcSigned
+                                          ? builder_.CreateSExt(raw, i64())
+                                          : builder_.CreateZExt(raw, i64());
                         } else if (raw->getType()->isIntegerTy(64)) {
                             initVal = raw;
                         }

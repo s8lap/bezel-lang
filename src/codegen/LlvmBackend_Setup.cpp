@@ -15629,6 +15629,17 @@ bool Emitter::lowerOwnedCollectionFieldStore(const ast::Expr& target,
     // per §4.6/§4.7: LinkedList/OwningLinkedList free via bz_llist_free.
     // §28.5/§28.11, #894: OwningDictionary fields free via bz_dict_free.
     bool isLL = collTy && isLinkedListTypeName(collTy);
+    // #2608: drop-on-overwrite twin of the scope-end site in
+    // LlvmBackend_Disposal.cpp. The DISPLACED backing of an `owned` field typed
+    // by a borrowing list interface may itself be owning (stdlib §4.3 — the
+    // read-only list interfaces are shared by both hierarchies), so consult the
+    // construction-time header disposer rather than assuming borrowing.
+    if (!isLL && !isDict && !elemDisp && isBorrowingListInterfaceName(collTy)) {
+        auto* dynFn = declareC("bz_array_free_dynamic",
+                               llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(dynFn, {oldVal});
+        return true;
+    }
     const char* freeName = isLL   ? "bz_llist_free"
                           : isDict ? "bz_dict_free"
                           :          "bz_array_free";
@@ -19772,6 +19783,17 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
     llvm::Value* arr = builder_.CreateCall(
         allocFn, {builder_.getInt64(esz), builder_.getInt64(cap)}, "clit.arr");
+    // fix #2635 (#2608 residual) / §28.11 / stdlib §4.3: a COLLECTION-LITERAL
+    // -constructed owning array is an owning array like any other, but #2608
+    // stamped the element disposer only at the `new` arm in lowerNew, so an
+    // `OwningArray<Cell>` built here reached an erased list-interface `owned`
+    // field with a NULL header disposer and leaked its elements. Confirmed
+    // mechanically: `32 byte(s) leaked in 2 allocation(s)`, both frames the
+    // literal's enclosing method, with the bz_array_t backing itself correctly
+    // freed. `name` is the CONCRETE head of the literal's own type, so the
+    // owning test is the same one lowerNew applies; a borrowing literal is
+    // never tagged and keeps a NULL header, i.e. today's behaviour exactly.
+    stampOwningElemDisposer(arr, elemRef, common::isOwningPrefixedName(name));
 
     // Store each element in textual order via bz_array_add (same as `.Add`).
     auto* addFn = declareC("bz_array_add", llvm::Type::getVoidTy(llvm_),
@@ -20232,6 +20254,15 @@ llvm::Value* Emitter::materializeArrayBackedSetLiteral(
     auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
     llvm::Value* arr = builder_.CreateCall(
         allocFn, {builder_.getInt64(esz), builder_.getInt64(cap)}, "slit.arr");
+    // fix #2635 (#2608 residual): the array-backed `OwningSet<T>` literal is
+    // the second construction site that skipped the stamp. Tagged here for
+    // CONSISTENCY of the invariant "an owning bz_array_t is always tagged at
+    // construction", not because a leak is reachable through it today: per
+    // #401 only Array/OwningArray implement the read-only list interfaces, so
+    // a set's header disposer is never read by bz_array_free_dynamic. NOT
+    // separately probed — same status as the OwningStack/OwningQueue/OwningSet
+    // tags #2608 records as inferred. `owning` is the concrete head test.
+    stampOwningElemDisposer(arr, elemRef, owning);
 
     // --- 2. #1292 / §15.4 L2170: unwind cleanup around the element evals. ---
     llvm::BasicBlock* savedUnwind = unwindTarget_;

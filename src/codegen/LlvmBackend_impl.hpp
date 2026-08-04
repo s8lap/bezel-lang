@@ -3423,10 +3423,25 @@ private:
     // non-nullable target (sema kept its declared {flag,value} layout but
     // accepted the coercion). When `v` is exactly that tagged-optional struct
     // and `targetTy` is its non-nullable value element, extract the value;
-    // otherwise return `v` unchanged. Fires ONLY for an accepted narrowed read
-    // (a genuinely-nullable source is rejected by sema; a force-unwrap is
-    // already an extracted scalar), so it never strips a value that should stay
-    // nullable.
+    // otherwise return `v` unchanged.
+    //
+    // PRECONDITION (#2614 / #2618) — this keys on NULLABILITY (the {flag,value}
+    // shape), NOT on narrowing. It cannot distinguish a sema-proved-non-null
+    // read from a genuinely-nullable one, so it is sound ONLY at a site where a
+    // sema gate already rejects the un-narrowed form. This comment previously
+    // asserted the opposite as a global invariant ("fires ONLY for an accepted
+    // narrowed read; a genuinely-nullable source is rejected by sema") and that
+    // was false: `Span<T>.Slice`, `string.AsSpan` and the `new Atomic<T>(...)`
+    // NewExpr argument each had NO nullability gate, so applying the unwrap
+    // there turned a loud verifyModule ICE into a SILENT WRONG VALUE — the
+    // payload of a possibly-null box. Those three gates now exist
+    // (checkBuiltinSpanCallArgs, checkBuiltinStringCallArgs' intPos set, and
+    // the Atomic NewExpr check).
+    //
+    // Before adding a call site: confirm sema rejects the un-narrowed form
+    // there, and ship a reject control asserting the diagnostic TEXT. If no
+    // gate exists and cannot be added, leave the ICE -- it is strictly better
+    // than a silent miscompile.
     llvm::Value* unwrapNarrowedNullable(llvm::Value* v, llvm::Type* targetTy) {
         if (!v || !targetTy) return v;
         if (auto* st = llvm::dyn_cast<llvm::StructType>(v->getType()))
@@ -3435,6 +3450,65 @@ private:
                 st->getElementType(1) == targetTy)
                 return nullablePrimValue(v);
         return v;
+    }
+
+    // #2614 / §7.4 / §12.7: the same unwrap, applied at a BUILTIN lowering site
+    // that needs a bare scalar operand, keyed on the argument expression's own
+    // sema type rather than on a target LLVM type the caller must supply.
+    //
+    // A builtin's parameter list is synthetic: its arguments are lowered ad hoc
+    // by each intrinsic's lowering code, so they never pass through the
+    // user-method argument binding that already performs this unwrap
+    // (LlvmBackend_Assign.cpp ~7897). When such an argument is a §7.4
+    // flow-narrowed nullable value, sema types the READ as the non-nullable
+    // primitive T (the null-check proved it present) while codegen still loads
+    // the declared `{i8 hasVal; T payload}` box — and the site's subsequent
+    // trunc/sext on a struct is malformed IR that verifyModule rejects.
+    //
+    // The guard is two-sided, and deliberately NOT the §7.11 binary-operator
+    // one (LlvmBackend_Exprs.cpp ~6025). That path keys on a NON-nullable sema
+    // type because its operand is a lifted arithmetic RESULT, which sema
+    // retypes. A narrowed *read* is different: sema leaves the expression's
+    // declared type as `T?` and records the narrowing in checkAssignable
+    // instead (see LlvmBackend_Assign.cpp ~7897), so the operand here arrives
+    // with sema type `int?`. Hence:
+    //   * the lowered value must have the tagged-optional {i8 hasVal; T} shape,
+    //     AND
+    //   * the argument's sema type must be a nullable PRIMITIVE
+    //     (isNullablePrimTy) — never a record, choice, enum, or value builtin,
+    //     whose boxes can share the {i8, ...} shape but are not this family.
+    //
+    // ⚠⚠ SOUNDNESS PRECONDITION — READ BEFORE ADDING A CALL SITE. This helper
+    // fires on NULLABILITY (the box shape + a nullable-primitive sema type). It
+    // does NOT and CANNOT test that sema proved the value non-null: a narrowed
+    // read keeps its `T?` sema type, so narrowed and un-narrowed are
+    // indistinguishable here. Extracting the payload is therefore correct ONLY
+    // at a site where a SEMA GATE already rejects the un-narrowed form. Where no
+    // such gate exists, this helper reads the payload of a possibly-null box and
+    // converts a loud verifyModule ICE into a SILENT WRONG VALUE — strictly
+    // worse than the bug it fixes. The first version of #2614 did exactly that
+    // at three ungated sites (`Span/ArraySpan.Slice`, `string.AsSpan`), which is
+    // why this warning is here.
+    //
+    // The established pattern in this family (#2601/#2602) is a PAIR: sema
+    // REJECTS the un-narrowed form, codegen UNWRAPS the narrowed one. Current
+    // gates, all in src/sema/:
+    //   * string int params  → checkBuiltinStringCallArgs' `intPos` set
+    //                          (ExprTypecheck_Calls.cpp), incl. AsSpan (#2614)
+    //   * ReadOnlyStringSpan and span-buffer `Slice`
+    //                        → checkBuiltinSpanCallArgs (#2601, #2614)
+    // Adding a call site without first extending a gate is a defect, not an
+    // optimization. A no-op for every ordinary scalar operand (no struct →
+    // returns `v` untouched).
+    llvm::Value* unwrapNarrowedNullableOperand(llvm::Value* v,
+                                               const ast::Expr* e) {
+        if (!v || !e) return v;
+        auto* st = llvm::dyn_cast<llvm::StructType>(v->getType());
+        if (!st || st->getNumElements() != 2 ||
+            st->getElementType(0) != nullablePrimHasValTy())
+            return v;
+        if (!isNullablePrimTy(ctx_.exprType(*e))) return v;
+        return nullablePrimValue(v);
     }
 
     llvm::Type* lowerTypeRef(const sema::TypeRef* rt);
@@ -5881,6 +5955,47 @@ private:
         llvm::Function* thunk = elementPolicyFor(elemTy, owningFamily).disposerThunk;
         return thunk ? llvm::cast<llvm::Value>(thunk)
                      : llvm::ConstantPointerNull::get(ptrTy());
+    }
+
+    // #2608 / #2635 / §28.11 / stdlib §4.3: record an OWNING array-backed
+    // collection's element disposer in its `bz_array_t` header at CONSTRUCTION,
+    // so an erased free site can recover it (bz_array_free_dynamic).
+    //
+    // Element ownership is otherwise a purely STATIC property, chosen at the
+    // free site from the collection's static type. That fails for an `owned`
+    // field typed by a read-only interface SHARED by both hierarchies
+    // (stdlib §4.3: "The two hierarchies share `IEnumerable<T>`,
+    // `IReadOnlyCollection<T>`, and `IReadOnlyList<T>` as common ancestors"),
+    // where one static type legitimately carries EITHER backing and the free
+    // site cannot tell which. The concrete type IS known at construction.
+    //
+    // WHY THIS IS A SHARED MEMBER RATHER THAN #2608's FUNCTION-LOCAL LAMBDA
+    // (#2635): #2608 inlined the stamp as a `[&]` lambda inside lowerNew's
+    // array arm, capturing that arm's `colName`/`rt`. It was therefore
+    // unreachable from the OTHER construction sites, which call
+    // `bz_array_alloc` directly and silently produced UNTAGGED owning arrays —
+    // a residual element leak, mechanically confirmed. Pairing the allocation
+    // with the tag in one callable is what stops the next construction site
+    // from skipping it.
+    //
+    // NEVER over-disposes: `owning` is the caller's CONCRETE-type test, a
+    // borrowing collection is never tagged, and an untagged header holds NULL,
+    // which is exactly the pre-#2608 behaviour.
+    void stampOwningElemDisposer(llvm::Value* arr,
+                                 const sema::TypeRef* elemTy,
+                                 bool owning) {
+        if (!arr || !owning) return;
+        // #816: inside a specialized body the element may still be a generic
+        // parameter — resolve it so elementPolicyFor can build the thunk (a
+        // no-op outside a substitution).
+        llvm::Function* d =
+            elementPolicyFor(resolveTypeParamRef(elemTy), /*owningFamily=*/true)
+                .disposerThunk;
+        if (!d) return;   // value/unknown elements: nothing to run
+        auto* setFn = declareC("bz_array_set_elem_disposer",
+                               llvm::Type::getVoidTy(llvm_),
+                               {ptrTy(), ptrTy()});
+        builder_.CreateCall(setFn, {arr, d});
     }
 
     // #362 / stdlib §4.5: a module-level `void(void*)` thunk that runs an

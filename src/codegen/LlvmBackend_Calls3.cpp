@@ -2730,7 +2730,12 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         if (m == "Slice" && (call.args.size() == 1 || call.args.size() == 2) &&
             call.args[0].value &&
             (call.args.size() == 1 || call.args[1].value)) {
-            llvm::Value* st = lowerExpr(*call.args[0].value);
+            // #2614 / §7.4: a flow-narrowed `int?` start/length is admitted by
+            // sema as the non-nullable `int` parameter but still lowers to its
+            // {i8,i32} box; unwrap before the trunc below, which would otherwise
+            // emit `trunc {i8,i32} to i32` and fail verifyModule.
+            llvm::Value* st = unwrapNarrowedNullableOperand(
+                lowerExpr(*call.args[0].value), call.args[0].value.get());
             if (!st) return nullptr;
             if (!st->getType()->isIntegerTy(32))
                 st = builder_.CreateTrunc(st, i32());
@@ -2742,7 +2747,8 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
             llvm::Value* avail = builder_.CreateSub(L, st);
             llvm::Value* sl = avail;   // v0.195 one-arg form: to the end
             if (call.args.size() == 2) {
-                sl = lowerExpr(*call.args[1].value);
+                sl = unwrapNarrowedNullableOperand(
+                    lowerExpr(*call.args[1].value), call.args[1].value.get());
                 if (!sl) return nullptr;
                 if (!sl->getType()->isIntegerTy(32))
                     sl = builder_.CreateTrunc(sl, i32());
@@ -3013,8 +3019,13 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
         llvm::Value* src  = loadSource();
         llvm::Value* base = loadStart();
         llvm::Value* slen = loadLen();
-        llvm::Value* start = lowerExpr(*call.args[0].value);
-        llvm::Value* slen2 = lowerExpr(*call.args[1].value);
+        // #2614 / §7.4: unwrap a flow-narrowed `int?` start/length to its bare
+        // payload before the truncs below — see the ReadOnlyStringSpan.Slice
+        // site above; identical shape, identical defect.
+        llvm::Value* start = unwrapNarrowedNullableOperand(
+            lowerExpr(*call.args[0].value), call.args[0].value.get());
+        llvm::Value* slen2 = unwrapNarrowedNullableOperand(
+            lowerExpr(*call.args[1].value), call.args[1].value.get());
         if (!start || !slen2) return nullptr;
         if (!start->getType()->isIntegerTy(32))
             start = builder_.CreateTrunc(start, i32());

@@ -138,6 +138,21 @@ struct bz_array_t {
     // mutation (Add, Remove, Insert, Clear). Captured by for-in codegen at loop
     // start; checked on each iteration — mismatch → InvalidOperationException.
     int64_t mod_count;
+    // #2608 / §28.11 / stdlib §4.3: the element disposer of an OWNING array-backed
+    // collection, recorded at CONSTRUCTION (bz_array_set_elem_disposer) because
+    // the concrete type is known only there. Element ownership is otherwise a
+    // purely STATIC property, materialized as bz_array_free's dispose_elem
+    // argument; that breaks down when the static type is one of the read-only
+    // interfaces SHARED by the borrowing and owning hierarchies (stdlib §4.3:
+    // IEnumerable/IReadOnlyCollection/IReadOnlyList are common ancestors of both
+    // Array<T> and OwningArray<T>), where the same static type can carry either
+    // backing. Only bz_array_free_dynamic reads this; every existing call site
+    // still passes its statically-derived disposer to bz_array_free and ignores
+    // this field. NULL (calloc-zeroed) means "borrowing / no element disposal",
+    // i.e. exactly today's behavior — so an untagged array can never be
+    // over-disposed by the dynamic path. APPENDED last: data@0/count@8/capacity@16
+    // are read at fixed offsets by codegen and must not move.
+    void (*elem_disposer)(void*);
 };
 typedef struct { char* data; int64_t len; uint8_t width; int64_t rc; } bz_string_hdr;
 struct bz_string_struct {

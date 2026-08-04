@@ -103,6 +103,21 @@ void bz_array_remove_at_disposing(void* arr, int64_t idx, int64_t elem_size,
 // passing a pointer to the element's storage.
 void bz_array_free(void* arr, void (*dispose_elem)(void*));
 
+// #2608 / §28.11 / stdlib §4.3: record an OWNING array-backed collection's
+// element disposer in the array header at construction. Codegen emits this only
+// for a concrete owning collection (`new OwningArray<T>()` and its Stack/Queue
+// siblings) whose element policy yields a disposer thunk; a borrowing collection
+// is never tagged and keeps the calloc-zeroed NULL.
+void bz_array_set_elem_disposer(void* arr, void (*dispose_elem)(void*));
+
+// #2608: free an array whose element ownership is NOT statically known at the
+// free site — an `owned` field typed by a read-only interface shared by the
+// borrowing and owning hierarchies (stdlib §4.3), whose dynamic backing may be
+// `Array<T>` (borrowing) or `OwningArray<T>` (owning). Uses the header disposer
+// recorded at construction; an untagged array degenerates exactly to
+// `bz_array_free(arr, nullptr)`, so this can never over-dispose.
+void bz_array_free_dynamic(void* arr);
+
 // §28.2 v0.135 / issue #621: checked-disposal-mode quarantine. Marks the
 // array as disposed (for the indexer guard) and disposes elements, but does
 // NOT free the header block — mirrors class-instance quarantine in the codegen.

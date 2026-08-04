@@ -175,6 +175,45 @@ BEZEL_TEST(owning_iter_exhaust_2616, for_loop_protocol_disposes_each_exactly_onc
         "  end Main; end C;"), 46);
 }
 
+// NO DOUBLE-FREE guard, the shape the added dispose is NOT gated on: every
+// other case here yields a direct `new R(n)` expression, but the exhaustion
+// dispose fires for ANY non-null current_val, including one that arrived via
+// `yield return <owned local>` — the §29.7/#2306 owned-LOCAL transfer path,
+// where a wrong release is a double-free rather than a leak.
+//
+// The other releasers are inert at this point: the owned-param disposal is
+// gated on `itp.active` (state >= 0) and the owned-local disposal on
+// `itl.estab` (state >= establishedAtState >= 1), while the exhaustion
+// transition has just stored state = -1. This test PINS that reasoning rather
+// than leaving it as a code reading: a double dispose would trip ASan and push
+// the count to 3, a leak would drop it to 1.
+BEZEL_TEST(owning_iter_exhaust_2616, abandoned_owned_local_yield_disposed_exactly_once) {
+    BEZEL_EXPECT_EQ(runChecked(
+        "module M; " + kCountR +
+        "class C "
+        "  public static method Gen(): IOwningEnumerable<R> "
+        "    yield return new R(1); "
+        "    var L := new R(2); "
+        "    yield return L; "
+        "  end Gen; "
+        "  private static method Drive(): int "
+        "    using var source := Gen(); "
+        "    using var en := source.GetOwningEnumerator(); "
+        "    var taken := 0; "
+        "    if en.MoveNext() then "
+        "      using var x := en.TakeCurrent(); "
+        "      taken := taken + x.v; "
+        "    end; "
+        "    var junk := 0; "
+        "    while en.MoveNext() do junk := junk + 1; end; "
+        "    return taken; "
+        "  end Drive; "
+        "  public static method Main(): int "
+        "    var t := Drive(); "
+        "    return R._n * 10 + t; "   // 2 disposed exactly once, 1 taken -> 21
+        "  end Main; end C;"), 21);
+}
+
 // NO DOUBLE-FREE guard, the abandon-then-DISPOSE path (the one that already
 // worked, via disposeYieldedVal): abandon the pending value and dispose the
 // enumerator WITHOUT driving to exhaustion. The new exhaustion dispose must not

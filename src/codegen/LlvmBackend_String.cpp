@@ -1382,7 +1382,30 @@ llvm::Value* Emitter::tryLowerStringMethod(const ast::CallExpr& call,
     };
     auto getIntArg = [&](size_t idx) -> llvm::Value* {
         if (idx >= call.args.size() || !call.args[idx].value) return nullptr;
-        return lowerExpr(*call.args[idx].value);
+        // #2614 / §7.4: unwrap a flow-narrowed `int?` argument — which sema
+        // correctly ADMITS as the non-nullable `int` parameter — to its bare
+        // payload before the caller trunc/sext-es it to the width it needs
+        // (e.g. Insert's `sext ... to i64`). No-op for a plain int.
+        //
+        // ⚠ This helper is NOT the single funnel for the string int-parameter
+        // family: it has six uses (AsSpan's start/length, Substring pos 0,
+        // Insert pos 0, Remove pos 0). PadLeft/PadRight/PadCenter's width
+        // (~:2152) and padChar, Remove's count (~:2446), Repeat's n (~:2173),
+        // Substring's length (~:1868) and IndexOf's startIndex (~:1744/:1794)
+        // still lower via a raw `lowerExpr` and retain the #2614 defect — so
+        // `s.Substring(n)` compiles while `s.Substring(0, n)` still ICEs.
+        // Audited with per-site file:line and per-site confidence in #2625.
+        //
+        // ⚠ SOUNDNESS PRECONDITION: this unwrap tests the tagged-optional
+        // SHAPE, not that sema proved the value non-null, so it is safe ONLY
+        // where a sema gate rejects the un-narrowed form. Every method reaching
+        // it is gated in checkBuiltinStringCallArgs' `intPos` set
+        // (ExprTypecheck_Calls.cpp) — AsSpan was added there by this same fix,
+        // precisely because it was NOT gated and the unwrap turned a clean ICE
+        // into a silent wrong value. Do not route a new method through
+        // getIntArg without adding it to `intPos` first.
+        return unwrapNarrowedNullableOperand(lowerExpr(*call.args[idx].value),
+                                             call.args[idx].value.get());
     };
 
     // §9.6 / §3.3 (#883): string.AsSpan() and its overloads → a ReadOnlyStringSpan

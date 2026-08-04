@@ -213,26 +213,68 @@ public:
     // `declared_` (so reads are tracked) but not into `assigned_`.
     void run(const std::vector<ast::Param>& params,
              const std::vector<std::unique_ptr<ast::Stmt>>& body) {
-        // Seed out-params as declared-but-unassigned.
-        for (const auto& p : params) {
-            if (!p.name.empty() && p.modifier.rfind("out", 0) == 0 &&
-                p.modifier.rfind("out var", 0) != 0) {
-                // "out" or "out owned" — callee must assign. "out var"
-                // is a caller-side inline-decl modifier, not a callee
-                // param mode, so it's excluded here (no method body uses
-                // "out var" as a param modifier; the check is belt-and-
-                // suspenders).
-                outParams_.insert(p.name);
-                declared_.insert(p.name);
-                // Intentionally NOT inserted into assigned_ — starts unassigned.
-            }
-        }
+        seedOutParams(params);
         for (const auto& s : body) {
             if (s) visitStmt(*s);
         }
         // §22.3 fall-off check: if control can reach the end of the method
         // without a return/throw, every out-param must be assigned.
         if (!terminated_) checkOutParams(/*span=*/nullptr);
+    }
+
+    // §22.3 (v0.236, fix #2595): an EXPRESSION-bodied method `=> E;` has
+    // exactly one normal-completion path, and the value it returns is `E` —
+    // semantically the `return E;` the block form would spell. The walker was
+    // never entered for this body kind (checkMember gated on
+    // MethodBodyKind::Block), so an `out` parameter on an expression-bodied
+    // method was never seeded and checkOutParams never ran: `method F(out n:
+    // int): int => 5;` was ADMITTED, and the caller's recipient was left
+    // holding unassigned storage — §22.3: "The callee must assign every `out`
+    // parameter on every normal-completion (return) path … failing to do so is
+    // a compile error."
+    //
+    // The check is a walk, NOT a blanket rejection of `out` on expression
+    // bodies: an expression body CAN discharge the obligation by passing the
+    // parameter on as an `out` argument (`=> Helper(out n)` — a §22.3
+    // assignable storage location, since within the callee an `out` parameter
+    // "denotes a callee-local slot"). That shape compiles and works today, so
+    // rejecting `out` at the declaration would be a false reject on working
+    // code. Walking `E` and then running the ordinary §22.3 check at the single
+    // return point gives exact parity with the block form: `visitExpr` marks an
+    // `out`-argument operand assigned and reports a read of a still-unassigned
+    // out parameter, so `=> Helper(out n)` is accepted, `=> 5` and `=> n + 1`
+    // are rejected with the same diagnostics their `return …;` counterparts
+    // already produce.
+    void runExpressionBody(const std::vector<ast::Param>& params,
+                           const ast::Expr& body) {
+        seedOutParams(params);
+        sawUnanalyzedForm_ = false;
+        visitExpr(body);
+        // §17.12: "`throw` is an expression … Valid in any expression
+        // position." §22.3 exempts it: "a path that exits by `throw` carries
+        // no assignment obligation". A `=> throw E;` body therefore has NO
+        // normal-completion path and owes nothing — exactly like the block
+        // form's `throw E;`, whose ThrowStmt arm sets `terminated_` and is
+        // skipped by the fall-off check at the end of `run`. Route the
+        // expression form through the SAME `terminated_` gate rather than
+        // adding a second exemption mechanism.
+        //
+        // Set here, on the BODY node, and deliberately NOT inside visitExpr's
+        // ThrowExpr arm: a `throw` nested in a sub-expression does not
+        // terminate the enclosing statement (`(if c then 1 else throw E)`
+        // completes normally on the `then` path), so setting the flag there
+        // would suppress legitimate fall-off §22.3 rejections on the BLOCK
+        // path. Only a body that IS the throw diverges unconditionally.
+        if (dynamic_cast<const ast::ThrowExpr*>(&body)) terminated_ = true;
+        // §22.3: report only when the walk actually understood the whole body.
+        // visitExpr has no arm for several composite forms (see
+        // `sawUnanalyzedForm_`), and an `out` argument nested inside one is
+        // invisible to it — reporting there would be a FALSE REJECT on code
+        // that does discharge the obligation. Staying silent restores exactly
+        // the pre-fix behavior for those shapes (they were never checked at
+        // all) rather than inventing a wrong answer.
+        if (!terminated_ && !sawUnanalyzedForm_)
+            checkOutParams(&body.span.begin);
     }
 
     // No-param overload for destructors (which have no params).
@@ -448,6 +490,15 @@ private:
     // branch termination; partial-branch termination leaves it false so
     // the fall-off check runs on the live path).
     bool terminated_ = false;
+
+    // §22.3 (fix #2595): set by visitExpr's fall-through when it meets an Expr
+    // form it has no arm for and that is not a childless leaf — currently
+    // `InterpolatedStringExpr`, `RangeExpr`, `CaseExpr`. An `out` argument
+    // nested in one is invisible to the walk, so `runExpressionBody` declines
+    // to run the §22.3 check rather than report an assignment it simply could
+    // not see. Reset per expression-body walk; read ONLY by runExpressionBody
+    // (the block-bodied path is unaffected).
+    bool sawUnanalyzedForm_ = false;
 
     // §22.7 (v0.184) construction-time `this`-observation checking. Active only
     // while walking a constructor body (runConstructor). The observation gate
@@ -1379,7 +1430,40 @@ private:
             }
             return;
         }
-        // Literals, This/Base/TypeOf/NameOf/Default — no child to walk.
+        // Everything above either returned or is a genuinely childless leaf.
+        // Anything ELSE reaching here is a composite form this walker has no
+        // arm for and therefore cannot see into. As of v0.236 that is
+        // `InterpolatedStringExpr` (its holes), `RangeExpr` (lo/hi/step), and
+        // `CaseExpr` (scrutinee, guards, arm bodies) — each can contain a call,
+        // hence an `out` argument that DISCHARGES the §22.3 obligation.
+        //
+        // Record it so `runExpressionBody` can decline to report rather than
+        // emit a false reject (fix #2595 follow-up). Deliberately a leaf
+        // WHITELIST rather than a blind-form blacklist: a newly added Expr node
+        // then defaults to "unanalyzed" — a missed diagnosis, the safe
+        // direction — instead of being silently mis-reported as unassigned.
+        // Read only by `runExpressionBody`; the block-bodied path never
+        // consults it, so this adds no behavior change there.
+        if (!isChildlessLeaf(e)) sawUnanalyzedForm_ = true;
+    }
+
+    // True for the Expr forms that genuinely have no `Expr` child, so their
+    // absence from visitExpr's chain loses nothing. `TypeOfExpr`/`NameOfExpr`/
+    // `DefaultExpr` hold a `Type`/`QualifiedName`, not an expression;
+    // `MarkedTransferExpr` holds only the transferred name (`owned x`).
+    static bool isChildlessLeaf(const ast::Expr& e) {
+        return dynamic_cast<const ast::IntLiteralExpr*>(&e) ||
+               dynamic_cast<const ast::FloatLiteralExpr*>(&e) ||
+               dynamic_cast<const ast::CharLiteralExpr*>(&e) ||
+               dynamic_cast<const ast::StringLiteralExpr*>(&e) ||
+               dynamic_cast<const ast::VerbatimStringExpr*>(&e) ||
+               dynamic_cast<const ast::BoolLiteralExpr*>(&e) ||
+               dynamic_cast<const ast::NullLiteralExpr*>(&e) ||
+               dynamic_cast<const ast::TypeOfExpr*>(&e) ||
+               dynamic_cast<const ast::NameOfExpr*>(&e) ||
+               dynamic_cast<const ast::DefaultExpr*>(&e) ||
+               dynamic_cast<const ast::UnitExpr*>(&e) ||
+               dynamic_cast<const ast::MarkedTransferExpr*>(&e);
     }
 
     // §22.3 (#747 R43): an `out` argument is an OUTPUT location, not a read —
@@ -1457,6 +1541,26 @@ private:
             }
         }
         visitExpr(*a.value);
+    }
+
+    // §22.3: seed the callee's `out` parameters as declared-but-unassigned.
+    // By-value and `ref` params are definitely-assigned on entry (the caller
+    // bound them) and are not tracked here. Shared by every body-form entry
+    // point (`run`, `runExpressionBody`) so they cannot drift apart.
+    void seedOutParams(const std::vector<ast::Param>& params) {
+        for (const auto& p : params) {
+            if (!p.name.empty() && p.modifier.rfind("out", 0) == 0 &&
+                p.modifier.rfind("out var", 0) != 0) {
+                // "out" or "out owned" — callee must assign. "out var"
+                // is a caller-side inline-decl modifier, not a callee
+                // param mode, so it's excluded here (no method body uses
+                // "out var" as a param modifier; the check is belt-and-
+                // suspenders).
+                outParams_.insert(p.name);
+                declared_.insert(p.name);
+                // Intentionally NOT inserted into assigned_ — starts unassigned.
+            }
+        }
     }
 
     // §22.3: check that every out-parameter is in assigned_ at the current
@@ -1774,6 +1878,19 @@ private:
     }
 };
 
+// §22.3 (fix #2595): does this parameter list declare a callee-side `out`
+// parameter (plain `out` or `out owned`)? The `out var` spelling is a
+// caller-side inline-declaration modifier, never a parameter mode — same
+// exclusion MethodDA::seedOutParams makes.
+bool hasOutParam(const std::vector<ast::Param>& params) {
+    for (const auto& p : params) {
+        if (!p.name.empty() && p.modifier.rfind("out", 0) == 0 &&
+            p.modifier.rfind("out var", 0) != 0)
+            return true;
+    }
+    return false;
+}
+
 // `enclosing` is the type whose members are being walked (null for extension
 // members and top-level free code). §22.7 construction-time `this`-observation
 // checking runs only for a CLASS's non-static constructors — the same scope as
@@ -1786,6 +1903,25 @@ void checkMember(const ast::Member& m, SemaContext& ctx,
         if (md->bodyKind == ast::MethodBodyKind::Block) {
             MethodDA da(ctx);
             da.run(md->params, md->stmts);
+        } else if (md->bodyKind == ast::MethodBodyKind::Expression &&
+                   md->exprBody && hasOutParam(md->params)) {
+            // §22.3 (v0.236, fix #2595): an expression-bodied method was never
+            // walked, so its `out` parameters escaped the callee-side
+            // definite-assignment obligation entirely. Walk the body as the
+            // single return path it is (MethodDA::runExpressionBody).
+            //
+            // The walk is entered ONLY for a method that actually declares an
+            // `out` parameter. That is deliberate scope control, not an
+            // oversight: an expression body declares no locals, so with no out
+            // parameter seeded the walker's `declared_` set is empty and the
+            // §22.3 check is the only diagnosis it could produce — while
+            // entering the walk unconditionally would newly subject every
+            // expression-bodied method in the language to the walker's other
+            // (§29.11 lazy-consumption) bookkeeping for no §22.3 benefit. The
+            // residual local-DA gap for expression bodies, property accessors,
+            // and lambda bodies is pre-existing and untouched here.
+            MethodDA da(ctx);
+            da.runExpressionBody(md->params, *md->exprBody);
         }
     } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(&m)) {
         MethodDA da(ctx);

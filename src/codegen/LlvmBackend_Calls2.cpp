@@ -1616,9 +1616,62 @@ void Emitter::ensureOutVarSlots(const ast::CallExpr& call) {
         // the same bit pattern nullableValueNull's ConstantAggregateZero
         // produces for the nullable-value case, so this needs no separate
         // isNullableValueTy branch.
+        //
+        // §22.3 (v0.236, #2629) — every shape is now initialized; the
+        // previously-exempt one just gets its store somewhere else. The
+        // paragraph above reasons only about what the CALLER may read back on a
+        // skipped path, and on those grounds skipped a non-nullable
+        // REFERENCE-typed recipient entirely ("dead weight"). That missed a
+        // second consumer of the slot's incoming bits: the CALLEE. §22.3 says
+        // "within the callee the parameter denotes a callee-local slot" and
+        // "the variable need not be initialized before the call", but this
+        // backend takes §22.3's blessed shortcut — "an implementation may pass
+        // a hidden reference" — so the callee's `n := ...` lowers to the
+        // ordinary assign sequence, which for a REFCOUNTED referent (string,
+        // closure, box) first LOADS the slot's prior value and calls
+        // bz_string_release / bz_closure_release on it (see the `strrp.old`
+        // load in lowerAssign). A non-nullable reference-typed recipient is
+        // exactly the shape that reached that release with an un-stored
+        // alloca, so the callee released raw stack garbage — a wild free /
+        // SIGSEGV, not a wrong value. Null is a documented no-op for every
+        // one of those releasers (bezel_runtime_refcounting.cpp:126), so a
+        // null-initialized slot makes the callee's release-of-prior sound.
+        // This cannot make an accepted program observe the null: §22.4's
+        // "Scope is not definite assignment" still makes any read of a
+        // non-nullable-reference out variable on a maybe-skipped path a
+        // compile error, so the stored null is unobservable by construction —
+        // it exists solely to give the callee's release a defined operand.
+        //
+        // WHERE the store goes differs by shape, and the difference is
+        // load-bearing in a LOOP (measured under LSan, not reasoned):
+        //
+        //  * DA-EXEMPT shapes (value-typed, nullable) keep the store HERE, at
+        //    the call site. §22.4 promises such a recipient observes §7.9's
+        //    default on a path where the call was skipped, and in a loop that
+        //    promise is per-ITERATION — an iteration whose short-circuit
+        //    skipped the call must see the default, not the previous
+        //    iteration's leftover. Hoisting these would break #2395/#2402.
+        //
+        //  * The NON-NULLABLE REFERENCE shape stores ONCE, in the entry block
+        //    next to the alloca. No default is owed (DA rejects every read on
+        //    a skipped path), so nothing requires a per-iteration reset — and
+        //    a per-iteration reset is actively WRONG here: it would overwrite
+        //    the pointer the previous iteration left in the slot before the
+        //    callee's release-of-prior could consume it, leaking one string
+        //    per iteration. Measured on a 5-iteration loop assigning a heap
+        //    string through `out n: string`: call-site store leaks 5 objects
+        //    (195 B), entry-block store leaks 1 (39 B) — and that remaining 1
+        //    is a PRE-EXISTING leak of the final value at scope exit, present
+        //    identically before this fix and filed separately. So the entry
+        //    placement fixes the SIGSEGV while leaving the loop's release
+        //    balance exactly as it was.
         if (!loc || !loc->declType ||
             !sema::isNonNullableReferenceType(loc->declType)) {
             builder_.CreateStore(llvm::Constant::getNullValue(slotTy), slot);
+        } else {
+            llvm::IRBuilder<> init(slot->getParent(),
+                                   std::next(slot->getIterator()));
+            init.CreateStore(llvm::Constant::getNullValue(slotTy), slot);
         }
         locals_[id] = slot;
         if (loc && loc->decl) locals_[loc->decl] = slot;
@@ -1920,8 +1973,27 @@ void Emitter::ensureCtorOutVarSlots(const ast::NewExpr& ne,
         // sema-level defect (affects narrowing/definite-assignment, not
         // codegen) — filed separately, not fixed here (different function,
         // different subsystem, per this project's small-PR discipline).
+        //
+        // §22.3 (v0.236, #2629) — the previously-exempt shape is now
+        // initialized too, in the ENTRY block rather than here. The `pt`-vs-
+        // `loc->declType` note above still governs which branch is taken (and
+        // `pt` still sizes the slot). See the matching paragraph in
+        // ensureOutVarSlots for the full reasoning and the LSan measurements:
+        // the predicate only ever considered what the CALLER could read back,
+        // and so skipped the one shape — a non-nullable REFERENCE-typed
+        // recipient — whose un-stored bits the CALLEE then fed to
+        // bz_string_release as the "prior value" of its own `n := ...`, wildly
+        // freeing stack garbage. `new Widget("x", out var n)` with
+        // `out n: string` SIGSEGVs on the plain build for exactly this reason.
+        // Entry-block placement (not here) so that a `new` inside a LOOP does
+        // not reset the slot each iteration and strand the previous
+        // iteration's reference before the callee can release it.
         if (!pt || !sema::isNonNullableReferenceType(pt)) {
             builder_.CreateStore(llvm::Constant::getNullValue(slotTy), slot);
+        } else {
+            llvm::IRBuilder<> init(slot->getParent(),
+                                   std::next(slot->getIterator()));
+            init.CreateStore(llvm::Constant::getNullValue(slotTy), slot);
         }
         locals_[id] = slot;
         if (loc && loc->decl) locals_[loc->decl] = slot;

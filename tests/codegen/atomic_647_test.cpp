@@ -836,3 +836,457 @@ BEZEL_TEST(codegen_atomic_narrowed_2605,
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, 42);
 }
+
+// ===========================================================================
+// #2618 / §7.4 (narrowing) / stdlib §6.4, v0.236 — narrowed `T?` INITIAL value
+// on the `new Atomic<T>(initial)` / `new AtomicInteger<T>(initial)` CONSTRUCTOR.
+//
+// The fifth atomic site, and the one with the WORST symptom. stdlib §6.4
+// declares `public constructor(initial: T)`; sema admits a §7.4-narrowed `T?`
+// there exactly as it does for the instance-method operands of #2605. But the
+// constructor is a NewExpr, lowered separately (LlvmBackend_Exprs2.cpp,
+// `bz_atomic_new`), and its widen ladder is a chain of `isIntegerTy()` tests
+// with NO else — a tagged-optional `{i8 hasVal; T payload}` struct matches no
+// branch, `initVal` silently keeps its `getInt64(0)` default, and the narrowed
+// payload is DISCARDED. The cell is initialized to 0.
+//
+// That makes these tests different in kind from the #2605 block above: the
+// defect is a SILENT WRONG VALUE, not a verifyModule ICE. A test that merely
+// asserted "compiles" or "ran" would pass with and without the fix and be
+// vacuous — so every case below asserts the cell's OBSERVED CONTENT (42 / 7 /
+// true), which is 0 / false without the unwrap and correct with it.
+//
+// Proven mechanically: each narrowed case exits 0 (or false) on the unpatched
+// compiler and exits with the payload once the unwrap is in place.
+// ===========================================================================
+
+// #2618 / §7.4 / stdlib §6.4: `new Atomic<int>(narrowed int?)` must initialize
+// the cell to the narrowed payload (42), not 0. This is THE issue repro.
+BEZEL_TEST(codegen_atomic_narrowed_ctor_2618,
+           atomic_ctor_narrowed_nullable_initial) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  private static method N(flag: bool): int? "
+        "    if flag then return 42; end; "
+        "    return null; "
+        "  end N; "
+        "  public static method Main(): int "
+        "    var v := N(true); "                  // v: int?, runtime 42
+        "    if v = null then return 0; end; "    // narrows v → int (§7.4)
+        "    var a := new Atomic<int>(v); "       // initial = narrowed 42
+        "    return a.Value; "                    // 42 with the unwrap, 0 without
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// #2618 / §7.4 / stdlib §6.4: the same defect on the AtomicInteger<T>
+// constructor — the lowering is the shared `colName == "Atomic" ||
+// colName == "AtomicInteger"` branch, so this pins the second entry point.
+BEZEL_TEST(codegen_atomic_narrowed_ctor_2618,
+           atomic_integer_ctor_narrowed_nullable_initial) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  private static method N(flag: bool): int? "
+        "    if flag then return 42; end; "
+        "    return null; "
+        "  end N; "
+        "  public static method Main(): int "
+        "    var v := N(true); "
+        "    if v = null then return 0; end; "         // §7.4 narrowing
+        "    var a := new AtomicInteger<int>(v); "
+        "    return a.Value; "
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// #2618 / §7.4 / stdlib §6.4: `Atomic<long>` — proves the unwrap keys on the
+// instantiation's genericArgs[0] LLVM type (i64, so the box is {i8,i64}), not
+// a hardcoded i32. A hardcoded-i32 unwrap would leave the {i8,i64} struct
+// untouched and the cell would again read back 0.
+BEZEL_TEST(codegen_atomic_narrowed_ctor_2618,
+           atomic_long_ctor_narrowed_nullable_initial) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  private static method N(flag: bool): long? "
+        "    if flag then return 42; end; "
+        "    return null; "
+        "  end N; "
+        "  public static method Main(): int "
+        "    var v := N(true); "
+        "    if v = null then return 0; end; "         // §7.4 narrowing
+        "    var a := new Atomic<long>(v); "
+        "    return int(a.Value); "                    // §5.2 explicit long→int
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// #2618 / §7.4 / stdlib §6.4: `Atomic<bool>` — the narrowed box is {i8,i1},
+// and the payload must reach the `isIntegerTy(1)` ZExt branch. Guards the
+// 1-byte cell-size path (bool is in §6.4's eligible list) and, together with
+// the long case, brackets the widen ladder at both ends.
+BEZEL_TEST(codegen_atomic_narrowed_ctor_2618,
+           atomic_bool_ctor_narrowed_nullable_initial) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  private static method N(flag: bool): bool? "
+        "    if flag then return true; end; "
+        "    return null; "
+        "  end N; "
+        "  public static method Main(): int "
+        "    var v := N(true); "
+        "    if v = null then return 0; end; "         // §7.4 narrowing
+        "    var a := new Atomic<bool>(v); "
+        "    if a.Value then return 1; end; "          // 1 with unwrap, 0 without
+        "    return 0; "
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 1);
+}
+
+// #2618 POSITIVE CONTROL: a plain (non-nullable) literal initial must be
+// unaffected. unwrapNarrowedNullable is shape-guarded — it fires only on a
+// {i8, T} tagged optional — so an ordinary `new Atomic<int>(7)` keeps its
+// existing lowering. This is the test that would fail if the unwrap were
+// over-eager and stripped a legitimate value.
+BEZEL_TEST(codegen_atomic_narrowed_ctor_2618,
+           atomic_ctor_plain_initial_unchanged) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var a := new Atomic<int>(7); "
+        "    return a.Value; "
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// ---------------------------------------------------------------------------
+// #2618 REJECT CONTROLS — the soundness half of the pair.
+//
+// The codegen unwrap fires on the tagged-optional SHAPE; it cannot itself tell
+// a §7.4-narrowed value from an un-narrowed one. It is sound only because sema
+// REJECTS the un-narrowed form, so `hasVal` is statically true wherever it
+// fires. That gate did NOT exist for the constructor: #2602 gated the atomic
+// INSTANCE methods via checkBuiltinCollectionCallArgs, which runs on the
+// CallExpr path only, while `new Atomic<T>(…)` is a NewExpr whose sole sema
+// check was the §6.4 T-restriction. So `new Atomic<int>(nullLocal)` passed sema
+// unchecked and initialized the cell to 0 — and with the unwrap in place would
+// have read the payload out of a null box instead. The fix adds the missing
+// checkAssignable on the NewExpr argument (ExprTypecheck_Exprs.cpp).
+//
+// If these two ever start compiling, the #2618 unwrap becomes a silent
+// miscompile and must be removed. Asserted on diagnostic TEXT per
+// tests/README.md: runAot's WIFSIGNALED path synthesizes an Error diagnostic
+// for a runtime crash too, so `!r.ran` alone cannot distinguish a genuine
+// rejection from a segfault.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+bool atomicRejectsMentioning(const std::string& program, const char* keyword) {
+    JitResult r = runAot(program);
+    if (r.ran) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(keyword) != std::string_view::npos) return true;
+    return false;
+}
+
+}  // namespace
+
+// #2618 / §7 / stdlib §6.4: an UN-narrowed `int?` initial must be REJECTED.
+BEZEL_TEST(codegen_atomic_narrowed_ctor_2618,
+           atomic_ctor_unnarrowed_nullable_rejected) {
+    BEZEL_EXPECT_TRUE(atomicRejectsMentioning(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var n: int? := null; "
+        "    var a := new Atomic<int>(n); "   // NOT narrowed — must reject
+        "    return a.Value; "
+        "  end Main; "
+        "end C;", "nullable"));
+}
+
+// #2618 / §7 / stdlib §6.4: the same gate on the AtomicInteger<T> constructor,
+// which shares the lowering branch and so shares the hazard.
+BEZEL_TEST(codegen_atomic_narrowed_ctor_2618,
+           atomic_integer_ctor_unnarrowed_nullable_rejected) {
+    BEZEL_EXPECT_TRUE(atomicRejectsMentioning(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var n: int? := null; "
+        "    var a := new AtomicInteger<int>(n); "   // NOT narrowed — reject
+        "    return a.Value; "
+        "  end Main; "
+        "end C;", "nullable"));
+}
+
+// ===========================================================================
+// #2634 / §5.1 (implicit conversions) / §7.4 (narrowing) / stdlib §6.4, v0.236
+// — the `new Atomic<T>(initial)` argument at a WIDENING type, in both of its
+// broken directions. #2618 (the block above) closed only `T? -> Atomic<T>`.
+//
+// PART 1 — the WIDENING UNWRAP (#2634 as filed).
+// #2618's unwrap requires the tagged-optional payload to EQUAL T's LLVM type.
+// §5.1 admits `int -> long` ("| `int` | `long`, … |"), so `Atomic<long>` legally
+// takes an `int` argument — and a §7.4-narrowed `int?` therefore arrives as an
+// `{i8, i32}` box against T's i64. No branch of the exact-match unwrap fires,
+// the struct then matches no `isIntegerTy()` test in the widen ladder, and
+// `initVal` keeps its `getInt64(0)` default. The cell is SILENTLY 0 — the exact
+// #2618 symptom, one argument type over. Proven on 4c27002: the first test
+// below exits 0, not 42.
+//
+// PART 2 — the SIGNEDNESS of the widen (found probing part 1; the blocking
+// half, exactly as in the sibling #2617).
+// The ladder zero-extended unconditionally, so every SIGNED source narrower
+// than the cell lost its sign. Proven pre-existing on 4c27002, with no nullable
+// involved at all:
+//   * `new Atomic<long>(x)`, `x: int := -1`      read back 4294967295;
+//   * `new Atomic<int>(x)`,  `x: sbyte := -1`    read back 255.
+// The two halves must land together: part 1 is what lets a narrowed `int?`
+// reach the widen at all, so shipping it alone would turn "silently 0" into
+// "silently sign-flipped" for a negative payload. The widen is now keyed on the
+// source's sema type via isUnsignedPrim — ZExt for unsigned, SExt for signed —
+// per §5.1's "Widening from unsigned to a strictly larger signed type … is
+// permitted because no value is lost".
+//
+// Every case asserts the cell's OBSERVED CONTENT. Because runAot's exitCode is
+// WEXITSTATUS-masked to 8 bits, the sign cases compare IN-PROGRAM against both
+// the correct value and the specific wrong value the defect produced, and
+// return a small discriminator: 7 = correct, 8 = the known defect, 9 = neither.
+// A "compiles / ran" assertion would be vacuous against a wrong-value defect.
+// ===========================================================================
+
+// #2634 THE ISSUE REPRO: a §7.4-narrowed `int?` into `Atomic<long>`. The
+// payload (i32) is narrower than T (i64), so #2618's exact-match unwrap does
+// not fire. Must initialize the cell to 42; silently 0 before this fix.
+BEZEL_TEST(codegen_atomic_widening_ctor_2634,
+           atomic_long_ctor_narrowed_int_nullable_initial) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  private static method N(flag: bool): int? "
+        "    if flag then return 42; end; "
+        "    return null; "
+        "  end N; "
+        "  public static method Main(): int "
+        "    var v := N(true); "                    // v: int?, runtime 42
+        "    if v = null then return 0; end; "      // narrows v → int (§7.4)
+        "    var a := new Atomic<long>(v); "        // int payload, i64 cell
+        "    return int(a.Value); "                 // 42 with the fix, 0 without
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// #2634: the same widening shape on the `AtomicInteger<T>` entry point, which
+// shares the `colName == "Atomic" || colName == "AtomicInteger"` lowering
+// branch and therefore shares the defect.
+BEZEL_TEST(codegen_atomic_widening_ctor_2634,
+           atomic_integer_long_ctor_narrowed_int_nullable_initial) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  private static method N(flag: bool): int? "
+        "    if flag then return 42; end; "
+        "    return null; "
+        "  end N; "
+        "  public static method Main(): int "
+        "    var v := N(true); "
+        "    if v = null then return 0; end; "      // §7.4 narrowing
+        "    var a := new AtomicInteger<long>(v); "
+        "    return int(a.Value); "
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 42);
+}
+
+// #2634 part 1 + part 2 together: a NEGATIVE narrowed `int?` into
+// `Atomic<long>`. This is the case that makes the two halves inseparable —
+// with only the unwrap it reads back 4294967295 (the unconditional ZExt),
+// with only the signedness key it is still 0 (never unwrapped).
+BEZEL_TEST(codegen_atomic_widening_ctor_2634,
+           atomic_long_ctor_narrowed_negative_int_nullable_sign_extends) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  private static method N(flag: bool): int? "
+        "    if flag then return -1; end; "
+        "    return null; "
+        "  end N; "
+        "  public static method Main(): int "
+        "    var v := N(true); "
+        "    if v = null then return 0; end; "      // §7.4 narrowing
+        "    var a := new Atomic<long>(v); "
+        "    var got: long := a.Value; "
+        "    a.Dispose(); "
+        "    if got = -1L then return 7; end; "            // correct (SExt)
+        "    if got = 4294967295L then return 8; end; "    // the ZExt defect
+        "    return 9; "
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// #2634 OVER-SEXT GUARD, the #2617 lesson: a narrowed UNSIGNED nullable must
+// still ZERO-extend. §5.1 admits `byte -> long`, and byte(200) is i8 0xC8 —
+// sign-extending it yields -56. This shape is NEWLY REACHABLE (before the
+// unwrap it was silently 0), so it is the case a careless "just SExt" fix
+// would break.
+BEZEL_TEST(codegen_atomic_widening_ctor_2634,
+           atomic_long_ctor_narrowed_byte_nullable_zero_extends) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  private static method N(flag: bool): byte? "
+        "    if flag then return byte(200); end; "
+        "    return null; "
+        "  end N; "
+        "  public static method Main(): int "
+        "    var v := N(true); "
+        "    if v = null then return 0; end; "      // §7.4 narrowing
+        "    var a := new Atomic<long>(v); "
+        "    var got: long := a.Value; "
+        "    a.Dispose(); "
+        "    if got = 200L then return 7; end; "    // correct (ZExt)
+        "    if got = -56L then return 8; end; "    // the SExt trap
+        "    return 9; "
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// #2634 part 2, the PRE-EXISTING half pinned: NO nullable anywhere. A plain
+// `int` of -1 into `Atomic<long>` read back 4294967295 on 4c27002. Independent
+// of part 1 — this value never had a tagged-optional layout.
+BEZEL_TEST(codegen_atomic_widening_ctor_2634,
+           atomic_long_ctor_plain_negative_int_sign_extends) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var x: int := -1; "
+        "    var a := new Atomic<long>(x); "        // §5.1 int → long
+        "    var got: long := a.Value; "
+        "    a.Dispose(); "
+        "    if got = -1L then return 7; end; "
+        "    if got = 4294967295L then return 8; end; "
+        "    return 9; "
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// #2634 part 2: the same pre-existing sign loss at a cell size of 4 rather
+// than 8 — `sbyte` -1 into `Atomic<int>` read back 255 on 4c27002. Proves the
+// defect was never specific to the 8-byte cell, and that `sbyte`/`short` (the
+// signed types NOT in isUnsignedPrim's set) take the SExt branch.
+BEZEL_TEST(codegen_atomic_widening_ctor_2634,
+           atomic_int_ctor_plain_negative_sbyte_sign_extends) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var x: sbyte := sbyte(-1); "
+        "    var a := new Atomic<int>(x); "         // §5.1 sbyte → int
+        "    var got: int := a.Value; "
+        "    a.Dispose(); "
+        "    if got = -1 then return 7; end; "
+        "    if got = 255 then return 8; end; "
+        "    return 9; "
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// #2634 NO-REGRESSION CONTROL for part 2: a plain UNSIGNED source at the
+// maximal ZExt/SExt divergence. `uint` 0x80000000 into `Atomic<long>` was
+// CORRECT before this commit (the ladder's blanket ZExt happened to suit it)
+// and must stay 2147483648, not -2147483648. This is the test that fails if
+// the signedness key is inverted or if isUnsignedPrim stops covering `uint`.
+BEZEL_TEST(codegen_atomic_widening_ctor_2634,
+           atomic_long_ctor_plain_uint_zero_extends) {
+    JitResult r = runAot(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var x: uint := 2147483648U; "
+        "    var a := new Atomic<long>(x); "        // §5.1 uint → long
+        "    var got: long := a.Value; "
+        "    a.Dispose(); "
+        "    if got = 2147483648L then return 7; end; "
+        "    if got = -2147483648L then return 8; end; "
+        "    return 9; "
+        "  end Main; "
+        "end C;"
+    );
+    if (aotWasSkipped(r)) return;
+    BEZEL_EXPECT_TRUE(r.ran);
+    BEZEL_EXPECT_EQ(r.exitCode, 7);
+}
+
+// #2634 REJECT CONTROL — the soundness precondition of the widening unwrap.
+//
+// The unwrap fires on the argument's sema type being a NULLABLE PRIMITIVE,
+// which is precisely the trigger condition of #2618's sema gate. That gate
+// checks the argument against the non-nullable form of ITS OWN type, so it
+// fires for `int?` whatever T is — verified mechanically at this WIDENING
+// instantiation, not merely assumed from the `Atomic<int>` case above. If this
+// ever starts compiling, the widening unwrap becomes a silent read of a null
+// box's payload and must be removed. Asserted on diagnostic TEXT per
+// tests/README.md (runAot synthesizes an Error for a SIGSEGV too, so `!r.ran`
+// alone cannot distinguish a rejection from a crash).
+BEZEL_TEST(codegen_atomic_widening_ctor_2634,
+           atomic_long_ctor_unnarrowed_int_nullable_rejected) {
+    BEZEL_EXPECT_TRUE(atomicRejectsMentioning(
+        "module M; "
+        "class C "
+        "  public static method Main(): int "
+        "    var n: int? := null; "
+        "    var a := new Atomic<long>(n); "   // NOT narrowed — must reject
+        "    return int(a.Value); "
+        "  end Main; "
+        "end C;", "nullable"));
+}

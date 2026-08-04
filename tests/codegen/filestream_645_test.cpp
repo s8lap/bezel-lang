@@ -449,3 +449,261 @@ BEZEL_TEST(filestream_645_7_5, no_crash_on_missing_file_open) {
         "if n = 0 and r.Length = 0 then return 7; end; "
         "return 0; ")), 7);
 }
+
+// ---------------------------------------------------------------------------
+// fix #2617 — §7.4 ("Member access on nullable values", v0.236) narrowed
+// nullable operand to the stdlib §7.1 `Position: long` setter.
+//
+// §7.4 "How narrowing is established" admits an early exit: "after
+// `if x = null then return; end;` … the surviving path is narrowed", and the
+// null test form `x <> null` narrows the true branch. Sema therefore accepts a
+// narrowed `long?` (and, through §6's `S → T → T?` numeric widening, a narrowed
+// `int?`) as the value of the non-nullable `long` Position property.
+//
+// Codegen did NOT unwrap it: the narrowed local keeps its declared tagged-
+// optional `{i8 hasVal; T}` layout, which was handed straight to
+// bz_filestream_set_position's `i64` parameter, so LLVM's verifyModule rejected
+// the module — "Call parameter type does not match function signature!" — i.e.
+// a codegen ICE on a legal §7.4 idiom. Same family as #2605 (atomics) / #2614.
+//
+// WITHOUT the fix every case below fails to COMPILE (`ran` is false, run()
+// yields -999); WITH it each returns its distinct non-zero code. The codes are
+// runtime VALUE assertions derived from the bytes actually read back at the
+// seeked-to position, so a value-corrupting unwrap (e.g. extracting the hasVal
+// flag instead of the payload, or truncating) cannot be mistaken for a pass.
+// Verified mechanically both ways (patch out → -999; patch in → the code).
+// ---------------------------------------------------------------------------
+
+// §7.4 early-exit narrowing: `if p = null then return; end;` narrows `p` on the
+// surviving path, and the narrowed `long?` is admitted for `Position: long`.
+// The assertion is on the SEEK's effect (the byte read back), not just on the
+// Position getter, so an unwrap that produced the wrong integer would fail.
+BEZEL_TEST(filestream_2617_7_4, narrowed_long_nullable_position_set) {
+    BEZEL_EXPECT_EQ(runChecked(prog(
+        "using var src := new Array<byte>(); "
+        "src.Add(byte(10)); src.Add(byte(11)); "
+        "src.Add(byte(12)); src.Add(byte(13)); "
+        "using var w := new FileStream(\"/tmp/bzt2617_long.bin\", "
+        "                              FileMode.Create, FileAccess.Write); "
+        "w.Write(src, 0, 4); w.Dispose(); "
+        "using var r := new FileStream(\"/tmp/bzt2617_long.bin\", "
+        "                              FileMode.Open, FileAccess.Read); "
+        "var p: long? := 2L; "
+        "if p = null then return 0; end; "
+        "r.Position := p; "
+        "if r.Position <> 2 then return 1; end; "
+        "using var buf := new Array<byte>(1, byte(0)); "
+        "var n := r.Read(buf, 0, 1); "
+        "if n = 1 and buf[0] = byte(12) then return 21; end; "
+        "return 2; ")), 21);
+}
+
+// §7.4 + §6 numeric widening: a narrowed `int?` is likewise admitted (an `int`
+// converts to `long`, and the conversion lifts through `?`). Its payload is
+// i32, NOT i64 — so this case pins that the unwrap keys on the RHS's own
+// declared payload type rather than on the setter's i64 parameter. It ICEd
+// with `{i8, i32}` on origin/main, a shape the issue as filed did not name.
+BEZEL_TEST(filestream_2617_7_4, narrowed_int_nullable_position_set) {
+    BEZEL_EXPECT_EQ(runChecked(prog(
+        "using var src := new Array<byte>(); "
+        "src.Add(byte(10)); src.Add(byte(11)); "
+        "src.Add(byte(12)); src.Add(byte(13)); "
+        "using var w := new FileStream(\"/tmp/bzt2617_int.bin\", "
+        "                              FileMode.Create, FileAccess.Write); "
+        "w.Write(src, 0, 4); w.Dispose(); "
+        "using var r := new FileStream(\"/tmp/bzt2617_int.bin\", "
+        "                              FileMode.Open, FileAccess.Read); "
+        "var q: int? := 3; "
+        "if q = null then return 0; end; "
+        "r.Position := q; "
+        "if r.Position <> 3 then return 1; end; "
+        "using var buf := new Array<byte>(1, byte(0)); "
+        "var n := r.Read(buf, 0, 1); "
+        "if n = 1 and buf[0] = byte(13) then return 22; end; "
+        "return 2; ")), 22);
+}
+
+// §7.4 the other narrowing form — a `<> null` test narrowing its TRUE branch,
+// with the set inside the controlled block (the issue's repro used the early
+// exit; this pins the block form reaches the same lowering).
+BEZEL_TEST(filestream_2617_7_4, narrowed_long_nullable_position_set_in_if_block) {
+    BEZEL_EXPECT_EQ(runChecked(prog(
+        "using var src := new Array<byte>(); "
+        "src.Add(byte(10)); src.Add(byte(11)); "
+        "src.Add(byte(12)); src.Add(byte(13)); "
+        "using var w := new FileStream(\"/tmp/bzt2617_ifblk.bin\", "
+        "                              FileMode.Create, FileAccess.Write); "
+        "w.Write(src, 0, 4); w.Dispose(); "
+        "using var r := new FileStream(\"/tmp/bzt2617_ifblk.bin\", "
+        "                              FileMode.Open, FileAccess.Read); "
+        "var p: long? := 1L; "
+        "if p <> null then r.Position := p; end; "
+        "using var buf := new Array<byte>(1, byte(0)); "
+        "var n := r.Read(buf, 0, 1); "
+        "if n = 1 and buf[0] = byte(11) then return 23; end; "
+        "return 2; ")), 23);
+}
+
+// §7.11 "Lifted operators": an arithmetic expression over a NARROWED operand
+// (`p + 1L`) reaches the setter as an `insertvalue {i8, i64}` rather than as a
+// plain optional load — the same defect through a different lowering. Found by
+// this lane's adversarial grid, not named in the issue. Sema rejects the
+// UN-narrowed form of the same expression ("the assigned value is nullable but
+// the target type is non-nullable (§7)", confirmed mechanically), so the
+// unwrap here is on a value sema proved non-null.
+BEZEL_TEST(filestream_2617_7_4, narrowed_nullable_in_lifted_operator_position_set) {
+    BEZEL_EXPECT_EQ(runChecked(prog(
+        "using var src := new Array<byte>(); "
+        "src.Add(byte(10)); src.Add(byte(11)); "
+        "src.Add(byte(12)); src.Add(byte(13)); "
+        "using var w := new FileStream(\"/tmp/bzt2617_lift.bin\", "
+        "                              FileMode.Create, FileAccess.Write); "
+        "w.Write(src, 0, 4); w.Dispose(); "
+        "using var r := new FileStream(\"/tmp/bzt2617_lift.bin\", "
+        "                              FileMode.Open, FileAccess.Read); "
+        "var p: long? := 1L; "
+        "if p = null then return 0; end; "
+        "r.Position := p + 1L; "
+        "if r.Position <> 2 then return 1; end; "
+        "using var buf := new Array<byte>(1, byte(0)); "
+        "var n := r.Read(buf, 0, 1); "
+        "if n = 1 and buf[0] = byte(12) then return 24; end; "
+        "return 2; ")), 24);
+}
+
+// ---------------------------------------------------------------------------
+// fix #2617, part 2 — §5.1 (v0.236) UNSIGNED widening at the same setter.
+//
+// §5.1's implicit-conversion table admits `byte`, `ushort`, `uint`, and `char`
+// -> `long` ("Widening from unsigned to a strictly larger signed type … is
+// permitted because no value is lost"), and each lowers to an integer narrower
+// than the i64 bz_filestream_set_position takes. The widen at that site was an
+// unconditional CreateSExt, which SIGN-extends them: `byte(200)` (i8 0xC8)
+// became -56.
+//
+// For a PLAIN unsigned RHS this is pre-existing. For a NARROWED unsigned
+// nullable it was newly REACHABLE: the unwrap added by the first half of this
+// fix is what lets such a value reach the widen at all — on origin/main that
+// shape died loudly at verifyModule. Without the signedness fix, shipping the
+// unwrap would have converted a loud ICE into a silent wrong seek offset. The
+// two halves therefore ship together.
+//
+// These cases assert on the byte read back at the seeked-to offset (or, where
+// the offset is far past EOF, on the Position getter), so a sign-extended
+// offset cannot pass: -56 is not 200.
+// ---------------------------------------------------------------------------
+
+// §5.1 + §7.4: a narrowed `byte?` of 200 has the i8 sign bit set. With SExt the
+// seek target is -56; with ZExt it is 200. A 256-byte file whose byte at offset
+// N has value N makes the read-back decisive.
+BEZEL_TEST(filestream_2617_7_4, narrowed_byte_nullable_position_set_zero_extends) {
+    BEZEL_EXPECT_EQ(runChecked(prog(
+        "using var src := new Array<byte>(); "
+        "var i := 0; "
+        "while i < 256 do src.Add(byte(i)); i := i + 1; end; "
+        "using var w := new FileStream(\"/tmp/bzt2617_byte.bin\", "
+        "                              FileMode.Create, FileAccess.Write); "
+        "w.Write(src, 0, 256); w.Dispose(); "
+        "using var r := new FileStream(\"/tmp/bzt2617_byte.bin\", "
+        "                              FileMode.Open, FileAccess.Read); "
+        "var b: byte? := byte(200); "
+        "if b = null then return 0; end; "
+        "r.Position := b; "
+        "if r.Position <> 200 then return 1; end; "
+        "using var buf := new Array<byte>(1, byte(0)); "
+        "var n := r.Read(buf, 0, 1); "
+        "if n = 1 and buf[0] = byte(200) then return 25; end; "
+        "return 2; ")), 25);
+}
+
+// §5.1 + §7.4: a narrowed `ushort?` of 40000 has the i16 sign bit set
+// (SExt -> -25536, ZExt -> 40000). The offset is past EOF, where a seek is
+// legal on a regular file but no byte can be read back, so the assertion is on
+// the Position getter — still decisive, since a negative offset cannot report
+// 40000.
+BEZEL_TEST(filestream_2617_7_4, narrowed_ushort_nullable_position_set_zero_extends) {
+    BEZEL_EXPECT_EQ(runChecked(prog(
+        "using var src := new Array<byte>(); "
+        "src.Add(byte(1)); src.Add(byte(2)); "
+        "using var w := new FileStream(\"/tmp/bzt2617_ushort.bin\", "
+        "                              FileMode.Create, FileAccess.Write); "
+        "w.Write(src, 0, 2); w.Dispose(); "
+        "using var r := new FileStream(\"/tmp/bzt2617_ushort.bin\", "
+        "                              FileMode.Open, FileAccess.Read); "
+        "var s: ushort? := ushort(40000); "
+        "if s = null then return 0; end; "
+        "r.Position := s; "
+        "if r.Position = 40000 then return 26; end; "
+        "return 1; ")), 26);
+}
+
+// §5.1 + §7.4: a narrowed `uint?` exactly at the 32-bit sign boundary
+// (0x80000000 = 2147483648). SExt -> -2147483648, ZExt -> 2147483648. This is
+// the widest unsigned type §5.1 admits here, and the boundary value is the one
+// where the two widenings differ maximally.
+BEZEL_TEST(filestream_2617_7_4, narrowed_uint_nullable_position_set_zero_extends) {
+    BEZEL_EXPECT_EQ(runChecked(prog(
+        "using var src := new Array<byte>(); "
+        "src.Add(byte(1)); src.Add(byte(2)); "
+        "using var w := new FileStream(\"/tmp/bzt2617_uint.bin\", "
+        "                              FileMode.Create, FileAccess.Write); "
+        "w.Write(src, 0, 2); w.Dispose(); "
+        "using var r := new FileStream(\"/tmp/bzt2617_uint.bin\", "
+        "                              FileMode.Open, FileAccess.Read); "
+        "var u: uint? := uint(2147483648L); "
+        "if u = null then return 0; end; "
+        "r.Position := u; "
+        "if r.Position = 2147483648L then return 27; end; "
+        "return 1; ")), 27);
+}
+
+// §5.1: the PLAIN (never-nullable) `byte` RHS — the PRE-EXISTING half of the
+// sign-extension defect. This fix does not create it, but the fix sits on the
+// same widen, so it is pinned here rather than left to regress silently.
+BEZEL_TEST(filestream_2617_7_4, plain_byte_position_set_zero_extends) {
+    BEZEL_EXPECT_EQ(runChecked(prog(
+        "using var src := new Array<byte>(); "
+        "var i := 0; "
+        "while i < 256 do src.Add(byte(i)); i := i + 1; end; "
+        "using var w := new FileStream(\"/tmp/bzt2617_pbyte.bin\", "
+        "                              FileMode.Create, FileAccess.Write); "
+        "w.Write(src, 0, 256); w.Dispose(); "
+        "using var r := new FileStream(\"/tmp/bzt2617_pbyte.bin\", "
+        "                              FileMode.Open, FileAccess.Read); "
+        "var c: byte := byte(200); "
+        "r.Position := c; "
+        "if r.Position <> 200 then return 1; end; "
+        "using var buf := new Array<byte>(1, byte(0)); "
+        "var n := r.Read(buf, 0, 1); "
+        "if n = 1 and buf[0] = byte(200) then return 28; end; "
+        "return 2; ")), 28);
+}
+
+// Guard for the OTHER direction: a PLAIN (never-nullable) `long`/`int` RHS must
+// still lower exactly as before — the unwrap is a no-op for it. This one
+// passes both without and with the fix by construction; it is here so that a
+// future change to the unwrap that over-fires (stripping a non-optional value)
+// is caught in the same file. Both widths are exercised, since the i32 RHS is
+// the one the SExt path handles.
+BEZEL_TEST(filestream_2617_7_4, plain_long_and_int_position_set_unchanged) {
+    BEZEL_EXPECT_EQ(runChecked(prog(
+        "using var src := new Array<byte>(); "
+        "src.Add(byte(10)); src.Add(byte(11)); "
+        "src.Add(byte(12)); src.Add(byte(13)); "
+        "using var w := new FileStream(\"/tmp/bzt2617_plain.bin\", "
+        "                              FileMode.Create, FileAccess.Write); "
+        "w.Write(src, 0, 4); w.Dispose(); "
+        "using var r := new FileStream(\"/tmp/bzt2617_plain.bin\", "
+        "                              FileMode.Open, FileAccess.Read); "
+        "var mask := 0; "
+        "var a: long := 2L; "
+        "r.Position := a; "
+        "if r.Position = 2 then mask := mask + 1; end; "
+        "var b: int := 1; "
+        "r.Position := b; "
+        "if r.Position = 1 then mask := mask + 2; end; "
+        "using var buf := new Array<byte>(1, byte(0)); "
+        "var n := r.Read(buf, 0, 1); "
+        "if n = 1 and buf[0] = byte(11) then mask := mask + 4; end; "
+        "return mask; ")), 7);
+}
