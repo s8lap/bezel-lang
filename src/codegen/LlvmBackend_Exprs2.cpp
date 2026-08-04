@@ -988,6 +988,25 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // frees the 8-byte capture cell at last-drop. Single holder ⇒ no
         // double-free; definite escape ⇒ outer scope gone ⇒ no UAF.
         bool                   freeCellInEnvdtor = false;
+        // fix #2706 / §27.5 / §28.9 (v0.240): true when this capture's cell is
+        // WRITTEN by the enclosing function (or by a lambda body) after it can
+        // be captured, AND more than one env can share that one cell. The
+        // per-capture retain below and the envdtor release then refer to
+        // DIFFERENT strings — the retain lands on the value present at capture,
+        // the release on whatever the last write left in the cell — so N envs
+        // release the final value once each against its single +1: a double
+        // free. Both sides are suppressed together (the retain is skipped where
+        // this is set, the envdtor's release is skipped on the same flag), which
+        // leaks the cell's final value instead of over-releasing it. Never set
+        // for a box capture (releaseBoxInEnvdtor is a disjoint branch on a
+        // non-String, non-Function sema type).
+        //
+        // RESIDUAL, tracked as #2718: the leak this trades for. The sound model
+        // refcounts the CELL (rc(contents) must equal the LIVE ENV COUNT, a
+        // runtime quantity), which is a design change, not a local patch — four
+        // local patches were tried and each is unsound, see #2718. Write paths
+        // this gate does not see are #2719.
+        bool                   suppressContentRcInEnvdtor = false;
     };
     std::vector<CaptureEntry> captures;
 
@@ -1147,15 +1166,25 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // retain and release predicates is the invariant. A captured ref/out
         // param is a different loop below and stays at semaTy = nullptr: it
         // borrows the caller's storage and the envdtor releases nothing.
-        if (isStringTypeRefNonNull(ce.semaTy)) {
-            llvm::Value* str =
-                builder_.CreateLoad(ptrTy(), ce.envValue, "str.pcap");
-            emitStringRetain(str);
-        } else if (ce.semaTy &&
-                   ce.semaTy->kind == sema::TypeRef::Kind::Function) {
-            llvm::Value* cl =
-                builder_.CreateLoad(ptrTy(), ce.envValue, "cl.pcap");
-            emitClosureRetain(cl);
+        //
+        // fix #2706: EXCEPT when the body WRITES this parameter's cell and more
+        // than one env can share it — see armMutatedSharedCaptureCell. The
+        // retain and the envdtor release are then suppressed TOGETHER; keeping
+        // the retain alone would merely move the leak.
+        ce.suppressContentRcInEnvdtor = mutatedSharedCaptureCell(
+            static_cast<const void*>(sym), ce.semaTy,
+            /*freshCellPerIteration=*/false);
+        if (!ce.suppressContentRcInEnvdtor) {
+            if (isStringTypeRefNonNull(ce.semaTy)) {
+                llvm::Value* str =
+                    builder_.CreateLoad(ptrTy(), ce.envValue, "str.pcap");
+                emitStringRetain(str);
+            } else if (ce.semaTy &&
+                       ce.semaTy->kind == sema::TypeRef::Kind::Function) {
+                llvm::Value* cl =
+                    builder_.CreateLoad(ptrTy(), ce.envValue, "cl.pcap");
+                emitClosureRetain(cl);
+            }
         }
         // §27.5 / §28.9 / #694: free the capture CELL in the envdtor when this
         // PARAMETER is captured by exactly ONE env (singleCaptureLocals_, which
@@ -1411,7 +1440,17 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         // producer) + (N-1) retains = N references = N envdtor releases → 0 after the
         // last env dies. Exclude guarded boxing (loop-iteration cell reuse) for the
         // same reason the box branch does (conservative leak, never over-release).
-        if (alreadyBoxed && !wasGuardedLocal) {
+        //
+        // fix #2706: as in the captured-PARAMS loop, a cell the body WRITES and
+        // that more than one env can share has BOTH its retain and its envdtor
+        // release suppressed — the two would otherwise refer to different
+        // strings. Note the flag is consulted for EVERY capture of such a
+        // variable, not only the `alreadyBoxed` ones, because it is the ENVDTOR
+        // release (which the first env also emits) that must go away.
+        ce.suppressContentRcInEnvdtor = mutatedSharedCaptureCell(
+            static_cast<const void*>(decl), ce.semaTy,
+            /*freshCellPerIteration=*/forceFresh);
+        if (alreadyBoxed && !wasGuardedLocal && !ce.suppressContentRcInEnvdtor) {
             if (isStringTypeRefNonNull(ce.semaTy)) {
                 llvm::Value* str =
                     builder_.CreateLoad(ptrTy(), ce.envValue, "str.recap");
@@ -1708,6 +1747,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         llvm::Function* savedCellFreeEligFn = cellFreeEligibleFn_;
         auto savedBoxCaptureLocals = boxCaptureLocals_;
         auto savedSingleCaptureLocals = singleCaptureLocals_;
+        auto savedAssignedCaptureVars = assignedCaptureVars_;  // fix #2706
         llvm::Function* savedBoxCaptureLocalsFn = boxCaptureLocalsFn_;
         auto savedDefinitelyEscaping = definitelyEscapingLambdas_;
         // #2132: emitAsyncLambda now ALSO recomputes the borrowing-array /
@@ -1749,6 +1789,7 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         cellFreeEligibleFn_ = savedCellFreeEligFn;
         boxCaptureLocals_ = std::move(savedBoxCaptureLocals);
         singleCaptureLocals_ = std::move(savedSingleCaptureLocals);
+        assignedCaptureVars_ = std::move(savedAssignedCaptureVars);  // fix #2706
         boxCaptureLocalsFn_ = savedBoxCaptureLocalsFn;
         definitelyEscapingLambdas_ = std::move(savedDefinitelyEscaping);
         borrowingArrayFreeEligible_ = std::move(savedBorrowingArrayFreeElig);
@@ -2077,7 +2118,18 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // The cell continues to leak — a pre-existing contained leak,
                 // safe in the direction of PRIME DIRECTIVE (never over-releases).
                 // Future work: free non-escaping cells at outer-scope exit.
-                if (isStringTypeRefNonNull(ce.semaTy)) {
+                // fix #2706 / §27.5 / §28.9 (v0.240): suppressContentRcInEnvdtor
+                // says the enclosing function WRITES this shared cell, so "the +1
+                // we retained" is a lie — the retain landed on the value present
+                // at CAPTURE and this load yields whatever the last write left
+                // behind. N envs would each release that final value against its
+                // single +1: a double free (the issue's `SEGV in
+                // bz$lam$0$envdtor`). The retain at the capture site is skipped
+                // under the same flag, so the two stay in agreement; the final
+                // value leaks instead — the bounded, non-over-releasing side.
+                if (ce.suppressContentRcInEnvdtor) {
+                    // no content release: see above.
+                } else if (isStringTypeRefNonNull(ce.semaTy)) {
                     // String capture: load and release the +1 we retained.
                     llvm::Value* str =
                         builder_.CreateLoad(ptrTy(), cell, "str");

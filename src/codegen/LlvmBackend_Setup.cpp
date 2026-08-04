@@ -6085,6 +6085,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // (escape-suppressed) scope-end box release.
     boxCaptureLocals_.clear();
     singleCaptureLocals_.clear();          // #694
+    assignedCaptureVars_.clear();          // fix #2706
     definitelyEscapingLambdas_.clear();    // #694
     boxCaptureLocalsFn_ = fn;
     // #429 / §27.5: which captured locals/params have ALL-non-escaping lambdas
@@ -18793,6 +18794,7 @@ void Emitter::collectBoxCaptureLocals(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     boxCaptureLocals_.clear();
     singleCaptureLocals_.clear();  // #694
+    assignedCaptureVars_.clear();  // fix #2706
 
     // Candidate box-producer locals (same predicate as collectBoxReleaseEligible).
     std::unordered_set<const void*> candidates;
@@ -18859,6 +18861,67 @@ void Emitter::collectBoxCaptureLocals(
         if (n == 1)
             singleCaptureLocals_.insert(d);   // #694: captured by exactly one env
     }
+
+    // fix #2706 / §27.5 / §28.9 (v0.240): record every LOCAL/PARAMETER this body
+    // ASSIGNS TO, under the SAME key space the tally above uses (LocalDecl* for a
+    // local, Symbol* for a parameter — distinct allocations, so they cannot
+    // collide). lowerLambda consults this to decide whether a capture cell is
+    // WRITTEN after it is captured; see assignedCaptureVars_ in the header for
+    // why that makes the per-capture retain and the envdtor release refer to
+    // different strings.
+    //
+    // THE WALK DESCENDS INTO LAMBDA BODIES, unlike retainAssignedStringParams's
+    // (#2696). It must: `lambda(k) => do s := "x"; end` writes through the very
+    // same shared cell (§27.5: "Modifications to a captured variable inside the
+    // lambda are visible outside, and vice versa."), so it desynchronizes the
+    // capture retain from the envdtor
+    // release exactly as an outer assignment does. Over-inclusion here is safe in
+    // one direction only, and it is the safe one: a variable wrongly listed loses
+    // a retain AND the matching release together, so it leaks — it can never
+    // over-release. collectAllLambdas descends fully, so a nested lambda's
+    // assignment is reached too.
+    std::function<void(const ast::Stmt*)> scanAssign = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // `x := e` and every compound form (`x += e`) are ONE AssignmentStmt
+            // node; both store through the target's slot, i.e. through the cell.
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get())) {
+                if (sema::Symbol* sym = ctx_.exprSymbol(*id)) {
+                    if (auto* loc = dynamic_cast<sema::LocalSymbol*>(sym)) {
+                        if (loc->decl)
+                            assignedCaptureVars_.insert(
+                                static_cast<const void*>(loc->decl));
+                    } else if (dynamic_cast<sema::ParameterSymbol*>(sym)) {
+                        assignedCaptureVars_.insert(
+                            static_cast<const void*>(sym));
+                    }
+                }
+            }
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scanAssign(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scanAssign(b.get());
+            for (auto& b : is->elseBody) scanAssign(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scanAssign(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scanAssign(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scanAssign(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scanAssign(b.get());
+            for (auto& c : ts->catches) scanAssign(c.body.get());
+            for (auto& b : ts->finallyBody) scanAssign(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scanAssign(a.get());
+        }
+    };
+    for (auto& s : body) scanAssign(s.get());
+    for (const ast::LambdaExpr* lam : lambdas)
+        for (auto& s : lam->stmts) scanAssign(s.get());
 }
 
 

@@ -8535,6 +8535,52 @@ private:
     // ⇒ no double-free; definite escape ⇒ the outer scope is gone before the
     // closure dies ⇒ no UAF.
     std::unordered_set<const void*> singleCaptureLocals_;
+    // fix #2706 / §27.5 / §28.9 (v0.240): LOCAL DECL NODES and PARAMETER SYMBOLS
+    // that this function body ASSIGNS TO (`x := e` / `x += e`), including from
+    // inside a lambda body. Computed alongside boxCaptureLocals_/
+    // singleCaptureLocals_ and guarded by the same boxCaptureLocalsFn_ token.
+    //
+    // A capture cell is SHARED and MUTABLE (§27.5). The per-capture retain is
+    // taken on the value in the cell AT CAPTURE, while every env's envdtor
+    // releases the value in the cell AT DESTRUCTION. A write between those two
+    // points makes them different strings: the displaced value is over-retained
+    // and the new value takes one release per env against its single +1 — a
+    // double free as soon as two envs share the cell. Keying the envdtor's
+    // release to what was retained is impossible without refcounting the CELL
+    // (the closures read the cell, so the FINAL value must stay alive until the
+    // LAST env dies, and that count is dynamic). Consulted at the capture site
+    // to suppress BOTH the retain and the envdtor release for such a cell —
+    // a bounded leak instead of an over-release.
+    std::unordered_set<const void*> assignedCaptureVars_;
+    // fix #2706 / §27.5 / §28.9 (v0.240): does this capture's cell need BOTH its
+    // per-capture retain and its envdtor release suppressed? True iff
+    //   (a) the capture is of a runtime-managed type the envdtor releases at all
+    //       (non-nullable `string` or a function type — exactly the envdtor's own
+    //       two branches, so the predicates agree by construction), AND
+    //   (b) the enclosing function ASSIGNS to the variable (assignedCaptureVars_),
+    //       so the cell's contents at destruction differ from those at capture,
+    //       AND
+    //   (c) MORE THAN ONE env can share that one cell: either two or more lambda
+    //       NODES capture it (not in singleCaptureLocals_), or a single node sits
+    //       inside a loop over a cell that is NOT reallocated per iteration
+    //       (guarded boxing) — so one cell backs every iteration's closure.
+    // (c) is what keeps the sole-capture, no-loop case — which is BALANCED today
+    // (one env, one release, one reference) — byte-identical.
+    // Gated on `currentFn_ == boxCaptureLocalsFn_`, the token the two sets it
+    // reads are computed under: outside the analyzed function they are stale, and
+    // the conservative answer there is FALSE (leave today's behavior alone).
+    bool mutatedSharedCaptureCell(const void* key, const sema::TypeRef* semaTy,
+                                  bool freshCellPerIteration) {
+        if (currentFn_ != boxCaptureLocalsFn_) return false;
+        if (!isStringTypeRefNonNull(semaTy) &&
+            !(semaTy && semaTy->kind == sema::TypeRef::Kind::Function))
+            return false;
+        if (!assignedCaptureVars_.count(key)) return false;
+        const bool manyEnvsShareOneCell =
+            !singleCaptureLocals_.count(key) ||
+            (!loopStack_.empty() && !freshCellPerIteration);
+        return manyEnvsShareOneCell;
+    }
     // §27.5 / #694: LambdaExpr nodes that DEFINITELY escape the function (directly
     // returned). Computed once per body by collectDefinitelyEscapingLambdas;
     // consulted in lowerLambda to arm the envdtor cell-free.

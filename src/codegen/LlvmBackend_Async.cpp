@@ -1117,6 +1117,7 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         // lastLambdaCapturedCells_ and lowerLocalDecl registers their frees.
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();
+        assignedCaptureVars_.clear();  // fix #2706
         definitelyEscapingLambdas_.clear();
         boxCaptureLocalsFn_ = resumeFn;
         cellFreeEligible_.clear();
@@ -1520,6 +1521,7 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
         // has its cell freed at scope end (mirrors emitAsyncMethod above).
         boxCaptureLocals_.clear();
         singleCaptureLocals_.clear();
+        assignedCaptureVars_.clear();  // fix #2706
         definitelyEscapingLambdas_.clear();
         boxCaptureLocalsFn_ = resumeFn;
         cellFreeEligible_.clear();
