@@ -1,6 +1,6 @@
 # Bezel Guide 5: Collections, Queries, and Iteration
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.236.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.238.*
 
 The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5, `import System.Collections.Linq;`). What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed **How Bezel does it**. Every standard collection comes in **two families** — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a **bound lazy query is single-consumption** — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `owned` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three **How Bezel does it** sections and the table in §8.
 
@@ -12,7 +12,7 @@ The surface here looks familiar: resizable arrays, dictionaries, sets, stacks an
 
 Elsewhere, one collection type serves every purpose, because a garbage collector cleans up whatever the collection referenced. Bezel has no collector, so a collection must answer Guide 1's question for its elements: *is this container responsible for disposing them, or is someone else?* Each standard shape ships in two forms (spec §28.11; stdlib §4):
 
-- **Borrowing collections** — `Array<T>`, `Dictionary<K, V>`, `Set<T>`, `Stack<T>`, `Queue<T>`, `LinkedList<T>`, and the sorted forms. Elements stay owned by whoever put them there. The collection's `Dispose()` does no semantic work — the borrowing forms are **trivial-dispose** (spec §28.9; Guide 1 §2): no destructor runs and no element is disposed, while the collection's own backing storage is reclaimed with the instance (spec §28.11; stdlib §4.4). `Remove` and `Clear` drop references and dispose nothing.
+- **Borrowing collections** — `Array<T>`, `Dictionary<K, V>`, `Set<T>`, `Stack<T>`, `Queue<T>`, `LinkedList<T>`, and the sorted forms. Elements stay owned by whoever put them there. The collection's `Dispose()` does no semantic work — the borrowing forms are **trivial-dispose** (spec §28.9; Guide 1 §2): no destructor runs and no element is disposed, while the collection's own backing storage is part of the instance's single allocation, released with it when the compiler frees the collection at its owner's release point (spec §28.11; stdlib §4.4). `Remove` and `Clear` drop references and dispose nothing.
 - **Owning collections** — `OwningArray<T>`, `OwningDictionary<K, V>`, `OwningSet<T>`, `OwningStack<T>`, `OwningQueue<T>`, `OwningLinkedList<T>`. `Add`/`Push`/`Enqueue` take `owned` arguments — ownership transfers in. `Remove`, `Clear`, and the indexer-set **dispose** the affected elements, and the collection's `Dispose()` cascades through every element it still holds.
 
 ```bezel

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review (owner queue, 2026-08-04) |
+| **Status** | **superseded — stage 1 graduated v0.238** (owner-ruled 2026-08-04, Q1–Q4 as recommended; stage 2 = implementation conformance, [#2654](https://github.com/s8lap/bezel-lang/issues/2654)/[#2655](https://github.com/s8lap/bezel-lang/issues/2655)/[#2656](https://github.com/s8lap/bezel-lang/issues/2656)/[#2660](https://github.com/s8lap/bezel-lang/issues/2660)) |
 | **Tracking issue** | [#2653](https://github.com/s8lap/bezel-lang/issues/2653); side findings filed independently: [#2654](https://github.com/s8lap/bezel-lang/issues/2654) (spec-contrary warning), [#2655](https://github.com/s8lap/bezel-lang/issues/2655) (abandonment leaks), [#2656](https://github.com/s8lap/bezel-lang/issues/2656) (coverage gap), [#2660](https://github.com/s8lap/bezel-lang/issues/2660) (nested-literal lowering gap); pre-existing: [#2332](https://github.com/s8lap/bezel-lang/issues/2332) (the parked general question) |
 | **Target module(s)** | **spec** — §28 preamble, §28.2/§28.12 (backstop clause), §28.3 (K1.6, unbound temporaries), §15.4 (the literal-tree ownership rule replaces the trivial-producer carve-out), §17.13, §22.5, §28.6 (three ambiguity resolutions), §28.9 (the defining subsection), §28.11 (wording + one sentence), §30.14 (moved-obligation clause), Appendix C.3, and — conditional on Q2 — §2.8.2/§2.8.6/§3.6 (the definition amendment's verdict carriage, delta row, and property-table row); **no grammar change** (Appendix A untouched). **stdlib** — §1, §4.4/§4.17/§4.18/§4.20 (wording; the intrinsic-backing device stated). **rationale** — §5.9 rewrite + a new decision-record subsection; §1/§4 caveats. **guides** — 01 §2 and 05 §1 wording. |
 | **Written against** | spec/stdlib v0.237 |
