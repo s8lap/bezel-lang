@@ -8053,6 +8053,16 @@ private:
     void collectStringReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+    // fix #2696 / §28.1 / §28.9 / §4.6: give every non-nullable `string`
+    // PARAMETER this body ASSIGNS TO an independent +1 at bind, so the
+    // drop-on-overwrite release the assignment emits consumes THIS frame's
+    // reference instead of the caller's borrow. Call right after
+    // bindParameters, with the body statements and the member's parameter
+    // symbols (see the .cpp for the full argument).
+    void retainAssignedStringParams(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body,
+        const std::vector<sema::Symbol*>& params);
+
     // fix #2115 / §28.9 / §35.4: the set of `var` value-like choice LocalDecl
     // nodes whose initializer is a choice construction every string payload arg
     // of which is a +1 producer or a literal, AND a conservative whole-body walk

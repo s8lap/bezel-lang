@@ -6142,6 +6142,12 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     } else {
         bindParameters(fn, /*hasThis=*/!isStaticMethod(ms), &ms->params);
     }
+    // fix #2696 / §28.1 / §28.9: an ASSIGNED-TO `string` parameter's slot must
+    // own an independent +1, or the assignment's drop-on-overwrite release
+    // frees the CALLER's borrow (a use-after-free). Block bodies only — an
+    // expression body has no assignment statement.
+    if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts)
+        retainAssignedStringParams(*ci.stmts, ms->params);
 
     // §28.2 v0.134 / issue #601: checked disposal mode guard.
     // For every instance method of a class (not static, not the entry point,
@@ -7278,6 +7284,12 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     moveOnlyArrayTransferredFn_ = fn;
     collectMoveOnlyArrayTransferred(cd->body);  // §15.3 (#747)
     bindParameters(fn, /*hasThis=*/true, &cs->params);
+    // fix #2696: NO retainAssignedStringParams call here, deliberately. A
+    // COMPILED constructor never sets stringReleaseEligibleFn_, so both
+    // drop-on-overwrite releases are gated OFF in its body and `s := s + "-x"`
+    // is a plain store. Retaining here would mint a +1 that pairs nothing — a
+    // leak per constructor call. The retain belongs where the release actually
+    // fires, which for constructor bodies is the INLINE path (inlineCtorBody).
 
     // §22.16 (v0.203, #2053): a constructor's `requires` clauses evaluate
     // AFTER argument binding completes and BEFORE any of the member's own
@@ -8268,6 +8280,20 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
     auto* cd = dynamic_cast<const ast::ConstructorDecl*>(cs->decl);
     if (!cd) return;
     currentThis_ = obj;
+    // fix #2696 / §28.1 / §28.9: an INLINED constructor body is lowered into the
+    // ENCLOSING function — this function never touches currentFn_ — so when the
+    // enclosing body is the analyzed one, `currentFn_ == stringReleaseEligibleFn_`
+    // still holds and the drop-on-overwrite release DOES fire for `s := s + "-x"`
+    // on the constructor's own `string` parameter. Without a compensating retain
+    // that releases the caller's borrow: the #2696 use-after-free, reached through
+    // `new Box<int>($"v-{i}", i)` (the generic-class inline path). Its callers have
+    // already bound the parameters into paramSlots_ (this function's documented
+    // precondition), which is what the retain reads. Emitted before the chain call
+    // and the body, so it dominates every assignment. When the enclosing body is
+    // NOT the analyzed one — an inlined constructor inside a COMPILED constructor,
+    // via the chain-call path — the helper's own co-gate makes this a no-op,
+    // exactly as the release is a no-op there.
+    retainAssignedStringParams(cd->body, cs->params);
 
     // §22.9 step 1 (v0.181): run the leading chain (base/this) — recursively
     // inlining a generic base/sibling ctor — BEFORE installing this class's
@@ -14017,6 +14043,141 @@ void Emitter::armStringLocalRefcount(const void* declNode,
         Disposal d{slot, nullptr};
         d.stringRelease = true;
         disposeStack_.back().push_back(d);
+    }
+}
+
+
+// fix #2696 / §28.1 / §28.9 / §4.6 (v0.240): a non-nullable `string` PARAMETER
+// that this body ASSIGNS TO is retained at bind, so its slot owns an
+// INDEPENDENT +1 — exactly the treatment armStringLocalRefcount (above) gives a
+// BORROW-initialized string local.
+//
+// WHY IT IS NEEDED. lowerStringLocalReassign (`s := e`) and the §4.6 `s += e`
+// path both emit a drop-on-overwrite `bz_string_release` of the value they
+// displace, and both admit a PARAMETER target: their gate is localSlot(), which
+// resolves a ParameterSymbol through paramSlots_ (LlvmBackend_Layout.cpp). That
+// release is correct for a LOCAL, whose slot was given a +1 at bind (a producer
+// transferred, a borrow retained — armStringLocalRefcount). A PARAMETER's slot
+// was given NOTHING: §28.1 "Where the `owned` modifier can appear" — "On any
+// other type — a primitive, `string`, a function type, an ordinary record, an
+// enum, a non-owning inline array, or the unit type — `owned` is a compile
+// error: such values carry no disposal obligation to transfer (§28.9)" — so a
+// `string` parameter is ALWAYS an unmodified borrow whose single reference
+// belongs to the CALLER. The first assignment therefore released a reference
+// this frame never owned, freeing the caller's string under it: a
+// use-after-free from ordinary code (`s := s + "-x";` — #2696, and #2689's
+// recorded residual).
+//
+// WHY A RETAIN AND NOT A SUPPRESSION. Deleting the release instead would leak
+// the displaced value on EVERY assignment (unboundedly in `while … do s += t;
+// end`). Retaining once at bind leaks at most one reference per CALL, and it is
+// PURELY ADDITIVE to the emitted refcount traffic: adding a retain can convert a
+// crash into a leak but can never create an over-release. That is the whole
+// safety argument for doing this in one lane.
+//
+// WHAT IS STILL NOT BALANCED, DELIBERATELY. No scope-end release is registered
+// for the parameter slot, so its final value leaks (one string per call). A
+// scope-end release would need the parameter to be proven non-escaping, and the
+// escape machinery does not see parameters at all: collectStringReleaseEligible
+// collects `const ast::LocalDecl*` candidates only, and armStringLocalRefcount —
+// the sole registrar of a scope-end Disposal{stringRelease} — is reached only
+// from lowerLocalDecl. A parameter is in NONE of stringBorrowAll_ /
+// stringReleaseEligible_ / stringBorrowRetainEligible_, so nothing about it is
+// suppressed and nothing is inherited: #2689's borrow premise for a captured
+// parameter still holds, and its per-capture retain stays independent of this
+// one. Adding the release without that analysis would fight the envdtor releases
+// of a captured parameter's cell — a double-free. A bounded leak is the correct
+// trade (see the follow-up issue).
+//
+// SCOPE. Assignments nested in if/while/for/do/try/case bodies count (the walk
+// below mirrors collectStringReleaseEligible's). An assignment that appears only
+// inside a LAMBDA body is deliberately NOT counted: the retain would fire once
+// per call while the lambda's release fires once per lambda INVOCATION, so it
+// would not balance anyway; that shape keeps today's behavior unchanged. A
+// CONDITIONAL assignment retains unconditionally — if the branch is not taken
+// the +1 leaks (safe). `ref`/`out` string parameters are excluded: they alias
+// the caller's slot, which genuinely owns its value, and their store goes
+// through lowerStringRefParamStore (#2321), whose release-old is correct.
+void Emitter::retainAssignedStringParams(
+    const std::vector<std::unique_ptr<ast::Stmt>>& body,
+    const std::vector<sema::Symbol*>& params) {
+    // 0. CO-GATE WITH THE RELEASE. Both drop-on-overwrite releases this retain
+    //    pairs are gated on `currentFn_ == stringReleaseEligibleFn_`
+    //    (LlvmBackend_Stmts.cpp — the `:=` call site, which is the ONLY caller
+    //    of lowerStringLocalReassign, and the §4.6 `+=` branch's `isLocal`).
+    //    `stringReleaseEligibleFn_` is assigned in exactly ONE place in the
+    //    backend, emitFunctionBody, so the gate is FALSE in any body lowered
+    //    outside it — a compiled constructor (emitConstructorBody sets
+    //    currentFn_ but not this token), an async/iterator/generic-
+    //    specialization body, a lambda body. There the assignment is a plain
+    //    store that releases nothing, and a retain would mint a +1 pairing
+    //    NOTHING — a leak this fix would have INTRODUCED. Agreement between the
+    //    retain and release predicates is the invariant (the same one #2689
+    //    states for its capture retain vs the envdtor release); this line is
+    //    what enforces it, and it is why the retain can be requested from the
+    //    inline-constructor path without auditing that path's callers.
+    if (currentFn_ != stringReleaseEligibleFn_) return;
+    // 1. Candidates: by-value, non-nullable `string` parameters with a slot.
+    std::unordered_set<const sema::Symbol*> candidates;
+    for (sema::Symbol* s : params) {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(s);
+        if (!ps) continue;
+        if (isByRefMod(ps->modifier)) continue;  // aliases the caller's slot
+        const sema::TypeRef* ty =
+            ps->resolvedDeclType
+                ? ps->resolvedDeclType
+                : (ps->declType ? ctx_.resolvedType(*ps->declType) : nullptr);
+        if (!isStringTypeRefNonNull(ty)) continue;
+        if (paramSlots_.find(s) == paramSlots_.end()) continue;
+        candidates.insert(s);
+    }
+    if (candidates.empty()) return;
+
+    // 2. Does the body assign to one? Both `:=` and the compound forms count —
+    //    they are one AssignmentStmt node (op) and BOTH release the displaced
+    //    value (LlvmBackend_Setup.cpp lowerStringLocalReassign / the §4.6
+    //    string `+=` branch in LlvmBackend_Stmts.cpp).
+    std::unordered_set<const sema::Symbol*> assigned;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            if (auto* id =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get()))
+                if (sema::Symbol* sym = ctx_.exprSymbol(*id))
+                    if (candidates.count(sym)) assigned.insert(sym);
+        }
+        // Mirrors collectStringReleaseEligible's recursion (NOT into lambdas).
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+
+    // 3. Mint the frame's own reference. Emitted in the prologue, where the
+    //    builder still sits in the entry block right after bindParameters
+    //    stored the incoming argument. bz_string_retain is null-safe and a
+    //    no-op on a literal/sentinel, so a `null`-ish or constant-folded
+    //    argument costs nothing.
+    for (const sema::Symbol* sym : assigned) {
+        llvm::AllocaInst* slot = paramSlots_[const_cast<sema::Symbol*>(sym)];
+        if (!slot) continue;
+        emitStringRetain(builder_.CreateLoad(ptrTy(), slot, "str.parm"));
     }
 }
 
