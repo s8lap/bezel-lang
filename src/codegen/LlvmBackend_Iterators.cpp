@@ -1413,9 +1413,43 @@ void Emitter::emitIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn,
             // defensive null on the exhaustion path covers manual-protocol usage
             // where MoveNext returning false without a prior TakeCurrent is
             // possible (e.g. zero-element owning iterator, or skip pattern).
+            // fix #2616 / §29.1 (v0.236): the null must be preceded by a
+            // DISPOSE. Under the §29.1 owning contract ownership transfers to
+            // the consumer only at TakeCurrent, so a NON-NULL current_val here
+            // is a value the consumer never took — the enumerator still owns
+            // it, and nulling the only reference leaked it. This is reachable
+            // exactly on manual-protocol abandonment (`en.MoveNext()` without a
+            // matching `en.TakeCurrent()`, then driving on to exhaustion); the
+            // dominant `for var x in src` desugaring takes every value, so
+            // current_val is null here and the branch below is a no-op.
+            //
+            // Exactly-once, not a double-free: the abandon-then-Dispose path
+            // (disposeYieldedVal, below) is the same dispose-then-null under
+            // the same null guard, so after this runs its load sees null and
+            // no-ops. TakeCurrent is the only other reader and raises §29.1's
+            // InvalidOperationException on null (unchanged: after exhaustion it
+            // already saw null). The BORROWING head is untouched — this branch
+            // is gated on isOwningIter, and the `elemIsOwnedClass` block just
+            // above (mutually exclusive with isOwningIter by construction,
+            // since elemIsOwnedClass is only set when retName is neither owning
+            // head) keeps its owned-flag-gated behaviour.
             if (isOwningIter && elemTy->isPointerTy()) {
                 llvm::Value* cvField = builder_.CreateStructGEP(
                     stateStructTy, self, CURRENT_VAL_FIELD);
+                llvm::Value* pend =
+                    builder_.CreateLoad(elemTy, cvField, "ity.pend");
+                llvm::Value* pendNull = builder_.CreateICmpEQ(
+                    pend, llvm::ConstantPointerNull::get(ptrTy()),
+                    "ity.pendnull");
+                auto* dispBB = llvm::BasicBlock::Create(
+                    llvm_, "ity.pend.disp", moveNextFn);
+                auto* contBB2 = llvm::BasicBlock::Create(
+                    llvm_, "ity.pend.cont", moveNextFn);
+                builder_.CreateCondBr(pendNull, contBB2, dispBB);
+                builder_.SetInsertPoint(dispBB);
+                emitDisposeAndReclaim(pend);
+                builder_.CreateBr(contBB2);
+                builder_.SetInsertPoint(contBB2);
                 builder_.CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy()), cvField);
             }
