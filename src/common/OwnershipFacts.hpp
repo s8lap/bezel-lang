@@ -326,11 +326,20 @@ bool isBuiltinOwnedMaterializerCall(const ast::CallExpr& call,
 //       sema accepts — which leaves the single-element read `arr[i]` alone; it
 //       is §28.3's *indexer* row, a Borrow, which §21.1 admits verbatim;
 //   (c) sema in fact typed the whole index expression as the receiver's OWN
-//       TypeRef object. That pointer identity is unique to the range-slice arm:
-//       every other IndexExpr arm sets a DIFFERENT TypeRef (an element, a
-//       dictionary value, a primitive), and no TypeRef can be its own generic
-//       argument. It is what keeps a `Span<Array<int>>` element read — whose
-//       result head is a declaration-less `Array` too — out of this predicate.
+//       TypeRef object. ⚠ NARROWLY: within the receiver family (a) selects —
+//       Named, declaration-less, head `Array` — that arm is the only one storing
+//       `tt` itself; every other arm there stores `tt->genericArgs[0]` or `[1]`,
+//       which cannot alias `tt`. It is NOT unique across ALL IndexExpr arms: an
+//       earlier draft claimed that, and it is FALSE, because
+//       `SemaContext::primitiveTypeRef` is an INTERN TABLE (SemaContext.hpp
+//       :655-666, primitiveCache_ at :569) — so the STRING range-slice arm
+//       (ExprTypecheck_Exprs.cpp:1491-1494) also stores a pointer frequently
+//       identical to its receiver's exprType. That collision is harmless only
+//       because (a) rejects a `string` receiver as Kind::Primitive before this
+//       check runs, and it is DATA-DEPENDENT (an explicitly annotated
+//       `var s: string` mints a fresh TypeRef and does NOT collide). Anyone
+//       relaxing (a) — to cover `string` slices, or to widen the head test —
+//       must not inherit the false invariant.
 //
 // All three are AND-ed and every one of them FAILS OPEN: a shape this cannot
 // type, or one sema types differently than the mirror expects, is ACCEPTED, not

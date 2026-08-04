@@ -442,14 +442,22 @@ bool isBuiltinArrayRangeSliceIndex(const ast::IndexExpr& ix,
             return false;
     }
     // (c) And sema must in fact have typed the whole index expression as the
-    // RECEIVER'S OWN TypeRef object. That pointer identity is the range-slice
-    // arm's signature — it is the only IndexExpr arm that writes `tt` itself
-    // rather than a derived TypeRef (an element `tt->genericArgs[0]`, a
-    // dictionary value `tt->genericArgs[1]`, an inline-array element, a
-    // primitive), and no TypeRef can be its own generic argument. This is what
-    // excludes an element read of a `Span<Array<int>>`, whose result head is a
-    // declaration-less `Array` too but is a DIFFERENT object from the span's
-    // TypeRef. It is a cross-check on (a)+(b), not a substitute: if sema ever
+    // RECEIVER'S OWN TypeRef object. WITHIN the receiver family (a) selects
+    // — Named, declaration-less, head `Array` — that is the range-slice arm's
+    // signature: it is the only arm there writing `tt` itself rather than a
+    // derived TypeRef (`tt->genericArgs[0]` / `[1]`), which cannot alias `tt`.
+    // ⚠ NOT unique across ALL IndexExpr arms: primitiveTypeRef is INTERNED, so
+    // the string range-slice arm collides too — harmless only because (a)
+    // rejects a Kind::Primitive receiver first. See the header.
+    //
+    // ★ The real work (c) does is NOT excluding a `Span<Array<int>>` element
+    // read — (a) already gates on the RECEIVER's head, so a span receiver never
+    // reaches (c). It is that sema tests the Range index by SYMBOL IDENTITY
+    // (`it->declaration == builtinClassSym("Range")`, ExprTypecheck_Exprs.cpp
+    // :1574) while (b) below tests by NAME STRING — so (b) is strictly WIDER
+    // than sema's arm, and a USER type named `Range` passes (b) but not sema.
+    // (c) catches exactly that, failing open. Load-bearing; the earlier stated
+    // reason was wrong. It is a cross-check on (a)+(b), not a substitute: if sema ever
     // stops setting this arm's type by identity the predicate goes SILENT
     // (accepting), never over-wide.
     return ctx.exprType(ix) == rt;
