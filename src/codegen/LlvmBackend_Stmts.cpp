@@ -2293,8 +2293,24 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // statement, 'end of the full expression' and 'end of the statement'
         // coincide"). Free it here, exactly as the §17.13 discard spelling of
         // the same statement does — this branch is a verbatim copy of the
-        // DiscardStmt::disposeOwnedValue branch below, keyed to the flag the
-        // ownership pass sets under the identical producerState == Owned gate.
+        // DiscardStmt::disposeOwnedValue branch below, but the FLAG IT READS IS
+        // SET ELSEWHERE: sema sets it inside §21.9's own walk
+        // (src/sema/ExprTypecheck.cpp, the single setter), NOT the ownership
+        // pass, and NOT under `producerState == Owned`.
+        //
+        // ⚠ That distinction is the whole correctness argument, so do not
+        // "simplify" it back. An earlier draft did key on the ownership pass's
+        // `producerState == Owned`, which is far WIDER than §21.9's rejection —
+        // it also admits unannotated static factories, imported `owned` returns
+        // (§21.9's dynamic_cast yields null for a null ms->decl), extern/FFI,
+        // function-value calls, Deserialize/TakeCurrent, `await` Pattern B,
+        // operator overloads, `??`, arm-meet and `move x`, and §21.9 further
+        // requires !nullable && kind == Class. Under that gate this arm ran USER
+        // DESTRUCTOR CODE at end of statement, contradicting §28.9's "runs no
+        // user code" and proposal 0077 §2.2 (demonstrated: the destructor ran).
+        // Deriving the flag inside §21.9's walk makes the freed set a strict
+        // subset of what §21.9 inspected and declined to reject, so the two
+        // cannot disagree by construction.
         // Before this, the value was produced and dropped on the floor with no
         // free emitted anywhere and no diagnostic (§21.9 hard-errors only the
         // non-trivial-dispose case), so every bare trivial `new` leaked.
@@ -2303,10 +2319,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             // `ownedProduced` shapes — `new`, an `owned`-returning user call, an
             // owning-collection drain — never a borrow), so it is freed EXACTLY
             // once: no leak, no double-free. dynamicDispose dispatches
-            // Dispose+reclaim through the object's own vtable, null-guarded; the
-            // class is trivial-dispose (sema's gate), so that disposer runs no
-            // user code — precisely §28.9's "mechanism … that runs no user
-            // code".
+            // Dispose+reclaim through the object's own vtable, null-guarded.
+            //
+            // Scope of the trivial-dispose claim, stated precisely: §21.9's walk
+            // classifies the STATIC type, while the dispatch is through the
+            // object's vtable, so two shapes can still reach a user destructor —
+            // a factory returning `owned Base` whose runtime value is a
+            // destructor-bearing `Derived`, and a class made non-trivial by an
+            // owning-inline-array field (`[N owned]T`), which the walk does not
+            // detect because it tests only `fs->modifiers` for "owned", never the
+            // field's type. Neither is unsound: the value is the sole owner and
+            // §28.3 K8.1 mandates the reclaim, and the already-shipped `_ := …`
+            // spelling has no trivial-dispose gate at all, so this arm is
+            // strictly narrower than a path live since #1009. It is only the
+            // "runs no user code" phrasing that would overclaim.
             //
             // ORDER MATTERS: lower the expression FIRST, in the enclosing block
             // scope, and only THEN open the one-entry dispose scope. Opening it

@@ -26,12 +26,22 @@
 // cosmetic discard sink — has been freed since #1009, while the bare spelling
 // leaked.
 //
-// Fix: `ast::ExpressionStmt::disposeOwnedValue`, set by the ownership pass
-// under the byte-identical gate #1009's discard path uses (producerState ==
-// Owned + a user Class/Interface with a real decl), consumed by a codegen arm
+// Fix: `ast::ExpressionStmt::disposeOwnedValue`, set by SEMA inside §21.9's
+// OWN WALK (src/sema/ExprTypecheck.cpp -- the single setter), NOT by the
+// ownership pass and NOT under `producerState == Owned`, consumed by a codegen arm
 // that is a verbatim copy of the DiscardStmt::disposeOwnedValue arm (one-entry
 // dispose scope -> both edges; `dynamicDispose` dispatches Dispose+reclaim
 // through the object's own vtable, null-guarded). The two spellings now agree.
+//
+// SCOPE (why the freed set is safe): the flag is derived from §21.9's own
+// trivial-dispose verdict, so the freed set is a STRICT SUBSET of what §21.9
+// inspected and declined to reject -- the two cannot disagree by construction,
+// and they widen together when #2680 lands. An earlier draft keyed on the
+// ownership pass's `producerState == Owned`, which is far wider than §21.9's
+// rejection and therefore ran USER DESTRUCTOR CODE at end of statement
+// (demonstrated, and pinned by
+// non_trivial_producer_outside_spec_21_9_keeps_its_destructor_unrun below).
+// Do not re-derive the gate from the paragraph that follows.
 //
 // SOLE-OWNER PROOF (why this cannot double-free): `producerState == Owned`
 // admits ONLY a fresh production — a `new`, an `owned`-returning call, a `move`
