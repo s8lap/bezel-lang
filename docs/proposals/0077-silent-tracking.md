@@ -125,7 +125,7 @@ The audit found seven sites where the current text does not decide what tracking
 
 ## 10. Questions for the owner
 
-- **Q1** — §4: `Add`-position fresh trivial nodes: option (i) uniform admission as recorded hazard (recommended) or (ii) rejection?
+- **Q1** — §4: `Add`-position fresh trivial nodes: option (i) uniform admission as recorded hazard (recommended, **with the targeted lint on**: rejection cannot be scoped by signature — `coll.Add(new X())` and `sink.Consume(new X())` are indistinguishable plain-parameter calls — and the lint is the ceremony exemption's counterpart, restoring a signal at the one shape where silence hides a statically-certain dangle; recorded follow-on: the same lint would serve the non-trivial #1813 shape) or (ii) rejection?
 - **Q2** — §5 c1: amend the trivial-dispose definition to disregard `owned` fields of trivial-dispose type (recommended, costs stated), or accept the wrapper-type flip?
 - **Q3** — §3.4: per-aggregate conservative freeze granularity (recommended), or demand per-node tracking from the start?
-- **Q4** — §9: land stage 2's independent bug fixes (#2654, #2655, #2660) ahead of the stage-1 docs revision, or hold them to ship together?
+- **Q4** — §9: land stage 2's independent bug fixes (#2654, #2655, #2660) ahead of the stage-1 docs revision, or hold them to ship together? **Recommended: land all three now.** #2654/#2660 are conformance bugs identical under every ruling. #2655's literal-element fix (free the elements with the receiving binding) is a conforming implementation of *both* readings: the literal-tree semantics under this proposal, and a legal choice of the current spec's implementation-defined mechanism — today's sema already rejects every escape, so no accepted program can observe the free, which is the spec's own "invisible to programs" condition. Stage 1 then documents semantics the implementation already exhibits. #2656's escape pin rides the #2654 lane.
