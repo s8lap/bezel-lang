@@ -1633,9 +1633,49 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // §3.3 (#883): ReadOnlyStringSpan[i] → char (the i-th code
                     // point of the viewed range). Non-generic, so its element
                     // type is the fixed `char` primitive (not genericArgs[0]).
-                    else if (cn == "ReadOnlyStringSpan")
+                    else if (cn == "ReadOnlyStringSpan") {
+                        // §7 / stdlib §3.3 (#2613): stdlib §3.3 line 1321
+                        // declares the indexer `public property [i: int]: char`
+                        // — a single NON-nullable `int` index, and the only
+                        // indexer form the record declares (no Range overload).
+                        // The builtin has no PropertySymbol (ReadOnlyStringSpan
+                        // resolves to a synthetic Named TypeRef with a null
+                        // declaration, which is why this branch types the result
+                        // by hand), so nothing on the IndexExpr path ever ran
+                        // checkAssignable on the index — an un-narrowed `int?`
+                        // was silently accepted by sema and reached codegen,
+                        // where the indexer lowering truncated the `{ i8, i32 }`
+                        // nullable-value struct to `i32` and failed
+                        // verifyModule ("Trunc only operates on integer"). Same
+                        // §7 hole #2601 closed for `Slice` on the CallExpr path
+                        // (checkBuiltinSpanCallArgs), on the IndexExpr path.
+                        //
+                        // The check is deliberately gated to a NULLABLE index
+                        // type: this fix is scoped to the §7 nullable ->
+                        // non-nullable conversion #2613 reports, and gating it
+                        // that way makes a false reject of some other index
+                        // spelling structurally impossible (a non-nullable
+                        // index of any kind is left exactly as it was). A
+                        // NARROWED `int?` stays accepted — the §7.4 narrowing
+                        // exception lives inside checkAssignable, which this
+                        // reuses — and a `ref`/`out`-modified or discard index
+                        // is skipped, mirroring the CallExpr gates' guard.
+                        if (ix->indices.size() == 1 && ix->indices[0].value &&
+                            !ix->indices[0].isDiscard &&
+                            ix->indices[0].modifier.empty()) {
+                            TypeRef* idxTy =
+                                ctx_.exprType(*ix->indices[0].value);
+                            if (idxTy && idxTy->nullable)
+                                checkAssignable(
+                                    idxTy,
+                                    ctx_.primitiveTypeRef(PrimitiveType::Int),
+                                    ix->indices[0].value->span.begin,
+                                    "index argument to `ReadOnlyStringSpan[i]`",
+                                    ix->indices[0].value.get());
+                        }
                         ctx_.setExprType(
                             &e, ctx_.primitiveTypeRef(PrimitiveType::Char));
+                    }
                     // #794 / §14.2 + §23.4: `x[i]` where `x` has the type of a
                     // bare generic parameter `T` constrained `where T: IIndexable`
                     // and the constraint interface declares an indexer. The stdlib
