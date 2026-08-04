@@ -9547,6 +9547,20 @@ private:
 
     llvm::Value* lowerNew(const ast::NewExpr& ne);
 
+    // fix #2722 / stdlib §4.8/§4.9/§4.10 (v0.240): diagnose the hash-collection
+    // `IEqualityComparer` constructors, which lowerNew's Set and Dictionary arms
+    // previously accepted and then silently DROPPED (building the table with the
+    // default content-based trampolines, so a supplied comparer never
+    // participated). `sec` is the stdlib section that declares the overload for
+    // `colName`. The declaring section is derived from `colName` inside (§4.10
+    // covers Set and OwningSet together; the dictionary pair splits into §4.8 and
+    // §4.9), so the two dictionary names cannot collapse onto one citation.
+    // Returns true when it reported, so the caller can stop rather than fall
+    // through into the array arm (which would read the comparer as a capacity and
+    // emit malformed IR); the diagnostic is what fails the compile.
+    bool rejectUnimplementedComparerCtor(const ast::NewExpr& ne,
+                                         std::string_view colName);
+
     // CG8: address of a field access `obj.f`. Returns the GEP pointer and
     // sets `elemTy` to the field's type. Null if `ma` isn't a field
     // access we can lower. #1039: when `outRecvPtr` is non-null and the

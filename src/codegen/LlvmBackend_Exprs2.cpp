@@ -2660,6 +2660,160 @@ llvm::Value* Emitter::lowerExceptionInfoField(const ast::Expr& target,
 }
 
 
+// fix #2722 / stdlib §4.8/§4.9/§4.10 (v0.240).
+//
+// WHY A DIAGNOSTIC AND NOT AN IMPLEMENTATION. The comparer overloads ARE
+// specified — §4.10 declares two of them on `Set<T>` and on `OwningSet<T>`,
+// §4.8/§4.9 the same pair on `Dictionary<K, V>`/`OwningDictionary<K, V>`, and
+// §4.8's "Stability while stored" paragraph names "the collection's
+// `IEqualityComparer` (hash forms)" as what governs lookup — so this is NOT the
+// #2693 `OwningLinkedList<T>(source)` case of an unspecified form invented by
+// codegen. It is nonetheless deferred rather than implemented here, for two
+// reasons that are recorded so the decision can be revisited. Both are purely
+// MECHANICAL — no design question is open, and an implementer should not go
+// looking for a ruling (see the note after them):
+//
+//  1. The runtime table has nowhere to put a comparer. `bz_dict_alloc_generic`
+//     (bezel_runtime_collections.cpp:719) takes bare
+//     `uint64_t (*)(const void*)` / `bool (*)(const void*, const void*)`
+//     function pointers with NO user-data parameter, and `bz_dict_t`
+//     (bezel_runtime_collections.cpp:369) has no context field. Threading an
+//     instance through means widening the struct and all eight `hash_fn`/`eq_fn`
+//     call sites, plus the dict→dict clone at :1298 — a runtime change, not a
+//     codegen one.
+//  2. Dispatching to the comparer from a trampoline is not yet safe. The
+//     existing builders (buildValueHashTrampoline / buildValueEqTrampoline,
+//     LlvmBackend_Calls3.cpp:393/440) save only the insert point and
+//     `currentFn_`; they do not reset `propagateBB_`/`unwindTarget_`/
+//     `disposeStack_`. An interface call goes through `emitMethodCall`, which
+//     calls `emitPendingCheck()` and would splice unwind edges belonging to the
+//     ENCLOSING user function into the trampoline. The iterator/async lowerers
+//     show the required reset idiom, but adopting it here is its own change.
+//
+// THE COMPARER'S LIFETIME IS ALREADY SETTLED — do not treat it as an open
+// question. An earlier draft of this comment listed it as a third, blocking
+// reason (that holding a borrowed comparer for the collection's whole life
+// needed a ruling). That was wrong and is withdrawn: the stdlib's own reference
+// implementation of `OwningDictionary<K, V>` declares `private _comparer:
+// IEqualityComparer<K>;` — an unmarked, i.e. BORROWING, field held for exactly
+// that lifetime — and calls `_comparer.Equals(...)` from inside `Add`
+// (Bezel_Standard_Library.md:2040 and :2057/:2083), and spec §9.7 confirms a
+// direct class-typed borrow field is a supported, statically checked construct.
+// The borrow reading is therefore already modelled normatively; implement it
+// rather than seeking a new ruling or proposing a stdlib amendment.
+//
+// Sema already records the same deferral in prose (SemaContext.hpp: "the
+// Dictionary/Set comparer-constructor overloads that would *consume* one are a
+// separate, still-deferred feature"). What was missing is that the deferral was
+// SILENT: codegen accepted the call and produced a wrong answer. Per the #511
+// `GetType` precedent, make it loud instead.
+//
+// SortedSet (§4.18) / SortedDictionary (§4.17) are deliberately NOT covered:
+// §4.17 states they order by `K`'s `IComparable<K>.CompareTo` and that "there is
+// no separate comparer parameter", so what a comparer argument means there is a
+// different question, filed rather than answered here.
+bool Emitter::rejectUnimplementedComparerCtor(const ast::NewExpr& ne,
+                                              std::string_view colName) {
+    // The section that DECLARES the overload, per type: §4.10 covers "Set<T> and
+    // OwningSet<T>" together, but the dictionary pair is split — §4.8 is
+    // `Dictionary<K, V>` and §4.9 is `OwningDictionary<K, V>`. Deriving it here
+    // rather than taking it from the call site is what keeps the two dictionary
+    // names from collapsing onto one section.
+    const char* sec = nullptr;
+    if (colName == "Set" || colName == "OwningSet")   sec = "§4.10";
+    else if (colName == "Dictionary")                 sec = "§4.8";
+    else if (colName == "OwningDictionary")           sec = "§4.9";
+    else return false;
+    if (ne.args.empty() || !ne.args[0].value) return false;
+    // Which forms carry a comparer: `(capacity, comparer)` is the only
+    // two-argument constructor either family declares, and a lone argument is
+    // the comparer form exactly when it is not the `capacity: int` overload.
+    //
+    // POLARITY. The discriminator mirrors the negative-capacity guard's
+    // non-nullable-int test, and — deliberately — mirrors its behavior on an
+    // UNKNOWN argument type too: a null `exprType` counts as NOT the comparer
+    // form, so it is skipped rather than rejected. Inverting that (treating
+    // unknown as a comparer) would turn any argument sema could not type into a
+    // hard error on a program that compiles today, and a false reject is worse
+    // than the silent drop this guard exists to catch — the drop is merely the
+    // pre-existing status quo for such an argument.
+    //
+    // WIDTH. The capacity form is every non-nullable integral primitive that
+    // spec §5.1 (v0.240) IMPLICITLY converts to `int`, not `int` alone:
+    //
+    //     sbyte -> short, int, long, …          byte  -> short, ushort, int, …
+    //     short -> int, long, …                 ushort -> int, uint, long, …
+    //     char  -> int, uint, long, …
+    //
+    // so `var b: byte := 8; new Set<int>(b)` is a well-typed call against the
+    // declared `constructor(capacity: int)`. Matching on `Int` alone classified
+    // it as the comparer form and hard-rejected a program that compiles today —
+    // a false reject carrying a WRONG explanation, which is the worse half.
+    // Nothing upstream rescues it: the builtin collections have
+    // `declaration == nullptr` so sema's `checkNewExprArgs` never runs, and
+    // `exprType` reports the argument's NATURAL type, never a target-converted
+    // one, so the widening is invisible here unless it is spelled out.
+    //
+    // `uint`, `long` and `ulong` are deliberately NOT accepted: §5.1's
+    // never-implicit list covers signed/unsigned of the same or narrower width
+    // and every narrowing, so none of them converts to `int` AS A RUNTIME VALUE.
+    // They stay on the comparer side, where the pre-existing negative-capacity
+    // guard also ignores them.
+    //
+    // ⚠ That is true of the IMPLEMENTATION, not of the spec. §5.1's *Constant
+    // narrowing* clause (spec line 667) also lets a compile-time CONSTANT of
+    // integer type convert to any integer type whose range contains its value,
+    // so `const N: long := 8; new Set<int>(N)` is a well-typed capacity call by
+    // the spec and is rejected here. It is not a live regression: sema
+    // implements constant narrowing only when the source's static type is
+    // exactly `Int`, and never *to* `Int`, so the compiler already rejects that
+    // conversion everywhere — this predicate merely inherits the existing gap
+    // rather than widening it. Filed separately; if sema ever gains the spec's
+    // full constant-narrowing rule, this set must widen with it.
+    //
+    // NULLABILITY is deliberately NOT tested. §7.4/§12.7 flow narrowing (#914)
+    // proves a nullable value non-null in value position, and
+    // ExprTypecheck.cpp's implementation says verbatim that it treats the
+    // narrowed source as non-nullable "WITHOUT rewriting its exprType" — so
+    // `var n: int? := 8; if n is not null then new Set<int>(n)` still reports
+    // `nullable == true` here, and a `!nullable` conjunct rejected a program
+    // that compiles and runs correctly (arg 0 was simply never lowered on the
+    // capacity path — capacity is only a hint). Dropping the conjunct cannot
+    // re-open the silent drop this guard exists to catch: `IEqualityComparer<T>`
+    // is an INTERFACE, hence `Kind::Named`, while every capacity primitive is
+    // `Kind::Primitive` — the two sets are disjoint by construction, nullable or
+    // not. The pre-existing negative-capacity guards keep their own `!nullable`
+    // test, which is theirs to keep: they must LOWER the argument, and a
+    // tagged-optional slot is not an i64.
+    auto isCapacityPrimitive = [](sema::PrimitiveType p) {
+        switch (p) {
+            case sema::PrimitiveType::SByte:
+            case sema::PrimitiveType::Byte:
+            case sema::PrimitiveType::Short:
+            case sema::PrimitiveType::UShort:
+            case sema::PrimitiveType::Char:
+            case sema::PrimitiveType::Int:
+                return true;
+            default:
+                return false;
+        }
+    };
+    bool comparerForm = ne.args.size() >= 2;
+    if (!comparerForm) {
+        const sema::TypeRef* a0ty = ctx_.exprType(*ne.args[0].value);
+        comparerForm = a0ty && !(a0ty->kind == sema::TypeRef::Kind::Primitive &&
+                                 isCapacityPrimitive(a0ty->primitive));
+    }
+    if (!comparerForm) return false;
+    ctx_.diagnostics().report(
+        Severity::Error, ne.span.begin,
+        "stdlib " + std::string(sec) + ": the '" + std::string(colName) +
+        "' IEqualityComparer constructor is not yet implemented — the comparer "
+        "would be silently ignored and default equality used instead. Omit it "
+        "and give the element type its own Equals/GetHashCode (spec §8.3).");
+    return true;
+}
+
 llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // §17.7 `new(args)` shorthand: there is no explicit `ne.type` — the target
     // type is inferred from context (the LHS annotation / assignment target) and
@@ -2938,6 +3092,31 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                  // branch lowerNew returned nullptr, leaving the slot uninitialized
                  // — same root cause as #1406 for SortedDictionary.
                  colName == "SortedSet")) {
+                // fix #2722 / stdlib §4.10 (v0.240): the comparer overloads.
+                // §4.10 declares FOUR constructors on `Set<T>` (and the same
+                // four on `OwningSet<T>`):
+                //     public constructor();
+                //     public constructor(capacity: int);
+                //     public constructor(comparer: IEqualityComparer<T>);
+                //     public constructor(capacity: int, comparer: IEqualityComparer<T>);
+                // The two comparer-bearing forms were lowered by DROPPING the
+                // comparer and building the table with the default content-based
+                // trampolines, so a caller who supplied a comparer precisely
+                // because default equality is wrong for their type silently got
+                // default equality — a wrong answer on a documented API with no
+                // diagnostic. Diagnose it instead, per the #511 `GetType`
+                // precedent (a loud "not yet implemented" beats a silent wrong
+                // value), and see rejectUnimplementedComparerCtor for why this
+                // is a deferral rather than an implementation.
+                // Return on rejection rather than falling through. A
+                // class-element `OwningSet<T>` has a null `genericBackingType`,
+                // so it falls out of this arm into the Array one, which reads
+                // arg 0 as a capacity and emitted `sext ptr to i64` — malformed
+                // IR ("SExt only operates on integer") stacked on top of the
+                // real diagnostic. The compile already fails on the error; a
+                // well-formed null keeps the verifier out of it.
+                if (rejectUnimplementedComparerCtor(ne, colName))
+                    return llvm::ConstantPointerNull::get(ptrTy());
                 // stdlib §1/§4.4 (v0.183, #1396): `Set<T>(capacity: int)` /
                 // `OwningSet<T>(capacity: int)` fault on a negative capacity
                 // rather than silently ignoring it. The first arg is the
@@ -3367,6 +3546,26 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 // leaving the variable slot uninitialized — bz_dict_* calls then
                 // received a zero/i32 receiver and produced malformed IR.
                 colName == "SortedDictionary") {
+                // fix #2722 / stdlib §4.8 (v0.240): the comparer overloads.
+                // §4.8 declares on `Dictionary<K, V>` (and §4.9 the same pair on
+                // `OwningDictionary<K, V>`):
+                //     public constructor(comparer: IEqualityComparer<K>);
+                //     public constructor(capacity: int, comparer: IEqualityComparer<K>);
+                // Both were lowered by DROPPING the comparer — see the §4.10
+                // note in the Set arm above; §4.8's "Stability while stored"
+                // paragraph names "the collection's `IEqualityComparer` (hash
+                // forms)" as governing lookup, so the comparer is normative
+                // rather than advisory and silently ignoring it is a wrong
+                // answer, not a liberty.
+                // Return on rejection rather than falling through. A
+                // class-element `OwningSet<T>` has a null `genericBackingType`,
+                // so it falls out of this arm into the Array one, which reads
+                // arg 0 as a capacity and emitted `sext ptr to i64` — malformed
+                // IR ("SExt only operates on integer") stacked on top of the
+                // real diagnostic. The compile already fails on the error; a
+                // well-formed null keeps the verifier out of it.
+                if (rejectUnimplementedComparerCtor(ne, colName))
+                    return llvm::ConstantPointerNull::get(ptrTy());
                 // stdlib §1/§4.8 (v0.183, #1396): `Dictionary<K,V>(capacity: int)`
                 // / `OwningDictionary<K,V>(capacity: int)` (bare or paired with a
                 // comparer) fault on a negative capacity. The first arg is the
