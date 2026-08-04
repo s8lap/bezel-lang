@@ -3036,11 +3036,23 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
     //
     // Therefore the trunc below may NOT assume an integer, and the explicit
     // `isIntegerTy()` tests are load-bearing rather than defensive: they return
-    // null so the failure stays LOUD (the #2434/#2491 `internal:` note, exactly
-    // the behaviour a Range operand has today) instead of emitting
-    // `trunc {i32,i32} to i32` and truncating a struct — which is the same
+    // null instead of emitting `trunc {i32,i32} to i32` and truncating a struct
+    // into a plausible-looking start index — which is the same
     // silent-wrong-value class this issue is about, one level down. Do not drop
     // them on the assumption that sema has already filtered the operand.
+    //
+    // ⚠ RETURNING NULL IS NOT RELIABLY LOUD, and an earlier version of this
+    // comment claimed it was. The #2434/#2491 `internal:` notes are emitted
+    // ONLY from local-decl-shaped and return-shaped positions —
+    // LlvmBackend_Setup.cpp:9408, LlvmBackend_Stmts.cpp:1909 and :6319,
+    // LlvmBackend_Calls2.cpp:8891, LlvmBackend_Assign.cpp:3472 — and NONE of
+    // them covers an expression-statement or a call-argument position. In those
+    // positions a null simply drops the enclosing statement with no diagnostic
+    // at all and `bezelc` still exits 0, which is exactly the #2312 symptom this
+    // branch was written to fix (`Console.WriteLine(ros.Slice(2).Length…)`
+    // printed nothing). So a null here is the LEAST-BAD available outcome, not a
+    // loud one: it forecloses the miscompile but does not guarantee a
+    // diagnostic. #2662 tracks giving the Range operand a real answer.
     if (m == "Slice" && (call.args.size() == 1 || call.args.size() == 2) &&
         call.args[0].value &&
         (call.args.size() == 1 || call.args[1].value)) {
