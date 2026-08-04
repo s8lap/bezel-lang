@@ -419,8 +419,14 @@ BEZEL_TEST(nested_collection_literal_2660, interior_string_valued_dict_node_no_d
         142);
 }
 
-// ── (c) `for var kv in groups do` binds each interior node to `kv.Value`,
-// which the walk cannot bound — declined. Value: 2 + 1 = 3.
+// ── (c) `for var kv in groups do` binds each interior node to `kv.Value` —
+// declined. Value: 2 + 1 = 3.
+// NB (issue #2711): the REASON changed, the behaviour did not. #2660 declined
+// this because it could not bound the loop VARIABLE at all, so every iterated
+// root was denied; #2711 now bounds the loop variable as a tracked interior
+// alias, and this shape still declines one step later — `kv.Value` is not one of
+// the alias's admitted borrow positions (`Count`/`Length`/`IsEmpty`), so the
+// dictionary-iteration shape keeps leaking by design. Tracked as #2740.
 // per §15.4, §29.1 (issue #2660 self-pass)
 BEZEL_TEST(nested_collection_literal_2660, for_in_over_root_no_uaf) {
     BEZEL_EXPECT_EQ(runValueOnly(

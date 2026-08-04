@@ -17958,6 +17958,15 @@ struct InteriorAliasWalker {
     // DEFAULT-DENY — an unresolved or unrecognised type must answer true. A
     // null callable is treated as "always yes" at every call site.
     std::function<bool(const ast::Expr*)> mayYieldNode;
+    // fix #2711: the loop variables of the `for var x in <root-or-alias>` forms
+    // admitted by stmt()'s ForStmt arm, keyed by the ForStmt the loop variable's
+    // LocalSymbol is anchored on (sema sets `lsym->decl = fs`; §21.4 / §29.2). Live only
+    // for the extent of that loop's body, so an identifier outside it — or one
+    // shadowed by an inner binding, which resolves to a DIFFERENT symbol — is
+    // never mistaken for an alias. Members while live: exactly the values that
+    // alias an interior node of the target tree, held to the same whitelist as
+    // an interior node read out of the root.
+    std::unordered_set<const void*> nodeAliases;
 
     bool isTarget(const ast::Expr* e) const {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -17965,6 +17974,16 @@ struct InteriorAliasWalker {
         auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
         return loc && loc->decl &&
                static_cast<const void*>(loc->decl) == target;
+    }
+
+    // fix #2711: is `e` a bare mention of a live interior-node alias?
+    bool isNodeAlias(const ast::Expr* e) const {
+        if (nodeAliases.empty()) return false;
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return false;
+        auto* loc = dynamic_cast<sema::LocalSymbol*>(ctx.exprSymbol(*id));
+        return loc && loc->decl &&
+               nodeAliases.count(static_cast<const void*>(loc->decl)) != 0;
     }
 
     // Members of the ROOT that cannot yield an interior node. Deliberately
@@ -18004,7 +18023,14 @@ struct InteriorAliasWalker {
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
             // A BARE mention of the root: passed, aliased, returned, captured —
             // the interior nodes go with it. Deny.
-            if (isTarget(id)) safe = false;
+            if (isTarget(id)) { safe = false; return; }
+            // fix #2711: a BARE mention of an interior-node alias (an admitted
+            // loop variable) is the same escape one level down — `return row;`,
+            // `f(row)`, `outer := row`, a capture — and lets the node outlive
+            // the root's scope, which the scope-end interior free would then
+            // dangle. Admissible only where an interior node read out of the
+            // root is: a borrow position that cannot retain it (nodeOk).
+            if (!nodeOk && isNodeAlias(id)) safe = false;
             return;
         }
         if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
@@ -18206,8 +18232,66 @@ struct InteriorAliasWalker {
             return;
         }
         if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
-            // Iterating the root binds each VALUE (an interior node) to the loop
-            // variable, which the walk cannot bound — nodeOk=false denies it.
+            // fix #2711 / §29.1 / §29.2 / §28.11 / §28.9: iterating the root
+            // binds each VALUE (an
+            // interior node) to the loop variable. #2660 could not bound that
+            // binding, so it denied the shape outright with nodeOk=false — and
+            // every interior node of an ITERATED root leaked, `using var` or not
+            // (measured: the whole interior, once per scope entry).
+            //
+            // The iteration ITSELF is not an escape: `for` clones a per-loop
+            // enumerator that BORROWS the backing and whose Dispose frees only
+            // its own struct, never the backing. That premise is normative in
+            // §28.11 ("borrow out (source: the collection)" for default
+            // iteration), §29.1 (`Current` is non-destructive and re-borrows a
+            // borrow-based source) and §29.2 (the desugared `using var __source`
+            // is replaced by a borrow that pins without assuming the obligation)
+            // — NOT in §21.4, which delegates to §29 and says nothing about
+            // borrowing. It is the identical property #1871 /
+            // #2142 rely on to admit a for-in in StringEscapeWalker's
+            // borrowingArrayMode (which is why the root's own reclaim already
+            // fires here). What needs bounding is the loop VARIABLE, and that is
+            // what nodeAliases does: for the body's extent the variable IS an
+            // interior node and is held to the same whitelist as `root[k]`.
+            //
+            // Only a BARE identifier naming the root, or an already-live alias,
+            // is admitted as the iterable. That is not a convenience: any OTHER
+            // iterable that could yield interior nodes must mention the root (or
+            // an alias) in a producing position — `rows[k]`, `rows.Where(..)`,
+            // `rows.Values`, a prior alias binding — and expr() denies every one
+            // of those. So an unadmitted iterable can never put an interior node
+            // into an UNtracked loop variable, and loops over unrelated sources
+            // (`for var i in 0..rows.Count-1`) keep today's behaviour untouched.
+            if (isTarget(fs->iterable.get()) || isNodeAlias(fs->iterable.get())) {
+                // Outside what the paragraph above reasons about, so: deny.
+                // `await for` is a different (async) enumerator + disposal
+                // protocol; a `with` clause introduces a second borrow of the
+                // source; an OWNED iteration variable (§29.2 / §28.3) carries a
+                // per-iteration obligation that is "discharged by the program or
+                // auto-dropped" (§29.2's wording — NOT unconditionally disposed),
+                // so freeing the same node again with the root would risk a
+                // double free; and a nameless loop variable has no symbol to
+                // anchor the alias on.
+                // ⚠ `ownedIterVarAutoDropAtBodyEnd` is a PROXY, not the property
+                // itself: Ownership.cpp sets it only when the obligation reaches
+                // a body-exit edge UNDISCHARGED, so an owned iteration variable
+                // discharged on every path leaves it false. Unreachable today —
+                // §29.1 puts default iteration over an owning collection on the
+                // borrowing path, and isLiteralTreeAggregate rejects owning-family
+                // outers — but it is a proxy and should be replaced if either of
+                // those two facts changes.
+                if (fs->isAwait || fs->withExpr ||
+                    fs->ownedIterVarAutoDropAtBodyEnd || fs->varName.empty()) {
+                    safe = false;
+                    return;
+                }
+                const void* alias =
+                    static_cast<const void*>(static_cast<const ast::Node*>(fs));
+                const bool inserted = nodeAliases.insert(alias).second;
+                stmts(fs->body);
+                if (inserted) nodeAliases.erase(alias);
+                return;
+            }
             expr(fs->iterable.get(), false);
             expr(fs->withExpr.get(), false);
             stmts(fs->body);
