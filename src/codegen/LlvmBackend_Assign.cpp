@@ -3786,8 +3786,20 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     // note there for the reasoning, the +0 call-site contract (the read path at
     // ~line 1598 above hands this call's result straight back as a borrow), and
     // why NULL rather than the indexer's own return node is the right value.
-    auto* savedRetNode   = currentReturnTypeNode_;
-    auto* savedLamRet    = currentLambdaReturnSemaTy_;
+    //
+    // fix #2701 (§23.4 "Indexers" / §30.5, v0.240): this emitter is the INDEXER
+    // spelling of ensurePropertyBlockGetter and lowers a user statement body the
+    // same way, but #2170's `smKind_`/`smStateStruct_` save was never mirrored
+    // here — so reading a block-bodied INDEXER from an `async` body reproduced
+    // #2170's exact symptom (the getter's `return` took the async-return path,
+    // emitting bz_task_complete / spill-free / frame-free into the getter, whose
+    // own `ret i32` was then never emitted). Adopting NestedBodyScope closes
+    // that together with #2702's residual set — which matters here in
+    // particular, because #2170's reset value `smKind_ = Yield` is itself what
+    // OPENS the `smStateGEP_ && (Yield || AsyncYield)` gate in lowerTry: fixing
+    // the state-machine pair WITHOUT nulling `smStateGEP_` would have moved this
+    // failure rather than removed it.
+    NestedBodyScope nestedScope(*this);
 
     // --- Switch into the getter function ---
     currentFn_          = fn;
@@ -3802,8 +3814,6 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     currentCaughtExc_   = nullptr;
     unwindScopeDepth_   = 0;
     diverged_           = false;
-    currentReturnTypeNode_     = nullptr;  // fix #2694 / §28.9
-    currentLambdaReturnSemaTy_ = nullptr;  // fix #2694 / §27.3 / §28.9
 
     // arg 0 is `this`; args 1.. are the index params. Spill each index param to
     // a stack slot so localSlot() resolves the body's identifier reads.
@@ -3839,8 +3849,8 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     unwindScopeDepth_   = savedUD;
     diverged_           = savedDiv;
     genericSubst_       = std::move(savedGSubst);
-    currentReturnTypeNode_     = savedRetNode;   // fix #2694 / §28.9
-    currentLambdaReturnSemaTy_ = savedLamRet;    // fix #2694 / §27.3 / §28.9
+    // The #2694 return-contract pair and the #2170/#2701 state-machine fields
+    // are restored by ~NestedBodyScope, which runs after this block.
     if (savedBB) builder_.SetInsertPoint(savedBB, savedBBOffset);
 
     return fn;
