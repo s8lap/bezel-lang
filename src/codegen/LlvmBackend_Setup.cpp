@@ -22050,26 +22050,38 @@ bool Emitter::lowerBody(const std::vector<std::unique_ptr<ast::Stmt>>& body) {
 }
 
 
-// §8.6: the stable spelling of each boxable primitive (and string), used to key
-// primBoxDesc_/primBoxVtable_ and to match a type-test target's name.
+// §8.6: the ONE table of primitives that get a box descriptor + box vtable, and
+// their stable spellings (the keys of primBoxDesc_/primBoxVtable_ and the names
+// a type-test target is matched by). `string` is in the table because `o is
+// string` needs a descriptor to name, even though a string is never boxed (it
+// stays a bare bz_string* in an Object slot — see isBoxableValueType).
+//
+// #2793: this used to be THREE hand-maintained lists — this switch, the `prims[]`
+// array in setupBoxDescriptors, and an exclusion list in isBoxableValueType — and
+// `decimal` was missing from all three, so every `Object`-typed decimal silently
+// answered `false` to every type test (§8.6 requires it to box; the only
+// exception §8.6 names is move-only value types, which decimal is not). One
+// table now feeds all three, and the switch below is deliberately WITHOUT a
+// `default:` so that adding a sema::PrimitiveType enumerator is a -Wswitch
+// diagnostic here rather than a silent fourth omission.
+#define BZ_BOX_PRIMITIVES(X)                                                   \
+    X(Bool, "bool")     X(Char, "char")     X(String, "string")                \
+    X(Byte, "byte")     X(SByte, "sbyte")   X(Short, "short")                  \
+    X(UShort, "ushort") X(Int, "int")       X(UInt, "uint")                    \
+    X(Long, "long")     X(ULong, "ulong")   X(Float, "float")                  \
+    X(Double, "double") X(Decimal, "decimal")
+
 static const char* primBoxName(sema::PrimitiveType p) {
     using P = sema::PrimitiveType;
     switch (p) {
-        case P::Bool:    return "bool";
-        case P::Char:    return "char";
-        case P::String:  return "string";
-        case P::Byte:    return "byte";
-        case P::SByte:   return "sbyte";
-        case P::Short:   return "short";
-        case P::UShort:  return "ushort";
-        case P::Int:     return "int";
-        case P::UInt:    return "uint";
-        case P::Long:    return "long";
-        case P::ULong:   return "ulong";
-        case P::Float:   return "float";
-        case P::Double:  return "double";
-        default:         return nullptr;  // Object / Decimal / None: no box desc
+#define BZ_BOX_PRIM_CASE(E, N) case P::E: return N;
+        BZ_BOX_PRIMITIVES(BZ_BOX_PRIM_CASE)
+#undef BZ_BOX_PRIM_CASE
+        // Object is the reference root (§8.1) and None is the absence of a
+        // primitive — neither is a boxable value, so neither has a box key.
+        case P::Object: case P::None: return nullptr;
     }
+    return nullptr;
 }
 
 
@@ -22551,9 +22563,13 @@ void Emitter::setupBoxDescriptors() {
     // but a string is NOT boxed — it stays a bare bz_string* in an Object slot,
     // recognized via bz_obj_is_string; see lowerTypeTest / lowerObjectToString.)
     using P = sema::PrimitiveType;
-    static const P prims[] = {P::Bool, P::Char, P::String, P::Byte, P::SByte,
-                              P::Short, P::UShort, P::Int, P::UInt, P::Long,
-                              P::ULong, P::Float, P::Double};
+    // #2793: derived from the ONE box-primitive table next to primBoxName, not
+    // re-listed here — the two copies drifted and `decimal` fell out of this one.
+    static const P prims[] = {
+#define BZ_BOX_PRIM_ELEM(E, N) P::E,
+        BZ_BOX_PRIMITIVES(BZ_BOX_PRIM_ELEM)
+#undef BZ_BOX_PRIM_ELEM
+    };
     for (P p : prims) {
         const char* nm = primBoxName(p);
         if (!nm || primBoxDesc_.count(nm)) continue;
@@ -23253,8 +23269,26 @@ llvm::Constant* Emitter::primBoxEqualsThunk(sema::PrimitiveType prim,
         llvm::Value* eq;
         if (valTy->isFloatingPointTy())
             eq = builder_.CreateFCmpOEQ(sv, ov);
-        else
+        else if (valTy->isIntegerTy())
             eq = builder_.CreateICmpEQ(sv, ov);
+        else {
+            // #2793 (§8.3 "Primitive → Value comparison"): a payload the scalar
+            // predicates cannot express. `decimal` lowers to a 16-byte
+            // {i32×4} struct, on which CreateICmpEQ is not merely wrong but
+            // INVALID IR (ICmpInst accepts only int/ptr operands) — and a byte
+            // compare would be a silent wrong answer besides: per §4.4 decimal
+            // is an "Exact representation of finite decimal fractions", so
+            // 12.5m and 12.50m are one value carrying different scale bits.
+            // Route through emitValueEquality — the same canonical per-value
+            // helper `=` and record-field equality use, which calls
+            // bz_decimal_cmp for decimal (#663/#685) — so box Equals agrees with
+            // `=` and with bz_decimal_hash, keeping §8.3's invariant "if
+            // a.Equals(b) then a.GetHashCode() = b.GetHashCode()".
+            sema::TypeRef primRef;
+            primRef.kind      = sema::TypeRef::Kind::Primitive;
+            primRef.primitive = prim;
+            eq = emitValueEquality(sv, ov, &primRef);
+        }
         llvm::BasicBlock* checkEnd = builder_.GetInsertBlock();
         builder_.CreateBr(endBB);
 
@@ -23337,12 +23371,25 @@ llvm::GlobalVariable* Emitter::buildPrimBoxItmap(sema::PrimitiveType prim,
     if (!valTy) return nullptr;
 
     // Comparison class — mirrors the direct primitive CompareTo/Equals lowering.
-    bool isSignedInt   = prim == P::Int   || prim == P::Long  ||
-                         prim == P::Short || prim == P::SByte ||
-                         prim == P::Char;
+    // #2793: the FP and non-scalar tests are driven by the LOWERED payload shape,
+    // not by a name list, so a primitive whose payload is not a scalar can never
+    // silently fall into the signed-integer default below. `decimal` lowers to a
+    // {i32×4} struct: ICmpSGT on it is invalid IR, and its BYTES are not ordered
+    // at all — per §4.4 decimal is an "Exact representation of finite decimal
+    // fractions", so 12.5m and 12.50m are one value carrying different scale
+    // bits. bz_decimal_cmp is decimal's only ordering (#663/#685), and stdlib
+    // §9.3 declares `Decimal: IComparable<decimal>, IEquatable<decimal>` — these
+    // itable slots are the boxed spelling of exactly those two members.
+    // Signedness among INTEGER payloads stays a name test: it is a genuine
+    // per-primitive property with no LLVM-type witness (i32 is both int and uint).
+    bool isFP          = valTy->isFloatingPointTy();
+    bool isDecimal     = prim == P::Decimal;
     bool isUnsignedInt = prim == P::UInt  || prim == P::ULong ||
                          prim == P::UShort|| prim == P::Byte;
-    bool isFP          = prim == P::Double || prim == P::Float;
+    // Category-blind backstop: any future payload shape that is neither an
+    // ordered scalar nor decimal gets NO itmap (the box vtable keeps its null
+    // itmap and interface dispatch bails) rather than malformed comparison IR.
+    if (!isFP && !isDecimal && !valTy->isIntegerTy()) return nullptr;
 
     // Helper: load the scalar payload from the box (offset 16 = GEP index 2 on
     // a byte-strided ptr, the same slot primBoxEqualsThunk/primBoxHashThunk
@@ -23352,6 +23399,20 @@ llvm::GlobalVariable* Emitter::buildPrimBoxItmap(sema::PrimitiveType prim,
         llvm::Value* pay = tb.CreateGEP(
             ptrTy(), box, {llvm::ConstantInt::get(i32(), 2)}, "pbcmp.pay");
         return tb.CreateLoad(valTy, pay, "pbcmp.val");
+    };
+    // #2793: the decimal thunks want the payload's ADDRESS (bz_decimal_* take
+    // pointers), not a loaded struct — the same offset-16 slot, unloaded.
+    auto decPayloadPtr = [&](llvm::IRBuilder<>& tb,
+                             llvm::Value* box) -> llvm::Value* {
+        return tb.CreateGEP(ptrTy(), box,
+                            {llvm::ConstantInt::get(i32(), 2)}, "pbdec.pay");
+    };
+    // …and a stack slot for the by-value `other` argument, for the same reason.
+    auto decByValSlot = [&](llvm::IRBuilder<>& tb,
+                            llvm::Value* v) -> llvm::Value* {
+        llvm::Value* slot = tb.CreateAlloca(valTy, nullptr, "pbdec.oslot");
+        tb.CreateStore(v, slot);
+        return slot;
     };
 
     // --- CompareTo thunk: i32(ptr this, T other) — (a>b) - (a<b) → -1/0/1 ---
@@ -23365,22 +23426,34 @@ llvm::GlobalVariable* Emitter::buildPrimBoxItmap(sema::PrimitiveType prim,
         llvm::IRBuilder<> tb(entry);
         llvm::Value* self  = cmpFn->getArg(0);
         llvm::Value* other = cmpFn->getArg(1);
-        llvm::Value* a = loadPayload(tb, self);
-        llvm::Value* b = other;
-        llvm::Value* gt, *lt;
-        if (isFP) {
-            gt = tb.CreateFCmpOGT(a, b, "pbcmp.gt");
-            lt = tb.CreateFCmpOLT(a, b, "pbcmp.lt");
-        } else if (isUnsignedInt) {
-            gt = tb.CreateICmpUGT(a, b, "pbcmp.gt");
-            lt = tb.CreateICmpULT(a, b, "pbcmp.lt");
+        if (isDecimal) {
+            // #2793 / §4.4: bz_decimal_cmp already yields exactly -1/0/1 (it
+            // aligns the two scales before comparing mantissas), so it IS
+            // CompareTo's result. Read `this`'s payload in place (the box's value
+            // bytes, offset 16 — the same slot loadPayload reads) and give the
+            // by-value `other` a stack slot, since the runtime takes pointers.
+            llvm::Value* selfPay = decPayloadPtr(tb, self);
+            llvm::Value* oSlot = decByValSlot(tb, other);
+            auto* decCmp = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+            tb.CreateRet(tb.CreateCall(decCmp, {selfPay, oSlot}, "pbcmp.dec"));
         } else {
-            gt = tb.CreateICmpSGT(a, b, "pbcmp.gt");
-            lt = tb.CreateICmpSLT(a, b, "pbcmp.lt");
+            llvm::Value* a = loadPayload(tb, self);
+            llvm::Value* b = other;
+            llvm::Value* gt, *lt;
+            if (isFP) {
+                gt = tb.CreateFCmpOGT(a, b, "pbcmp.gt");
+                lt = tb.CreateFCmpOLT(a, b, "pbcmp.lt");
+            } else if (isUnsignedInt) {
+                gt = tb.CreateICmpUGT(a, b, "pbcmp.gt");
+                lt = tb.CreateICmpULT(a, b, "pbcmp.lt");
+            } else {
+                gt = tb.CreateICmpSGT(a, b, "pbcmp.gt");
+                lt = tb.CreateICmpSLT(a, b, "pbcmp.lt");
+            }
+            llvm::Value* gtI = tb.CreateZExt(gt, i32(), "pbcmp.gti");
+            llvm::Value* ltI = tb.CreateZExt(lt, i32(), "pbcmp.lti");
+            tb.CreateRet(tb.CreateSub(gtI, ltI, "pbcmp.res"));
         }
-        llvm::Value* gtI = tb.CreateZExt(gt, i32(), "pbcmp.gti");
-        llvm::Value* ltI = tb.CreateZExt(lt, i32(), "pbcmp.lti");
-        tb.CreateRet(tb.CreateSub(gtI, ltI, "pbcmp.res"));
     }
 
     // --- Equals thunk: i1(ptr this, T other) — payload == other ---
@@ -23394,10 +23467,24 @@ llvm::GlobalVariable* Emitter::buildPrimBoxItmap(sema::PrimitiveType prim,
         llvm::IRBuilder<> tb(entry);
         llvm::Value* self  = eqFn->getArg(0);
         llvm::Value* other = eqFn->getArg(1);
-        llvm::Value* a = loadPayload(tb, self);
-        llvm::Value* r = isFP ? tb.CreateFCmpOEQ(a, other, "pbcmp.eq")
-                             : tb.CreateICmpEQ(a, other, "pbcmp.eq");
-        tb.CreateRet(r);
+        if (isDecimal) {
+            // #2793 / §4.4 / §8.3: `IEquatable<decimal>.Equals` is
+            // `bz_decimal_cmp(a, b) = 0` — the SAME arbiter the boxed
+            // `Object.Equals` (primBoxEqualsThunk) and `bz_decimal_hash` use, so
+            // 12.5m and 12.50m are equal and hash alike on every path. A raw
+            // ICmpEQ here would be invalid IR on the {i32×4} payload.
+            llvm::Value* selfPay = decPayloadPtr(tb, self);
+            llvm::Value* oSlot = decByValSlot(tb, other);
+            auto* decCmp = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+            llvm::Value* c = tb.CreateCall(decCmp, {selfPay, oSlot}, "pbeq.dec");
+            tb.CreateRet(tb.CreateICmpEQ(
+                c, llvm::ConstantInt::get(i32(), 0), "pbeq.eq"));
+        } else {
+            llvm::Value* a = loadPayload(tb, self);
+            llvm::Value* r = isFP ? tb.CreateFCmpOEQ(a, other, "pbcmp.eq")
+                                  : tb.CreateICmpEQ(a, other, "pbcmp.eq");
+            tb.CreateRet(r);
+        }
     }
 
     // --- Assemble itables + itmap (mirrors ensureSpanBoxVtable) ---
@@ -23992,10 +24079,18 @@ bool Emitter::isBoxableValueType(const sema::TypeRef* rt) {
     using K = sema::TypeRef::Kind;
     using P = sema::PrimitiveType;
     if (rt->kind == K::Primitive) {
-        // string/Object are reference types; everything else (numeric, bool,
-        // char) is a value primitive that boxes.
-        return rt->primitive != P::String && rt->primitive != P::Object &&
-               rt->primitive != P::None && rt->primitive != P::Decimal;
+        // §8.6: "When a value type is used where `Object` (or an interface
+        // implemented by the value type) is expected, the value is **boxed**."
+        // A primitive is boxable exactly when the ONE box-primitive table
+        // (primBoxName) gives it a descriptor AND it is not `string` — string is
+        // a reference type (§4.6) that keeps its bare bz_string* in an Object
+        // slot; its descriptor exists only so `o is string` has a target.
+        // #2793: this used to re-list the exclusions by name and had grown a
+        // fourth entry, `P::Decimal`, that its own comment did not mention —
+        // so an `Object`-typed decimal was never boxed and every type test on it
+        // silently answered false. Deriving the predicate from the table means a
+        // primitive can only fall out of boxing by falling out of the table.
+        return rt->primitive != P::String && primBoxName(rt->primitive);
     }
     // §8.6 / §2.5–§2.6 (#1945): value-builtins (DateTime/TimeSpan/Guid/DateOnly/
     // TimeOnly) are scalar/struct value types that box into Object like a record.
