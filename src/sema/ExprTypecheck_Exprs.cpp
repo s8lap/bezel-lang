@@ -1567,7 +1567,82 @@ void ExprTC::visitExpr(const ast::Expr& e) {
     // §4.6: string indexer `s[i]` → char (code point).
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e)) {
         if (ix->target) {
-            if (auto* tt = ctx_.exprType(*ix->target)) {
+            TypeRef* tt = ctx_.exprType(*ix->target);
+            // fix #2795 (§23.4 / §7.1 / §7.4, v0.240): the receiver type of a
+            // `this`-rooted index. §23.4: "Inside a member of a class with its
+            // own indexer, `this[i]` is required (the brackets need a left-hand
+            // side)" — so this is the MANDATED spelling, not an exotic one.
+            // But the IdentifierExpr arm above deliberately leaves `this`
+            // WITHOUT an exprType (only #456's primitive/builtin-`extension`
+            // case sets one), so `ctx_.exprType(*ix->target)` was null and this
+            // ENTIRE block was skipped for `this[i]`. Everything the block does
+            // was therefore missing on the one spelling §23.4 requires: the
+            // indexer RESULT TYPE (`var s := this[i].ToString()` degraded to a
+            // zero-initialized value, #2434, and emitted malformed IR — "ret
+            // i32 %4 / ptr"), the #2530 PropertySymbol attachment, the #2543
+            // write-only-read gate, and the #2619 §7 index check (so
+            // `this[NI()]` with an `int?` index compiled with NO diagnostic and
+            // returned the WRONG VALUE — the null index became 0). A bare
+            // `return this[i];` happened to work because the return coercion
+            // supplies the type, which is why this went unnoticed.
+            //
+            // Resolved LOCALLY here rather than by publishing an exprType for
+            // `this` in the IdentifierExpr arm (the wider of the two shapes the
+            // issue proposed): that would turn on every exprType(`this`) reader
+            // at once, including codegen's `indexReceiverDecl`
+            // (LlvmBackend_Assign.cpp), whose #747 R42 branch deliberately
+            // recovers the owner TypeSymbol from `methodFns_` /
+            // `currentSpecMethodSymbol_` — a specialization-aware path that a
+            // sema-published TypeRef would silently short-circuit. Confining
+            // the resolution to this expression form changes nothing outside
+            // `this[i]`.
+            //
+            // GENERICS: `substituteMemberType` already handles a `this` target
+            // (its own #747 R42 branch seeds the base-chain walk from
+            // `currentType_` when the receiver carries no exprType), so passing
+            // `ix->target` through unchanged below is correct at both shapes —
+            // an INHERITED generic-base indexer resolves `T` to the enclosing
+            // instantiation's binding (`Derived: Base<int>` → `int`), while the
+            // declaring generic class's own indexer stays its rigid parameter
+            // (inside `Box<T>`, `this[i]` is `T`), which is exactly what a body
+            // in that class sees. The synthesized TypeRef therefore carries NO
+            // genericArgs — it denotes the enclosing declaration, not an
+            // instantiation of it.
+            //
+            // `base[i]` is deliberately NOT covered (filed as #2832):
+            // codegen's `indexReceiverDecl` resolves `base` to the DERIVED
+            // type, so `base[i]` already dispatches to the override — a
+            // confirmed silent wrong value (`base[i]` on a `virtual` base
+            // indexer overridden in the derived class returns the OVERRIDE's
+            // value, while `base.P` / `base.M()` correctly bypass). Typing it
+            // here would only widen the set of spellings that reach that
+            // miscompile, and a clean compile error beats a silent wrong
+            // value; the receiver-resolution and the non-virtual-dispatch
+            // halves must land together.
+            //
+            // `this[i]` inside a LAMBDA body is typed by this fix but still
+            // lowers to 0 (#2833): codegen's receiver recovery is a reverse
+            // lookup of `currentFn_` in `methodFns_`, which a closure's
+            // llvm::Function is not in. That value was already wrong before
+            // this fix — measured identical — so nothing here regresses it,
+            // but the incidental #2491 note that used to accompany it is gone,
+            // which is why #2833 records it.
+            //
+            // A STATIC member is excluded so the existing "`this` is not
+            // available in a static method or static constructor (§12.3)"
+            // rejection stays the only diagnostic there.
+            if (!tt && currentType_ && !inStaticMember_) {
+                if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ix->target.get())) {
+                    if (tid->name == "this") {
+                        TypeRef* rt = ctx_.makeTypeRef();
+                        rt->kind = TypeRef::Kind::Named;
+                        rt->declaration = currentType_;
+                        tt = rt;
+                    }
+                }
+            }
+            if (tt) {
                 if (tt->kind == TypeRef::Kind::InlineArray && tt->arrayElement) {
                     // §15.6 (#746 R41-E): "Slicing is not supported on inline
                     // arrays in this version." A range index on an inline array
