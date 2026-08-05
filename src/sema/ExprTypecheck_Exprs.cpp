@@ -587,6 +587,125 @@ void ExprTC::collectLambdaReturnTypes(
         collectLambdaReturnTypeFromStmt(s.get(), out);
 }
 
+// fix #2619 (§7.1 / §7.4 / §23.4, v0.240) — the §7 check on an INDEX argument.
+//
+// §23.4: "An indexer is a property whose name is replaced by `[parameters]`",
+// so an index argument is a parameter pass, and §7.1: "The compiler enforces
+// the distinction at every assignment, parameter pass, and return." Every
+// indexer path in sema skipped that check (see the declaration's comment for
+// the failure it produced); this runs it once per IndexExpr for every receiver
+// family, builtin and user-declared alike.
+//
+// WHY THIS CANNOT FALSE-REJECT (the hazard for a widened rejection):
+//
+//  1. It fires only when the index argument's OWN static type is nullable.
+//     Every non-nullable index spelling the compiler accepts today — a plain
+//     `int`, a `const` local, an enum, a bare generic `T`, a `long`, a Range
+//     literal `[a..b]`, a Range-typed value — never reaches the check at all.
+//     (This is the gate #2613 chose, kept and generalized.)
+//  2. The target it checks against is the index's own type with `nullable`
+//     cleared — NOT the indexer's declared parameter type. So the only
+//     diagnostic reachable from here is the §7 "…is nullable but the target
+//     type is non-nullable" one; a type MISMATCH between an index argument and
+//     a declared parameter is a different question this fix does not open
+//     (nor does it touch the named/`ref`/`owned`/discard modifier axis, which
+//     is #2758's unresolved design question — those forms are skipped).
+//  3. The §7.4 narrowing exception is inherited by construction: it lives
+//     inside `checkAssignable`, which this reuses, so `if i <> null then a[i]`,
+//     an early-return narrowing, a `const` narrowing and `a[i!]` all stay
+//     accepted (§7.4 deliberately does not rewrite `exprType`, so a naive
+//     "is the argument type nullable" rejection would break them).
+//  4. A declared index parameter that is ITSELF nullable legitimately accepts
+//     a nullable argument (`property [i: int?]`, a `Dictionary<string?, V>`
+//     key). Those are detected from the declared parameter type — substituted
+//     against the receiver's concrete type arguments, so a `Box<int?>` whose
+//     indexer is declared `[k: T]` reports `int?` — and skipped.
+void ExprTC::checkIndexArgNullability(const ast::IndexExpr& ix,
+                                      const ast::Expr& e, TypeRef* recvTy) {
+    if (!recvTy || ix.indices.empty()) return;
+
+    // The receiver's declared index parameters, where they are knowable:
+    //   * a USER-declared indexer, whose resolved PropertySymbol the §23.4
+    //     branch attached to this node (#2530). Its k-th parameter type is
+    //     read through the ast::PropertyDecl for a local indexer and through
+    //     the reconstructed ParameterSymbols for an IMPORTED one (#2414's
+    //     dual read), then substituted like the result type is.
+    //   * a builtin dictionary receiver, whose indexer is `[key: K]`
+    //     (stdlib §4.8 / §4.9 / §4.17) — K is genericArgs[0].
+    // Every other family (Array<T> and the list interfaces, the span/buffer
+    // families, `string`, inline arrays, an indexer reached through a
+    // type-parameter constraint) declares a NON-nullable index parameter, so
+    // leaving `declared` null means exactly "non-nullable" here.
+    PropertySymbol* ps = nullptr;
+    if (auto* sym = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(e)))
+        if (sym->isIndexer) ps = sym;
+    TypeRef* dictKey = nullptr;
+    if (!ps && recvTy->kind == TypeRef::Kind::Named && !recvTy->declaration &&
+        !recvTy->genericArgs.empty() && recvTy->genericArgs[0]) {
+        std::string_view cn = recvTy->headName();
+        if (cn == "Dictionary" || cn == "OwningDictionary" ||
+            cn == "SortedDictionary")
+            dictKey = recvTy->genericArgs[0];
+    }
+    auto declaredIndexParam = [&](std::size_t k) -> TypeRef* {
+        if (dictKey) return k == 0 ? dictKey : nullptr;
+        if (!ps) return nullptr;
+        TypeRef* p = nullptr;
+        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+            if (k < pd->indexerParams.size() && pd->indexerParams[k].type)
+                p = ctx_.resolvedType(*pd->indexerParams[k].type);
+        } else if (k < ps->indexerParams.size()) {
+            if (auto* prm =
+                    dynamic_cast<ParameterSymbol*>(ps->indexerParams[k]))
+                p = prm->resolvedDeclType;
+        }
+        if (!p) return nullptr;
+        return substituteMemberType(p, ix.target.get(), ps->parent);
+    };
+
+    // The diagnostic's subject. `<Receiver>[i]` (or `[key]` for a dictionary)
+    // for the single-index case — the wording #2613 introduced — and an
+    // ordinal for a multi-parameter indexer, where "the index argument" alone
+    // would not say which one.
+    std::string recvName;
+    if (recvTy->kind == TypeRef::Kind::Named) {
+        recvName = std::string(recvTy->headName());
+        if (recvName.empty() && recvTy->declaration)
+            recvName = std::string(recvTy->declaration->name);
+    } else if (recvTy->kind == TypeRef::Kind::Primitive &&
+               recvTy->primitive == PrimitiveType::String) {
+        recvName = "string";
+    }
+    const std::size_t nargs = ix.indices.size();
+    auto subject = [&](std::size_t k) -> std::string {
+        if (nargs == 1) {
+            if (recvName.empty()) return "index argument";
+            return "index argument to `" + recvName +
+                   (dictKey ? "[key]`" : "[i]`");
+        }
+        std::string s = "index argument " + std::to_string(k + 1);
+        if (!recvName.empty()) s += " to the `" + recvName + "` indexer";
+        return s;
+    };
+
+    for (std::size_t k = 0; k < nargs; ++k) {
+        const auto& arg = ix.indices[k];
+        // §22.3 / #2758: a named / `ref` / `out` / `owned` modifier or a `_`
+        // discard on an index argument is a separate, unresolved question
+        // (#2758). This governs the index VALUE only — the same guard #2613's
+        // check carried.
+        if (!arg.value || arg.isDiscard || !arg.modifier.empty()) continue;
+        TypeRef* idxTy = ctx_.exprType(*arg.value);
+        if (!idxTy || !idxTy->nullable) continue;      // gate (1)
+        TypeRef* declared = declaredIndexParam(k);
+        if (declared && declared->nullable) continue;  // gate (4)
+        TypeRef* nonNull = ctx_.makeTypeRef(*idxTy);   // gate (2)
+        nonNull->nullable = false;
+        checkAssignable(idxTy, nonNull, arg.value->span.begin, subject(k),
+                        arg.value.get());
+    }
+}
+
 void ExprTC::visitExpr(const ast::Expr& e) {
     // §17.15 (v0.216, #2098): the binding atom `(var x := E; body)`. Handled
     // before visitChildren — the clauses are §21.1 declaration statements
@@ -1638,41 +1757,14 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                         // declares the indexer `public property [i: int]: char`
                         // — a single NON-nullable `int` index, and the only
                         // indexer form the record declares (no Range overload).
-                        // The builtin has no PropertySymbol (ReadOnlyStringSpan
-                        // resolves to a synthetic Named TypeRef with a null
-                        // declaration, which is why this branch types the result
-                        // by hand), so nothing on the IndexExpr path ever ran
-                        // checkAssignable on the index — an un-narrowed `int?`
-                        // was silently accepted by sema and reached codegen,
-                        // where the indexer lowering truncated the `{ i8, i32 }`
-                        // nullable-value struct to `i32` and failed
-                        // verifyModule ("Trunc only operates on integer"). Same
-                        // §7 hole #2601 closed for `Slice` on the CallExpr path
-                        // (checkBuiltinSpanCallArgs), on the IndexExpr path.
-                        //
-                        // The check is deliberately gated to a NULLABLE index
-                        // type: this fix is scoped to the §7 nullable ->
-                        // non-nullable conversion #2613 reports, and gating it
-                        // that way makes a false reject of some other index
-                        // spelling structurally impossible (a non-nullable
-                        // index of any kind is left exactly as it was). A
-                        // NARROWED `int?` stays accepted — the §7.4 narrowing
-                        // exception lives inside checkAssignable, which this
-                        // reuses — and a `ref`/`out`-modified or discard index
-                        // is skipped, mirroring the CallExpr gates' guard.
-                        if (ix->indices.size() == 1 && ix->indices[0].value &&
-                            !ix->indices[0].isDiscard &&
-                            ix->indices[0].modifier.empty()) {
-                            TypeRef* idxTy =
-                                ctx_.exprType(*ix->indices[0].value);
-                            if (idxTy && idxTy->nullable)
-                                checkAssignable(
-                                    idxTy,
-                                    ctx_.primitiveTypeRef(PrimitiveType::Int),
-                                    ix->indices[0].value->span.begin,
-                                    "index argument to `ReadOnlyStringSpan[i]`",
-                                    ix->indices[0].value.get());
-                        }
+                        // The §7 check on that index used to live here, gated to
+                        // this one head name; #2619 found the SAME hole on every
+                        // other indexer path (including USER-declared indexers,
+                        // which do have a PropertySymbol, so the "builtin members
+                        // have no MethodSymbol" explanation never covered them)
+                        // and moved the check to checkIndexArgNullability, run
+                        // once for every receiver family at the end of this
+                        // block. Keeping a second copy here would double-report.
                         ctx_.setExprType(
                             &e, ctx_.primitiveTypeRef(PrimitiveType::Char));
                     }
@@ -2023,6 +2115,15 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 " (§23.4)");
                     }
                 }
+                // fix #2619 (§7.1 / §7.4 / §23.4, v0.240): run the §7
+                // index-argument check ONCE, after every receiver family above
+                // has been typed — a user-declared indexer's resolved
+                // PropertySymbol (#2530) is attached by then, which is what
+                // lets the check read its declared parameter types. Placed
+                // here rather than per-branch because the hole was in EVERY
+                // branch, and a single site cannot be forgotten by the next
+                // receiver family added above.
+                checkIndexArgNullability(*ix, e, tt);
             }
         }
     }

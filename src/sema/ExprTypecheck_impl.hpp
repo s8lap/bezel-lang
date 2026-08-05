@@ -1776,6 +1776,28 @@ private:
     // overload is not a primitive slot and is not covered here.
     void checkBuiltinSpanCallArgs(const ast::CallExpr& ce);
 
+    // §7.1 / §7.4 / §23.4 (#2619): the INDEX-ARGUMENT twin of the CallExpr §7
+    // gates above, and the generalization of #2613 (which closed this hole for
+    // the single `ReadOnlyStringSpan` receiver). §23.4: "An indexer is a
+    // property whose name is replaced by `[parameters]`" — an index argument is
+    // therefore a parameter pass, and §7.1 states the compiler "enforces the
+    // distinction at every assignment, parameter pass, and return". NO indexer
+    // path in sema ran that check: the builtin receivers (Array<T>, string,
+    // Dictionary<K,V>, the span/buffer families, inline arrays) are synthetic
+    // Named/Primitive TypeRefs with no MethodSymbol, and the USER-declared
+    // indexer path — which DOES resolve a PropertySymbol, so the
+    // no-MethodSymbol explanation never applied to it — did not check its
+    // arguments either. An un-narrowed `int?` index was silently accepted and
+    // reached codegen, which emitted malformed IR (`SExt only operates on
+    // integer`, `GEP indexes must be integers`, `Call parameter type does not
+    // match function signature`) — an internal compiler error where §7 asks
+    // for a clean diagnostic. Called once per IndexExpr, after every receiver
+    // family has been typed (so a user indexer's resolved PropertySymbol is
+    // already attached to the node by #2530). See the definition in
+    // ExprTypecheck_Exprs.cpp for why it cannot false-reject.
+    void checkIndexArgNullability(const ast::IndexExpr& ix, const ast::Expr& e,
+                                  TypeRef* recvTy);
+
     // §2.5 / §22.7 (issue #328 FINDING [7] B): check `new ImportedT(args)`
     // against an imported type's reconstructed constructor signatures (no
     // ast::ConstructorDecl; ParameterSymbol resolved types). Single-ctor,
