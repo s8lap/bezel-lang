@@ -8371,6 +8371,153 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             return nullptr;
         }
     }
+    // fix #2841 (§22.12 / §2.8.3 rule 4 / §2.8.2 rule 2 / §14.1, v0.240) — the
+    // STATIC-side half of the §14.1/#783 soundness gate that #2821 deliberately
+    // left open (it scoped itself to INSTANCE calls, because a static method is
+    // handed no object and gating every static on the instance layout would
+    // falsely reject a static that touches no static state — #2821's T5).
+    //
+    // §22.12 is explicit: "Each distinct instantiation has its own static
+    // state", and §2.8.3 rule 4 makes that identity a RUNTIME one — a
+    // constructed generic type is one type in the running process with "exactly
+    // one copy of its static state". So `Box<string>` and `Box<int>` hold two
+    // cells, each of them exactly one cell program-wide, and §2.8.2 rule 2
+    // requires that "An external instantiation behaves identically to a
+    // same-module instantiation of the same generic at the same arguments".
+    //
+    // The importer honours that: staticFieldGlobal (LlvmBackend_Setup.cpp)
+    // redirects every static-field access on a generic class to a
+    // PER-INSTANTIATION global (`bz$Box$string$_count`, `bz$Box$int$_count`).
+    // The EXPORTER's compiled `bz$Box$Bump`, emitted once against the generic
+    // placeholder, references the placeholder-level global `bz$Box$_count` —
+    // a cell that belongs to NO instantiation. When #783 reconstruction
+    // declines there is no importer-side body to monomorphize, so the call
+    // lands on that one function and every instantiation's static reads and
+    // writes collapse onto the exporter's spurious cell.
+    //
+    // MEASURED, on real two-module builds (never inferred):
+    //   * two instantiations SHARE: `Box<string>.Bump()` then `Box<int>.Bump()`
+    //     printed `a=1 b=2`; the identical declarations compiled as ONE module
+    //     print `a=1 b=1`.
+    //   * and — the stronger finding, which is why there is no layout-identity
+    //     escape hatch here — ONE instantiation is SPLIT IN TWO: `Box<int>`
+    //     alone, `Bump()` followed by a direct read of `Box<int>._count`,
+    //     printed `a=1 direct=0`. The method mutated the exporter's cell while
+    //     the importer's own access read the per-instantiation cell. So unlike
+    //     the instance side, `<int>` — where the instantiation IS the
+    //     placeholder layout — is NOT sound: static-cell identity is keyed on
+    //     the mangled instantiation name, not on the lowered layout, so it
+    //     diverges for every type argument including `int`.
+    //
+    // Hence the gate is not layout-valued but STORAGE-EXISTENCE-valued: reject
+    // when the class (or a class ancestor, whose statics its body may equally
+    // name) declares any static field, because the body cannot be seen and any
+    // static-field reference inside it is bound to the spurious cell. A class
+    // with NO static field has no per-instantiation static state to diverge, so
+    // #2821's T5 shape — a static that only calls a sibling helper — keeps
+    // compiling and running. That is the same posture #783's design note states
+    // ("keeps the clean gate — never a wrong value"), and the same
+    // conservative-where-the-body-is-invisible choice #2821 made: a static that
+    // happens to touch no static state in a class that HAS one is now rejected,
+    // because nothing at this site can tell the two apart. Importer-side
+    // monomorphization (#428/#783 family) is the real fix.
+    //
+    // The guard is deliberately narrower than "declares a static", because each
+    // exclusion below was MEASURED to compile and answer correctly today and a
+    // false reject breaks working code:
+    //   * a static whose OWNER is NOT generic — an inherited static from a
+    //     non-generic base is one cell program-wide, so the exporter's
+    //     reference to it is the same cell the importer uses
+    //     (`class GenChild<T> : StatOwner` printed the correct 7).
+    //   * a `readonly` static whose lowered type carries NO POINTER — the two
+    //     cells are independently initialized but hold equal bits for any
+    //     T-independent initializer (`static readonly Base: int := 5` printed
+    //     the correct 5 at both `<string>` and `<int>`). A T-DEPENDENT
+    //     initializer does diverge, but that is #2295/#803's already-ruled
+    //     per-instantiation-sfinit miscompile, which reproduces SINGLE-MODULE
+    //     too — so it is not the cross-artifact divergence this gate owns.
+    // A `readonly` static that DOES carry a pointer stays rejected, because
+    // there the two cells hold two distinct REFERENTS, not two equal values —
+    // measured: `static readonly Inst: Cell := new Cell();`, an importer-side
+    // write through `Ro<string>.Inst.n := 7`, and the exporter-compiled
+    // `Get()` still reading 41.
+    //
+    // NOT covered, stated rather than left implicit: a static AUTO-PROPERTY
+    // (§23.1/#743) is not per-instantiation redirected at all today
+    // (staticFieldGlobal's own comment says so), and a body reaching a SIBLING
+    // generic type's statics diverges on that sibling's cells rather than this
+    // class's. Both are filed, not widened into here.
+    if (isStaticMethod(ms) && ms->parent &&
+        ms->parent->kind == ast::TypeDeclKind::Class &&
+        !ms->parent->genericParams.empty() && ctx_.isImported(ms->parent) &&
+        !dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        // Does `ty` transitively carry a pointer? Measured on the LOWERED type
+        // rather than enumerated over source categories (the #2787/#2790/#2821
+        // lesson): the question is "can this cell hold a REFERENT whose
+        // identity differs between the two cells", and that is exactly
+        // "does the lowered storage contain a pointer".
+        std::function<bool(llvm::Type*)> carriesPointer =
+            [&](llvm::Type* ty) -> bool {
+            if (!ty) return true;  // unknown → conservative
+            if (ty->isPointerTy()) return true;
+            if (auto* st = llvm::dyn_cast<llvm::StructType>(ty)) {
+                for (llvm::Type* et : st->elements())
+                    if (carriesPointer(et)) return true;
+                return false;
+            }
+            if (auto* at = llvm::dyn_cast<llvm::ArrayType>(ty))
+                return carriesPointer(at->getElementType());
+            return false;
+        };
+        bool hasPerInstantiationStatic = false;
+        for (const sema::TypeSymbol* c = ms->parent;
+             c && !hasPerInstantiationStatic;) {
+            for (const sema::Symbol* m : c->members) {
+                auto* fs = dynamic_cast<const sema::FieldSymbol*>(m);
+                if (!fs || !isStaticField(fs)) continue;
+                // staticFieldGlobal only mangles per-instantiation when the
+                // OWNER is generic; a non-generic owner's static is one cell.
+                if (!fs->parent || fs->parent->genericParams.empty()) continue;
+                bool readonlyStatic = false;
+                for (auto mod : fs->modifiers)
+                    if (mod == "readonly") { readonlyStatic = true; break; }
+                if (readonlyStatic && !carriesPointer(storageType(m))) continue;
+                hasPerInstantiationStatic = true;
+                break;
+            }
+            const sema::TypeSymbol* next = nullptr;
+            for (const sema::TypeSymbol* b : c->baseTypes)
+                if (b && b->kind == ast::TypeDeclKind::Class) { next = b; break; }
+            c = next;
+        }
+        if (hasPerInstantiationStatic) {
+            ctx_.diagnostics().report(
+                Severity::Error, callLoc,
+                "calling the static method `" + std::string(ms->name) +
+                "` on the imported generic class `" +
+                std::string(ms->parent->name) + "` is not yet monomorphized "
+                "for this instantiation (\xC2\xA7""22.12 / \xC2\xA7""2.8.3 "
+                "rule 4 / \xC2\xA7""14.1 / #783, #2841): this method's body "
+                "could not be reconstructed importer-side, so the only "
+                "available callee is the defining module's placeholder-"
+                "compiled function, whose static-field references were bound "
+                "to a single placeholder-level cell. `" +
+                std::string(ms->parent->name) + "` declares static state, and "
+                "\xC2\xA7""22.12 gives each distinct instantiation its own — "
+                "so that call would read and write a cell belonging to no "
+                "instantiation, silently diverging both from the other "
+                "instantiations and from this program's own accesses to this "
+                "instantiation's static fields. Keep this method's body to "
+                "this class's own members (a body that reaches a sibling type "
+                "or a module function cannot be reconstructed across the "
+                "boundary), or move the static state out of the generic class, "
+                "until importer-side method monomorphization lands");
+            llvm::FunctionType* ft = methodFnType(ms);
+            if (ft && !ft->getReturnType()->isVoidTy())
+                return llvm::PoisonValue::get(ft->getReturnType());
+            return nullptr;
+        }
+    }
     // Is this an interface method dispatch? Check if the declaring type is
     // an interface (CG35-itable, §13).
     bool isIfaceMethod = ms->parent &&
