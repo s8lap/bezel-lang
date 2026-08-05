@@ -1931,6 +1931,23 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // boxes as its concrete type (#1279), and BEFORE the #2717 index-producer
     // release, which concerns the index arguments and never the result.
     result = boxForTarget(result, ctx_.exprType(ix), getterExpr);
+    // fix #2850 (§7.2 "Nullable value types" / §23.4 "Indexers", v0.240): the
+    // INDEXER spelling of #1168's expression-getter nullable-VALUE coercion —
+    // the twin of `wrapNullableGetterResult(ctx_.exprType(*ma), v)` on the
+    // named-property inline path (LlvmBackend_Exprs.cpp). §7.2: "A value type
+    // wrapped in `?` is an optional: it either holds a value or `null`", and
+    // §23.5's restriction list names only move-only value types, so
+    // `property [i: int]: int?` is an admitted declaration whose getter body
+    // may legally yield `null` or a bare `int`. Without this the inlined body
+    // handed the caller the RAW body value — a `ptr null` for `get => null;`,
+    // a bare i32 for `get => i + 5;` — where the caller expects the tagged
+    // `{i8 hasValue, i32}` optional, and the mismatch reached LLVM as an
+    // assertion abort (a PHI-operand type assert for the `??` merge, a
+    // checkGEPType assert for the bare-value shape) rather than any
+    // diagnostic. Done AFTER boxForTarget (the two are disjoint: an `Object`
+    // target is a reference type, so isNullableValueTy is false there) and
+    // while the receiver's generic substitution is still installed.
+    result = wrapNullableGetterResult(ctx_.exprType(ix), result);
     // fix #2717: release a `+1` string producer index temporary now the getter
     // body has read it. The helper's element-type gate is what makes this safe
     // on the GETTER side: an inlined `get => k;` lowers to a bare load of the
@@ -5131,6 +5148,17 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
     // before setupBoxDescriptors); see the note there.
     if (pd->type)
         result = boxForTarget(result, ctx_.resolvedType(*pd->type), getterExpr);
+    // fix #2850 (§7.2 "Nullable value types" / §23.4 "Indexers", v0.240): the
+    // STANDALONE-FUNCTION face of the same missing coercion the inline path in
+    // lowerIndexerGet carries — this emitter fills the vtable slot for a
+    // `virtual` indexer and the itable slot for an interface-typed one, and its
+    // signature already returns `lowerType(pd->type)` (the tagged
+    // `{i8 hasValue, T}` optional). Returning the raw body value there is not a
+    // PHI assert but MALFORMED IR (`ret ptr null` from a `{i8, i32}` function),
+    // caught only by the module verifier. `coerceNumericToType` below cannot
+    // close it: it is a no-op on a pointer→struct or scalar→struct pair.
+    if (pd->type)
+        result = wrapNullableGetterResult(ctx_.resolvedType(*pd->type), result);
     if (!result) result = llvm::Constant::getNullValue(retTy);
     result = coerceNumericToType(result, retTy, false);
     if (!builder_.GetInsertBlock()->getTerminator())
