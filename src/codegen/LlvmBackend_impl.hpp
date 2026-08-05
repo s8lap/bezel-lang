@@ -3721,20 +3721,34 @@ private:
     // TypeSymbol from the current method, mirroring lowerWith. Null when the
     // receiver is not a user-defined type.
     //
-    // It is the "which class's body am I in" recovery, and
-    // LlvmBackend_Calls2.cpp's inherited-generic-base call path (#747 R42)
-    // depends on that exact reading — an INDEXER ACCESS goes through
-    // indexAccessReceiverDecl below instead.
+    // For BOTH `this` and `base` this returns the ENCLOSING type — it is the
+    // "which class's body am I in" recovery, and LlvmBackend_Calls2.cpp's
+    // inherited-generic-base call path (#747 R42) depends on that reading.
+    // An INDEXER ACCESS must not use it directly: `base[i]` resolves against
+    // the class base (§12.3). Use indexAccessReceiverDecl below.
     const sema::TypeSymbol* indexReceiverDecl(const ast::Expr* target);
 
-    // fix #2833 (§23.4 / §27.3, v0.240): the receiver TypeSymbol an INDEXER
-    // ACCESS `ix` resolves its indexer against — indexReceiverDecl, and when
-    // that cannot answer (a lambda body or an `async` body, whose
-    // llvm::Function is not a value in methodFns_) sema's resolved indexer
-    // PropertySymbol, attached to the IndexExpr by #2530.
+    // fix #2832 / #2833 (§12.3 / §23.4, v0.240): the receiver TypeSymbol an
+    // INDEXER ACCESS `ix` resolves its indexer against.
+    //   * `this[i]` / an ordinary typed receiver → indexReceiverDecl.
+    //   * `base[i]` → the enclosing type's CLASS BASE, per §12.3 "Inside a
+    //     derived member, `base.Name(...)` calls the base class's
+    //     implementation, bypassing virtual dispatch" (#2832: without the step
+    //     the derived type's OVERRIDE was selected and the whole point of the
+    //     spelling was lost).
+    //   * when neither recovery works — a lambda body or an `async` body, whose
+    //     llvm::Function is not in methodFns_ (#2833) — sema's resolved indexer
+    //     PropertySymbol, attached to the IndexExpr by #2530.
     // Announces a genuinely unrecoverable `this`/`base` receiver (see the
     // definition); every caller degrades silently on null.
     const sema::TypeSymbol* indexAccessReceiverDecl(const ast::IndexExpr& ix);
+
+    // fix #2832 (§12.3 / §23.4 / §2.8.2, v0.240): report the one `base[i]`
+    // shape whose §12.3 non-virtual lowering does not exist — an IMPORTED
+    // VIRTUAL indexer. Returns true when it reported (the caller must then
+    // bail). See the definition for the ABI reason and the follow-up issue.
+    bool rejectImportedVirtualBaseIndexer(const ast::IndexExpr& ix,
+                                          const sema::PropertySymbol* ps);
 
     // §22.10: emit the getter of an indexer property via inline body.
     // Returns the loaded value, or null if no indexer applies.

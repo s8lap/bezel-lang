@@ -1609,42 +1609,65 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // genericArgs — it denotes the enclosing declaration, not an
             // instantiation of it.
             //
-            // `base[i]` is deliberately NOT covered (filed as #2832):
-            // codegen's `indexReceiverDecl` resolves `base` to the DERIVED
-            // type, so `base[i]` already dispatches to the override — a
-            // confirmed silent wrong value (`base[i]` on a `virtual` base
-            // indexer overridden in the derived class returns the OVERRIDE's
-            // value, while `base.P` / `base.M()` correctly bypass). Typing it
-            // here would only widen the set of spellings that reach that
-            // miscompile, and a clean compile error beats a silent wrong
-            // value; the receiver-resolution and the non-virtual-dispatch
-            // halves must land together.
+            // fix #2832 (§12.3 / §23.4, v0.240): `base[i]` — the OTHER
+            // keyword-rooted spelling — is covered too, now that its
+            // miscompile is fixed in the same change. #2795 deliberately left
+            // it out on the grounds that typing it alone would only widen the
+            // set of spellings reaching a known silent wrong value (`base[i]`
+            // on a `virtual` base indexer overridden in the derived class
+            // returned the OVERRIDE's value: 202 where 102 is correct), and
+            // that the receiver-resolution and non-virtual-dispatch halves
+            // had to land together. They do here: codegen's
+            // `indexAccessReceiverDecl` takes the §12.3 step to the class base
+            // and the two #1080 vtable branches now decline a `base` receiver
+            // (LlvmBackend_Assign.cpp), so this typing feeds a correct
+            // lowering rather than a wider one.
             //
-            // `this[i]` inside a LAMBDA body (and inside an `async` body) is
-            // typed by this fix but still lowers to 0 (#2833): codegen's
-            // receiver recovery is a reverse lookup of `currentFn_` in
-            // `methodFns_`, which a closure's llvm::Function is not in. That
-            // value was already wrong before this fix — measured identical —
-            // so nothing here regresses it. Typing it DID remove the
-            // incidental #2491 note that used to accompany the lambda case
-            // (that note fired on the CALLER's `return f(i);`, only because an
-            // untyped `this[n]` left the lambda's return type unknown), so the
-            // wrong value would have become fully silent; `indexReceiverDecl`
-            // (LlvmBackend_Assign.cpp) now announces the drop at the point it
-            // happens, gated on the recovery having failed rather than on a
-            // body kind. See tests/lit/this_indexer_dropped_in_lambda_warns_
-            // 2833.bzl.
+            // The receiver is the CLASS BASE, mirroring `memberTargetType`'s
+            // own `base` arm (ExprTypecheck_Calls.cpp: "§12.3: `base.X`
+            // resolves X against the base class, so an override in the current
+            // type is bypassed and the base member is found"). Resolving it
+            // here rather than to `currentType_` is what makes the attached
+            // #2530 PropertySymbol the BASE's indexer — which is in turn what
+            // codegen's #2833 fallback reads.
             //
-            // A STATIC member is excluded so the existing "`this` is not
-            // available in a static method or static constructor (§12.3)"
+            // §12.3 also bounds where `base` is legal at all: "`base` is legal
+            // only inside instance members of a derived class." A class with
+            // no class base has `Object` as its base, and `Object` declares no
+            // indexer — so `base[i]` there names nothing. It used to compile
+            // and silently read the class's OWN indexer (MEASURED: 301, the
+            // derived value). Reject it, mirroring the named form's #1106
+            // defect-6 rejection in ExprTypecheck_Calls.cpp.
+            //
+            // A STATIC member is excluded so the existing "`this`/`base` is
+            // not available in a static method or static constructor (§12.3)"
             // rejection stays the only diagnostic there.
             if (!tt && currentType_ && !inStaticMember_) {
                 if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                         ix->target.get())) {
+                    TypeSymbol* recv = nullptr;
                     if (tid->name == "this") {
+                        recv = currentType_;
+                    } else if (tid->name == "base") {
+                        for (TypeSymbol* b : currentType_->baseTypes)
+                            if (b && b->kind == ast::TypeDeclKind::Class) {
+                                recv = b;
+                                break;
+                            }
+                        if (!recv)
+                            ctx_.diagnostics().report(
+                                Severity::Error, e.span.begin,
+                                "`base[...]` does not name a base-class "
+                                "indexer: `" +
+                                    std::string(currentType_->name) +
+                                    "` has no class base (its base is "
+                                    "`Object`, which declares no indexer) "
+                                    "(§12.3/§23.4)");
+                    }
+                    if (recv) {
                         TypeRef* rt = ctx_.makeTypeRef();
                         rt->kind = TypeRef::Kind::Named;
-                        rt->declaration = currentType_;
+                        rt->declaration = recv;
                         tt = rt;
                     }
                 }
@@ -2206,6 +2229,46 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                 // branch, and a single site cannot be forgotten by the next
                 // receiver family added above.
                 checkIndexArgNullability(*ix, e, tt);
+                // fix #2832 (§12.3 / §12.5 / §23.4, v0.240): `base[i]` where
+                // the resolved base indexer is ABSTRACT has no implementation
+                // to reach — §12.3's whole contract is "calls the base class's
+                // implementation", and §12.5 is what says an abstract member
+                // has none. The named form already rejects this ("cannot call
+                // abstract base method `M` via `base` — it has no
+                // implementation (§12.3/§12.5)", ExprTypecheck_Calls.cpp
+                // #874); the indexer form silently ran the DERIVED override
+                // instead (the #2832 miscompile), and with that fixed it would
+                // instead degrade to a zero/null value in codegen — the static
+                // accessor-body path finds no body. Reject it here so neither
+                // wrong value is reachable. Reads the resolved PropertySymbol
+                // the #2530 attachment just published, so it covers every
+                // arity and overload without re-doing the lookup. An IMPORTED
+                // abstract indexer has no ast::PropertyDecl to read modifiers
+                // from and is left alone (the same `!pd` scope limit every
+                // other AST-reading indexer check in this block carries).
+                if (auto* btid = dynamic_cast<const ast::IdentifierExpr*>(
+                        ix->target.get())) {
+                    if (btid->name == "base") {
+                        auto* bps = dynamic_cast<PropertySymbol*>(
+                            ctx_.exprSymbol(e));
+                        auto* bpd = bps ? dynamic_cast<const ast::PropertyDecl*>(
+                                              bps->decl)
+                                        : nullptr;
+                        bool bAbstract = false;
+                        if (bpd)
+                            for (auto mod : bpd->modifiers)
+                                if (mod == "abstract") {
+                                    bAbstract = true;
+                                    break;
+                                }
+                        if (bAbstract)
+                            ctx_.diagnostics().report(
+                                Severity::Error, e.span.begin,
+                                "cannot access an abstract base indexer via "
+                                "`base` — it has no implementation "
+                                "(§12.3/§12.5)");
+                    }
+                }
             }
         }
     }

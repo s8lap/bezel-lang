@@ -54,6 +54,18 @@ std::size_t indexerParamCount(const sema::PropertySymbol* ps) {
     return ps->indexerParams.size();
 }
 
+// fix #2832 (§12.3, v0.240): is this indexer access `base[...]`? §12.3 —
+// "Inside a derived member, `base.Name(...)` calls the base class's
+// implementation, bypassing virtual dispatch" — so a `base`-rooted access is
+// NON-VIRTUAL, and the two #1080 vtable-dispatch branches below must decline
+// it (the base indexer shares its vtable slot with the derived override, so
+// dispatching would run the override — the defect). Mirrors the `base`
+// bail-outs in lowerVirtualPropertyGet / lowerVirtualPropertySet.
+bool indexTargetIsBase(const ast::IndexExpr& ix) {
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(ix.target.get());
+    return id && id->name == "base";
+}
+
 // fix #2528 (§23.4 / §11.2 / §14.1, v0.236): an interface indexer's element
 // type is declared in the interface generic parameter list, but an itable call
 // is lowered from the concrete receiver type (`IFlag<bool>`). Do the positional
@@ -1363,16 +1375,44 @@ const sema::TypeSymbol* Emitter::indexReceiverDecl(const ast::Expr* target) {
     return nullptr;
 }
 
-// fix #2833 (§23.4 / §27.3, v0.240) — see the header for the contract.
+// fix #2832 / #2833 (§12.3 / §23.4, v0.240) — see the header for the contract.
 const sema::TypeSymbol* Emitter::indexAccessReceiverDecl(
     const ast::IndexExpr& ix) {
     const ast::Expr* target = ix.target.get();
     if (!target) return nullptr;
     auto* id = dynamic_cast<const ast::IdentifierExpr*>(target);
+    const bool viaBase = id && id->name == "base";
     const bool viaKeyword = id && (id->name == "this" || id->name == "base");
 
-    if (const sema::TypeSymbol* recv = indexReceiverDecl(target))
-        return recv;
+    if (const sema::TypeSymbol* recv = indexReceiverDecl(target)) {
+        // fix #2832 (§12.3, v0.240): "Inside a derived member, `base.Name(...)`
+        // calls the base class's implementation, bypassing virtual dispatch."
+        // indexReceiverDecl's #747 R42 branch answers `base` with the DERIVED
+        // type (it recovers "the class whose body this is"), so selectIndexer
+        // was handed the derived type and picked its OVERRIDE — `base[i]` on a
+        // `virtual` base indexer returned the override's value, silently, with
+        // no diagnostic, on the one construct whose entire purpose is to bypass
+        // the override. Take the §12.3 step to the class base here, mirroring
+        // sema's own `base` receiver resolution (ExprTypecheck_Calls.cpp
+        // `memberTargetType`, which walks `currentType_->baseTypes` for the
+        // class base). Only the CLASS base is a candidate: an interface in
+        // `baseTypes` declares no implementation for `base` to reach.
+        //
+        // The dispatch half is separate and lives at the two #1080 vtable
+        // branches below (lowerIndexerGet / lowerIndexerSet), which this step
+        // alone would NOT have fixed — the base's PropertySymbol shares its
+        // vtable slot with the derived override, so a vtable-dispatched
+        // `base[i]` still runs the override. Those branches now decline a
+        // `base` receiver exactly as lowerVirtualPropertyGet / -Set already
+        // decline `base.P` (§12.3), leaving the static getter/setter-body path
+        // to bind the base's own accessor.
+        if (!viaBase) return recv;
+        for (const sema::TypeSymbol* b : recv->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) return b;
+        // No class base: `base` is not legal here at all (§12.3 "`base` is
+        // legal only inside instance members of a derived class"). Sema rejects
+        // it; fall through rather than silently indexing the derived type.
+    }
 
     // fix #2833 (§23.4 / §27.3, v0.240): the receiver could not be recovered
     // from the current llvm::Function. That happens for a LAMBDA body (whose
@@ -1454,6 +1494,42 @@ const sema::TypeSymbol* Emitter::indexAccessReceiverDecl(
     return nullptr;
 }
 
+// fix #2832 (§12.3 / §23.4 / §2.8.2, v0.240) — see the header for the contract.
+bool Emitter::rejectImportedVirtualBaseIndexer(
+    const ast::IndexExpr& ix, const sema::PropertySymbol* ps) {
+    // Gated on the PROPERTY that actually blocks the lowering — "the only
+    // entry point I have dispatches virtually" — not on a source category.
+    //   * an IMPORTED indexer has no ast::PropertyDecl (#2414: ModuleLoader
+    //     reconstructs no AST), so every accessor call must go through
+    //     importedIndexerGetterFns_ / -SetterFns_; and
+    //   * for a VIRTUAL imported indexer what sits there is #2545's
+    //     vtable-DISPATCH wrapper, because emitExportedIndexerGetters /
+    //     -Setters skip a virtual indexer ("Skip virtual/override/abstract/
+    //     interface — other dispatch paths") and so the exporting module emits
+    //     no `bz$<Class>$idxget$<arity>` symbol for it at all.
+    // Calling that wrapper from `base[i]` would run the OVERRIDE — precisely
+    // the #2832 miscompile, one level below where #2832's fix operates
+    // (MEASURED cross-module: 201 where 101 is correct, before and after that
+    // fix). Report instead of emitting it: a clean compile error beats a
+    // silent wrong value. The ABI addition that would make it work is #2837.
+    //
+    // The imported NON-virtual case is untouched and correct (measured: 101
+    // through `base[i]`, `this[i]`, and `this[i]` inside a lambda), because
+    // its entry point IS the direct `bz$…$idxget$…` stub.
+    if (!ps || dynamic_cast<const ast::PropertyDecl*>(ps->decl)) return false;
+    if (!indexTargetIsBase(ix) || !isVirtualIndexer(ps)) return false;
+    ctx_.diagnostics().report(
+        Severity::Error, ix.span.begin,
+        "cannot lower `base[...]` against the imported virtual indexer on `" +
+            std::string(ps->parent ? ps->parent->name : "") +
+            "` — §12.3 requires the base class's own implementation, but the "
+            "cross-module indexer ABI exports a direct entry point only for a "
+            "NON-virtual indexer, so the only imported entry available "
+            "dispatches virtually and would run the override "
+            "(§12.3/§23.4/§2.8.2) — #2837");
+    return true;
+}
+
 llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return nullptr;
@@ -1461,6 +1537,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (!recvDecl) return nullptr;
     auto* ps = selectIndexer(recvDecl, ix);  // per §23.4 (#1172)
     if (!ps) return nullptr;
+    if (rejectImportedVirtualBaseIndexer(ix, ps)) return nullptr;  // #2832
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): an
     // IMPORTED indexer has no ast::PropertyDecl (mirrors Property's own
@@ -1642,7 +1719,19 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // from vt[propGetSlot_] and call it as `T get(ptr this, idx...)`. Mirrors
     // the #481 property-vtable path; the slot was assigned by buildVtable and
     // filled with ensureIndexerGetterFn.
-    if (recvDecl->kind == ast::TypeDeclKind::Class) {
+    //
+    // fix #2832 (§12.3, v0.240): `base[i]` DECLINES this path. §12.3: "Inside a
+    // derived member, `base.Name(...)` calls the base class's implementation,
+    // bypassing virtual dispatch." Resolving the receiver to the class base
+    // (indexAccessReceiverDecl) is necessary but NOT sufficient — the base
+    // indexer's PropertySymbol shares its vtable slot with the derived
+    // override, so a vtable-dispatched `base[i]` still ran the override
+    // (MEASURED: 202 where 102 is correct). Declining here hands the access to
+    // the static getter-body path below, which binds the BASE's own accessor —
+    // exactly what lowerVirtualPropertyGet does for `base.P` ("bypass dispatch
+    // — the static getter path handles it") and emitMethodCall's
+    // `baseQualified` does for `base.M()`.
+    if (recvDecl->kind == ast::TypeDeclKind::Class && !indexTargetIsBase(ix)) {
         auto gsIt = propGetSlot_.find(ps);
         if (gsIt != propGetSlot_.end()) {
             llvm::Type* retTy = lowerType(pd->type.get());
@@ -2011,6 +2100,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     if (!recvDecl) return false;
     auto* ps = selectIndexer(recvDecl, ix);  // per §23.4 (#1172)
     if (!ps) return false;
+    if (rejectImportedVirtualBaseIndexer(ix, ps)) return false;  // #2832
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     // fix #2414: the SETTER twin of lowerIndexerGet's decl-null fallback
     // immediately above — see its comment for the full rationale. Dispatches
@@ -2331,7 +2421,12 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     // receiver dispatches dynamically through the vtable slot (symmetric with
     // the getter path above). Load the setter fn-ptr from vt[propSetSlot_] and
     // call it as `void set(ptr this, idx..., value)`.
-    if (recvDecl->kind == ast::TypeDeclKind::Class) {
+    //
+    // fix #2832 (§12.3, v0.240): `base[i] := v` declines it, exactly as the
+    // getter twin above and as lowerVirtualPropertySet's own `base` bail-out
+    // (`if (tid->name == "base") return false;  // §12.3`) — the write must
+    // reach the BASE's setter body, not the override's vtable slot.
+    if (recvDecl->kind == ast::TypeDeclKind::Class && !indexTargetIsBase(ix)) {
         auto ssIt = propSetSlot_.find(ps);
         if (ssIt != propSetSlot_.end()) {
             llvm::Type* valTy = lowerType(pd->type.get());
@@ -2570,6 +2665,7 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     if (!recvDecl) return false;
     auto* ps = selectIndexer(recvDecl, *ix);  // per §23.4 (#1172)
     if (!ps) return false;
+    if (rejectImportedVirtualBaseIndexer(*ix, ps)) return false;  // #2832
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     // fix #2509 (§9.2/§23.4, v0.236): the IMPORTED-indexer compound-assign
     // twin of #2489's `!pd` branches in lowerIndexerGet/lowerIndexerSet
