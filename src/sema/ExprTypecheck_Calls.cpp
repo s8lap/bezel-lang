@@ -4846,6 +4846,65 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     }
                                 }
                             }
+                            // fix #2768 (stdlib §4.4 / §2.8, spec §14.2,
+                            // v0.240): (c) an INTERFACE element that names
+                            // `IComparable<E>` with E the interface ITSELF.
+                            // §14.2's interface-conformance rule 3 admits an
+                            // interface substitution ("T is an interface that
+                            // has I in its extension chain"), and its worked
+                            // example states that `where T: IComparable<int>`
+                            // "admits a mix of primitive, class, record, and
+                            // interface substitutions" — so rejecting
+                            // `Array<IFoo>.Sorted()` for `interface IFoo:
+                            // IComparable<IFoo>` was a FALSE REJECT of a
+                            // document-admissible shape. The self-recurrence is
+                            // required, not just any IComparable base: it is
+                            // what `where T: IComparable<T>` literally asks,
+                            // and it is what keeps `string` (stdlib §9.6:
+                            // `IComparable<string>`, never
+                            // `IComparable<IComparable<string>>`) out of the
+                            // interface arm codegen selects for this shape.
+                            // This predicate is the same test codegen's
+                            // selfComparableIfaceCompareTo applies, with ONE
+                            // difference: codegen additionally requires that a
+                            // non-static one-parameter `CompareTo` actually be
+                            // found among IComparable's members. That is not an
+                            // exact mirror, but it cannot desynchronize the two
+                            // in the dangerous direction — codegen's extra
+                            // conjunct failing is a MISS (the pre-fix
+                            // comparator choice stands), never a fault. So sema
+                            // can never admit an element codegen crashes on.
+                            //
+                            // #1867's convention: the builtin interface is
+                            // matched by IDENTITY, not by name — see
+                            // TypeResolution_Checks.cpp, "Blanket-accepting by
+                            // decl/name was too lenient — it admitted a WRONG
+                            // generic argument".
+                            if (!isComparableElem && elemTy472 &&
+                                !elemTy472->nullable &&
+                                elemTy472->kind == TypeRef::Kind::Named &&
+                                elemTy472->declaration &&
+                                elemTy472->declaration->kind ==
+                                    ast::TypeDeclKind::Interface) {
+                                const TypeSymbol* ed = elemTy472->declaration;
+                                const TypeSymbol* icmpSym =
+                                    ctx_.builtinInterfaceSym("IComparable");
+                                for (const TypeRef* bt : ed->baseTypeRefs) {
+                                    if (!bt || bt->nullable || !icmpSym ||
+                                        bt->kind != TypeRef::Kind::Named ||
+                                        bt->declaration != icmpSym ||
+                                        bt->genericArgs.size() != 1)
+                                        continue;
+                                    // §14.2 exact, component-wise, INVARIANT
+                                    // identity (§12.9) — compares the
+                                    // argument's own generic arguments too.
+                                    if (typeRefEqual(bt->genericArgs[0],
+                                                     elemTy472)) {
+                                        isComparableElem = true;
+                                        break;
+                                    }
+                                }
+                            }
                             if (!isComparableElem) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,

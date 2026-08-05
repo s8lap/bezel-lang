@@ -3053,11 +3053,33 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     findMethodByName(elemTR->declaration, "CompareTo");
                 if (cm && cm->params.size() == 1) classCompareMs = cm;
             }
+            // fix #2768 (stdlib §4.4/§2.8, spec §14.2, v0.240): an INTERFACE
+            // element `IFoo: IComparable<IFoo>` is neither a Class (so
+            // classCompareMs stays null) nor a string, yet it lowers to
+            // ptrTy() — so isStringElem below used to select bz$strcmp, which
+            // strcmp'd each element's VTABLE POINTER as a char*. Every instance
+            // of one class shares one vtable, so every pair compared equal and
+            // Sort() was a silent no-op with CompareTo never called. Dispatch
+            // through the §13 itable instead. See selfComparableIfaceCompareTo
+            // / ensureIfaceCmpThunk for why no other element category can be
+            // routed here.
+            sema::MethodSymbol* ifaceCompareMs =
+                classCompareMs ? nullptr : selfComparableIfaceCompareTo(elemTR);
+            // Null when the interface descriptor or itable index is missing;
+            // the pre-fix comparator choice then stands unchanged.
+            llvm::Function* ifaceCmpFn =
+                ifaceCompareMs
+                    ? ensureIfaceCmpThunk(elemTR->declaration, ifaceCompareMs)
+                    : nullptr;
             // Choose comparator: class IComparable → bz$classcmp$<Name>,
+            // interface IComparable → bz$ifacecmp$<Name>,
             // string → bz$strcmp, int/other → bz$intcmp.
-            bool isStringElem = !classCompareMs && (elemTy2 == ptrTy());
+            bool isStringElem =
+                !classCompareMs && !ifaceCmpFn && (elemTy2 == ptrTy());
             llvm::Function* cmpFn = nullptr;
-            if (classCompareMs) {
+            if (ifaceCmpFn) {
+                cmpFn = ifaceCmpFn;
+            } else if (classCompareMs) {
                 // Class IComparable<T> comparator thunk: dispatches a.CompareTo(b)
                 // via vtable (virtual/override) or direct compiled call otherwise.
                 // Each thunk arg is ptr* — a pointer to the class-pointer slot in
@@ -3335,9 +3357,23 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     findMethodByName(elemTR2->declaration, "CompareTo");
                 if (cm && cm->params.size() == 1) classCompareMs2 = cm;
             }
-            bool isStringElem2 = !classCompareMs2 && (elemTy2 == ptrTy());
+            // fix #2768: interface element — see the Sort() site above. The
+            // sema gate on the comparerless Sorted() (ExprTypecheck_Calls.cpp)
+            // admits exactly the same self-referential shape, so this arm and
+            // that gate accept or reject in lockstep.
+            sema::MethodSymbol* ifaceCompareMs2 =
+                classCompareMs2 ? nullptr
+                                : selfComparableIfaceCompareTo(elemTR2);
+            llvm::Function* ifaceCmpFn2 =
+                ifaceCompareMs2
+                    ? ensureIfaceCmpThunk(elemTR2->declaration, ifaceCompareMs2)
+                    : nullptr;
+            bool isStringElem2 =
+                !classCompareMs2 && !ifaceCmpFn2 && (elemTy2 == ptrTy());
             llvm::Function* cmpFn2 = nullptr;
-            if (classCompareMs2) {
+            if (ifaceCmpFn2) {
+                cmpFn2 = ifaceCmpFn2;
+            } else if (classCompareMs2) {
                 // Class IComparable<T> comparator thunk (mirrors Sort() path).
                 // per §14.2 / #1195.
                 std::string thunkName2 = std::string("bz$classcmp$") +

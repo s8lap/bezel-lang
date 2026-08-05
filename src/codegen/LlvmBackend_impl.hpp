@@ -28,6 +28,7 @@
 #include "codegen/LlvmBackend.hpp"
 #include "common/BuiltinRegistry.hpp"  // #1414 stage 3: builtin name registry
 #include "sema/SemaContext.hpp"
+#include "sema/TypeResolution.hpp"  // typeRefEqual — §14.2 exact type identity
 #include "sema/Symbol.hpp"
 
 #include "llvm/IR/BasicBlock.h"
@@ -4618,6 +4619,165 @@ private:
             t = baseClassOf(t);
         }
         return nameOnly;
+    }
+
+    // fix #2768 (stdlib §4.4 / §2.8, spec §14.2, v0.240): the `CompareTo` that
+    // `Array<T>.Sort()` / `.Sorted()` must dispatch to when T is an INTERFACE,
+    // or null when this element type is not one the comparerless forms govern.
+    //
+    // stdlib §4.4 declares the comparerless forms ONLY inside
+    //     public extension Array<T> where T: IComparable<T>
+    //       public method Sort();                    // in place
+    //       public method Sorted(): owned Array<T>;  // fresh sorted copy
+    // and §4.4's sorting contract makes CompareTo the ordering authority:
+    // "A comparer (or `CompareTo`) must induce a **total order**".  stdlib §2.8
+    // fixes its meaning: "`a.CompareTo(b)` returns a negative number if
+    // `a < b`, zero if equal, a positive number if `a > b`."
+    //
+    // spec §14.2's interface-conformance rule 3 admits an interface
+    // substitution — "**T is an interface** that has I in its extension chain —
+    // either I is named directly in T's inheritance clause, or T extends an
+    // interface that itself conforms to I" — and the §14.2 worked example says
+    // outright that "`where T: IComparable<int>` therefore admits a mix of
+    // primitive, class, record, and **interface** substitutions".  So
+    // `Array<IFoo>.Sort()` with `interface IFoo: IComparable<IFoo>` is a
+    // document-admissible shape whose order is the user's `CompareTo`.
+    //
+    // The test below is the §4.4 CONSTRAINT ITSELF, not a weaker proxy: the
+    // element interface must name `IComparable<E>` with E the element interface
+    // *itself*.  Being exactly the constraint is what makes the interface arm
+    // safe — see ensureIfaceCmpThunk's header comment.  Nullable is excluded
+    // because §14.2 states "A type-bound constraint — naming a class or
+    // interface — implies non-null T".
+    sema::MethodSymbol* selfComparableIfaceCompareTo(
+            const sema::TypeRef* elemTR) {
+        if (!elemTR || elemTR->nullable ||
+            elemTR->kind != sema::TypeRef::Kind::Named)
+            return nullptr;
+        const sema::TypeSymbol* d = elemTR->declaration;
+        if (!d || d->kind != ast::TypeDeclKind::Interface) return nullptr;
+        // #1867's convention: match the builtin interface by IDENTITY, never by
+        // name. TypeResolution_Checks.cpp records why — "Blanket-accepting by
+        // decl/name was too lenient — it admitted a WRONG generic argument" —
+        // and a name test would additionally let a USER-declared interface that
+        // happens to be called `IComparable` masquerade as the stdlib §2.8 one.
+        const sema::TypeSymbol* icmpSym =
+            ctx_.builtinInterfaceSym("IComparable");
+        if (!icmpSym) return nullptr;
+        // NOTE (#2772): baseTypeRefs holds the DIRECT inheritance clause, while
+        // §14.2 rule 3 is transitive. Reaching `IComparable<Self>` transitively
+        // would require an ancestor naming its own descendant, so the direct
+        // scan is exhaustive in practice; the residual is recorded on #2772.
+        //
+        // ⚠ MEASURED LIMIT: this does NOT reach a CROSS-MODULE interface. With
+        // `IFoo` and its implementor in an imported library, the repro still
+        // returns the pre-fix 32 instead of 18 — the imported interface's
+        // baseTypeRefs does not carry `IComparable<IFoo>`, so the scan below
+        // finds nothing and the unchanged (defective) comparator stands. A/B'd:
+        // the same-module case is unaffected, and matching by identity rather
+        // than by name is NOT the cause — the cross-module miss reproduces
+        // identically under both. Filed separately.
+        for (const sema::TypeRef* bt : d->baseTypeRefs) {
+            if (!bt || bt->kind != sema::TypeRef::Kind::Named || bt->nullable)
+                continue;
+            if (bt->declaration != icmpSym || bt->genericArgs.size() != 1)
+                continue;
+            // `IComparable<E>` with E the element type ITSELF — what the
+            // self-recurrence `where T: IComparable<T>` literally asks.
+            // typeRefEqual is §14.2's exact, component-wise, INVARIANT identity,
+            // so it compares the argument's own generic arguments too: for
+            // `interface I<T>: IComparable<I<int>>`, `Array<I<string>>` is
+            // correctly rejected (§12.9 — IComparable is invariant), where a
+            // bare `arg->declaration == d` would have admitted it.
+            if (!sema::typeRefEqual(bt->genericArgs[0], elemTR)) continue;
+            const sema::TypeSymbol* bd = bt->declaration;
+            for (sema::Symbol* m : bd->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (ms && !isStaticMethod(ms) && ms->name == "CompareTo" &&
+                    ms->params.size() == 1)
+                    return ms;
+            }
+        }
+        return nullptr;
+    }
+
+    // fix #2768: the `bz_array_sort` comparator thunk for an INTERFACE element
+    // type — it dispatches `a.CompareTo(b)` through the §13 itable, exactly as
+    // emitMethodCall's interface arm does for a written-out `a.CompareTo(b)`.
+    // Null when the descriptor or the itable index is missing, in which case
+    // the caller keeps its pre-fix comparator choice UNCHANGED.
+    //
+    // ⚠ "Unchanged" is the accurate word, NOT "safe": the fallback is
+    // `bz$strcmp` on a vtable global, i.e. this issue's own unbounded read,
+    // which happens not to fault only because a vtable typically contains an
+    // early zero byte. So a miss here preserves the DEFECT, it does not
+    // neutralize it — which is exactly why the predicate above matches the
+    // builtin interface by identity rather than by name (#1867): a name test
+    // is a live route into this fallback, not a harmless over-rejection.
+    //
+    // ⚠ WHY THIS CANNOT MIS-ROUTE ANY ELEMENT CATEGORY.  The thunk reads word 0
+    // of each element as a vtable and word 1 of that vtable as the itmap.  That
+    // holds for every value that can inhabit an `Array<E>` slot at an interface
+    // E: a class instance (`itmap$C`), a BOXED record / enum / choice
+    // (`itmap$box$C`), and a boxed primitive (`itmap$prim$…`) — every one has a
+    // registered vtable word.  The one reference shape whose word 0 is NOT a
+    // vtable is `string` (spec §4.6 "a reference type with content-based
+    // equality", §28.9 runtime-managed; word 0 is `char* data`) — precisely
+    // #2752's trap.  A `string` can inhabit an `Array<E>` slot only if `string`
+    // conforms to E, and stdlib §9.6 declares
+    //     public class String: IEnumerable<char>, IComparable<string>,
+    //                          IEquatable<string>
+    // — none of those three names `IComparable<Self>` in its extension chain
+    // (`IComparable<string>` would have to extend `IComparable<IComparable<
+    // string>>`), so selfComparableIfaceCompareTo rejects all three and no
+    // string ever reaches this thunk.
+    //
+    // ⚠ This is NOT #2752's diamond and must not be read as one.  That fix
+    // classified a value at RUN TIME with `bz_obj_is_string`, a whitelist
+    // NEGATION whose unsoundness (#2766) is that unregistered word-0 shapes
+    // answer "string".  Here nothing is classified by inspecting a runtime
+    // word: the arm is selected from the STATIC element type, by the exact
+    // stdlib §4.4 constraint, and the dispatch performed is the ordinary one
+    // every other interface call already uses.
+    llvm::Function* ensureIfaceCmpThunk(const sema::TypeSymbol* elemIface,
+                                        sema::MethodSymbol* cmpMs) {
+        if (!elemIface || !cmpMs) return nullptr;
+        auto descIt = descArray_.find(cmpMs->parent);
+        auto idxIt = ifaceMethodIndex_.find(cmpMs);
+        if (descIt == descArray_.end() || idxIt == ifaceMethodIndex_.end())
+            return nullptr;
+        std::string thunkName =
+            std::string("bz$ifacecmp$") + mangledTypeName(elemIface);
+        if (llvm::Function* existing = module_->getFunction(thunkName))
+            return existing;
+        auto* thunkTy =
+            llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+        auto* fn = llvm::Function::Create(
+            thunkTy, llvm::Function::InternalLinkage, thunkName, module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", fn);
+        llvm::IRBuilder<> tb(bb);
+        // Each argument is a ptr* — a pointer to the element slot in the array
+        // buffer (the bz_array_sort comparator ABI the other thunks use).
+        llvm::Value* aPtr = tb.CreateLoad(ptrTy(), &*fn->arg_begin());
+        llvm::Value* bPtr =
+            tb.CreateLoad(ptrTy(), &*std::next(fn->arg_begin()));
+        // §13 itable dispatch: vptr = a[0]; itmap = vptr[1];
+        // itab = bz_itable_lookup(itmap, td$I); fnPtr = itab[k].
+        llvm::Value* vptr = tb.CreateLoad(ptrTy(), aPtr);
+        llvm::Value* itmap = tb.CreateLoad(
+            ptrTy(), tb.CreateGEP(ptrTy(), vptr, {tb.getInt32(1)}));
+        auto* lookupFn =
+            declareC("bz_itable_lookup", ptrTy(), {ptrTy(), ptrTy()});
+        llvm::Value* itab = tb.CreateCall(
+            llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
+            lookupFn, {itmap, descIt->second}, "itab");
+        llvm::Value* fnPtr = tb.CreateLoad(
+            ptrTy(),
+            tb.CreateGEP(ptrTy(), itab, {tb.getInt32(idxIt->second)}), "ifn");
+        auto* cmpToTy =
+            llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+        tb.CreateRet(tb.CreateCall(cmpToTy, fnPtr, {aPtr, bPtr}));
+        return fn;
     }
 
     // #481 / §13 / §23: the (non-static, non-indexer) PropertySymbol named
