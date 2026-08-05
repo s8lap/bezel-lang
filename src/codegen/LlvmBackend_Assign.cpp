@@ -1445,6 +1445,23 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         emitPendingCheck();
         releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
                                        /*accessorResultEscapes=*/true);
+        // fix #2814 (§28.3 "Unbound owned temporaries", v0.240): the INDEX half
+        // of the same sentence the property half (#2751) covers — "used only by
+        // borrowing operations within the expression … as a member or INDEX
+        // access". `(new Src())[1]` leaked its receiver in every one of this
+        // function's five getter paths (MEASURED: 320 B / 20 allocs, live-object
+        // count 20 at exit). `disposeFreshNewReceiverTemp` already gates itself
+        // to a provably non-reference result, so a `string`/class/interface
+        // element still declines — the safe direction.
+        //
+        // `calleeReturnsOwned` is false BY CONSTRUCTION, not by choice: §A.3's
+        // `IndexerDecl` grammar carries no `owned` marker (only
+        // `StaticReadonlyDecl` does), so an indexer read can never announce a
+        // fresh transfer and the #1859/#2205 widenings are unreachable here.
+        // That is what keeps this clear of #2261's fresh-receiver UAF shape.
+        if (!diverged_)
+            disposeFreshNewReceiverTemp(ix.target.get(), obj, ctx_.exprType(ix),
+                                        /*calleeReturnsOwned=*/false);
         return r;
     }
     // #730 / §13 / §23.4: an indexer accessed through an INTERFACE-typed receiver
@@ -1508,6 +1525,23 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         }
         llvm::Value* r = builder_.CreateCall(gFnTy, fnPtr, callArgs);
         emitPendingCheck();
+        // fix #2814 (§28.3 "Unbound owned temporaries", v0.240): the INDEX half
+        // of the same sentence the property half (#2751) covers — "used only by
+        // borrowing operations within the expression … as a member or INDEX
+        // access". `(new Src())[1]` leaked its receiver in every one of this
+        // function's five getter paths (MEASURED: 320 B / 20 allocs, live-object
+        // count 20 at exit). `disposeFreshNewReceiverTemp` already gates itself
+        // to a provably non-reference result, so a `string`/class/interface
+        // element still declines — the safe direction.
+        //
+        // `calleeReturnsOwned` is false BY CONSTRUCTION, not by choice: §A.3's
+        // `IndexerDecl` grammar carries no `owned` marker (only
+        // `StaticReadonlyDecl` does), so an indexer read can never announce a
+        // fresh transfer and the #1859/#2205 widenings are unreachable here.
+        // That is what keeps this clear of #2261's fresh-receiver UAF shape.
+        if (!diverged_)
+            disposeFreshNewReceiverTemp(ix.target.get(), obj, ctx_.exprType(ix),
+                                        /*calleeReturnsOwned=*/false);
         return r;
     }
     // #1080 / §23.4: a virtual/override/abstract indexer on a CLASS receiver
@@ -1553,6 +1587,23 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
                 emitPendingCheck();
                 releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
                                                /*accessorResultEscapes=*/true);
+                // fix #2814 (§28.3 "Unbound owned temporaries", v0.240): the INDEX half
+                // of the same sentence the property half (#2751) covers — "used only by
+                // borrowing operations within the expression … as a member or INDEX
+                // access". `(new Src())[1]` leaked its receiver in every one of this
+                // function's five getter paths (MEASURED: 320 B / 20 allocs, live-object
+                // count 20 at exit). `disposeFreshNewReceiverTemp` already gates itself
+                // to a provably non-reference result, so a `string`/class/interface
+                // element still declines — the safe direction.
+                //
+                // `calleeReturnsOwned` is false BY CONSTRUCTION, not by choice: §A.3's
+                // `IndexerDecl` grammar carries no `owned` marker (only
+                // `StaticReadonlyDecl` does), so an indexer read can never announce a
+                // fresh transfer and the #1859/#2205 widenings are unreachable here.
+                // That is what keeps this clear of #2261's fresh-receiver UAF shape.
+                if (!diverged_)
+                    disposeFreshNewReceiverTemp(ix.target.get(), obj, ctx_.exprType(ix),
+                                                /*calleeReturnsOwned=*/false);
                 return r;
             }
         }
@@ -1617,6 +1668,23 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         // (`!diverged_`) discipline and the safe direction.
         releaseIndexArgStringProducers(ix, ps, recvDecl, idxArgVals,
                                        /*accessorResultEscapes=*/true);
+        // fix #2814 (§28.3 "Unbound owned temporaries", v0.240): the INDEX half
+        // of the same sentence the property half (#2751) covers — "used only by
+        // borrowing operations within the expression … as a member or INDEX
+        // access". `(new Src())[1]` leaked its receiver in every one of this
+        // function's five getter paths (MEASURED: 320 B / 20 allocs, live-object
+        // count 20 at exit). `disposeFreshNewReceiverTemp` already gates itself
+        // to a provably non-reference result, so a `string`/class/interface
+        // element still declines — the safe direction.
+        //
+        // `calleeReturnsOwned` is false BY CONSTRUCTION, not by choice: §A.3's
+        // `IndexerDecl` grammar carries no `owned` marker (only
+        // `StaticReadonlyDecl` does), so an indexer read can never announce a
+        // fresh transfer and the #1859/#2205 widenings are unreachable here.
+        // That is what keeps this clear of #2261's fresh-receiver UAF shape.
+        if (!diverged_)
+            disposeFreshNewReceiverTemp(ix.target.get(), obj, ctx_.exprType(ix),
+                                        /*calleeReturnsOwned=*/false);
         return res;
     }
 
@@ -1694,6 +1762,23 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     locals_ = std::move(savedLocals);
     paramSlots_ = std::move(savedParams);
     genericSubst_ = std::move(savedSubst);
+    // fix #2814 (§28.3 "Unbound owned temporaries", v0.240): the INDEX half
+    // of the same sentence the property half (#2751) covers — "used only by
+    // borrowing operations within the expression … as a member or INDEX
+    // access". `(new Src())[1]` leaked its receiver in every one of this
+    // function's five getter paths (MEASURED: 320 B / 20 allocs, live-object
+    // count 20 at exit). `disposeFreshNewReceiverTemp` already gates itself
+    // to a provably non-reference result, so a `string`/class/interface
+    // element still declines — the safe direction.
+    //
+    // `calleeReturnsOwned` is false BY CONSTRUCTION, not by choice: §A.3's
+    // `IndexerDecl` grammar carries no `owned` marker (only
+    // `StaticReadonlyDecl` does), so an indexer read can never announce a
+    // fresh transfer and the #1859/#2205 widenings are unreachable here.
+    // That is what keeps this clear of #2261's fresh-receiver UAF shape.
+    if (!diverged_)
+        disposeFreshNewReceiverTemp(ix.target.get(), obj, ctx_.exprType(ix),
+                                    /*calleeReturnsOwned=*/false);
     return result;
 }
 
