@@ -1602,6 +1602,35 @@ static bool parseAndAttachMethodBody(
             auto it = importedMethods.find(freshMethodSigKey(fms));
             if (it != importedMethods.end())
                 mainCtx.setExprSymbol(expr, it->second);
+        } else if (dynamic_cast<sema::LocalSymbol*>(freshSym)) {
+            // fix #2818 (§14.1 monomorphization / §2.5 modules, v0.240): a
+            // symbol DECLARED INSIDE the re-parsed body — a `var`/`const`
+            // local, a `for`/`for-in` iteration variable, a `using var`, a
+            // pattern binding — is the one category with NO importer-side
+            // counterpart to remap to. It *is* the fresh symbol: its `decl`
+            // is the re-parsed `ast::LocalDecl` that codegen keys `locals_`
+            // on when the body is monomorphized, and the fresh SemaContext
+            // that owns it is kept alive below (ownImportedAuxiliary). Copy
+            // the binding VERBATIM.
+            //
+            // Field/parameter/method are remapped because the importer holds
+            // a different symbol for the same entity; a body-local has no
+            // such twin, so "remap" degenerates to "carry over". Before this,
+            // the entry was simply DROPPED: `ctx_.exprSymbol()` returned null
+            // for every read of a body-local, `lowerExpr` on the identifier
+            // produced no value, and the enclosing expression degraded to a
+            // zero/null result (the #2491 return-path fallback) — e.g.
+            // `var built := $"xm-{i}"; return built.Length;` in an imported
+            // `Box<T>` returned 0 while still executing (and allocating) the
+            // body. A silent wrong value across the module boundary.
+            //
+            // Note this hole was MASKED whenever any sibling method of the
+            // same class declared a reference-typed return: buildMethodStub
+            // emits `=> 0` for it, which fails to typecheck, which trips the
+            // #783 soundness gate above and leaves `decl` unattached — so the
+            // call fell back to the exporter's own compiled function and got
+            // the right answer by accident. See #2820.
+            mainCtx.setExprSymbol(expr, freshSym);
         }
     }
 
