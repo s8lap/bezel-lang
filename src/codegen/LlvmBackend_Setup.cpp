@@ -20925,6 +20925,35 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
             if (litIsStrArr && !isPlusOneStringProducer(elemPtr.get()))
                 emitStringRetain(ev);
         }
+        // fix #2771 (§8.6, §15.4, v0.240): BOX the element against the declared
+        // ELEMENT type before storing it. Without this the loop stored the raw
+        // value: for `var arr: Array<IRank> := [new Pt(3)]` with `Pt` a record
+        // implementing `IRank`, the IR was
+        //     %2 = alloca %record.Pt
+        //     store %record.Pt %5, ptr %2
+        //     call void @bz_array_add(ptr %clit.arr, ptr %2, i64 8)
+        // — `esz` is 8 because the declared element type is an INTERFACE (a
+        // pointer slot), so `bz_array_add` copied the record's first 8 bytes
+        // into a slot every reader treats as an object pointer. `arr[0].Rank()`
+        // then dereferenced the field bits as a vtable: SIGSEGV (exit 139),
+        // with no collection operation involved at all.
+        //
+        // §8.6 is the rule this restores: a value type stored where the declared
+        // location is Object or an interface is boxed. The same call already
+        // guards the assignment path (LlvmBackend_Assign.cpp ~5082) and the
+        // property/return paths; the collection-literal element store was the
+        // gap. It is keyed on the DECLARED element type (`elemRef`), not on the
+        // source, so a class element stays a bare pointer (#399) and a numeric
+        // element keeps the `coerceNumericToType` result above — boxForTarget is
+        // a no-op unless the target is Object/interface AND the source is a
+        // boxable value type.
+        //
+        // Measured before the fix: boxing into an interface-typed LOCAL worked
+        // (`var x: IRank := new Pt(3); x.Rank()` → 3), and boxing into a local
+        // and then into the array worked — only the literal-direct-into-array
+        // spelling was broken, which is what made this look like a collection
+        // defect rather than a §8.6 one.
+        if (elemRef) ev = boxForTarget(ev, elemRef, elemPtr.get());
         llvm::AllocaInst* slot = entryAlloca(ev->getType());
         builder_.CreateStore(ev, slot);
         builder_.CreateCall(addFn, {arr, slot, builder_.getInt64(esz)});
