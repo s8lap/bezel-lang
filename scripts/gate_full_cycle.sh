@@ -92,6 +92,29 @@ run_until_trustworthy() {
 
 say "cycle start at $(git rev-parse --short HEAD) — logs in $LOGDIR"
 
+# STALENESS PREFLIGHT. A gate that validates a STALE compiler is the worst
+# possible outcome: it reports green for code that was never built. This is not
+# hypothetical — `cmake --build --target bezelc` has been observed printing
+# "Built target bezelc" and NOT relinking, leaving a binary older than both its
+# own object file and the sources (the #2426 unreliable-incremental family).
+# During this run that cost a false "the fix does not work" finding and a
+# lane's time before a binary mtime check settled it.
+#
+# gate.sh rebuilds before it tests, so this preflight is about the state we
+# ENTER in: if the tree already carries a stale binary, say so loudly here
+# rather than trusting the build phase to notice. Advisory, not fatal — the
+# gate's own reconfigure+build is still the mechanism that fixes it; this only
+# guarantees the condition is never silent.
+if [ -x "$REPO/build/bezelc" ]; then
+  newest_src="$(find "$REPO/src" -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
+                  -newer "$REPO/build/bezelc" -print -quit 2>/dev/null)"
+  if [ -n "$newest_src" ]; then
+    say "STALE: build/bezelc is older than $(basename "$newest_src") — the gate's"
+    say "STALE: build phase must relink it. If a gate ever reports green while"
+    say "STALE: this warning stands, do NOT believe the result (see #2426)."
+  fi
+fi
+
 run_until_trustworthy "$LOGDIR/${TAG}_plain.log" "plain" || exit $?
 
 # --full folds whole-suite generated-code AddressSanitizer into the same sharded
