@@ -2698,7 +2698,14 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     // and the setter would mutate a throwaway slot — #2489's own
     // confirmed defect for plain `r[i] := v`) and #2489's lowerIndexerSet
     // `!pd` branch.
-    if (!pd) {
+    //
+    // fix #2836 (§23.4/§11.2, v0.240): exclude an INTERFACE receiver from this
+    // gate, exactly as #2422 excluded it from lowerIndexerGet's and
+    // lowerIndexerSet's identical `!pd` gates. An IMPORTED interface's indexer
+    // also has `pd == null`, and its accessors live in the itable, not in the
+    // `bz$<Class>$idx{get,set}$<arity>` direct-call ABI — it must reach the
+    // itable branch added just below rather than be rejected here.
+    if (!pd && recvDecl->kind != ast::TypeDeclKind::Interface) {
         if (recvDecl->kind != ast::TypeDeclKind::Class &&
             recvDecl->kind != ast::TypeDeclKind::Record) return false;
         auto git = importedIndexerGetterFns_.find(ps);
@@ -2805,6 +2812,313 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
         releaseIndexArgStringProducers(*ix, ps, recvDecl, idxArgVals,
                                        /*accessorResultEscapes=*/false);
         return true;
+    }
+
+    // fix #2836 (§6.6 / §23.4 / §12.1, v0.240) — THE TWO DYNAMIC-DISPATCH
+    // BRANCHES THIS FUNCTION NEVER HAD.
+    //
+    // §12.1, verbatim: "A method, property, or indexer is non-virtual unless
+    // marked `virtual`. To override a virtual member in a derived class, mark
+    // the matching member `override`." §23.4, verbatim: indexers "participate
+    // in `virtual`/`override`/`sealed`/`abstract` like methods."
+    //
+    // `lowerIndexerGet` and `lowerIndexerSet` each carry an interface-itable
+    // branch (#730) and a class-vtable branch (#1080) so a virtual indexer
+    // dispatches on the RUNTIME type. `lowerIndexerCompound` carried NEITHER:
+    // its local (`pd != nullptr`) path went straight to "find a getter accessor
+    // body / find a setter accessor body" and inlined the COMPILE-TIME receiver
+    // type's bodies. So `a[i] OP= v` was always statically bound, while the
+    // plain `a[i]` read and the plain `a[i] := v` write right next to it
+    // dispatched correctly — a SILENT wrong value on an idiomatic shape.
+    // MEASURED on 9983ddb, `this[0] += 1` through a `virtual`/`override` pair:
+    // 102 (the base's accessors) where 203 (the override's) is correct.
+    //
+    // An INTERFACE receiver was worse still: `pd` is the (bodiless) interface
+    // PropertyDecl, so the accessor-body search below found nothing and the
+    // whole statement was DROPPED — MEASURED 0, no diagnostic. So was an
+    // `abstract` indexer declared on an abstract base and compounded through
+    // `this[i]` in that base's own method (MEASURED 0): same bodiless shape.
+    //
+    // WHY NOT DELEGATE TO lowerIndexerGet + lowerIndexerSet (the #2510 shape,
+    // correctly declined). §6.6, verbatim (the document's hard line wraps
+    // joined with a single space): "the statement `x op= e` is equivalent to
+    // `x := x op e` with the target evaluated **once**", and "every constituent
+    // of the left-hand side's lvalue chain … is evaluated exactly once … and
+    // every index expression in the chain". Driving the two
+    // siblings would lower the receiver and each index TWICE. Both branches
+    // below therefore evaluate the receiver and every index expression ONCE,
+    // spill each index into a slot, and share those slots between the getter
+    // call and the setter call — the same discipline the `!pd` branch above
+    // already uses, and in §6.6's stated order (LHS constituents, getter, `e`,
+    // the operation, the store).
+    //
+    // `base[i] OP= v` DECLINES the vtable branch, exactly as #2832 made
+    // lowerIndexerGet's and lowerIndexerSet's decline it (§12.3: "Inside a
+    // derived member, `base.Name(...)` calls the base class's implementation,
+    // bypassing virtual dispatch"). The base indexer shares its vtable slot
+    // with the derived override, so dispatching would run the override.
+    //
+    // Shared by both branches: §6.6's "then `e`, then the operation". Returns
+    // the new value; `rhsOut` receives the lowered RHS so the caller can
+    // discharge its +1 (see each branch's release block).
+    auto emitCompoundValue = [&](llvm::Value* cur,
+                                 llvm::Value*& rhsOut) -> llvm::Value* {
+        rhsOut = nullptr;
+        llvm::Value* rhs = lowerExpr(*as.value);
+        if (!rhs) {
+            // #1386 precedent: ICE rather than a silently dropped store.
+            ctx_.diagnostics().report(
+                Severity::Error, as.value->span.begin,
+                "internal: lowerExpr returned null for compound indexer "
+                "assignment RHS (dynamic-dispatch path) — #2836");
+            return nullptr;
+        }
+        rhsOut = rhs;
+        std::string op(as.op);
+        if (!op.empty() && op.back() == '=') op.pop_back();
+        return emitCompoundOp(
+            op, cur, rhs, cur->getType()->isFloatingPointTy(),
+            isUnsignedTargetExpr(*as.target),
+            isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
+            isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
+    };
+
+    // Shared by both branches: discharge the +1 references the desugaring
+    // minted. `newVal` is `emitCompoundOp`'s result, and that function returns
+    // a POINTER on exactly one path — `op == "+"` with two pointer operands,
+    // which routes to `emitStringConcat` (a fresh rc=1 per #422); every other
+    // path is numeric. So "pointer-typed" IS "a fresh string" here, which is
+    // why the test is on the lowered type rather than a source-type category.
+    // `rhs` is released only when the RHS AST is itself a +1 producer (a named
+    // local is a BORROW — releasing it would drop the owner's only reference);
+    // `emitCompoundOp` does not consume `rhs` (it concatenates into a fresh
+    // buffer), so a producer's +1 would otherwise be stranded. This mirrors the
+    // local inline path's own #2567 release block at the end of this function,
+    // one for one. Only sound on a CLASS-backed store, where the setter retains
+    // (§23.3/§9); the caller passes `classBacked=false` where the runtime
+    // implementor may be a RECORD (whose reference fields are borrows stored
+    // plainly, §9/§9.7 — releasing there would dangle the field).
+    auto releaseCompoundProducers = [&](llvm::Value* newVal, llvm::Value* rhs,
+                                        bool classBacked) {
+        if (!classBacked || diverged_) return;
+        if (newVal && newVal->getType()->isPointerTy())
+            emitStringRelease(newVal);
+        if (rhs && rhs->getType()->isPointerTy() && as.value.get() &&
+            isPlusOneStringProducer(as.value.get()))
+            emitStringRelease(rhs);
+    };
+
+    // --- #730 / §13 / §23.4 / §6.6: INTERFACE-typed receiver. -----------------
+    // `(q: IFoo)[i] OP= v` dispatches BOTH halves through the itable — the
+    // compound twin of lowerIndexerGet's and lowerIndexerSet's own #730
+    // branches. `itab` is computed ONCE, before the getter call, and both
+    // fn-ptr loads index it: re-deriving it after the setter would read a
+    // receiver the setter has already mutated (lowerIndexerSet's #2506 note).
+    // Handles `pd == null` (an IMPORTED interface indexer, #2422) by reading
+    // the signature off the reconstructed side tables, as those branches do.
+    if (recvDecl->kind == ast::TypeDeclKind::Interface) {
+        auto gIt = ifacePropertyGetIndex_.find(ps);
+        auto sIt = ifacePropertySetIndex_.find(ps);
+        auto descIt = descArray_.find(recvDecl);
+        if (gIt == ifacePropertyGetIndex_.end() ||
+            sIt == ifacePropertySetIndex_.end() ||
+            descIt == descArray_.end()) return false;
+        // fix #2528's resolution: an interface generic parameter is resolved
+        // against the receiver instantiation BEFORE LLVM lowering.
+        const sema::TypeRef* elemRef =
+            interfaceIndexerElementType(ctx_, *ix, recvDecl, ps);
+        llvm::Type* elemTy = lowerTypeRef(resolveTypeParamRef(elemRef));
+        if (!elemTy) elemTy = i32();
+        const std::size_t nparams = indexerParamCount(ps);
+        std::vector<llvm::Type*> paramTys;
+        paramTys.push_back(ptrTy());
+        for (std::size_t k = 0; k < nparams; ++k) {
+            llvm::Type* pt = nullptr;
+            if (pd) {
+                if (k < pd->indexerParams.size() && pd->indexerParams[k].type)
+                    pt = lowerType(pd->indexerParams[k].type.get());
+            } else if (auto* tr = indexerParamType(ctx_, ps, k)) {
+                pt = lowerTypeRef(tr);
+            }
+            paramTys.push_back(pt ? pt : i32());
+        }
+        auto* gFnTy = llvm::FunctionType::get(elemTy, paramTys, false);
+        std::vector<llvm::Type*> setParamTys(paramTys);
+        setParamTys.push_back(elemTy);
+        auto* sFnTy = llvm::FunctionType::get(
+            llvm::Type::getVoidTy(llvm_), setParamTys, false);
+
+        // §6.6: the receiver, then every index, each exactly once.
+        llvm::Value* obj = lowerExpr(*ix->target);
+        if (!obj || !obj->getType()->isPointerTy()) return false;
+        std::vector<llvm::Value*> idxArgVals;   // original SSA values (#2717)
+        std::vector<llvm::AllocaInst*> idxSlots;
+        for (std::size_t k = 0; k < nparams && k < ix->indices.size(); ++k) {
+            if (!ix->indices[k].value) return false;
+            llvm::Value* argVal = lowerExpr(*ix->indices[k].value);
+            if (!argVal) return false;
+            llvm::AllocaInst* slot = entryAlloca(argVal->getType());
+            builder_.CreateStore(argVal, slot);
+            idxSlots.push_back(slot);
+            idxArgVals.push_back(argVal);
+        }
+        auto loadIndices = [&](std::vector<llvm::Value*>& into) {
+            for (std::size_t k = 0; k < idxSlots.size(); ++k)
+                into.push_back(coerceNumericToType(
+                    builder_.CreateLoad(idxSlots[k]->getAllocatedType(),
+                                        idxSlots[k]),
+                    paramTys[k + 1], false));
+        };
+
+        llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
+        auto* lookupFn =
+            declareC("bz_itable_lookup", ptrTy(), {ptrTy(), ptrTy()});
+        llvm::Value* itmapPtr = builder_.CreateLoad(
+            ptrTy(), builder_.CreateGEP(ptrTy(), vptr, {builder_.getInt32(1)}));
+        llvm::Value* itab = builder_.CreateCall(
+            llvm::FunctionType::get(ptrTy(), {ptrTy(), ptrTy()}, false),
+            lookupFn, {itmapPtr, descIt->second}, "itab");
+
+        llvm::Value* getPtr = builder_.CreateLoad(
+            ptrTy(),
+            builder_.CreateGEP(ptrTy(), itab, {builder_.getInt32(gIt->second)}),
+            "idxget");
+        std::vector<llvm::Value*> getArgs;
+        getArgs.push_back(obj);
+        loadIndices(getArgs);
+        llvm::Value* cur = builder_.CreateCall(gFnTy, getPtr, getArgs);
+        emitPendingCheck();
+        if (!cur) return false;
+
+        llvm::Value* rhs = nullptr;
+        llvm::Value* newVal = emitCompoundValue(cur, rhs);
+        if (!newVal) return false;
+
+        llvm::Value* setPtr = builder_.CreateLoad(
+            ptrTy(),
+            builder_.CreateGEP(ptrTy(), itab, {builder_.getInt32(sIt->second)}),
+            "idxset");
+        std::vector<llvm::Value*> setArgs;
+        setArgs.push_back(obj);
+        loadIndices(setArgs);
+        setArgs.push_back(coerceNumericToType(newVal, elemTy, false));
+        builder_.CreateCall(sFnTy, setPtr, setArgs);
+        emitPendingCheck();
+        // RECORDED SCOPE LIMIT, not an oversight: no producer release fires on
+        // this branch. The runtime implementor behind an interface may be
+        // RECORD-backed, whose setter PLAIN-STORES (§9/§9.7), and releasing
+        // there would drop the field's only reference — a UAF. Distinguishing
+        // the two needs lowerIndexerSet's #2506/#2535 runtime itable owner-kind
+        // flag; until that is carried here a `string`-element compound through
+        // an interface leaks its concatenation (MEASURED: 355 B / 20 allocs
+        // over 5 iterations, no UAF — a bounded leak, the safe direction; filed
+        // as #2847). `releaseIndexArgStringProducers` reaches
+        // the same conclusion on its own (it early-returns for a non-Class
+        // recvDecl), so it is not called here.
+        return true;
+    }
+
+    // --- #1080 / §23.4 / §12.1 / §6.6: CLASS receiver, vtable dispatch. -------
+    // The compound twin of lowerIndexerGet's and lowerIndexerSet's own #1080
+    // branches: load the getter/setter fn-ptrs from vt[propGetSlot_] /
+    // vt[propSetSlot_] and call them as `T get(ptr this, idx...)` /
+    // `void set(ptr this, idx..., T)`. Slots were assigned by buildVtable and
+    // filled by ensureIndexerGetterFn / -SetterFn.
+    //
+    // `!indexTargetIsBase` per §12.3 — see the block comment above. Both slots
+    // are required: a getter-only virtual indexer has no setter to compound
+    // through, and falling through to the static path (which would find no
+    // setter body either) keeps that shape's existing outcome rather than
+    // inventing a new one. MEASURED: that outcome is a SILENT no-op, identical
+    // for the non-virtual spelling — a pre-existing SEMA gap (a write to a
+    // getter-only indexer should be rejected, as it already is for a named
+    // property), filed as #2851 and deliberately not papered over here.
+    if (recvDecl->kind == ast::TypeDeclKind::Class && !indexTargetIsBase(*ix)) {
+        auto gsIt = propGetSlot_.find(ps);
+        auto ssIt = propSetSlot_.find(ps);
+        if (gsIt != propGetSlot_.end() && ssIt != propSetSlot_.end()) {
+            llvm::Type* elemTy = lowerType(pd->type.get());
+            if (!elemTy) elemTy = i32();
+            std::vector<llvm::Type*> paramTys;
+            paramTys.push_back(ptrTy());
+            for (const auto& p : pd->indexerParams) {
+                llvm::Type* pt = p.type ? lowerType(p.type.get()) : nullptr;
+                paramTys.push_back(pt ? pt : i32());
+            }
+            auto* gFnTy = llvm::FunctionType::get(elemTy, paramTys, false);
+            std::vector<llvm::Type*> setParamTys(paramTys);
+            setParamTys.push_back(elemTy);
+            auto* sFnTy = llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), setParamTys, false);
+
+            // §6.6: the receiver, then every index, each exactly once. A class
+            // receiver is a pointer, so `lowerExpr` yields the object itself
+            // (no #2507 lvalueAddr spill is needed or wanted — that exists for
+            // the by-value RECORD receiver, and a record has no vtable: §9,
+            // "A record cannot derive from another record or from a class").
+            llvm::Value* obj = lowerExpr(*ix->target);
+            if (obj && obj->getType()->isPointerTy()) {
+                std::vector<llvm::Value*> idxArgVals;      // #2717
+                std::vector<llvm::AllocaInst*> idxSlots;
+                for (std::size_t k = 0; k < pd->indexerParams.size() &&
+                     k < ix->indices.size(); ++k) {
+                    if (!ix->indices[k].value) return false;
+                    llvm::Value* argVal = lowerExpr(*ix->indices[k].value);
+                    if (!argVal) return false;
+                    llvm::AllocaInst* slot = entryAlloca(argVal->getType());
+                    builder_.CreateStore(argVal, slot);
+                    idxSlots.push_back(slot);
+                    idxArgVals.push_back(argVal);
+                }
+                auto loadIndices = [&](std::vector<llvm::Value*>& into) {
+                    for (std::size_t k = 0; k < idxSlots.size(); ++k)
+                        into.push_back(coerceNumericToType(
+                            builder_.CreateLoad(
+                                idxSlots[k]->getAllocatedType(), idxSlots[k]),
+                            paramTys[k + 1], false));
+                };
+
+                llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
+                llvm::Value* getPtr = builder_.CreateLoad(
+                    ptrTy(),
+                    builder_.CreateGEP(ptrTy(), vptr,
+                                       {builder_.getInt32(gsIt->second)}),
+                    "idxget");
+                std::vector<llvm::Value*> getArgs;
+                getArgs.push_back(obj);
+                loadIndices(getArgs);
+                llvm::Value* cur = builder_.CreateCall(gFnTy, getPtr, getArgs);
+                emitPendingCheck();
+                if (!cur) return false;
+
+                llvm::Value* rhs = nullptr;
+                llvm::Value* newVal = emitCompoundValue(cur, rhs);
+                if (!newVal) return false;
+
+                llvm::Value* setPtr = builder_.CreateLoad(
+                    ptrTy(),
+                    builder_.CreateGEP(ptrTy(), vptr,
+                                       {builder_.getInt32(ssIt->second)}),
+                    "idxset");
+                std::vector<llvm::Value*> setArgs;
+                setArgs.push_back(obj);
+                loadIndices(setArgs);
+                setArgs.push_back(coerceNumericToType(newVal, elemTy, false));
+                builder_.CreateCall(sFnTy, setPtr, setArgs);
+                emitPendingCheck();
+                // A vtable slot is always a CLASS's own slot (§9 again), so the
+                // setter's class-gated retain fired and the desugaring's +1s are
+                // doubled/stranded exactly as on the inline path — #2548's own
+                // argument for the plain-set twin of this branch.
+                releaseCompoundProducers(newVal, rhs, /*classBacked=*/true);
+                // fix #2717: the index was lowered ONCE and shared by both
+                // calls, so its producer +1 is discharged once, here — after
+                // the setter, its last consumer.
+                releaseIndexArgStringProducers(*ix, ps, recvDecl, idxArgVals,
+                                               /*accessorResultEscapes=*/false);
+                return true;
+            }
+        }
     }
 
     // --- Locate getter body. ---
