@@ -8051,11 +8051,63 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         findMethodByName(t->declaration, "CompareTo"))
                     if (cm->params.size() == 1) return cm;
             }
+            // fix #2782 (stdlib §2.2, spec §14.2, v0.240): an INTERFACE
+            // argument was omitted from the kind test above, so this returned
+            // null, the `Math.Min`/`Max`/`Clamp` arms fell through to the
+            // float path, and the call degraded to a ZERO/NULL result with
+            // only the #2491 internal Warning — the build SUCCEEDED and the
+            // program silently computed the wrong answer. That is strictly
+            // worse than #2770's ICE on the sibling `Array<T>.Min()` shape:
+            // a stopped build cannot ship, a wrong value can.
+            //
+            // stdlib §2.2 declares
+            //     public static method Min<T>(a: T, b: T): T
+            //                                     where T: IComparable<T>;
+            // and spec §14.2 conformance rule 3 admits an interface
+            // substitution — "**T is an interface** that has I in its
+            // extension chain" — so this is a document-admissible shape that
+            // must compute the user's ordering.
+            //
+            // Selected by the exact §2.2 constraint (selfComparableIfaceCompareTo,
+            // shared with #2768/#2770), from the STATIC argument type, never by
+            // a runtime word test — so no other category can be mis-routed in,
+            // and `string` is structurally excluded (stdlib §9.6 names no
+            // `IComparable<Self>`). Tried only after the kind test above
+            // returns nothing, so every shape that works today is unchanged.
+            if (sema::MethodSymbol* ifm = selfComparableIfaceCompareTo(t))
+                return ifm;
             return nullptr;
         };
         auto emitCompareToCmp = [&](sema::MethodSymbol* cmpMs, llvm::Value* a,
                                     llvm::Value* b,
                                     const ast::Expr* recvExpr) -> llvm::Value* {
+            // fix #2782: an interface receiver's `CompareTo` is declared on
+            // `IComparable` and has NO compiled body, so emitMethodCall below
+            // cannot reach it. Dispatch through #2768's `bz$ifacecmp$<Iface>`
+            // thunk instead — the same §13 itable dispatch a written-out
+            // `a.CompareTo(b)` uses. The thunk's ABI is two element-SLOT
+            // addresses, and here both operands are values, so each spills to
+            // one entry alloca (exactly as #2770's selector site does).
+            // Fail-CLOSED: any leg that cannot be established returns null,
+            // which the callers propagate as "not lowered" rather than
+            // silently selecting an operand.
+            if (cmpMs && cmpMs->parent &&
+                cmpMs->parent->kind == ast::TypeDeclKind::Interface) {
+                const sema::TypeRef* rt =
+                    recvExpr ? ctx_.exprType(*recvExpr) : nullptr;
+                if (!rt || !rt->declaration) return nullptr;
+                if (!a || !b || !a->getType()->isPointerTy() ||
+                    !b->getType()->isPointerTy())
+                    return nullptr;
+                llvm::Function* thunk =
+                    ensureIfaceCmpThunk(rt->declaration, cmpMs);
+                if (!thunk) return nullptr;
+                llvm::Value* aSlot = entryAlloca(ptrTy());
+                llvm::Value* bSlot = entryAlloca(ptrTy());
+                builder_.CreateStore(a, aSlot);
+                builder_.CreateStore(b, bSlot);
+                return builder_.CreateCall(thunk, {aSlot, bSlot}, "cmp.iface");
+            }
             // fix #1858 / §5 / §11 / §14.2: for a GENERIC-record IComparable
             // instantiation (`Box<string>`), install the per-instantiation
             // generic substitution from the receiver's concrete type arguments

@@ -8239,7 +8239,27 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                  // so member access on the returned borrow
                                  // resolves to the class's fields/methods.
                                  argTy->declaration->kind ==
-                                     ast::TypeDeclKind::Class)) {
+                                     ast::TypeDeclKind::Class ||
+                                 // fix #2782 (stdlib §2.2, spec §14.2, v0.240):
+                                 // an INTERFACE argument was omitted here, so
+                                 // the call was left mistyped (defaulting to
+                                 // int) exactly as a record/enum was before
+                                 // #1141. §14.2 rule 3 admits an interface
+                                 // substitution — "**T is an interface** that
+                                 // has I in its extension chain" — and its
+                                 // worked example says `where T:
+                                 // IComparable<int>` "admits a mix of
+                                 // primitive, class, record, and **interface**
+                                 // substitutions". The mistyping is why
+                                 // `Math.Min(x, y).Rank()` and an UNANNOTATED
+                                 // `var t := Math.Min(x, y)` degraded to a
+                                 // zero/null result: with the call typed int,
+                                 // member access on the result could not
+                                 // resolve. An annotated `var t: IFoo := …`
+                                 // masked it, which is why the codegen half
+                                 // alone was not enough.
+                                 argTy->declaration->kind ==
+                                     ast::TypeDeclKind::Interface)) {
                                 // #1215 / §14.2: nullable types do not satisfy
                                 // interface constraints — reject with a clean
                                 // diagnostic so the call never reaches codegen.
@@ -8277,6 +8297,38 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                         "IComparable<T>` constraint — nullable "
                                         "types do not implement interface "
                                         "constraints (§14.2)");
+                                } else if (
+                                    argTy->declaration->kind ==
+                                        ast::TypeDeclKind::Interface &&
+                                    !selfComparableIfaceArg(argTy,
+                                                            icomparable)) {
+                                    // fix #2782: for an INTERFACE argument the
+                                    // loose `isSubtype(decl, IComparable)`
+                                    // below is NOT sufficient, and admitting
+                                    // more here than codegen can lower would be
+                                    // worse than the original defect: codegen's
+                                    // arm requires `IComparable<Self>` exactly
+                                    // (selfComparableIfaceCompareTo), and an
+                                    // interface it declines falls through to
+                                    // the FLOAT path, which emits `sitofp ptr
+                                    // … to double` on a pointer operand. So the
+                                    // two layers are held to the SAME test:
+                                    // `interface IG<T>: IComparable<IG<int>>`
+                                    // with argument `IG<string>` is rejected
+                                    // here (§12.9 — IComparable is invariant)
+                                    // rather than reaching a malformed-IR path.
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        "type argument `" +
+                                        std::string(argTy->declaration->name) +
+                                        "` does not satisfy the constraint `where "
+                                        "T: IComparable<T>` — `Math." +
+                                        std::string(ma->member) +
+                                        "` requires an interface that names "
+                                        "`IComparable<" +
+                                        std::string(argTy->declaration->name) +
+                                        ">` (itself) in its extension chain "
+                                        "(§14.2, §12.9, stdlib §2.2)");
                                 } else if (icomparable &&
                                            !isSubtype(argTy->declaration,
                                                       icomparable)) {
