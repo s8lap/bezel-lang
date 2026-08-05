@@ -328,17 +328,28 @@ BEZEL_TEST(array_minmax_iface_elem_2770,
         "#1198"));
 }
 
-// CONTROL — an interface element with NO IComparable in its chain
-// (`Array<IDisposable>`, spec §28.2's implicit conformance).  stdlib §5.1 does
-// not admit it and this fix does not claim it.  MEASURED: it compiles and
-// returns 7 — it reaches neither the new interface arm (IDisposable's
-// baseTypeRefs name no IComparable) nor the new reject guard, so this commit
-// cannot have changed it.  Pinned so a later widening of the predicate cannot
-// silently start itable-dispatching here.  (That §5.1 admits this call at all
-// is the Min/Max analogue of the sema laxity recorded on #2772 for Sort; it is
-// not touched here.)
-BEZEL_TEST(array_minmax_iface_elem_2770, control_non_comparable_interface_unchanged) {
-    BEZEL_EXPECT_EQ(runChecked(
+// An interface element with NO IComparable in its chain (`Array<IDisposable>`).
+// stdlib §5.1 does not admit it, so it must be REJECTED.
+//
+// ⚠ UPDATED BY #2784.  As originally written this case asserted that the
+// program COMPILES and returns 7, described as "MEASURED: … it reaches neither
+// the new interface arm … nor the new reject guard, so this commit cannot have
+// changed it."  That measurement was accurate, but it pinned a DEFECT: the call
+// violates §5.1's `where T: IComparable<T>` and was being accepted silently,
+// returning a non-null element chosen under no defined ordering, while the
+// user-defined analogue was correctly rejected.  #2784 established that; the
+// reject guard is now category-blind (it no longer requires the element to
+// carry a `declaration`, which a BUILTIN interface never has — root cause
+// #2789), so this shape now reports the §5.1 diagnostic.
+//
+// The case still serves its original purpose.  It was written so "a later
+// widening of the predicate cannot silently start itable-dispatching here", and
+// it still catches exactly that: a widening that dispatched `IDisposable`
+// through the itable would COMPILE, and this assertion — which demands the
+// diagnostic — would fail.  Only the pinned outcome changed, from "silently
+// accepted" to "rejected"; what is being guarded against did not.
+BEZEL_TEST(array_minmax_iface_elem_2770, control_non_comparable_interface_rejected) {
+    BEZEL_EXPECT_TRUE(rejectsWith(
         "module M; "
         "class Node public constructor() end constructor; end Node; "
         "class C "
@@ -349,7 +360,8 @@ BEZEL_TEST(array_minmax_iface_elem_2770, control_non_comparable_interface_unchan
         "    var m := arr.Min(); "
         "    return 7; "
         "  end Main; "
-        "end C; "), 7);
+        "end C; ",
+        "requires the element type to satisfy"));
 }
 
 // CONTROL — a NULLABLE interface element.  spec §14.2: "A type-bound constraint

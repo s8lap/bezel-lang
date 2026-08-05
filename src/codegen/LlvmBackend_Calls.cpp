@@ -2313,19 +2313,50 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 // programs that abort the compiler today: sema rejects a
                 // reference element whose type names no `IComparable` at all,
                 // so the residue reaching here is exactly the ICE set.
+                // fix #2784 (stdlib §5.1, spec §14.2, v0.240): this guard
+                // originally also required `elemTypeRef->declaration`, and a
+                // BUILTIN interface element has none — the whitelist at
+                // TypeResolution_Names.cpp:1511 attaches a synthesized
+                // Interface TypeSymbol to IComparable/IEquatable/
+                // IEqualityComparer/IReadOnlySpan/INumber/ISteppable/IParsable
+                // and NOT to IDisposable (root cause: #2789). So
+                // `Array<IDisposable>.Min()` slipped past BOTH this guard and
+                // sema's #1198 gate — which scans the element declaration's
+                // base list and likewise found nothing to scan — and compiled
+                // with NO diagnostic at all, returning a non-null pointer
+                // chosen under no defined ordering. MEASURED: it returned 92
+                // (a non-null result) where the user-defined analogue is
+                // correctly rejected.
+                //
+                // The declaration requirement is therefore dropped: what makes
+                // an element admissible here is that a comparator was RESOLVED
+                // (the arms above), not that it happens to carry a declaration.
+                // Anything reaching this point is a reference element with no
+                // usable ordering, whatever its symbol representation. Same
+                // reasoning as #2786's category-blind guard — enumerating the
+                // shapes that may arrive is exactly how this family kept
+                // acquiring new members.
+                //
+                // `headName()` is used for the message because it is defined
+                // for a Named TypeRef WITHOUT a declaration (it falls back to
+                // the syntactic head, then to the metadata importedName) and
+                // it resolves through a type alias (#1462).
                 if (elemTypeRef &&
                     elemTypeRef->kind == sema::TypeRef::Kind::Named &&
-                    elemTypeRef->declaration &&
-                    (elemTypeRef->declaration->kind == ast::TypeDeclKind::Class ||
+                    (!elemTypeRef->declaration ||
+                     elemTypeRef->declaration->kind == ast::TypeDeclKind::Class ||
                      elemTypeRef->declaration->kind ==
                          ast::TypeDeclKind::Interface)) {
+                    std::string_view en = elemTypeRef->declaration
+                                              ? elemTypeRef->declaration->name
+                                              : elemTypeRef->headName();
                     ctx_.diagnostics().report(
                         Severity::Error, call.span.begin,
                         std::string(m) +
                         "() without a selector requires the element type to "
                         "satisfy `T: IComparable<T>` (stdlib §5.1 / spec "
                         "§14.2 / #2770); `" +
-                        std::string(elemTypeRef->declaration->name) +
+                        (en.empty() ? std::string("<element>") : std::string(en)) +
                         "` does not — its `CompareTo` could not be resolved "
                         "for dispatch. Use " + std::string(m) +
                         "(selector: (T) -> U) instead.");
