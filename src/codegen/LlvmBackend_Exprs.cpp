@@ -4378,6 +4378,21 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             currentThis_ = saved;
             genericSubst_ = std::move(savedSubst);
             genericSubstSemaTy_ = std::move(savedSemaTy);
+            // fix #2751 / §28.3 "Unbound owned temporaries" (v0.240): the
+            // EXPRESSION-BODIED getter spelling of the unbound-owned-receiver
+            // reclaim — `(new Src()).N` where `N`'s getter is `=> _v`. See
+            // lowerVirtualPropertyGet for the shared rationale and the
+            // soundness argument. `obj` is the receiver pointer this path
+            // already lowered (never re-lowered — that would run the producer
+            // twice); the getter body has been fully inlined and its result
+            // wrapped/boxed into `v` by now, so nothing reads the receiver
+            // after this point. Emitted after the generic-substitution restore
+            // because the disposal is the CALLER's (it dispatches through the
+            // receiver's vtable, so it is substitution-independent anyway).
+            if (!diverged_)
+                disposeFreshNewReceiverTemp(ma->target.get(), obj,
+                                            ctx_.exprType(*ma),
+                                            /*calleeReturnsOwned=*/false);
             return v;
         }
         // CG33b: block-form getter (`get => do … end;`) — emit as a
@@ -4410,6 +4425,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // an ordinary method call does (emitMethodCall → emitPendingCheck).
             // Without this the throw is swallowed and `res` is a garbage value.
             emitPendingCheck();
+            // fix #2751 / §28.3 "Unbound owned temporaries" (v0.240): the
+            // BLOCK-BODIED getter spelling (`get => do … end;`). See
+            // lowerVirtualPropertyGet for the shared rationale. `obj` may have
+            // been spilled to an alloca just above for a by-value RECORD
+            // receiver — harmless, because isFreshOwnedClassProducer (inside
+            // the helper) admits only a heap CLASS receiver, so the spilled
+            // form never reaches the disposal.
+            if (!diverged_)
+                disposeFreshNewReceiverTemp(ma->target.get(), obj,
+                                            ctx_.exprType(*ma),
+                                            /*calleeReturnsOwned=*/false);
             return res;
         }
         // §2.5 / §23 (issue #503): imported non-virtual property getter.
@@ -4486,6 +4512,14 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     llvm::Value* res = builder_.CreateCall(
                         git->second->getFunctionType(), git->second, {obj});
                     emitPendingCheck();
+                    // fix #2751 / §28.3 "Unbound owned temporaries" (v0.240):
+                    // the IMPORTED (cross-module) getter spelling — the same
+                    // reclaim as the two local getter paths above. See
+                    // lowerVirtualPropertyGet for the shared rationale.
+                    if (!diverged_)
+                        disposeFreshNewReceiverTemp(ma->target.get(), obj,
+                                                    ctx_.exprType(*ma),
+                                                    /*calleeReturnsOwned=*/false);
                     return res;
                 }
             }
@@ -5073,6 +5107,52 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
     }
     llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, {recv});
     emitPendingCheck();  // the accessor body may throw (§23.3)
+    // fix #2751 / §28.3 "Unbound owned temporaries" (v0.240) — THE SHARED
+    // RATIONALE for all four property-read sites (this one, and the computed-
+    // getter / block-getter / imported-getter paths in lowerExprInner).
+    //
+    // §28.3 enumerates the member read among the borrowing uses that produce an
+    // unbound owned temporary: "An owned value may also be produced as an
+    // **unbound temporary**: the result of an `owned`-returning call (or other
+    // owned producer) that is not bound to any name, not `move`d, and not
+    // returned, but used only by *borrowing* operations within the expression —
+    // as the receiver of a further call, as a non-`owned` argument, as a member
+    // or index access, or as the scrutinee of a `case` … Such a temporary is
+    // disposed at the **end of the full expression** in which it is produced,
+    // after every use of it within that expression has completed."
+    //
+    // #1039 covered exactly two of the member-read shapes: the FIELD read
+    // (fieldAddr path in lowerExprInner) and the METHOD call (emitMethodCall).
+    // A PROPERTY read is neither — it resolves to a PropertySymbol and is
+    // lowered by one of the four getter paths, none of which disposed the
+    // receiver — so `(new Src()).N` leaked the `Src` in every position tested
+    // (local-variable initializer, field initializer, bare statement), for the
+    // arrow-bodied, block-bodied and virtual getter forms alike. Only the AUTO
+    // property (`property N: int := 5;`) was already covered, because it is
+    // backed by a field and travels the #1039 field path.
+    //
+    // SOUNDNESS — the disposal is delegated whole to disposeFreshNewReceiverTemp,
+    // which fires only when the receiver is a fresh owned-class producer AND the
+    // extracted result is a non-reference value (numeric/bool/char/decimal
+    // primitive, enum, unit). `calleeReturnsOwned` is FALSE at every property
+    // site by construction: §A.3's property grammar has no `owned` marker on a
+    // property type (only `StaticReadonlyDecl` carries one), so a property read
+    // can never announce a fresh transfer, and the #1859/#2205 class/interface/
+    // owning-collection widenings stay unreachable from here. That keeps this
+    // fix strictly inside the provably-safe subset and away from #2261's
+    // use-after-free shape (a deferred iterator/task frame that still borrows a
+    // freed receiver): a property returning `string`, a class reference, a span,
+    // an inline array, a record, `Object`, or an iterable/`Task` interface is
+    // NOT disposed here — it keeps leaking, which is the sound direction.
+    //
+    // Emitted after emitPendingCheck, so it lands in the normal-return
+    // continuation only: on the accessor's throw edge the temporary leaks, the
+    // same pre-existing safe direction the argument string-release at
+    // emitMethodCall (LlvmBackend_Calls2.cpp) documents. `recvExpr` is null for
+    // a bare `P` read (implicit `this`), where the helper returns immediately.
+    if (!diverged_)
+        disposeFreshNewReceiverTemp(recvExpr, recv, ctx_.exprType(e),
+                                    /*calleeReturnsOwned=*/false);
     return r;
 }
 
