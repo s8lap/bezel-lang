@@ -461,7 +461,7 @@ BEZEL_TEST(codegen_block_getter_return_repr_2703,
 }
 
 // ===========================================================================
-// (C) Nullable-value return coercion. // per §7, §14.1, §23.3
+// (C) Nullable-value return coercion. // per §7.2, §5.1 (the widen), §23.3
 // ===========================================================================
 BEZEL_TEST(codegen_block_getter_return_repr_2703,
            nullable_widening_block_getter_coerces_spec_7) {

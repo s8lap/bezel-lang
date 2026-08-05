@@ -4070,7 +4070,7 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                                      : llvm::Constant::getNullValue(valTy));
             }
         } else if (blockGet) {
-            // fix #2703 (§23.3 / §13 "Visibility"-independent vtable face,
+            // fix #2703 (§23.3 / §12 "Inheritance and Dispatch" vtable face,
             // v0.240): the VIRTUAL/interface face of the same block getter. This
             // emitter builds an independent function for the vtable/itable slot
             // and lowers the SAME user statement body, so it needs the same

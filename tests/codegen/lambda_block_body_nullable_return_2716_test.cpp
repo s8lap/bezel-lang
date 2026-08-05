@@ -6,10 +6,10 @@
 //   §27.3 "Lambda expressions" — a lambda's return-type ascription is a return
 //     contract of its own; the two body spellings of the same lambda must
 //     produce the same value and the same representation.
-//   §7.1 "Nullable types" — a nullable VALUE type `T?` has a distinct runtime
+//   §7.2 "Nullable value types" — a nullable VALUE type `T?` has a distinct runtime
 //     representation from its payload (`{ i8 hasValue; T value }`), so a bare
 //     `T` reaching a `T?` return edge must be wrapped.
-//   §5.1 "Numeric conversions" — a narrower numeric implicitly widens to the
+//   §5.1 "Implicit conversions" — a narrower numeric implicitly widens to the
 //     declared type; the widen must happen BEFORE the nullable wrap, or the
 //     payload width does not match.
 //
