@@ -1372,6 +1372,18 @@ void* bz_string_to_utf16z(const void* str);
 // null-terminated uint16_t buffer, excluding the terminating zero unit.
 int64_t bz_wstrlen(const void* wstr);
 
+// spec §32.6 / stdlib §10.4 (v0.240) / fix #2734: the FFI READ-BACK direction —
+// the inverses of bz_string_to_utf8z / bz_string_to_utf16z. Copy a
+// NUL-terminated C buffer into a fresh +1 managed Bezel string; the source
+// buffer is only read (never freed, never retained), so "the original is
+// unaffected and is still subject to the caller's disposal obligation" (§32.6).
+// Return NULL on ill-formed input (the stdlib §3.2 strict fault model — codegen
+// raises FormatException) and on a NULL argument. They back
+// `string.From(c: CString)` / `string.From(w: WString)` and the raw-pointer
+// forms `string.FromCStringPointer` / `string.FromWStringPointer`.
+void* bz_string_from_utf8z(const void* p);
+void* bz_string_from_utf16z(const void* p);
+
 // stdlib §10.3 / fix #977 / #985: RawBytes.From(buffer: Array<byte>) — copies
 // the byte array into a fresh malloc'd buffer and wraps it with its length in a
 // { ptr, len } heap struct so RawBytes is a backed pointer-and-length pair.

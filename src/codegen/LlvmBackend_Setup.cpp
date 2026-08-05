@@ -13657,12 +13657,30 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                         if (tid->name == "string" || tid->name == "String") {
                             std::size_t argc = call->args.size();
                             // §9.6 string.From(char): string — 1-arg overload.
+                            // (v0.240, #2734: the OTHER two 1-arg overloads,
+                            // From(CString)/From(WString), mint rc=1 too — via
+                            // bz_string_from_utf8z / bz_string_from_utf16z — so
+                            // the arity test stays correct for all three.)
                             if (ma->member == "From" && argc == 1)
                                 return true;  // emitPrimitiveToString → rc=1
                             // §9.6 string.From(buffer, start, count): string —
                             // 3-arg overload, bz_str_from_char_array.
                             if (ma->member == "From" && argc == 3)
                                 return true;  // bz_str_from_char_array → rc=1
+                            // spec §32.6 / stdlib §9.6 + §10.4 (v0.240, #2734):
+                            // string.FromCStringPointer(p) /
+                            // FromWStringPointer(p) mint the SAME fresh rc=1
+                            // string through the same two runtime entry points
+                            // (emitStringFromFfiBuffer). Recognized here for the
+                            // same reason as the From family: without it the
+                            // bind borrow-RETAINS (rc 1→2) and the scope-end
+                            // release only drops it back to 1, so the
+                            // producer's reference never dies — LSan-confirmed
+                            // 35 bytes for a 3-code-point result.
+                            if ((ma->member == "FromCStringPointer" ||
+                                 ma->member == "FromWStringPointer") &&
+                                argc == 1)
+                                return true;  // bz_string_from_utf8z/16z → rc=1
                             // §9.6 string.Repeat(char, count): string —
                             // 2-arg overload, inline malloc + initStringRc.
                             if (ma->member == "Repeat" && argc == 2)

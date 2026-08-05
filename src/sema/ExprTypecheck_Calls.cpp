@@ -5806,6 +5806,31 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     if (colName == "string" || colName == "String") {
                         if (m == "Join")
                             ctx_.setExprType(&ce, ctx_.primitiveTypeRef(P::String));
+                        // §32.6 / §10 (v0.240, #2734): does `at` name the FFI
+                        // builtin `nm`? A builtin with no user TypeDecl reaches
+                        // us in EITHER of two TypeRef shapes and the difference
+                        // is invisible at the source level: a factory result
+                        // (`CString.From(s)`) carries declaration =
+                        // builtinClassSym("CString"), while an ANNOTATION
+                        // (`c: CString` on a parameter or field) carries
+                        // declaration = null and only the astNode head name
+                        // (TypeResolution_Names.cpp: the §10 names resolve to a
+                        // null-declaration Named ref). #1145's guard tested
+                        // only the first, so `string.From(c)` on a `CString`
+                        // PARAMETER was rejected as "no matching overload"
+                        // even though §9.6 declares exactly that overload.
+                        auto isFfiBuiltin = [](TypeRef* at,
+                                               std::string_view nm) {
+                            if (!at || at->kind != TypeRef::Kind::Named)
+                                return false;
+                            // declaration set → a builtinClassSym (factory
+                            // result); otherwise headName(), which is the
+                            // alias-transparent read and already falls back to
+                            // the metadata `importedName` for a cross-module
+                            // TypeRef with no astNode.
+                            return at->declaration ? at->declaration->name == nm
+                                                   : at->headName() == nm;
+                        };
                         // §9.6 / #1145: the single-argument `String.From`
                         // overloads accept only `char`, `CString`, or `WString`
                         // (the char-array form is the three-arg
@@ -5823,10 +5848,8 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             if (at && at->kind == TypeRef::Kind::Primitive &&
                                 at->primitive == P::Char)
                                 ok = true;
-                            else if (at && at->kind == TypeRef::Kind::Named &&
-                                     at->declaration &&
-                                     (at->declaration->name == "CString" ||
-                                      at->declaration->name == "WString"))
+                            else if (isFfiBuiltin(at, "CString") ||
+                                     isFfiBuiltin(at, "WString"))
                                 ok = true;
                             if (at && !ok)
                                 ctx_.diagnostics().report(
@@ -5837,6 +5860,38 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     "a string from a char array use "
                                     "`String.From(buffer, start, count)` "
                                     "(§9.6)");
+                        }
+                        // spec §32.6 / stdlib §9.6 + §10.4 (v0.240, #2734):
+                        // `string.FromCStringPointer(p: IntPtr): string` and
+                        // `string.FromWStringPointer(p: IntPtr): string` — "the
+                        // same operation on a raw `IntPtr`" (§32.6), for the
+                        // borrowed-pointer FFI shape where the Bezel side owns
+                        // nothing. Both take exactly one `IntPtr`; anything
+                        // else is a no-overload error rather than a silent
+                        // reinterpretation of some other pointer-shaped value
+                        // (a `string` argument would otherwise be decoded as if
+                        // it were a C buffer and yield garbage).
+                        if (m == "FromCStringPointer" ||
+                            m == "FromWStringPointer") {
+                            ctx_.setExprType(&ce,
+                                             ctx_.primitiveTypeRef(P::String));
+                            TypeRef* at = ce.args.size() == 1 && ce.args[0].value
+                                ? ctx_.exprType(*ce.args[0].value) : nullptr;
+                            bool ok = ce.args.size() == 1 &&
+                                      isFfiBuiltin(at, "IntPtr");
+                            // Stay silent when the sole argument is itself
+                            // untyped — it has already been diagnosed, and a
+                            // cascading second error only obscures it (the
+                            // #1145 convention directly above).
+                            if (!ok && (ce.args.size() != 1 || at))
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "no matching overload of `String." +
+                                    std::string(m) + "` — it takes exactly "
+                                    "one `IntPtr` (stdlib §9.6); to read "
+                                    "from an owned `CString`/`WString` "
+                                    "instance use `String.From(c)` "
+                                    "(§10.4)");
                         }
                     }
                     // File static methods (§7.3)
@@ -11705,8 +11760,19 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     // them from the accept set so they fall through to the clean
                     // "type 'string' has no static method 'Format'" §3.4 reject,
                     // exactly as any other unknown static (`string.Bogus()`).
+                    // §9.6 / §10.4 / spec §32.6 (v0.240, #2734):
+                    // FromCStringPointer / FromWStringPointer are the
+                    // raw-`IntPtr` twins of the `String.From(CString/WString)`
+                    // overloads. They were absent from this set, so the
+                    // spec's own FFI read-back idiom
+                    // (`return string.FromCStringPointer(resultPtr);`, §32.6's
+                    // `getenv` example) was rejected outright as an unknown
+                    // static. Both return `string`; codegen lowers them in
+                    // tryLowerPrimitiveStaticCall.
                     if (mbr == "Join" || mbr == "Empty" ||
-                        mbr == "From" || mbr == "Repeat") {
+                        mbr == "From" || mbr == "Repeat" ||
+                        mbr == "FromCStringPointer" ||
+                        mbr == "FromWStringPointer") {
                         ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::String));
                         return;
                     }

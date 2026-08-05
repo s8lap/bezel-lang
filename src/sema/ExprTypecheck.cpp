@@ -250,7 +250,21 @@ TypeRef* ExprTC::namedValueBuiltinRef(std::string_view name) {
     auto* ann = new ast::Type();
     ann->kind = ast::TypeKind::Named;
     auto* nm = new ast::QualifiedName();
-    nm->parts.push_back(std::string(name));
+    // fix #2734: `QualifiedName::parts` is a vector of NON-OWNING
+    // `std::string_view`s (ast/Node.hpp) — every other producer fills it with
+    // views into the source buffer or into a string literal. This one pushed
+    // `std::string(name)`, a TEMPORARY destroyed at the end of the statement,
+    // so `headName()` on the resulting TypeRef read freed memory: every
+    // `IntPtr.Zero` / `UIntPtr.Zero` expression and every `IntPtr(v)`
+    // conversion carried a dangling type name. Nothing had read it before, so
+    // the UB was silent; the moment a check did (the §10.4
+    // `string.FromCStringPointer(IntPtr.Zero)` guard) it compared garbage and
+    // rejected the spec's own idiom. Store a static literal instead — the
+    // callers only ever pass one of these two names, and a literal's storage
+    // outlives every TypeRef. (Mirrors the `rb.Pointer` synthesis in
+    // ExprTypecheck_Calls.cpp, which already pushes a literal.)
+    nm->parts.push_back(name == "UIntPtr" ? std::string_view("UIntPtr")
+                                          : std::string_view("IntPtr"));
     ann->name.reset(nm);
     tr->astNode = ann;
     return tr;

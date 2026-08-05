@@ -10856,6 +10856,13 @@ private:
     // `double.Parse(s)`, etc. The target is a primitive keyword identifier.
     llvm::Value* tryLowerPrimitiveStaticCall(const ast::CallExpr& call);
 
+    // spec §32.6 / stdlib §10.4 (v0.240, #2734): copy a NUL-terminated foreign
+    // buffer into a fresh Bezel string — `wide` selects UTF-16LE (WString)
+    // over UTF-8 (CString). The buffer is read only: no free, no retention, so
+    // the caller's disposal obligation on it is untouched. Ill-formed content
+    // raises FormatException (the stdlib §3.2 strict fault model).
+    llvm::Value* emitStringFromFfiBuffer(llvm::Value* buf, bool wide);
+
     // §22.4: Pre-create alloca slots for any `out var x` arguments before the
     // call is dispatched (primitive-static, builtin, or regular method). This
     // ensures lvalueAddr() finds the slot regardless of which code path handles

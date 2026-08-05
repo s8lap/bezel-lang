@@ -199,6 +199,34 @@ llvm::Value* Emitter::tryLowerEncodingCall(const ast::CallExpr& call) {
 }
 
 
+// spec §32.6 / stdlib §10.4 (v0.240, #2734): the shared lowering of every
+// "C buffer → Bezel string" conversion — `string.From(c: CString)`,
+// `string.From(w: WString)`, `string.FromCStringPointer(p)` and
+// `string.FromWStringPointer(p)` all reduce to it.
+//
+// `buf` is the NUL-terminated foreign buffer (a char* for UTF-8, a uint16_t*
+// for UTF-16LE). The runtime COPIES out of it and never frees or retains it:
+// per §32.6 "the original is unaffected and is still subject to the caller's
+// disposal obligation", so a `using var` CString still owes exactly one free
+// and this conversion must add none.
+//
+// An ill-formed buffer is the stdlib §3.2 defined fault, inherited by routing
+// through the same strict decoders `Encoding.UTF8/UTF16.GetString` use: the
+// runtime returns NULL and we raise FormatException. §10.4 does not state the
+// ill-formed-input behavior for these four conversions; taking §3.2's model is
+// the reading recorded with this fix (a silent substitution is the only
+// alternative, and §3.2 declines it explicitly).
+llvm::Value* Emitter::emitStringFromFfiBuffer(llvm::Value* buf, bool wide) {
+    auto* fn = declareC(wide ? "bz_string_from_utf16z" : "bz_string_from_utf8z",
+                        ptrTy(), {ptrTy()});
+    llvm::Value* s = builder_.CreateCall(fn, {buf}, "str.fromffi");
+    llvm::Value* bad = builder_.CreateICmpEQ(
+        s, llvm::Constant::getNullValue(ptrTy()), "str.fromffi.bad");
+    emitGuardThrow(bad, "FormatException");  // stdlib §3.2 strict fault model
+    return s;
+}
+
+
 llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
@@ -463,16 +491,85 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         }
     }
 
-    // string.From(char): string — one-character string from a char code point.
-    // string.From(c) is equivalent to char.ToString(c).
+    // stdlib §9.6 declares THREE one-argument `String.From` overloads —
+    // From(char), From(CString), From(WString) — so this arm must dispatch on
+    // the ARGUMENT'S TYPE, not on the argument count (fix #2734). It used to
+    // claim every 1-arg call and sign-extend the argument to i32; a CString
+    // lowers to a bare pointer, so `string.From(c)` emitted `sext ptr to i32`
+    // and failed IR verification — a normative §32.6 conversion was
+    // uncompilable. Sema's #1145 guard already rejects any other argument type
+    // with a no-overload diagnostic, so only these three shapes arrive here.
     if (pt == P::String && m == "From" &&
         call.args.size() == 1 && call.args[0].value) {
+        std::string_view an =
+            builtinTypeName(ctx_.exprType(*call.args[0].value));
+        // spec §32.6 / stdlib §10.4 (v0.240): read a caller-owned CString /
+        // WString into a fresh Bezel string. The FFI buffer is only READ — "the
+        // original is unaffected and is still subject to the caller's disposal
+        // obligation" — so no free and no ownership transfer is emitted here;
+        // the `using var` that owns the CString still discharges it.
+        if (an == "CString" || an == "WString") {
+            llvm::Value* buf = lowerExpr(*call.args[0].value);
+            if (!buf) return nullptr;
+            // §28.3 (v0.240) *Unbound owned temporaries*, the #2728/#2733
+            // machinery: the issue's second spelling is
+            // `string.From(CString.From(s))`, where the argument is an owned
+            // buffer the programmer minted inline and bound to no name. It is
+            // "disposed at the end of the full expression in which it is
+            // produced, after every use of it within that expression has
+            // completed" — which is exactly where flushFfiExprTemps discharges
+            // this registration, i.e. AFTER the copy below has read the buffer.
+            // Without it the buffer simply leaks (LSan: 13 bytes for "abc").
+            // The `using var` spelling is untouched: isFfiBufferFactoryCall
+            // admits only a directly-written factory call, which by
+            // construction is bound to no name — so exactly one free is
+            // emitted for exactly one malloc.
+            bool argIsRawBytes = false;
+            if (isFfiBufferFactoryCall(*call.args[0].value, argIsRawBytes)) {
+                auto* tmpSlot = entryAllocaNullPtr();
+                builder_.CreateStore(buf, tmpSlot);
+                registerFfiExprTemp(tmpSlot, argIsRawBytes);
+            }
+            return emitStringFromFfiBuffer(buf, an == "WString");
+        }
+        // string.From(char): string — one-character string from a char code
+        // point. string.From(c) is equivalent to char.ToString(c).
         llvm::Value* arg = lowerExpr(*call.args[0].value);
         if (!arg) return nullptr;
         // Normalize to i32 if needed.
         if (!arg->getType()->isIntegerTy(32))
             arg = builder_.CreateSExt(arg, i32());
         return emitPrimitiveToString(arg, P::Char);
+    }
+
+    // spec §32.6 / stdlib §9.6 + §10.4 (v0.240, #2734):
+    //   string.FromCStringPointer(p: IntPtr): string
+    //   string.FromWStringPointer(p: IntPtr): string
+    // "`string.FromCStringPointer(p)` is the same operation on a raw `IntPtr`"
+    // (§32.6) — read through a pointer the Bezel side does NOT own, copying
+    // into a fresh string. §10.4 makes the null pointer a normative fault:
+    // "`string.FromCStringPointer(IntPtr.Zero)` and
+    // `string.FromWStringPointer(IntPtr.Zero)` raise `ArgumentNullException`".
+    // (For a non-null pointer that is not properly NUL-terminated §10.4 makes
+    // behavior undefined; nothing here can validate that.)
+    if (pt == P::String && call.args.size() == 1 && call.args[0].value &&
+        (m == "FromCStringPointer" || m == "FromWStringPointer")) {
+        llvm::Value* raw = lowerExpr(*call.args[0].value);
+        if (!raw) return nullptr;
+        // §32.7: IntPtr lowers to a pointer-sized integer (i64 on the host);
+        // the runtime entry points take a pointer. Normalize to i64 before
+        // inttoptr so a narrower integer representation cannot silently drop
+        // the high half of an address.
+        llvm::Value* p = raw;
+        if (p->getType()->isIntegerTy()) {
+            if (!p->getType()->isIntegerTy(64))
+                p = builder_.CreateZExtOrTrunc(p, i64(), "fromptr.w");
+            p = builder_.CreateIntToPtr(p, ptrTy(), "fromptr.p");
+        }
+        llvm::Value* isNull = builder_.CreateICmpEQ(
+            p, llvm::Constant::getNullValue(ptrTy()), "fromptr.null");
+        emitGuardThrow(isNull, "ArgumentNullException");  // stdlib §10.4
+        return emitStringFromFfiBuffer(p, m == "FromWStringPointer");
     }
 
     // §9.6 (#747 R43): string.From(buffer: Array<char>, start, count): string —
