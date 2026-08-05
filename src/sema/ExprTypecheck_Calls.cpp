@@ -4806,7 +4806,22 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                 "Array", recvTy->genericArgs[0]));
                         } else if (colName == "Array" && !recvTy->genericArgs.empty() &&
-                                   m == "Sorted" && ce.args.empty()) {
+                                   (m == "Sorted" || m == "Sort") &&
+                                   ce.args.empty()) {
+                            // fix #2790 (stdlib §4.4, spec §14.2, v0.240): the
+                            // PARAMETERLESS `Sort()` reached this branch under
+                            // `m == "Sorted"` only, so it had NO admissibility
+                            // gate at all while its sibling `Sorted()` did.
+                            // MEASURED consequence: `Array<Plain>.Sort()` for a
+                            // `Plain` implementing no `IComparable` COMPILED,
+                            // RAN, and SILENTLY DID NOTHING — elements 3,1,2
+                            // came back 3,1,2 — while `Array<Plain>.Sorted()`
+                            // was correctly rejected on the same type. The user
+                            // asks for a sort and gets a no-op with no
+                            // diagnostic. Both forms carry the same stdlib §4.4
+                            // constraint, so both take the same gate; only the
+                            // RESULT TYPE differs (Sorted() yields a new Array,
+                            // Sort() is in place), which is handled below.
                             // Constraint check: T must be IComparable<T>.  Accepts:
                             // (a) built-in primitive comparable types (int, string,
                             //     long, byte, double, float, char — §9.x);
@@ -4894,16 +4909,26 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     ctx_.builtinInterfaceSym("IComparable")))
                                 isComparableElem = true;
                             if (!isComparableElem) {
+                                // fix #2790: name the form the user actually
+                                // wrote, and point at that form's comparer
+                                // overload — suggesting `Sorted(comparer)` to
+                                // someone who called `Sort()` sends them to a
+                                // different operation (a copy, not in place).
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,
-                                    "Array<T>.Sorted() requires T to implement "
+                                    "Array<T>." + std::string(m) +
+                                    "() requires T to implement "
                                     "IComparable<T> (§3 / #472); T is not a "
                                     "built-in comparable type. "
-                                    "Use Sorted(comparer: (T, T) -> int) instead.");
-                            } else {
+                                    "Use " + std::string(m) +
+                                    "(comparer: (T, T) -> int) instead.");
+                            } else if (m == "Sorted") {
                                 ctx_.setExprType(&ce, makeConcreteCollectionResult(
                                     "Array", recvTy->genericArgs[0]));
                             }
+                            // `Sort()` sorts IN PLACE and yields no value, so it
+                            // gets no result type here — deliberately, and it is
+                            // why the two forms cannot simply share one arm.
                         } else if (colName == "Array" && !recvTy->genericArgs.empty() &&
                                    m == "Sorted" && ce.args.size() == 1) {
                             // #542 / §3 / #472: validate that the comparer argument

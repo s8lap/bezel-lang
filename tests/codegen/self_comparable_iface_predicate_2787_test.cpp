@@ -19,11 +19,13 @@
 // they REJECT.  Re-inlining any one copy and then changing it would break these
 // cases even though every per-issue test above still passed.
 //
-// ⚠ The first thing this test caught is that they do NOT all agree today:
-// `Sort()` accepts an invariance-violating element that the other two reject.
-// That is pre-existing (measured identical either side of this refactor) and is
-// filed as #2790; the case below pins the divergence with its issue number
-// rather than asserting a uniformity that does not yet hold.
+// ⚠ The first thing this test caught is that they did NOT all agree: `Sort()`
+// accepted an invariance-violating element that the other two rejected — filed
+// as #2790, pinned here at its then-current behaviour with the issue number in
+// the case name, and FIXED shortly after (the parameterless `Sort()` had no
+// admissibility gate at all).  The case is now flipped to demand the rejection.
+// That cycle — pin the divergence, let the fix fail the pin, flip it — is the
+// intended way to use this file.
 //
 // This matters concretely and soon: #2776 records that the predicate does NOT
 // reach a CROSS-MODULE interface (an imported interface's `baseTypeRefs` does
@@ -127,28 +129,24 @@ BEZEL_TEST(self_comparable_iface_predicate_2787, gate_math_minmax_admits_self_co
 // ...and the same three gates must agree on what the predicate DECLINES.
 // §12.9 invariance: `IG<string>` does not satisfy `IComparable<IG<int>>`.
 
-// ⚠ SORT DOES NOT AGREE — and this case pins that divergence rather than
-// hiding it.  `arr.Sort()` COMPILES AND RUNS on the shape the other two gates
-// reject (exit 7).  MEASURED to be byte-identical before and after #2787's
-// refactor, so it is pre-existing and not caused by the factoring; filed as
-// **#2790**.  Under generated-code ASan it also runs clean, so it is not
-// currently an observable memory error — but `ensureIfaceCmpThunk`'s own header
-// records that the accepting path's fallback is "`bz$strcmp` on a vtable
-// global, i.e. this issue's own unbounded read, which happens not to fault only
-// because a vtable typically contains an early zero byte."
+// ✅ SORT NOW AGREES — this case did its job.  As first written it recorded a
+// DIVERGENCE: `arr.Sort()` compiled and ran (exit 7) on the shape the other two
+// gates reject, pinned at that behaviour under the name
+// `gate_sort_diverges_pinned_2790` with the comment "when #2790 is fixed this
+// case will fail, and that failure is the signal to flip it to rejects(...)".
+// It failed on exactly that fix, and this is the flip.
 //
-// Asserting the CORRECT behaviour here would leave a red test in the suite;
-// asserting nothing would let the divergence pass unrecorded.  So the current
-// behaviour is pinned with its issue number: when #2790 is fixed this case will
-// fail, and that failure is the signal to flip it to `rejects(...)` and delete
-// this comment.
-BEZEL_TEST(self_comparable_iface_predicate_2787, gate_sort_diverges_pinned_2790) {
-    BEZEL_EXPECT_EQ(runChecked(prog(kRejected,
+// Root cause was simpler than the issue first guessed: the PARAMETERLESS
+// `Sort()` reached its branch under `m == "Sorted"` only, so it had no
+// admissibility gate at all.  All three gates now share one predicate AND one
+// answer.
+BEZEL_TEST(self_comparable_iface_predicate_2787, gate_sort_declines_invariance_violation) {
+    BEZEL_EXPECT_TRUE(rejects(prog(kRejected,
         "    using var a := new G<string>(); "
         "    using var b := new G<string>(); "
         "    var arr: Array<IG<string>> := [a, b]; "
         "    arr.Sort(); "
-        "    return 7; ")), 7);
+        "    return 7; ")));
 }
 
 BEZEL_TEST(self_comparable_iface_predicate_2787, gate_array_min_declines_invariance_violation) {

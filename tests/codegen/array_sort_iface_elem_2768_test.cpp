@@ -76,6 +76,18 @@ int runChecked(const std::string& program) {
     return r.ran ? r.exitCode : -999;
 }
 
+// #2790: asserting on diagnostic TEXT, not the coarse "did not run" — runAot
+// synthesizes an Error for a runtime crash too, and these shapes previously
+// COMPILED, so the distinction matters.
+bool rejectsWith(const std::string& program, const std::string& needle) {
+    auto r = runAot(program);
+    if (r.ran || !r.diagnostics.hasErrors()) return false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find(needle) != std::string::npos) return true;
+    return false;
+}
+const char* kSortNeedle = "requires T to implement";
+
 // `interface IFoo: IComparable<IFoo>` — the §14.2 rule-3 shape, with the
 // self-recurrence stdlib §4.4's `where T: IComparable<T>` requires.
 const char* IFOO =
@@ -290,15 +302,24 @@ BEZEL_TEST(array_sort_iface_elem_2768, control_int_element_still_ascending) {
 // the predicate been the looser "any IComparable in the chain", this test would
 // fail on a heap-buffer-overflow rather than on a value.
 BEZEL_TEST(array_sort_iface_elem_2768,
-           control_icomparable_string_element_not_itable_routed) {
-    BEZEL_EXPECT_EQ(runChecked(
+           control_icomparable_string_element_rejected_2790) {
+    // ⚠ UPDATED BY #2790.  This asserted that the program COMPILES and returns
+    // 7.  stdlib §4.4 constrains `where T: IComparable<T>`, and here T is
+    // `IComparable<string>`, which does not implement
+    // `IComparable<IComparable<string>>` — so the call must be REJECTED.  It was
+    // accepted only because the parameterless `Sort()` had NO gate at all while
+    // `Sorted()` did; `Array<IComparable<string>>.Min()` already rejected this
+    // exact element (measured during #2770).  The case still guards what it was
+    // written to guard — that a string element is never itable-routed — because
+    // a routing change would COMPILE and fail this assertion.
+    BEZEL_EXPECT_TRUE(rejectsWith(
         "module M; class C "
         "  public static method Main(): int "
         "    var arr: Array<IComparable<string>> := [\"c\", \"a\", \"b\"]; "
         "    arr.Sort(); "
         "    return 7; "
         "  end Main; "
-        "end C; "), 7);
+        "end C; ", kSortNeedle));
 }
 
 // CONTROL — an interface element with NO IComparable in its chain
@@ -307,8 +328,12 @@ BEZEL_TEST(array_sort_iface_elem_2768,
 // was, memory-safe and without a new rejection.  Pinned so a later widening of
 // the predicate cannot silently start dispatching here.
 BEZEL_TEST(array_sort_iface_elem_2768,
-           control_non_comparable_interface_element_unchanged) {
-    BEZEL_EXPECT_EQ(runChecked(
+           control_non_comparable_interface_element_rejected_2790) {
+    // ⚠ UPDATED BY #2790, for the same reason its Min() twin was updated by
+    // #2784: `IDisposable` names no `IComparable`, so stdlib §4.4's constraint
+    // is unsatisfied and the call must be REJECTED.  It compiled only because
+    // the parameterless `Sort()` had no gate.
+    BEZEL_EXPECT_TRUE(rejectsWith(
         "module M; "
         "class Node public constructor() end constructor; end Node; "
         "class C "
@@ -319,7 +344,7 @@ BEZEL_TEST(array_sort_iface_elem_2768,
         "    arr.Sort(); "
         "    return 7; "
         "  end Main; "
-        "end C; "), 7);
+        "end C; ", kSortNeedle));
 }
 
 // CONTROL — INVARIANCE.  `interface I<T>: IComparable<I<int>>` names
@@ -376,8 +401,14 @@ BEZEL_TEST(array_sort_iface_elem_2768,
 // this call at all is a separate gap, filed — this test only pins that the fix
 // does not make it worse.)
 BEZEL_TEST(array_sort_iface_elem_2768,
-           control_nullable_interface_element_unchanged) {
-    BEZEL_EXPECT_EQ(runChecked(
+           control_nullable_interface_element_rejected_2790) {
+    // ⚠ UPDATED BY #2790.  spec §14.2: "A type-bound constraint — naming a
+    // class or interface — implies non-null T", so `IFoo?` does not satisfy
+    // §4.4's `where T: IComparable<T>` and must be REJECTED — as the identical
+    // `Array<IFoo?>.Min()` shape already was (#2770).  It compiled only because
+    // the parameterless `Sort()` had no gate.  The exclusion is deliberate:
+    // itable-dispatching a slot that may hold `null` would be a null deref.
+    BEZEL_EXPECT_TRUE(rejectsWith(
         std::string(IFOO) + NODE +
         "class C "
         "  public static method Main(): int "
@@ -387,5 +418,5 @@ BEZEL_TEST(array_sort_iface_elem_2768,
         "    arr.Sort(); "
         "    return 7; "
         "  end Main; "
-        "end C; "), 7);
+        "end C; ", kSortNeedle));
 }
