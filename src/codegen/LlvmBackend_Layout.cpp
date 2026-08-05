@@ -1713,6 +1713,43 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     if (!obj) return nullptr;
     sema::TypeRef* rt = ctx_.resolvedType(*te.testType);
     if (!rt) return nullptr;
+
+    // fix #2775 (§8.6/§12.7/§19.3, v0.240): SILENCE AMPLIFIER. Every
+    // `return nullptr` below is not "an error we recover from" — lowerIf turns
+    // a null condition into an unconditional branch PAST the body (see the note
+    // there), so a dropped type test reads as a constant `false` in a program
+    // that compiled clean. Two shipped defects (#2703's collection-literal arm
+    // and #2761) each had "no diagnostic at all" as their worst failure mode.
+    //
+    // ONE definition, called from every bail, rather than a guard copied per
+    // site: the copies are how a predicate acquires the missing case (the
+    // #2787 lesson). Follows the #2491 precedent — Warning, suppressed once the
+    // compile already has errors so a cascade never buries the real diagnostic.
+    //
+    // The `dropped` classification deliberately EXCLUDES the shapes where a
+    // non-answer is legitimate: a declaration-less Named target is the bare
+    // type-PARAMETER shape, whose descriptor does not resolve inside the
+    // UNSPECIALIZED generic template body (issue #490 — that stub is never
+    // executed; the specialization path compiles the concrete version), and an
+    // operand whose sema type is not Object/an interface is erased there for
+    // the same reason. Warning on either would fire on dead code.
+    auto reportDroppedTest = [&](const char* why) {
+        if (ctx_.diagnostics().hasErrors()) return;
+        ctx_.diagnostics().report(
+            Severity::Warning, te.span.begin,
+            std::string("internal: this type test was DROPPED and reads as "
+                        "false — ") + why +
+                " (a value type reaching an Object/interface location must be "
+                "boxed, §8.6) — #2775");
+    };
+    // True when the OPERAND is statically a reference location (Object or an
+    // interface): sema has already promised a pointer, so a non-pointer lowered
+    // value is by construction a producer that failed to establish the §8.6
+    // boxed representation.
+    auto operandIsReferenceLocation = [&]() {
+        const sema::TypeRef* opTy = ctx_.exprType(*te.operand);
+        return opTy && isObjectOrInterfaceTarget(opTy);
+    };
     // §8.6 / §12.7 (#417): `is string` / `as string`. A string stored in an
     // Object is a bare `bz_string*` with NO leading vtable/descriptor word, so
     // emitIsA's descriptor walk cannot run on it. Recognize it via
@@ -1724,7 +1761,11 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // (already the bz_string*) or null.
     if (rt->kind == sema::TypeRef::Kind::Primitive &&
         rt->primitive == sema::PrimitiveType::String) {
-        if (!obj->getType()->isPointerTy()) return nullptr;
+        if (!obj->getType()->isPointerTy()) {
+            if (operandIsReferenceLocation())
+                reportDroppedTest("the operand did not lower to a reference");
+            return nullptr;
+        }
         auto* isStrFn = declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
         llvm::Value* isStr = builder_.CreateCall(
             isStrFn, {obj, vtableTablePtr()}, "is.string");
@@ -1744,7 +1785,11 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // non-null operand; `o as Object` is the operand itself (no downcast).
     if (rt->kind == sema::TypeRef::Kind::Primitive &&
         rt->primitive == sema::PrimitiveType::Object) {
-        if (!obj->getType()->isPointerTy()) return nullptr;
+        if (!obj->getType()->isPointerTy()) {
+            if (operandIsReferenceLocation())
+                reportDroppedTest("the operand did not lower to a reference");
+            return nullptr;
+        }
         llvm::Value* nonNull = builder_.CreateICmpNE(
             obj, llvm::ConstantPointerNull::get(ptrTy()), "is.object");
         if (te.op == "is") return nonNull;
@@ -1798,7 +1843,23 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         auto bit = builtinDesc_.find(tn);
         if (bit != builtinDesc_.end()) targetDesc = bit->second;
     }
-    if (!targetDesc) return nullptr;
+    if (!targetDesc) {
+        // #2775: a CONCRETE target with no runtime descriptor means the
+        // compiler has no runtime tag for it — an internal limitation, not a
+        // program error. Measured live when this guard landed: `var o: Object
+        // := 12.5m; o is decimal` and `var o: Object := ia; o is [3]int` both
+        // compiled clean and answered false, because neither `decimal` nor an
+        // inline array is boxed although §8.6 requires both.
+        const bool concreteTarget =
+            rt->kind == sema::TypeRef::Kind::Primitive ||
+            rt->kind == sema::TypeRef::Kind::Unit ||
+            rt->kind == sema::TypeRef::Kind::InlineArray ||
+            (rt->kind == sema::TypeRef::Kind::Named && rt->declaration);
+        if (concreteTarget)
+            reportDroppedTest("no runtime descriptor resolved for the target "
+                              "type");
+        return nullptr;
+    }
     // §12.7 / §7 / issues #447 + #448: a nullable VALUE type operand is a
     // tagged {i8 hasValue; T value} struct, NOT a pointer. emitIsA walks a
     // vtable descriptor chain and requires a pointer operand; calling it on a
@@ -1816,6 +1877,12 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             if (te.op == "is") return hasVal;
             if (te.op == "is not") return builder_.CreateNot(hasVal);
         }
+        // #2775: sema already typed this operand as `Object` or an interface —
+        // both REFERENCE locations — so a non-pointer lowered value here is by
+        // construction a codegen invariant violation: some producer failed to
+        // establish the §8.6 boxed representation.
+        if (operandIsReferenceLocation())
+            reportDroppedTest("the operand did not lower to a reference");
         return nullptr;
     }
     // #1071 / §8.6 / §12.7: an Object/interface operand may hold a bare

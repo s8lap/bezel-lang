@@ -4073,7 +4073,15 @@ bool Emitter::lowerIf(const ast::IfStmt& ifs) {
         auto* bodyBB = llvm::BasicBlock::Create(llvm_, "if.body", currentFn_);
         auto* nextBB = llvm::BasicBlock::Create(llvm_, "if.next", currentFn_);
         if (cond) builder_.CreateCondBr(cond, bodyBB, nextBB);
-        else builder_.CreateBr(nextBB);  // defensive
+        // #2775 (§17): NOT merely "defensive" — this arm is REACHABLE, and it
+        // is where a condition that failed to lower becomes a SILENT `false`:
+        // the body is branched past and ends up with no predecessors at all.
+        // It is kept (removing it would turn a degraded compile into a crash),
+        // but every producer that can return null for a condition expression
+        // must report its own diagnostic before doing so — lowerTypeTest's two
+        // bails now do. If you land here debugging a "the if body never runs"
+        // report, the defect is in the condition's lowering, not here.
+        else builder_.CreateBr(nextBB);
 
         builder_.SetInsertPoint(bodyBB);
         if (!lowerScopedBlock(br->body)) {
