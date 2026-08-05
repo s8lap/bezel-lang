@@ -4657,46 +4657,29 @@ private:
     // safe — see ensureIfaceCmpThunk's header comment.  Nullable is excluded
     // because §14.2 states "A type-bound constraint — naming a class or
     // interface — implies non-null T".
+    // #2787: the ADMISSIBILITY test is now sema::selfComparableIface — THE one
+    // definition of §14.2 rule 3's self-recurrence (TypeResolution.hpp), shared
+    // with sema's Sort/Sorted and Math.Min/Max gates. It used to be hand-rolled
+    // here, and keeping three copies in step is what #2787 was filed to stop:
+    // #2776's pending CROSS-MODULE fix (an imported interface's `baseTypeRefs`
+    // does not carry its `IComparable` base) must reach every caller at once.
+    //
+    // What remains here is codegen's own extra step: having established that the
+    // element satisfies the bound, find the `CompareTo` MethodSymbol on the
+    // matched `IComparable` base to dispatch through. That is the part sema does
+    // not need, and the only reason this wrapper exists.
     sema::MethodSymbol* selfComparableIfaceCompareTo(
             const sema::TypeRef* elemTR) {
-        if (!elemTR || elemTR->nullable ||
-            elemTR->kind != sema::TypeRef::Kind::Named)
-            return nullptr;
-        const sema::TypeSymbol* d = elemTR->declaration;
-        if (!d || d->kind != ast::TypeDeclKind::Interface) return nullptr;
-        // #1867's convention: match the builtin interface by IDENTITY, never by
-        // name. TypeResolution_Checks.cpp records why — "Blanket-accepting by
-        // decl/name was too lenient — it admitted a WRONG generic argument" —
-        // and a name test would additionally let a USER-declared interface that
-        // happens to be called `IComparable` masquerade as the stdlib §2.8 one.
         const sema::TypeSymbol* icmpSym =
             ctx_.builtinInterfaceSym("IComparable");
-        if (!icmpSym) return nullptr;
-        // NOTE (#2772): baseTypeRefs holds the DIRECT inheritance clause, while
-        // §14.2 rule 3 is transitive. Reaching `IComparable<Self>` transitively
-        // would require an ancestor naming its own descendant, so the direct
-        // scan is exhaustive in practice; the residual is recorded on #2772.
-        //
-        // ⚠ MEASURED LIMIT: this does NOT reach a CROSS-MODULE interface. With
-        // `IFoo` and its implementor in an imported library, the repro still
-        // returns the pre-fix 32 instead of 18 — the imported interface's
-        // baseTypeRefs does not carry `IComparable<IFoo>`, so the scan below
-        // finds nothing and the unchanged (defective) comparator stands. A/B'd:
-        // the same-module case is unaffected, and matching by identity rather
-        // than by name is NOT the cause — the cross-module miss reproduces
-        // identically under both. Filed separately.
-        for (const sema::TypeRef* bt : d->baseTypeRefs) {
+        if (!sema::selfComparableIface(elemTR, icmpSym)) return nullptr;
+        // The predicate guarantees a matching base exists; re-find it to reach
+        // its members.
+        for (const sema::TypeRef* bt : elemTR->declaration->baseTypeRefs) {
             if (!bt || bt->kind != sema::TypeRef::Kind::Named || bt->nullable)
                 continue;
             if (bt->declaration != icmpSym || bt->genericArgs.size() != 1)
                 continue;
-            // `IComparable<E>` with E the element type ITSELF — what the
-            // self-recurrence `where T: IComparable<T>` literally asks.
-            // typeRefEqual is §14.2's exact, component-wise, INVARIANT identity,
-            // so it compares the argument's own generic arguments too: for
-            // `interface I<T>: IComparable<I<int>>`, `Array<I<string>>` is
-            // correctly rejected (§12.9 — IComparable is invariant), where a
-            // bare `arg->declaration == d` would have admitted it.
             if (!sema::typeRefEqual(bt->genericArgs[0], elemTR)) continue;
             const sema::TypeSymbol* bd = bt->declaration;
             for (sema::Symbol* m : bd->members) {

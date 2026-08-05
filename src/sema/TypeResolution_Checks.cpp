@@ -156,6 +156,22 @@ bool Resolver::recordValueContainsSelf(TypeSymbol* start, TypeSymbol* cur,
 // Free-function wrapper exposing the resolver's structural type equality
 // for reuse by other passes (§22.6 overload resolution). Single source of
 // truth: delegates to Resolver::typeRefEqual.
+// #2787: the single definition of the §14.2-rule-3 self-recurrence test. See
+// TypeResolution.hpp for why this is exact rather than a proxy.
+bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable) {
+    if (!t || t->nullable || !icomparable ||
+        t->kind != TypeRef::Kind::Named || !t->declaration ||
+        t->declaration->kind != ast::TypeDeclKind::Interface)
+        return false;
+    for (const TypeRef* bt : t->declaration->baseTypeRefs) {
+        if (!bt || bt->nullable || bt->kind != TypeRef::Kind::Named ||
+            bt->declaration != icomparable || bt->genericArgs.size() != 1)
+            continue;
+        if (typeRefEqual(bt->genericArgs[0], t)) return true;
+    }
+    return false;
+}
+
 bool typeRefEqual(const TypeRef* a, const TypeRef* b) {
     return Resolver::typeRefEqual(a, b);
 }

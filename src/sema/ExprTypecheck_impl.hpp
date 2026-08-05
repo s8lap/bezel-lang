@@ -35,10 +35,11 @@
 
 namespace bezel::sema {
 
-// Declared in TypeResolution.hpp (§14.2's exact, component-wise, INVARIANT type
-// identity). Forward-declared rather than included to keep this header's
-// include graph unchanged; used by selfComparableIfaceArg (#2782).
+// Declared in TypeResolution.hpp. Forward-declared rather than included to keep
+// this header's include graph unchanged. #2787: the §14.2 rule-3 self-recurrence
+// test now lives there as the single shared definition.
 bool typeRefEqual(const TypeRef* a, const TypeRef* b);
+bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
 
 // per §15.4 (#1174 / #1866): a collection literal's admissible TARGET types are
 // a CLOSED list of CONCRETE collections (inline array, `Array`/`OwningArray`,
@@ -978,35 +979,13 @@ private:
     // interface)? BFS, cycle-guarded.
     static bool isSubtype(TypeSymbol* from, TypeSymbol* to);
 
-    // fix #2782 (stdlib §2.2, spec §14.2 / §12.9, v0.240): does the INTERFACE
-    // `argTy` satisfy `where T: IComparable<T>` — i.e. does it name
-    // `IComparable<Self>` in its extension clause? This is the constraint
-    // ITSELF, not the weaker `isSubtype(decl, IComparable)`: the latter would
-    // admit `interface IG<T>: IComparable<IG<int>>` for an `IG<string>`
-    // argument, which §12.9's invariance forbids and which codegen's own arm
-    // (selfComparableIfaceCompareTo) declines — leaving a pointer operand to
-    // reach the float path's `sitofp`. Both layers must apply the same test.
-    //
-    // ⚠ This is the THIRD copy of this predicate (codegen's
-    // selfComparableIfaceCompareTo for #2768/#2770, #2768's inline sema scan
-    // for Sort/Sorted, and this one). Factoring the three into one shared
-    // helper is filed separately rather than folded into a fix commit; until
-    // then, a change to any one of them must be mirrored to the others.
+    // #2782 / #2787: does the INTERFACE `argTy` satisfy `where T:
+    // IComparable<T>`? Delegates to sema::selfComparableIface — THE one
+    // definition of this predicate (TypeResolution.hpp). This was one of three
+    // hand-rolled copies until #2787 collapsed them; do not re-inline it.
     static bool selfComparableIfaceArg(const TypeRef* argTy,
                                        const TypeSymbol* icomparable) {
-        if (!argTy || argTy->nullable || !icomparable ||
-            argTy->kind != TypeRef::Kind::Named || !argTy->declaration ||
-            argTy->declaration->kind != ast::TypeDeclKind::Interface)
-            return false;
-        for (const TypeRef* bt : argTy->declaration->baseTypeRefs) {
-            if (!bt || bt->nullable || bt->kind != TypeRef::Kind::Named ||
-                bt->declaration != icomparable || bt->genericArgs.size() != 1)
-                continue;
-            // §14.2 exact, component-wise, INVARIANT identity (§12.9) — it
-            // compares the argument's own generic arguments too.
-            if (typeRefEqual(bt->genericArgs[0], argTy)) return true;
-        }
-        return false;
+        return selfComparableIface(argTy, icomparable);
     }
 
     // §8.6 / §5.1 (#1311): does a primitive value type box into a builtin

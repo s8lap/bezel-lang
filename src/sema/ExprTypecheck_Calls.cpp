@@ -4880,31 +4880,19 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // TypeResolution_Checks.cpp, "Blanket-accepting by
                             // decl/name was too lenient — it admitted a WRONG
                             // generic argument".
-                            if (!isComparableElem && elemTy472 &&
-                                !elemTy472->nullable &&
-                                elemTy472->kind == TypeRef::Kind::Named &&
-                                elemTy472->declaration &&
-                                elemTy472->declaration->kind ==
-                                    ast::TypeDeclKind::Interface) {
-                                const TypeSymbol* ed = elemTy472->declaration;
-                                const TypeSymbol* icmpSym =
-                                    ctx_.builtinInterfaceSym("IComparable");
-                                for (const TypeRef* bt : ed->baseTypeRefs) {
-                                    if (!bt || bt->nullable || !icmpSym ||
-                                        bt->kind != TypeRef::Kind::Named ||
-                                        bt->declaration != icmpSym ||
-                                        bt->genericArgs.size() != 1)
-                                        continue;
-                                    // §14.2 exact, component-wise, INVARIANT
-                                    // identity (§12.9) — compares the
-                                    // argument's own generic arguments too.
-                                    if (typeRefEqual(bt->genericArgs[0],
-                                                     elemTy472)) {
-                                        isComparableElem = true;
-                                        break;
-                                    }
-                                }
-                            }
+                            // #2787: was a hand-rolled copy of the §14.2
+                            // rule-3 self-recurrence scan; now delegates to
+                            // sema::selfComparableIface, THE one definition
+                            // (TypeResolution.hpp). Behaviour is unchanged —
+                            // same identity match on the builtin symbol, same
+                            // typeRefEqual on the argument, same nullable
+                            // exclusion. Do not re-inline it: #2776's pending
+                            // cross-module fix must reach every caller.
+                            if (!isComparableElem &&
+                                selfComparableIface(
+                                    elemTy472,
+                                    ctx_.builtinInterfaceSym("IComparable")))
+                                isComparableElem = true;
                             if (!isComparableElem) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, ce.span.begin,
