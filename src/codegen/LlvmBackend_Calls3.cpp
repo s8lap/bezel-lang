@@ -567,7 +567,8 @@ llvm::Function* Emitter::buildSortedKeyComparator(const sema::TypeRef* keyTy) {
 
 llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
                                              llvm::Type* outTy,
-                                             const sema::TypeSymbol* elemRec) {
+                                             const sema::TypeSymbol* elemRec,
+                                             const sema::TypeRef* elemRef) {
     // Build a fresh internal function (each LINQ-operator site gets its own;
     // they are tiny and the closure type is baked into the IR).
     llvm::FunctionType* fty = nullptr;
@@ -606,7 +607,43 @@ llvm::Function* Emitter::buildLinqTrampoline(int kind, llvm::Type* elemTy,
             eq = emitStructEquality(a, b, llvm::cast<llvm::StructType>(elemTy),
                                     elemRec);
         } else if (elemTy->isPointerTy()) {
-            eq = emitStringEq(a, b);           // string content equality (§4.6)
+            // fix #2773 / §8.3 / §8.4 / §4.6: `isPointerTy()` does NOT mean
+            // "string" — a class, an interface, `Object` and a boxed value all
+            // lower to `ptr` too. Decide by the sema TypeRef, following the
+            // buildValueEqTrampoline / emitValueEquality precedent ("when
+            // fieldTy is absent we do NOT assume ptr-means-string"). Only a
+            // TypeRef that PROVES `string` may take the `%bz.string` layout
+            // path; before this fix a class element ran loadStringLen/
+            // loadStringData over the object's own bytes — a heap-buffer-
+            // overflow (ASan: READ past the object) and a silently wrong
+            // dedup verdict.
+            //
+            // Every other pointer element goes through lowerObjectEquals,
+            // which is category-blind by construction: it decides at RUN time
+            // (null → reference identity, a genuine string → content equality,
+            // otherwise vtable[kEqualsSlot] → the class's `Equals` override or
+            // §8.3's reference-identity default). That is exactly the contract
+            // stdlib §5 states for these operators — "`Distinct`, `Union`,
+            // `Intersect`, `Except`, `Contains`, and `ToSet` require
+            // equality-bearing `T` … exactly as for `Set<T>`" — and `Set<C>`'s
+            // own membership scan (emitArrayBackedSetInsert) already honours a
+            // user `Equals` override and otherwise falls back to reference
+            // identity. It is also the safe default for a null/unresolved
+            // elemRef: a string still compares by content there.
+            const sema::TypeRef* er =
+                elemRef ? resolveTypeParamRef(elemRef) : nullptr;
+            const bool provenString =
+                er && er->kind == sema::TypeRef::Kind::Primitive &&
+                er->primitive == sema::PrimitiveType::String;
+            if (provenString) {
+                eq = emitStringEq(a, b);       // string content equality (§4.6)
+            } else {
+                eq = lowerObjectEquals(a, b);  // §8.3/§8.4 object equality
+                // Defensive: lowerObjectEquals only declines on a non-pointer
+                // operand, which cannot happen here. Reference identity is the
+                // §8.3 default and is always memory-safe.
+                if (!eq) eq = builder_.CreateICmpEQ(a, b);
+            }
         } else {
             eq = builder_.CreateICmpEQ(a, b);  // value equality
         }
@@ -781,12 +818,34 @@ llvm::Function* Emitter::buildLinqHashTrampoline(llvm::Type* elemTy,
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
     builder_.SetInsertPoint(entry);
     llvm::Value* v = builder_.CreateLoad(elemTy, fn->getArg(0), "hash.v");
-    llvm::Value* h = elemTy->isIntegerTy(64) ? v
-                   : elemTy->isIntegerTy(32)
-                       ? builder_.CreateZExt(v, i64())
-                       : elemTy->isPointerTy()
-                           ? builder_.CreatePtrToInt(v, i64())
-                           : builder_.CreateZExtOrBitCast(v, i64());
+    llvm::Value* h = nullptr;
+    if (elemTy->isPointerTy()) {
+        // fix #2773 / §8.3: a pointer-shaped element that is not an
+        // equality-bearing VALUE type is a class/interface/`Object` reference.
+        // Its §8.3 hash is the user's `GetHashCode` override when declared,
+        // else the ASSIGNED identity hash (bz_obj_identity_hash — "identity
+        // hashes are assigned, not derived … never expose addresses"), NOT the
+        // raw pointer bits. lowerObjectGetHashCode dispatches exactly that
+        // (null → 0, a run-time string → its content hash, otherwise
+        // vtable[kGetHashCodeSlot]), which is the hash side of the SAME
+        // vtable pair the equality trampoline now dispatches through
+        // (lowerObjectEquals → vtable[kEqualsSlot]). Keeping the pair together
+        // is what makes §8.3's `a.Equals(b) ⇒ a.GetHashCode() = b.GetHashCode()`
+        // hold inside the membership dict: before this fix the hash was
+        // pointer identity while the equality trampoline content-compared the
+        // object's bytes as a `%bz.string`, so the two disagreed *and* the
+        // comparison was memory-unsafe.
+        if (llvm::Value* oh = lowerObjectGetHashCode(v))
+            h = builder_.CreateZExt(oh, i64());
+        else
+            h = builder_.CreatePtrToInt(v, i64());  // defensive (unreachable)
+    } else if (elemTy->isIntegerTy(64)) {
+        h = v;
+    } else if (elemTy->isIntegerTy(32)) {
+        h = builder_.CreateZExt(v, i64());
+    } else {
+        h = builder_.CreateZExtOrBitCast(v, i64());
+    }
     builder_.CreateRet(h);
     builder_.restoreIP(savedIP);
     currentFn_ = savedFn;
@@ -1584,7 +1643,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         int64_t esz = lazyElemSize(elemTy2, module_->getDataLayout());
         const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
         llvm::Function* hashTramp = buildLinqHashTrampoline(elemTy2, elemRef, elemRec);
-        llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy2, nullptr, elemRec);
+        llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy2, nullptr, elemRec,
+                                                        elemRef);  // #2773
         auto* toSet = declareC("bz_lazy_to_set", ptrTy(),
                                {ptrTy(), i64(), ptrTy(), ptrTy()});
         return builder_.CreateCall(toSet,
@@ -1728,7 +1788,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         llvm::Function* hashTramp = keyIsString
             ? nullptr : buildLinqHashTrampoline(keyTy, keyRefSema, keyRec);
         llvm::Function* eqTramp = keyIsString
-            ? nullptr : buildLinqTrampoline(3, keyTy, nullptr, keyRec);
+            ? nullptr : buildLinqTrampoline(3, keyTy, nullptr, keyRec,
+                                            keyRefSema);  // #2773
         llvm::Value* hashTrampV = hashTramp
             ? static_cast<llvm::Value*>(hashTramp)
             : llvm::ConstantPointerNull::get(ptrTy());
@@ -1935,7 +1996,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // on the aggregate. recordTypeOfRef is non-null only for an
         // equality-bearing record element type.
         const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
-        llvm::Function* eqTramp = buildLinqTrampoline(3, elemTy, nullptr, elemRec);
+        llvm::Function* eqTramp = buildLinqTrampoline(3, elemTy, nullptr, elemRec,
+                                                      elemRef);  // #2773
         auto* distFn = declareC("bz_lazy_distinct", ptrTy(), {ptrTy(), ptrTy()});
         return builder_.CreateCall(distFn, {src, eqTramp}, "linq.distinct");
     }
@@ -2089,7 +2151,8 @@ llvm::Value* Emitter::tryLowerLazyLinqCall(const ast::CallExpr& call) {
         // Build element hash + equality trampolines for the membership dict.
         const sema::TypeSymbol* elemRec = recordTypeOfRef(elemRef);
         llvm::Function* hashTramp = buildLinqHashTrampoline(elemTy, elemRef, elemRec);
-        llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy, nullptr, elemRec);
+        llvm::Function* eqTramp   = buildLinqTrampoline(3, elemTy, nullptr, elemRec,
+                                                        elemRef);  // #2773
         const char* rtFn = (m == "Union")     ? "bz_lazy_union"
                          : (m == "Intersect") ? "bz_lazy_intersect"
                                               : "bz_lazy_except";

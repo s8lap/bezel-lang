@@ -10740,9 +10740,17 @@ private:
     // `elemRec` is non-null only for kind 3 over a record element type (D6):
     // the comparison routes through synthesized structural equality
     // (emitStructEquality, §9.1/§9.2) instead of an ICmp on the aggregate.
+    // `elemRef` (fix #2773) is the element's sema TypeRef, consulted by kind 3
+    // to decide whether a POINTER-shaped element is genuinely a `string`. The
+    // lowered pointer alone does not say so — class, interface, `Object` and
+    // boxed values all lower to `ptr` — so kind 3 must not read a class
+    // reference as a `%bz.string` (the buildValueEqTrampoline /
+    // emitValueEquality precedent: absent a TypeRef we do NOT assume
+    // ptr-means-string).
     llvm::Function* buildLinqTrampoline(int kind, llvm::Type* elemTy,
                                         llvm::Type* outTy,
-                                        const sema::TypeSymbol* elemRec = nullptr);
+                                        const sema::TypeSymbol* elemRec = nullptr,
+                                        const sema::TypeRef* elemRef = nullptr);
 
     // stdlib §5 SelectMany: a flatten-selector trampoline `void*(closure, elem)`.
     // Calls the closure `(env, elem) -> ptr` (the inner collection) and wraps the
