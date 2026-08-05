@@ -3789,6 +3789,16 @@ private:
     // accessors. This routes both spellings through ONE definition instead.
     bool lowerIndexerIncrDecr(const ast::IncrementStmt& inc);
 
+    // fix #2858 (§17.6 / §12.1 / §12.3 / §11.2, v0.240): `P++` / `P--` on a
+    // VIRTUAL, OVERRIDE, ABSTRACT or INTERFACE property — the named-property
+    // twin of lowerIndexerIncrDecr, dispatching BOTH halves through the vtable
+    // or itable as `P := v` and `P OP= v` already do. Returns true when it
+    // lowered the whole statement; declines (before emitting anything) for a
+    // non-property target, an indexer, `base.P`, and a property with no
+    // vtable/itable slot — i.e. a non-virtual or static one. See the definition
+    // in LlvmBackend_Stmts.cpp for the measurements.
+    bool lowerVirtualPropertyIncrDecr(const ast::IncrementStmt& inc);
+
     // The shared body of the two entry points above. `binOp` is the already-
     // stripped binary operator ("+" for `+=` and for `++`, "-" for `-=` and for
     // `--`, and so on). `valueExpr` is the compound assignment's right-hand

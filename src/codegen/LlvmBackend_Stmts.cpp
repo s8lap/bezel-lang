@@ -2,6 +2,99 @@
 
 namespace bezel::codegen {
 
+// fix #2858 (§17.6 / §12.1 / §12.3 / §11.2, v0.240): `P++` / `P--` on a
+// VIRTUAL, OVERRIDE, ABSTRACT or INTERFACE property.
+//
+// §17.6, verbatim: "The operand must be an assignable lvalue (a local variable,
+// a writable field, an indexer slot, or a property with a setter …)", and "For
+// built-in numeric types, `x++` is equivalent to `x := x + 1` (and likewise
+// `x--` to `x := x - 1`)". §12.1, verbatim: "A method, property, or indexer is
+// non-virtual unless marked `virtual`. To override a virtual member in a
+// derived class, mark the matching member `override`."
+//
+// THE DEFECT this closes: `lowerStmt`'s IncrementStmt arm reached the property
+// setter through `lowerPropertySetValue` (statically bound) or, for an
+// auto-property, through `lvalueAddr` (a direct store into the DECLARING
+// class's backing field) — never through `lowerVirtualPropertySet`, which is
+// what the AssignmentStmt arm calls for both `:=` and `OP=`. The READ half went
+// through `lowerExpr` and therefore DID dispatch, so the two halves of one
+// statement disagreed. MEASURED on dafe6d9 with `B`'s accessors at +100/+1 and
+// `D`'s at +200/+2, receiver always a `D`: `P++`, `this.P++` and `b.P++` all
+// gave 202 where 203 is correct; an `abstract` read-write property and a
+// virtual AUTO-property were DROPPED entirely (0); an interface-typed `q.P++`
+// gave 1.
+//
+// Returns true when it lowered the whole statement. Everything cheap is checked
+// BEFORE the getter is lowered, so a decline does not leave a stranded call:
+//   * a non-property or an INDEXER target — the indexer spelling is
+//     `lowerIndexerIncrDecr`'s (#2848);
+//   * `base.P++` — §12.3, verbatim: "Inside a derived member, `base.Name(...)`
+//     calls the base class's implementation, bypassing virtual dispatch." The
+//     base property shares its vtable slot with the derived override, so
+//     dispatching would run the override. Declined HERE rather than relying on
+//     lowerVirtualPropertySet's own `base` bail-out, because that one fires
+//     only after the getter has already been emitted;
+//   * no vtable/itable slot — a NON-VIRTUAL or STATIC property (§12.1:
+//     "Fields, constructors, destructors, and static members may not be
+//     virtual", so buildVtable never gives one a slot). Both keep their
+//     existing static lowering.
+bool Emitter::lowerVirtualPropertyIncrDecr(const ast::IncrementStmt& inc) {
+    if (!inc.target) return false;
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*inc.target));
+    if (!ps || ps->isIndexer) return false;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(inc.target.get())) {
+        if (!ma->target) return false;
+        if (auto* tid =
+                dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+            if (tid->name == "base") return false;  // §12.3
+    } else if (!dynamic_cast<const ast::IdentifierExpr*>(inc.target.get())) {
+        return false;  // only `P` and `recv.P` are property lvalues here
+    }
+    const bool hasSet =
+        propSetSlot_.count(ps) || ifacePropertySetIndex_.count(ps);
+    const bool hasGet =
+        propGetSlot_.count(ps) || ifacePropertyGetIndex_.count(ps);
+    if (!hasSet || !hasGet) return false;
+
+    llvm::Value* cur = lowerExpr(*inc.target);   // the dispatched getter
+    if (!cur) return false;
+    // §17.6's implicit `1`, synthesized at the getter's result type. Gated on
+    // the LOWERED type, not a source category: any non-numeric lowering (a
+    // `string` property, say) declines rather than emitting a malformed
+    // constant — `ConstantInt::get` ASSERTS on a non-integer type.
+    llvm::Type* t = cur->getType();
+    const std::string binOp = inc.op == "++" ? "+" : "-";
+    const bool fp = t->isFloatingPointTy();
+    llvm::Value* res = nullptr;
+    if (t == decimalStructType()) {
+        // §6.4: `decimal` is a struct-typed primitive. `emitCompoundOp` would
+        // feed it to the integer overflow intrinsic and emit IR that fails
+        // verification ("Intrinsic has incorrect return type ...
+        // llvm.sadd.with.overflow.s_bz.decimals" — measured); the decimal
+        // arithmetic helper is what this same statement handler's `lvalueAddr`
+        // path already uses for `d++` on a decimal LOCAL.
+        res = emitDecimalArith(binOp, cur, emitDecimalOne());
+    } else {
+        llvm::Value* one = nullptr;
+        if (fp) one = llvm::ConstantFP::get(t, 1.0);
+        else if (t->isIntegerTy()) one = llvm::ConstantInt::get(t, 1);
+        if (!one) return false;
+        res = emitCompoundOp(
+            binOp, cur, one, fp,
+            isUnsignedTargetExpr(*inc.target),
+            isCharTargetExpr(*inc.target));    // §6.6/§5.2 #1961
+    }
+    if (!res) return false;
+    // valueIsPlusOne mirrors the AssignmentStmt compound arm's #2586 call: the
+    // operation's RESULT has no source AST node, so the setter cannot recognise
+    // it as a producer on its own. It is only ever a fresh +1 for a pointer
+    // result, which `one`'s type gate above already excludes here — the flag is
+    // kept for symmetry with that call site, not because it can fire.
+    return lowerVirtualPropertySet(*inc.target, res, /*valueExpr=*/nullptr,
+                                   /*valueIsPlusOne=*/true);
+}
+
+
 bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
@@ -1149,8 +1242,17 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
     // paths handle the write-back:
     //   (a) Block-setter computed property (`obj.P++`): mirrors lowerPropertyCompound
     //       — read via getter (lowerExpr), compute ±1, write via lowerPropertySetValue.
-    //   (b) User-defined indexer (`v[i]++`): mirrors lowerIndexerCompound — evaluate
-    //       receiver and index once, call getter, compute ±1, call setter.
+    //   (b) User-defined indexer (`v[i]++`): fix #2848 DELEGATES to
+    //       lowerIndexerCompoundCore, the same body `a[i] += 1` uses, rather
+    //       than mirroring it — §17.6 defines the two as one rule, and the
+    //       former mirror had drifted three fixes behind the original.
+    // Ahead of BOTH, and ahead of the lvalueAddr probe itself:
+    //   (0) fix #2858 — a VIRTUAL / OVERRIDE / ABSTRACT / INTERFACE property
+    //       dispatches through its vtable or itable
+    //       (lowerVirtualPropertyIncrDecr). It must precede lvalueAddr because
+    //       that call succeeds for a virtual AUTO-property and resolves to the
+    //       DECLARING class's backing field, which is not where the override
+    //       reads from.
     if (auto* inc = dynamic_cast<const ast::IncrementStmt*>(&s)) {
         if (inc->target) {
             // §25: look for a user-defined operator on the target's Named type.
@@ -1170,6 +1272,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     }
                 }
             }
+            // fix #2858 (§17.6/§12.1/§11.2, v0.240): a VIRTUAL / OVERRIDE /
+            // ABSTRACT / INTERFACE property increments through its vtable or
+            // itable, exactly as `P := v` and `P OP= v` already do (this
+            // function's AssignmentStmt arm, ~L207 and ~L316). Checked BEFORE
+            // `lvalueAddr` on purpose: for a virtual AUTO-property that call
+            // succeeds and resolves to the DECLARING class's own backing field,
+            // so the direct store below would land in the base's field while
+            // every read goes through the dispatched getter to the override's —
+            // MEASURED as a silently dropped write (0 where 1 is correct).
+            // Gated on `!opMethod` per §17.6, verbatim: "For a value-type
+            // operand whose type T overloads `operator ++`, the statement `x++`
+            // is equivalent to `x := T.operator++(x)`" — that shape keeps the
+            // operator path below, unchanged.
+            if (!opMethod && lowerVirtualPropertyIncrDecr(*inc)) return false;
             llvm::Type* elemTy = nullptr;
             llvm::Value* addr = lvalueAddr(*inc->target, elemTy);
             if (addr) {
