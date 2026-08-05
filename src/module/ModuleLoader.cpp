@@ -1002,13 +1002,38 @@ static std::string metaVisibilityToKeyword(MetaVisibility v) {
     }
 }
 
-// §14/#662c / #695: build a stub declaration for an instance method whose body
-// is not available.  The stub only carries the signature (enough for sema to
-// register a MethodSymbol and resolve calls to it inside the ctor/dtor body).
-// Limitations: operators, abstract methods, and methods with `Function`/
-// `InlineArray` return types receive an `=> 0`-style stub; they should not
-// normally be called from a ctor/dtor body, but we emit stubs anyway so that
-// any call to them is at least resolved (rather than silently returning zero).
+// §14/#662c / #695: build a stub declaration for a method whose body is not
+// available.  The stub only carries the signature — enough for sema to register
+// a MethodSymbol so a self-call inside the body being reconstructed (a ctor
+// body, a dtor body, a static-field initializer, or the #783 method body)
+// resolves to it and can be remapped to the imported MethodSymbol.  Abstract
+// methods have no body and are skipped; operators are skipped by the callers.
+//
+// fix #2820 (spec §14.1/§2.5, v0.240): the stub body used to be `=> 0` for EVERY
+// return type (only `bool` was special-cased, and the computed `retText` was
+// never used).  `0` does not typecheck against `string`, a class, `owned C`, an
+// interface, `Task<…>`, `[N]T`, `() -> R` — nor, per §5.1, against `byte`,
+// `sbyte`, `short`, `ushort`, `uint`, `ulong` or `char`, which reject an `int`
+// literal outright.  A stub that fails to typecheck makes the fresh context
+// report an error, and parseAndAttachMethodBody's #783 soundness gate then
+// refuses to attach THE BODY BEING RECONSTRUCTED — even though the failure is
+// entirely in an unrelated sibling's synthetic stub.  Declaring one
+// reference-returning method anywhere in an imported generic class therefore
+// silently disabled §14.1/#783 monomorphization for EVERY method of that class,
+// on a condition no author can see; via the fallback to the exporter's
+// placeholder-compiled function that could then become a wrong value (#2821).
+//
+// A per-return-type literal table is the wrong shape (the enumerate-the-
+// categories mistake of the #2787/#2790 family — several types have no literal
+// at all).  Emit instead a body that is type-correct BY CONSTRUCTION for any
+// signature: a SELF-CALL forwarding the stub's own parameters, whose type IS the
+// declared return type whatever that type is.  The stub is never lowered —
+// parseAndAttach* runs collectSymbols / resolveTypes / typecheckExpressions on
+// the synthetic module and nothing else — so the recursion is never emitted, let
+// alone executed; it exists only to give sema a well-typed body.  A BARE call
+// (not `this.`) is used so one spelling covers static and instance members
+// alike, and because a `this.`-rooted call inside an `async` stub takes a
+// different receiver-recovery path.
 static std::string buildMethodStub(const MetaMember& mm) {
     std::string s;
     // Visibility and non-body modifiers (skip abstract — it suppresses the body).
@@ -1046,14 +1071,15 @@ static std::string buildMethodStub(const MetaMember& mm) {
     bool hasReturnType = mm.type.kind != TypeKind::Unit &&
                          mm.type.kind != TypeKind::Error;
     if (hasReturnType) s += ": " + metaTypeToSourceText(mm.type);
-    // Minimal expression body.  Use a literal that matches the return type so
-    // the stub compiles without type errors.  For pointer-sized types that
-    // sema would flag as missing, fall back to `0`.
+    // fix #2820: an expression body that is well-typed for ANY return type — a
+    // self-call forwarding this stub's own parameters (see the header comment).
     if (hasReturnType) {
-        std::string retText = metaTypeToSourceText(mm.type);
-        bool isBool = (mm.type.kind == TypeKind::Primitive &&
-                       mm.type.primitive == PrimitiveKind::Bool);
-        s += " => " + std::string(isBool ? "false" : "0") + ";";
+        s += " => " + std::string(mm.name.empty() ? "unknown" : mm.name) + "(";
+        for (std::size_t i = 0; i < mm.params.size(); ++i) {
+            if (i) s += ", ";
+            s += mm.params[i].name;
+        }
+        s += ");";
     } else {
         s += " end " + std::string(mm.name.empty() ? "unknown" : mm.name) + ";";
     }
