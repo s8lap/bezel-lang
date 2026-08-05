@@ -5,6 +5,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "lexer/Lexer.hpp"
@@ -1258,6 +1259,14 @@ static bool parseAndAttachCtorBody(
     // Build index→ParameterSymbol map for the imported ctor.
     const std::vector<sema::Symbol*>& importedParams = importedCs->params;
 
+    // fix #2839 (§14/#662c / §27.3/§27.5, v0.240): every symbol that is a
+    // LAMBDA's parameter somewhere in this ctor body — see the identical set in
+    // parseAndAttachMethodBody for why the ParameterSymbol arm below needs it.
+    std::unordered_set<const sema::Symbol*> freshLambdaParamSyms;
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        for (sema::Symbol* ps : syms)
+            if (ps) freshLambdaParamSyms.insert(ps);
+
     // Walk fresh context's exprSymbols and remap into mainCtx.
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
@@ -1267,6 +1276,14 @@ static bool parseAndAttachCtorBody(
             if (it != importedFields.end())
                 mainCtx.setExprSymbol(expr, it->second);
         } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
+            // fix #2839: a LAMBDA parameter is declared inside the body and has
+            // no importer-side counterpart (like a body-local, §2290 bug 1
+            // below) — carry it over verbatim rather than running the
+            // positional ctor-param search that can never match it.
+            if (freshLambdaParamSyms.count(freshSym)) {
+                mainCtx.setExprSymbol(expr, freshSym);
+                continue;
+            }
             // Param reference: find by position in freshCs.params.
             for (std::size_t pi = 0; pi < freshCs->params.size(); ++pi) {
                 if (freshCs->params[pi] == freshSym &&
@@ -1310,6 +1327,18 @@ static bool parseAndAttachCtorBody(
         if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
     for (const auto& [expr, ref] : freshCtx.allExprTypes())
         if (expr && ref) mainCtx.setExprType(expr, ref);
+    // fix #2839 (§14/#662c / §27.3 Lambda expressions, v0.240): carry the
+    // body's per-lambda parameter lists too — the fourth AST-keyed side table,
+    // and the only one no remap loop copied. codegen's lowerLambda reads
+    // `ctx_.lambdaParams(&lam)` to declare the closure's user parameters and to
+    // bind each incoming argument to its ParameterSymbol; with no entry the
+    // closure took ZERO user parameters and the lambda's value was lost, so
+    // `var f := lambda(x: int) => x + 1; tag := f(n);` in an imported generic
+    // constructor stored 0. Verbatim copy: keys are the re-parsed
+    // ast::LambdaExpr nodes, values the fresh ParameterSymbols with no
+    // importer-side twin; both are kept alive below.
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        if (lam) mainCtx.setLambdaParams(lam, syms);
 
     // Attach the parsed ConstructorDecl and keep the AST alive.
     // Keep the backing source string alive too: all string_view fields in the
@@ -1610,6 +1639,19 @@ static bool parseAndAttachMethodBody(
     // Param remap: the target method's own parameters (by position).
     const std::vector<sema::Symbol*>& importedParams = importedMs->params;
 
+    // fix #2839 (§14.1/#783 / §27.3/§27.5, v0.240): every symbol that is a
+    // LAMBDA's parameter somewhere in this body. A lambda parameter is a
+    // ParameterSymbol, so without this set the ParameterSymbol arm below reads
+    // it as "the enclosing method's parameter", finds it in NO position of
+    // freshMs->params, and drops the binding. It belongs in the same category
+    // as a body-local (#2818): declared INSIDE the body, no importer-side twin,
+    // carried over verbatim. See the lambdaParams_ copy below for the other
+    // half of this fix.
+    std::unordered_set<const sema::Symbol*> freshLambdaParamSyms;
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        for (sema::Symbol* ps : syms)
+            if (ps) freshLambdaParamSyms.insert(ps);
+
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
         if (dynamic_cast<sema::FieldSymbol*>(freshSym)) {
@@ -1617,6 +1659,17 @@ static bool parseAndAttachMethodBody(
             if (it != importedFields.end())
                 mainCtx.setExprSymbol(expr, it->second);
         } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
+            // fix #2839: a LAMBDA parameter is not the enclosing method's — it
+            // is declared inside the body and has no importer-side counterpart,
+            // exactly like a body-local. Carry it over verbatim (its
+            // ParameterSymbol is the one codegen's lowerLambda keys paramSlots_
+            // on, from the lambdaParams entry copied below), instead of running
+            // the positional method-param search that can never match it and
+            // then dropping the binding.
+            if (freshLambdaParamSyms.count(freshSym)) {
+                mainCtx.setExprSymbol(expr, freshSym);
+                continue;
+            }
             for (std::size_t pi = 0; pi < freshMs->params.size(); ++pi) {
                 if (freshMs->params[pi] == freshSym &&
                     pi < importedParams.size()) {
@@ -1672,6 +1725,27 @@ static bool parseAndAttachMethodBody(
         if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
     for (const auto& [expr, ref] : freshCtx.allExprTypes())
         if (expr && ref) mainCtx.setExprType(expr, ref);
+    // fix #2839 (§14.1/#783 / §27.3 Lambda expressions, v0.240): lambdaParams_
+    // is the FOURTH side table this reconstruction has to carry, and it was the
+    // only one nothing copied. codegen's lowerLambda reads
+    // `ctx_.lambdaParams(&lam)` to (a) build the closure function's user
+    // parameter type list and (b) bind each incoming argument to its
+    // ParameterSymbol in paramSlots_. With no entry in mainCtx it got null, the
+    // closure was declared with ZERO user parameters, and the lambda's value
+    // was lost — `var f := lambda(x: int) => x + 1; return f(6);` in an
+    // imported generic body returned 0, not 7, with no diagnostic. §2.8.2
+    // clause 2 is the rule broken: "An external instantiation behaves
+    // identically to a same-module instantiation of the same generic at the
+    // same arguments" — the same source compiled as ONE module answered 7.
+    //
+    // Copied VERBATIM, like the two type tables above and for the same reasons:
+    // the keys are the re-parsed ast::LambdaExpr nodes (unique to the fresh
+    // AST, so no collision with mainCtx's own lambdas) and the values are the
+    // fresh ParameterSymbols, which have no importer-side twin to remap to. The
+    // fresh context that owns them is kept alive below (ownImportedAuxiliary),
+    // exactly as for the TypeRefs.
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        if (lam) mainCtx.setLambdaParams(lam, syms);
 
     // Attach the parsed MethodDecl to the imported MethodSymbol and keep the
     // backing source + AST alive (string_view fields point into them), plus the

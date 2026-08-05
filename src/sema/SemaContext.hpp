@@ -182,6 +182,20 @@ public:
         auto it = lambdaParams_.find(lam);
         return it == lambdaParams_.end() ? nullptr : &it->second;
     }
+    // fix #2839 (§14.1/#783, §14/#662c, v0.240): iterate all lambda→param-list
+    // entries. Used by ModuleLoader to COPY a re-parsed imported generic body's
+    // lambda parameter lists from the fresh context into the main one — the
+    // fourth AST-keyed side table the body-reconstruction remap loops must
+    // carry, alongside allExprSymbols/allResolvedTypes/allExprTypes. Without it
+    // `lambdaParams(&lam)` is null in the importer, codegen's lowerLambda
+    // declares the closure with NO user parameters, and the lambda's value is
+    // lost. The keys are the re-parsed ast::LambdaExpr nodes (kept alive by
+    // ownImportedAst) and the values point into the fresh context's symbol
+    // arena (kept alive by ownImportedAuxiliary).
+    const std::unordered_map<const ast::LambdaExpr*, std::vector<Symbol*>>&
+    allLambdaParams() const {
+        return lambdaParams_;
+    }
 
     // --- Cross-module imports (§2.2 / §2.5, issue #328 increment 3) ---------
     //
