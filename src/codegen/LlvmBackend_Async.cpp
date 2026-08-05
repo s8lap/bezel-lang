@@ -1150,6 +1150,35 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
         groupingFreeEligibleFn_ = resumeFn;
         setLiteralFreeEligibleFn_ = resumeFn;   // #2142
         dictLiteralFreeEligibleFn_ = resumeFn;  // #2143
+        // fix #2807 / #429 / §4.6 / §28.9 / §28.3 (v0.240): the `var` STRING-
+        // local refcount analysis must describe the RESUME fn too. EVERY
+        // consumer of the three string sets gates on `currentFn_ ==
+        // stringReleaseEligibleFn_` — armStringLocalRefcount's bind-time retain
+        // and its scope-end `Disposal{stringRelease}`, returnedStringLocalOwns
+        // PlusOne's transfer-on-return, the two record-backed interface-property
+        // retains (LlvmBackend_Assign.cpp / LlvmBackend_Exprs.cpp), and the
+        // `:=` / §4.6 `+=` drop-on-overwrite release — and emitFunctionBody's
+        // async routing returns BEFORE Setup's collectStringReleaseEligible
+        // runs. The async body therefore lowered with currentFn_ == resumeFn
+        // while the token still named the last SYNCHRONOUS method emitted, so
+        // NO string local in ANY async body was ever retained OR released:
+        // both allocations (bz_string header + payload) leaked, per local, per
+        // call (#2807 — measured 1904 bytes / 80 allocations for 20 calls x 2
+        // locals). Mirrors the closure / unwind / cell / borrowing-array
+        // re-establishment above.
+        //
+        // The frame-spill dimension needs no extra machinery: collectSuspend
+        // Locals (LlvmBackend_Iterators.cpp) gives EVERY LocalDecl in the body
+        // a frame field, and emitAwaitSuspend spills / restores every mapped
+        // alloca around each suspend, so the alloca the Disposal loads holds
+        // the live value on whichever activation reaches the exit. The release
+        // itself runs on exactly one edge per activation — emitAllDisposals on
+        // an explicit `return`, emitDisposals on the fall-off, emitUnwind
+        // Disposals on the throw edge — and a SUSPEND returns from resume
+        // without touching disposeStack_, so a suspended local is released once,
+        // by the activation that finally completes. // per §28.9, §30.2
+        collectStringReleaseEligible(*ci.stmts);
+        stringReleaseEligibleFn_ = resumeFn;
         // §30.9 / §31.2 (#438): start with no pending handler-context spill slots;
         // lowerTry registers them as it lowers any in-handler await.
         asyncHandlerSpillSlots_.clear();
@@ -1163,6 +1192,29 @@ void Emitter::emitAsyncMethod(sema::MethodSymbol* ms, llvm::Function* fn,
 
         // Restore captured params (this + params) from the frame.
         emitFrameCaptureRestores(frame, self);
+
+        // fix #2807 / fix #2696 / §28.1 / §28.9 / §4.6 (v0.240): CO-GATE the
+        // parameter retain with the parameter release the pin above just turned
+        // on. lowerStringLocalReassign (and the §4.6 `+=` branch's `isLocal`)
+        // admit ANY slot localSlot() resolves — which includes a `string`
+        // PARAMETER, whose single reference belongs to the CALLER (§28.1: on a
+        // `string`, "`owned` is a compile error: such values carry no disposal
+        // obligation to transfer (§28.9)"). Enabling that release without the
+        // paired bind-time retain frees the caller's borrow under it — exactly
+        // the #2696 use-after-free — so the two predicates must move together,
+        // which is the invariant retainAssignedStringParams' step 0 states.
+        //
+        // Emitted in the resume ENTRY block, which dominates every assignment
+        // and re-runs on every activation, while a given activation can release
+        // the incoming value at most once (after the first assignment the slot
+        // holds a value this frame owns). So retains >= releases on every path:
+        // a surplus retain leaks one reference per resume, it can never
+        // over-release. (An async body's param slot is re-restored from the
+        // frame capture on each activation and is NOT spilled back, so an
+        // assignment to a `string` param does not survive a suspend — a
+        // separate, pre-existing async defect this fix neither causes nor
+        // fixes; the retain-per-activation is what keeps it leak-safe.)
+        retainAssignedStringParams(*ci.stmts, ms->params);
 
         // State field GEP — read by the resume dispatch, written at each await.
         llvm::Value* stateGEP =

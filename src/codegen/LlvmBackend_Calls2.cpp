@@ -9072,6 +9072,20 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // returns to it.
     auto savedUnwindIneligible = unwindIneligible_;
     llvm::Function* savedUnwindIneligibleFn = unwindIneligibleFn_;
+    // fix #2807 / #429 / §4.6 / §28.9: the same save/restore for the `var`
+    // STRING-local refcount state, for the same reason #1483 needed it for the
+    // unwind sets — this wrapper may run MID-EMISSION of an outer body (a lazy
+    // specialization is built at its first call site), and both the sets and
+    // their fn token are per-function state owned by that outer body. Without
+    // the restore, the outer body's remaining string locals would silently lose
+    // their bind-time retain and scope-end release once emission returned to it
+    // (the leak-direction, but a regression this fix would have introduced).
+    auto savedStringReleaseEligible = stringReleaseEligible_;
+    auto savedStringBorrowRetainEligible = stringBorrowRetainEligible_;
+    auto savedStringBorrowAll = stringBorrowAll_;
+    auto savedValueLikeChoiceStrReleaseEligible =
+        valueLikeChoiceStrReleaseEligible_;
+    llvm::Function* savedStringReleaseEligibleFn = stringReleaseEligibleFn_;
     // fix #568 / §8.6: the specialized body's ReturnStmt lowering consults
     // currentReturnTypeNode_ (return-value boxing, nullable-value coercion). It
     // must name THIS method's declared return type while the body is emitted —
@@ -9263,6 +9277,40 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     currentThis_ = nullptr;
     bindParameters(specFn, /*hasThis=*/!isStaticMethod(ms), &ms->params);
 
+    // fix #2807 / #429 / §4.6 / §28.9 / §28.3 (v0.240): populate the `var`
+    // STRING-local refcount state for THIS specialized function, mirroring the
+    // non-specialized method-body prolog (LlvmBackend_Setup.cpp emitFunction
+    // Body: `collectStringReleaseEligible(*ci.stmts); stringReleaseEligibleFn_
+    // = fn;` followed by `retainAssignedStringParams(*ci.stmts, ms->params)`).
+    // EVERY consumer of the three string sets gates on `currentFn_ ==
+    // stringReleaseEligibleFn_`, which is assigned in exactly ONE other place
+    // in the backend (emitFunctionBody); specFn is a freshly-created
+    // llvm::Function, so without this the gate was false for the whole
+    // specialized body and NO string local in ANY generic specialization was
+    // ever retained or released — both allocations leaked, per local, per call
+    // (#2807 — measured 1904 bytes / 80 allocations for 20 calls x 2 locals).
+    //
+    // The walk itself needs no genericSubst_ awareness: it is keyed on the
+    // shared body AST's LocalDecl nodes and classifies a candidate by its SEMA
+    // type, so a local whose declared type is the type PARAMETER (`var x: T`)
+    // never reads as Kind::Primitive/String and is simply not admitted — the
+    // conservative, leak-direction answer — while a concretely `string`-typed
+    // local is classified identically in every instantiation. The sets are
+    // saved/restored around this whole emission (see the save above), so a
+    // specialization built mid-emission of an outer body cannot clobber it.
+    //
+    // retainAssignedStringParams is CO-GATED with the drop-on-overwrite release
+    // the pin above enables for a `string` PARAMETER target (§28.1 makes such a
+    // parameter an unmodified borrow of the CALLER's reference, so an unpaired
+    // release is the #2696 use-after-free). Sound here exactly as in a plain
+    // method: bindParameters binds each param ONCE, in this entry block, which
+    // dominates every assignment in the body.
+    if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts) {
+        collectStringReleaseEligible(*ci.stmts);
+        stringReleaseEligibleFn_ = specFn;
+        retainAssignedStringParams(*ci.stmts, ms->params);
+    }
+
     // Emit the body. fix #580: handle both EXPRESSION and block bodies, so a
     // virtual generic method whose override is `=> $"..."` (an expression body)
     // produces a callable standalone function for dispatch-by-descriptor.
@@ -9326,6 +9374,13 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     finallyBodyStack_ = std::move(savedFinBodies);    // #2281 / §29.7
     unwindIneligible_ = std::move(savedUnwindIneligible);  // fix #1483
     unwindIneligibleFn_ = savedUnwindIneligibleFn;          // fix #1483
+    // fix #2807: restore the outer body's string-refcount state (see the save).
+    stringReleaseEligible_ = std::move(savedStringReleaseEligible);
+    stringBorrowRetainEligible_ = std::move(savedStringBorrowRetainEligible);
+    stringBorrowAll_ = std::move(savedStringBorrowAll);
+    valueLikeChoiceStrReleaseEligible_ =
+        std::move(savedValueLikeChoiceStrReleaseEligible);
+    stringReleaseEligibleFn_ = savedStringReleaseEligibleFn;
     currentReturnTypeNode_ = savedRetNode;
     currentSpecMethodSymbol_ = savedSpecMs;  // fix #628
     emittingGenericTemplateBody_ = savedGenTemplate;  // #817
