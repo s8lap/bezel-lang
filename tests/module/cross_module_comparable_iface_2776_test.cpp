@@ -166,13 +166,14 @@ BEZEL_TEST(cross_module_comparable_iface_2776, math_min_over_imported_interface)
 // consumer's own `td$IComparable` collided with the dependency's ("multiple
 // definition of `td$IComparable'"), and a link failure surfaces here as -1.
 //
-// The body deliberately does NOT call `CompareTo` explicitly.  That path is
-// separately broken — a written-out `CompareTo` through an imported interface
-// silently returns 0 while `Rank()` on the same value returns correctly — which
-// is **#2792**, measured to be pre-existing on both sides of this fix.  Pinning
-// it here would either bake in a wrong value or leave a red case for a defect
-// this commit does not claim to fix; the interface value is still constructed
-// and used, so the link and the itable are both exercised.
+// The body deliberately does NOT call `CompareTo` explicitly.  That path was
+// separately broken when this test was written — a written-out `CompareTo`
+// through an imported interface silently returned 0 while `Rank()` on the same
+// value returned correctly — which is **#2792**, measured to be pre-existing on
+// both sides of this fix.  #2792 is now FIXED (the consumer's `bz$vtable$table`
+// omitted every imported class's vtable, so `bz_obj_is_string` took the receiver
+// for a string); it is pinned by `xmod_imported_class_vtable_2792`, and this
+// case is left as-is so the linkage half stays isolated from it.
 BEZEL_TEST(cross_module_comparable_iface_2776, both_modules_naming_icomparable_link) {
     BEZEL_EXPECT_EQ(compileAndRunCrossModule(kLib, app(
         "    using var a := new RNode(7); "

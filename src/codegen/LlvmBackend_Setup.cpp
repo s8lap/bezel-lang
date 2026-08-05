@@ -3349,6 +3349,79 @@ void Emitter::declareVtables() {
             if (ts && ts->kind == ast::TypeDeclKind::Class) buildVtable(ts);
         }
     }
+    // fix #2792 (§2.8.3 rule 4, §12.7, §4.6, §8.6/§12.7 #417; v0.240): register
+    // the IMPORTED classes' vtables in `bz$vtable$table`.
+    //
+    // That table is the ONLY thing `bz_obj_is_string` consults, and it answers
+    // "this is a string" for any object whose word 0 is NOT one of the listed
+    // vtables (bezel_runtime_refcounting.cpp — a whitelist NEGATION). Pass D
+    // below builds the table from `allVtables_`, which only ever received the
+    // vtable globals THIS module emitted; the sentence three comments up says it
+    // outright ("No vtable GLOBAL is emitted for an imported type"). So every
+    // instance of an imported class was misreported as a string at every
+    // discriminator site, and each site then dereferenced the object through the
+    // `bz.string` layout {ptr data, i64 len, i8 width, i64 rc}.
+    //
+    // MEASURED consequences of that misreport (two-module builds,
+    // `bezelc -c lib.bzl` then `--import lib.o`) — five silent wrong values and
+    // one crash, every one of them fixed here:
+    //   * `x.CompareTo(y)` through an imported `IRank: IComparable<IRank>`
+    //     returned 0 instead of 4 — #2792's repro. The `strRecvPossible` diamond
+    //     in emitMethodCall (LlvmBackend_Calls2.cpp) took its BOTH-STRINGS arm
+    //     and returned the ordinal "length difference" of two RNodes.
+    //   * `x.Equals(y)` through an imported `IIdent: IEquatable<IIdent>` returned
+    //     TRUE for a user `Equals` that answers FALSE — so the defect is NOT
+    //     IComparable-specific; it is general to the discriminator.
+    //   * `o is Plain` on an `Object` holding an imported instance was FALSE,
+    //     which §2.8.3 rule 4 forbids directly: `is` tests "match identically
+    //     regardless of which artifact produced the value or performs the test".
+    //   * a `case` type pattern (§19.3) over the same value took the `_` arm.
+    //   * `o.ToString()` on the same value produced "" instead of the §8.5
+    //     default type name.
+    //   * `o.Equals(b)` / `o.GetHashCode()` on the same value SIGSEGV'd — those
+    //     lowerings dereference a receiver the discriminator claimed was a
+    //     string, so `bz.string`'s `data` field is read out of the vtable word.
+    //
+    // THE FIX declares the exporter's `vt$<Type>` (same #1488 mangling, same
+    // export gate Pass D applies when it DEFINES the global — public and
+    // non-generic, so the symbol is guaranteed external in the dependency
+    // object) and pushes it into `allVtables_`. It is a declaration only; the
+    // definition stays in the dependency artifact, which `--import` links in.
+    // `vtables_` is deliberately NOT populated: that map means "a vtable this
+    // module emitted", and vtableOf()'s callers rely on that.
+    //
+    // ⚠ EXACTLY HOW FAR THIS REACHES, measured on both sides. A vtable the
+    // dependency mints with INTERNAL linkage cannot be named here at all, so a
+    // value the DEPENDENCY boxed (its `bvt$box$<R>` is `d`, not `D`) is still
+    // misreported — #2797, which needs a linkage/ABI decision rather than a
+    // guess. And an imported GENERIC class is excluded above because its vtable
+    // is per-instantiation and internal in the exporter; the importer
+    // monomorphizes its own `vt$C$specN` and registers it, so the discriminator
+    // is fine there — but its `is` test fails for an unrelated
+    // descriptor-identity reason (#2798).
+    if (ctx_.hasImports()) {
+        for (sema::Symbol* sym : ctx_.importedSymbols()) {
+            auto* ts = dynamic_cast<sema::TypeSymbol*>(sym);
+            if (!ts || ts->kind != ast::TypeDeclKind::Class) continue;
+            if (ts->visibility != ast::Visibility::Public) continue;
+            if (!ts->genericParams.empty()) continue;
+            std::string vtName = "vt$" + mangledTypeName(ts);
+            llvm::GlobalVariable* gv = module_->getNamedGlobal(vtName);
+            if (!gv) {
+                // The element count is unknown here (it is the exporter's
+                // virtual-slot count) and irrelevant: the global is only ever
+                // taken as an opaque address. A zero-length array declaration
+                // keeps the type well-formed without asserting a size.
+                gv = new llvm::GlobalVariable(
+                    *module_, llvm::ArrayType::get(ptrTy(), 0),
+                    /*isConstant=*/true, llvm::GlobalValue::ExternalLinkage,
+                    /*init=*/nullptr, vtName);
+            }
+            if (std::find(allVtables_.begin(), allVtables_.end(), gv) ==
+                allVtables_.end())
+                allVtables_.push_back(gv);  // §8.6 #417: string discriminator
+        }
+    }
     // fix #2387 (§2.8.2/§2.8.3 rule 4; v0.235): declareImportedPropertyGetters
     // populates importedPropGetterFns_, which ensurePropertyAccessorFn's
     // imported-property fallback (LlvmBackend_Assign.cpp) now consults from
