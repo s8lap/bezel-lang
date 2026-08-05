@@ -2673,9 +2673,58 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
 // function the compound assign was silently a no-op (returns old value, no store).
 bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     if (!as.target || !as.value) return false;
-    auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get());
+    std::string op(as.op);
+    if (!op.empty() && op.back() == '=') op.pop_back();
+    return lowerIndexerCompoundCore(*as.target, op, as.value.get());
+}
+
+
+// fix #2848 (§17.6/§6.6/§12.1/§23.4, v0.240): `a[i]++` / `a[i]--` — §17.6's
+// indexer desugaring, which that section states verbatim "is the indexer
+// instance of the general compound-assignment rule of §6.6". Routed through
+// the SAME body as `a[i] += 1` rather than a second hand-written copy of it;
+// see the declaration in LlvmBackend_impl.hpp for what the copy had drifted
+// out of sync with. §17.6, verbatim: "For built-in numeric types, `x++` is
+// equivalent to `x := x + 1` (and likewise `x--` to `x := x - 1`)".
+bool Emitter::lowerIndexerIncrDecr(const ast::IncrementStmt& inc) {
+    if (!inc.target) return false;
+    return lowerIndexerCompoundCore(*inc.target,
+                                    inc.op == "++" ? "+" : "-",
+                                    /*valueExpr=*/nullptr);
+}
+
+
+bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
+                                       const std::string& binOp,
+                                       const ast::Expr* valueExpr) {
+    auto* ix = dynamic_cast<const ast::IndexExpr*>(&targetExpr);
     if (!ix || !ix->target || ix->indices.empty() || !ix->indices[0].value)
         return false;
+    // fix #2848: §17.6's right operand for the `++`/`--` spelling — the
+    // implicit literal `1`, synthesized at the GETTER's result type (`cur`)
+    // rather than lowered from an AST node, because the desugaring has none.
+    // `decimal` is a struct-typed primitive, so its `1` comes from the decimal
+    // helper, not ConstantInt (which would assert on a struct type — the
+    // pre-fix mirror's own latent crash on a decimal-element indexer). A type
+    // that is none of the three yields null, which declines the whole lowering
+    // rather than emitting a malformed constant.
+    auto lowerRhs = [&](llvm::Value* cur) -> llvm::Value* {
+        if (valueExpr) return lowerExpr(*valueExpr);
+        if (!cur) return nullptr;
+        llvm::Type* t = cur->getType();
+        if (t->isFloatingPointTy()) return llvm::ConstantFP::get(t, 1.0);
+        if (t == decimalStructType()) return emitDecimalOne();
+        if (t->isIntegerTy()) return llvm::ConstantInt::get(t, 1);
+        return nullptr;
+    };
+    // §6.2/#2140's `rUns` (is the RIGHT operand unsigned?) — §17.6's implicit
+    // `1` is a signed literal, so `false` for the `++`/`--` spelling, which is
+    // exactly what the pre-fix mirror passed (it omitted the argument).
+    const bool rhsUnsigned = valueExpr && isUnsignedTargetExpr(*valueExpr);
+    // The ICE report below needs a source position; the `++`/`--` spelling has
+    // no RHS node, so it points at the target.
+    const auto rhsSpanBegin =
+        valueExpr ? valueExpr->span.begin : targetExpr.span.begin;
     // Check that this is a user-defined indexer (class/record with a property
     // [i]: T declaration). Built-in arrays fall through to lvalueAddr instead.
     const sema::TypeSymbol* recvDecl = indexAccessReceiverDecl(*ix);
@@ -2788,22 +2837,20 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
         if (!cur) return false;
 
         // --- Apply the compound operator. ---
-        llvm::Value* rhs = lowerExpr(*as.value);
+        llvm::Value* rhs = lowerRhs(cur);
         if (!rhs) {
             // #1386/#2509: ICE — lowerExpr returned null for the RHS.
             ctx_.diagnostics().report(
-                Severity::Error, as.value->span.begin,
+                Severity::Error, rhsSpanBegin,
                 "internal: lowerExpr returned null for compound indexer "
                 "assignment RHS (imported-indexer path) — #2509");
             return false;
         }
-        std::string op(as.op);
-        if (!op.empty() && op.back() == '=') op.pop_back();
         llvm::Value* newVal = emitCompoundOp(
-            op, cur, rhs, cur->getType()->isFloatingPointTy(),
-            isUnsignedTargetExpr(*as.target),
-            isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
-            isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
+            binOp, cur, rhs, cur->getType()->isFloatingPointTy(),
+            isUnsignedTargetExpr(targetExpr),
+            isCharTargetExpr(targetExpr),      // §6.6/§5.2 #1961
+            rhsUnsigned);                      // §6.2 #2140 rUns
         if (!newVal) return false;
 
         // --- Call setter with the new value + shared receiver/indices. ---
@@ -2881,23 +2928,21 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     auto emitCompoundValue = [&](llvm::Value* cur,
                                  llvm::Value*& rhsOut) -> llvm::Value* {
         rhsOut = nullptr;
-        llvm::Value* rhs = lowerExpr(*as.value);
+        llvm::Value* rhs = lowerRhs(cur);
         if (!rhs) {
             // #1386 precedent: ICE rather than a silently dropped store.
             ctx_.diagnostics().report(
-                Severity::Error, as.value->span.begin,
+                Severity::Error, rhsSpanBegin,
                 "internal: lowerExpr returned null for compound indexer "
                 "assignment RHS (dynamic-dispatch path) — #2836");
             return nullptr;
         }
         rhsOut = rhs;
-        std::string op(as.op);
-        if (!op.empty() && op.back() == '=') op.pop_back();
         return emitCompoundOp(
-            op, cur, rhs, cur->getType()->isFloatingPointTy(),
-            isUnsignedTargetExpr(*as.target),
-            isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
-            isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
+            binOp, cur, rhs, cur->getType()->isFloatingPointTy(),
+            isUnsignedTargetExpr(targetExpr),
+            isCharTargetExpr(targetExpr),      // §6.6/§5.2 #1961
+            rhsUnsigned);                      // §6.2 #2140 rUns
     };
 
     // Shared by both branches: discharge the +1 references the desugaring
@@ -2920,8 +2965,11 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
         if (!classBacked || diverged_) return;
         if (newVal && newVal->getType()->isPointerTy())
             emitStringRelease(newVal);
-        if (rhs && rhs->getType()->isPointerTy() && as.value.get() &&
-            isPlusOneStringProducer(as.value.get()))
+        // fix #2848: `valueExpr` is null for `++`/`--`, whose right operand is
+        // §17.6's implicit literal `1` — never a producer, so nothing to
+        // release (and no AST node to test).
+        if (rhs && rhs->getType()->isPointerTy() && valueExpr &&
+            isPlusOneStringProducer(valueExpr))
             emitStringRelease(rhs);
     };
 
@@ -3281,23 +3329,21 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     if (!cur) return false;
 
     // --- Apply the compound operator. ---
-    llvm::Value* rhs = lowerExpr(*as.value);
+    llvm::Value* rhs = lowerRhs(cur);
     if (!rhs) {
         // #1386: ICE — lowerExpr returned null for the RHS of a compound
         // indexer assignment; the expression kind is not yet handled.
         ctx_.diagnostics().report(
-            Severity::Error, as.value->span.begin,
+            Severity::Error, rhsSpanBegin,
             "internal: lowerExpr returned null for compound indexer "
             "assignment RHS (block-getter path) — #1386");
         return false;
     }
-    std::string op(as.op);
-    if (!op.empty() && op.back() == '=') op.pop_back();
     llvm::Value* newVal = emitCompoundOp(
-        op, cur, rhs, cur->getType()->isFloatingPointTy(),
-        isUnsignedTargetExpr(*as.target),
-        isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
-        isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns
+        binOp, cur, rhs, cur->getType()->isFloatingPointTy(),
+        isUnsignedTargetExpr(targetExpr),
+        isCharTargetExpr(targetExpr),      // §6.6/§5.2 #1961
+        rhsUnsigned);                      // §6.2 #2140 rUns
     if (!newVal) return false;
 
     // --- Call setter with the new value and the pre-computed receiver/params. ---
@@ -3370,13 +3416,15 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
     if (recvDecl->kind == ast::TypeDeclKind::Class) {
         if (newVal && newVal->getType()->isPointerTy())
             emitStringRelease(newVal);   // release the OP-result's +1
-        // For string `+=`, rhs is `lowerExpr(*as.value)` — a +1 string
+        // For string `+=`, rhs is `lowerExpr(*valueExpr)` — a +1 string
         // when the AST is a producer (e.g. BinaryExpr("+", ...)) but a
         // BORROW when the AST is a named local (e.g. `s += t` where `t` is
         // a tracked string local). Check the AST shape, not the LLVM
         // pointer type: only release when the rhs is itself a +1 producer.
-        if (rhs && rhs->getType()->isPointerTy() && as.value.get() &&
-            isPlusOneStringProducer(as.value.get()))
+        // fix #2848: null `valueExpr` is the `++`/`--` spelling, whose right
+        // operand is §17.6's implicit literal `1` — never a producer.
+        if (rhs && rhs->getType()->isPointerTy() && valueExpr &&
+            isPlusOneStringProducer(valueExpr))
             emitStringRelease(rhs);      // release the rhs's +1 (producer)
     }
     // fix #2717: the INDEX-argument twin of the two value-side releases above.

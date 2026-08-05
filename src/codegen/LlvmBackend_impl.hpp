@@ -3774,6 +3774,34 @@ private:
     // target); false to let the caller fall through to other paths.
     bool lowerIndexerCompound(const ast::AssignmentStmt& as);
 
+    // fix #2848 (§17.6 / §6.6 / §12.1 / §23.4, v0.240): `a[i]++` / `a[i]--`
+    // through a user-defined indexer. §17.6, verbatim: "For an indexer slot
+    // `expr[i]` (or `expr[i, j, ...]` for a multi-dim indexer), `expr[i]++`
+    // desugars to a read-modify-write through the indexer", and it "is the
+    // indexer instance of the general compound-assignment rule of §6.6".
+    //
+    // So it is not merely *similar* to `a[i] += 1` — the spec DEFINES it as
+    // that rule's instance. Before this fix `lowerStmt`'s IncrementStmt arm
+    // carried a ~480-line HAND-INLINED MIRROR of lowerIndexerCompound that had
+    // drifted three fixes behind it (#2833's receiver recovery, #2832's `base`
+    // decline, #2836's vtable/itable dispatch), so `this[i]++` was DROPPED
+    // ENTIRELY and `b[i]++` through a base-typed reference ran the base
+    // accessors. This routes both spellings through ONE definition instead.
+    bool lowerIndexerIncrDecr(const ast::IncrementStmt& inc);
+
+    // The shared body of the two entry points above. `binOp` is the already-
+    // stripped binary operator ("+" for `+=` and for `++`, "-" for `-=` and for
+    // `--`, and so on). `valueExpr` is the compound assignment's right-hand
+    // side, or NULL for the `++`/`--` spelling — whose right operand is §17.6's
+    // implicit literal `1`, synthesized at the getter's result type rather than
+    // lowered from an AST node. Single evaluation (§6.6: "every constituent of
+    // the left-hand side's lvalue chain … is evaluated exactly once … and every
+    // index expression in the chain") is a property of this one body, so both
+    // spellings inherit it.
+    bool lowerIndexerCompoundCore(const ast::Expr& targetExpr,
+                                  const std::string& binOp,
+                                  const ast::Expr* valueExpr);
+
     // fix #2717 / §23.4 / §23.5 / §28.1 / §28.9 (v0.240): the INDEXER twin of
     // #429's ARGUMENT-PASS release (LlvmBackend_Calls2.cpp ~7834). A `+1` string
     // PRODUCER used directly as an INDEX ARGUMENT (`t[$"v-{i}"] := i`) holds an
