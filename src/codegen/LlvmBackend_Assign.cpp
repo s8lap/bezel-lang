@@ -1360,6 +1360,57 @@ const sema::TypeSymbol* Emitter::indexReceiverDecl(const ast::Expr* target) {
             }
         }
     }
+    // #2795 follow-up (§23.4, v0.240): ANNOUNCE THE DROP. Reaching here with a
+    // `this`/`base`-rooted index means the receiver TypeSymbol could not be
+    // recovered — and EVERY caller bails immediately on a null return, silently:
+    //   * lowerIndexerGet returns null, so the READ degrades to a zero/null
+    //     value through lowerLocalDecl's #2434 / emitReturn's #2491 fallbacks.
+    //     The two fallbacks after it in lowerExpr cannot rescue a `this`
+    //     receiver either — it has no builtin-collection exprType for
+    //     lowerCollectionIndexerGet, and lvalueAddr yields the class struct
+    //     type, not an llvm::ArrayType.
+    //   * lowerIndexerSet returns false, so the WRITE is silently discarded.
+    //   * lowerIndexerCompound returns false — documented at its own head as
+    //     "silently a no-op (returns old value, no store)".
+    //
+    // WHY THIS EXISTS. #2795 gave `this[i]` a receiver type in sema, which is
+    // correct, but it also removed the *incidental* #2491 note that used to
+    // accompany the lambda case: that note fired on the CALLER's `return f(i);`
+    // only because an untyped `this[n]` left the lambda's return type unknown.
+    // With the type available the caller lowers cleanly and the wrong value
+    // became FULLY SILENT — a net loss against this tree's standing rule that a
+    // clean diagnostic beats a silent wrong value. This restores the
+    // announcement. It does NOT fix the underlying defect; see #2833.
+    //
+    // GATED ON THE PROPERTY, NOT A SOURCE CATEGORY (the #2787 lesson). Measured
+    // on this tree, not inferred: recovery FAILS and the value is wrong in a
+    // LAMBDA body (`currentFn_` is the closure's llvm::Function, which is not a
+    // value in `methodFns_`) — for an expression-bodied, `do`-bodied, directly
+    // passed, and nested lambda alike, for the read (0) and for the write
+    // (silently no stored value) — AND in an `async` body. It SUCCEEDS, so no
+    // warning fires, in a plain method body, in a generic SPECIALIZATION
+    // (`currentSpecMethodSymbol_`) and in an extension body. Testing
+    // `inLambda_`-style source context in sema instead would have missed the
+    // async body outright; testing "the recovery failed" cannot, and it stops
+    // firing by construction once #2833 makes the recovery succeed.
+    //
+    // Warning, suppressed once the compile already has errors — the #2491 /
+    // #2775 precedent, so a cascade never buries the real diagnostic. That guard
+    // also covers the shapes that reach here with no `currentFn_` at all: a
+    // field initializer (already the §22.8 error) and a static member (already
+    // the §12.3 error) stay single-diagnostic.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(target)) {
+        if ((id->name == "this" || id->name == "base") &&
+            !ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Warning, id->span.begin,
+                "internal: this `" + std::string(id->name) +
+                "[i]` indexer access was DROPPED — the receiver could not be "
+                "recovered for this body kind (a lambda body or an `async` "
+                "body); the read degrades to a zero/null value and a write is "
+                "silently discarded (§23.4) — #2833");
+        }
+    }
     return nullptr;
 }
 

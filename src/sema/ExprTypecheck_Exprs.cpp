@@ -1620,13 +1620,20 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // value; the receiver-resolution and the non-virtual-dispatch
             // halves must land together.
             //
-            // `this[i]` inside a LAMBDA body is typed by this fix but still
-            // lowers to 0 (#2833): codegen's receiver recovery is a reverse
-            // lookup of `currentFn_` in `methodFns_`, which a closure's
-            // llvm::Function is not in. That value was already wrong before
-            // this fix — measured identical — so nothing here regresses it,
-            // but the incidental #2491 note that used to accompany it is gone,
-            // which is why #2833 records it.
+            // `this[i]` inside a LAMBDA body (and inside an `async` body) is
+            // typed by this fix but still lowers to 0 (#2833): codegen's
+            // receiver recovery is a reverse lookup of `currentFn_` in
+            // `methodFns_`, which a closure's llvm::Function is not in. That
+            // value was already wrong before this fix — measured identical —
+            // so nothing here regresses it. Typing it DID remove the
+            // incidental #2491 note that used to accompany the lambda case
+            // (that note fired on the CALLER's `return f(i);`, only because an
+            // untyped `this[n]` left the lambda's return type unknown), so the
+            // wrong value would have become fully silent; `indexReceiverDecl`
+            // (LlvmBackend_Assign.cpp) now announces the drop at the point it
+            // happens, gated on the recovery having failed rather than on a
+            // body kind. See tests/lit/this_indexer_dropped_in_lambda_warns_
+            // 2833.bzl.
             //
             // A STATIC member is excluded so the existing "`this` is not
             // available in a static method or static constructor (§12.3)"

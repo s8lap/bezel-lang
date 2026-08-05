@@ -51,9 +51,13 @@
 //     confirmed silent wrong value: 202 where 102 is expected, while `base.P`
 //     and `base.M()` correctly bypass). Typing it here would only widen the set
 //     of spellings that reach that miscompile.
-//   * `this[i]` inside a LAMBDA body (#2833) — codegen cannot lower it (the
-//     `methodFns_` reverse lookup fails for a closure's llvm::Function), so it
-//     yields 0 both before and after this fix (measured identical).
+//   * `this[i]` inside a LAMBDA body, and inside an `async` body (#2833) —
+//     codegen cannot lower it (the `methodFns_` reverse lookup fails for a
+//     closure's llvm::Function), so it yields 0 both before and after this fix
+//     (measured identical). Typing it removed the incidental #2491 note that
+//     used to accompany the lambda case, so `indexReceiverDecl` now announces
+//     the drop where it happens — pinned by
+//     tests/lit/this_indexer_dropped_in_lambda_warns_2833.bzl.
 //   * indexer overload selection ignoring nullability (#2834) — why the
 //     nullable-declared-parameter accept control below uses a class whose ONLY
 //     indexer is `[n: int?]`: with an `[i: int]` sibling present the resolver
