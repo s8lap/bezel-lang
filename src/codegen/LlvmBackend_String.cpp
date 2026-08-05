@@ -2849,8 +2849,28 @@ llvm::Value* Emitter::lowerObjectToString(llvm::Value* recv) {
     builder_.CreateCondBr(isStrBit, strBB, vtBB);
 
     // string: ToString is identity (§9.6).
+    //
+    // fix #2846 / §28.9 (v0.240): RETAIN it. This function's contract — relied
+    // on by every one of its callers — is that the value it hands back is a
+    // fresh `+1` the consumer discharges once: `emitPrimitiveToString`'s own
+    // declaration calls it "allocates a fresh heap string with rc := 1" and
+    // routes `P::Object` straight here; `StringBuilder.Append(o: Object)` sets
+    // `rendered = true` and TRANSFERS (no retain) precisely because of it; the
+    // interpolation render path does the same. The other two arms honour that
+    // (the vtable thunks mint, a literal is an immortal sentinel on which
+    // retain/release are no-ops) — this arm did not, and returning the
+    // receiver's own un-retained pointer to a consumer that releases it is a
+    // heap-use-after-free, not a leak. MEASURED on b0fa41a: `var o: Object := s;
+    // var r := $"[{o}]";` in a 20-iteration loop aborts with
+    // "AddressSanitizer: heap-use-after-free … freed by bz_string_release" on
+    // the SECOND iteration's read of `s`. Filed separately as the UAF it is; the
+    // retain lives here because #2846's fix (recognizing `Object.ToString()` as
+    // a +1 producer, LlvmBackend_Setup.cpp) is unsound without it — it would
+    // turn that shape's balanced retain/release into a bare release.
+    // `bz_string_retain` is null-safe and a no-op on the literal sentinel.
     builder_.SetInsertPoint(strBB);
     llvm::Value* strResult = recv;
+    emitStringRetain(strResult);
     builder_.CreateBr(endBB);
 
     // class/box: dispatch vtable[kToStringSlot](recv).

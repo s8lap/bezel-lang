@@ -13330,10 +13330,109 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                             case P::Float: case P::Double: case P::Decimal:
                             case P::Char:
                                 return true;  // emitPrimitiveToString → rc=1 heap string
+                            case P::Object:
+                                // fix #2846 (§8.5 "ToString" / §8.6 "Boxing" /
+                                // §28.9, v0.240): `o.ToString()` on an
+                                // OBJECT-typed receiver. Previously excluded
+                                // here as "may or may not allocate", which left
+                                // its result treated as a BORROW: the consumer
+                                // retained on top of the value's own reference
+                                // and the producer's +1 was never dropped —
+                                // ONE leaked string PER CALL, unboundedly in a
+                                // loop (LSan on the issue's repro: 913 bytes /
+                                // 38 allocations for 20 iterations, from
+                                // `bz$boxtostr$Pt`; the same for
+                                // `bz$primtostr$int` and, contrary to the
+                                // issue's "the class path is correct", for a
+                                // class whose `override ToString()` MINTS —
+                                // `bz$App.KMint$ToString`, 711 bytes / 40
+                                // allocations. The class default does not leak
+                                // only because §8.5 makes it "the type's
+                                // qualified name", an immortal literal).
+                                //
+                                // The exclusion is no longer needed because the
+                                // path IS now uniformly +1-or-sentinel.
+                                // `lowerObjectToString` (LlvmBackend_String.cpp)
+                                // is the sole lowering for this shape and has
+                                // exactly three arms: a `null` receiver renders
+                                // the literal "null" (an immortal sentinel —
+                                // release is a no-op); a `string` receiver
+                                // returns itself, now RETAINED (the companion
+                                // half of this fix, which also closes a live
+                                // heap-use-after-free on the consumers that
+                                // already transferred); and a class/box
+                                // receiver dispatches vtable[kToStringSlot],
+                                // whose every filler hands back +1 or a
+                                // sentinel — `classToStringThunk` calls the
+                                // user override, whose §22.9 ReturnStmt
+                                // lowering mints +1 for a `string` return
+                                // (LlvmBackend_Stmts.cpp) and otherwise returns
+                                // the class-name literal;
+                                // `boxToStringThunk`/`primBoxToStringThunk`/
+                                // `valueBuiltinBoxToStringThunk` likewise mint
+                                // (`emitRecordToString`, `emitPrimitiveToString`)
+                                // or return a literal.
+                                //
+                                // §28.9 leaves the mechanism open — "The
+                                // implementation of runtime-managed types'
+                                // lifecycle (reference counting, region
+                                // allocation, or other) is not part of this
+                                // specification" — but the value must be
+                                // reclaimed, and §8.6 makes both the box and
+                                // the string it produces runtime-managed.
+                                //
+                                // The receiver-shape gate is the one
+                                // `lowerObjectToString`'s call site uses (see
+                                // the Named-receiver block just below for the
+                                // other three spellings of the same shape), and
+                                // the `!ms` condition mirrors it verbatim:
+                                // LlvmBackend_Calls2.cpp only takes the
+                                // `lowerObjectToString` branch under
+                                // `if (!ms)`. With a resolved MethodSymbol the
+                                // call is an ordinary method call and
+                                // `isUserMethodStringReturnCall` (below) is the
+                                // arm that decides.
+                                if (!dynamic_cast<sema::MethodSymbol*>(
+                                        ctx_.exprSymbol(*call->callee)))
+                                    return true;
+                                break;
                             default:
-                                break;  // Bool → sentinel; String → identity; Object → excluded
+                                break;  // Bool → sentinel; String → identity
                         }
                     }
+                    // fix #2846 (§8.5 / §8.6 / §28.9, v0.240) — the NAMED
+                    // spellings of the same `lowerObjectToString` shape the
+                    // `P::Object` case above covers. `Object` is not always the
+                    // `P::Object` primitive: in a module that IMPORTS another,
+                    // `var o: Object := …` resolves to a Named TypeRef carrying
+                    // the loaded `Object` TypeSymbol, which is why the
+                    // primitive-only gate left the CROSS-MODULE boxed-record
+                    // shape leaking (MEASURED: `bezelc -c lib.bzl` then
+                    // `--import lib.o app.bzl`, 962 bytes / 40 allocations from
+                    // `bz$boxtostr$Pt` over 20 iterations, while the identical
+                    // single-module program was clean). The remaining two
+                    // spellings — an INTERFACE-typed receiver, and a
+                    // class-typed receiver whose `ToString` resolves to no
+                    // MethodSymbol (i.e. the class has no override, so §8.5's
+                    // "the type's qualified name" literal is the answer) —
+                    // reach the same lowering through the same `if (!ms)` gate
+                    // and are included for the same reason.
+                    //
+                    // This mirrors LlvmBackend_Calls2.cpp's own gate
+                    // (`isIfaceRecv || isNamedClassRecv`) rather than
+                    // re-deriving it. A BUILTIN-EXCEPTION receiver
+                    // (`isBuiltinExRecv` there) is deliberately NOT included:
+                    // its vtable slot 3 is filled by machinery this lane did
+                    // not audit for the +1 contract, and an unaudited widening
+                    // here is the over-release direction. It keeps the
+                    // pre-existing leak — the safe direction — and is filed.
+                    if (tt && tt->kind == sema::TypeRef::Kind::Named &&
+                        tt->declaration &&
+                        (tt->declaration->kind == ast::TypeDeclKind::Interface ||
+                         tt->declaration->kind == ast::TypeDeclKind::Class) &&
+                        !dynamic_cast<sema::MethodSymbol*>(
+                            ctx_.exprSymbol(*call->callee)))
+                        return true;
                 }
             }
         }
