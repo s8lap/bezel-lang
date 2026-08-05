@@ -10246,108 +10246,43 @@ private:
     // ptr/value lowering through the switch below). Exception types are
     // recognized via builtinVtable_, so this is a member (not static).
     //
-    // SCOPE (fix #2743 — the old wording, "Mirrors the name sets the lowerTypeRef
-    // Named-case branches enumerate", was aspirational and had gone false). A
-    // mechanical grep of every name compared in that Named case
-    // (LlvmBackend_Layout.cpp) against this predicate's three sources yields 26
-    // names it did not cover. 24 are now covered — the registry via
-    // isHeapPointerReferenceBuiltin, plus kNamedCaseDeltas below. The remaining
-    // TWO, `DictionaryEntry` and `DrainedEntry`, are deliberately NOT listed and
-    // must not be added: their Named-case arm requires `genericArgs.size() >= 2`,
-    // and the only caller that can misread them — isBareTypeParamRef — already
-    // bails on `!genericArgs.empty()`, so they are STRUCTURALLY excluded.
-    // Listing them would instead change the generic-argument INFERENCE site that
-    // also consults this predicate (LlvmBackend_Calls2.cpp), with no test
-    // covering the difference.
+    // SCOPE (fix #2757; the wording before #2743 — "Mirrors the name sets the
+    // lowerTypeRef Named-case branches enumerate" — was aspirational and had
+    // gone false, which is the whole defect). This predicate now holds NO name
+    // list of its own: the reserved-name set lives once, in the data-only
+    // registry — `common::isReservedBuiltinTypeName` in
+    // src/common/BuiltinRegistry.cpp, where the heap-pointer table and the
+    // non-heap Named-case table are both snapshot-pinned. #2757 was the THIRD
+    // drift of a
+    // hand-maintained duplicate of that set (after #1390 and #1406, the two
+    // defects whose fix created the registry): the copy here carried 59 names
+    // where the registry carried 65, so `isBuiltinTypeRefName("Stopwatch")`
+    // answered false and a plain `Stopwatch?` took the {i8,i32} placeholder,
+    // passing a `bz_stopwatch_t*` as `i32` to bz_stopwatch_is_running
+    // (IR-verify failure on a legal program). #2743 patched that by consulting
+    // the registry IN ADDITION TO the local list; deleting the list is what
+    // stops it drifting again — in either direction, since a name dropped from
+    // the registry no longer stays alive here. (The per-name provenance the
+    // deleted list carried — #620 Shared/Weak, #600 Channel/ChannelSender,
+    // #651 IGrouping, #647 Mutex/Lock/Semaphore/SemaphoreToken/Atomic/
+    // AtomicInteger, #974 TaskCompletionSource, #545 Buffer — is preserved in
+    // this file's git history; every one of those names is in the registry's
+    // heap table, so the entries themselves are not lost.)
     //
     // ⚠ THIS PREDICATE HAS THREE CONSUMERS, not one: lowerTypeRef's #568
     // nullable-type-param branch, isBareTypeParamRef, and the generic-argument
     // inference binding in LlvmBackend_Calls2.cpp (`if (cn.empty() ||
-    // !isBuiltinTypeRefName(cn)) return;`). Widening it therefore widens what
-    // INFERENCE binds, not only what lowering intercepts. That is per that
-    // site's own stated intent ("only a genuine unresolved type-parameter name
-    // is skipped"), but it is a real behavior change — weigh all three when
-    // editing this list.
+    // !isBuiltinTypeRefName(cn)) return;`). Widening the registry set therefore
+    // widens what INFERENCE binds, not only what lowering intercepts — weigh
+    // all three when editing the registry tables.
     bool isBuiltinTypeRefName(std::string_view name) const {
-        static const std::unordered_set<std::string_view> kBuiltins = {
-            "IntPtr", "UIntPtr", "CString", "WString", "RawBytes",
-            "DateTime", "TimeSpan", "Range", "Guid",
-            "ArraySpan", "ReadOnlyArraySpan",
-            "Array", "OwningArray", "Dictionary", "OwningDictionary",
-            "Stack", "OwningStack", "Queue", "OwningQueue",
-            "Set", "OwningSet", "LinkedList", "OwningLinkedList",
-            "LinkedListNode", "StringBuilder", "Random",
-            "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
-            "IAsyncEnumerable", "IAsyncEnumerator",
-            "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
-            "IReadOnlyCollection", "IReadOnlyList", "ICollection", "IList",
-            "IOwningCollection", "IOwningList", "Task", "OwningTask",
-            "Subscription", "CancellationToken", "CancellationTokenSource",
-            // §28.13 / stdlib §2.16 (#620): Shared<T> and Weak<T> are
-            // compiler-known heap-pointer types.  Without them a bare
-            // `Shared<T>?` annotation (no declaration) was mis-classified as
-            // a naked generic type-parameter, and the nullable-type-param branch
-            // lowered it to {i8,i32} instead of ptr → LLVM GEP type assertion
-            // crash on `Shared<T>? := null` / null-compare / `?.` / `!`.
-            "Shared", "Weak",
-            // §30.14/§30.15 (#600 phase c): Channel<T> and ChannelSender<T>
-            // are compiler-known pointer-typed builtins backed by bz_channel_t
-            // and bz_channel_sender_t respectively.
-            "Channel", "ChannelSender",
-            // stdlib §5 (#651): IGrouping<TKey, T> is a compiler-known pointer
-            // (bz_grouping_t*) produced by GroupBy.
-            "IGrouping",
-            // §6.2 / #647: Mutex and Lock are compiler-known heap-pointer builtins
-            // (bz_mutex_t* and bz_lock_t* respectively). Without these entries a
-            // nullable `Lock?` was mis-classified as a bare generic type-parameter
-            // and the nullable-type-param branch (fix #568) lowered it to {i8,i32}
-            // instead of ptr → emitStructEquality crash on `guard <> null`.
-            "Mutex", "Lock",
-            // §6.3 / #647: Semaphore and SemaphoreToken are compiler-known
-            // heap-pointer builtins (bz_semaphore_t* and bz_semaphore_token_t*
-            // respectively). Same fix as Mutex/Lock above: without these entries a
-            // nullable `SemaphoreToken?` was mis-classified as a bare generic
-            // type-parameter and the nullable-type-param branch lowered it to
-            // {i8,i32} instead of ptr → emitStructEquality crash on `tok <> null`.
-            "Semaphore", "SemaphoreToken",
-            // §6.6 / issue #974: TaskCompletionSource<T>/OwningTaskCompletionSource<T>/
-            // TaskCompletionSource — compiler-known heap-pointer builtins (bz_tcs_t*).
-            "TaskCompletionSource", "OwningTaskCompletionSource",
-            // §6.4 / #647: Atomic<T> and AtomicInteger<T> are compiler-known
-            // heap-pointer builtins (bz_atomic_t*).  Without these entries a
-            // nullable `Atomic<T>?` was mis-classified as a bare generic
-            // type-parameter and the nullable-type-param branch lowered it to
-            // {i8,i32} instead of ptr.
-            "Atomic", "AtomicInteger",
-            // issue #545: Buffer<T> is a compiler-known heap-pointer builtin
-            // (bz_buffer_hdr_t* + inline payload).  Without this entry a
-            // nullable `Buffer<T>?` would be mis-classified as a bare generic
-            // type-parameter and lowered to {i8,i32} instead of ptr.
-            "Buffer",
-        };
-        if (kBuiltins.count(name)) return true;
-        // fix #2743: the list ABOVE had drifted from the sets lowerTypeRef's
-        // Named case actually enumerates — it was missing all 17 registry names
-        // this predicate's own contract claims to mirror (Stopwatch, FileStream,
-        // TaskScope, SortedDictionary/SortedSet, the IEvent/EventSource family,
-        // and the 8 serializer names) plus the Named case's explicit deltas.
-        // Consult the registry directly rather than re-listing it: a duplicated
-        // list is the miss-a-list class #1414 stage 3 centralized this set to
-        // end. A missing name is not benign — the caller below treats "not a
-        // builtin" as "a bare type parameter", so `Stopwatch?` took the {i8,i32}
-        // placeholder and its `bz_stopwatch_t*` payload was passed as `i32` to
-        // bz_stopwatch_is_running (IR-verify failure — measured, not inferred).
-        if (common::isHeapPointerReferenceBuiltin(name)) return true;
-        // The Named case's explicit non-registry deltas, in its own order:
-        // OwningBuffer (astNode-path-only ptr, LlvmBackend_Layout.cpp), the
-        // {ptr,i32,i32} span shapes, the JsonOptions value record, the
-        // DateOnly/TimeOnly i32 value builtins, and §31.4's ExceptionInfo triple.
-        static const std::unordered_set<std::string_view> kNamedCaseDeltas = {
-            "OwningBuffer", "Span", "ReadOnlySpan", "ReadOnlyStringSpan",
-            "JsonOptions", "DateOnly", "TimeOnly", "ExceptionInfo",
-        };
-        if (kNamedCaseDeltas.count(name)) return true;
-        // §31.4: a built-in exception type (Exception / a subtype).
+        // #2757 / §7.1 / §14.1: the one reserved-name set (see the registry
+        // header for why the test must be negative and why completeness is
+        // load-bearing).
+        if (common::isReservedBuiltinTypeName(name)) return true;
+        // §31.4: a built-in exception type (Exception / a subtype). Kept local
+        // because `builtinVtable_` is a live per-module map, not a duplicated
+        // name list — it cannot drift from a table it does not copy.
         return builtinVtable_.find(std::string(name)) != builtinVtable_.end();
     }
 
@@ -10605,12 +10540,17 @@ private:
     //
     // ⚠ This is a NEGATIVE name test, so its correctness depends on
     // `isBuiltinTypeRefName` naming EVERY type the Named case lowers specially.
-    // A builtin missing from that list is classified here as a type parameter,
+    // A builtin missing from that set is classified here as a type parameter,
     // and a concrete `Stopwatch` bound to `T` then takes the {i8,i32}
-    // placeholder where it must be a `ptr`. That list had drifted by 17 registry
-    // names plus the Named-case deltas when this predicate was added (#2743);
-    // it now consults common::isHeapPointerReferenceBuiltin directly. Any new
-    // Named-case branch must extend `isBuiltinTypeRefName` in the same commit.
+    // placeholder where it must be a `ptr`. The test is necessarily negative —
+    // a type PARAMETER is defined by the absence of a declaration, so there is
+    // no positive registry of parameter names to test against; the hardening is
+    // therefore to keep the builtin set un-duplicable, not to invert the test.
+    // It had drifted by 17 registry names plus the Named-case deltas when this
+    // predicate was added (#2743); #2757 deleted the duplicate outright, so
+    // `isBuiltinTypeRefName` now derives entirely from
+    // common::isReservedBuiltinTypeName. Any new Named-case branch must extend
+    // the registry table (and its snapshot row) in the same commit.
     bool isBareTypeParamRef(const sema::TypeRef* t) const {
         if (!t || t->kind != sema::TypeRef::Kind::Named || t->declaration)
             return false;

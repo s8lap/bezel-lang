@@ -206,6 +206,81 @@ BEZEL_TEST(builtin_registry_snapshot, heap_pointer_reference_builtin_set) {
         BEZEL_EXPECT_FALSE(isHeapPointerReferenceBuiltin(n));
 }
 
+// --- isReservedBuiltinTypeName (#2757 / §7.1 / §14.1): the COMPLETE reserved
+// builtin type-name set — the heap table above plus the non-heap Named-case
+// names. `Emitter::isBuiltinTypeRefName` used to keep a hand-maintained
+// duplicate of this set and it DRIFTED (59 names against the registry's 65), so
+// a plain `Stopwatch?` was read as a nullable generic type PARAMETER and took
+// the {i8, i32} placeholder — a `bz_stopwatch_t*` passed as `i32`. That is the
+// third instance of the miss-a-list class (#1390, #1406) the registry exists to
+// end, so the duplicate is gone and the predicate derives from here.
+//
+// The test is necessarily NEGATIVE at its call sites ("not a builtin name,
+// therefore a type parameter" — a parameter is defined by the absence of a
+// declaration, so there is no positive parameter registry to test against),
+// which makes COMPLETENESS load-bearing rather than merely tidy: a name missing
+// here is silently misread as a type parameter at all three consumers. Pinned
+// in both directions — every name in, every near-neighbour out.
+BEZEL_TEST(builtin_registry_snapshot, reserved_builtin_type_name_set) {
+    // (a) the non-heap half: the names lowerTypeRef's Named case compares that
+    // are NOT heap-pointer references. Exactly `kNonHeapReservedBuiltins`.
+    static constexpr std::array<std::string_view, 19> kNonHeapSnapshot = {
+        // §32.5 / §32.7 — FFI boundary
+        "IntPtr", "UIntPtr", "CString", "WString", "RawBytes",
+        // §2.5 — temporal / identity value builtins
+        "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid",
+        // §9.8 (#499)
+        "Range",
+        // §4.14 / §4.15 (#549/#779) / §3.3 (#883) — the {ptr,i32,i32} spans
+        "ArraySpan", "ReadOnlyArraySpan", "Span", "ReadOnlySpan",
+        "ReadOnlyStringSpan",
+        // §2.15 (#687)
+        "JsonOptions",
+        // §4.14 — heap ptr, but only on the astNode rep path
+        "OwningBuffer",
+        // §31.4 — the Exception.CauseChain element record
+        "ExceptionInfo",
+    };
+    for (auto n : kNonHeapSnapshot) {
+        BEZEL_EXPECT_TRUE(isReservedBuiltinTypeName(n));
+        // ...and each is genuinely OUTSIDE the heap table (no redundancy: if one
+        // of these were also in the heap set, the split would be meaningless).
+        BEZEL_EXPECT_FALSE(isHeapPointerReferenceBuiltin(n));
+    }
+    // (b) the heap half is reserved too — spot-check the names whose absence
+    // from the deleted duplicate WAS the defect, plus the long-standing ones.
+    for (std::string_view n : {"Stopwatch", "FileStream", "TaskScope",
+                               "SortedDictionary", "SortedSet",
+                               "IEvent", "IAsyncEvent", "EventSource",
+                               "AsyncEventSource", "ISerializer",
+                               "IDeserializer", "ISerializable",
+                               "IDeserializable", "BinarySerializer",
+                               "BinaryDeserializer", "JsonSerializer",
+                               "JsonDeserializer",
+                               "Array", "Dictionary", "Task", "Shared",
+                               "Mutex", "Buffer", "IGrouping"})
+        BEZEL_EXPECT_TRUE(isReservedBuiltinTypeName(n));
+    // (c) OUT: ordinary generic type-parameter spellings must stay classifiable
+    // as parameters — this is the whole point of the negative test.
+    for (std::string_view n : {"T", "U", "K", "V", "TKey", "TResult",
+                               "Self", "MyClass", "Stopwatch2", "stopwatch",
+                               ""})
+        BEZEL_EXPECT_FALSE(isReservedBuiltinTypeName(n));
+    // (d) OUT by deliberate exclusion: `DictionaryEntry` / `DrainedEntry` are
+    // compared in the Named case, but only on a SYNTHETIC TypeRef (no astNode,
+    // importedName-keyed, genericArgs.size() >= 2), and neither resolves as a
+    // written type annotation at all ("unresolved type name" — measured). No
+    // declaration-less single-part Named ref can carry them, so listing them
+    // would change only the generic-argument inference binding, to no end.
+    for (std::string_view n : {"DictionaryEntry", "DrainedEntry"})
+        BEZEL_EXPECT_FALSE(isReservedBuiltinTypeName(n));
+    // (e) OUT: built-in EXCEPTION names are not in the registry's reserved set —
+    // codegen tests those separately against its live `builtinVtable_` map,
+    // which is not a duplicated name list and so cannot drift from a table.
+    for (std::string_view n : {"Exception", "ArgumentException", "IOException"})
+        BEZEL_EXPECT_FALSE(isReservedBuiltinTypeName(n));
+}
+
 // --- §22.16 (v0.203, #2053): ContractViolationException registration ---
 // Per spec §22.16 "Failure semantics and the enforcement modes",
 // ContractViolationException joins the built-in hierarchy DERIVING DIRECTLY

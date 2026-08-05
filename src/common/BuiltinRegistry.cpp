@@ -156,6 +156,40 @@ constexpr std::array<std::string_view, 65> kHeapPointerReferenceBuiltins = {
     "JsonDeserializer",
 };
 
+// #2757: the RESERVED builtin type names that lowerTypeRef's Named case
+// recognizes but that are NOT heap-pointer references — the complement that,
+// together with kHeapPointerReferenceBuiltins above, makes up the complete
+// reserved-name set (`isReservedBuiltinTypeName`, see the header for why the
+// set exists and who consults it). Derived by grepping every name compared in
+// that Named case (src/codegen/LlvmBackend_Layout.cpp) and subtracting the
+// heap table; each entry names the branch it comes from.
+//
+// `DictionaryEntry` and `DrainedEntry` are compared there too and are
+// deliberately ABSENT: their arm is reached only by a synthetic TypeRef
+// (no astNode, importedName-keyed, genericArgs.size() >= 2), and neither name
+// resolves as a written type annotation at all (`bezelc` reports "unresolved
+// type name" — measured, not inferred), so no declaration-less single-part
+// Named ref can ever carry them. Adding them would only change the
+// generic-argument inference binding, with nothing to gain.
+constexpr std::array<std::string_view, 19> kNonHeapReservedBuiltins = {
+    // §32.5 / §32.7 / stdlib §10: FFI-boundary types (i64 / opaque ptr).
+    "IntPtr", "UIntPtr", "CString", "WString", "RawBytes",
+    // §2.5: the temporal/identity value builtins (i64 / i32 / {i64,i64}).
+    "DateTime", "TimeSpan", "DateOnly", "TimeOnly", "Guid",
+    // §9.8 (#499): Range<T> — the intrinsic value-type record.
+    "Range",
+    // §4.14 / §4.15 (#549/#779) / §3.3 (#883): the {ptr,i32,i32} span shapes.
+    "ArraySpan", "ReadOnlyArraySpan", "Span", "ReadOnlySpan",
+    "ReadOnlyStringSpan",
+    // §2.15 (#687): JsonOptions — a compiler-known value record.
+    "JsonOptions",
+    // §4.14: OwningBuffer<T> — a heap ptr, but only on the astNode rep path,
+    // so it is not a member of the shared heap table above.
+    "OwningBuffer",
+    // §31.4: ExceptionInfo — the {ptr,ptr,ptr} Exception.CauseChain element.
+    "ExceptionInfo",
+};
+
 // §31.4 / #1621: the built-in exception hierarchy (child name -> parent
 // name); the root `Exception` maps to "" (no parent). MIRRORS
 // `Emitter::builtinExceptionHierarchy()` in src/codegen/LlvmBackend_Setup.cpp
@@ -253,6 +287,13 @@ bool isLinkedListName(std::string_view n) {
 bool isHeapPointerReferenceBuiltin(std::string_view n) {
     return contains(kHeapPointerReferenceBuiltins, n);
 }  // per §4 / §6 / §29 / §30 / §2.14–§2.15 — heap-pointer reference builtins shared by the two codegen rep paths
+
+// #2757 / §7.1 / §14.1: the COMPLETE reserved builtin type-name set — the heap
+// table plus the non-heap Named-case names. See the header for the contract.
+bool isReservedBuiltinTypeName(std::string_view n) {
+    return contains(kHeapPointerReferenceBuiltins, n) ||
+           contains(kNonHeapReservedBuiltins, n);
+}
 
 std::string_view builtinExceptionParentOf(std::string_view name) {
     for (const auto& edge : kBuiltinExceptionHierarchy)

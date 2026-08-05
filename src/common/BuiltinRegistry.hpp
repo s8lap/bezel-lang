@@ -95,6 +95,35 @@ bool isLinkedListName(std::string_view n);
 // per §4 / §6 / §29 / §30 / §2.14–2.15
 bool isHeapPointerReferenceBuiltin(std::string_view n);
 
+// #2757 / §7.1 / §14.1: is `n` a RESERVED built-in type name — i.e. one of the
+// names `Emitter::lowerTypeRef`'s Named case lowers specially — as opposed to a
+// user-chosen generic type PARAMETER name?
+//
+// A declaration-less, single-part Named TypeRef is one of exactly two things: a
+// reserved builtin, or a type parameter. There is no positive registry of type-
+// PARAMETER names to test against (a parameter is defined by the ABSENCE of a
+// declaration), so every consumer necessarily asks the question negatively —
+// "not a builtin name, therefore a type parameter". That makes this set's
+// COMPLETENESS load-bearing: a missing name is silently read as a type
+// parameter. Three codegen sites depend on it, all with that shape:
+//   * lowerTypeRef's #568 nullable-type-parameter branch — a missed name takes
+//     the {i8, i32} placeholder instead of its own lowering, truncating a heap
+//     pointer into a 32-bit payload (#1390, #1406, #2757: `Stopwatch?`);
+//   * `Emitter::isBareTypeParamRef` (#2743);
+//   * the generic-argument INFERENCE binding in LlvmBackend_Calls2.cpp (#1162)
+//     — a missed name is skipped rather than bound, so the call lowers the
+//     parameter to the i32 fallback while the monomorphized body uses `ptr`.
+//
+// This is therefore the one home for the set, not a mirror of one: #2757 was
+// the third instance (after #1390 and #1406) of a hand-maintained duplicate
+// drifting from it, so `isBuiltinTypeRefName` now consults this and holds no
+// name list of its own. Built-in EXCEPTION names are NOT here — codegen tests
+// those against its live `builtinVtable_` map, which is not a duplicated list.
+// Adding a `lowerTypeRef` Named-case branch means adding its name here, in the
+// same commit, plus the snapshot row in
+// tests/support/builtin_registry_snapshot_test.cpp.
+bool isReservedBuiltinTypeName(std::string_view n);
+
 // §31.4 / #1621: given a built-in exception type's simple name, return the
 // name of its DIRECT parent in the built-in exception hierarchy (e.g.
 // "FileNotFoundException" -> "IOException"), or an empty string_view if
