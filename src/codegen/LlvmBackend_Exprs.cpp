@@ -4828,6 +4828,10 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // — a silent no-op for event handlers (#880) and a SIGSEGV at the
         // call site (#881). Route through makeMethodThunk with currentThis_.
         if (auto* ms = dynamic_cast<sema::MethodSymbol*>(ctx_.exprSymbol(e))) {
+            // A bare (implicit-`this`) reference has no receiver EXPRESSION, so
+            // there is no static interface type to instantiate from; the #2766
+            // substitution simply does not apply and the erased signature is
+            // used, exactly as before.
             if (isStaticMethod(ms)) return makeMethodThunk(ms, nullptr);
             else if (currentThis_) return makeMethodThunk(ms, currentThis_);
         }
@@ -4848,7 +4852,15 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // uniformly for every non-static method ref.
             if (!isStaticMethod(ms) && ma->target)
                 recv = lowerExpr(*ma->target);
-            return makeMethodThunk(ms, recv);
+            // fix #2766: hand the RECEIVER's static type to makeMethodThunk. For
+            // `eq.Equals` with `eq: IEquatable<string>` that is the only place
+            // the type ARGUMENT (`string`) is recorded — sema leaves the
+            // reference's own function-type parameters null — and the thunk's
+            // ABI has to match it, not the interface's erased `T`.
+            const sema::TypeRef* recvTy =
+                (!isStaticMethod(ms) && ma->target) ? ctx_.exprType(*ma->target)
+                                                    : nullptr;
+            return makeMethodThunk(ms, recv, recvTy);
         }
         // §27.6 (v0.184, #1758): a bare reference to a primitive-intrinsic static
         // method (`int.Parse`, `char.IsDigit`, …) — no MethodSymbol (intrinsics

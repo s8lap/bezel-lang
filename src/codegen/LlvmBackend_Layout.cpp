@@ -2680,7 +2680,8 @@ bool Emitter::forVarCapturedInBody(const ast::ForStmt& fs) {
 
 
 llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
-                             llvm::Value* receiverVal) {
+                             llvm::Value* receiverVal,
+                             const sema::TypeRef* recvStaticTy) {
     llvm::Function* origFn = nullptr;
     auto it = methodFns_.find(ms);
     if (it != methodFns_.end()) origFn = it->second;
@@ -2706,6 +2707,84 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     llvm::FunctionType* methTy =
         origFn ? origFn->getFunctionType() : methodFnType(ms);
     if (!methTy) return nullptr;
+    // fix #2766 / §27.6 / §14.1: an INTERFACE-dispatch thunk (no concrete
+    // origFn) must use the INSTANTIATED parameter types of the receiver's static
+    // interface type, not methodFnType(ms)'s erased ones. methodFnType lowers
+    // the interface's DECLARED parameter types, and for a generic interface
+    // (`IEquatable<T>.Equals(other: T)`) the unbound `T` lowers to a placeholder
+    // `i32` for EVERY instantiation. That is the ABI the emitted thunk then
+    // advertises, while both the call site (which types the call from the
+    // reference's static `(string) -> bool`) and the itable target
+    // (`bz$M.SC$Equals(ptr, ptr)`) use the real one.
+    //
+    // The consequence is not cosmetic — it was measured on the generated code:
+    // the thunk compiled to `mov %esi,%ebx` / `mov %ebx,%esi`, i.e. it TRUNCATED
+    // the reference argument to 32 bits before forwarding it. A string argument
+    // whose address happens to be below 4 GiB (a literal in a small, non-PIE
+    // executable) survives the round trip, which is why this went unnoticed; a
+    // HEAP string does not. A probe passing a runtime-concatenated string to a
+    // `IEquatable<string>` method group over a user class SEGVs inside the
+    // callee at the truncated address under ASan (whose allocator returns high
+    // addresses), and only "works" on the plain oracle by allocator luck.
+    //
+    // It is also what makes #2766's string-receiver guard below possible at all:
+    // with the erased signature, ONE cached thunk serves `IEquatable<string>`
+    // and `IEquatable<int>` alike, so the argument cannot be tested as a pointer
+    // (for `IEquatable<int>` it is a raw `i32` value, and calling
+    // bz_obj_is_string on it would dereference the integer as an address).
+    // Taking the instantiated types separates those instantiations into distinct
+    // thunks — see the widened methodThunks_ key — after which the
+    // reference-shaped ones carry real pointers and the value-shaped ones are
+    // excluded by the `isPointerTy()` gate.
+    //
+    // Deliberately narrow: only when there is NO concrete origFn (a virtual
+    // method's thunk already takes its signature from the real function), only
+    // for a bound instance reference whose static receiver type IS this
+    // interface with resolved generic arguments, only for a parameter whose
+    // DECLARED type is a bare type-parameter name of that interface, and never
+    // for a by-ref parameter (§22.3 — methodFnType passes those as a
+    // pointer-to-slot, which is already correct). A parameter with a concrete
+    // declared type keeps the type it already had, so a non-generic interface
+    // (`IFoo.Do(n: int): int`) is bit-for-bit unaffected. The RETURN type is
+    // left alone here: a generic-returning interface method has the same latent
+    // defect, but fixing it is a separate change and is filed rather than
+    // bundled.
+    if (!origFn && dynamicDispatch && instMethod && !extRef && recvStaticTy &&
+        ms->parent && recvStaticTy->kind == sema::TypeRef::Kind::Named &&
+        recvStaticTy->declaration == ms->parent &&
+        recvStaticTy->genericArgs.size() == 1 &&
+        ms->parent->genericParams.size() == 1 && ms->params.size() == 1 &&
+        methTy->getNumParams() == 2 &&
+        ((ms->parent->name == "IEquatable"  && ms->name == "Equals") ||
+         (ms->parent->name == "IComparable" && ms->name == "CompareTo"))) {
+        // These two, and ONLY these two, are substituted — because the STDLIB
+        // states their signatures, so the mapping "the single parameter is the
+        // interface's single type argument" is read off the document rather than
+        // guessed. stdlib §9.4 declares `IComparable<T>` with
+        //   `public method CompareTo(other: T): int;`
+        // and §9.6's `String` satisfies `IEquatable<string>` with
+        //   `public method Equals(other: string?): bool;`
+        //
+        // Every OTHER generic interface method is deliberately left alone. The
+        // reason is not caution for its own sake: a SYNTHETIC builtin interface
+        // records NO resolved declared type for its parameters at all
+        // (ParameterSymbol::resolvedDeclType is null — which is precisely why
+        // methodFnType fell back to the `i32` placeholder), so for an arbitrary
+        // method there is no evidence in the symbol table for WHICH type
+        // parameter a given parameter position corresponds to. Inventing a
+        // positional mapping (`IDictionary<K,V>.Add(k: K, v: V)`…) would be
+        // exactly the silent interpretation this project forbids. The remaining
+        // methods keep today's erased ABI — unchanged, still latently wrong —
+        // and that residue is FILED rather than guessed at here.
+        if (sema::TypeRef* arg = recvStaticTy->genericArgs[0]) {
+            if (llvm::Type* t = lowerTypeRef(arg)) {
+                if (t != methTy->getParamType(1))
+                    methTy = llvm::FunctionType::get(
+                        methTy->getReturnType(),
+                        {methTy->getParamType(0), t}, /*isVarArg=*/false);
+            }
+        }
+    }
     // A non-virtual, non-interface method ref must have a concrete origFn.
     if (!origFn && !dynamicDispatch) return nullptr;
 
@@ -2722,7 +2801,11 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // receiver-independent (it loads `this` from env), so one thunk per method
     // is correct. On a cache hit skip re-emitting the body and go straight to
     // building a fresh closure cell with the current receiver.
-    if (auto cit = methodThunks_.find({ms, extRef}); cit != methodThunks_.end())
+    // fix #2766: the LLVM signature is part of the key — see methodThunks_'s
+    // declaration. Same method + same instantiated signature still yields ONE
+    // thunk, so #1170's `+=`/`-=` identity is unaffected.
+    if (auto cit = methodThunks_.find({ms, extRef, methTy});
+        cit != methodThunks_.end())
         return buildMethodClosureCell(cit->second, instMethod, receiverVal, kind);
 
     // Build the thunk's parameter types: (ptr env, user_params...).
@@ -2865,9 +2948,160 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     // or interface method (mirrors emitMethodCall's dynamic path); otherwise call
     // the concrete origFn directly. callArgs[0] is the receiver.
     llvm::Value* dynFnPtr = nullptr;
+    // fix #2766 (§4.6 / stdlib §9.6): state for the string-receiver arm below.
+    bool strRecvPossible = false;
+    llvm::BasicBlock* dispEndBB = nullptr;
+    llvm::BasicBlock* strDispEnd = nullptr;
+    llvm::BasicBlock* strNeBB = nullptr;
+    llvm::Value* strDispVal = nullptr;
     if (dynamicDispatch && !callArgs.empty() &&
         callArgs[0]->getType()->isPointerTy()) {
         llvm::Value* recv = callArgs[0];
+        // fix #2766 / §4.6 / stdlib §9.6: the SAME defect #2752 fixed in
+        // emitMethodCall's interface arm, at the METHOD-GROUP site. stdlib §9.6
+        // declares
+        //   `public class String: IEnumerable<char>, IComparable<string>,
+        //    IEquatable<string>`
+        // so `var eq: IEquatable<string> := s;` is a legal conversion — but a
+        // §4.6 string is a runtime-managed REFERENCE, and the slot holds a bare
+        // `bz_string*` whose word 0 is `char* data`, NOT a vtable (see
+        // bezel_runtime.h's bz_obj_is_string contract, §8.6/§12.7 #417). The
+        // itmap load at vptr[1] below therefore reads `data + 8` — 8 bytes past
+        // the payload — and SIGSEGVs (exit 139 on the plain oracle; ASan reports
+        // a global-/heap-buffer-overflow "in thunk$0").
+        //
+        // ⚠ THE FIX BELONGS HERE, IN THE THUNK BODY, NOT AT THE MINT SITE.
+        // Thunks are cached in methodThunks_ keyed {ms, extRef} and the body is
+        // receiver-independent, so a decision taken where the thunk is minted
+        // would be wrong for every other receiver reusing the cached thunk.
+        // Measured, not assumed: a program forming `IEquatable<string>` method
+        // groups over a user class AND over a string AND an `IEquatable<Object>`
+        // group emits exactly ONE `thunk$0`; likewise one thunk serves both
+        // `IComparable<int>` (boxed primitive) and `IComparable<string>`. The
+        // discrimination must therefore be a RUN-TIME test, which is what this is.
+        //
+        // ⚠ REACHABILITY ARGUMENT, RE-ESTABLISHED FOR THIS SITE (#2766 requires
+        // this rather than copying #2752's diamond on faith). bz_obj_is_string is
+        // a whitelist NEGATION (bezel_runtime_refcounting.cpp): it answers
+        // "string" for ANY pointer whose word 0 is absent from bz$vtable$table,
+        // and that table omits several vtable kinds — bz_array_t (no vtable word
+        // at all), bz_lazy_vtable (every lazy LINQ pipeline), the iterator /
+        // async-frame / collection-adapter vtables. So the question is NOT "does
+        // the receiver's type declare the interface?" (`Object` admits anything,
+        // so that question has no force) but: can a value with an unregistered
+        // word 0 reach THIS site, and did it previously dispatch CORRECTLY here?
+        //   * It CAN reach here, only through the IEquatable<Object> /
+        //     IComparable<Object> acceptance (#2765).
+        //   * It does NOT dispatch correctly today: both shapes were probed on
+        //     this exact method-group path and both already crash INSIDE thunk$0
+        //     before this change — `Array<int>` through `IEquatable<Object>` is a
+        //     heap-buffer-overflow, and a `.Where(...)` lazy pipeline is a null
+        //     deref (bz_lazy_vtable's word 1 is not an itmap).
+        // So no previously correct program becomes incorrect. The shapes that DO
+        // dispatch correctly today — a user/imported class declaring the
+        // interface, and a boxed primitive/value-builtin — all have REGISTERED
+        // vtables, so bz_obj_is_string answers "not a string" for them and they
+        // keep taking the itable path unchanged (probed: both still return their
+        // pre-change values).
+        //
+        // The static gate below only decides whether to EMIT the tests; it is
+        // deliberately as narrow as #2752's (the interface arm of exactly
+        // IEquatable.Equals / IComparable.CompareTo). It never fires on the
+        // VTABLE arm and never on a wider interface such as IEnumerable, where an
+        // unregistered-vtable receiver genuinely does dispatch correctly today
+        // and a false positive would be a real regression.
+        strRecvPossible =
+            ifaceIt != ifaceMethodIndex_.end() && ms->parent &&
+            callArgs.size() == 2 && callArgs[1] &&
+            callArgs[1]->getType()->isPointerTy() && !retTy->isVoidTy() &&
+            ((ms->parent->name == "IEquatable"  && ms->name == "Equals") ||
+             (ms->parent->name == "IComparable" && ms->name == "CompareTo")) &&
+            descArray_.count(ms->parent) != 0;
+        if (strRecvPossible) {
+            bool isEqualsMethod = ms->name == "Equals";
+            auto* strDispBB =
+                llvm::BasicBlock::Create(llvm_, "thunk.str", thunk);
+            auto* objDispBB =
+                llvm::BasicBlock::Create(llvm_, "thunk.obj", thunk);
+            auto* mixedBB =
+                llvm::BasicBlock::Create(llvm_, "thunk.mixed", thunk);
+            dispEndBB = llvm::BasicBlock::Create(llvm_, "thunk.dend", thunk);
+            strNeBB = llvm::BasicBlock::Create(
+                llvm_, isEqualsMethod ? "thunk.strne" : "thunk.strtrap", thunk);
+            auto* isStrFn =
+                declareC("bz_obj_is_string", i32(), {ptrTy(), ptrTy()});
+            // BOTH operands are tested, not just the receiver — the lesson
+            // #2752 needed two rounds to learn. emitStringEq / emitStringOrdCmp
+            // dereference `l` AND `r` as bz_string (loadStringLen reads offset
+            // 8, loadStringData offset 0), so a receiver-only guard would read a
+            // non-string ARGUMENT's vtable pointer as `char* data` and answer
+            // from whatever bytes follow it — a silent wrong answer, no crash.
+            // That argument is reachable here: one cached thunk serves
+            // IEquatable<Object> too, where the argument is statically `Object`
+            // and need not be a string. For IEquatable<string> /
+            // IComparable<string> the argument is statically `string`, so the
+            // extra test always passes and behaviour is unchanged.
+            llvm::Value* rIsStr = builder_.CreateICmpNE(
+                builder_.CreateCall(isStrFn, {recv, vtableTablePtr()},
+                                    "thunk.risstr"),
+                builder_.getInt32(0));
+            llvm::Value* aIsStr = builder_.CreateICmpNE(
+                builder_.CreateCall(isStrFn, {callArgs[1], vtableTablePtr()},
+                                    "thunk.aisstr"),
+                builder_.getInt32(0));
+            builder_.CreateCondBr(
+                builder_.CreateAnd(rIsStr, aIsStr, "thunk.bothstr"),
+                strDispBB, mixedBB);
+            builder_.SetInsertPoint(mixedBB);
+            builder_.CreateCondBr(rIsStr, strNeBB, objDispBB);
+            builder_.SetInsertPoint(strNeBB);
+            if (isEqualsMethod) {
+                // §9.6 answers a string-vs-non-string comparison directly:
+                //   public pure override method Equals(other: Object?): bool;
+                //     // content-based, not reference-based
+                // so the answer is FALSE. Neither operand is dereferenced, and
+                // the PHI below supplies the `false`.
+            } else {
+                // CompareTo: §9.6 declares only
+                //   public pure method CompareTo(other: string): int  // ordinal
+                // and spec §4.6 confines ordinal comparison to string operands,
+                // so there is NO ordering to return and inventing one would be a
+                // silent fabrication. Falling through to the itable path is not
+                // a "loud failure" either — bz_itable_lookup would scan the
+                // string payload as an itmap and then call through itab[k], an
+                // indirect call through arbitrary memory. Trap instead: one
+                // block, invents no ordering, strictly defined. Reachable only
+                // through the IComparable<Object> acceptance (#2765); for
+                // IComparable<string> the argument is statically a string, so
+                // this arm is dead there.
+                builder_.CreateCall(
+                    declareC("abort", llvm::Type::getVoidTy(llvm_), {}), {});
+            }
+            builder_.CreateBr(dispEndBB);
+            // Both operands are strings: §9.6 content equality / ordinal
+            // comparison. emitStringEq is null-safe on both operands;
+            // emitStringOrdCmp requires non-null, which §4.6 guarantees for an
+            // ordering operand ("Ordering requires non-nullable operands").
+            builder_.SetInsertPoint(strDispBB);
+            if (isEqualsMethod) {
+                strDispVal = emitStringEq(recv, callArgs[1]);
+            } else if (llvm::Value* c = emitStringOrdCmp(recv, callArgs[1])) {
+                strDispVal = c->getType()->isIntegerTy(32)
+                    ? c
+                    : builder_.CreateTrunc(c, i32(), "thunk.str.cmp");
+            }
+            // Match the dispatched slot's return type so the merge PHI is
+            // well-typed (Equals → i1, CompareTo → i32).
+            if (strDispVal && strDispVal->getType() != retTy &&
+                strDispVal->getType()->isIntegerTy() && retTy->isIntegerTy())
+                strDispVal = builder_.CreateZExtOrTrunc(strDispVal, retTy,
+                                                        "thunk.str.ret");
+            // The intrinsics can emit their own blocks, so the PHI's incoming
+            // block is wherever the builder ended up, not strDispBB.
+            strDispEnd = builder_.GetInsertBlock();
+            builder_.CreateBr(dispEndBB);
+            builder_.SetInsertPoint(objDispBB);
+        }
         llvm::Value* vptr = builder_.CreateLoad(ptrTy(), recv);
         if (ifaceIt != ifaceMethodIndex_.end()) {
             // §13 itable: vptr[1] = itmap; bz_itable_lookup(itmap, td$I)[k].
@@ -2900,6 +3134,46 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
     llvm::Value* result =
         dynFnPtr ? builder_.CreateCall(methTy, dynFnPtr, callArgs)
                  : builder_.CreateCall(origFn, callArgs);
+    // fix #2766: merge the string-receiver arm back in. Only reached when the
+    // diamond above was emitted.
+    if (strRecvPossible && strDispVal && strDispEnd && strNeBB && dispEndBB &&
+        strDispVal->getType() == result->getType()) {
+        llvm::BasicBlock* objDispEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(dispEndBB);
+        builder_.SetInsertPoint(dispEndBB);
+        auto* phi = builder_.CreatePHI(result->getType(), 3, "thunk.res");
+        phi->addIncoming(strDispVal, strDispEnd);
+        // §9.6 mixed-operand arm. For Equals this IS the answer — string vs
+        // non-string is false, and getNullValue is `false` for the i1 return
+        // type. For CompareTo the arm aborts before reaching here, so the
+        // incoming value is unreachable and exists only to keep the PHI
+        // well-formed.
+        phi->addIncoming(llvm::Constant::getNullValue(result->getType()),
+                         strNeBB);
+        phi->addIncoming(result, objDispEnd);
+        result = phi;
+    } else if (strRecvPossible && dispEndBB) {
+        // Defensive: an intrinsic returned null, or the arms disagreed on type
+        // (neither should happen for the two gated signatures). Keep the CFG
+        // well-formed by joining every arm and taking the dispatched result —
+        // never leave a block without a terminator.
+        llvm::BasicBlock* objDispEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(dispEndBB);
+        if (strDispEnd && !strDispEnd->getTerminator()) {
+            builder_.SetInsertPoint(strDispEnd);
+            builder_.CreateBr(dispEndBB);
+        }
+        builder_.SetInsertPoint(dispEndBB);
+        auto* phi = builder_.CreatePHI(result->getType(), 3, "thunk.res");
+        if (strDispEnd)
+            phi->addIncoming(llvm::UndefValue::get(result->getType()),
+                             strDispEnd);
+        if (strNeBB)
+            phi->addIncoming(llvm::Constant::getNullValue(result->getType()),
+                             strNeBB);
+        phi->addIncoming(result, objDispEnd);
+        result = phi;
+    }
     if (retTy->isVoidTy()) builder_.CreateRetVoid();
     else builder_.CreateRet(result);
 
@@ -2919,7 +3193,7 @@ llvm::Value* Emitter::makeMethodThunk(sema::MethodSymbol* ms,
 
     // #1170 / §24.4: cache the thunk so subsequent references to this method
     // (e.g. the `-=` matching an earlier `+=`) reuse the SAME fn pointer.
-    methodThunks_[{ms, extRef}] = thunk;
+    methodThunks_[{ms, extRef, methTy}] = thunk;
 
     return buildMethodClosureCell(thunk, instMethod, receiverVal, kind);
 }

@@ -676,7 +676,15 @@ private:
     // (`x.M`, receiver captured) and an UNBOUND (`T.M`, receiver is the first
     // parameter) reference to the same extension method cache DISTINCT thunks
     // (they have different signatures).
-    std::map<std::pair<sema::MethodSymbol*, bool>, llvm::Function*> methodThunks_;
+    // fix #2766: the LLVM signature is part of the key too. For a GENERIC
+    // interface method (`IEquatable<T>.Equals`) one MethodSymbol serves every
+    // instantiation, but the ABI does NOT: `IEquatable<string>` passes a `ptr`
+    // where `IEquatable<int>` passes an `i32`. Keying by symbol alone made the
+    // first instantiation's thunk serve all of them, truncating a reference
+    // argument to 32 bits. Two references with the SAME instantiated signature
+    // still share one thunk, so #1170's `event -= OnTick` identity is preserved.
+    std::map<std::tuple<sema::MethodSymbol*, bool, llvm::FunctionType*>,
+             llvm::Function*> methodThunks_;
     // §27.6 (v0.184, #1758): cached thunk per primitive-intrinsic static method
     // reference, keyed by (primitive kind, member name). A primitive intrinsic
     // (`int.Parse`, `char.IsDigit`, …) has no MethodSymbol — it is recognized by
@@ -9786,8 +9794,16 @@ private:
     // For instance methods: env = heap-copy of receiver ptr, thunk
     // loads receiver from env.
     // The thunk has calling convention (ptr env, params...) -> ret.
+    // fix #2766: `recvStaticTy` is the STATIC type of the receiver expression
+    // (`IEquatable<string>` for `eq.Equals`), or null when the caller has none.
+    // It is used ONLY for an interface-dispatch thunk (no concrete origFn), to
+    // substitute the interface's resolved generic ARGUMENTS for parameters whose
+    // declared type is a bare type parameter — methodFnType(ms) lowers those
+    // unbound `T`s to a placeholder `i32`, an ABI that is wrong for every
+    // reference-typed instantiation and truncates the argument to 32 bits.
     llvm::Value* makeMethodThunk(sema::MethodSymbol* ms,
-                                 llvm::Value* receiverVal);
+                                 llvm::Value* receiverVal,
+                                 const sema::TypeRef* recvStaticTy = nullptr);
 
     // §27.6 (v0.184, #1758): produce a closure { thunk, null-env } for a bare
     // reference to a primitive-intrinsic static method (`int.Parse`,
