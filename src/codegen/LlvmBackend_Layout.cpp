@@ -1137,10 +1137,39 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
             std::unordered_map<std::string_view, const sema::TypeRef*> nextArgs;
             if (!base->genericParams.empty()) {
                 auto* btd = dynamic_cast<const ast::TypeDecl*>(base->decl);
-                if (!baseRef || !btd ||
-                    btd->genericParams.size() != baseRef->genericArgs.size())
+                // fix #2840 (§14.1 / §2.5, v0.240): an IMPORTED generic base has
+                // NO ast::TypeDecl — ModuleLoader::reconstructTypeSymbol builds a
+                // sema::TypeSymbol from the metadata and never sets `decl` (there
+                // is no AST node in the importer) — but it DOES populate
+                // `genericParams` positionally from the metadata
+                // (ModuleLoader.cpp:339). Reading the parameter NAMES off
+                // `base->decl` therefore made this walk `break` for every
+                // cross-module base, dropping `D : Base<string>` to the
+                // UNSPECIALIZED (placeholder) layout in which the inherited
+                // `v: T` is the i32 fallback rather than ptr — malformed IR on any
+                // read of the inherited field, and a silently truncating store on
+                // any write. Take the names from the AST decl when present, else
+                // from the imported TypeSymbol — the same `td ? td->genericParams
+                // : ts->genericParams` fallback already written for the call path
+                // (LlvmBackend_Calls2.cpp, §14.1/#783) and the static-access path
+                // (§22.12/#684), and the reason `computeAncestorGenericSubst`
+                // (which binds T→ptr for exactly this receiver) did not have the
+                // gap. Both sequences are positional against
+                // `baseRef->genericArgs`, so the arity check below is unchanged.
+                std::vector<std::string_view> gpNames;
+                if (btd) {
+                    gpNames.reserve(btd->genericParams.size());
+                    for (const auto& gp : btd->genericParams)
+                        gpNames.push_back(gp.name);
+                } else {
+                    gpNames.reserve(base->genericParams.size());
+                    for (const sema::Symbol* gp : base->genericParams)
+                        if (gp) gpNames.push_back(gp->name);
+                }
+                if (!baseRef || gpNames.empty() ||
+                    gpNames.size() != baseRef->genericArgs.size())
                     break;  // unresolvable — fall through to unspecialized layout
-                for (std::size_t gi = 0; gi < btd->genericParams.size(); ++gi) {
+                for (std::size_t gi = 0; gi < gpNames.size(); ++gi) {
                     const sema::TypeRef* arg = baseRef->genericArgs[gi];
                     // Resolve a bare generic-param ref (`T`, no declaration)
                     // through the lower level's bindings; concrete args pass
@@ -1151,7 +1180,7 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
                         auto it = curArgs.find(arg->headName());
                         if (it != curArgs.end()) arg = it->second;
                     }
-                    std::string_view pname = btd->genericParams[gi].name;
+                    std::string_view pname = gpNames[gi];
                     nextArgs[pname] = arg;
                     // Record the layout binding (keep the lowest/most-derived
                     // binding on a param-name collision — it is the concrete one).
@@ -4680,7 +4709,6 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
         } else if (targetTy->kind == sema::TypeRef::Kind::Named &&
                    targetTy->declaration &&
                    targetTy->declaration != ms->parent &&
-                   !targetTy->genericArgs.empty() &&
                    !ms->parent->genericParams.empty()) {
             // §12 / §14 (issue #585): direct access of an INHERITED field
             // declared on a generic BASE (`ms->parent`) through a derived
@@ -4690,6 +4718,30 @@ llvm::Value* Emitter::fieldAddr(const ast::MemberAccessExpr& ma,
             // layout and the GEP/field type are wrong for a non-int base field
             // (read 0 / garbage). Bind the base's generic params to the concrete
             // arguments the derived class supplied (walking the base chain).
+            //
+            // fix #2840 (§12 / §14.1 / §2.5, v0.240): this branch used to
+            // ALSO require `!targetTy->genericArgs.empty()` — i.e. the
+            // receiver had to be a generic instantiation of its own. A
+            // NON-generic derived class (`class D : Base<long>`) has no
+            // generic args, so `d.v` / `d.tag` skipped the substitution
+            // entirely and GEP'd `classStruct(Base)` under the EMPTY subst —
+            // the T→i32 template layout — while `new D()` allocated the
+            // correctly specialized derived struct. Writing `d.v` then stored
+            // 8 bytes at the template's 4-byte-slot offset and silently
+            // clobbered the following field (measured: `tag` read back 28,
+            // the high half of the stored `long`); at `T = string` the same
+            // mismatch produced an unlocated IR-verifier abort. The bare-
+            // identifier twin of this access — `implicitFieldAddr`, fixed for
+            // exactly this shape by #989 — already builds a synthetic
+            // no-generic-args receiver TypeRef and calls
+            // computeAncestorGenericSubst; this is the qualified-access path
+            // doing the step its own sibling does. computeAncestorGenericSubst
+            // seeds `curArgs` from `recvTy->genericArgs` against the
+            // receiver's own param names, so an EMPTY-args non-generic
+            // receiver is the 0 == 0 case and walks the chain correctly; it
+            // returns false (leaving the substitution untouched) whenever the
+            // chain cannot be resolved, so widening the guard cannot install a
+            // wrong substitution.
             std::unordered_map<std::string_view, llvm::Type*> ancSubst;
             std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
             if (computeAncestorGenericSubst(targetTy, ms->parent, ancSubst,
