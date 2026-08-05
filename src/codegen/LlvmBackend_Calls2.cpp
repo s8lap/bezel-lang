@@ -9190,6 +9190,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     auto savedStringReleaseEligible = stringReleaseEligible_;
     auto savedStringBorrowRetainEligible = stringBorrowRetainEligible_;
     auto savedStringBorrowAll = stringBorrowAll_;
+    auto savedStringLocalCandidates = stringLocalCandidates_;  // fix #2817
     auto savedValueLikeChoiceStrReleaseEligible =
         valueLikeChoiceStrReleaseEligible_;
     llvm::Function* savedStringReleaseEligibleFn = stringReleaseEligibleFn_;
@@ -9390,8 +9391,9 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     // Body: `collectStringReleaseEligible(*ci.stmts); stringReleaseEligibleFn_
     // = fn;` followed by `retainAssignedStringParams(*ci.stmts, ms->params)`).
     // EVERY consumer of the three string sets gates on `currentFn_ ==
-    // stringReleaseEligibleFn_`, which is assigned in exactly ONE other place
-    // in the backend (emitFunctionBody); specFn is a freshly-created
+    // stringReleaseEligibleFn_`, which at the time of #2807 was assigned in
+    // exactly ONE other place in the backend (emitFunctionBody; #2817 has since
+    // added the iterator, lambda and constructor bodies); specFn is a freshly-created
     // llvm::Function, so without this the gate was false for the whole
     // specialized body and NO string local in ANY generic specialization was
     // ever retained or released — both allocations leaked, per local, per call
@@ -9485,6 +9487,7 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
     stringReleaseEligible_ = std::move(savedStringReleaseEligible);
     stringBorrowRetainEligible_ = std::move(savedStringBorrowRetainEligible);
     stringBorrowAll_ = std::move(savedStringBorrowAll);
+    stringLocalCandidates_ = std::move(savedStringLocalCandidates);  // #2817
     valueLikeChoiceStrReleaseEligible_ =
         std::move(savedValueLikeChoiceStrReleaseEligible);
     stringReleaseEligibleFn_ = savedStringReleaseEligibleFn;

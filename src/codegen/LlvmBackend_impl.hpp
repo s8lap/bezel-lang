@@ -8463,8 +8463,15 @@ private:
     // release; absence ⇒ the string leaks (the pre-existing, safe behavior).
     std::unordered_set<const void*> stringReleaseEligible_;
     // The function for which stringReleaseEligible_ was computed (mirrors
-    // unwindIneligibleFn_): a lambda/thunk body lowered mid-function inherits no
-    // eligibility, so its string locals just leak (never double-freed).
+    // unwindIneligibleFn_): a body that inherits no eligibility just leaks its
+    // string locals (never double-freed). Pinned by emitFunctionBody,
+    // emitAsyncMethod and buildSpecializedMethodFn (#2807), and by
+    // emitIteratorMethod, emitAsyncIteratorMethod, lowerLambda (block bodies),
+    // emitAsyncLambda (block bodies) and emitConstructorBody (#2817);
+    // inlineCtorBody re-runs the analysis for the inlined body under the
+    // ENCLOSING function's token and restores it afterwards. Still unpinned, and
+    // therefore still leaking: a destructor body, an expression-bodied lambda,
+    // and a `finally` body replayed by an iterator's Dispose.
     llvm::Function* stringReleaseEligibleFn_ = nullptr;
     // Compute stringReleaseEligible_ for a block body (see the .cpp).
     void collectStringReleaseEligible(
@@ -8814,6 +8821,26 @@ private:
     // (stringBorrowRetainEligible_) is additionally released at scope end; the
     // escaping ones leak their retained +1 (safe).
     std::unordered_set<const void*> stringBorrowAll_;
+    // fix #2817 / §4.6 / §28.9 (v0.240): EVERY `var` string LocalDecl node the
+    // last collectStringReleaseEligible walk ADMITTED as a candidate — producer,
+    // borrow, or value-like choice — whether or not it turned out to escape. It
+    // is the "does this decl belong to the body currently being lowered?" test,
+    // which the three eligibility sets above cannot answer on their own: an
+    // ESCAPING producer is recorded in none of them, so a membership test against
+    // them cannot distinguish "this body's local, which escapes" from "some other
+    // body's local entirely".
+    //
+    // Needed because #2817 pins stringReleaseEligibleFn_ to a LAMBDA body for the
+    // first time, and a lambda body can NAME an enclosing local (a §27.5 capture).
+    // returnedStringLocalOwnsPlusOne's producer branch re-derives "+1 producer
+    // initializer, `string`-typed" straight from the decl, so with only the fn
+    // token to gate it, `lambda() => do return s; end` over a captured
+    // `var s := p + "!"` read as "this body owns the +1" and SKIPPED the return
+    // retain — handing the caller a +0 borrow it then releases (an over-release
+    // measured as a double free in the #2689 / #2706 suites). The capture's
+    // reference is co-owned through the shared cell and dropped by the env
+    // destructor; the lambda body owns nothing.
+    std::unordered_set<const void*> stringLocalCandidates_;
     // #429: emit retain-or-transfer for a `var`-string local at bind time, and
     // arm its scope-end release. Returns true if it armed/handled the local's
     // string reference (the caller still performs the slot store). `init` is the

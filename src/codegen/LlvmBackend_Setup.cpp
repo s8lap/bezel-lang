@@ -7384,12 +7384,44 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
     moveOnlyArrayTransferredFn_ = fn;
     collectMoveOnlyArrayTransferred(cd->body);  // §15.3 (#747)
     bindParameters(fn, /*hasThis=*/true, &cs->params);
-    // fix #2696: NO retainAssignedStringParams call here, deliberately. A
-    // COMPILED constructor never sets stringReleaseEligibleFn_, so both
-    // drop-on-overwrite releases are gated OFF in its body and `s := s + "-x"`
-    // is a plain store. Retaining here would mint a +1 that pairs nothing — a
-    // leak per constructor call. The retain belongs where the release actually
-    // fires, which for constructor bodies is the INLINE path (inlineCtorBody).
+    // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §22.8 (v0.240): run the
+    // `var` STRING-local refcount analysis for the COMPILED constructor body and
+    // pin the token to this fn. EVERY consumer of the three string sets gates on
+    // `currentFn_ == stringReleaseEligibleFn_`, and this function sets currentFn_
+    // but never touched that token, so no string local in any constructor body
+    // was ever retained OR released: both allocations (bz_string header +
+    // payload) leaked, per local, per construction (#2817 — measured 1904 bytes /
+    // 80 allocations for 20 constructions x 2 locals).
+    //
+    // ORDERING. The analysis is a pure walk of `cd->body`'s own AST, so running
+    // it here (before the chain call, the field initializers and the body) simply
+    // describes the function about to be emitted; it registers no IR. The
+    // scope-end releases themselves are registered by lowerScopedBlock below —
+    // AFTER §22.8's step 1 (base/this chain) and step 2 (own field initializers),
+    // which is the only ordering the §22.8 sequence constrains. A string local
+    // cannot be live before its own declaration, so no release can precede a
+    // field initializer that might read the same heap string; and an escaping
+    // local (one stored into a field — `Name := built;`) is excluded by the
+    // escape walk, so a field that OUTLIVES the constructor never has its value
+    // released underneath it. The ctor's throw edge routes to `ctor.cleanup`,
+    // which runs only the owned-field / base-subobject disposals and never
+    // emitUnwindDisposals — so a body throw still LEAKS these locals exactly as
+    // it does today (the safe direction, unchanged by this fix).
+    //
+    // fix #2696 / §28.1: retainAssignedStringParams is now CALLED here, where
+    // before it was deliberately absent. That decision was conditioned entirely
+    // on the token being unset ("a COMPILED constructor never sets
+    // stringReleaseEligibleFn_, so both drop-on-overwrite releases are gated OFF
+    // in its body"); the pin above turns those releases ON, and a `string`
+    // parameter's single reference belongs to the CALLER (§28.1: on a `string`,
+    // "`owned` is a compile error: such values carry no disposal obligation to
+    // transfer (§28.9)"), so the retain must move with the release or `s := s +
+    // "-x"` on a ctor parameter frees the caller's borrow — the #2696
+    // use-after-free. Emitted right after bindParameters, in the entry block,
+    // which dominates every assignment in the body.
+    collectStringReleaseEligible(cd->body);
+    stringReleaseEligibleFn_ = fn;
+    retainAssignedStringParams(cd->body, cs->params);
 
     // §22.16 (v0.203, #2053): a constructor's `requires` clauses evaluate
     // AFTER argument binding completes and BEFORE any of the member's own
@@ -8390,9 +8422,55 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
     // already bound the parameters into paramSlots_ (this function's documented
     // precondition), which is what the retain reads. Emitted before the chain call
     // and the body, so it dominates every assignment. When the enclosing body is
-    // NOT the analyzed one — an inlined constructor inside a COMPILED constructor,
-    // via the chain-call path — the helper's own co-gate makes this a no-op,
-    // exactly as the release is a no-op there.
+    // NOT the analyzed one, the helper's own co-gate makes this a no-op, exactly
+    // as the release is a no-op there.
+    //
+    // fix #2817 / #429 / §4.6 / §28.9 / §28.3 (v0.240): the same argument applies
+    // to the inlined body's `var` string LOCALS, and there it was NOT satisfied.
+    // The three eligibility sets describe the ENCLOSING body's AST, so an inlined
+    // constructor body's own LocalDecls are in none of them — yet
+    // lowerStringLocalReassign's gate (`currentFn_ == stringReleaseEligibleFn_`)
+    // is about the enclosing FUNCTION, so it fires. A BORROW-initialized local
+    // (`var s := h.Name;`) therefore took NO bind-time retain and then had its
+    // first assignment (`s := s + "-x";`) release the reference it merely
+    // borrowed: a use-after-free from ordinary code, reproduced on the base of
+    // this change through `new Box<int>(h, i)` inside an ordinary method. The
+    // constructor-body pin added to emitConstructorBody above would have EXTENDED
+    // that hole to a compiled constructor that chain-calls a generic base/sibling
+    // (whose body is inlined into it) — measured: a 1324-byte bounded leak turning
+    // into a heap-use-after-free — so closing it is a co-requisite of that pin,
+    // not an unrelated fix.
+    //
+    // Run the analysis for the body actually being lowered and restore the
+    // enclosing body's state afterwards (the same save/restore discipline #1483
+    // uses for the unwind sets and #2807 added to buildSpecializedMethodFn). The
+    // sets are keyed on `const ast::LocalDecl*`, unique per AST node, so the
+    // inlined body's verdicts cannot collide with the enclosing body's; the
+    // enclosing body only resumes registering after the restore, and the inlined
+    // body never names an enclosing local (its AST sees only its own params,
+    // locals and fields — the call site already evaluated the arguments).
+    //
+    // ONLY when the enclosing body is already the analyzed one. If it is not, the
+    // drop-on-overwrite release does not fire in it at all, so there is nothing to
+    // pair and pinning here would ARM a release with no matching bind-time retain
+    // wherever armStringLocalRefcount is itself inert (an expression-bodied
+    // lambda, say, whose disposeStack_ is empty) — a use-after-free this fix
+    // would have introduced. Leaving that case exactly as it is keeps the bounded
+    // leak, which is the safe direction.
+    const bool analyzeInlinedCtorBody = (currentFn_ == stringReleaseEligibleFn_);
+    std::unordered_set<const void*> savedInlineStringReleaseEligible;
+    std::unordered_set<const void*> savedInlineStringBorrowRetainEligible;
+    std::unordered_set<const void*> savedInlineStringBorrowAll;
+    std::unordered_set<const void*> savedInlineStringLocalCandidates;
+    std::unordered_set<const void*> savedInlineValueLikeChoiceStrRelease;
+    if (analyzeInlinedCtorBody) {
+        savedInlineStringReleaseEligible = stringReleaseEligible_;
+        savedInlineStringBorrowRetainEligible = stringBorrowRetainEligible_;
+        savedInlineStringBorrowAll = stringBorrowAll_;
+        savedInlineStringLocalCandidates = stringLocalCandidates_;
+        savedInlineValueLikeChoiceStrRelease = valueLikeChoiceStrReleaseEligible_;
+        collectStringReleaseEligible(cd->body);
+    }
     retainAssignedStringParams(cd->body, cs->params);
 
     // §22.9 step 1 (v0.181): run the leading chain (base/this) — recursively
@@ -8482,6 +8560,18 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
         auto* deadBB = llvm::BasicBlock::Create(
             llvm_, "ctor.inline.unreachable", currentFn_);
         builder_.SetInsertPoint(deadBB);
+    }
+    // fix #2817: restore the ENCLOSING body's string-refcount state (see the save
+    // at the top). stringReleaseEligibleFn_ is untouched — an inlined body shares
+    // the enclosing llvm::Function, so only the three sets (plus #2115's) move.
+    if (analyzeInlinedCtorBody) {
+        stringReleaseEligible_ = std::move(savedInlineStringReleaseEligible);
+        stringBorrowRetainEligible_ =
+            std::move(savedInlineStringBorrowRetainEligible);
+        stringBorrowAll_ = std::move(savedInlineStringBorrowAll);
+        stringLocalCandidates_ = std::move(savedInlineStringLocalCandidates);
+        valueLikeChoiceStrReleaseEligible_ =
+            std::move(savedInlineValueLikeChoiceStrRelease);
     }
 }
 
@@ -13953,6 +14043,18 @@ bool Emitter::returnedStringLocalOwnsPlusOne(const ast::Expr* e) const {
     const void* declNode = static_cast<const void*>(loc->decl);
     // A borrow local was retained at bind (owns a +1).
     if (stringBorrowAll_.count(declNode)) return true;
+    // fix #2817 / §27.5 / §28.9 (v0.240): the decl must belong to the body being
+    // lowered. The fn token alone does not establish that any more: #2817 pins it
+    // to a LAMBDA body, and a lambda body can NAME an enclosing local (a §27.5
+    // capture), whose reference is co-owned through the shared cell and dropped
+    // by the env destructor — this body owns nothing of it. Without this test the
+    // producer branch below re-derived "+1 producer initializer" from the
+    // ENCLOSING decl and skipped the return retain, handing the caller a +0
+    // borrow it then released (a double free, caught by the #2689 / #2706
+    // suites). stringBorrowAll_ above is already body-scoped, so only the
+    // producer branch needs the guard; an ESCAPING producer is in none of the
+    // three eligibility sets, which is why the candidate set exists at all.
+    if (!stringLocalCandidates_.count(declNode)) return false;
     // A producer-initialized non-nullable string local transferred the
     // producer's +1 into its slot. (Borrow locals are exactly stringBorrowAll_;
     // a non-using string LocalDecl whose initializer is a +1 producer is the
@@ -14138,12 +14240,16 @@ void Emitter::armStringLocalRefcount(const void* declNode,
                                      const ast::Expr* init) {
     (void)init;
     if (!v || !v->getType()->isPointerTy() || disposeStack_.empty()) return;
-    // Gated on the analyzed function: a lambda/thunk body lowered mid-function is
-    // not walked, so the eligibility sets are empty for its locals — they just
-    // leak (never double-freed). collectStringReleaseEligible classified THIS
-    // function's `var` string locals into the three sets below; this function
-    // only acts on members of those sets, so it never fires on a non-string
-    // pointer local (a class/interface/box).
+    // Gated on the analyzed function: a body no pin names is not walked, so the
+    // eligibility sets are empty for its locals — they just leak (never
+    // double-freed). collectStringReleaseEligible classified THIS function's
+    // `var` string locals into the three sets below; this function only acts on
+    // members of those sets, so it never fires on a non-string pointer local (a
+    // class/interface/box). fix #2817 (v0.240): a LAMBDA body (sync or async), a
+    // sync/async ITERATOR body, a compiled CONSTRUCTOR body and an INLINED
+    // constructor body are now walked and pinned like any other; what remains
+    // unanalyzed is a destructor body, an expression-bodied lambda, and a
+    // `finally` body replayed by an iterator's Dispose (each filed separately).
     if (currentFn_ != stringReleaseEligibleFn_) return;
     // BORROW string local (escaping or not): retain so the slot owns an
     // independent +1. A literal initializer is a sentinel — the retain is a
@@ -14238,12 +14344,14 @@ void Emitter::retainAssignedStringParams(
     //    pairs are gated on `currentFn_ == stringReleaseEligibleFn_`
     //    (LlvmBackend_Stmts.cpp — the `:=` call site, which is the ONLY caller
     //    of lowerStringLocalReassign, and the §4.6 `+=` branch's `isLocal`).
-    //    `stringReleaseEligibleFn_` is assigned in exactly ONE place in the
-    //    backend, emitFunctionBody, so the gate is FALSE in any body lowered
-    //    outside it — a compiled constructor (emitConstructorBody sets
-    //    currentFn_ but not this token), an async/iterator/generic-
-    //    specialization body, a lambda body. There the assignment is a plain
-    //    store that releases nothing, and a retain would mint a +1 pairing
+    //    `stringReleaseEligibleFn_` is assigned only where a body's own string
+    //    analysis has been run for it — emitFunctionBody, emitAsyncMethod and
+    //    buildSpecializedMethodFn (#2807), and emitIteratorMethod,
+    //    emitAsyncIteratorMethod, lowerLambda, emitAsyncLambda and
+    //    emitConstructorBody (#2817) — so the gate is FALSE in any body lowered
+    //    outside those (a destructor body, an expression-bodied lambda, a
+    //    `finally` replayed by an iterator's Dispose). There the assignment is a
+    //    plain store that releases nothing, and a retain would mint a +1 pairing
     //    NOTHING — a leak this fix would have INTRODUCED. Agreement between the
     //    retain and release predicates is the invariant (the same one #2689
     //    states for its capture retain vs the envdtor release); this line is
@@ -14381,8 +14489,9 @@ void Emitter::armValueLikeChoiceStrRelease(const void* declNode,
     //       an alias would double-free), recorded in
     //       valueLikeChoiceStrReleaseEligible_.
     // Gated on stringReleaseEligibleFn_ (the same analyzed-function contract as
-    // the string set): a lambda/thunk body lowered mid-function is not walked,
-    // so its choice locals just leak (never double-freed — the safe direction).
+    // the string set): a body no pin names is not walked, so its choice locals
+    // just leak (never double-freed — the safe direction). fix #2817 widened the
+    // set of pinned bodies; see stringReleaseEligibleFn_'s declaration.
     if (!slot || !ld || disposeStack_.empty()) return;
     if (emittingDisposerBody_) return;  // a disposer walks fields directly
     if (currentFn_ != stringReleaseEligibleFn_) return;
@@ -16915,6 +17024,7 @@ void Emitter::collectStringReleaseEligible(
     stringReleaseEligible_.clear();
     stringBorrowRetainEligible_.clear();
     stringBorrowAll_.clear();
+    stringLocalCandidates_.clear();               // fix #2817
     valueLikeChoiceStrReleaseEligible_.clear();  // fix #2115
     // Find every `var` (non-using) string LocalDecl, classified as a +1 PRODUCER
     // (`+`/interpolation/range-slice) or a BORROW (any other string initializer:
@@ -16936,11 +17046,15 @@ void Emitter::collectStringReleaseEligible(
             if (!ld->isUsing && ld->initializer) {
                 if (isPlusOneStringProducer(ld->initializer.get())) {
                     producerCandidates.push_back(ld);
+                    // fix #2817: this decl belongs to the body being analyzed.
+                    stringLocalCandidates_.insert(static_cast<const void*>(ld));
                 } else if (valueLikeChoiceLocalMintsStringPayload(ld)) {
                     // fix #2115: a value-like choice local whose construction
                     // mints +1 string payload(s) — released at scope end iff
                     // non-escaping (the walk below).
                     valueLikeChoiceCandidates.push_back(ld);
+                    // fix #2817: see the producer branch above.
+                    stringLocalCandidates_.insert(static_cast<const void*>(ld));
                 } else {
                     // #429: a BORROW-initialized string local. Recognized by the
                     // local's resolved type being `string` (non-nullable; a
@@ -16958,6 +17072,9 @@ void Emitter::collectStringReleaseEligible(
                         lt->primitive == sema::PrimitiveType::String) {
                         borrowCandidates.push_back(ld);
                         stringBorrowAll_.insert(static_cast<const void*>(ld));
+                        // fix #2817: see the producer branch above.
+                        stringLocalCandidates_.insert(
+                            static_cast<const void*>(ld));
                     }
                 }
             }

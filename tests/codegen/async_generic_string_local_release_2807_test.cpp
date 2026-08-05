@@ -95,17 +95,21 @@
 // registered for the parameter slot, so its final value leaks") — but the leak
 // SHRINKS to exactly that, and no memory error appears.
 //
-// ⚠ DELIBERATE EXCLUSIONS, each measured post-fix and each still a bounded leak
-// with the correct value and NO memory error — the safe direction, filed as a
-// follow-up rather than fixed here, because each has its own activation model
-// (an iterator resume runs once per advance and has a separate abandonment
-// path; a lambda/constructor body is lowered mid-function with no body of its
-// own to analyze at that point):
+// ⚠ DELIBERATE EXCLUSIONS at the time this test was written, each measured
+// post-fix and each still a bounded leak with the correct value and NO memory
+// error — the safe direction, filed as a follow-up (#2817) rather than fixed
+// here, because each has its own activation model (an iterator resume runs once
+// per advance and has a separate abandonment path; a lambda/constructor body is
+// lowered mid-function with no body of its own to analyze at that point):
 //   async iterator body   1904 B / 80 allocs   sync iterator body 1845 B / 78
 //   plain lambda body     1904 B / 80          async lambda body  1904 B / 80
 //   compiled constructor  1904 B / 80
-// Case (M) below pins the async-iterator one as a characterization guard: it
-// must keep LEAKING rather than turn into a use-after-free.
+// ALL FIVE were subsequently fixed by #2817 (v0.240), which pins the token in
+// emitIteratorMethod, emitAsyncIteratorMethod, lowerLambda, emitAsyncLambda and
+// emitConstructorBody (plus inlineCtorBody, whose unanalyzed body the
+// constructor pin would otherwise have turned into a use-after-free). Case (M)
+// below is the async-iterator one; its assertion moved from "must keep leaking"
+// to "is clean" at that point — see its own comment.
 
 #include <string>
 
@@ -467,13 +471,14 @@ const char* kSpecializationBuiltMidOuterBody =
     "end C;";
 
 // =====================================================================
-// (M) DELIBERATE EXCLUSION — an ASYNC ITERATOR body. Its resume runs once per
-// MoveNextAsync and it has a separate abandonment path (Dispose while suspended
-// at a yield), so it is filed as a follow-up rather than armed here. It must
-// keep LEAKING (the safe direction) and must NOT become a use-after-free.
-// §30.7 / §29.7.
+// (M) an ASYNC ITERATOR body. Its resume runs once per MoveNextAsync and it has
+// a separate abandonment path (Dispose while suspended at a yield), so #2807
+// filed it as a follow-up rather than arming it here; #2817 then armed it (the
+// bind and the scope-end release land in consecutive advances, one each, and the
+// abandonment path is covered by the yield handler's cleanup snapshot). §30.7 /
+// §29.7.
 // =====================================================================
-const char* kAsyncIteratorStillLeaks =
+const char* kAsyncIteratorBody =
     "module M; class C "
     "  private static async method Seq(n: int): IAsyncEnumerable<int> "
     "    for var i in 1..n do "
@@ -693,19 +698,29 @@ BEZEL_TEST(codegen_async_generic_string_local_release_2807,
 }
 
 // ---------------------------------------------------------------------
-// (M) the deliberate exclusion, pinned as a characterization guard: an async
-// ITERATOR body must keep leaking rather than turn into a use-after-free.
+// (M) WAS the deliberate exclusion, pinned as a characterization guard: an async
+// ITERATOR body had to keep LEAKING rather than turn into a use-after-free.
+//
+// fix #2817 (v0.240) REMOVED that exclusion — emitAsyncIteratorMethod now runs
+// collectStringReleaseEligible for its resume fn and co-gates the parameter
+// retain, so this program is clean (1904 B / 80 allocations -> none), and its
+// abandonment path is covered by the yield handler's smIterCleanupAtState_
+// snapshot. The characterization is updated rather than deleted: the case still
+// earns its place as the async-iterator arm of the exactly-once oracle, and the
+// assertion direction is now the stronger one (`r.ran` fails on a leak AND on a
+// use-after-free). #2817's own file carries the full five-body-kind grid.
 // ---------------------------------------------------------------------
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
-           async_iterator_body_is_a_documented_exclusion_spec_30_7) {
-    JitResult r = runAotChecked(kAsyncIteratorStillLeaks);
+           async_iterator_body_locals_are_released_after_2817_spec_30_7) {
+    JitResult r = runAotChecked(kAsyncIteratorBody);
     if (wasSkipped(r)) return;
-    expectLeakButNoMemoryError(r);         // 1904 B / 80 allocations, unchanged
+    BEZEL_EXPECT_TRUE(r.ran);              // 1904 B / 80 allocations pre-#2817
+    BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }
 
 BEZEL_TEST(codegen_async_generic_string_local_release_2807,
            async_iterator_body_value_is_correct_spec_30_7) {
-    JitResult r = runAot(kAsyncIteratorStillLeaks);
+    JitResult r = runAot(kAsyncIteratorBody);
     BEZEL_EXPECT_TRUE(r.ran);
     BEZEL_EXPECT_EQ(r.exitCode, kLenSum20);
 }

@@ -1129,6 +1129,25 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
     // lambda's OWN return type); only the block-body path goes through
     // emitReturn, which reads currentReturnTypeNode_.
     const ast::Type* savedCurrentReturnTypeNode = currentReturnTypeNode_;
+    // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 (v0.240): save the `var`
+    // STRING-local refcount state across the WHOLE lambda emission. A lambda body
+    // is lowered MID-EMISSION of its enclosing function, and both the three sets
+    // and their fn token are per-function state owned by that enclosing body — so
+    // the pin below (and the one emitAsyncLambda performs for an async lambda's
+    // resume fn) must not survive back into it. This is the same discipline #1483
+    // established for the unwind sets and #2807 had to add to
+    // buildSpecializedMethodFn: without the restore, every string local the
+    // enclosing body declares AFTER this `var f := <lambda>` silently loses its
+    // bind-time retain and scope-end release (the leak direction, but a
+    // regression this change would have introduced — #2807 measured exactly that
+    // for the specialization case).
+    auto savedStringReleaseEligible = stringReleaseEligible_;
+    auto savedStringBorrowRetainEligible = stringBorrowRetainEligible_;
+    auto savedStringBorrowAll = stringBorrowAll_;
+    auto savedStringLocalCandidates = stringLocalCandidates_;
+    auto savedValueLikeChoiceStrReleaseEligible =
+        valueLikeChoiceStrReleaseEligible_;
+    llvm::Function* savedStringReleaseEligibleFn = stringReleaseEligibleFn_;
 
     // §27.5: the set of outer locals/params the body references.
     std::unordered_set<const sema::Symbol*> capturedSyms;
@@ -1759,6 +1778,52 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
         }
     }
 
+    // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §27.3 (v0.240): run the
+    // `var` STRING-local refcount analysis for the LAMBDA's own block body and
+    // pin the token to the lambda's fn. EVERY consumer of the three string sets
+    // gates on `currentFn_ == stringReleaseEligibleFn_` (armStringLocalRefcount's
+    // bind-time retain AND its scope-end `Disposal{stringRelease}`,
+    // returnedStringLocalOwnsPlusOne, the two record-backed interface-property
+    // retains, and the `:=` / §4.6 `+=` drop-on-overwrite release), and until now
+    // that token never named a lambda fn — the case armStringLocalRefcount's own
+    // comment already recorded ("a lambda/thunk body lowered mid-function is not
+    // walked, so the eligibility sets are empty for its locals — they just
+    // leak"). Every `var` string local in every lambda body therefore leaked both
+    // of its allocations, per call (#2817 — measured 1904 bytes / 80 allocations
+    // for 20 invocations x 2 locals).
+    //
+    // WHY IT DOES NOT FIGHT THE ENV DESTRUCTOR. A lambda-body local captured by a
+    // NESTED lambda is marked ESCAPED by StringEscapeWalker (`inLambda` makes any
+    // read of the tracked local inside a lambda body an unconditional escape), so
+    // it enters NEITHER release set and no scope-end release is registered for it
+    // — exactly the suppression the envdtor's deferred release relies on. The
+    // only thing that changes for such a local is that a BORROW-initialized one
+    // now takes its bind-time retain (stringBorrowAll_), which is what the
+    // envdtor's unconditional content release was already assuming was there;
+    // that direction can only turn an over-release into a balanced pair.
+    //
+    // EXPRESSION bodies are excluded (no statements to analyze, no local to
+    // release, and leaving the token unpinned keeps the expr-body return path's
+    // `returnedStringLocalOwnsPlusOne` verdict bit-for-bit as it was). The async
+    // branch below is handled inside emitAsyncLambda, against its RESUME fn.
+    if (!lam.isAsync && !lam.exprBody) {
+        collectStringReleaseEligible(lam.stmts);
+        stringReleaseEligibleFn_ = fn;
+        // fix #2696 / §28.1 / §28.9 (v0.240): CO-GATE the parameter retain with
+        // the parameter release the pin above just turned on. The drop-on-
+        // overwrite release admits ANY slot localSlot() resolves — including a
+        // `string` PARAMETER, whose single reference belongs to the CALLER
+        // (§28.1: on a `string`, "`owned` is a compile error: such values carry
+        // no disposal obligation to transfer (§28.9)"). Enabling that release
+        // without the paired bind-time retain frees the caller's borrow under it
+        // — the #2696 use-after-free — so the two predicates move together, which
+        // is the invariant retainAssignedStringParams' step 0 states. Emitted in
+        // the lambda's ENTRY block, where the parameter binding loop above has
+        // just stored each incoming argument, so it dominates every assignment in
+        // the body and runs exactly once per INVOCATION.
+        if (paramSyms) retainAssignedStringParams(lam.stmts, *paramSyms);
+    }
+
     // §30.6 (#488): an `async` lambda's body is an async STATE MACHINE, not a
     // straight-line body. The closure entry fn (with its params + captured cells
     // + this now bound above) becomes the async ENTRY; emitAsyncLambda takes
@@ -2055,6 +2120,16 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
 
     // --- Restore emitter state ---
     expectedFunctionType_ = savedExpectedFT;  // #731
+    // fix #2817: restore the enclosing body's string-refcount state (see the
+    // save above). Covers BOTH branches — the sync pin just above and the resume
+    // pin emitAsyncLambda performs.
+    stringReleaseEligible_ = std::move(savedStringReleaseEligible);
+    stringBorrowRetainEligible_ = std::move(savedStringBorrowRetainEligible);
+    stringBorrowAll_ = std::move(savedStringBorrowAll);
+    stringLocalCandidates_ = std::move(savedStringLocalCandidates);
+    valueLikeChoiceStrReleaseEligible_ =
+        std::move(savedValueLikeChoiceStrReleaseEligible);
+    stringReleaseEligibleFn_ = savedStringReleaseEligibleFn;
     currentReturnTypeNode_ = savedCurrentReturnTypeNode;  // #2515
     currentLambdaReturnSemaTy_ = savedLambdaRetSemaTy;    // fix #2688
     lambdaParamTypeHint_ = std::move(savedLambdaParamHints);

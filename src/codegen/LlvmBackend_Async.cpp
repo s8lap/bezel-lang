@@ -1648,6 +1648,39 @@ void Emitter::emitAsyncLambda(const ast::LambdaExpr& lam, llvm::Function* fn,
             if (fc.paramSym) paramSlots_[fc.paramSym] = slot;
             if (fc.localDecl) locals_[fc.localDecl] = slot;
         }
+        // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §30.6 (v0.240): the
+        // `var` STRING-local refcount analysis must describe the async LAMBDA's
+        // RESUME fn too — the same re-establishment performed just above for the
+        // closure (#422), capture-cell (#1416/#1418) and borrowing-collection
+        // (#2132/#2142/#2143) analyses. Without it every `var` string local in
+        // an async lambda body leaked both of its allocations, per invocation
+        // (#2817 — measured 1904 bytes / 80 allocations for 20 invocations x 2
+        // locals). Block bodies only: an expression body has no LocalDecl to
+        // arm, and leaving the token unpinned there keeps that path unchanged.
+        // The enclosing function's sets/token are saved and restored by
+        // lowerLambda around this whole call (fix #2817), so this pin cannot
+        // leak back into the body that is building the closure.
+        //
+        // The frame-spill dimension is the one emitAsyncMethod already argued:
+        // collectSuspendLocals gives every LocalDecl in the body a frame field
+        // and emitAwaitSuspend spills/restores every mapped alloca around each
+        // suspend, so the alloca a scope-end Disposal loads holds the live value
+        // on whichever activation reaches the exit; a SUSPEND returns from resume
+        // without touching disposeStack_, so a local live across an `await` is
+        // released once, by the activation that completes. // per §28.9, §30.2
+        if (!lam.exprBody) {
+            collectStringReleaseEligible(lam.stmts);
+            stringReleaseEligibleFn_ = resumeFn;
+            // fix #2696 / §28.1 / §28.9: CO-GATE the parameter retain with the
+            // parameter release the pin just enabled (see lowerLambda's mirror
+            // and emitAsyncMethod's). Emitted in the resume ENTRY block, which
+            // dominates every assignment and re-runs on every activation, while a
+            // given activation can release the incoming value at most once (after
+            // the first assignment the slot holds a value this frame owns) — so
+            // retains >= releases on every path: a surplus retain leaks one
+            // reference per resume, it can never over-release.
+            if (paramSyms) retainAssignedStringParams(lam.stmts, *paramSyms);
+        }
         (void)paramSyms;  // params are restored via caps (paramSlots_) above
 
         // State field GEP — read by the resume dispatch, written at each await.
@@ -2359,11 +2392,37 @@ void Emitter::emitAsyncIteratorMethod(sema::MethodSymbol* ms, llvm::Function* fn
         // Mirror the synchronous setup. // per §28.3
         unwindIneligibleFn_ = resumeFn;
         collectUnwindIneligible(*ci.stmts);
+        // fix #2817 / #2807 / #429 / §4.6 / §28.9 / §28.3 / §30.7 (v0.240): the
+        // `var` STRING-local refcount analysis must describe the async-ITERATOR
+        // resume fn too — the same re-establishment #1896/#1897 made just above
+        // for the unwind sets. Without it no string local in any `async` +
+        // `yield return` body was ever retained OR released: both allocations
+        // leaked, per local, per element (#2817 — measured 1904 bytes / 80
+        // allocations over 20 advances). Same activation model the SYNC iterator
+        // fix argues in full (LlvmBackend_Iterators.cpp emitIteratorMethod): the
+        // bind and the scope-end release of a local declared inside the yielding
+        // loop land in consecutive ADVANCES, one each, and the abandonment path
+        // is covered by the yield handler's smIterCleanupAtState_/
+        // smIterDisposalsAtState_ snapshot, which the async Dispose replays with
+        // the frame locals restored. // per §29.7, §30.7
+        collectStringReleaseEligible(*ci.stmts);
+        stringReleaseEligibleFn_ = resumeFn;
         auto* entry = llvm::BasicBlock::Create(llvm_, "entry", resumeFn);
         builder_.SetInsertPoint(entry);
 
         llvm::Value* self = resumeFn->getArg(1);
         emitFrameCaptureRestores(frame, self);
+
+        // fix #2817 / fix #2696 / §28.1 / §28.9 / §4.6 (v0.240): CO-GATE the
+        // parameter retain with the parameter release the pin above just turned
+        // on — a `string` PARAMETER's single reference belongs to the CALLER
+        // (§28.1: on a `string`, "`owned` is a compile error: such values carry
+        // no disposal obligation to transfer (§28.9)"), so an unpaired release is
+        // the #2696 use-after-free. Emitted in the resume ENTRY block, which
+        // dominates every state block and re-runs on every activation, while a
+        // given activation can release the incoming value at most once — so
+        // retains >= releases on every path.
+        retainAssignedStringParams(*ci.stmts, ms->params);
 
         // §30.7 (v0.228, #1525): "every MoveNextAsync() performs an implicit
         // token.ThrowIfCancellationRequested() — on entry, and at each resume
