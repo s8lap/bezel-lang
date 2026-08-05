@@ -5223,12 +5223,56 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
                                       const ast::Expr* valueExpr,
                                       bool valueIsPlusOne) {
     if (!v) return false;
-    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target);
-    if (!ma || !ma->target) return false;
-    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+    // fix #2849 (§12.1/§6.6/§23.3, v0.240): ACCEPT THE RECEIVER-LESS TARGET.
+    //
+    // The receiver is either an explicit `obj.P` target, or — for a bare `P`
+    // write inside an instance member — the current `this`. This function used
+    // to require an `ast::MemberAccessExpr` and bail on anything else, while
+    // its getter twin `lowerVirtualPropertyGet` (above) deliberately handles
+    // BOTH spellings. That asymmetry was the whole defect: a bare `P` target is
+    // an `ast::IdentifierExpr`, so every caller fell through to the STATICALLY
+    // bound setter and ran the compile-time type's accessor.
+    //
+    // §12.1, verbatim: "A method, property, or indexer is non-virtual unless
+    // marked `virtual`. To override a virtual member in a derived class, mark
+    // the matching member `override`."
+    //
+    // MEASURED on b0fa41a with a `virtual`/`override` pair whose accessors are
+    // +100/+1 (base) and +200/+2 (derived), receiver always a `D`:
+    //   * `P := 7`   stored 8 where 9 is correct — the BASE setter ran.
+    //   * `P += 1`   yielded 202 where 203 is correct — the diagnostic value:
+    //     the getter DISPATCHED (D's 200, +1 = 201) and the setter did NOT
+    //     (B's `value + 1` = 202). The two halves of one statement disagreed.
+    // `this.P := 7` / `this.P += 1` / `b.P += 1` were already correct, so the
+    // defect is specific to the receiver-less spelling — the most idiomatic
+    // way to write to one's own property.
+    //
+    // A STATIC property cannot reach the dispatch below even inside an instance
+    // member (where `currentThis_` is a live pointer): §12.1, verbatim,
+    // "Fields, constructors, destructors, and static members may not be
+    // virtual", and buildVtable's `isVirtualProperty`/`isVirtualIndexer` gate
+    // (LlvmBackend_Setup.cpp) is what populates propSetSlot_ — so a static
+    // property has no slot and the `setIt == propSetSlot_.end()` guard below
+    // declines it. Interfaces declare no static members, so the itable half is
+    // likewise unreachable. The getter twin relies on exactly this.
+    const ast::Expr* recvExpr = nullptr;
+    sema::PropertySymbol* ps = nullptr;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
+        if (!ma->target) return false;
+        ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+        recvExpr = ma->target.get();
+        // `base.P` (§12.3, verbatim: "Inside a derived member, `base.Name(...)`
+        // calls the base class's implementation, bypassing virtual dispatch"):
+        // decline — the static setter path handles it.
+        if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(recvExpr))
+            if (tid->name == "base") return false;  // §12.3
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target)) {
+        ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*id));
+        // bare `P` → implicit `this.P`; no recvExpr (currentThis_ is the recv).
+    } else {
+        return false;
+    }
     if (!ps || ps->isIndexer) return false;
-    if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
-        if (tid->name == "base") return false;  // §12.3
 
     bool isIfaceProp = ps->parent &&
                        ps->parent->kind == ast::TypeDeclKind::Interface;
@@ -5258,7 +5302,11 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
     auto* fnTy = llvm::FunctionType::get(
         llvm::Type::getVoidTy(llvm_), {ptrTy(), valTy}, false);
 
-    llvm::Value* recv = lowerExpr(*ma->target);
+    // fix #2849: `recvExpr` is null for the bare `P` spelling — the receiver is
+    // then `currentThis_`, exactly as in lowerVirtualPropertyGet. The
+    // pointer-typed requirement below is what excludes a static context (no
+    // `this`) and the erased-generic receiver, as it does in the getter.
+    llvm::Value* recv = recvExpr ? lowerExpr(*recvExpr) : currentThis_;
     if (!recv || !recv->getType()->isPointerTy()) return false;
     v = coerceNumericToType(v, valTy, isUnsignedTargetExpr(target));
     // fix #2500 (§8.6/§23.3/§28.9, v0.236): virtual/interface-dispatch twin of
