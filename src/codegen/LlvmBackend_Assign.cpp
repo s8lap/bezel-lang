@@ -1360,6 +1360,50 @@ const sema::TypeSymbol* Emitter::indexReceiverDecl(const ast::Expr* target) {
             }
         }
     }
+    return nullptr;
+}
+
+// fix #2833 (§23.4 / §27.3, v0.240) — see the header for the contract.
+const sema::TypeSymbol* Emitter::indexAccessReceiverDecl(
+    const ast::IndexExpr& ix) {
+    const ast::Expr* target = ix.target.get();
+    if (!target) return nullptr;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(target);
+    const bool viaKeyword = id && (id->name == "this" || id->name == "base");
+
+    if (const sema::TypeSymbol* recv = indexReceiverDecl(target))
+        return recv;
+
+    // fix #2833 (§23.4 / §27.3, v0.240): the receiver could not be recovered
+    // from the current llvm::Function. That happens for a LAMBDA body (whose
+    // closure fn is not a value in methodFns_, and for which
+    // currentSpecMethodSymbol_ is unset) and for an `async` body (a
+    // state-machine frame, likewise not in methodFns_) — MEASURED, both, on
+    // this tree: the read degraded to 0 and the write was silently discarded.
+    //
+    // Recover it from the indexer PropertySymbol sema attached to this
+    // IndexExpr (#2530). This is CATEGORY-BLIND by construction — it asks the
+    // type-checker what this very access resolved to rather than enumerating
+    // codegen body kinds — so a lambda, a `do`-bodied lambda, a nested lambda,
+    // an `async` body and any future body kind are all covered by the same
+    // line, and the #2833 announcement below stops firing for them without
+    // being weakened.
+    //
+    // It yields the indexer's DECLARING type, which for an INHERITED indexer is
+    // a base of the receiver rather than the receiver itself. That is the same
+    // PropertySymbol `selectIndexer` would have found by walking the receiver's
+    // base chain (both walk `baseTypes` from the same root), and every use of
+    // the returned symbol below is either keyed on the PropertySymbol itself
+    // (the imported-stub and vtable-slot maps) or on `->kind`, which a class's
+    // class base shares. Restricted to the `this`/`base` keyword: an ordinary
+    // typed receiver already resolves through its exprType above, and this
+    // fallback must not silently redirect one that legitimately failed.
+    if (viaKeyword) {
+        if (auto* ps = dynamic_cast<const sema::PropertySymbol*>(
+                ctx_.exprSymbol(ix)))
+            if (ps->isIndexer && ps->parent) return ps->parent;
+    }
+
     // #2795 follow-up (§23.4, v0.240): ANNOUNCE THE DROP. Reaching here with a
     // `this`/`base`-rooted index means the receiver TypeSymbol could not be
     // recovered — and EVERY caller bails immediately on a null return, silently:
@@ -1379,20 +1423,16 @@ const sema::TypeSymbol* Emitter::indexReceiverDecl(const ast::Expr* target) {
     // only because an untyped `this[n]` left the lambda's return type unknown.
     // With the type available the caller lowers cleanly and the wrong value
     // became FULLY SILENT — a net loss against this tree's standing rule that a
-    // clean diagnostic beats a silent wrong value. This restores the
-    // announcement. It does NOT fix the underlying defect; see #2833.
+    // clean diagnostic beats a silent wrong value.
     //
-    // GATED ON THE PROPERTY, NOT A SOURCE CATEGORY (the #2787 lesson). Measured
-    // on this tree, not inferred: recovery FAILS and the value is wrong in a
-    // LAMBDA body (`currentFn_` is the closure's llvm::Function, which is not a
-    // value in `methodFns_`) — for an expression-bodied, `do`-bodied, directly
-    // passed, and nested lambda alike, for the read (0) and for the write
-    // (silently no stored value) — AND in an `async` body. It SUCCEEDS, so no
-    // warning fires, in a plain method body, in a generic SPECIALIZATION
-    // (`currentSpecMethodSymbol_`) and in an extension body. Testing
-    // `inLambda_`-style source context in sema instead would have missed the
-    // async body outright; testing "the recovery failed" cannot, and it stops
-    // firing by construction once #2833 makes the recovery succeed.
+    // GATED ON THE PROPERTY, NOT A SOURCE CATEGORY (the #2787 lesson), which is
+    // why #2833's fix above could switch it off without weakening it: it tests
+    // "the recovery failed", so making the recovery SUCCEED for the lambda and
+    // `async` bodies retires it by construction for exactly those shapes and
+    // keeps it armed for any receiver still genuinely unrecoverable (an
+    // IndexExpr sema left without a resolved indexer PropertySymbol, which
+    // today means a compile that already has errors — hence the guard below —
+    // and any future body kind that breaks BOTH recoveries at once).
     //
     // Warning, suppressed once the compile already has errors — the #2491 /
     // #2775 precedent, so a cascade never buries the real diagnostic. That guard
@@ -1406,9 +1446,9 @@ const sema::TypeSymbol* Emitter::indexReceiverDecl(const ast::Expr* target) {
                 Severity::Warning, id->span.begin,
                 "internal: this `" + std::string(id->name) +
                 "[i]` indexer access was DROPPED — the receiver could not be "
-                "recovered for this body kind (a lambda body or an `async` "
-                "body); the read degrades to a zero/null value and a write is "
-                "silently discarded (§23.4) — #2833");
+                "recovered, neither from the enclosing function nor from the "
+                "resolved indexer; the read degrades to a zero/null value and "
+                "a write is silently discarded (§23.4) — #2833");
         }
     }
     return nullptr;
@@ -1417,7 +1457,7 @@ const sema::TypeSymbol* Emitter::indexReceiverDecl(const ast::Expr* target) {
 llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return nullptr;
-    const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix.target.get());
+    const sema::TypeSymbol* recvDecl = indexAccessReceiverDecl(ix);
     if (!recvDecl) return nullptr;
     auto* ps = selectIndexer(recvDecl, ix);  // per §23.4 (#1172)
     if (!ps) return nullptr;
@@ -1598,10 +1638,10 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // #1080 / §23.4: a virtual/override/abstract indexer on a CLASS receiver
     // dispatches dynamically through the vtable slot (the static getter-body
     // resolution below binds the COMPILE-TIME receiver type's getter, so a
-    // `base[i]` or `this[i]` read would run the base/abstract body). Load the
-    // getter fn-ptr from vt[propGetSlot_] and call it as `T get(ptr this,
-    // idx...)`. Mirrors the #481 property-vtable path; the slot was assigned by
-    // buildVtable and filled with ensureIndexerGetterFn.
+    // `this[i]` read would run the base/abstract body). Load the getter fn-ptr
+    // from vt[propGetSlot_] and call it as `T get(ptr this, idx...)`. Mirrors
+    // the #481 property-vtable path; the slot was assigned by buildVtable and
+    // filled with ensureIndexerGetterFn.
     if (recvDecl->kind == ast::TypeDeclKind::Class) {
         auto gsIt = propGetSlot_.find(ps);
         if (gsIt != propGetSlot_.end()) {
@@ -1967,7 +2007,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
                               const ast::Expr* valueExpr) {
     if (!ix.target || ix.indices.empty() || !ix.indices[0].value)
         return false;
-    const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix.target.get());
+    const sema::TypeSymbol* recvDecl = indexAccessReceiverDecl(ix);
     if (!recvDecl) return false;
     auto* ps = selectIndexer(recvDecl, ix);  // per §23.4 (#1172)
     if (!ps) return false;
@@ -2526,7 +2566,7 @@ bool Emitter::lowerIndexerCompound(const ast::AssignmentStmt& as) {
         return false;
     // Check that this is a user-defined indexer (class/record with a property
     // [i]: T declaration). Built-in arrays fall through to lvalueAddr instead.
-    const sema::TypeSymbol* recvDecl = indexReceiverDecl(ix->target.get());
+    const sema::TypeSymbol* recvDecl = indexAccessReceiverDecl(*ix);
     if (!recvDecl) return false;
     auto* ps = selectIndexer(recvDecl, *ix);  // per §23.4 (#1172)
     if (!ps) return false;

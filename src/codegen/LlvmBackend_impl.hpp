@@ -3720,7 +3720,21 @@ private:
     // (the member resolver uses the current type directly), so recover the owner
     // TypeSymbol from the current method, mirroring lowerWith. Null when the
     // receiver is not a user-defined type.
+    //
+    // It is the "which class's body am I in" recovery, and
+    // LlvmBackend_Calls2.cpp's inherited-generic-base call path (#747 R42)
+    // depends on that exact reading — an INDEXER ACCESS goes through
+    // indexAccessReceiverDecl below instead.
     const sema::TypeSymbol* indexReceiverDecl(const ast::Expr* target);
+
+    // fix #2833 (§23.4 / §27.3, v0.240): the receiver TypeSymbol an INDEXER
+    // ACCESS `ix` resolves its indexer against — indexReceiverDecl, and when
+    // that cannot answer (a lambda body or an `async` body, whose
+    // llvm::Function is not a value in methodFns_) sema's resolved indexer
+    // PropertySymbol, attached to the IndexExpr by #2530.
+    // Announces a genuinely unrecoverable `this`/`base` receiver (see the
+    // definition); every caller degrades silently on null.
+    const sema::TypeSymbol* indexAccessReceiverDecl(const ast::IndexExpr& ix);
 
     // §22.10: emit the getter of an indexer property via inline body.
     // Returns the loaded value, or null if no indexer applies.
