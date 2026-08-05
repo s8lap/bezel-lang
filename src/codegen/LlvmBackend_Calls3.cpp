@@ -374,6 +374,38 @@ const sema::TypeRef* Emitter::genericBackingType(const sema::TypeRef* collTy,
         // (sema rejects a non-value-like one). Stored as the choice struct's
         // bytes; hashed/compared by tag + active payload (build*ChoiceTrampoline).
         eligible = true;
+    else if (!isSet && !ty->nullable && hasObjectHeaderEquality(ty))
+        // fix #2773 (rows A3/A4) / §3.6 / §8.3 / stdlib §4.8: a DICTIONARY key
+        // that carries the §8.3 object header — a class, an interface, or
+        // `Object`. §3.6's equality-bearing row admits "every type except (a) a
+        // record that is neither auto-equality-bearing nor declares user
+        // equality, and (b) a choice that is not value-like
+        // auto-equality-bearing", and sema's isEqualityBearing admits a class
+        // and an interface as a hash-container key verbatim ("class (reference
+        // identity), interface, enum — all bear consistent Equals/
+        // GetHashCode"), so the shape is legal and REACHABLE, not latent.
+        //
+        // Such a key has a perfectly good generic backing: the stored key bytes
+        // are the reference itself (pointer-sized, held by BORROW — stdlib §4.8
+        // "A class-typed key/element is held by borrow", and §4.9's
+        // `Add(key: K, owned value: V)` marks only the VALUE owned, so there is
+        // no key-disposal obligation to express), and its hash/equality are
+        // §8.3's `Equals`/`GetHashCode` pair, which buildValueEqTrampoline /
+        // buildValueHashTrampoline emit via the object vtable.
+        //
+        // Returning null here instead sent the key to the STRING fast path,
+        // which GEPs the object as a `%bz.string`. Measured on
+        // `new Dictionary<Box,int>().Add(b, 10)`: SEGV in
+        // `bz_dict_contains_str` → `fnv1a`. The `GetEnumerator` sites
+        // (LlvmBackend_Assign.cpp, LlvmBackend_Calls2.cpp) already classified
+        // such a dictionary GENERIC-mode — they use a real TypeRef string test
+        // — so BUILD mode and READ mode disagreed; converging on generic is
+        // what makes the two agree.
+        //
+        // `isSet` is excluded deliberately: a class/interface SET element keeps
+        // its ARRAY-backed linear-scan machinery (emitArrayBackedSetInsert,
+        // #1070), a separate and working design.
+        eligible = true;
     if (!eligible) return nullptr;
     if (byteSize) {
         llvm::Type* lt = lowerTypeRef(ty);
@@ -411,6 +443,25 @@ llvm::Function* Emitter::buildValueHashTrampoline(const sema::TypeRef* ty) {
     auto* fty = llvm::FunctionType::get(i64(), {ptrTy()}, false);
     auto* fn = llvm::Function::Create(fty, llvm::Function::InternalLinkage,
                                       "bz$valkey$hash", module_.get());
+    // fix #2773 (rows A3/A4) / §8.3: a class/interface/`Object` key hashes by
+    // its §8.3 pair — the user's `GetHashCode` override when declared, else the
+    // ASSIGNED identity hash ("identity hashes are assigned, not derived …
+    // never expose addresses"). lowerObjectGetHashCode is that dispatch, and is
+    // the hash half of the same vtable pair buildValueEqTrampoline dispatches
+    // equality through, so `a.Equals(b)` ⇒ equal hashes holds in the table.
+    if (hasObjectHeaderEquality(ty)) {
+        auto savedIP2 = builder_.saveIP();
+        llvm::Function* savedFn2 = currentFn_;
+        currentFn_ = fn;
+        builder_.SetInsertPoint(llvm::BasicBlock::Create(llvm_, "entry", fn));
+        llvm::Value* k = builder_.CreateLoad(ptrTy(), fn->getArg(0), "objkey");
+        llvm::Value* oh = lowerObjectGetHashCode(k);
+        builder_.CreateRet(oh ? builder_.CreateZExt(oh, i64())
+                              : builder_.CreatePtrToInt(k, i64()));
+        builder_.restoreIP(savedIP2);
+        currentFn_ = savedFn2;
+        return fn;
+    }
     auto savedIP = builder_.saveIP();
     llvm::Function* savedFn = currentFn_;
     currentFn_ = fn;
@@ -481,8 +532,17 @@ llvm::Function* Emitter::buildValueEqTrampoline(const sema::TypeRef* ty) {
     llvm::Value* b = builder_.CreateLoad(lt, fn->getArg(1), "eq.b");
     bool isString = ty->kind == K::Primitive &&
                     ty->primitive == sema::PrimitiveType::String;
-    llvm::Value* eq;
-    if (isString)
+    // fix #2773 (rows A3/A4) / §8.3 / §8.4: a class/interface/`Object` key
+    // compares by its §8.3 pair — "For classes, `=` always invokes `Equals`.
+    // … classes customize equality by overriding `Equals`" — so dispatch the
+    // vtable slot rather than falling to the plain pointer ICmp below, which
+    // would silently ignore an override the hash trampoline DOES honour and
+    // break §8.3's hash/equality agreement inside the table.
+    llvm::Value* eq =
+        hasObjectHeaderEquality(ty) ? lowerObjectEquals(a, b) : nullptr;
+    if (eq) {
+        // (dispatched above)
+    } else if (isString)
         eq = emitStringEq(a, b);                           // §4.6 content compare
     else if (lt->isFloatingPointTy())
         eq = builder_.CreateFCmpOEQ(a, b);                 // float/double compare

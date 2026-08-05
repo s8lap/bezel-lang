@@ -10445,6 +10445,31 @@ private:
                                             unsigned idx, bool isSet,
                                             uint64_t* byteSize);
 
+    // fix #2773 (rows A3/A4) / §8.3 / §8.4: does a value of `ty` carry the
+    // §8.3 OBJECT HEADER — the vtable whose fixed slots kEqualsSlot /
+    // kGetHashCodeSlot hold its `Equals`/`GetHashCode` pair?
+    //
+    // That is the property `lowerObjectEquals` / `lowerObjectGetHashCode`
+    // need, and it is the property a hash container needs in order to key on
+    // a REFERENCE. It is emphatically NOT implied by "lowers to `ptr`", which
+    // is why this is a named predicate rather than an `isPointerTy()` test at
+    // each site: a closure (§27.5), a `Shared<T>`/`Weak<T>` handle, an
+    // `IGrouping`, a `Subscription` and a nested builtin collection are all
+    // pointer-shaped with NO vtable at offset 0, so dispatching slot 4/5 on
+    // one of them would be an indirect call through whatever bytes happen to
+    // sit there. `string` is excluded here too — it has its own header and its
+    // own §4.6 content equality; `lowerObjectEquals` still copes with a string
+    // arriving dynamically through an `Object`, which is why `Object` IS
+    // admitted.
+    bool hasObjectHeaderEquality(const sema::TypeRef* ty) const {
+        if (!ty) return false;
+        if (ty->kind == sema::TypeRef::Kind::Primitive)
+            return ty->primitive == sema::PrimitiveType::Object;
+        return ty->kind == sema::TypeRef::Kind::Named && ty->declaration &&
+               (ty->declaration->kind == ast::TypeDeclKind::Class ||
+                ty->declaration->kind == ast::TypeDeclKind::Interface);
+    }
+
     // fix #567 / §14.1: resolve a bare type-parameter TypeRef (a single-part
     // Named with no `declaration`, e.g. `K` / `T`) to its CONCRETE substituted
     // sema type via the active monomorphization binding (`genericSubstSemaTy_`).
