@@ -11086,11 +11086,18 @@ private:
     // `args` (index-aligned, including a nullptr receiver slot for instance
     // methods) — used to recover each argument's signedness so an unsigned
     // source widens via UIToFP/ZExt at the parameter boundary (issue #421/#410).
+    // `callLoc` (fix #2821) is the call site's own location, supplied by the
+    // user-call paths (lowerCall / lowerNullCondCall). argExprs[0] is
+    // deliberately nullptr for an instance receiver, so a 0-argument call has no
+    // expression to locate a diagnostic on; the §14.1/#783 imported-generic
+    // layout gate needs one. Defaulted, so the synthesized callers (ToString /
+    // Equals / operator dispatch) are unchanged and simply report unlocated.
     llvm::Value* emitMethodCall(sema::MethodSymbol* ms,
                                 std::vector<llvm::Value*>& args,
                                 bool baseQualified,
                                 const std::vector<const ast::Expr*>* argExprs
-                                    = nullptr);
+                                    = nullptr,
+                                SourceLocation callLoc = {});
 
     // §12 / §14 (issue #585): compute the concrete generic substitution for an
     // ANCESTOR generic class reached through inheritance from `recvTy`. When a

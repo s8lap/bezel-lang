@@ -7865,7 +7865,8 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                               callBoundedClosureArgs.end());
         unwindTarget_ = closureArgUnwindCleanup(allClosureArgs);
     }
-    llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs);
+    llvm::Value* result = emitMethodCall(ms, args, baseQualified, &argExprs,
+                                         call.span.begin);
     unwindTarget_ = savedClArgUnwind;
     if (!diverged_) {
         for (llvm::Value* cl : syncIterClosureArgs) emitClosureRelease(cl);
@@ -8273,7 +8274,8 @@ bool Emitter::computeAncestorGenericSubst(
 llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
                             std::vector<llvm::Value*>& args,
                             bool baseQualified,
-                            const std::vector<const ast::Expr*>* argExprs) {
+                            const std::vector<const ast::Expr*>* argExprs,
+                            SourceLocation callLoc) {
     // issue #421 / #410: is the argument at index `ai` an unsigned source?
     // Defaults to false (signed) when no source expression is known for the
     // slot (e.g. the receiver) or no argExprs vector was supplied.
@@ -8282,6 +8284,93 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             return false;
         return isUnsignedTargetExpr(*(*argExprs)[ai]);
     };
+    // fix #2821 (§14.1 / §2.5 / §2.8.3, v0.240) — the §14.1/#783 SOUNDNESS GATE,
+    // stated as the property it actually needs.
+    //
+    // An IMPORTED GENERIC CLASS's method whose body could NOT be reconstructed
+    // importer-side (#783: `ms->decl` is not a live ast::MethodDecl — the body
+    // reached a sibling type or a module function, no body text was exported, or
+    // the re-parse/typecheck failed) has exactly ONE callee available: the
+    // EXPORTER's compiled function, emitted in the defining module against the
+    // generic PLACEHOLDER layout (an unresolved type parameter lowers to i32 —
+    // lowerTypeRef's value-kind fallback). Calling that function on an
+    // instantiation whose receiver is laid out DIFFERENTLY makes it read every
+    // storage slot at the placeholder's offset. #2821's repro: `Box<T>` with
+    // `v: T` ahead of `tag: int`, and `GetTag(): int` returning 4610688 instead
+    // of 7 — no diagnostic at any severity.
+    //
+    // The pre-existing sema gate (ExprTypecheck_Calls.cpp, the `!md &&
+    // isImported(ms)` branch) fires only when the METHOD'S RETURN TYPE
+    // substitutes to a reference type. That is a syntactic marker on the
+    // signature, not the property that matters: `GetTag(): int` mentions no type
+    // parameter anywhere and slipped straight through it. §2.5 makes artifact
+    // resolution the meaning-preserving equivalent of compiling as one unit, and
+    // #783's design note promises that a body which could not be reconstructed
+    // "keeps the clean gate — never a wrong value"; that promise was not kept.
+    //
+    // Gate instead on the REAL lowered layout, measured rather than inferred:
+    // compare each instance-storage slot's LLVM type under the active
+    // substitution against its type under the EMPTY (placeholder) one.
+    //   equal     -> the exporter's function reads the very offsets this object
+    //                has, so the fallback is sound. `Box<int>` (i32 == the
+    //                placeholder) and any class with no parameter-typed storage
+    //                at all keep compiling — no false reject.
+    //   different -> reject. A located compile error is the honest fallback the
+    //                #783 design intends, and is strictly better than 4610688.
+    // Being LLVM-type-valued, this is blind to how the difference arises — a
+    // bare `T` field, `[N]T`, `Inner<T>`, an inherited generic base's field, a
+    // reference OR a merely wider value argument (`long`) — instead of
+    // enumerating source categories (the #2787/#2790 lesson).
+    //
+    // Scoped to INSTANCE calls: a static method is handed no object, so the
+    // instance layout is not what its compiled body reads. (A static body that
+    // touches a §22.12 per-instantiation static field is an independent hazard
+    // — filed, not widened into here.)
+    if (!isStaticMethod(ms) && ms->parent &&
+        ms->parent->kind == ast::TypeDeclKind::Class &&
+        !ms->parent->genericParams.empty() && ctx_.isImported(ms->parent) &&
+        !dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        std::vector<const sema::Symbol*> storage;
+        collectInstanceStorage(ms->parent, storage);
+        std::vector<llvm::Type*> here, placeholder;
+        here.reserve(storage.size());
+        placeholder.reserve(storage.size());
+        for (const sema::Symbol* sm : storage) here.push_back(storageType(sm));
+        {
+            auto savedSubst = genericSubst_;
+            auto savedSemaTy = genericSubstSemaTy_;
+            genericSubst_.clear();
+            genericSubstSemaTy_.clear();
+            for (const sema::Symbol* sm : storage)
+                placeholder.push_back(storageType(sm));
+            genericSubst_ = std::move(savedSubst);
+            genericSubstSemaTy_ = std::move(savedSemaTy);
+        }
+        if (here != placeholder) {
+            ctx_.diagnostics().report(
+                Severity::Error, callLoc,
+                "calling `" + std::string(ms->name) + "` on the imported "
+                "generic class `" + std::string(ms->parent->name) +
+                "` is not yet monomorphized for this instantiation "
+                "(\xC2\xA7""14.1 / \xC2\xA7""2.5 / #783, #2821): this method's "
+                "body could not be reconstructed importer-side, so the only "
+                "available callee is the defining module's placeholder-"
+                "compiled function — and this instantiation does not lay `" +
+                std::string(ms->parent->name) + "` out the way that "
+                "placeholder (`int` for every type parameter) does, so the "
+                "callee would read this object's storage at the placeholder's "
+                "offsets and widths and return a wrong value with no "
+                "diagnostic. Use an `int` instantiation, or keep this "
+                "method's body to this class's own members (a body that "
+                "reaches a sibling type or a module function cannot be "
+                "reconstructed across the boundary), until importer-side "
+                "method monomorphization lands");
+            llvm::FunctionType* ft = methodFnType(ms);
+            if (ft && !ft->getReturnType()->isVoidTy())
+                return llvm::PoisonValue::get(ft->getReturnType());
+            return nullptr;
+        }
+    }
     // Is this an interface method dispatch? Check if the declaring type is
     // an interface (CG35-itable, §13).
     bool isIfaceMethod = ms->parent &&
@@ -10129,7 +10218,8 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     auto savedNcSubst = genericSubst_;
     auto savedNcSemaTy = genericSubstSemaTy_;
     applyMethodGenericSubst(call, ms);
-    llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false, &argExprs);
+    llvm::Value* r = emitMethodCall(ms, args, /*baseQualified=*/false, &argExprs,
+                                    call.span.begin);
     genericSubst_ = std::move(savedNcSubst);
     genericSubstSemaTy_ = std::move(savedNcSemaTy);
     // fix #1302 / §22.3: the copy-OUT half of every accessor-mediated
