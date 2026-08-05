@@ -2176,9 +2176,41 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                             findMethodByName(elemTypeRef->declaration, "CompareTo"))
                         if (cm->params.size() == 1) cmpMs = cm;
                 }
-                if (isStrElem || cmpMs) {
-                    // Element is a pointer (string object / class instance) in
-                    // both cases.
+                // fix #2770 (stdlib §5.1, spec §14.2, v0.240): an INTERFACE
+                // element never satisfies the probe above — findMethodByName
+                // walks CLASS bases only (baseClassOf) and additionally demands
+                // `methodFns_.count(ms)`, a COMPILED BODY, while the element's
+                // `CompareTo` is declared on `IComparable` and has none. So
+                // `cmpMs` stayed null, this whole arm was skipped, and the
+                // numeric path below built an `icmp` between a pointer and an
+                // i32 — LLVM's `ICmpInst::AssertOK` fired and the compiler
+                // ABORTED. stdlib §5.1 declares these forms in
+                //     public extension IEnumerable<T> where T: IComparable<T>
+                //       public method Min(): T;  public method Max(): T;
+                // and spec §14.2 conformance rule 3 admits an interface
+                // substitution — "**T is an interface** that has I in its
+                // extension chain" — so this is a document-admissible shape
+                // that must compile and must order by the user's CompareTo.
+                //
+                // Reuses #2768's `bz$ifacecmp$<Iface>` thunk UNCHANGED: its
+                // `bz_array_sort` ABI takes the ADDRESS of each element slot,
+                // and `ep` (from bz_array_ptr_at) and `accSlot` are exactly
+                // that, so no second thunk and no generalization is needed.
+                // The arm is chosen from the STATIC element type by the exact
+                // §5.1 constraint (see selfComparableIfaceCompareTo), never by
+                // a runtime word test — so, as in #2768, no other element
+                // category can be mis-routed into it. Tried only when `cmpMs`
+                // is null, so every shape that works today is bit-identical.
+                llvm::Function* ifaceCmpFn = nullptr;
+                if (!isStrElem && !cmpMs) {
+                    if (sema::MethodSymbol* ifm =
+                            selfComparableIfaceCompareTo(elemTypeRef))
+                        ifaceCmpFn = ensureIfaceCmpThunk(
+                            elemTypeRef->declaration, ifm);
+                }
+                if (isStrElem || cmpMs || ifaceCmpFn) {
+                    // Element is a pointer (string object / class or interface
+                    // instance) in all cases.
                     auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
                     llvm::Value* len = builder_.CreateCall(lenFn, {recv});
                     // stdlib §5.1: Min()/Max() throw on an empty source.
@@ -2227,6 +2259,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                 module_.get());
                         }
                         cmp = builder_.CreateCall(strcmpFn, {elData, accData}, "mm.cmp");
+                    } else if (ifaceCmpFn) {
+                        // fix #2770: §13 itable dispatch of the element's own
+                        // `CompareTo` — the identical dispatch a written-out
+                        // `el.CompareTo(acc)` uses. `ep` and `accSlot` are slot
+                        // ADDRESSES, which is the thunk's ABI.
+                        cmp = builder_.CreateCall(ifaceCmpFn, {ep, accSlot},
+                                                  "mm.cmp");
                     } else {
                         std::vector<llvm::Value*> cargs{el, acc};
                         cmp = emitMethodCall(cmpMs, cargs, /*baseQualified=*/false);
@@ -2249,6 +2288,48 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                     builder_.SetInsertPoint(endBB);
                     freeLazyTemp();
                     return builder_.CreateLoad(ptrTy(), accSlot, "mm.r");
+                }
+                // fix #2770: a REFERENCE element (class or interface — both
+                // lower to a pointer) for which no comparator could be
+                // resolved must not fall through to the numeric path below.
+                // That path derives an i32 accumulator and folds the result
+                // with `icmp`, so it built `icmp ptr, i32` and LLVM's
+                // `ICmpInst::AssertOK` ABORTED the compiler — the ICE this
+                // issue reports. Sema's §5.1 gate scans the element's DIRECT
+                // AST base list for the NAME `IComparable` without checking
+                // its type argument or nullability, so it admits shapes the
+                // interface arm above correctly declines, and every one of
+                // them landed on that assertion. MEASURED to reach here:
+                //   * `Array<IFoo?>` — spec §14.2: "A type-bound constraint
+                //     — naming a class or interface — implies non-null T",
+                //     so a nullable element does not satisfy §5.1's
+                //     `where T: IComparable<T>`.
+                //   * `interface IG<T>: IComparable<IG<int>>` with element
+                //     `IG<string>` — §12.9, IComparable is INVARIANT, so this
+                //     does not satisfy the self-recurrence either.
+                // Reporting an Error and returning a type-correct null keeps
+                // the IR well-formed and ends the build with a diagnostic
+                // instead of an assertion failure. This can only affect
+                // programs that abort the compiler today: sema rejects a
+                // reference element whose type names no `IComparable` at all,
+                // so the residue reaching here is exactly the ICE set.
+                if (elemTypeRef &&
+                    elemTypeRef->kind == sema::TypeRef::Kind::Named &&
+                    elemTypeRef->declaration &&
+                    (elemTypeRef->declaration->kind == ast::TypeDeclKind::Class ||
+                     elemTypeRef->declaration->kind ==
+                         ast::TypeDeclKind::Interface)) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, call.span.begin,
+                        std::string(m) +
+                        "() without a selector requires the element type to "
+                        "satisfy `T: IComparable<T>` (stdlib §5.1 / spec "
+                        "§14.2 / #2770); `" +
+                        std::string(elemTypeRef->declaration->name) +
+                        "` does not — its `CompareTo` could not be resolved "
+                        "for dispatch. Use " + std::string(m) +
+                        "(selector: (T) -> U) instead.");
+                    return llvm::ConstantPointerNull::get(ptrTy());
                 }
             }
 
@@ -2286,7 +2367,25 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                             findMethodByName(uRef->declaration, "CompareTo"))
                         if (cm->params.size() == 1) uCmpMs = cm;
                 }
-                if (uIsStr || uCmpMs) {
+                // fix #2770: the SELECTOR sibling of the defect fixed above —
+                // the identical findMethodByName probe, so an INTERFACE
+                // projection U was equally invisible. stdlib §5 declares
+                //     public method Min<U>(selector: (T) -> U): U
+                //                                     where U: IComparable<U>
+                // so an interface U is admissible on exactly the §14.2 rule-3
+                // grounds. MEASURED: this site does not reach the `icmp`
+                // assertion — with U an interface the call degrades to the
+                // #2491 "return-value expression failed to lower" internal
+                // diagnostic instead — but the ROOT CAUSE is the same probe,
+                // and a class U at the same site compiles and runs correctly.
+                llvm::Function* uIfaceCmpFn = nullptr;
+                if (!uIsStr && !uCmpMs) {
+                    if (sema::MethodSymbol* ifm =
+                            selfComparableIfaceCompareTo(uRef))
+                        uIfaceCmpFn =
+                            ensureIfaceCmpThunk(uRef->declaration, ifm);
+                }
+                if (uIsStr || uCmpMs || uIfaceCmpFn) {
                     llvm::Value* closureP =
                         lowerLinqLambda(call.args[0].value.get(), uRef);
                     if (!closureP) return nullptr;
@@ -2299,6 +2398,10 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                            {ptrTy(), i64(), i64()});
                     auto* idxSlot = entryAlloca(i64());
                     auto* accSlot = entryAlloca(ptrTy());
+                    // fix #2770: scratch slot for the interface arm below (the
+                    // thunk takes slot addresses, not values). Unused by the
+                    // string / class arms.
+                    auto* pvSlot = entryAlloca(ptrTy());
                     // Seed the accumulator with selector(element[0]) and scan
                     // from index 1 (avoids comparing against a null accumulator).
                     llvm::Value* p0 = builder_.CreateCall(
@@ -2338,6 +2441,13 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                                 module_.get());
                         }
                         cmp = builder_.CreateCall(strcmpFn, {pvData, accData},
+                                                  "mm.cmp");
+                    } else if (uIfaceCmpFn) {
+                        // fix #2770: the thunk's ABI is slot ADDRESSES, and the
+                        // projection `pv` is a value, so spill it to an entry
+                        // alloca. `accSlot` already is such a slot.
+                        builder_.CreateStore(pv, pvSlot);
+                        cmp = builder_.CreateCall(uIfaceCmpFn, {pvSlot, accSlot},
                                                   "mm.cmp");
                     } else {
                         std::vector<llvm::Value*> cargs{pv, acc};
