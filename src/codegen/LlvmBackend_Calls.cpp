@@ -8175,6 +8175,38 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 "exposes no `CompareTo` reachable from here. (#2786)");
             return true;
         };
+        // fix #2788 (stdlib §2.2 / §4.4, spec §4.4, v0.240): a `decimal`
+        // argument. decimal is a numeric primitive with a total order, so §2.2's
+        // `where T: IComparable<T>` admits it — but it lowers to a STRUCT, not
+        // an LLVM integer or float, so it too fell into the float fallback and
+        // aborted on `CreateSIToFP` (measured, identical to #2785's string
+        // abort). This is the fourth category this family was found to be
+        // missing, after Interface (#2782), string (#2785) and the builtin
+        // interfaces (#2786).
+        //
+        // Reuses the runtime comparison every other decimal ordering already
+        // uses — `bz_decimal_cmp` on two struct slots, returning -1/0/+1, the
+        // same path a plain `x < 2m` takes (LlvmBackend_Exprs2.cpp:7431's
+        // decCmp). So Math.Min and the `<` operator agree by construction.
+        auto isDecimalArg = [&](const ast::Expr* e) -> bool {
+            const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+            return t && !t->nullable &&
+                   t->kind == sema::TypeRef::Kind::Primitive &&
+                   t->primitive == sema::PrimitiveType::Decimal;
+        };
+        // Fails CLOSED: a null result falls through to #2786's guard, which
+        // reports a spec-cited Error, rather than to the aborting SIToFP.
+        auto emitDecCmp = [&](llvm::Value* a, llvm::Value* b) -> llvm::Value* {
+            llvm::StructType* dst = decimalStructType();
+            if (!a || !b || !dst || a->getType() != dst || b->getType() != dst)
+                return nullptr;
+            llvm::AllocaInst* aSlot = entryAlloca(dst);
+            llvm::AllocaInst* bSlot = entryAlloca(dst);
+            builder_.CreateStore(a, aSlot);
+            builder_.CreateStore(b, bSlot);
+            auto* cmpFn = declareC("bz_decimal_cmp", i32(), {ptrTy(), ptrTy()});
+            return builder_.CreateCall(cmpFn, {aSlot, bSlot}, "mm.deccmp");
+        };
         auto emitCompareToCmp = [&](sema::MethodSymbol* cmpMs, llvm::Value* a,
                                     llvm::Value* b,
                                     const ast::Expr* recvExpr) -> llvm::Value* {
@@ -8448,6 +8480,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     llvm::Value* le = builder_.CreateICmpSLE(
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
                     return builder_.CreateSelect(le, a, b, "min.str.result");
+                } else if (llvm::Value* dcmp =
+                               isDecimalArg(call.args[0].value.get())
+                                   ? emitDecCmp(a, b) : nullptr) {
+                    // fix #2788 / stdlib §4.4: decimal ordering via bz_decimal_cmp.
+                    llvm::Value* le = builder_.CreateICmpSLE(
+                        dcmp, llvm::ConstantInt::get(dcmp->getType(), 0));
+                    return builder_.CreateSelect(le, a, b, "min.dec.result");
                 } else {
                     // fix #2786: fail CLOSED before the SIToFP below.
                     if (rejectNonNumericMathOperand(a) ||
@@ -8481,6 +8520,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     llvm::Value* ge = builder_.CreateICmpSGE(
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
                     return builder_.CreateSelect(ge, a, b, "max.str.result");
+                } else if (llvm::Value* dcmp =
+                               isDecimalArg(call.args[0].value.get())
+                                   ? emitDecCmp(a, b) : nullptr) {
+                    // fix #2788 / stdlib §4.4: decimal ordering via bz_decimal_cmp.
+                    llvm::Value* ge = builder_.CreateICmpSGE(
+                        dcmp, llvm::ConstantInt::get(dcmp->getType(), 0));
+                    return builder_.CreateSelect(ge, a, b, "max.dec.result");
                 } else {
                     // fix #2786: fail CLOSED before the SIToFP below.
                     if (rejectNonNumericMathOperand(a) ||
@@ -8566,6 +8612,28 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     cmpHi, llvm::ConstantInt::get(cmpHi->getType(), 0));
                 llvm::Value* inner = builder_.CreateSelect(gtHi, hi, val);
                 return builder_.CreateSelect(ltLo, lo, inner, "clamp.cmp.result");
+            } else if (isDecimalArg(call.args[0].value.get())) {
+                // fix #2788 / stdlib §4.4: decimal ordering via bz_decimal_cmp,
+                // same shape as the CompareTo arm above. Each comparison is
+                // emitted EXACTLY ONCE — testing emitDecCmp in the `else if`
+                // condition would emit its allocas and call and then emit them
+                // again in the body, leaving dead `bz_decimal_cmp` calls in the
+                // block.
+                llvm::Value* cmpLo = emitDecCmp(val, lo);
+                llvm::Value* cmpHi = emitDecCmp(val, hi);
+                // Fail CLOSED, and loudly: a null here means the operands did
+                // not carry the decimal struct layout after all, which must not
+                // become a silent zero/null result (#2491).
+                if (!cmpLo || !cmpHi) {
+                    rejectNonNumericMathOperand(val);
+                    return nullptr;
+                }
+                llvm::Value* ltLo = builder_.CreateICmpSLT(
+                    cmpLo, llvm::ConstantInt::get(cmpLo->getType(), 0));
+                llvm::Value* gtHi = builder_.CreateICmpSGT(
+                    cmpHi, llvm::ConstantInt::get(cmpHi->getType(), 0));
+                llvm::Value* inner = builder_.CreateSelect(gtHi, hi, val);
+                return builder_.CreateSelect(ltLo, lo, inner, "clamp.dec.result");
             } else if (isStringArg(call.args[0].value.get())) {
                 // fix #2785 / stdlib §9.6: ordinal string ordering, same shape
                 // as the CompareTo arm above.
