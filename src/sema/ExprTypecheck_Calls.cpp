@@ -12689,21 +12689,47 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 return;
             }
         }
-        // stdlib §10.3 / fix #985: RawBytes readonly properties. Length: int and
-        // Pointer: IntPtr. The RawBytes TypeRef carries declaration =
-        // builtinClassSym("RawBytes") (set by the RawBytes.From factory typing),
-        // so the ordinary member-lookup path never types these (no user TypeDecl).
-        // Without typing them here, the access fell through untyped and a
-        // `var p: IntPtr := rb.Pointer` would not see the IntPtr type.
+        // stdlib §10.1/§10.2/§10.3 (fix #985, #2825/#2810): the `Pointer: IntPtr`
+        // readonly property of the §10 FFI-boundary BUFFER classes. None of the
+        // three has a user TypeDecl, so the ordinary member-lookup path never
+        // types the bare (no-parens) property read; without typing it here the
+        // access falls through untyped and `var p: IntPtr := c.Pointer` never
+        // sees the IntPtr type.
+        //
+        // fix #2825 / #2810 (v0.240): this was `RawBytes`-only, on both axes —
+        // only one of the three §10 heads, and only ONE of the two TypeRef shapes
+        // a §10 builtin reaches sema in (see the `isFfiBuiltin` note at the
+        // `string.From` arm above: the FACTORY result carries declaration =
+        // builtinClassSym, the ANNOTATION `c: CString` on a parameter/field
+        // carries declaration = null and only the astNode head name). So
+        // `CString.Pointer` / `WString.Pointer` were untyped here and unlowered
+        // in codegen, and the read silently produced a NULL address — handed
+        // straight to C by stdlib §10.1's named consumer (`char*[]` argv-building
+        // over `OwningBuffer<IntPtr>`). Both axes are now read through ONE shared
+        // predicate rather than a per-arm enumeration, which is what produced
+        // this defect: the sibling `.Length` codegen arm already had all three.
         if (ma.target) {
             auto* tt = ctx_.exprType(*ma.target);
-            bool isRaw = tt && tt->kind == TypeRef::Kind::Named &&
-                tt->declaration && tt->declaration->name == "RawBytes";
-            if (isRaw && ma.member == "Length") {
-                ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
-                return;
+            // The both-shapes read, over `common::isFfiBufferBuiltinName` — the
+            // single home of the {CString, WString, RawBytes} set (#2809/#2757).
+            // Mirrors codegen's `Emitter::builtinTypeName`
+            // (LlvmBackend_Calls.cpp:374) branch for branch, INCLUDING its
+            // user-type exclusion: a `declaration` with a non-null `decl` is a
+            // real user `TypeDecl`, so a user-declared `class CString` with its
+            // own `Pointer` member keeps its own typing and is not claimed here.
+            // `headName()` is the alias-transparent accessor and already falls
+            // back to the metadata `importedName` for a cross-module TypeRef
+            // with no astNode, so a cross-module receiver matches too.
+            bool isFfiBuf = false;
+            if (tt && tt->kind == TypeRef::Kind::Named) {
+                std::string_view bn;
+                if (!tt->declaration)
+                    bn = tt->headName();
+                else if (!tt->declaration->decl)   // builtinClassSym
+                    bn = tt->declaration->name;
+                isFfiBuf = common::isFfiBufferBuiltinName(bn);
             }
-            if (isRaw && ma.member == "Pointer") {
+            if (isFfiBuf && ma.member == "Pointer") {
                 // IntPtr: a Named type resolved by name (no user TypeDecl); codegen
                 // lowers it to a pointer-sized integer (§32.7).
                 auto* ip = ctx_.makeTypeRef();
@@ -12715,6 +12741,18 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 ann->name.reset(nm);
                 ip->astNode = ann;
                 ctx_.setExprType(&ma, ip);
+                return;
+            }
+            // §10.3 `Length: int` — deliberately left on the RawBytes-only,
+            // declaration-only test it has carried since #985. Widening it is a
+            // separate, larger change than #2825's `Pointer` defect: `CString`/
+            // `WString` `.Length` is untyped in sema today (codegen lowers it
+            // correctly via strlen / bz_wstrlen), and giving it a type changes
+            // what the §5.1 no-implicit-conversion rule sees at every existing
+            // use site. Measured, not inferred, and filed rather than folded in.
+            if (tt && tt->kind == TypeRef::Kind::Named && tt->declaration &&
+                tt->declaration->name == "RawBytes" && ma.member == "Length") {
+                ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                 return;
             }
         }

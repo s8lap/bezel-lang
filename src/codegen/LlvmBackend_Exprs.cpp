@@ -2888,23 +2888,58 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             }
         }
     }
-    // stdlib §10.3 / fix #985: RawBytes.Pointer — the underlying buffer address
-    // as an IntPtr (i64 on the host). Reads the `ptr` field of the { ptr, len }
-    // struct (bz_rawbytes_ptr) and converts it to a pointer-sized integer, which
-    // is the codegen representation of IntPtr (§32.7). Valid until disposal.
+    // stdlib §10.1/§10.2/§10.3 (fix #985, #2825/#2810): the `Pointer` readonly
+    // property of the THREE §10 FFI-boundary buffer classes — the underlying
+    // buffer address as an IntPtr (i64 on the host, §32.7).
+    //
+    // fix #2825 / #2810 (v0.240): this arm used to test `RawBytes` ALONE, so
+    // `CString.Pointer` and `WString.Pointer` had no lowering at all: the read
+    // fell through to CG8's permissive member fall-through and the slot degraded
+    // to zero (#2547/#2434), handing the program a NULL address behind two
+    // `internal:` WARNINGS — the compile succeeded. That is the worst failure
+    // mode this member has, because stdlib §10.1 names the consumer: `Pointer`
+    // is "the element source for `char*[]` argv-building over
+    // `OwningBuffer<IntPtr>`", so the null is not caught on the Bezel side at
+    // all — it is dereferenced in C. Enumerating the three heads per-arm is what
+    // produced the defect (`.Length` directly above already had all three), so
+    // the family test is now the shared registry predicate, once.
+    //
+    // Lifetime, per spec §32.10 (v0.240) verbatim: "For addresses of Bezel-owned
+    // mutable storage (`RawBytes.Pointer`, `CString`/`WString.Pointer`,
+    // `OwningBuffer<T>.DangerousPointer()` — stdlib §10, §4.14): native retention
+    // of such an address past the synchronous call is a use-after-free hazard no
+    // rule in this chapter can track — validity ends at a disposal the native
+    // side is never told about." So the address is an ALIAS of the receiver's
+    // buffer, never a fresh allocation: nothing here is owned, nothing here is
+    // freed, and a read after the owner's disposal is the programmer's §32.10
+    // obligation, not a rule the compiler enforces (§32.12 item 7: "every
+    // address the language exposes is stable until its owner's disposal").
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "Pointer") {
             auto* tt = ctx_.exprType(*ma->target);
-            // fix #2809: both TypeRef shapes (see the `.Length` arm above).
-            bool isRaw = builtinTypeName(tt) == "RawBytes" &&
-                isFfiBufferTypeRef(tt);
-            if (isRaw) {
-                llvm::Value* rb = lowerExpr(*ma->target);
-                if (!rb) return nullptr;
-                auto* fn = declareC("bz_rawbytes_ptr", ptrTy(), {ptrTy()});
-                llvm::Value* p = builder_.CreateCall(fn, {rb}, "raw.ptr");
+            // fix #2809: both TypeRef shapes (see the `.Length` arm above) —
+            // `isFfiBufferTypeRef` reads the set through `builtinTypeName`, the
+            // accessor that handles the FACTORY result (`CString.From(s)`,
+            // declaration = builtinClassSym) and the ANNOTATION (`c: CString` on
+            // a parameter/field, declaration = null) alike.
+            if (isFfiBufferTypeRef(tt)) {
+                llvm::Value* buf = lowerExpr(*ma->target);
+                if (!buf) return nullptr;
+                llvm::Value* p;
+                if (builtinTypeName(tt) == "RawBytes") {
+                    // §10.3: the value is a { ptr, len } struct — read field 0.
+                    auto* fn = declareC("bz_rawbytes_ptr", ptrTy(), {ptrTy()});
+                    p = builder_.CreateCall(fn, {buf}, "raw.ptr");
+                } else {
+                    // §10.1/§10.2: a CString is a bare null-terminated char*
+                    // and a WString a bare null-terminated uint16_t*
+                    // (bz_string_to_utf8z / bz_string_to_utf16z /
+                    // bz_cstring_from_bytes each return the malloc'd buffer
+                    // itself). The runtime value IS the address — no helper.
+                    p = buf;
+                }
                 // §32.7: IntPtr is a pointer-sized integer (i64 host).
-                return builder_.CreatePtrToInt(p, i64(), "raw.ptr.i");
+                return builder_.CreatePtrToInt(p, i64(), "ffi.ptr.i");
             }
         }
     }
