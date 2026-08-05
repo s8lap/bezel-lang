@@ -8127,6 +8127,54 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             }
             return builder_.CreateCall(strcmpFn, {aData, bData}, "mm.strcmp");
         };
+        // fix #2786 (stdlib §2.2, spec §14.2, v0.240): the float fallback below
+        // is reached by anything the integer, CompareTo (#1141/#1148/#2782) and
+        // string (#2785) arms all declined. It immediately does
+        // `CreateSIToFP(v, double)`, which ABORTS the compiler outright on a
+        // POINTER operand ("SIToFP source must be integer or integer vector").
+        //
+        // This guard is deliberately CATEGORY-BLIND — it tests the lowered LLVM
+        // type rather than enumerating the source categories that may reach it.
+        // Enumerating is what produced this family in the first place: the kind
+        // tests listed Record|Enum|Class and were then found to be missing
+        // Interface (#2782), string (#2785), and now the builtin interfaces.
+        // Any operand that is not numeric cannot satisfy §2.2's
+        // `where T: IComparable<T>` in a form this lowering can compare, so the
+        // honest answer is a spec-cited Error, not an assertion failure.
+        //
+        // The known reacher is a BUILTIN interface argument (`IDisposable`).
+        // ROOT CAUSE, recorded here because the guard only contains it: the
+        // whitelist at TypeResolution_Names.cpp:1511 attaches a real synthesized
+        // Interface TypeSymbol to `IComparable`/`IEquatable`/`IEqualityComparer`/
+        // `IReadOnlySpan`/`INumber`/`ISteppable`/`IParsable` — and NOT to
+        // `IDisposable`, whose TypeRefs therefore carry no `declaration` at all.
+        // Every gate in this family keys on `declaration`, which is why the same
+        // blind spot shows up as #2784 (the §5.1 gate bypassed for
+        // `Array<IDisposable>`) and #2766 (no `resolvedDeclType`, so a thunk
+        // signature fell back to an i32 placeholder). Adding IDisposable to that
+        // whitelist would close all three at the source, but it changes the
+        // symbol representation of the type the whole §28 disposal machinery is
+        // built on — out of scope for a bug fix, filed instead.
+        auto rejectNonNumericMathOperand = [&](llvm::Value* v) -> bool {
+            if (!v) return false;
+            if (v->getType()->isIntegerTy() || v->getType()->isFloatingPointTy())
+                return false;
+            // ⚠ The message must NOT claim the argument type HAS no ordering.
+            // It reaches here whenever this lowering could not find one, and
+            // those are different claims: `decimal` also lands here (measured —
+            // it aborted identically before this guard), yet stdlib §4.4 gives
+            // it a perfectly good ordering that Math simply has no arm for.
+            // Filed as its own defect; an inaccurate diagnostic would be a poor
+            // trade for an assertion failure.
+            ctx_.diagnostics().report(
+                Severity::Error, call.span.begin,
+                "`Math." + std::string(m) +
+                "` could not lower a comparison for this argument type "
+                "(stdlib §2.2 requires `where T: IComparable<T>`): it is not a "
+                "numeric primitive this intrinsic handles, not `string`, and "
+                "exposes no `CompareTo` reachable from here. (#2786)");
+            return true;
+        };
         auto emitCompareToCmp = [&](sema::MethodSymbol* cmpMs, llvm::Value* a,
                                     llvm::Value* b,
                                     const ast::Expr* recvExpr) -> llvm::Value* {
@@ -8401,6 +8449,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
                     return builder_.CreateSelect(le, a, b, "min.str.result");
                 } else {
+                    // fix #2786: fail CLOSED before the SIToFP below.
+                    if (rejectNonNumericMathOperand(a) ||
+                        rejectNonNumericMathOperand(b))
+                        return nullptr;
                     // float/double: use llvm.minnum intrinsic
                     auto* dbl = llvm::Type::getDoubleTy(llvm_);
                     if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
@@ -8430,6 +8482,10 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
                     return builder_.CreateSelect(ge, a, b, "max.str.result");
                 } else {
+                    // fix #2786: fail CLOSED before the SIToFP below.
+                    if (rejectNonNumericMathOperand(a) ||
+                        rejectNonNumericMathOperand(b))
+                        return nullptr;
                     auto* dbl = llvm::Type::getDoubleTy(llvm_);
                     if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
                     if (!b->getType()->isDoubleTy()) b = builder_.CreateSIToFP(b, dbl);
@@ -8523,6 +8579,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 llvm::Value* inner = builder_.CreateSelect(gtHi, hi, val);
                 return builder_.CreateSelect(ltLo, lo, inner, "clamp.str.result");
             } else {
+                // fix #2786: fail CLOSED before the SIToFP below.
+                if (rejectNonNumericMathOperand(val) ||
+                    rejectNonNumericMathOperand(lo) ||
+                    rejectNonNumericMathOperand(hi))
+                    return nullptr;
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
                 if (!val->getType()->isDoubleTy()) val = builder_.CreateSIToFP(val, dbl);
                 if (!lo->getType()->isDoubleTy())  lo  = builder_.CreateSIToFP(lo, dbl);
