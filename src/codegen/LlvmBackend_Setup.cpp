@@ -3478,10 +3478,36 @@ void Emitter::declareVtables() {
         bool exportedDesc = ts->visibility == ast::Visibility::Public &&
                             (ts->genericParams.empty() ||
                              ts->kind == ast::TypeDeclKind::Interface);
+        // fix #2776 (spec §2.8.3 rule 5, §2.5, v0.240): a SYNTHESIZED BUILTIN
+        // interface's descriptor is emitted by EVERY module that mentions it —
+        // the symbol is compiler-provided, not owned by any one artifact — so a
+        // strong definition collides at link time ("multiple definition of
+        // `td$IComparable'") as soon as two linked modules both name it. That
+        // became reachable when the loader started resolving an IMPORTED
+        // occurrence to the same builtin symbol (the #2776 identity fix), which
+        // makes the consumer emit its own copy alongside the dependency's.
+        //
+        // linkonce_odr is what §2.8.3 rule 5 actually asks for: "a process
+        // contains exactly one copy of each module's code and, for each type …
+        // exactly one static state and one RUNTIME IDENTITY, regardless of link
+        // mode". Merging duplicate identical definitions is precisely that
+        // guarantee; keeping N strong copies is what would violate it. The ODR
+        // precondition holds by construction — the definition is generated from
+        // the one synthesized TypeSymbol, so every copy is identical.
+        //
+        // Detected by IDENTITY against builtinInterfaceSym (#1867's convention),
+        // never by name, so a USER interface that happens to be called
+        // `IComparable` keeps ordinary external linkage.
+        bool synthesizedBuiltinIface =
+            ts->kind == ast::TypeDeclKind::Interface && !ts->name.empty() &&
+            sema::SemaContext::isSynthesizedBuiltinInterfaceName(ts->name) &&
+            ts == ctx_.builtinInterfaceSym(ts->name);
         descArray_[ts] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
-            exportedDesc ? llvm::GlobalValue::ExternalLinkage
-                         : llvm::GlobalValue::InternalLinkage,
+            synthesizedBuiltinIface
+                ? llvm::GlobalValue::LinkOnceODRLinkage
+                : (exportedDesc ? llvm::GlobalValue::ExternalLinkage
+                                : llvm::GlobalValue::InternalLinkage),
             nullptr, "td$" + mangledTypeName(ts));
     }
     // §2.5 / §2.6 / §12 (issue #328 / #103): declare EXTERNAL descriptor globals

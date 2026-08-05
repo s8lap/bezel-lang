@@ -185,6 +185,37 @@ struct Loader {
                 // type name branch, independent of astNode/declaration).
                 if (ref->declaration == nullptr && !mt.namedName.empty())
                     ref->importedName = ctx.internString(mt.namedName);
+                // fix #2776 (spec §14.2 rule 3, §2.5, v0.240): give an IMPORTED
+                // occurrence of a synthesized builtin interface the SAME
+                // TypeSymbol identity a local occurrence gets.
+                //
+                // `lookupNamed` searches the dependency's exported user types,
+                // and `IComparable` is not one — it is compiler-synthesized —
+                // so the base recorded for an imported `interface IRank:
+                // IComparable<IRank>` came back with `declaration == nullptr`.
+                // MEASURED with a two-module build (`bezelc -c lib.bzl` then
+                // `--import lib.o app.bzl`): the base's head is `IComparable`
+                // but its declaration is nil while the local builtin symbol is
+                // a real pointer, so #1867's IDENTITY test — which
+                // TypeResolution_Checks.cpp's selfComparableIface applies, and
+                // which exists because "blanket-accepting by decl/name was too
+                // lenient" — could never match. The consequence was that
+                // `Array<IRank>.Sort()/.Min()/.Max()` and `Math.Min` all
+                // silently declined a document-admissible CROSS-MODULE element,
+                // the limit recorded on #2776 and noted in
+                // selfComparableIfaceCompareTo's header.
+                //
+                // Resolving to `builtinInterfaceSym` here fixes it once for
+                // EVERY consumer of that identity rather than per call site —
+                // which is the point of #2787 having collapsed the predicate to
+                // a single definition. The name set is
+                // SemaContext::isSynthesizedBuiltinInterfaceName, the same
+                // closed list the local name-resolution site uses, so the two
+                // cannot drift.
+                if (ref->declaration == nullptr && !mt.namedName.empty() &&
+                    sema::SemaContext::isSynthesizedBuiltinInterfaceName(
+                        mt.namedName))
+                    ref->declaration = ctx.builtinInterfaceSym(mt.namedName);
                 for (const MetaType& ga : mt.genericArgs)
                     ref->genericArgs.push_back(convert(ga));
                 break;

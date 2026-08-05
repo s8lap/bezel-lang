@@ -1508,16 +1508,18 @@ void Resolver::resolveNamed(const ast::Type& t, Scope* scope, TypeRef& ref) {
                 // — usable as a field/parameter/return/local value type, not just
                 // a `where` bound. The arity check above (still) diagnoses wrong
                 // arity; this only attaches the declaration when name+arity valid.
-                if (first == "IComparable" || first == "IEquatable" ||
-                    first == "IEqualityComparer" || first == "IReadOnlySpan" ||
-                    // stdlib §2.19 / §11.8 (v0.176, #807): the static-
-                    // abstraction interfaces get a real synthesized Interface
-                    // TypeSymbol so `: INumber<Meters>` conformance and
-                    // `where T: INumber<T>` bounds resolve to a declaration
-                    // whose (static) member signatures drive the §11.8
-                    // conformance check and T.Member dispatch.
-                    first == "INumber" || first == "ISteppable" ||
-                    first == "IParsable") {
+                // stdlib §2.19 / §11.8 (v0.176, #807) covers the static-
+                // abstraction members of that set (INumber/ISteppable/
+                // IParsable): they get a real synthesized Interface TypeSymbol
+                // so `: INumber<Meters>` conformance and `where T: INumber<T>`
+                // bounds resolve to a declaration whose (static) member
+                // signatures drive the §11.8 conformance check and T.Member
+                // dispatch.
+                // #2776: the set now lives in ONE place
+                // (SemaContext::isSynthesizedBuiltinInterfaceName) because the
+                // module loader must recognise exactly the same names to give
+                // an IMPORTED occurrence the same identity.
+                if (SemaContext::isSynthesizedBuiltinInterfaceName(first)) {
                     ref.declaration = ctx_.builtinInterfaceSym(first);
                 }
                 return;

@@ -538,6 +538,19 @@ public:
     // Returns nullptr for any non-builtin-interface name.
     TypeSymbol* builtinInterfaceSym(std::string_view name);
 
+    // #2776 / #2787: the CLOSED set of builtin interfaces that get a REAL
+    // synthesized Interface TypeSymbol (see TypeResolution_Names.cpp's
+    // name-resolution site for why each is on the list). Factored into one
+    // predicate rather than copied, because #1867's convention is that these
+    // are matched by IDENTITY against `builtinInterfaceSym` — so every place
+    // that must produce or recognise that identity has to agree on the same
+    // set, and a second hand-written copy is how they drift apart (#2787).
+    static bool isSynthesizedBuiltinInterfaceName(std::string_view n) {
+        return n == "IComparable" || n == "IEquatable" ||
+               n == "IEqualityComparer" || n == "IReadOnlySpan" ||
+               n == "INumber" || n == "ISteppable" || n == "IParsable";
+    }
+
     // §26.5 (#714): store/retrieve the free-type-variable binding that was
     // inferred when a generic extension method matched via ancestor lookup.
     // `e` is the MemberAccessExpr node of the member access (the `.MyCount`
