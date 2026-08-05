@@ -8078,6 +8078,55 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 return ifm;
             return nullptr;
         };
+        // fix #2785 (stdlib §2.2 / §9.6, spec §4.6, v0.240): is this argument a
+        // non-null `string`? stdlib §9.6 declares
+        //     public class String: IEnumerable<char>, IComparable<string>,
+        //                          IEquatable<string>
+        // so string satisfies §2.2's `where T: IComparable<T>` and
+        // `Math.Min("b", "a")` is document-admissible. It was not admitted by
+        // `comparableCompareTo` (string is none of Record/Enum/Class and has no
+        // MethodSymbol to return), so the Min/Max/Clamp arms fell through to
+        // the FLOAT path and `CreateSIToFP` was handed a POINTER — the compiler
+        // ABORTED with "SIToFP source must be integer or integer vector".
+        //
+        // A NULLABLE `string?` TypeRef is accepted here as well, and that is
+        // deliberate rather than an oversight: §7.4 narrowing does NOT rewrite
+        // the variable's exprType (ExprTypecheck_impl.hpp:146 — "the declared
+        // (nullable) type is preserved so codegen's nullable-value layout logic
+        // … stays correct"), so a `string?` PROVEN non-null by `if p <> null`
+        // still presents as nullable here. Requiring non-null would abort the
+        // compiler on legal narrowed code. Safety comes from the paired sema
+        // gate, which rejects an UN-narrowed `string?` argument outright, and
+        // from `emitStrCmp`, which fails closed unless both operands lowered to
+        // pointers — `string?` shares `string`'s plain-pointer representation
+        // (verified by measuring the narrowed shape end-to-end, not assumed).
+        auto isStringArg = [&](const ast::Expr* e) -> bool {
+            const sema::TypeRef* t = e ? ctx_.exprType(*e) : nullptr;
+            return t && t->kind == sema::TypeRef::Kind::Primitive &&
+                   t->primitive == sema::PrimitiveType::String;
+        };
+        // fix #2785: ORDINAL comparison on the two data pointers — the same
+        // lowering `Array<string>.Min()` already uses (tryLowerCollectionInstanceCall's
+        // `isStrElem` arm), so `Math.Min` and the collection form agree by
+        // construction. stdlib §9.6 fixes string ordering as ordinal.
+        auto emitStrCmp = [&](llvm::Value* a, llvm::Value* b) -> llvm::Value* {
+            if (!a || !b || !a->getType()->isPointerTy() ||
+                !b->getType()->isPointerTy())
+                return nullptr;
+            llvm::Value* aData = builder_.CreateLoad(
+                ptrTy(), builder_.CreateStructGEP(stringType(), a, 0));
+            llvm::Value* bData = builder_.CreateLoad(
+                ptrTy(), builder_.CreateStructGEP(stringType(), b, 0));
+            auto* strcmpFn = module_->getFunction("strcmp");
+            if (!strcmpFn) {
+                auto* ft =
+                    llvm::FunctionType::get(i32(), {ptrTy(), ptrTy()}, false);
+                strcmpFn = llvm::Function::Create(
+                    ft, llvm::Function::ExternalLinkage, "strcmp",
+                    module_.get());
+            }
+            return builder_.CreateCall(strcmpFn, {aData, bData}, "mm.strcmp");
+        };
         auto emitCompareToCmp = [&](sema::MethodSymbol* cmpMs, llvm::Value* a,
                                     llvm::Value* b,
                                     const ast::Expr* recvExpr) -> llvm::Value* {
@@ -8344,6 +8393,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     llvm::Value* le = builder_.CreateICmpSLE(
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
                     return builder_.CreateSelect(le, a, b, "min.cmp.result");
+                } else if (isStringArg(call.args[0].value.get())) {
+                    // fix #2785 / stdlib §9.6: ordinal string ordering.
+                    llvm::Value* cmp = emitStrCmp(a, b);
+                    if (!cmp) return nullptr;
+                    llvm::Value* le = builder_.CreateICmpSLE(
+                        cmp, llvm::ConstantInt::get(cmp->getType(), 0));
+                    return builder_.CreateSelect(le, a, b, "min.str.result");
                 } else {
                     // float/double: use llvm.minnum intrinsic
                     auto* dbl = llvm::Type::getDoubleTy(llvm_);
@@ -8366,6 +8422,13 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     llvm::Value* ge = builder_.CreateICmpSGE(
                         cmp, llvm::ConstantInt::get(cmp->getType(), 0));
                     return builder_.CreateSelect(ge, a, b, "max.cmp.result");
+                } else if (isStringArg(call.args[0].value.get())) {
+                    // fix #2785 / stdlib §9.6: ordinal string ordering.
+                    llvm::Value* cmp = emitStrCmp(a, b);
+                    if (!cmp) return nullptr;
+                    llvm::Value* ge = builder_.CreateICmpSGE(
+                        cmp, llvm::ConstantInt::get(cmp->getType(), 0));
+                    return builder_.CreateSelect(ge, a, b, "max.str.result");
                 } else {
                     auto* dbl = llvm::Type::getDoubleTy(llvm_);
                     if (!a->getType()->isDoubleTy()) a = builder_.CreateSIToFP(a, dbl);
@@ -8447,6 +8510,18 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     cmpHi, llvm::ConstantInt::get(cmpHi->getType(), 0));
                 llvm::Value* inner = builder_.CreateSelect(gtHi, hi, val);
                 return builder_.CreateSelect(ltLo, lo, inner, "clamp.cmp.result");
+            } else if (isStringArg(call.args[0].value.get())) {
+                // fix #2785 / stdlib §9.6: ordinal string ordering, same shape
+                // as the CompareTo arm above.
+                llvm::Value* cmpLo = emitStrCmp(val, lo);
+                llvm::Value* cmpHi = emitStrCmp(val, hi);
+                if (!cmpLo || !cmpHi) return nullptr;
+                llvm::Value* ltLo = builder_.CreateICmpSLT(
+                    cmpLo, llvm::ConstantInt::get(cmpLo->getType(), 0));
+                llvm::Value* gtHi = builder_.CreateICmpSGT(
+                    cmpHi, llvm::ConstantInt::get(cmpHi->getType(), 0));
+                llvm::Value* inner = builder_.CreateSelect(gtHi, hi, val);
+                return builder_.CreateSelect(ltLo, lo, inner, "clamp.str.result");
             } else {
                 auto* dbl = llvm::Type::getDoubleTy(llvm_);
                 if (!val->getType()->isDoubleTy()) val = builder_.CreateSIToFP(val, dbl);

@@ -8227,6 +8227,51 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
                         ma->target.get())) {
                     if (tid->name == "Math") {
+                        // fix #2785 (stdlib §2.2 / §9.6, spec §14.2, v0.240): a
+                        // NULLABLE string argument. §14.2: "nullable types do
+                        // not themselves implement the interfaces of their
+                        // non-nullable counterparts: a `null` value satisfies
+                        // no interface contract" — so `string?` does not
+                        // satisfy §2.2's `where T: IComparable<T>` and this
+                        // must be REJECTED. The #1215 check just below applies
+                        // the same rule, but only to a record/enum/class/
+                        // interface argument (it requires a `declaration`),
+                        // and `string` is a PRIMITIVE TypeRef with none — so a
+                        // `string?` argument fell past every gate into the
+                        // float path and ABORTED the compiler on `CreateSIToFP`
+                        // of a pointer, the same abort the non-null string case
+                        // produced before this fix.
+                        // ⚠ §7.4 narrowing must be consulted explicitly here.
+                        // `nullNarrowed_` deliberately does NOT rewrite the
+                        // variable's exprType ("the declared (nullable) type is
+                        // preserved so codegen's nullable-value layout logic
+                        // stays correct"), so a `string?` PROVEN non-null by
+                        // `if p <> null then …` still reports a nullable
+                        // exprType. Rejecting on exprType alone would therefore
+                        // reject legal narrowed code — MEASURED: it did, before
+                        // this guard was added. Same shape as the
+                        // `narrowedPresent` test at ExprTypecheck_Exprs.cpp:3870.
+                        auto narrowedNonNull = [&](const ast::Expr* e) -> bool {
+                            if (auto* id =
+                                    dynamic_cast<const ast::IdentifierExpr*>(e))
+                                if (Symbol* s = ctx_.exprSymbol(*id))
+                                    return nullNarrowed_.count(s) > 0;
+                            return false;
+                        };
+                        if (auto* sTy = ctx_.exprType(*ce.args[0].value))
+                            if (sTy->nullable &&
+                                sTy->kind == TypeRef::Kind::Primitive &&
+                                sTy->primitive == PrimitiveType::String &&
+                                !narrowedNonNull(ce.args[0].value.get())) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    "nullable type `string?` does not satisfy "
+                                    "the `where T: IComparable<T>` constraint "
+                                    "— nullable types do not implement "
+                                    "interface constraints (§14.2); narrow it "
+                                    "to `string` before calling `Math." +
+                                    std::string(ma->member) + "` (stdlib §2.2)");
+                            }
                         if (auto* argTy = ctx_.exprType(*ce.args[0].value))
                             if (argTy->kind == TypeRef::Kind::Named &&
                                 argTy->declaration &&
