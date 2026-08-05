@@ -22253,9 +22253,47 @@ void Emitter::setupBoxDescriptors() {
         std::vector<std::pair<const sema::TypeSymbol*,
                               std::vector<const sema::TypeRef*>>>>
         extraInstOf;
-    for (const auto& sym : ctx_.symbols()) {
-        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
-        if (!ts) continue;
+    // fix #2796 (§8.6 / §2.5 / §2.8.3 rule 4, v0.240): the set of record/enum
+    // TypeSymbols this module must be able to BOX is NOT "the ones it declares".
+    // §8.6 attaches boxing to the USE — "When a value type is used where `Object`
+    // (or an interface implemented by the value type) is expected, the value is
+    // **boxed**: a heap-allocated wrapper holds the value." — and §2.5 makes an
+    // imported type's use ordinary. A module that `import`s a record and then
+    // writes `var o: Object := p;` boxes it HERE, in this artifact, so the
+    // descriptor + box vtable have to exist HERE.
+    //
+    // Imported symbols are owned in a list SEPARATE from ctx_.symbols() (see
+    // SemaContext.hpp, whose comment there explains the separation exists so
+    // codegen never tries to emit a BODY for an externally-defined symbol), so
+    // this loop simply never saw them: descArray_/boxVtable_ had no
+    // entry for an imported record, boxVtableFor returned null, and boxValue's
+    // `if (!vt) return value;` made the box a SILENT NO-OP. The record's raw
+    // bytes were then stored into the Object local and the §28.9 box-release
+    // that lowerLocalDecl emits for that slot (gated on isBoxableValueType,
+    // which DOES answer true for the imported record) loaded the first 8 bytes
+    // of the record — `x=3, y=4` → 0x0000000400000003 — and handed them to
+    // bz_box_release: SIGSEGV.
+    //
+    // The enumeration, not a per-type predicate, is what was local-only, so the
+    // fix is to widen the enumeration and leave every gate below untouched:
+    // whatever a local record/enum gets, an imported one now gets by the same
+    // code on the same terms (Pass B's chain, Pass C's itable/thunks/vtable).
+    //
+    // ⚠ SCOPE, measured on both sides. This gives the CONSUMER a box identity
+    // for an imported record; a value the DEPENDENCY boxed still carries the
+    // dependency's own INTERNAL-linkage `bvt$box$<R>`, which no consumer can
+    // name, so cross-artifact box identity (#2797) is unchanged and still needs
+    // a linkage/ABI decision. #2798 (imported GENERIC class `is`) is a distinct
+    // descriptor-identity defect and is also unchanged.
+    std::vector<const sema::TypeSymbol*> boxCandidates;
+    for (const auto& sym : ctx_.symbols())
+        if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get()))
+            boxCandidates.push_back(ts);
+    if (ctx_.hasImports())
+        for (sema::Symbol* sym : ctx_.importedSymbols())
+            if (auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym))
+                boxCandidates.push_back(ts);
+    for (const sema::TypeSymbol* ts : boxCandidates) {
         if (ts->kind != ast::TypeDeclKind::Record &&
             ts->kind != ast::TypeDeclKind::Enum)
             continue;
