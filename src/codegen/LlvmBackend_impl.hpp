@@ -10243,6 +10243,24 @@ private:
     // Returns an empty string_view if the TypeRef is not a builtin named type.
     static std::string_view builtinTypeName(const sema::TypeRef* rt);
 
+    // fix #2809 / spec §32.5 / stdlib §10.1–§10.3 (v0.240): is `rt` one of the
+    // three FFI-boundary BUFFER classes (`CString` / `WString` / `RawBytes`)?
+    //
+    // ⚠ Deliberately routed through `builtinTypeName`, which sees BOTH TypeRef
+    // shapes a §10 builtin reaches codegen in — the FACTORY result
+    // (`CString.From(s)`, declaration = builtinClassSym) and the ANNOTATION
+    // (`c: CString` on a parameter or field, declaration = null, head name
+    // only; TypeResolution_Names.cpp resolves the §10 names to a
+    // null-declaration Named ref). The difference is invisible at the source
+    // level, so a `declaration->name == "CString"` test — which is what every
+    // §10 member handler used before #2809 — silently covers only the factory
+    // spelling; the annotation spelling then falls through to the
+    // declaration-less `.Length` STRING fallback and reads a raw `char*`
+    // buffer at `%bz.string` field 1 (a heap-buffer-overflow, #2809). Sema
+    // already reads the two shapes together the same way (`builtinInstName` in
+    // ExprTypecheck_Calls.cpp, and #2734's `isFfiBuiltin`).
+    static bool isFfiBufferTypeRef(const sema::TypeRef* rt);
+
     // fix #568: is `name` a BUILTIN type name that lowerTypeRef recognizes (a
     // collection / interface / task / FFI / value builtin / exception), as
     // opposed to a user-chosen generic type PARAMETER? A bare single-part Named

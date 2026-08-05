@@ -85,6 +85,23 @@ bool isDictionaryName(std::string_view n);
 // bz_llist_t*-backed collections.  Backs isLinkedListTypeName. // per §4.6/§4.7
 bool isLinkedListName(std::string_view n);
 
+// #2809 / spec §32.5 / stdlib §10.1–§10.3: the three FFI-boundary BUFFER
+// classes — `CString`, `WString`, `RawBytes`. Each is a raw malloc'd buffer
+// (or, for RawBytes, a { ptr, len } struct over one), NOT a `%bz.string` and
+// NOT an object with a header, so any handler that reaches into one at a
+// `%bz.string` field offset reads out of bounds.
+//
+// This is the set the member-access handlers in `LlvmBackend_Exprs.cpp` must
+// recognise BEFORE the declaration-less `.Length` string fallback claims the
+// receiver: `isStringFallbackTarget` is a negative list ("not StringBuilder,
+// not Buffer, not FileStream, not a collection → assume `%bz.string`"), and
+// these three were its fifth missing category (#2809: a `c: CString` parameter
+// read `c.Length` as a `%bz.string` length field → heap-buffer-overflow).
+// The FFI value TYPES `IntPtr`/`UIntPtr` are deliberately NOT here: they are
+// pointer-sized integers, not buffers, and no member handler dereferences one.
+// per §32.5 / stdlib §10.1–§10.3
+bool isFfiBufferBuiltinName(std::string_view n);
+
 // The heap-pointer reference builtins shared by BOTH codegen representation
 // paths (the astNode-name path and the imported-name path in
 // LlvmBackend_Layout.cpp): collections, iteration/collection interfaces, task

@@ -5212,6 +5212,28 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                     v = lowerExpr(*ne.args[ai].value);
                 }
                 if (!v) { ok = false; break; }
+                // fix #2809 / §28.3 *Unbound owned temporaries* + §32.6
+                // (v0.240): the third argument-building site that needed the
+                // FFI-buffer temporary's reclaim — `new ImportedT(
+                // CString.From(s))`. Like lowerCall's imported-method arm, this
+                // path is hand-rolled because an imported ctor has no
+                // reconstructed AST (`buildOrderedArgs` cannot run), so it
+                // missed the registration the in-module ctor gets for free.
+                // Measured before this: 17 B leaked per construction.
+                // Same predicate, same `owned`-transfer exclusion (the callee
+                // takes the obligation, §28.3 transfer — reclaiming here would
+                // double-free).
+                if (!isByRefMod(formalMod) &&
+                    !isByRefMod(ne.args[ai].modifier) &&
+                    ne.args[ai].modifier != "owned" && formalMod != "owned") {
+                    bool argIsRawBytes = false;
+                    if (isFfiBufferFactoryCall(*ne.args[ai].value,
+                                               argIsRawBytes)) {
+                        auto* tmpSlot = entryAllocaNullPtr();
+                        builder_.CreateStore(v, tmpSlot);
+                        registerFfiExprTemp(tmpSlot, argIsRawBytes);
+                    }
+                }
                 // §5.1: widen an int argument to a wider numeric parameter, as
                 // the in-module ctor-call path does, so the ABI matches.
                 if (ai + 1 < fnTy->getNumParams())

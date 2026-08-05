@@ -132,6 +132,25 @@ BEZEL_TEST(builtin_registry_snapshot, linked_list_set) {
         BEZEL_EXPECT_FALSE(isLinkedListName(n));
 }
 
+// --- isFfiBufferBuiltinName (#2809 / §32.5 / stdlib §10.1–§10.3): the three
+// FFI-boundary BUFFER classes, the set every §10 member handler must recognise
+// BEFORE the declaration-less `.Length` STRING fallback claims the receiver.
+// A name MISSING here is a `%bz.string` field-1 read off a raw malloc'd buffer
+// (#2809's ASan heap-buffer-overflow), so the set's completeness is
+// load-bearing in the same way isReservedBuiltinTypeName's is. The FFI VALUE
+// types IntPtr/UIntPtr are §32.7 pointer-sized integers, not buffers, and are
+// negatives here on purpose. ---
+BEZEL_TEST(builtin_registry_snapshot, ffi_buffer_builtin_set) {
+    static constexpr std::array<std::string_view, 3> kSnapshot = {
+        "CString", "WString", "RawBytes",
+    };
+    for (auto n : kSnapshot) BEZEL_EXPECT_TRUE(isFfiBufferBuiltinName(n));
+    for (std::string_view n : {"IntPtr", "UIntPtr", "Ptr", "string", "String",
+                               "StringBuilder", "Buffer", "OwningBuffer",
+                               "Array", ""})
+        BEZEL_EXPECT_FALSE(isFfiBufferBuiltinName(n));
+}
+
 // --- isIterableInterfaceHead (§28.3/§29.3/§30.7 v0.201, #2048 / proposal 0048):
 // the iterable/enumerator interface heads whose unmarked return type is the
 // iterator convention's announced caller-owned frame. A static signature

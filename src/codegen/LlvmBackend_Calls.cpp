@@ -394,6 +394,13 @@ std::string_view Emitter::builtinTypeName(const sema::TypeRef* rt) {
 }
 
 
+// fix #2809 / §32.5 / stdlib §10.1–§10.3 (v0.240): see the header for why this
+// must read BOTH TypeRef shapes rather than `declaration->name`.
+bool Emitter::isFfiBufferTypeRef(const sema::TypeRef* rt) {
+    return common::isFfiBufferBuiltinName(builtinTypeName(rt));
+}
+
+
 bool Emitter::isCollectionTypeName(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named || rt->declaration)
         return false;
@@ -6771,9 +6778,12 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // instance method.)
     {
         auto* recvTy = ctx_.exprType(*ma->target);
-        bool isRaw = recvTy &&
-            recvTy->kind == sema::TypeRef::Kind::Named &&
-            recvTy->declaration && recvTy->declaration->name == "RawBytes";
+        // fix #2809 (v0.240): both TypeRef shapes — a `rb: RawBytes` PARAMETER
+        // carries no `declaration`, so the declaration-only test silently
+        // declined the call and `rb.CopyTo(dst, 0)` became a NO-OP that copied
+        // nothing (measured: the round-trip sum came back 0 instead of 26).
+        bool isRaw = builtinTypeName(recvTy) == "RawBytes" &&
+            isFfiBufferTypeRef(recvTy);
         if (isRaw && ma->member == "CopyTo" && call.args.size() == 2 &&
             call.args[0].value && call.args[1].value) {
             llvm::Value* rb = lowerExpr(*ma->target);
@@ -6808,9 +6818,11 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
     // so the local picks up the array-backed disposal path (bz_array_free).
     {
         auto* recvTy = ctx_.exprType(*ma->target);
-        bool isCStr = recvTy &&
-            recvTy->kind == sema::TypeRef::Kind::Named &&
-            recvTy->declaration && recvTy->declaration->name == "CString";
+        // fix #2809 (v0.240): both TypeRef shapes — on a `c: CString` PARAMETER
+        // receiver the declaration-only test declined and the call fell through
+        // to codegen's "initializer failed to lower" internal degrade (#2434).
+        bool isCStr = builtinTypeName(recvTy) == "CString" &&
+            isFfiBufferTypeRef(recvTy);
         if (isCStr && ma->member == "ToBytes" && call.args.empty()) {
             llvm::Value* cstr = lowerExpr(*ma->target);
             if (!cstr) return nullptr;

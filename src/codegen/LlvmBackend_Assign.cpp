@@ -8640,6 +8640,48 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                 "buildOrderedArgs — #1386");
             return false;
         }
+        // fix #2809 / §28.3 *Unbound owned temporaries* + §32.6 (v0.240): an FFI
+        // buffer temporary minted directly in an ORDINARY-CALL argument position
+        // — `len(CString.From("abc"))`, `new W(CString.From(s))`. #2728/#2733
+        // wired this reclaim into the EXTERN argument arm
+        // (LlvmBackend_Calls2.cpp), the bare-ExpressionStmt/DiscardStmt arms and
+        // (#2734) `string.From`, but never into the general call path, so the
+        // buffer simply leaked. §28.3: such a temporary "is disposed at the end
+        // of the full expression in which it is produced, after every use of it
+        // within that expression has completed" — which is exactly what
+        // registerFfiExprTemp (establish at production, covering the unwind
+        // edge) plus flushFfiExprTemps (discharge at the full-expression
+        // boundary) implement, so the callee still borrows a LIVE buffer for the
+        // whole call and the free runs once, after it.
+        //
+        // ⚠ Same predicate as the extern arm and for the same reason:
+        // isFfiBufferFactoryCall admits ONLY a directly-written
+        // CString.From/FromBytes / WString.From / RawBytes.From whose sema
+        // result is the builtin head — bound to no name by construction, which
+        // is §28.3's *unbound* case. A `using var`-bound argument is a plain
+        // IdentifierExpr and never matches, so the §32.6 rule that the CALLER of
+        // a bound CString keeps the disposal obligation is untouched.
+        //
+        // ⚠ An `owned` transfer is EXCLUDED: with `owned` the callee takes the
+        // disposal obligation (§28.3 transfer), so reclaiming here would be a
+        // double free. Skipping the registration leaves at worst a bounded leak
+        // if the callee does not dispose it — the deliberate direction, and
+        // today it DOES leak: the callee emits no reclaim for an `owned`
+        // FFI-buffer parameter either. Filed as #2823, whose fix belongs on the
+        // CALLEE side; these exclusions stay correct when it lands.
+        if (a.value && !a.isDiscard && a.modifier != "owned" &&
+            params[idx].modifier != "owned") {
+            bool argIsRawBytes = false;
+            if (isFfiBufferFactoryCall(*a.value, argIsRawBytes)) {
+                // Null-initialized in the ENTRY block, not merely stored here:
+                // the reclaim is reachable from the unwind edge of an argument
+                // evaluated BEFORE this one and from a sibling branch that never
+                // ran this store, neither of which this store dominates (#2733).
+                auto* tmpSlot = entryAllocaNullPtr();
+                builder_.CreateStore(v, tmpSlot);
+                registerFfiExprTemp(tmpSlot, argIsRawBytes);
+            }
+        }
         // CG-nullable: if the formal parameter is a nullable value type (a
         // primitive, or a nullable enum — issue #364) but the argument value is
         // a plain value, wrap it.

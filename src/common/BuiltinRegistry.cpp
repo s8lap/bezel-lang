@@ -109,6 +109,13 @@ constexpr std::array<std::string_view, 2> kLinkedListNames = {
     "LinkedList", "OwningLinkedList",
 };
 
+// #2809 / §32.5 / stdlib §10.1–§10.3: the FFI-boundary BUFFER classes. See the
+// header for why the set exists and who consults it. `IntPtr`/`UIntPtr` are
+// §32.7 pointer-sized integer VALUE types, not buffers, and stay out.
+constexpr std::array<std::string_view, 3> kFfiBufferBuiltins = {
+    "CString", "WString", "RawBytes",
+};
+
 // The heap-pointer reference builtins shared by BOTH codegen rep paths in
 // LlvmBackend_Layout.cpp (see header).  This is the intersection of the two
 // pre-refactor hand-lists: OwningBuffer (astNode-only) and the FFI class names
@@ -283,6 +290,10 @@ bool isDictionaryName(std::string_view n) {
 bool isLinkedListName(std::string_view n) {
     return contains(kLinkedListNames, n);
 }  // per §4.6 / §4.7 — bz_llist_t*-backed linked-list names
+
+bool isFfiBufferBuiltinName(std::string_view n) {
+    return contains(kFfiBufferBuiltins, n);
+}  // per §32.5 / stdlib §10.1–§10.3 (#2809) — the raw-buffer FFI classes
 
 bool isHeapPointerReferenceBuiltin(std::string_view n) {
     return contains(kHeapPointerReferenceBuiltins, n);

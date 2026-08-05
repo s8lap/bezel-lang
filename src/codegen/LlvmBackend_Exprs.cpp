@@ -2272,6 +2272,24 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // the reclaim, leaking the temporary (the value is right by luck
                 // but the temp leaks). Route to the dedicated array path instead.
                 if (isCollectionTypeName(tt)) return false;
+                // fix #2809 / §32.5 / stdlib §10.1–§10.3 (v0.240): the three
+                // FFI-boundary BUFFER classes have their own `.Length` handler
+                // below (strlen / bz_wstrlen / bz_rawbytes_length) and are the
+                // ONE receiver family here for which the fallback is a MEMORY
+                // ERROR rather than a wrong value: a `CString`/`WString` is a
+                // bare malloc'd null-terminated buffer with no header at all, so
+                // loadStringLen's `%bz.string` field-1 read (offset 8..15) runs
+                // off the end of a short buffer — `len(CString.From("abc"))`
+                // (13-byte buffer) was an ASan heap-buffer-overflow INSIDE the
+                // callee. The receiver reaches here only in the ANNOTATION
+                // TypeRef shape (`c: CString` on a parameter/field, declaration
+                // == null); the factory shape carries a builtinClassSym
+                // declaration and never entered this fallback, which is why the
+                // `using var` spelling always worked and only the parameter
+                // spelling crashed. RawBytes was right by layout coincidence
+                // ({ptr,len} field 1 == the byte count) — routed here too so it
+                // stops depending on that coincidence.
+                if (common::isFfiBufferBuiltinName(n)) return false;
                 return true;
             };
             if (ma->member == "Length" && isStringFallbackTarget() &&
@@ -2836,15 +2854,20 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "Length") {
             auto* tt = ctx_.exprType(*ma->target);
-            // A CString/WString/RawBytes TypeRef is a Named type whose declaration
-            // is the builtin class symbol (set in ExprTypecheck_Calls.cpp for the
-            // From/FromBytes factories), so match on the declaration's name.
-            bool isCStr = tt && tt->kind == sema::TypeRef::Kind::Named &&
-                tt->declaration && tt->declaration->name == "CString";
-            bool isWStr = tt && tt->kind == sema::TypeRef::Kind::Named &&
-                tt->declaration && tt->declaration->name == "WString";
-            bool isRaw = tt && tt->kind == sema::TypeRef::Kind::Named &&
-                tt->declaration && tt->declaration->name == "RawBytes";
+            // fix #2809 (v0.240): match through `isFfiBufferTypeRef`, which reads
+            // BOTH shapes a §10 builtin reaches codegen in — the FACTORY result
+            // (`CString.From(s)`, declaration = builtinClassSym, set in
+            // ExprTypecheck_Calls.cpp) and the ANNOTATION (`c: CString` on a
+            // parameter or field, declaration = null, head name only). The
+            // original declaration-only test covered only the first, so a
+            // `CString` PARAMETER's `.Length` fell through to the string
+            // fallback above and read the raw buffer at %bz.string field 1.
+            bool isCStr = isFfiBufferTypeRef(tt) &&
+                builtinTypeName(tt) == "CString";
+            bool isWStr = isFfiBufferTypeRef(tt) &&
+                builtinTypeName(tt) == "WString";
+            bool isRaw = isFfiBufferTypeRef(tt) &&
+                builtinTypeName(tt) == "RawBytes";
             if (isCStr || isWStr || isRaw) {
                 llvm::Value* buf = lowerExpr(*ma->target);
                 if (!buf) return nullptr;
@@ -2872,8 +2895,9 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
     if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
         if (ma->target && ma->member == "Pointer") {
             auto* tt = ctx_.exprType(*ma->target);
-            bool isRaw = tt && tt->kind == sema::TypeRef::Kind::Named &&
-                tt->declaration && tt->declaration->name == "RawBytes";
+            // fix #2809: both TypeRef shapes (see the `.Length` arm above).
+            bool isRaw = builtinTypeName(tt) == "RawBytes" &&
+                isFfiBufferTypeRef(tt);
             if (isRaw) {
                 llvm::Value* rb = lowerExpr(*ma->target);
                 if (!rb) return nullptr;

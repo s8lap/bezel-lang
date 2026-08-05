@@ -7328,6 +7328,24 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                                                  /*emit=*/false);
                     return nullptr;
                 }
+                // fix #2809 / §28.3 *Unbound owned temporaries* + §32.6
+                // (v0.240): the IMPORTED-callee twin of the registration
+                // buildOrderedArgs does (LlvmBackend_Assign.cpp). This arm
+                // builds its own argument list — #1221: an imported method has
+                // no reconstructed `ast::MethodDecl`, so `buildOrderedArgs`
+                // cannot run — and therefore missed the reclaim entirely:
+                // `L.LenOf(CString.From("abcde"))` across a `bezelc -c` /
+                // `--import` boundary leaked the buffer every call (measured,
+                // 21 B/iteration). Same predicate, same `owned`-transfer
+                // exclusion, same §28.3 boundary as the local-callee arm.
+                if (!byRef && a.modifier != "owned" && formalMod != "owned") {
+                    bool argIsRawBytes = false;
+                    if (isFfiBufferFactoryCall(*a.value, argIsRawBytes)) {
+                        auto* tmpSlot = entryAllocaNullPtr();
+                        builder_.CreateStore(v, tmpSlot);
+                        registerFfiExprTemp(tmpSlot, argIsRawBytes);
+                    }
+                }
                 args.push_back(v);
                 argExprs.push_back(a.value.get());
                 ++pi;
