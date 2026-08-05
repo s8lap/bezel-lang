@@ -6512,6 +6512,38 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                         "use `await t` — blocking waits are not available in "
                         "async code (§30.3)");
                 }
+                // fix #2819 (§30.3 *The `Task`, `Task<T>` and `OwningTask<T>`
+                // types*, §4.7 *The unit type*, v0.240): `Wait()` is declared
+                // `public method Wait();` — no return type — so §4.7's "It is
+                // the return type of methods declared without an explicit
+                // return type" makes its result UNIT. §30.3 is explicit that
+                // the value is read elsewhere: "`Wait()` and `Result` are
+                // synchronous escape hatches"; the result comes from `Result`.
+                // Codegen already models this (LlvmBackend_Calls2: the result
+                // buffer pointer is discarded because `Wait()` returns unit),
+                // but sema left the CallExpr with NO exprType at all — null,
+                // not `Kind::Unit`.
+                //
+                // That gap is what let `total := total + t.Wait();` compile and
+                // contribute 0 on every iteration (#2819), and it is why the
+                // category-blind unit-operand gate in typeBinary could not see
+                // it: the gate correctly refuses to key on "untyped", since a
+                // null exprType means "sema could not type this", which is
+                // reachable from many unrelated shapes and would be a broad
+                // false reject. Recording the type the spec actually assigns is
+                // the fix; the gate then applies to `Wait()` exactly as it does
+                // to a user method declared without a return type.
+                //
+                // Covers all three receivers §30.3 names — `Task`, `Task<T>`
+                // (both `colName == "Task"`) and `OwningTask<T>` — and is set
+                // regardless of async context, so the shape is typed even on
+                // the path where the §30.3 blocking-wait error above fires.
+                if ((colName == "Task" || colName == "OwningTask") &&
+                    m == "Wait" && ce.args.empty() && !ctx_.exprType(ce)) {
+                    auto* unit = ctx_.makeTypeRef();
+                    unit->kind = TypeRef::Kind::Unit;
+                    ctx_.setExprType(&ce, unit);
+                }
                 // §2.5: DateTime instance method return types.
                 // The receiver's TypeRef uses builtinClassSym (non-null declaration,
                 // null decl) so colName is empty; check via declaration->name directly.

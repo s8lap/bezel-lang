@@ -3402,6 +3402,103 @@ void ExprTC::typeBinary(const ast::BinaryExpr& be) {
             }
         }
     }
+    // fix #2819 (§3.5 *Operators on primitive types*, §6.2 *Mixed-type
+    // arithmetic*, §5.1 *Implicit conversions*, v0.240): an arithmetic,
+    // bitwise, shift or ordering operator with a UNIT (`()`) operand is
+    // ill-formed and must be rejected here.
+    //
+    // §3.5 enumerates each intrinsic operator group BY OPERAND TYPE —
+    // "**Arithmetic** on `byte`, `sbyte`, `short`, `ushort`, `int`, `uint`,
+    // `long`, `ulong`, `float`, `double`, `decimal`", bitwise and shift on the
+    // integer types, "**Ordering** … on every primitive **except `bool`**" —
+    // and `()` is in none of those lists (it is not even a primitive: §3.1
+    // lists the unit type separately). §3.5 closes the door explicitly: "The
+    // set of admitted combinations is fixed; primitives do not declare
+    // cross-type `operator +` methods that user code could inspect." §6.2 then
+    // gives the disposition for an operand pair with no shared type: "If no
+    // implicit conversion exists between the operand types … the operation is a
+    // compile error and an explicit cast is required" — and §5.1's table has no
+    // row converting `()` to anything numeric (its only conversion out of unit
+    // is boxing to `Object`). Nor can a user supply one: §25.2 draws the
+    // candidate set for non-primitive operands from `operator` overloads
+    // declared on the operand types, and the unit type declares none and cannot
+    // be extended to (§26.2).
+    //
+    // Before this the expression was ACCEPTED, with three different wrong
+    // outcomes depending only on where the unit came from: `total + t.Wait()`
+    // compiled and contributed 0 on every iteration (the #2819 repro — and the
+    // reason #2807's original bug report carried a false exit-code claim that
+    // nobody, including the compiler, contradicted); `total + C.Nop()` on a
+    // void-returning call emitted malformed IR ("Call parameter type does not
+    // match function signature", an `sadd.with.overflow` fed a `void`); and
+    // `total + u` on a `()`-typed local degraded through the #2434 fallback to
+    // 0. One clean rejection replaces all three.
+    //
+    // CATEGORY-BLIND by construction, as #2819 asked: the gate is "this
+    // operand's resolved type is `Kind::Unit`", not an enumeration of the
+    // expressions that can produce unit (`Task.Wait()`, a void-returning call,
+    // a `()` literal, a `()`-typed local/param/field, a unit-returning lambda
+    // invocation) — the same hole is reachable from each, and enumerating
+    // source categories is how the §14.2 predicate family accreted four
+    // separate bug reports.
+    //
+    // Nullability is deliberately IGNORED, so a `()?` operand is rejected too:
+    // §7.11 lifts an operator "only where it is defined on the underlying type
+    // `T`", and it is defined nowhere on `()`. Same posture as the `bool`
+    // ordering check below, which notes it covers `bool?` for this reason.
+    //
+    // NOT rejected — the accept-controls this deliberately leaves alone:
+    //   * `=` and `<>`. §8.4 defines `a = b` as `a.Equals(b)` with a null-safe
+    //     wrapper, and unit reaches `Object` (§8.6 boxing; §8.5 even specifies
+    //     its `ToString` as `"()"`), so `u = v` is well-formed and always true.
+    //     No spec text withdraws equality from unit, so rejecting it would be a
+    //     false reject with no authority behind it.
+    //   * `and`/`or`/`in` — not in the token set below.
+    //   * Every non-operator position: a bare `t.Wait();` statement, a
+    //     unit-returning method called for effect, `_ := f();`, `var u: () :=
+    //     ();`, `u := ();`, `var o: Object := ();` (§8.6 *Boxing of the unit
+    //     value* — note a BOXED unit's static type is `Object`, not `()`, so it
+    //     never reaches this gate), `$"u={u}"` interpolation, and a lambda
+    //     whose body is a unit call. All verified still accepted.
+    if (op == "+" || op == "-" || op == "*" || op == "/" || op == "mod" ||
+        op == "&" || op == "|" || op == "^" || op == "<<" || op == ">>" ||
+        op == "<" || op == ">" || op == "<=" || op == ">=") {
+        auto isUnit = [](const TypeRef* t) {
+            return t && t->kind == TypeRef::Kind::Unit;
+        };
+        TypeRef* lt = be.left ? ctx_.exprType(*be.left) : nullptr;
+        TypeRef* rt = be.right ? ctx_.exprType(*be.right) : nullptr;
+        if (isUnit(lt) || isUnit(rt)) {
+            bool relational =
+                (op == "<" || op == ">" || op == "<=" || op == ">=");
+            ctx_.diagnostics().report(
+                Severity::Error, be.span.begin,
+                "operator `" + std::string(op) + "` is not defined for a unit "
+                "(`()`) operand (\xC2\xA7""3.5) \xE2\x80\x94 the unit type has "
+                "exactly one value and no arithmetic, comparison or bitwise "
+                "operations, and \xC2\xA7""5.1 provides no conversion from `()` "
+                "to a numeric type, so the operation is a compile error "
+                "(\xC2\xA7""6.2). A unit-valued expression \xE2\x80\x94 a method "
+                "declared without a return type, or `Task.Wait()` "
+                "(\xC2\xA7""30.3), whose result is read from `Result`, not from "
+                "`Wait()` \xE2\x80\x94 is a statement, not a value: call it on "
+                "its own line.");
+            // Error recovery: type the result so downstream uses do not cascade
+            // an "untyped expression" error. A relational yields `bool`; an
+            // arithmetic/bitwise/shift yields the OTHER (non-unit) operand's
+            // type when there is one, else `int`.
+            if (relational) {
+                ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+            } else if (!isUnit(lt) && lt) {
+                ctx_.setExprType(&be, lt);
+            } else if (!isUnit(rt) && rt) {
+                ctx_.setExprType(&be, rt);
+            } else {
+                ctx_.setExprType(&be, ctx_.primitiveTypeRef(PrimitiveType::Int));
+            }
+            return;
+        }
+    }
     // §25.2 (#746 R41-C): a relational operator (`<`, `>`, `<=`, `>=`) on a
     // record/class operand requires a matching user-defined overload — none is
     // auto-generated. A partial comparison group (e.g. only `<`/`>` declared,
@@ -4399,6 +4496,26 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
     // access on a moved value (`var s := move r; s.M`) fails to resolve.
     if (op == "+" || op == "-" || op == "~" || op == "move") {
         TypeRef* ot = ue.operand ? ctx_.exprType(*ue.operand) : nullptr;
+        // fix #2819 (§3.5, v0.240): the UNARY half of the same rule the binary
+        // arm enforces above — unary `+`, `-` and `~` on a unit (`()`) operand.
+        // §3.5 groups unary `+`/`-` under "Arithmetic on `byte`, … `decimal`"
+        // and `~` under "Bitwise on `byte`, … `ulong`"; `()` is in neither list.
+        // The #1574/#1588/#6.5 bad-kind checks below all gate on
+        // `Kind::Primitive`, so a Unit operand slipped past every one of them
+        // and fell through to the identity pass-through — `-u` compiled and
+        // read 0, `~u` compiled and read -1. Included here rather than deferred
+        // because it is the same rule, the same §, and the same silent wrong
+        // value as the binary form; leaving it would be a known residual.
+        // `move` is deliberately excluded: it is not an arithmetic operator
+        // (§28.3 ownership transfer) and rejecting it needs its own authority.
+        if (op != "move" && ot && ot->kind == TypeRef::Kind::Unit) {
+            ctx_.diagnostics().report(Severity::Error, ue.span.begin,
+                "unary operator `" + std::string(op) + "` is not defined for a "
+                "unit (`()`) operand (\xC2\xA7""3.5) \xE2\x80\x94 the unit type "
+                "has exactly one value and no arithmetic or bitwise operations. "
+                "A unit-valued expression is a statement, not a value.");
+            return;
+        }
         // §6.5: unary `~` (bitwise complement) is "not valid on bool, char, or
         // floating-point types" — it requires an integer operand. (`not` is the
         // boolean complement.) Primitive-only; a user type overloading `~` is
