@@ -3351,6 +3351,16 @@ llvm::Value* Emitter::makePropertyThunk(sema::PropertySymbol* ps,
             if (ps->parent && ps->parent->kind == ast::TypeDeclKind::Enum)
                 currentEnumMethod_ = ps->parent;
             result = lowerExpr(*getter);
+            // fix #2761 (§8.6 "Boxing" / §27.6, v0.240): the PROPERTY-AS-
+            // FUNCTION-VALUE face of the same expression getter. Its `ret` is
+            // typed from `pd->type` a few lines above, so a value-typed body
+            // under an `Object`/interface declared type produced `ret i32` from
+            // a `ptr`-returning thunk — a hard build failure, reproduced on
+            // 0e554e3 with `var f: () -> Object := h.O; f()`. Same box, same
+            // reasoning as the inlined read (LlvmBackend_Exprs.cpp).
+            if (pd && pd->type)
+                result = boxForTarget(result, ctx_.resolvedType(*pd->type),
+                                      getter);
             currentEnumMethod_ = savedEnumMethod;
         } else if (const ast::PropertyAccessor* acc = blockGetterOf(ps)) {
             if (llvm::Function* fn = ensurePropertyBlockGetter(pd, acc)) {

@@ -1674,6 +1674,15 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         paramSlots_[ps->indexerParams[k]] = slot;
     }
     llvm::Value* result = lowerExpr(*getterExpr);
+    // fix #2761 (§8.6 "Boxing" / §23.4 "Indexers", v0.240): the INDEXER
+    // spelling of the expression-getter box — `property [i: int]: Object =>
+    // _n + i;` read as `h[0]` handed the caller a raw i32 in an `Object`, so
+    // `h[0] is int` was silently FALSE. Same reasoning as the property inline
+    // in LlvmBackend_Exprs.cpp; done while the receiver's generic substitution
+    // (setupReceiverGenericSubst above) is still installed so a `T`-typed body
+    // boxes as its concrete type (#1279), and BEFORE the #2717 index-producer
+    // release, which concerns the index arguments and never the result.
+    result = boxForTarget(result, ctx_.exprType(ix), getterExpr);
     // fix #2717: release a `+1` string producer index temporary now the getter
     // body has read it. The helper's element-type gate is what makes this safe
     // on the GETTER side: an inlined `get => k;` lowers to a bare load of the
@@ -4051,6 +4060,31 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                         // Plain T value → { i8 1, T v } (has-value = true).
                         v = wrapNullableValue(retTyRef, v);
                 }
+                // fix #2761 (§8.6 "Boxing" / §23.3, v0.240): the VTABLE/ITABLE
+                // face of an EXPRESSION-bodied getter, the sibling of #2703's
+                // registration for the block face a few lines below. A
+                // `public virtual property O: Object => 0;` emitted `ret i32 0`
+                // from a `ptr`-returning slot function — "Function return type
+                // does not match operand type of return inst!", a HARD build
+                // failure on a shape §23.3 plainly admits (reproduced on
+                // 0e554e3).
+                // ⚠ MEASURED INERT TODAY, and shipped anyway: `boxValue`
+                // resolves the box vtable through `primBoxVtable_`/`boxVtable_`,
+                // which `setupBoxDescriptors()` fills — and that pass runs
+                // AFTER `declareVtables()` (LlvmBackend_impl.hpp ~400), which is
+                // what reaches this emitter. `boxVtableFor` therefore returns
+                // null and `boxValue` returns `v` unchanged, so the virtual
+                // spelling STILL fails to build. That is #2759 (the identical
+                // gap #2703 hit on the block face), and it is not fixable by
+                // reordering the two passes: `setupBoxDescriptors` is
+                // documented at its call site as requiring the descArray_/
+                // vtable globals `declareVtables` builds, so the dependency is
+                // the wrong way round for a swap. Kept here so the arm is in
+                // place — and so the fix is one pass-ordering change away —
+                // rather than leaving the expression face the only one missing
+                // it. A build failure is the SAFE residual: unlike the inlined
+                // read this shape never silently produced a wrong value.
+                v = boxForTarget(v, retTyRef, getterExpr);
                 // #2491 (twin of #2434): the property getter body's return
                 // expression failed to lower — this site bypasses emitReturn
                 // (calls CreateRet directly), so the `v ? v : null` fallback
@@ -4504,6 +4538,13 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
         paramSlots_[ps->indexerParams[k]] = slot;
     }
     llvm::Value* result = lowerExpr(*getterExpr);
+    // fix #2761 (§8.6 "Boxing" / §23.4 "Indexers", v0.240): the ITABLE face of
+    // an expression-bodied INDEXER getter — the indexer spelling of the
+    // property arm in ensurePropertyAccessorFn above. Subject to the SAME #2759
+    // inertness on this face (this emitter is reached from declareVtables,
+    // before setupBoxDescriptors); see the note there.
+    if (pd->type)
+        result = boxForTarget(result, ctx_.resolvedType(*pd->type), getterExpr);
     if (!result) result = llvm::Constant::getNullValue(retTy);
     result = coerceNumericToType(result, retTy, false);
     if (!builder_.GetInsertBlock()->getTerminator())
@@ -7457,6 +7498,13 @@ llvm::Function* Emitter::ensureExprGetterThunk(const sema::PropertySymbol* ps,
     diverged_          = false; genericSubst_.clear();
 
     llvm::Value* val = lowerExpr(*getterExpr);
+    // fix #2761 (§8.6 "Boxing" / §23.2, v0.240): the THUNK face of an
+    // expression-bodied getter (built for a §29.2 enumerator's `Current`) owes
+    // the same box as the inlined read — its `ret` must carry the property's
+    // declared representation, not the body's natural one.
+    if (auto* tpd = dynamic_cast<const ast::PropertyDecl*>(ps->decl))
+        if (tpd->type)
+            val = boxForTarget(val, ctx_.resolvedType(*tpd->type), getterExpr);
     if (!val) val = llvm::Constant::getNullValue(retTy);
     if (val->getType() != retTy && retTy->isIntegerTy() &&
         val->getType()->isIntegerTy())

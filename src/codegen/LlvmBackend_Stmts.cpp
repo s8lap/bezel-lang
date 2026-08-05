@@ -7275,6 +7275,20 @@ bool Emitter::lowerIEnumerableFor(const ast::ForStmt& fs) {
                 // Try expression getter (get => expr).
                 if (const ast::Expr* getterExpr = computedGetterOf(currentPropSym)) {
                     curVal = lowerExpr(*getterExpr);
+                    // fix #2761 (§8.6 "Boxing" / §29.11, v0.240): the
+                    // DUCK-TYPED enumerator's `Current` read. This is the same
+                    // missing box as the ordinary property read, but its
+                    // failure mode is the worst one found for this defect: the
+                    // loop variable takes the raw scalar where the element type
+                    // is `Object`, and the body's `v is int` drove it as a
+                    // pointer — SIGSEGV, exit 139, reproduced on 0e554e3 with a
+                    // hand-written `MoveNext`/`Current` pair whose `Current` is
+                    // `property Current: Object => 7;`. The block-bodied twin
+                    // (the `else if` just below) calls a compiled getter, which
+                    // #2703 already made return a box.
+                    if (pd->type)
+                        curVal = boxForTarget(
+                            curVal, ctx_.resolvedType(*pd->type), getterExpr);
                 }
                 // Try block getter (get => do...end).
                 else if (const ast::PropertyAccessor* acc = blockGetterOf(currentPropSym)) {

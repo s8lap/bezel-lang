@@ -4221,8 +4221,12 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // Static property: no 'this', just evaluate the getter body.
                 // §23.2/§23.3 (#1168): wrap a bare-inner `T` body result to the
                 // declared `T?` optional, same as the instance paths below.
-                return wrapNullableGetterResult(ctx_.exprType(*ma),
-                                                lowerExpr(*getter));
+                llvm::Value* sv = wrapNullableGetterResult(
+                    ctx_.exprType(*ma), lowerExpr(*getter));
+                // fix #2761 (§8.6 "Boxing", v0.240): and box it when the
+                // property's declared type is Object/an interface — the static
+                // spelling of the instance-path box below; see there.
+                return boxForTarget(sv, ctx_.exprType(*ma), getter);
             }
             llvm::Value* obj = lowerExpr(*ma->target);
             if (!obj) return nullptr;
@@ -4347,6 +4351,29 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // return does (#541). Wrap while the receiver's generic context is
             // still active so a generic `T?` payload lowers correctly.
             v = wrapNullableGetterResult(ctx_.exprType(*ma), v);
+            // fix #2761 (§8.6 "Boxing" / §23.2, v0.240): an EXPRESSION-bodied
+            // property whose declared type is `Object` (or an interface) but
+            // whose body yields a VALUE type must box here — this inline is the
+            // getter's only value-production point, so it is the only place the
+            // §8.6 representation can be established. Every DOWNSTREAM
+            // boxForTarget keys on the sema type of its source EXPRESSION,
+            // which for a property read is already `Object`, so all of them
+            // no-op and the raw scalar used to travel into an `Object` slot:
+            //   `property O: Object => _n;` then `var o := h.O; o is int`
+            //   returned FALSE with no diagnostic (lowerTypeTest gives up on a
+            //   non-pointer operand and lowerIf's null-condition arm branches
+            //   past the body — reproduced, `if.body: No predecessors!`), and
+            //   `F(h.O)` for `F(o: Object)` failed IR verification outright
+            //   ("Call parameter type does not match function signature").
+            // The BLOCK-bodied twin has done this since #2703 (lowerReturn's
+            // §8.6 arm); this restores the #2688 agreement invariant between
+            // the two body forms. Boxed value types are runtime-managed and
+            // "exempt from manual disposal" (§28.9), so no release is added
+            // here — the box's lifetime question is #2760, shared with the
+            // block form. Emitted while the receiver's generic substitution is
+            // still installed, like the nullable wrap above, so a `T`-typed
+            // body under monomorphisation boxes as its CONCRETE type (#1279).
+            v = boxForTarget(v, ctx_.exprType(*ma), getter);
             currentEnumMethod_ = savedEnumMethod;
             currentThis_ = saved;
             genericSubst_ = std::move(savedSubst);
@@ -4702,11 +4729,17 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         if (id->name == "this" || id->name == "base") return currentThis_;
         // CG33b: a bare computed-property read evaluates its getter
         // against the current `this`.
-        if (const ast::Expr* getter = computedGetterOf(ctx_.exprSymbol(e)))
+        if (const ast::Expr* getter = computedGetterOf(ctx_.exprSymbol(e))) {
             // §23.2/§23.3 (#1168): wrap a bare-inner `T` body result to the
             // property's declared `T?` optional (see the qualified `obj.P`
             // read above for the rationale).
-            return wrapNullableGetterResult(ctx_.exprType(e), lowerExpr(*getter));
+            llvm::Value* bv =
+                wrapNullableGetterResult(ctx_.exprType(e), lowerExpr(*getter));
+            // fix #2761 (§8.6 "Boxing", v0.240): the BARE (`implicit this`)
+            // spelling of the same read — `var o := O;` inside the declaring
+            // class was silently unboxed too. See the qualified path above.
+            return boxForTarget(bv, ctx_.exprType(e), getter);
+        }
         // CG33b: block-form getter (`get => do … end;`) accessed bare.
         if (const ast::PropertyAccessor* acc = blockGetterOf(ctx_.exprSymbol(e))) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e));
@@ -4932,6 +4965,14 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
                     llvm::Value* saved = currentThis_;
                     currentThis_ = obj;
                     llvm::Value* v = lowerExpr(*getter);
+                    // fix #2761 (§8.6 "Boxing" / §14.2, v0.240): the
+                    // record-devirtualised spelling of the inline
+                    // expression-getter read. `ctx_.exprType(e)` is the
+                    // INTERFACE property's declared type at this use site; when
+                    // that is `Object`/an interface and the record's body
+                    // yields a value type, the read owes a box exactly as the
+                    // direct path does.
+                    v = boxForTarget(v, ctx_.exprType(e), getter);
                     currentThis_ = saved;
                     return v;
                 }
