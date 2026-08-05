@@ -18,10 +18,66 @@ extern "C" void bz_decimal_parse_cstr(const char* s, void* out,
 
 namespace bezel::codegen {
 
+// fix #2805 (§17.7 short-circuit operators / §8.6, v0.240): an operand that
+// FAILED TO LOWER must degrade to a well-formed `false`, not to a null that
+// poisons the whole chain (and, for the right operand, not to an unterminated
+// basic block).
+//
+// Both halves were live. `lowerExpr` returns null for a DROPPED type test —
+// #2775's mechanism, e.g. a value type §8.6 requires to box that codegen does
+// not box yet. Before this fix:
+//   * a null LEFT operand made the entire `and`/`or` null, which `lowerIf`
+//     then turns into a silent `false`. Measured: `o is [3]int or oi is int`
+//     answered FALSE with a TRUE disjunct, and `not (o is [3]int) and true`
+//     answered FALSE where `true` is required.
+//   * a null RIGHT operand returned after `rhsBB` was already branched into,
+//     leaving `sc.rhs` and `sc.end` with no terminator — a hard
+//     `IR verification failed`, i.e. the compiler aborting on the operand
+//     position rather than the value.
+// So the same underlying condition produced a silent wrong value in one
+// position and a compiler abort in another; neither is acceptable.
+//
+// `false` is the correct degrade, not an arbitrary one: it is exactly what a
+// dropped test already reads as in the single-test case (`lowerIf` branches
+// past the body), so this makes the chain CONSISTENT with the unchained
+// spelling instead of accidentally right in one shape and wrong in the others.
+// The producer is responsible for the diagnostic — lowerTypeTest's four bails
+// report #2775 — and the guard below is the backstop for a producer that
+// reports nothing, so the degrade is never silent.
+//
+// ⚠ NOT applied when `diverged_` is set: there the operand THREW, the block is
+// already terminated, and synthesising a value would emit code after a
+// terminator. That path keeps returning null, which is its established
+// contract.
+llvm::Value* Emitter::degradedBoolOperand(
+        std::initializer_list<const ast::Expr*> locCandidates,
+        const char* what) {
+    // A synthesized node can carry an empty span (`line` is 1-based, so 0 means
+    // unset — the #2737 shape) and renders as a useless `file:0:0`. Both the
+    // operand AND its enclosing operator were observed unset on a chained
+    // `a and b and c`, so take the first candidate that names a real position
+    // rather than assuming any single node has one.
+    SourceLocation at{};
+    for (const ast::Expr* e : locCandidates)
+        if (e && e->span.begin.line != 0) { at = e->span.begin; break; }
+    if (!ctx_.diagnostics().hasErrors())
+        ctx_.diagnostics().report(
+            Severity::Warning, at,
+            std::string("internal: the ") + what +
+                " failed to lower to a value and was treated as `false` "
+                "— #2805");
+    return builder_.getInt1(false);
+}
+
+
 llvm::Value* Emitter::lowerShortCircuit(const ast::BinaryExpr& bin) {
     bool isAnd = (bin.op == "and");
     llvm::Value* l = lowerExpr(*bin.left);
-    if (!l) return nullptr;
+    if (!l) {
+        if (diverged_) return nullptr;   // the operand threw; block terminated
+        l = degradedBoolOperand({bin.left.get(), &bin, bin.right.get()},
+                                "left operand of a short-circuit operator");
+    }
     // §22.4 / §7.9 (v0.235, #2395): pre-create/zero-init any inline
     // `out var` slot inside the RIGHT operand — the one THIS operator may
     // SKIP (`and` skips it when `l` is false, `or` skips it when `l` is
@@ -42,7 +98,14 @@ llvm::Value* Emitter::lowerShortCircuit(const ast::BinaryExpr& bin) {
 
     builder_.SetInsertPoint(rhsBB);
     llvm::Value* r = lowerExpr(*bin.right);
-    if (!r) return nullptr;
+    if (!r) {
+        // #2805: returning null HERE is what left `sc.rhs`/`sc.end`
+        // unterminated — `rhsBB` has already been branched into above, so
+        // there is no longer a null-safe exit from this function.
+        if (diverged_) return nullptr;   // threw: rhsBB already terminated
+        r = degradedBoolOperand({bin.right.get(), &bin, bin.left.get()},
+                                "right operand of a short-circuit operator");
+    }
     auto* rhsEndBB = builder_.GetInsertBlock();
     builder_.CreateBr(endBB);
 
@@ -359,7 +422,23 @@ llvm::Value* Emitter::lowerUnary(const ast::UnaryExpr& un) {
     }
 
     llvm::Value* v = lowerExpr(*un.operand);
-    if (!v) return nullptr;
+    if (!v) {
+        // fix #2805 (§17.7 / §8.6, v0.240): `not X` where X failed to lower.
+        // Returning null here propagates the failure OUTWARD, and the enclosing
+        // short-circuit chain then degrades the whole `not X` to `false` — the
+        // WRONG polarity. A dropped test reads as `false` (#2775), so `not` of
+        // it must read as `true`; measured before this arm,
+        // `not (o is [3]int) and oi is int` answered false where true is
+        // required. Degrading the OPERAND and negating it keeps the polarity
+        // correct and keeps the degrade in one place.
+        //
+        // Only `not` is degraded. Every other unary operator is arithmetic on a
+        // value whose type we do not know here, so there is no safe stand-in —
+        // those keep propagating null, which is their established contract.
+        if (diverged_ || un.op != "not" || !un.operand) return nullptr;
+        v = degradedBoolOperand({un.operand.get(), &un},
+                                "operand of `not`");
+    }
     const auto& op = un.op;
 
     // §7.11 Lifted unary operators: `-` and `~` on nullable value types.

@@ -1735,8 +1735,15 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     // the same reason. Warning on either would fire on dead code.
     auto reportDroppedTest = [&](const char* why) {
         if (ctx_.diagnostics().hasErrors()) return;
+        // A TypeTestExpr synthesized inside a chain can carry an empty span
+        // (line 0), which rendered as a useless `file:0:0` — the #2737 shape.
+        // Fall back to the operand, then to the tested type, so the report
+        // always names a real position. (`line` is 1-based, so 0 means unset.)
+        SourceLocation at = te.span.begin;
+        if (at.line == 0 && te.operand) at = te.operand->span.begin;
+        if (at.line == 0 && te.testType) at = te.testType->span.begin;
         ctx_.diagnostics().report(
-            Severity::Warning, te.span.begin,
+            Severity::Warning, at,
             std::string("internal: this type test was DROPPED and reads as "
                         "false — ") + why +
                 " (a value type reaching an Object/interface location must be "

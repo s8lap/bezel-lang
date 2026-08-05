@@ -9900,6 +9900,12 @@ private:
     // CG: short-circuit `and`/`or` via a branch + phi — the right operand
     // runs only on the deciding path (§17 logical operators).
     llvm::Value* lowerShortCircuit(const ast::BinaryExpr& bin);
+    // #2805: the `false` a short-circuit operand degrades to when it failed to
+    // lower, with the backstop diagnostic. See the definition for why `false`
+    // is the correct degrade and why `diverged_` is excluded.
+    llvm::Value* degradedBoolOperand(
+        std::initializer_list<const ast::Expr*> locCandidates,
+        const char* what);
 
     // CG39: null-coalescing `a ?? b` (§17.1 L12). Evaluates `a`; if it is a
     // non-null reference, that is the result; otherwise evaluates and yields
