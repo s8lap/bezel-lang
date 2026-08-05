@@ -14565,6 +14565,22 @@ struct StringEscapeWalker {
     // Non-null only in borrowingArrayMode; when null every into-local binding stays
     // an escape.
     const std::unordered_set<const void*>* safeViewAliases = nullptr;
+    // fix #2764 / §4.6 / §28.3 K1.6 / §28.9 (v0.240): the set of `var` string
+    // LocalDecls that armStringLocalRefcount RETAINS at bind — i.e.
+    // Emitter::stringBorrowAll_, passed by pointer so the walk and the codegen
+    // consult the SAME set and can never disagree. A binding of the tracked
+    // local into one of these (`var other := built;`) is a BORROW, not an
+    // escape: the new local mints its OWN +1 (`bz_string_retain`) into its own
+    // slot, leaving the tracked local's +1 untouched, so a scope-end release of
+    // the tracked local drops only its own reference. Non-null only in
+    // stringReleaseMode (set by collectStringReleaseEligible's producer/borrow
+    // loops); when null every into-local binding stays a conservative escape,
+    // which is what the dict-materializer (#1028), grouping (#1930),
+    // borrowing-`Array` (#1871), record-call-result (#1747) and value-like-
+    // choice (#2115) reuses of this walker require — none of them retains at
+    // the alias site, so for them a copy genuinely aliases a single reference
+    // and must keep tainting the source.
+    const std::unordered_set<const void*>* borrowRetainedAliases = nullptr;
 
     bool isTargetIdent(const ast::Expr* e) {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -15382,6 +15398,57 @@ struct StringEscapeWalker {
             if (auto* pb = dynamic_cast<const ast::PostfixBangExpr*>(
                     ld->initializer.get())) {
                 expr(pb->operand.get(), /*safeRead=*/true);
+                return;
+            }
+            // fix #2764 / §4.6 / §28.3 K1.6 / §28.9 (v0.240): the plain
+            // local-to-local string COPY — `var other := built;` — is a BORROW
+            // of `built`, not an escape of it, PROVIDED the new local is one
+            // armStringLocalRefcount retains at bind (membership in
+            // `borrowRetainedAliases`, i.e. stringBorrowAll_ — the exact same
+            // set that function tests before emitting `bz_string_retain`).
+            //
+            // WHY IT IS SOUND. #429 already gives EVERY borrow-initialized
+            // string local an INDEPENDENT +1: armStringLocalRefcount retains
+            // into the new slot unconditionally (escaping or not), and releases
+            // it at scope end iff the new local's own walk proves it
+            // non-escaping. So after `var other := built;` the heap string
+            // carries two references — `built`'s producer/borrow +1 and
+            // `other`'s fresh retain — with one owner each. Releasing `built`'s
+            // at ITS scope end can therefore neither dangle `other` (which
+            // still holds its own reference) nor double-free (each slot
+            // releases exactly the reference it minted). This is the SAME
+            // coordinated shape as #2201's `var t := s!` arm directly above and
+            // #2717's index-argument arm (LlvmBackend_Assign.cpp): the alias
+            // keeps its own +1, so the source keeps its own release. Without
+            // the relaxation the copy classified `built` as escaped and its +1
+            // leaked — one heap string per copy (#2764), for the commonest
+            // aliasing shape in the language.
+            //
+            // WHY THE SET MEMBERSHIP TEST AND NOT THE SYNTAX. Only a
+            // stringBorrowAll_ member is retained. A `using var` copy, a
+            // `string?`-declared copy (`var o: string? := built;`), an
+            // `object`-declared/boxing copy, and a copy declared in a LAMBDA
+            // body (whose LocalDecls collectStringReleaseEligible never scans —
+            // it recurses into if/while/for/do/try/case bodies only) are all
+            // NOT in the set, get NO retain, and so must keep tainting the
+            // source: relaxing for them would free `built` while an
+            // un-retained alias still named it (a use-after-free — strictly
+            // worse than the bounded leak). `const other := built;` is a
+            // LocalConstDecl, a different node handled by its own arm below,
+            // and is likewise never retained. Reassignment of either binding
+            // stays safe: both `built := …` and `other := …` route through
+            // lowerStringLocalReassign, which releases the displaced value and
+            // keeps its slot at exactly +1 on the new one.
+            //
+            // The initializer is walked as a safe-read ROOT rather than simply
+            // skipped, so `inLambda` still forces an escape (expr()'s
+            // `!safeRead || inLambda` test) — a copy written inside a lambda
+            // body reads the CAPTURED outer local, whose env cell is an
+            // un-retained alias (§27.5), and must stay conservative.
+            if (stringReleaseMode && !inLambda && borrowRetainedAliases &&
+                borrowRetainedAliases->count(static_cast<const void*>(ld)) &&
+                isTargetIdent(ld->initializer.get())) {
+                expr(ld->initializer.get(), /*safeRead=*/true);
                 return;
             }
             expr(ld->initializer.get(), /*safeRead=*/false);
@@ -16913,6 +16980,11 @@ void Emitter::collectStringReleaseEligible(
         // previously stayed an unconditional escape, so its scope-end release
         // never armed for the shape most real `case`-on-a-string code uses.
         w.scrutineeBorrowMode = true;
+        // fix #2764: a plain `var other := <this local>;` COPY into a local
+        // that armStringLocalRefcount retains at bind is a borrow, not an
+        // escape — see the borrowRetainedAliases member comment. The set is
+        // fully populated by the scan above, before any walk runs.
+        w.borrowRetainedAliases = &stringBorrowAll_;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringReleaseEligible_.insert(static_cast<const void*>(ld));
@@ -16934,6 +17006,11 @@ void Emitter::collectStringReleaseEligible(
         // retained borrow; either way the slot owns exactly one reference
         // and armsBindingsSafe proves no arm binding escapes it).
         w.scrutineeBorrowMode = true;
+        // fix #2764: mirrors the producer loop above — a copy-of-a-copy
+        // (`var a := p; var b := a;`) leaked `a`'s retained +1 for the same
+        // reason a copy of a producer leaked the producer's. `b`'s own retain
+        // is independent of `a`'s, so `a` keeps its release.
+        w.borrowRetainedAliases = &stringBorrowAll_;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringBorrowRetainEligible_.insert(static_cast<const void*>(ld));
