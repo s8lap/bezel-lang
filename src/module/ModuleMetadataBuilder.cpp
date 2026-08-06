@@ -232,6 +232,45 @@ std::string renderConstExpr(const ast::Expr* e) {
         if (base.empty()) return "";
         return base + "." + std::string(ma->member);
     }
+    // fix #2898 (§17.14 / §2.8.2 clause 2, v0.240): a §17.14 compile-time
+    // constant that is not a BARE literal — `:= 100 + 7` — has no arm above, so
+    // it rendered "" and every consumer read that as "not a compile-time
+    // constant". For an imported generic's instance field that is a FALSE
+    // REJECT: #2860's guard is category-blind (it asks whether a value reached
+    // the slot), so an empty rendering makes it refuse a construction §2.8.2
+    // clause 2 requires to behave exactly as the same-module one does.
+    //
+    // FOLD, don't render. The alternative — rendering `100 + 7` textually —
+    // would widen what `valueText` may CONTAIN, and it is consumed as text by
+    // codegen (`constValues_`, ModuleLoader.cpp), so every consumer would have
+    // to become an evaluator. Folding keeps `valueText` a literal, the shape
+    // they all already assume, so no consumer changes and none can regress.
+    //
+    // The arithmetic is `sema::foldIntConst`, the ONE §17.14 folder — already
+    // shared by type resolution, ExprTypecheck and codegen's enum path — rather
+    // than a second evaluator here, which would be free to drift from it.
+    //
+    // The resolver deliberately answers nullopt for EVERY identifier, so only
+    // literal arithmetic folds. That is not a limitation to remove later
+    // without thought: `renderConstExpr` above renders a bare `IdentifierExpr`
+    // as its NAME, which has no guaranteed importer-side meaning, and resolving
+    // names here would let a same-named-but-different const on the importing
+    // side silently supply a value. A loud rejection is the correct outcome for
+    // anything this cannot fold; #2874 covers carrying genuinely non-constant
+    // initializers.
+    //
+    // Integer-only by construction (foldIntConst's domain): a float-valued
+    // constant expression still renders "" and is still rejected, unchanged.
+    // Range is deliberately NOT re-checked here — a folded value reaches its
+    // slot by exactly the path a bare literal of the same value does, so this
+    // makes `:= 100 + 7` behave identically to `:= 107` and introduces no case
+    // the literal spelling does not already have (see #2926 for the missing
+    // field-initializer assignability check, which governs both spellings).
+    if (auto folded = sema::foldIntConst(
+            *e, [](std::string_view, int) -> std::optional<long long> {
+                return std::nullopt;
+            }))
+        return std::to_string(*folded);
     return "";
 }
 
