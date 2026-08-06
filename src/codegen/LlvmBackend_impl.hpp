@@ -10769,6 +10769,40 @@ private:
     llvm::Value* coerceNumericToType(llvm::Value* v, llvm::Type* targetTy) {
         return coerceNumericToType(v, targetTy, /*srcUnsigned=*/false);
     }
+
+    // fix #2903 (§5.1 / §7.2 / §23.1 / §9.2, v0.240): the ONE definition of
+    // "bring a field / auto-property INITIALIZER's lowered value to the WIDTH of
+    // the slot it is about to be stored into". `coerceNumericToType` above is
+    // §5.1's WIDENING direction only, by construction (`srcBits < targetBits`),
+    // and every field-initializer store site called it and then stored whatever
+    // came back. §5.1 also admits the other direction — verbatim, "**Constant
+    // narrowing.** An expression of integer type that is a **compile-time
+    // constant** ([§17.14]) implicitly converts to any integer type whose range
+    // contains its value: `var b: byte := 50;` …" — and, under **Nullable
+    // conversions**, "The two rules compose through at most one `?` on each
+    // side: `S` converts to `T?` via `S → T → T?`". So `public _q: byte? := 200;`
+    // and `public _q: byte := 200;` are both well-typed, and the initializer must
+    // reach an i8 slot as an i8.
+    //
+    // Nothing narrowed it: sema retypes the constant for a LOCAL declaration and
+    // for an assignment statement (ExprTypecheck.cpp's two `fitsInIntType`
+    // sites) but a field initializer is not fed to either, so it stays `int` and
+    // lowers to i32 — and a bare `store i32` into a 1-, 2- or 3-byte-wide slot is
+    // perfectly VALID IR under opaque pointers, so the verifier never saw it.
+    // Measured on c7404bf: `byte?`/`sbyte?`/`short?`/`ushort?` fields read back
+    // wrong (#2903's own repro), and the NON-nullable `sbyte := -1` spelling
+    // read back RIGHT while writing `FF FF FF` over the three following `byte`
+    // fields (they read 255 where 0 is correct).
+    //
+    // The one rule, applied at every initializer store site rather than copied:
+    // §7.2's tagged `{i8 hasValue; T}` slot is matched at its PAYLOAD width (the
+    // caller still does the wrap), everything else at the slot's own width.
+    // A pair no §5.1 conversion covers is returned UNCHANGED — declining is the
+    // same posture `coerceNumericToType` and `coerceReturnToNullableValue`
+    // already take, and keeps this from silently reinterpreting a shape it does
+    // not understand.
+    llvm::Value* coerceInitializerToSlot(llvm::Value* v, llvm::Type* slotTy,
+                                         bool srcUnsigned);
     // §6.4: decimal arithmetic for compound-assign / increment (sweep #6).
     llvm::Value* emitDecimalArith(const std::string& op, llvm::Value* lhs,
                                   llvm::Value* rhs);

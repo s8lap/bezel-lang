@@ -615,6 +615,43 @@ llvm::Constant* Emitter::constInitFor(const ast::FieldDecl* fd, llvm::Type* ty) 
 }
 
 llvm::Constant* Emitter::constInitForExpr(const ast::Expr* e, llvm::Type* ty) {
+    // fix #2903 (§7.2 / §22.13 / §5.1, v0.240): a `readonly` STATIC field or
+    // auto-property of nullable VALUE type BAKES its literal into the global's
+    // LLVM initializer, and that slot is §7.2's tagged `{i8 hasValue; T}` struct
+    // — but every literal arm below builds a constant of `ty` DIRECTLY, and
+    // `ConstantInt::get` on a struct type is an unchecked `cast<IntegerType>`.
+    // Measured on c7404bf, `public static readonly SQ: byte? := 200;` aborted
+    // the compile: "Global variable initializer type does not match global
+    // variable type! ptr @bz$…$SQ". Build the constant at the PAYLOAD type and
+    // wrap it PRESENT, mirroring what the runtime store paths do
+    // (coerceInitializerToSlot + wrapNullableValue). The shape test is #2888's
+    // exact one (a LITERAL two-element struct tagged by the i8 hasValue byte —
+    // every class/record/choice is a NAMED struct).
+    //
+    // The gate is `isConstantLiteralStaticInit` — the SAME predicate that
+    // decides whether an initializer is baked at all — and not "`e` is not
+    // `null`". Every other initializer (a `null` literal, a char literal, an
+    // enum member access, `new …`) matches no arm below and falls through to
+    // `getNullValue(ty)`, which for a tagged slot is exactly §7.2's `null`, and
+    // whose textual-order RUNTIME store then supplies the real value
+    // (`isBakedStaticFieldInit` is this same predicate). Wrapping those PRESENT
+    // would bake a present-zero over §7.2's `null`.
+    if (e && isConstantLiteralStaticInit(e)) {
+        if (auto* nst = llvm::dyn_cast<llvm::StructType>(ty)) {
+            if (nst->isLiteral() && nst->getNumElements() == 2 &&
+                nst->getElementType(0) == nullablePrimHasValTy()) {
+                llvm::Constant* pay =
+                    constInitForExpr(e, nst->getElementType(1));
+                if (pay && pay->getType() == nst->getElementType(1))
+                    return llvm::ConstantStruct::get(
+                        nst, {llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                              pay});
+                // A payload shape no arm produced keeps §7.2's `null` rather
+                // than a mistyped (verifier-rejected) constant.
+                return llvm::Constant::getNullValue(ty);
+            }
+        }
+    }
     if (e) {
         if (auto* lit = dynamic_cast<const ast::IntLiteralExpr*>(e)) {
             return llvm::ConstantInt::get(
@@ -7026,6 +7063,25 @@ void Emitter::emitStaticConstructorBody(sema::ConstructorSymbol* cs,
                     "initializer — #1386");
                 continue;
             }
+            // fix #2903 (§5.1 / §7.2 / §22.13 / §23.1, v0.240): the runtime
+            // (textual-order) store for a NON-baked static — a mutable static,
+            // or a readonly one whose initializer is not a foldable literal —
+            // had NEITHER of §5.1's numeric directions NOR §7.2's tagged-slot
+            // wrap, while the readonly BAKED path (constInitForExpr) and the
+            // instance-field path (emitInstanceInit) have both. Measured on
+            // c7404bf: `static _ml: long := -42;` read 4294967254 (the i32 bits
+            // zero-filled into the i64 global), `static _mq: byte? := 200;` read
+            // `null`, and `static _mn: sbyte := -1;` wrote 4 bytes over its
+            // 1-byte global. Same two lines, same order, as the instance site.
+            {
+                const sema::TypeRef* fRt =
+                    fd->type ? ctx_.resolvedType(*fd->type) : nullptr;
+                val = coerceInitializerToSlot(val, gvIt->second->getValueType(),
+                                              isUnsignedTargetExpr(*initExpr));
+                if (fRt && isNullableValueTy(fRt))
+                    val = coerceReturnToNullableValue(
+                        val, fRt, isUnsignedTargetExpr(*initExpr));
+            }
             builder_.CreateStore(val, gvIt->second);
             bumpProgress();  // #1553 / §22.13: this field is now assigned
             // §22.13 (#1212): a static OWNED class/interface field is disposed
@@ -8182,8 +8238,16 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
         // §5.1: an int initializer for a wider numeric field is implicitly
         // widened — convert before the store so the field holds the value, not
         // the int's raw bits (issue #408 / #410).
-        v = coerceNumericToType(v, st->getElementType(idxIt->second),
-                                isUnsignedTargetExpr(*init));
+        //
+        // fix #2903 (§5.1 "Constant narrowing" / §7.2 / §23.1, v0.240): and for
+        // a NARROWER field, narrowed — this was `coerceNumericToType`, which is
+        // the widening direction only, so `public _q: byte := 200;` stored the
+        // literal's i32 over the 1-byte slot and `public _q: byte? := 200;`
+        // stored it over the 2-byte `{i8,i8}` slot. `store i32` into a
+        // narrower slot is VALID IR under opaque pointers, so nothing caught
+        // it. See coerceInitializerToSlot's declaration comment.
+        v = coerceInitializerToSlot(v, st->getElementType(idxIt->second),
+                                    isUnsignedTargetExpr(*init));
         // per §23.1 (#1169) / §7: a field or auto-property of nullable VALUE type
         // (`int? := 42`, `bool? := true`, a nullable record `Pt? := new Pt(3,4)`)
         // lowers to a tagged {i8 hasValue; T value} slot, but the initializer is

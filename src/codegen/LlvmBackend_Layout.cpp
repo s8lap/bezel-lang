@@ -2053,6 +2053,42 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
 }
 
 
+// fix #2903 / §5.1 / §7.2 / §23.1 / §9.2: see the declaration comment in
+// LlvmBackend_impl.hpp for why this exists and what it is the one definition of.
+llvm::Value* Emitter::coerceInitializerToSlot(llvm::Value* v,
+                                              llvm::Type* slotTy,
+                                              bool srcUnsigned) {
+    if (!v || !slotTy) return v;
+    // §7.2: a nullable VALUE slot is the tagged `{i8 hasValue; T}` struct and
+    // the initializer is the bare payload `T`, so the width to match is T's.
+    // The shape test is the EXACT one #2888 established — a nullable value type
+    // is a LITERAL two-element struct whose element 0 is the i8 tag, while every
+    // class, record and choice is a NAMED struct — but with the payload left
+    // unrestricted, unlike `nullableValuePayloadTy`, which narrows to the
+    // scalars `emitCompoundOp` can operate on: a nullable RECORD / Guid payload
+    // is an aggregate this function must still recognize (so it does not target
+    // the whole tagged struct) and then pass through untouched.
+    llvm::Type* want = slotTy;
+    if (auto* st = llvm::dyn_cast<llvm::StructType>(slotTy))
+        if (st->isLiteral() && st->getNumElements() == 2 &&
+            st->getElementType(0) == nullablePrimHasValTy())
+            want = st->getElementType(1);
+    if (v->getType() == want) return v;
+    // §5.1's WIDENING direction (int→long, int→double, float→double, int→decimal).
+    llvm::Value* w = coerceNumericToType(v, want, srcUnsigned);
+    if (w->getType() == want) return w;
+    // §5.1's "Constant narrowing" direction: an integer strictly WIDER than the
+    // integer slot. `i1` (`bool`) is excluded on both sides — §5.1's "Between
+    // integers and `bool`" row makes that conversion never implicit, so a
+    // mismatch there is a shape this function must not touch.
+    if (v->getType()->isIntegerTy() && !v->getType()->isIntegerTy(1) &&
+        want->isIntegerTy() && !want->isIntegerTy(1) &&
+        v->getType()->getIntegerBitWidth() > want->getIntegerBitWidth())
+        return builder_.CreateTrunc(v, want, "init.narrow");
+    return v;  // no §5.1 conversion applies — leave the value as is.
+}
+
+
 // fix #568 / §14.1 / §7.1: see the declaration comment in LlvmBackend_impl.hpp.
 llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
                                                   const sema::TypeRef* declRet,

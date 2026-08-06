@@ -6494,12 +6494,26 @@ llvm::Value* Emitter::buildRecordValue(
                     "field/property default initializer — #1386");
                 continue;
             }
+            // fix #2903 (§5.1 / §7.2 / §9.2 / §23.1, v0.240): a record body
+            // field / auto-property initializer reaches its slot at the SLOT's
+            // width. This loop had NEITHER direction of §5.1's numeric
+            // conversion — the class-side twin (emitInstanceInit) has had the
+            // widening since #408 — so measured on c7404bf every one of these
+            // was wrong: `wl: long := -42` read 4294967254 (the i32 bits
+            // zero-filled into the i64 slot), `wq: long? := -42` and
+            // `wd: double? := 3` read 0 (a bare i32 written over the tagged
+            // `{i8, T}` slot), and `nn: sbyte := -1` wrote `FF FF FF` over the
+            // three following `byte` fields (255 where 0 is correct). One
+            // definition, shared with the class site — see the declaration
+            // comment on coerceInitializerToSlot.
+            const sema::TypeRef* initFty = recordMemberType(m);
+            v = coerceInitializerToSlot(v, st->getElementType(idxIt->second),
+                                        isUnsignedTargetExpr(*init));
             // CG-nullable: a NULLABLE VALUE field initialized with a plain
             // value (`property N: int? := 9;`, or `property C: Color? :=
             // Color.Green;` — issue #364) must wrap the bare value into the
             // {i8 hasValue; T value} struct, like the positional path below.
             // per §9.2
-            const sema::TypeRef* initFty = recordMemberType(m);
             if (isNullableValueTy(initFty)) {
                 auto* expectedSt = nullableValueStructTy(initFty);
                 if (v->getType() != expectedSt) {
