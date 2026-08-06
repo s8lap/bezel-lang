@@ -5884,6 +5884,229 @@ bool Emitter::lowerImportedPropertySet(const ast::Expr& target,
 }
 
 
+// fix #2862 (§6.6/§17.6/§2.8.2 clause 2/§12.1/§23.3, v0.240): the READ-MODIFY-
+// WRITE twin of lowerImportedPropertySet (#2400). See the declaration in
+// LlvmBackend_impl.hpp for the defect and the measurement; the two thin
+// wrappers below share ONE body, per §17.6's own identification of `x++` with
+// the §6.6 compound rule (the #2848 lesson, applied here so the next fix to
+// this lowering cannot land in one spelling and miss the other).
+bool Emitter::lowerImportedPropertyCompound(const ast::AssignmentStmt& as) {
+    if (!as.target || !as.value) return false;
+    std::string op(as.op);
+    if (!op.empty() && op.back() == '=') op.pop_back();
+    return lowerImportedPropertyCompoundCore(*as.target, op, as.value.get());
+}
+
+
+bool Emitter::lowerImportedPropertyIncrDecr(const ast::IncrementStmt& inc) {
+    if (!inc.target) return false;
+    // §17.6, verbatim: "For built-in numeric types, `x++` is equivalent to
+    // `x := x + 1` (and likewise `x--` to `x := x - 1`)".
+    return lowerImportedPropertyCompoundCore(*inc.target,
+                                             inc.op == "++" ? "+" : "-",
+                                             /*valueExpr=*/nullptr);
+}
+
+
+bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
+                                                const std::string& binOp,
+                                                const ast::Expr* valueExpr) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&targetExpr);
+    if (!ma || !ma->target) return false;
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
+    if (!ps || ps->isIndexer) return false;
+    // A LOCAL property carries an ast::PropertyDecl and is handled by
+    // lowerPropertyCompound (which runs FIRST at both call sites); only the
+    // imported shape — §2.8.2's metadata-reconstructed symbol, `decl == null`
+    // — reaches here. Explicit rather than implied, so this can never
+    // shadow the local path if the caller order ever changes.
+    if (dynamic_cast<const ast::PropertyDecl*>(ps->decl)) return false;
+    // An imported VIRTUAL / INTERFACE property dispatches through its vtable
+    // or itable slot (#2858 for the increment spelling, #481 for the compound
+    // one) and must not be bound statically here. Both callers try those
+    // branches first; decline explicitly for the same reason as above.
+    if (propSetSlot_.count(ps) || ifacePropertySetIndex_.count(ps) ||
+        propGetSlot_.count(ps) || ifacePropertyGetIndex_.count(ps))
+        return false;
+    auto git = importedPropGetterFns_.find(ps);
+    auto sit = importedPropSetterFns_.find(ps);
+    if (git == importedPropGetterFns_.end() ||
+        sit == importedPropSetterFns_.end()) return false;
+    llvm::Function* getFn = git->second;
+    llvm::Function* setFn = sit->second;
+    auto* getFnTy = getFn->getFunctionType();
+    auto* setFnTy = setFn->getFunctionType();
+    if (getFnTy->getNumParams() != 1 || setFnTy->getNumParams() != 2)
+        return false;
+    // §23: "get/set share one declared type" — the getter's result and the
+    // setter's `value` parameter are both `lowerType(P's declared type)`. A
+    // disagreement means this is not the shape this lowering understands;
+    // decline rather than emit a call the IR verifier would reject. Checked
+    // BEFORE anything is emitted, so declining leaves no half-lowered
+    // statement behind (the discipline #2204 established for
+    // lowerImportedPropertySet).
+    if (getFnTy->getReturnType() != setFnTy->getParamType(1)) return false;
+    // MIRROR THE EXPORTER'S OWN GATE, so this can never emit a call to a stub
+    // nothing defines. `declareImportedPropertySetters` declares the external
+    // reference for nearly every imported PropertySymbol, but
+    // `emitExportedPropertySetters` (LlvmBackend_Setup.cpp) DEFINES it only for
+    // a public, non-generic Class-or-Record type's public, non-static,
+    // non-virtual property. Calling outside that set turns a program that
+    // compiles and links today (with the silently-dropped write this issue is
+    // about) into a hard `undefined reference` LINK ERROR — strictly worse, and
+    // exactly the over-broad first draft #2474's own review caught on the
+    // sibling getter path. Declining leaves those shapes precisely as they are
+    // today; they are separate gaps, FILED rather than silently absorbed:
+    //   * generic parent — #2884: the PLAIN `:=` on an imported generic
+    //     class's property is ALREADY a hard link error today (measured:
+    //     `undefined reference to bz$HLib.HG$P$propset`), because
+    //     declareImportedPropertySetters has no generic gate while the
+    //     exporter does. Resolving it needs the per-instantiation stub naming
+    //     of §2.8.3 rule 4 — not this fix's to invent.
+    //   * static — #2885: an imported static property's `:=`, `+=` and `++`
+    //     are all silently dropped today (measured 0 where 8 / 102 is
+    //     correct); the static case needs its own no-`this` accessor ABI plus
+    //     §22.13's lazy static initialization.
+    //   * Enum: also lowers its receiver to a bare scalar `i32`, never a
+    //     pointer or aggregate (#2474/#2489 carry the same guard).
+    // An imported AUTO-property is direct instance STORAGE in the importing
+    // module's layout (#2478 widened `storageMemberOf` to
+    // `isAutoPropertyStorage` precisely so `lvalueAddr`/`fieldAddr` resolve its
+    // slot), so the established path already reads and writes it correctly —
+    // MEASURED: `b.A++` / `b.A += 4` on an imported auto-property give the
+    // right answer both before and after this fix. Declining keeps that path,
+    // rather than newly re-routing a working shape through the accessor stubs
+    // and its different ARC discipline (§23.1/§28.9). This is the "do not widen
+    // past the measured defect" line: the dropped write is the BLOCK-form
+    // property, whose accessors are the only way in.
+    if (isAutoPropertyStorage(ps)) return false;
+    if (!ps->parent) return false;
+    if (ps->parent->kind != ast::TypeDeclKind::Class &&
+        ps->parent->kind != ast::TypeDeclKind::Record) return false;
+    if (!ps->parent->genericParams.empty()) return false;
+    if (ps->parent->visibility != ast::Visibility::Public) return false;
+    if (ps->visibility != ast::Visibility::Public) return false;
+    for (auto mod : ps->modifiers)
+        if (mod == "static") return false;
+
+    // --- §6.6: resolve the RECEIVER's storage ONCE, share it with both calls.
+    // Mirrors lowerImportedPropertySetValue's #2489 receiver resolution
+    // verbatim: prefer lvalueAddr (a record receiver is by-value per §9.2, so
+    // lowerExpr would load a COPY and the setter would mutate a throwaway
+    // slot); fall back to lowerExpr + spill only for a receiver that is not an
+    // addressable place.
+    llvm::Value* obj = nullptr;
+    llvm::Type* objElemTy = nullptr;
+    if (llvm::Value* addr = lvalueAddr(*ma->target, objElemTy)) {
+        if (objElemTy && objElemTy->isPointerTy())
+            obj = builder_.CreateLoad(objElemTy, addr);
+        else if (objElemTy && objElemTy->isAggregateType())
+            obj = addr;  // already the address of the receiver's real storage
+    }
+    if (!obj) {
+        llvm::Value* ov = lowerExpr(*ma->target);
+        if (!ov) return false;
+        if (ov->getType()->isPointerTy()) {
+            obj = ov;
+        } else if (ov->getType()->isAggregateType()) {
+            llvm::AllocaInst* tmp = entryAlloca(ov->getType());
+            builder_.CreateStore(ov, tmp);
+            obj = tmp;
+        } else {
+            return false;
+        }
+    }
+
+    // --- §6.6's order: the LHS chain (above), then the getter. ---
+    llvm::Value* cur = builder_.CreateCall(getFnTy, getFn, {obj});
+    emitPendingCheck();   // §31.1/§31.2: a throw out of the imported getter
+    if (!cur) return false;
+
+    // --- then `e` (or §17.6's implicit `1`), then the operation. ---
+    llvm::Value* rhs = nullptr;
+    if (valueExpr) {
+        rhs = lowerExpr(*valueExpr);
+    } else {
+        // §17.6's right operand for the `++`/`--` spelling, synthesized at the
+        // getter's result type because the desugaring has no AST node for it.
+        // `decimal` is a struct-typed primitive, so its `1` comes from the
+        // decimal helper — ConstantInt would assert on a struct type. Mirrors
+        // lowerIndexerCompoundCore's lowerRhs exactly.
+        llvm::Type* t = cur->getType();
+        if (t->isFloatingPointTy()) rhs = llvm::ConstantFP::get(t, 1.0);
+        else if (t == decimalStructType()) rhs = emitDecimalOne();
+        else if (t->isIntegerTy()) rhs = llvm::ConstantInt::get(t, 1);
+    }
+    if (!rhs) {
+        // #1386/#2509 precedent: an ICE beats a silently dropped store.
+        ctx_.diagnostics().report(
+            Severity::Error,
+            valueExpr ? valueExpr->span.begin : targetExpr.span.begin,
+            "internal: could not lower the right operand of a compound "
+            "assignment to an imported property — #2862");
+        return false;
+    }
+    // §5.1/§6.4: `decimal` is a STRUCT-typed primitive. emitCompoundOp has no
+    // decimal arm — it would feed the struct to `sadd.with.overflow`, which the
+    // IR verifier rejects ("Intrinsic has incorrect return type"). Found by this
+    // fix's own probe grid, not inferred: the first draft ICE'd on
+    // `importedObj.M++` where `M: decimal`. Route decimal through the same
+    // helper the local `d++` branch uses (LlvmBackend_Stmts.cpp's IncrementStmt
+    // arm), which also carries §6.4's overflow raise.
+    //
+    // The SAME gap exists at emitCompoundOp's other callers and is a live ICE
+    // there today — `d.P += 1m` on a LOCAL block-form decimal property, and
+    // `d[0] += 1m` / `d[0]++` on a local decimal indexer, both abort the
+    // compile with "Intrinsic has incorrect return type!". Reproduced and
+    // filed as #2883, whose fix belongs in emitCompoundOp itself; this
+    // caller-side check should be deleted when that lands.
+    llvm::Value* res =
+        (cur->getType() == decimalStructType())
+            ? emitDecimalArith(binOp, cur, rhs)
+            : emitCompoundOp(
+                  binOp, cur, rhs, cur->getType()->isFloatingPointTy(),
+                  isUnsignedTargetExpr(targetExpr),
+                  isCharTargetExpr(targetExpr),                 // §6.6/§5.2 #1961
+                  valueExpr && isUnsignedTargetExpr(*valueExpr));  // §6.2 #2140
+    if (!res) return false;
+
+    // --- then the store. ---
+    llvm::Type* valTy = setFnTy->getParamType(1);
+    llvm::Value* sv = coerceNumericToType(res, valTy,
+                                          isUnsignedTargetExpr(targetExpr));
+    if (sv->getType() != valTy) return false;   // see the agreement note above
+    builder_.CreateCall(setFnTy, setFn, {obj, sv});
+    emitPendingCheck();   // §31.1/§31.2: a throw out of the imported setter
+
+    // fix #2576's structure, mirrored (§23.3/§28.9/§4.6). For a string-typed
+    // property, emitCompoundOp dispatches to emitStringConcat, which ALWAYS
+    // mints a fresh rc=1 `res` (memcpy of both operands' bytes, #422), and the
+    // imported setter stub forwards to ensurePropertyAccessorFn's body, which
+    // RETAINS its incoming `value` for a CLASS-owned property (#2490). So
+    // `res`'s +1 is doubled and must be discharged here — unconditionally on
+    // (classOwned && pointer), NOT gated on the RHS being a producer, because
+    // emitStringConcat mints +1 for a BORROW rhs too (that is exactly the half
+    // #2568 left open and #2567/#2576 closed). `rhs`'s own +1 is a SECOND
+    // orphan when the RHS AST is itself a producer — emitStringConcat copies
+    // its bytes and leaves its refcount untouched — and is released only then
+    // (a named local is a BORROW; releasing it would drop its owner's only
+    // reference). CLASS-only gate (§9/§9.7): a RECORD's setter plain-stores,
+    // so `res`'s +1 IS the field's reference and releasing it would dangle the
+    // field — the live UAF shape #2490/#2506/#2548/#2576 all record. `cur` is
+    // a BORROW (the getter returns a field load with no retain) and is
+    // deliberately never released.
+    bool classOwned = ps->parent && ps->parent->kind == ast::TypeDeclKind::Class;
+    if (classOwned && !diverged_) {
+        if (res->getType()->isPointerTy())
+            emitStringRelease(res);
+        if (rhs->getType()->isPointerTy() && valueExpr &&
+            isPlusOneStringProducer(valueExpr))
+            emitStringRelease(rhs);
+    }
+    return true;
+}
+
+
 bool Emitter::lowerPropertyCompound(const ast::AssignmentStmt& as) {
     if (!computedSetterOf(*as.target)) return false;
     llvm::Value* cur = lowerExpr(*as.target);   // getter read (CG33c)

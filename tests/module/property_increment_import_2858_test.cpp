@@ -151,23 +151,24 @@ BEZEL_TEST(property_increment_import_2858, imported_interface_property_increment
 }
 
 // ===========================================================================
-// T3 — ACCEPT CONTROL: an imported NON-VIRTUAL property has no vtable slot, so
-// the new branch declines and the existing cross-module lowering runs
-// unchanged.
+// T3 — CONTROL: an imported NON-VIRTUAL property has no vtable slot, so #2858's
+// branch declines and the NON-virtual cross-module lowering runs.
 //
-// ⚠ HONEST LABEL: "unchanged" here means unchanged and BROKEN. An imported
-// non-virtual property's read-modify-write is SILENTLY DROPPED — `b.P++` and
-// `b.P += 1` both store nothing (measured 0 where 102 is correct), while
-// `b.P := 7` on the same property is correct (8). That is a PRE-EXISTING
-// defect with its own root cause — `ps->decl` is null for an imported property
-// and `computedSetterOf` requires an `ast::PropertyDecl`, so both
-// read-modify-write paths fall through to the generic `lvalueAddr` fallback;
-// the plain write works only because #2400 added
-// `lowerImportedPropertySet`, and there is no compound/increment analogue of it
-// (nor of #2509, which fixed exactly this for an imported INDEXER). MEASURED at
-// 0 both BEFORE and AFTER this change, by a real two-module build. Filed as
-// #2862; deliberately not fixed here — this case exists to pin that #2858 does
-// not perturb it in either direction.
+// ⚠ UPDATED BY #2862. When this case was written it carried an HONEST LABEL
+// saying "unchanged" meant unchanged and BROKEN: an imported non-virtual
+// property's read-modify-write was SILENTLY DROPPED — `b.P++` and `b.P += 1`
+// both stored nothing (measured 0 where 102 is correct) while `b.P := 7` on the
+// same property was correct (8) — and it asserted that 0 so that #2858 could be
+// shown not to perturb it. #2862 fixed the dropped write: `lowerImported
+// PropertyCompoundCore` now dispatches the read-modify-write through the
+// exported `$propget`/`$propset` accessor stubs, with the receiver evaluated
+// ONCE and shared (§6.6), and the `++` spelling routed through that same body
+// (§17.6). So this control now asserts the CORRECT value, 102 — it is still the
+// control that #2858's vtable branch DECLINES for a non-virtual property, but
+// it no longer pins a bug.
+//
+// 102 is the correct answer: the getter gives `_s + 100` = 100, `++` makes 101,
+// and the setter stores `value + 1` = 102.
 // ===========================================================================
 BEZEL_TEST(property_increment_import_2858, imported_nonvirtual_unchanged) {
     const char* lib =
@@ -190,7 +191,7 @@ BEZEL_TEST(property_increment_import_2858, imported_nonvirtual_unchanged) {
         "  end Main; "
         "end C2858T3;");
     if (r == -2) return;
-    BEZEL_EXPECT_EQ(r, 0);   // #2862's dropped write — 102 once that is fixed
+    BEZEL_EXPECT_EQ(r, 102);   // was 0 — #2862's dropped write, now fixed
 }
 
 }  // namespace bezel::module

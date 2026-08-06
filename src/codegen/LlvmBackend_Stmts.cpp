@@ -421,6 +421,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     }
                 }
                 if (lowerPropertyCompound(*as)) return false;
+                // fix #2862 (§6.6/§2.8.2 clause 2/§12.1/§23.3, v0.240): the
+                // COMPOUND twin of the `lowerImportedPropertySet` fallback in
+                // the `:=` arm above. lowerPropertyCompound just declined
+                // because an IMPORTED property has no ast::PropertyDecl for
+                // `computedSetterOf` to find; before this call nothing else
+                // recognized the shape either, so `importedObj.P += 1` fell
+                // through to the generic lvalueAddr fallback — which cannot
+                // resolve a PropertySymbol target — and the write was SILENTLY
+                // DROPPED (measured 0 where 102 is correct, while
+                // `importedObj.P := 7` on the same property was correct at 8).
+                // Placed here, after the virtual/interface branch above and
+                // after the local-property path, so it only engages for the
+                // shape neither covers.
+                if (lowerImportedPropertyCompound(*as)) return false;
                 // §20 / §23.4: user-defined indexer compound assignment
                 // `a[i] OP= v`. Must come after lowerPropertyCompound (which
                 // handles non-indexer computed properties) and before the generic
@@ -1435,6 +1449,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                             isCharTargetExpr(*inc->target));  // §6.6/§5.2 #1961
                         if (res) lowerPropertySetValue(*inc->target, res);
                     }
+                // --- (a2) IMPORTED non-virtual property: `obj.P++` / `--` ---
+                // fix #2862 (§17.6/§6.6/§2.8.2 clause 2/§12.1, v0.240): branch
+                // (a) just declined because `computedSetterOf` needs an
+                // ast::PropertyDecl and an IMPORTED property has none (§2.8.2
+                // — the importer reconstructs the symbol from metadata). Branch
+                // (b) below only handles an IndexExpr target, so a named
+                // imported property reached NOTHING and the increment was
+                // SILENTLY DROPPED (measured 0 where 102 is correct, while
+                // `b.P := 7` on the same property was correct at 8). Routed
+                // through the SAME body as `obj.P += 1` rather than a second
+                // copy of it — §17.6 defines this spelling as an instance of
+                // the §6.6 compound rule, which is exactly the consolidation
+                // #2848 made for the indexer spelling.
+                } else if (lowerImportedPropertyIncrDecr(*inc)) {
+                    // handled: getter call, ±1, setter call, receiver shared.
                 // --- (b) User-defined indexer: `v[i]++` / `v[i]--` ---
                 // fix #2848 (§17.6/§6.6/§12.1/§23.4, v0.240): DELEGATE to the one
                 // definition of this lowering instead of mirroring it.

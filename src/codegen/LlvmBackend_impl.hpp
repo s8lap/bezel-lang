@@ -4227,6 +4227,40 @@ private:
     // side effects, which are not expressible as assignment targets here.
     bool lowerPropertyCompound(const ast::AssignmentStmt& as);
 
+    // fix #2862 (§6.6/§17.6/§2.8.2/§12.1/§23.3, v0.240): the READ-MODIFY-WRITE
+    // twin of lowerImportedPropertySet — `importedObj.P OP= e` and
+    // `importedObj.P++` / `--` on a plain (non-virtual, non-interface,
+    // non-indexer) IMPORTED property. `ps->decl` is null for an imported
+    // property (§2.8.2 — the importer reconstructs the symbol from artifact
+    // metadata, with no ast::PropertyDecl), so lowerPropertyCompound's opening
+    // `computedSetterOf` returns null and BOTH read-modify-write spellings fell
+    // through to the generic lvalueAddr fallback, which cannot resolve a
+    // PropertySymbol target: the write was SILENTLY DROPPED, no diagnostic
+    // (MEASURED 0 where 102 is correct, while `b.P := 7` on the same property
+    // was correct at 8). #2400 supplied `lowerImportedPropertySet` for the
+    // plain write and #2509 supplied the same thing for an imported INDEXER's
+    // compound/increment; this is the missing named-property analogue.
+    //
+    // Dispatches through the exported accessor ABI stubs the loader already
+    // records (importedPropGetterFns_ / importedPropSetterFns_), evaluating the
+    // RECEIVER ONCE and sharing it between the getter call and the setter call
+    // — §6.6, verbatim: "the statement `x op= e` is equivalent to `x := x op e`
+    // with the target evaluated **once**". Driving lowerExpr(target) +
+    // lowerImportedPropertySetValue instead would lower the receiver chain
+    // twice, which §6.6 forbids.
+    //
+    // The `++`/`--` spelling routes through the SAME body rather than a second
+    // copy of it — §17.6 defines it as an instance of the §6.6 rule, and #2848
+    // established that consolidation for the indexer spelling. `valueExpr` is
+    // null for that spelling; the right operand is then §17.6's implicit
+    // literal `1`, synthesized at the getter's result type because the
+    // desugaring has no AST node for it.
+    bool lowerImportedPropertyCompound(const ast::AssignmentStmt& as);
+    bool lowerImportedPropertyIncrDecr(const ast::IncrementStmt& inc);
+    bool lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
+                                           const std::string& binOp,
+                                           const ast::Expr* valueExpr);
+
     // The LLVM type backing an instance-storage member (field or
     // auto-property).
     llvm::Type* storageType(const sema::Symbol* m);
