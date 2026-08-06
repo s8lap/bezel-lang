@@ -248,12 +248,26 @@ const char* kUnboxRoundTrip =
     "  end Main; "
     "end C;";
 
-// CONTROL (passes with and without the fix). §8.6: "Move-only value types —
-// owning inline arrays (`[N owned]T` and `[N owned]T?`) … — cannot be boxed."
-// The guard is that the fix did NOT start boxing them: an owning array in an
-// Object slot stays unboxed, so the test is dropped (codegen reports the #2775
-// internal Warning) and answers false — the pre-fix behavior, preserved. Boxing
-// it would copy a move-only value and hand two owners to the same instances.
+// CONTROL. §8.6: "Move-only value types — owning inline arrays (`[N owned]T`
+// and `[N owned]T?`) … — cannot be boxed." The guard is that #2804's fix did
+// NOT start boxing them: boxing would copy a move-only value and hand two
+// owners to the same instances.
+//
+// RE-POINTED by #2912 (spec §8.6/§15.3, v0.240), following the same discipline
+// #2804 applied to tests/lit/type_test_dropped_warns_2775.bzl. When this test
+// was written, "not boxed" was observable only as behaviour: the program
+// compiled, the `is [2]R` test was DROPPED (codegen's #2775 `internal:`
+// Warning), and it exited 0. #2912 then supplied the rejection §8.6's "cannot
+// be boxed" always owed, so the same program no longer compiles — and the exit
+// code 0 this once asserted is now unreachable. The ASSERTION being preserved
+// is "#2804 did not sweep the owning form in with the non-owning one", and a
+// compile REJECT proves that at least as strongly as a dropped test did, so the
+// test is re-pointed at the rejection rather than deleted.
+//
+// ⚠ If a later change gives move-only values a boxing story, re-point this at
+// whatever §8.6 then excludes — do NOT delete the assertion, and do NOT relax
+// it to "compiles somehow": what must stay pinned is that a move-only value
+// never silently acquires a heap copy.
 const char* kOwningNotBoxed =
     "module M; "
     "class R public constructor() end constructor; end R; "
@@ -459,13 +473,23 @@ BEZEL_TEST(codegen_box_inline_array_2804,
     // spec §8.6, v0.240: "Move-only value types — owning inline arrays
     // (`[N owned]T` and `[N owned]T?`) and owning-classified choices — cannot be
     // boxed. Boxing a value type copies the value into a heap wrapper, but
-    // move-only types forbid copying ([§15.3])." This test passes both with and
-    // without the fix by design: it is the guard that the new boxing path did
-    // not sweep the owning form in with the non-owning one, which would copy a
-    // move-only value and give two owners to the same instances.
+    // move-only types forbid copying ([§15.3])." The guard is that #2804's new
+    // boxing path did not sweep the owning form in with the non-owning one,
+    // which would copy a move-only value and give two owners to the same
+    // instances.
+    //
+    // RE-POINTED by #2912 (see kOwningNotBoxed's note): the rejection §8.6 owes
+    // now exists, so this asserts the REJECT rather than the exit code of a
+    // program that used to compile with its type test silently dropped.
     JitResult r = runAot(kOwningNotBoxed);
-    BEZEL_EXPECT_TRUE(r.ran);
-    BEZEL_EXPECT_EQ(r.exitCode, 0);
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool rejected = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.message.find("move-only value type") != std::string::npos &&
+            d.message.find("cannot be boxed") != std::string::npos &&
+            d.message.find("§8.6") != std::string::npos)
+            rejected = true;
+    BEZEL_EXPECT_TRUE(rejected);
 }
 
 // =====================================================================

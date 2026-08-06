@@ -2911,6 +2911,74 @@ static bool functionSlotConvertible(
     return functionSlotTypeRefEqual(from, to);
 }
 
+// per §8.6 (#2912): the locations that BOX a value-typed source — §8.6's
+// opening sentence, "When a value type is used where `Object` (or an interface
+// implemented by the value type) is expected, the value is **boxed**: a
+// heap-allocated wrapper holds the value." This deliberately mirrors codegen's
+// `Emitter::isObjectOrInterfaceTarget`, which answers the same question one
+// pass later: the two must agree, or sema would reject a location codegen does
+// not box (or, worse, admit one it does).
+static bool isBoxingTargetType(const TypeRef* to) {
+    if (!to) return false;
+    if (to->kind == TypeRef::Kind::Primitive)
+        return to->primitive == PrimitiveType::Object;
+    return to->kind == TypeRef::Kind::Named && to->declaration &&
+           to->declaration->kind == ast::TypeDeclKind::Interface;
+}
+
+// per §15.3 (#2912): is `t` a MOVE-ONLY value type? §15.3, *Move-only value
+// types*: "The move-only value type kinds in this specification are two: the
+// owning inline array (`[N owned]T` or `[N owned]T?`, see [§15.1.1]) and the
+// owning-classified choice ([§35.4])." — and, immediately after, "Move-only
+// membership follows from *structure*, never from a declaration form".
+//
+// That two-kind population is EXACTLY the one §8.6 excludes from boxing, so
+// this is written against the property (move-only) rather than against the one
+// spelling the bug report used: an owning-classified choice reaching an
+// `Object` location was measured to be accepted with the same silent `false`
+// as the owning inline array, and a predicate that named only inline arrays
+// would have left half the rule unenforced. `kindOut` receives the spec's own
+// name for whichever kind matched, so the diagnostic can say which one it is.
+static bool isMoveOnlyValueType(const TypeRef* t, const SemaContext& ctx,
+                                const char*& kindOut) {
+    if (!t) return false;
+    if (t->kind == TypeRef::Kind::InlineArray && t->arrayOwned) {
+        kindOut = "an owning inline array";
+        return true;
+    }
+    if (t->kind == TypeRef::Kind::Named && t->declaration &&
+        t->declaration->kind == ast::TypeDeclKind::Choice) {
+        auto verdict = common::classifyChoiceType(t, ctx);
+        if (verdict && *verdict == common::ChoiceClassification::Owning) {
+            kindOut = "an owning-classified choice";
+            return true;
+        }
+    }
+    return false;
+}
+
+// per §8.6 (#2912): a source spelling for the move-only rejection below.
+// Deliberately spells the `owned` marker (`[2 owned]R`) — that marker is the
+// whole reason the value is move-only, so a message that dropped it would name
+// a type the rule does not apply to.
+static std::string spellMoveOnlySource(const TypeRef* t) {
+    if (!t) return "?";
+    if (t->kind == TypeRef::Kind::InlineArray) {
+        std::string s = "[";
+        s += t->arraySizeValue >= 0 ? std::to_string(t->arraySizeValue)
+                                    : std::string("N");
+        if (t->arrayOwned) s += " owned";
+        s += "]";
+        s += spellMoveOnlySource(t->arrayElement);
+        return s;
+    }
+    if (t->kind == TypeRef::Kind::Named) {
+        std::string s(namedTypeSimpleName(t));
+        return s.empty() ? std::string("?") : s;
+    }
+    return "?";
+}
+
 // Slices T1/T4: assignability check (§5.1, §7, §12 subtyping).
 // Handles two cases and conservatively skips everything else
 // (mixed primitive/named, generics, null, Object target) so it
@@ -2922,6 +2990,64 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
                              SourceLocation loc, const std::string& what,
                              const ast::Expr* fromExpr) {
     if (!from || !to) return;
+    // fix #2912 (§8.6 *Boxing of inline arrays*, v0.240) — the whole rule:
+    //
+    //   "Move-only value types — owning inline arrays (`[N owned]T` and
+    //    `[N owned]T?`) and owning-classified choices ([§35.4]) — cannot be
+    //    boxed. Boxing a value type copies the value into a heap wrapper, but
+    //    move-only types forbid copying ([§15.3]). A program that needs the
+    //    contents of an owning inline array to cross a boxed-value boundary
+    //    must explicitly transfer ownership — typically by draining the inline
+    //    array into a heap collection (`OwningArray<T>`), which is itself a
+    //    class type and is passed by reference rather than boxed."
+    //
+    // "cannot be boxed" is a prohibition on the PROGRAM, stated together with
+    // the remedy the program is expected to use — so the compiler owes a
+    // rejection, and codegen is NOT the place to supply one: the copy §8.6
+    // describes is exactly what §15.3 forbids, and performing it would hand the
+    // box and the source two owners for one set of instances. Codegen's refusal
+    // to box is therefore correct and is left alone; what was missing is this.
+    //
+    // Nothing rejected it. MEASURED on f069645 across §8.6's boxing positions,
+    // none of them diagnosed:
+    //   * `var oo: Object := own;`     compiles; `oo is [2]R` reads FALSE (the
+    //                                  #2775 `internal:` note is the only sign)
+    //   * `oo := own;`                 compiles; the same silent false
+    //   * `Take(own)`, Object param    ICE: "Call parameter type does not match
+    //                                  function signature!" + IR verify abort
+    //   * `return own;`, Object return ICE: "Function return type does not
+    //                                  match operand type of return inst!"
+    // and an owning-classified CHOICE at an `Object` local behaved identically
+    // — which is why the predicate is §15.3's population, not the one spelling.
+    //
+    // Deliberately NOT swept in, because the spec admits them explicitly on a
+    // BORROWED receiver and neither is an assignability question: §8.5's
+    // `ToString` for an owning inline array ("all forms, including move-only
+    // `[N owned]…` arrays, whose receiver is borrowed for the call"), §18.5
+    // interpolation, which dispatches that same `ToString`, and §8.2's
+    // `GetType()` ("cannot be boxed … but may be asked their type — the
+    // receiver is borrowed, not copied").
+    if (isBoxingTargetType(to)) {
+        const char* moveOnlyKind = nullptr;
+        if (isMoveOnlyValueType(from, ctx_, moveOnlyKind)) {
+            std::string target =
+                to->kind == TypeRef::Kind::Primitive
+                    ? std::string("Object")
+                    : std::string(namedTypeSimpleName(to));
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                std::string("the ") + what + " has type `" +
+                spellMoveOnlySource(from) + "`, " + moveOnlyKind +
+                " — a move-only value type, which §8.6 says cannot be boxed: "
+                "reaching a location of type `" + target +
+                "` boxes the value, and boxing copies it into a heap "
+                "wrapper, which move-only types forbid (§15.3). Transfer "
+                "ownership explicitly instead — drain the owned slots into an "
+                "`OwningArray<T>` (a class type, passed by reference rather "
+                "than boxed) and use that (§8.6)");
+            return;  // reported; the checks below would only cascade
+        }
+    }
     // §7.4 / §12.7 (#914): a value-type (primitive) nullable simple variable
     // proved non-null by null-flow narrowing (`if x is null then return; end`,
     // `is not null`, else-of-`is null`, or initialization with a non-null value)
