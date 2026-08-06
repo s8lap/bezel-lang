@@ -1245,8 +1245,26 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     out.hasPositionalFields = t.hasPositionalFields;
 
     const bool inInterface = (t.kind == ast::TypeDeclKind::Interface);
-    const bool isGenericClass = !t.genericParams.empty() &&
-                                t.kind == ast::TypeDeclKind::Class;
+    // fix #2871 (§2.8.2 clause 2 / §22.12 rule 1 / §22.13 / §9, v0.240): this
+    // predicate was `kind == Class`, which names a CATEGORY where the thing that
+    // actually matters is a PROPERTY — "this type is generic, so each consumer
+    // monomorphizes its OWN copy of its state and bodies, and the exporting
+    // module's compilation cannot run them on the consumer's behalf". That is
+    // true of a generic RECORD (§9) exactly as it is of a generic class, and a
+    // record fell out of every gate below.
+    //
+    // Consequence before this fix, MEASURED as a real two-module build: a
+    // `public static readonly Seed: int := 107;` on an imported generic RECORD
+    // read **0** in the importer with NO diagnostic at any severity, where the
+    // identical declarations compiled as ONE module read 107. It was silent
+    // rather than rejected because #2351's reject fires on the reconstruction
+    // path this flag also gates — so a record reached neither the carriage nor
+    // the rejection. The generic-class twin has been a hard located reject since
+    // #2351; only the record spelling was silently wrong.
+    const bool isGenericMonomorphized =
+        !t.genericParams.empty() &&
+        (t.kind == ast::TypeDeclKind::Class ||
+         t.kind == ast::TypeDeclKind::Record);
 
     // §14 generic params + their §14.2 constraints (from the TypeDecl AST).
     if (auto* td = dynamic_cast<const ast::TypeDecl*>(t.decl)) {
@@ -1299,7 +1317,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         bool exported = isExportedMember(member->visibility, inInterface);
         // For generic classes, also include private/internal METHODS so the
         // importer's ctor/dtor body re-parsing can resolve self-calls (#695).
-        bool includeForCtorBody = isGenericClass && isMethod &&
+        bool includeForCtorBody = isGenericMonomorphized && isMethod &&
             !exported &&
             (member->visibility == ast::Visibility::Private ||
              member->visibility == ast::Visibility::Internal);
@@ -1316,7 +1334,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
         // exported — no initializer, no ABI change. Mirrors the private-method
         // rationale (#695): the field is not accessible outside the class;
         // the stub is used solely for sema name-resolution in re-parsed bodies.
-        bool includeForMethodBody = isGenericClass && (isField || isAutoPropStorage) &&
+        bool includeForMethodBody = isGenericMonomorphized && (isField || isAutoPropStorage) &&
             !exported &&
             (member->visibility == ast::Visibility::Private ||
              member->visibility == ast::Visibility::Internal);
@@ -1410,7 +1428,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
             !includeForLayout)
             continue;
         MetaMember mm;
-        if (convertMember(*member, inInterface, ctx, mm, isGenericClass, source)) {
+        if (convertMember(*member, inInterface, ctx, mm, isGenericMonomorphized, source)) {
             // A field included ONLY for layout (not otherwise exported, and
             // not already carried for generic-body name resolution) is
             // name-invisible outside the class — strip the initializer text
@@ -1437,7 +1455,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
                 // generic bodies reach"). This is the text the consumer names in
                 // the §2.8.2 diagnostic; it adds no member, no slot and no ABI —
                 // the member itself was already being carried for layout.
-                if (!isGenericClass) mm.fieldInitText.clear();
+                if (!isGenericMonomorphized) mm.fieldInitText.clear();
             }
             out.members.push_back(std::move(mm));
         }
@@ -1460,7 +1478,7 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     // so the importer can run user destructor side-effects (#662 foundation C).
     // The destructor is skipped by convertMember (§13.3 not user-callable), so
     // we walk members here to find a DestructorDecl with a non-empty body.
-    if (isGenericClass && !source.empty()) {
+    if (isGenericMonomorphized && !source.empty()) {
         for (sema::Symbol* ms : t.members) {
             const auto* ds = dynamic_cast<const sema::DestructorSymbol*>(ms);
             if (!ds) continue;
