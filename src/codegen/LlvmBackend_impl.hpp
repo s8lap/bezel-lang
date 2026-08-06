@@ -350,6 +350,42 @@ public:
         collectBoxReturnMethods();
         collectBoxStorageFields();
         declareVtables();  // CG17: after functions exist (needs fn ptrs)
+        // fix #2864 (§8.6 "Boxing" / §23.2 / §2.5, v0.240): MOVED UP from just
+        // below `emitExportedIndexer*` to here. §8.6's box vtables/descriptors
+        // must exist BEFORE any emitter that lowers a user accessor BODY, or
+        // `boxValue`'s `boxVtableFor` returns null, `boxForTarget` is a silent
+        // no-op, and the body `ret`s a raw `i32` from the `ptr`-returning
+        // accessor — "Function return type does not match operand type of return
+        // inst!", a hard build failure on `public property Q: Object => 5;`
+        // (#2864's repro, both the expression and the `get => do … end;` block
+        // spelling). The four `emitExported{Property,Indexer}{Getters,Setters}`
+        // calls below are exactly such emitters: each wraps
+        // `ensurePropertyAccessorFn`/`ensureIndexer{Getter,Setter}Fn`, whose
+        // bodies are lowered on first request and memoized.
+        //
+        // ⚠ THIS IS AS EARLY AS IT CAN GO, and the limit is MEASURED, not
+        // assumed. Moving the call one step further — inside `declareVtables()`
+        // between its Pass C and Pass D, which would also close the remaining
+        // VIRTUAL/vtable face (#2759, whose accessor bodies are lowered by
+        // Pass D itself) — compiles #2759's repro but REGRESSES a working
+        // program to a SIGSEGV: `setupBoxDescriptors`'s own Pass C calls
+        // `ensurePropertyAccessorFn`/`ensureIndexerGetterFn` for a RECORD's
+        // interface-satisfying accessors, and a body lowered before Pass D runs
+        // ahead of the `vtables_[ts]` globals Pass D creates, so `emitVtableInit`
+        // (LlvmBackend_Setup.cpp — `if (auto* vt = specializedVtableFor(t))`)
+        // silently SKIPS the vptr store for any `new C()` in that body and the
+        // object carries a null vtable word. Reproduced: a `record R(a) : IP`
+        // whose `get => do using var h := new Helper(a*3); return h.v; end;`
+        // returns 21 on the parent commit and segfaults (exit 139) with the
+        // call moved before Pass D. Trading a build failure for a silent null
+        // vptr is the wrong direction, so #2759 stays open and its pinned test
+        // (`expr_getter_object_boxing_2761_test.cpp`) stays red-on-fix.
+        //
+        // `setupBoxDescriptors` itself only needs `descArray_` FILLED for
+        // classes/interfaces (declareVtables Pass C) plus `methodFns_`
+        // (declareFunctions) — nothing the four calls below produce — so the
+        // dependency direction is one-way and this placement is the correct one.
+        setupBoxDescriptors();  // §8.6: after descArray_/vtable globals exist
         // §2.5 / §22.9 (issue #503): emit ExternalLinkage getter stubs for
         // non-virtual public properties (exporter side). After declareVtables so
         // propGetSlot_ is populated; virtual properties are skipped.
@@ -398,7 +434,8 @@ public:
         // declareImportedIndexerSetters (importer-side external getter/setter
         // stubs) now run INSIDE declareVtables() itself, between the buildVtable
         // loops and Pass D — see the call site there for why.
-        setupBoxDescriptors();  // §8.6: after descArray_/vtable globals exist
+        // fix #2864: setupBoxDescriptors() used to be called here; it now runs
+        // immediately after declareVtables() (see the call site above for why).
         declareExterns();  // CG26
         // collectBoxReturnMethods()/collectBoxStorageFields() now run BEFORE
         // declareVtables() (see the call site just above computeEnumValues) so

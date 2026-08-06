@@ -4635,10 +4635,10 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     // as one: `declareVtables()` (LlvmBackend_impl.hpp ~290) ITSELF lowers user
     // statement bodies — via the accessor calls at LlvmBackend_Setup.cpp
     // ~3699/~3706/~3826 and `ensureIndexer{Getter,Setter}Fn` at ~3824-3825 —
-    // and it runs BEFORE `emitExportedPropertyGetters()` (~294),
-    // `emitExportedPropertySetters()` (~298) and `setupBoxDescriptors()`
-    // (~339). So "every call site precedes the body loop at ~346" does NOT
-    // establish that no user code has been lowered yet.
+    // and it runs BEFORE `setupBoxDescriptors()` (moved directly after
+    // `declareVtables()` by #2864), `emitExportedPropertyGetters()` and
+    // `emitExportedPropertySetters()`. So "every call site precedes the body
+    // loop" does NOT establish that no user code has been lowered yet.
     //
     // The real reason the two fields #2708 is about are clean at every entry is
     // that `currentReturnTypeNode_` and `currentLambdaReturnSemaTy_` are
@@ -4754,22 +4754,24 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                 // does not match operand type of return inst!", a HARD build
                 // failure on a shape §23.3 plainly admits (reproduced on
                 // 0e554e3).
-                // ⚠ MEASURED INERT TODAY, and shipped anyway: `boxValue`
-                // resolves the box vtable through `primBoxVtable_`/`boxVtable_`,
-                // which `setupBoxDescriptors()` fills — and that pass runs
-                // AFTER `declareVtables()` (LlvmBackend_impl.hpp ~400), which is
-                // what reaches this emitter. `boxVtableFor` therefore returns
-                // null and `boxValue` returns `v` unchanged, so the virtual
-                // spelling STILL fails to build. That is #2759 (the identical
-                // gap #2703 hit on the block face), and it is not fixable by
-                // reordering the two passes: `setupBoxDescriptors` is
-                // documented at its call site as requiring the descArray_/
-                // vtable globals `declareVtables` builds, so the dependency is
-                // the wrong way round for a swap. Kept here so the arm is in
-                // place — and so the fix is one pass-ordering change away —
-                // rather than leaving the expression face the only one missing
-                // it. A build failure is the SAFE residual: unlike the inlined
-                // read this shape never silently produced a wrong value.
+                // ⚠ LIVE ON THE EXPORTED FACE SINCE #2864, STILL INERT ON THE
+                // VTABLE FACE. `boxValue` resolves the box vtable through
+                // `primBoxVtable_`/`boxVtable_`, which `setupBoxDescriptors()`
+                // fills. #2864 moved that pass to run immediately after
+                // `declareVtables()` and therefore BEFORE the four
+                // `emitExported{Property,Indexer}{Getters,Setters}` emitters, so
+                // every accessor body those request — the NON-virtual public
+                // property/indexer, #2864's own repro — now boxes properly.
+                // The call sites INSIDE `declareVtables()` (Pass D, the
+                // vtable/itable slots) still run while `boxVtableFor` returns
+                // null, so `public virtual property O: Object => 0;` still fails
+                // to build. That residual is #2759, and it is NOT fixable by
+                // simply moving `setupBoxDescriptors` one step earlier: doing so
+                // regresses a working record program to a null-vptr SIGSEGV —
+                // the measurement is recorded at the call site
+                // (LlvmBackend_impl.hpp, `setupBoxDescriptors()`). A build
+                // failure is the SAFE residual: unlike the inlined read this
+                // shape never silently produced a wrong value.
                 v = boxForTarget(v, retTyRef, getterExpr);
                 // #2491 (twin of #2434): the property getter body's return
                 // expression failed to lower — this site bypasses emitReturn
@@ -5226,9 +5228,10 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
     llvm::Value* result = lowerExpr(*getterExpr);
     // fix #2761 (§8.6 "Boxing" / §23.4 "Indexers", v0.240): the ITABLE face of
     // an expression-bodied INDEXER getter — the indexer spelling of the
-    // property arm in ensurePropertyAccessorFn above. Subject to the SAME #2759
-    // inertness on this face (this emitter is reached from declareVtables,
-    // before setupBoxDescriptors); see the note there.
+    // property arm in ensurePropertyAccessorFn above. LIVE when this emitter is
+    // reached from `emitExportedIndexerGetters` (which #2864 moved after
+    // `setupBoxDescriptors`); still subject to the #2759 inertness when it is
+    // reached from declareVtables Pass D. See the note there.
     if (pd->type)
         result = boxForTarget(result, ctx_.resolvedType(*pd->type), getterExpr);
     // fix #2850 (§7.2 "Nullable value types" / §23.4 "Indexers", v0.240): the
