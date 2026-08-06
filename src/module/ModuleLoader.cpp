@@ -1409,8 +1409,20 @@ static bool parseAndAttachDtorBody(
     auto sf = freshParser.parseCompilationUnit();
     if (!sf || freshDiag.hasErrors()) return false;
 
-    DiagnosticEngine semaDiag;
-    sema::SemaContext freshCtx(semaDiag);
+    // fix #2855 (§14/#662c / §28.4, v0.240): the fresh context AND its
+    // diagnostics must OUTLIVE this function, exactly as in the ctor (#2290)
+    // and method (#783) paths. Until this fix nothing in mainCtx pointed into
+    // freshCtx, so a stack context was safe — and the dtor body consequently
+    // arrived in the importer with NO types at all, which is the crash this
+    // change fixes. The four things carried below (resolved types, expr types,
+    // body-local symbols, lambda parameter lists) all point into the fresh
+    // arena, so it is heap-allocated and kept alive at the tail. Order matters:
+    // SemaContext holds a DiagnosticEngine&, so the engine is owned FIRST
+    // (destroyed last) and the context SECOND (destroyed first).
+    auto semaDiagPtr = std::make_shared<DiagnosticEngine>();
+    DiagnosticEngine& semaDiag = *semaDiagPtr;
+    auto freshCtxPtr = std::make_shared<sema::SemaContext>(semaDiag);
+    sema::SemaContext& freshCtx = *freshCtxPtr;
     sema::collectSymbols(*sf, freshCtx);
     if (semaDiag.hasErrors()) return false;
     sema::resolveTypes(*sf, freshCtx);
@@ -1460,6 +1472,18 @@ static bool parseAndAttachDtorBody(
         }
     }
 
+    // fix #2855 (§14/#662c / §27.3/§27.5, v0.240): every symbol that is a
+    // LAMBDA's parameter somewhere in this dtor body — see the identical set in
+    // parseAndAttachMethodBody for why the ParameterSymbol arm below needs it.
+    // (A destructor declares no parameters of its own, §28.4, so every
+    // ParameterSymbol reachable from a dtor body IS a lambda's; the set is
+    // still built and tested rather than assumed, so the arm stays guarded on
+    // the property it actually needs rather than on the symbol's category.)
+    std::unordered_set<const sema::Symbol*> freshLambdaParamSyms;
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        for (sema::Symbol* ps : syms)
+            if (ps) freshLambdaParamSyms.insert(ps);
+
     // Remap exprSymbols.
     for (const auto& [expr, freshSym] : freshCtx.allExprSymbols()) {
         if (!expr || !freshSym) continue;
@@ -1472,8 +1496,57 @@ static bool parseAndAttachDtorBody(
             auto it = importedMethods.find(freshMethodSigKey(freshMs));
             if (it != importedMethods.end())
                 mainCtx.setExprSymbol(expr, it->second);
+        } else if (dynamic_cast<sema::LocalSymbol*>(freshSym)) {
+            // fix #2855, the #2290-bug-1 / #2818 arm this path never had: a
+            // symbol DECLARED INSIDE the dtor body — a `var`/`const` local, a
+            // `for`/`for-in` iteration variable, a `using var` — has NO
+            // importer-side counterpart to remap to. It IS the fresh symbol,
+            // and its `decl` is the re-parsed ast::LocalDecl that codegen keys
+            // `locals_` on. Carry the binding VERBATIM; the arena that owns it
+            // is kept alive at the tail (ownImportedAuxiliary).
+            mainCtx.setExprSymbol(expr, freshSym);
+        } else if (dynamic_cast<sema::ParameterSymbol*>(freshSym)) {
+            // fix #2855 / #2839: a LAMBDA parameter is a ParameterSymbol
+            // declared inside the body, with no importer-side twin — the same
+            // category as a body-local above. Carry it verbatim (its
+            // ParameterSymbol is the one codegen's lowerLambda keys
+            // `paramSlots_` on, from the lambdaParams entry copied below).
+            // Guarded on membership in the fresh context's lambdaParams_, not
+            // on the symbol's kind, so a ParameterSymbol arriving here by some
+            // other route is still declined rather than silently carried.
+            if (freshLambdaParamSyms.count(freshSym))
+                mainCtx.setExprSymbol(expr, freshSym);
         }
     }
+
+    // fix #2855 (§14/#662c, v0.240): carry the body's TYPE tables, which this
+    // path — alone among the four reconstructions — copied NEITHER of. codegen
+    // asks `ctx_.resolvedType(*declType)` / `ctx_.exprType(expr)` for every
+    // declaration and sub-expression it lowers; with mainCtx holding no entry
+    // for the re-parsed nodes it got a NULL TypeRef and dereferenced it —
+    // `TypeRef::headName()` inside `lowerLocalDecl`, reached from
+    // `emitDisposerCore` -> `emitSpecializedDisposer` ->
+    // `buildImportedGenericVtable`. So ANY local declaration in an imported
+    // generic class's destructor SIGSEGV'd the importing compiler with no
+    // diagnostic — the lambda in #2855's repro is one instance of that, not the
+    // axis: `var k: int := 5;` crashes identically.
+    //
+    // Verbatim copy, as in the three sibling paths and for the same reasons:
+    // the keys are the re-parsed AST nodes (unique to the fresh AST, so no
+    // collision with mainCtx's own) and the TypeRef* values point into the
+    // fresh arena, kept alive at the tail.
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        if (expr && ref) mainCtx.setExprType(expr, ref);
+    // fix #2855 (§27.3 Lambda expressions, v0.240): and the per-lambda
+    // parameter lists, the copy #2839 added to the method and ctor paths and
+    // #2856 to the field-initializer path. codegen's lowerLambda reads
+    // `ctx_.lambdaParams(&lam)` to declare the closure's user parameters and to
+    // bind each incoming argument to its ParameterSymbol; with no entry the
+    // closure takes ZERO user parameters and the lambda's value is lost.
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        if (lam) mainCtx.setLambdaParams(lam, syms);
 
     // Create a DestructorSymbol on the imported type and attach the parsed decl.
     auto* importedDs = mainCtx.makeImportedSymbol<sema::DestructorSymbol>();
@@ -1487,6 +1560,15 @@ static bool parseAndAttachDtorBody(
     // re-parsed AST point into it) and the SourceFile itself.
     mainCtx.ownImportedSource(std::move(source));
     mainCtx.ownImportedAst(std::move(sf));
+    // fix #2855: and the fresh context + diagnostics, which the four carries
+    // above now point into. importedAuxiliary_ destroys in REVERSE insertion
+    // order and SemaContext holds a DiagnosticEngine&, so push the engine FIRST
+    // (destroyed last) and the context SECOND (destroyed first) —
+    // context-then-engine, never dangling. Every `return false` above happens
+    // BEFORE the first mainCtx.set*() call, so a declined reconstruction leaves
+    // nothing in mainCtx pointing at the arena this drops.
+    mainCtx.ownImportedAuxiliary(semaDiagPtr);
+    mainCtx.ownImportedAuxiliary(freshCtxPtr);
     return true;
 }
 

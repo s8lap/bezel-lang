@@ -52,17 +52,18 @@ struct Entry {
 };
 const Entry kAstKeyedTables[] = {
     {"resolvedTypes_",
-     "CARRIED verbatim (method/ctor/field-init; NOT dtor - #2855)"},
+     "CARRIED verbatim by all four paths (method/ctor/field-init; dtor #2855)"},
     {"exprTypes_",
-     "CARRIED verbatim (method/ctor/field-init; NOT dtor - #2855)"},
+     "CARRIED verbatim by all four paths (method/ctor/field-init; dtor #2855)"},
     {"exprSymbols_",
-     "REMAPPED per symbol kind; Local carried (#2290 ctor, #2818 method), "
-     "lambda Parameter carried (#2839), dtor has no arm (#2855)"},
+     "REMAPPED per symbol kind; Local carried (#2290 ctor, #2818 method, "
+     "#2855 dtor), lambda Parameter carried (#2839 method+ctor, #2855 dtor; "
+     "field-init carries it via #2375's verbatim else)"},
     {"patternSymbols_",
      "CARRIED NOWHERE - reachable and broken, tracked by #2857"},
     {"lambdaParams_",
-     "CARRIED verbatim in method + ctor (#2839) and field-init (#2856); "
-     "dtor still missing - #2855"},
+     "CARRIED verbatim by all four paths: method + ctor (#2839), "
+     "field-init (#2856), dtor (#2855)"},
     {"exprExtBindings_",
      "NOT carried, and proven UNREACHABLE: a body naming an extension method "
      "declines reconstruction at #783's gate before this table is consulted"},
