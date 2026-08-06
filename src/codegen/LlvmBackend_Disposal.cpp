@@ -242,6 +242,68 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         }
         emitOwnedFieldDisposals(ts);
         emitBaseDisposeChain(ts);
+        // fix #2951 (§28.4 step 3 / §28.2 / §28.9 / §31.4, v0.240): release the
+        // INHERITED §31.4 header. §28.4's generated `Dispose()` step 3 states,
+        // verbatim: "Chains to the base class's `Dispose()`." `emitBaseDisposeChain`
+        // above iterates `ts->baseTypes`, which holds only ancestors that HAVE a
+        // TypeSymbol — and a built-in exception has none — so for a class whose
+        // base is `Exception` (or any built-in exception) step 3 chained to
+        // NOTHING. `vt$<C>` slot 2 is the class's own `bz$<C>$Dispose`, whose
+        // core never touched the header, so the shared `bz$exDisposeMsg` that a
+        // directly-constructed `new Exception(msg)` disposes through was never
+        // reached from a subclass and NOTHING released its Message (or
+        // ArgumentException's ParamName). Measured on the 20-iteration repro:
+        // `711 byte(s) leaked in 40 allocation(s)`, against an identical loop on
+        // the built-in `Exception` that is clean.
+        //
+        // §28.9 makes the slot's obligation explicit for a runtime-managed
+        // string field, and §28.2's exactly-once is the whole contract here, so
+        // both directions were measured, not just the leak:
+        //
+        //   * UNDER-release — LSan on the amplified loops; clean now.
+        //   * OVER-release — LSan is blind to it, so it is measured by keeping
+        //     an independent reference alive ACROSS the disposal and reading it
+        //     after, with churn in between: one `+1` string aliased into TWO
+        //     subclass instances, both disposed, then the original read. An
+        //     over-release faults there under ASan; it does not.
+        //
+        // Exactly-once holds structurally, not just on the probes, for the two
+        // shapes that would otherwise release twice:
+        //   * A MULTI-LEVEL hierarchy (`ExB: ExA: Exception`). The gate is the
+        //     TRANSITIVE `hasBuiltinExceptionBase`, so both levels' cores carry
+        //     this call and `emitBaseDisposeChain` runs ExA's core from ExB's.
+        //     `bz$exDisposeMsg` NULLS each slot after releasing it (see
+        //     setupBuiltinExceptions) and `bz_string_release` is null-safe, so
+        //     the second call is a no-op. The transitive gate is deliberate: it
+        //     also covers a LOCAL class over an IMPORTED exception base, where
+        //     the chain's reach into the dependency's compiled core is not this
+        //     module's to guarantee.
+        //   * §28.6 REPEAT DISPATCH (explicit `Dispose()` then scope-end). The
+        //     public wrapper's run-once flag already stops the second entry, and
+        //     the slot-nulling makes it idempotent even if it did not.
+        //
+        // BLOCKED UNTIL NOW, and both blockers are real: #2902 (the `base(msg)`
+        // chain stored the message UN-RETAINED, so releasing it here freed a
+        // reference the caller still owned — measured `heap-use-after-free ...
+        // #2 bz$exDisposeMsg`) and #2950 (an imported subclass was laid out
+        // WITHOUT the header, so the exporter-compiled disposer handed the
+        // importer's FIELD VALUE to `bz_string_release` — `SEGV on unknown
+        // address 0x2b`, rdi = the field's value). Both are in this batch; this
+        // call is only sound with them.
+        //
+        // CauseChain@24 is deliberately NOT released here — see the #811/#1389
+        // reasoning on `bz$exDisposeMsg`: it is reclaimed at the terminal
+        // `emitDisposeAndReclaim` site, which runs exactly once per object,
+        // rather than in a disposer that can be re-dispatched. (That reclaim is
+        // itself a no-op for a user subclass's vtable; tracked as this issue's
+        // second half, and NOT addressed here.)
+        //
+        // Inherits the pre-existing corner noted above: a destructor that
+        // returns early leaves `terminated` set and skips this block entirely,
+        // exactly as it already skips the owned-field cascade and the base chain.
+        if (hasBuiltinExceptionBase(ts) && builtinExceptionDisposeFn_ &&
+            currentThis_)
+            builder_.CreateCall(builtinExceptionDisposeFn_, {currentThis_});
         builder_.CreateRetVoid();
     }
 }

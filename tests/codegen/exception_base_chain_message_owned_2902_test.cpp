@@ -53,7 +53,15 @@
 // `heap-use-after-free`.
 //
 // ============================================================================
-// WHAT THIS FIX DELIBERATELY DOES NOT DO — read before strengthening a cell.
+// WHAT THIS FIX DELIBERATELY DID NOT DO — HISTORICAL AS OF #2951.
+//
+// Everything in this section was true when #2902 landed and is kept because it
+// is the reasoning the cells below were built around. The residual it describes
+// is now CLOSED for the Message/ParamName slots by #2951, which lands in the
+// same batch as #2950 (its two blockers, both named below); the pins live in
+// tests/codegen/exception_subclass_header_release_2951_test.cpp and
+// tests/module/xmod_exception_subclass_header_release_2951_test.cpp. The
+// CauseChain half is still open — see the ORACLES section after this one.
 // ============================================================================
 //
 // Making the slot own a reference does not by itself make it exactly-once:
@@ -84,15 +92,30 @@
 // `xmod_object_tostring_producer_residual_2867` test. Releasing is only sound
 // once the two modules agree on the layout.
 //
-// CONSEQUENCE FOR THIS FILE'S ORACLES. The cells that pin the fixed defect run
-// under `runAotCheckedLenient` — generated-code ASan WITHOUT LSan — because the
-// residual leak above is expected and tracked, while a use-after-free (an ASan
-// abort, which flips `r.ran` to false) is exactly what must not come back. The
-// two cells that were already leak-free — the built-in control and the literal
-// sentinel — run under the FULL `runAotChecked`, so a fix that introduced a
-// leak where there was none would still be caught here. When #2950 and the
-// residual (#2951) land, every lenient cell below should be promoted to
-// `runAotChecked`.
+// CONSEQUENCE FOR THIS FILE'S ORACLES — UPDATED BY #2951, WHICH HAS NOW LANDED.
+//
+// These cells originally ran under `runAotCheckedLenient` — generated-code ASan
+// WITHOUT LSan — because the residual leak above was expected and tracked, while
+// a use-after-free (an ASan abort, which flips `r.ran` to false) was exactly
+// what must not come back. This header said that when #2950 and the residual
+// (#2951) landed, every lenient cell should be promoted to `runAotChecked`.
+// Both have landed, and every cell IS now promoted — with ONE exception, which
+// was measured rather than assumed:
+//
+//   `message_and_cause_overload_sibling_branch_undisturbed_31_4` STAYS lenient.
+//   It uses §31.4's `(message, cause)` overload, whose CauseChain SNAPSHOT is
+//   still not reclaimed for a user subclass — #2951 closed the Message/ParamName
+//   half, not the CauseChain half (`bz_exc_reclaim_causechain` gates on the
+//   object's vtable being one of the BUILT-IN exception vtables, and a user
+//   subclass's is not, so the call emitted at the reclaim site returns early).
+//   Measured on the landed fix, this exact program: `2231 byte(s) leaked in 80
+//   allocation(s)`, with `bz_exc_causechain_link -> bz_array_alloc_count_n` in
+//   the trace. Promoting it would have made this file fail for a defect it does
+//   not pin. It is promoted the day that half lands — and the presence of a
+//   still-lenient cell here is the reminder that it has not.
+//
+// Everything else now asserts exactly-once, in both directions, so a fix that
+// introduced either a leak or an over-release is caught here.
 //
 // EVIDENCE DISCIPLINE. Every message/paramName is built at RUNTIME
 // (`"m" + i.ToString()`); every cell is LOOP-AMPLIFIED 20x with a churn
@@ -133,7 +156,7 @@ std::string out(const bezel::test::JitResult& r) {
 // `e.Message` read.
 BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
            base_chain_borrow_message_no_use_after_free_31_1) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module App; "
         "class SubEx: Exception "
         "  public constructor(m: string) base(m); end constructor; "
@@ -190,7 +213,7 @@ BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
 // PRE-FIX: heap-use-after-free.
 BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
            base_chain_paramname_isolated_no_use_after_free_31_4) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module App; "
         "class SubAe: ArgumentException "
         "  public constructor(m: string, p: string) base(m, p); "
@@ -222,7 +245,7 @@ BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
 // computed once and applied twice.
 BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
            base_chain_message_and_paramname_both_runtime_31_4) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module App; "
         "class SubAe2: ArgumentException "
         "  public constructor(m: string, p: string) base(m, p); "
@@ -259,7 +282,7 @@ BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
 // a built-in" at the wrong level would miss this.
 BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
            multi_level_subclass_hierarchy_no_use_after_free_12) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module App; "
         "class ExA: Exception "
         "  public constructor(m: string) base(m); end constructor; "
@@ -288,7 +311,7 @@ BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
 // site with a different lifetime; the store must own its reference on both.
 BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
            thrown_and_caught_subclass_no_use_after_free_31_1) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module App; "
         "class SubEx3: Exception "
         "  public constructor(m: string) base(m); end constructor; "
@@ -369,9 +392,10 @@ BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
 // still lowers, does not fault, and renders the right text. It becomes a true
 // exactly-once oracle the moment the residual lands — promote it to
 // `runAotChecked` then, together with the rest.
+// (#2951 has landed; this cell IS promoted, and is now that oracle.)
 BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
            base_chain_producer_message_transfer_arm_28_9) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module App; "
         "class SubEx8: Exception "
         "  public constructor(n: int) base(\"m\" + n.ToString()); "
