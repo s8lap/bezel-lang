@@ -4581,8 +4581,29 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
         }
     }
 
-    // Signature: getter (this)->T, setter (this, value:T)->void.
-    std::vector<llvm::Type*> paramTys{ptrTy()};
+    // fix #2885 (§22.12/§22.13/§23, v0.240): a STATIC property's accessor has
+    // NO receiver — §22.12: "a static body has no `this`". Every pre-#2885
+    // caller of this function filtered statics out before reaching here (the
+    // four emitExported* emitters skip them; a static property is never virtual
+    // and never an interface member, §11.8, so no vtable/itable caller exists),
+    // so this branch is reachable only from emitExportedStaticPropertyAccessors
+    // — the exporter half of the cross-module static ABI. The differences are
+    // exactly the three a missing `this` implies: the parameter list, the
+    // `value` argument position, and the §28.2 checked-disposal guard (which
+    // GEPs the receiver's disposed flag and would dereference nothing at all).
+    const bool isStaticProp = isStaticProperty(ps);
+    // A static AUTO-property's storage is a module-level global (§23.1 #743,
+    // declareStatics), NOT an instance slot — the isAuto branches below would
+    // GEP `currentThis_` into the instance struct. The static arms added by
+    // #2885 read/write that global instead; with no global there is no storage
+    // to accessor-ise, so decline BEFORE the function is created rather than
+    // emitting a body that returns a silent zero.
+    if (isStaticProp && isAuto && !staticGlobals_.count(ps)) return nullptr;
+
+    // Signature: getter (this)->T, setter (this, value:T)->void; static drops
+    // the `this` parameter from both.
+    std::vector<llvm::Type*> paramTys;
+    if (!isStaticProp) paramTys.push_back(ptrTy());
     if (isSet) paramTys.push_back(valTy);
     auto* fnTy = llvm::FunctionType::get(
         isSet ? llvm::Type::getVoidTy(llvm_) : valTy, paramTys, false);
@@ -4671,7 +4692,11 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     currentFn_          = fn;
     builder_.SetInsertPoint(entryBB);
     auto argIt = fn->args().begin();
-    currentThis_        = &*argIt;
+    // fix #2885: no `this` argument exists on a static accessor (§22.12); the
+    // body never reads one (sema rejects `this` in a static body), and leaving
+    // it null keeps any future reader from silently binding argument 0 — the
+    // `value` parameter — as a receiver.
+    currentThis_        = isStaticProp ? nullptr : &*argIt;
     locals_.clear();
     paramSlots_.clear();
     refParams_.clear();
@@ -4687,7 +4712,11 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     // accessors. Class properties only (enum properties are NOT disposable,
     // and records have no disposed flag). Per §28.2: "a property or indexer
     // accessor invocation" on a disposed instance raises DisposedAccessException.
-    if (checkedDisposal_ && cls && cls->kind == ast::TypeDeclKind::Class) {
+    // fix #2885: a STATIC accessor has no instance to test (§28.2's guard is
+    // about "a property or indexer accessor invocation" on a disposed
+    // INSTANCE); with no `this` the GEP below would have no base at all.
+    if (checkedDisposal_ && !isStaticProp && cls &&
+        cls->kind == ast::TypeDeclKind::Class) {
         llvm::StructType* st = classStruct(cls);
         unsigned fi = disposedFlagIndex(cls);
         llvm::Value* flagAddr =
@@ -4709,7 +4738,13 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
 
     if (!isSet) {
         // --- Getter body. ---
-        if (isAuto) {
+        if (isAuto && isStaticProp) {
+            // fix #2885 / §23.1 (#743): a STATIC auto-property's storage is the
+            // module-level global declareStatics allocated for it — the same
+            // one staticFieldGlobal routes the same-module implicit get/set to.
+            builder_.CreateRet(
+                builder_.CreateLoad(valTy, staticGlobals_.find(ps)->second));
+        } else if (isAuto) {
             // §23.1: auto-property backing field read.
             llvm::StructType* st = classStruct(cls);
             auto idxIt = fieldIndex_.find(ps);
@@ -4809,11 +4844,26 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
         }
     } else {
         // --- Setter body: bind the implicit `value` param (anchored on pd). ---
-        llvm::Argument& valArg = *std::next(fn->args().begin());
+        // fix #2885: `value` is argument 0 on a static accessor (no `this`).
+        llvm::Argument& valArg = isStaticProp
+                                     ? *fn->args().begin()
+                                     : *std::next(fn->args().begin());
         llvm::AllocaInst* vslot = entryAlloca(valArg.getType());
         builder_.CreateStore(&valArg, vslot);
         locals_[pd] = vslot;
-        if (isAuto) {
+        if (isAuto && isStaticProp) {
+            // fix #2885 / §23.1 (#743): the STATIC auto-property's global.
+            // A PLAIN store, deliberately, with none of the instance branch's
+            // ARC below: §22.12 rule 2's store semantics for an admitted
+            // mutable static are exactly that — "assigning a fresh owned value
+            // into an admitted mutable static discharges the producer" and
+            // "overwriting an admitted mutable static never disposes the
+            // displaced referent" — and the admitted set is primitives/enums
+            // plus the `Task?` cache, never `string` (rule 2 rejects a mutable
+            // `string` static outright). This matches the same-module lowering
+            // through staticFieldGlobal byte for byte.
+            builder_.CreateStore(&valArg, staticGlobals_.find(ps)->second);
+        } else if (isAuto) {
             // §23.1: auto-property backing field write.
             llvm::StructType* st = classStruct(cls);
             auto idxIt = fieldIndex_.find(ps);
@@ -5741,33 +5791,46 @@ bool Emitter::lowerImportedPropertySetValue(const ast::Expr& target,
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
     if (!ps || ps->isIndexer) return false;
     auto sit = importedPropSetterFns_.find(ps);
-    if (sit == importedPropSetterFns_.end()) return false;
+    // fix #2885 (§22.12/§22.13/§23.3/§2.8.2 clause 1, v0.240): a STATIC imported
+    // property writes through its own no-`this` stub. Pre-fix this function
+    // reached the receiver resolution below with `ma->target` naming a TYPE, got
+    // nothing pointer- or aggregate-shaped out of it, and returned false — the
+    // statement then fell through to the generic lvalueAddr fallback, which
+    // cannot resolve a PropertySymbol target at all, and the write was SILENTLY
+    // DROPPED (measured 0 where 8 is correct). The receiver resolution is
+    // skipped entirely, exactly as the LOCAL static path does
+    // (lowerPropertySetValue's `isStaticProp` branch).
+    auto stIt = importedStaticPropSetterFns_.find(ps);
+    const bool isStaticProp = stIt != importedStaticPropSetterFns_.end();
+    if (!isStaticProp && sit == importedPropSetterFns_.end()) return false;
     bool isEnumReceiver = ps->parent &&
                           ps->parent->kind == ast::TypeDeclKind::Enum;
     llvm::Value* recv = nullptr;
-    llvm::Type* recvElemTy = nullptr;
-    if (llvm::Value* addr = lvalueAddr(*ma->target, recvElemTy)) {
-        if (recvElemTy && recvElemTy->isPointerTy())
-            recv = builder_.CreateLoad(recvElemTy, addr);
-        else if (recvElemTy && recvElemTy->isAggregateType() &&
-                 !isEnumReceiver)
-            recv = addr;  // already the address of the receiver's real storage
-    }
-    if (!recv) {
-        llvm::Value* rv = lowerExpr(*ma->target);
-        if (!rv) return false;
-        if (rv->getType()->isPointerTy()) {
-            recv = rv;
-        } else if (rv->getType()->isAggregateType() && !isEnumReceiver) {
-            llvm::AllocaInst* tmp = entryAlloca(rv->getType());
-            builder_.CreateStore(rv, tmp);
-            recv = tmp;
-        } else {
-            return false;
+    if (!isStaticProp) {
+        llvm::Type* recvElemTy = nullptr;
+        if (llvm::Value* addr = lvalueAddr(*ma->target, recvElemTy)) {
+            if (recvElemTy && recvElemTy->isPointerTy())
+                recv = builder_.CreateLoad(recvElemTy, addr);
+            else if (recvElemTy && recvElemTy->isAggregateType() &&
+                     !isEnumReceiver)
+                recv = addr;  // the address of the receiver's real storage
+        }
+        if (!recv) {
+            llvm::Value* rv = lowerExpr(*ma->target);
+            if (!rv) return false;
+            if (rv->getType()->isPointerTy()) {
+                recv = rv;
+            } else if (rv->getType()->isAggregateType() && !isEnumReceiver) {
+                llvm::AllocaInst* tmp = entryAlloca(rv->getType());
+                builder_.CreateStore(rv, tmp);
+                recv = tmp;
+            } else {
+                return false;
+            }
         }
     }
-    llvm::Function* fn = sit->second;
-    llvm::Type* valTy = fn->getFunctionType()->getParamType(1);
+    llvm::Function* fn = isStaticProp ? stIt->second : sit->second;
+    llvm::Type* valTy = fn->getFunctionType()->getParamType(isStaticProp ? 0 : 1);
     v = coerceNumericToType(v, valTy, isUnsignedTargetExpr(target));
     // fix #2500 (§8.6/§23.3/§28.9, v0.236): for an Object/interface property
     // the setter's `value` parameter is `ptr` (a box pointer), but the RHS
@@ -5780,7 +5843,16 @@ bool Emitter::lowerImportedPropertySetValue(const ast::Expr& target,
     // null valueExpr (the ref/out write-back caller passes no RHS expr), so
     // only a boxable VALUE source is wrapped.
     v = boxForTarget(v, ctx_.exprType(target), valueExpr);
-    builder_.CreateCall(fn->getFunctionType(), fn, {recv, v});
+    if (isStaticProp) {
+        // §22.13: the write is a static-member access, so the declaring type's
+        // lazy initialization must have run first — the same guard a
+        // cross-module static FIELD write already emits (emitEnsureStaticInit's
+        // imported branch calls the exporter's `bz$<T>$ensureinit`).
+        emitEnsureStaticInit(ps->parent);
+        builder_.CreateCall(fn->getFunctionType(), fn, {v});
+    } else {
+        builder_.CreateCall(fn->getFunctionType(), fn, {recv, v});
+    }
     emitPendingCheck();
     // fix #2490 (§23.3/§4.6/§28.9, v0.236): the ARGUMENT-PASS release, the
     // property-setter-call twin of the ordinary method-call release in
@@ -5875,7 +5947,11 @@ bool Emitter::lowerImportedPropertySet(const ast::Expr& target,
     if (!ma || !ma->target) return false;
     auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma));
     if (!ps || ps->isIndexer) return false;
-    if (!importedPropSetterFns_.count(ps)) return false;
+    // fix #2885: the STATIC map is the second admissible shape — same #2204
+    // discipline (a pure symbol-shape check with no side effects BEFORE
+    // `value` is lowered, so a non-matching target never double-evaluates it).
+    if (!importedPropSetterFns_.count(ps) &&
+        !importedStaticPropSetterFns_.count(ps)) return false;
     llvm::Value* v = lowerExpr(value);
     // fix #2490: thread `value` through as valueExpr so
     // lowerImportedPropertySetValue can release a +1 producer passed
@@ -5930,14 +6006,26 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
         return false;
     auto git = importedPropGetterFns_.find(ps);
     auto sit = importedPropSetterFns_.find(ps);
-    if (git == importedPropGetterFns_.end() ||
-        sit == importedPropSetterFns_.end()) return false;
-    llvm::Function* getFn = git->second;
-    llvm::Function* setFn = sit->second;
+    // fix #2885 (§22.12/§22.13/§6.6/§17.6, v0.240): the STATIC shape rides its
+    // own no-`this` stub pair. Pre-fix this function declined for a static
+    // property (the `mod == "static"` gate below), so `HS.SP += 1` / `HS.SP++`
+    // fell through to the same dropped-write fallback the plain `:=` did
+    // (measured 0 where 110 / 212 is correct). Both stubs must be present:
+    // §6.6 reads AND writes, so a property missing either half is not this
+    // lowering's shape.
+    auto sgIt = importedStaticPropGetterFns_.find(ps);
+    auto ssIt = importedStaticPropSetterFns_.find(ps);
+    const bool isStaticProp = sgIt != importedStaticPropGetterFns_.end() &&
+                              ssIt != importedStaticPropSetterFns_.end();
+    if (!isStaticProp && (git == importedPropGetterFns_.end() ||
+                          sit == importedPropSetterFns_.end())) return false;
+    llvm::Function* getFn = isStaticProp ? sgIt->second : git->second;
+    llvm::Function* setFn = isStaticProp ? ssIt->second : sit->second;
     auto* getFnTy = getFn->getFunctionType();
     auto* setFnTy = setFn->getFunctionType();
-    if (getFnTy->getNumParams() != 1 || setFnTy->getNumParams() != 2)
-        return false;
+    const unsigned valueArgIdx = isStaticProp ? 0u : 1u;
+    if (getFnTy->getNumParams() != (isStaticProp ? 0u : 1u) ||
+        setFnTy->getNumParams() != valueArgIdx + 1) return false;
     // §23: "get/set share one declared type" — the getter's result and the
     // setter's `value` parameter are both `lowerType(P's declared type)`. A
     // disagreement means this is not the shape this lowering understands;
@@ -5945,7 +6033,8 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
     // BEFORE anything is emitted, so declining leaves no half-lowered
     // statement behind (the discipline #2204 established for
     // lowerImportedPropertySet).
-    if (getFnTy->getReturnType() != setFnTy->getParamType(1)) return false;
+    if (getFnTy->getReturnType() != setFnTy->getParamType(valueArgIdx))
+        return false;
     // MIRROR THE EXPORTER'S OWN GATE, so this can never emit a call to a stub
     // nothing defines. `declareImportedPropertySetters` declares the external
     // reference for nearly every imported PropertySymbol, but
@@ -5963,10 +6052,12 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
     //     declareImportedPropertySetters has no generic gate while the
     //     exporter does. Resolving it needs the per-instantiation stub naming
     //     of §2.8.3 rule 4 — not this fix's to invent.
-    //   * static — #2885: an imported static property's `:=`, `+=` and `++`
-    //     are all silently dropped today (measured 0 where 8 / 102 is
-    //     correct); the static case needs its own no-`this` accessor ABI plus
-    //     §22.13's lazy static initialization.
+    //   * static — CLOSED by #2885, which gave the static case its own
+    //     no-`this` accessor ABI (`$spropget`/`$spropset`) plus §22.13's lazy
+    //     init at the access site; the `isStaticProp` branch above now takes
+    //     that path instead of declining. The gate below still declines for a
+    //     static property whose stubs are absent (a static AUTO-property,
+    //     which is static STORAGE, not an accessor).
     //   * Enum: also lowers its receiver to a bare scalar `i32`, never a
     //     pointer or aggregate (#2474/#2489 carry the same guard).
     // An imported AUTO-property is direct instance STORAGE in the importing
@@ -5986,39 +6077,49 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
     if (!ps->parent->genericParams.empty()) return false;
     if (ps->parent->visibility != ast::Visibility::Public) return false;
     if (ps->visibility != ast::Visibility::Public) return false;
-    for (auto mod : ps->modifiers)
-        if (mod == "static") return false;
+    // fix #2885: a static property with no stub pair (a static AUTO-property)
+    // still declines here; one WITH the pair took the static branch above.
+    if (!isStaticProp && isStaticProperty(ps)) return false;
 
     // --- §6.6: resolve the RECEIVER's storage ONCE, share it with both calls.
     // Mirrors lowerImportedPropertySetValue's #2489 receiver resolution
     // verbatim: prefer lvalueAddr (a record receiver is by-value per §9.2, so
     // lowerExpr would load a COPY and the setter would mutate a throwaway
     // slot); fall back to lowerExpr + spill only for a receiver that is not an
-    // addressable place.
+    // addressable place. A STATIC property has no receiver at all (§22.12) —
+    // `ma->target` names the TYPE — so the whole resolution is skipped.
     llvm::Value* obj = nullptr;
-    llvm::Type* objElemTy = nullptr;
-    if (llvm::Value* addr = lvalueAddr(*ma->target, objElemTy)) {
-        if (objElemTy && objElemTy->isPointerTy())
-            obj = builder_.CreateLoad(objElemTy, addr);
-        else if (objElemTy && objElemTy->isAggregateType())
-            obj = addr;  // already the address of the receiver's real storage
-    }
-    if (!obj) {
-        llvm::Value* ov = lowerExpr(*ma->target);
-        if (!ov) return false;
-        if (ov->getType()->isPointerTy()) {
-            obj = ov;
-        } else if (ov->getType()->isAggregateType()) {
-            llvm::AllocaInst* tmp = entryAlloca(ov->getType());
-            builder_.CreateStore(ov, tmp);
-            obj = tmp;
-        } else {
-            return false;
+    if (!isStaticProp) {
+        llvm::Type* objElemTy = nullptr;
+        if (llvm::Value* addr = lvalueAddr(*ma->target, objElemTy)) {
+            if (objElemTy && objElemTy->isPointerTy())
+                obj = builder_.CreateLoad(objElemTy, addr);
+            else if (objElemTy && objElemTy->isAggregateType())
+                obj = addr;  // the address of the receiver's real storage
         }
+        if (!obj) {
+            llvm::Value* ov = lowerExpr(*ma->target);
+            if (!ov) return false;
+            if (ov->getType()->isPointerTy()) {
+                obj = ov;
+            } else if (ov->getType()->isAggregateType()) {
+                llvm::AllocaInst* tmp = entryAlloca(ov->getType());
+                builder_.CreateStore(ov, tmp);
+                obj = tmp;
+            } else {
+                return false;
+            }
+        }
+    } else {
+        // §22.13: the read-modify-write is a static-member access; run the
+        // declaring type's lazy initialization once, before the getter.
+        emitEnsureStaticInit(ps->parent);
     }
 
     // --- §6.6's order: the LHS chain (above), then the getter. ---
-    llvm::Value* cur = builder_.CreateCall(getFnTy, getFn, {obj});
+    llvm::Value* cur = isStaticProp
+                           ? builder_.CreateCall(getFnTy, getFn, {})
+                           : builder_.CreateCall(getFnTy, getFn, {obj});
     emitPendingCheck();   // §31.1/§31.2: a throw out of the imported getter
     if (!cur) return false;
 
@@ -6059,11 +6160,12 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
     if (!res) return false;
 
     // --- then the store. ---
-    llvm::Type* valTy = setFnTy->getParamType(1);
+    llvm::Type* valTy = setFnTy->getParamType(valueArgIdx);
     llvm::Value* sv = coerceNumericToType(res, valTy,
                                           isUnsignedTargetExpr(targetExpr));
     if (sv->getType() != valTy) return false;   // see the agreement note above
-    builder_.CreateCall(setFnTy, setFn, {obj, sv});
+    if (isStaticProp) builder_.CreateCall(setFnTy, setFn, {sv});
+    else              builder_.CreateCall(setFnTy, setFn, {obj, sv});
     emitPendingCheck();   // §31.1/§31.2: a throw out of the imported setter
 
     // fix #2576's structure, mirrored (§23.3/§28.9/§4.6). For a string-typed

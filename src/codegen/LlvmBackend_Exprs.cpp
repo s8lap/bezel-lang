@@ -4521,6 +4521,25 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // declareImportedPropertyGetters.
         if (auto* ps =
                 dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*ma))) {
+            // fix #2885 (§22.12/§22.13/§2.8.2 clause 1/§23, v0.240): an
+            // imported STATIC property reads through its own no-`this` stub.
+            // `ma->target` names a TYPE here, so the receiver lowering below
+            // produced nothing pointer-shaped and this whole `if` fell through
+            // — the read left `lowerExpr` as a bare nullptr, which the callers
+            // turn into a silent 0 (`var r := HS.SP;` hit lowerLocalDecl's
+            // #2434 zero-init backstop) or a CRASH (`"x" + HS.SP.ToString()`
+            // SIGSEGV'd, both measured on a real two-module build).
+            if (auto sgit = importedStaticPropGetterFns_.find(ps);
+                sgit != importedStaticPropGetterFns_.end()) {
+                // §22.13: a static-member access triggers the declaring type's
+                // lazy initialization — the same guard the cross-module static
+                // FIELD read emits (memberOwner/emitEnsureStaticInit above).
+                emitEnsureStaticInit(ps->parent);
+                llvm::Value* res = builder_.CreateCall(
+                    sgit->second->getFunctionType(), sgit->second, {});
+                emitPendingCheck();   // §31.1/§31.2: a throw out of the getter
+                return res;
+            }
             auto git = importedPropGetterFns_.find(ps);
             if (git != importedPropGetterFns_.end() && ma->target) {
                 llvm::Value* obj = lowerExpr(*ma->target);

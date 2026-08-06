@@ -2222,6 +2222,98 @@ void Emitter::emitExportedPropertySetters() {
 }
 
 
+// fix #2885 (§22.12/§22.13/§2.8.2 clause 1/§23, v0.240): the STATIC-property
+// exporter. `emitExportedPropertyGetters`/`-Setters` above both skip a static
+// property outright ("Static properties have no `this` parameter and are
+// handled separately by the static-field path; they're excluded here") — but no
+// such separate path ever existed for a COMPUTED static property, so nothing
+// defined a cross-module symbol for one, while
+// `declareImportedProperty{Getters,Setters}` carried no static filter and
+// declared the INSTANCE-shaped stub anyway. Measured on a real two-module build
+// (bc0e0a6 / 2aed89a): `HS.SP := 7` then reading the backing static field gave
+// 0 where 8 is correct, and `+=` / `++` the same; the READ side degraded to 0
+// through lowerLocalDecl's #2434 zero-init backstop in `var r := HS.SP;`, and
+// SIGSEGV'd outright in `"x" + HS.SP.ToString()`.
+//
+// A static accessor takes no receiver (§22.12: a static body has no `this`), so
+// this emits its own signature under its own name — `bz$<Class>$<Prop>$spropget
+// () -> T` and `bz$<Class>$<Prop>$spropset(T value) -> void`. See the
+// declaration in LlvmBackend_impl.hpp for why the name differs from the
+// instance form rather than sharing it with a shorter argument list.
+//
+// The body is built by the SAME ensurePropertyAccessorFn every other accessor
+// face uses — given a static-aware branch by this fix (no `this` parameter, no
+// §28.2 checked-disposal guard, `value` at argument 0) — so a static block
+// setter's statements, a static arrow getter's expression, and their ARC
+// discipline are byte-identical to the same-module inlined form. A static
+// AUTO-property is included: its accessor bodies read/write the module-level
+// global §23.1 (#743) allocates for it. That is NOT scope creep but a symmetry
+// requirement — the importer cannot tell an auto static property from a
+// computed one (MetaMember::isAutoProperty is deliberately forced false for
+// every static, since it means "instance storage"), so excluding it HERE while
+// the importer declared its stub anyway produced an `undefined reference to
+// bz$GLib.SAuto$A$spropget` on this fix's own probe grid. Its cross-module
+// access was equally broken before (nothing declares an external global for an
+// imported static auto-property — declareStatics' imported loop is
+// FieldSymbol-only — so the read fell through the same nullptr path).
+void Emitter::emitExportedStaticPropertyAccessors() {
+    for (const auto& sym : ctx_.symbols()) {
+        auto* ts = dynamic_cast<const sema::TypeSymbol*>(sym.get());
+        if (!ts || (ts->kind != ast::TypeDeclKind::Class &&
+                    ts->kind != ast::TypeDeclKind::Record)) continue;
+        if (ts->visibility != ast::Visibility::Public) continue;
+        if (!ts->genericParams.empty()) continue;   // #2884 / §2.8.3 rule 4
+        for (sema::Symbol* m : ts->members) {
+            auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
+            if (!ps || ps->isIndexer) continue;
+            if (!isStaticProperty(ps)) continue;
+            if (ps->visibility != ast::Visibility::Public) continue;
+            auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+            if (!pd) continue;
+            llvm::Type* valTy = lowerType(pd->type.get());
+            if (!valTy) valTy = i32();
+            std::string clsName = mangledTypeName(ts);
+            std::string propName = std::string(ps->name);
+            for (bool isSet : {false, true}) {
+                std::string mangled = "bz$" + clsName + "$" + propName +
+                                      (isSet ? "$spropset" : "$spropget");
+                if (module_->getNamedValue(mangled)) continue;
+                auto* fnTy =
+                    isSet ? llvm::FunctionType::get(
+                                llvm::Type::getVoidTy(llvm_), {valTy}, false)
+                          : llvm::FunctionType::get(valTy, {}, false);
+                auto* fn = llvm::Function::Create(
+                    fnTy, llvm::GlobalValue::ExternalLinkage, mangled, *module_);
+                // A getter-only property (no setter accessor) and a set-only
+                // one are excluded exactly the way the instance emitters do it:
+                // the body builder returns nullptr and the incomplete
+                // declaration is erased, so the missing half is simply not part
+                // of this property's cross-module surface (§23.3).
+                llvm::Function* innerFn = ensurePropertyAccessorFn(ts, ps, isSet);
+                if (!innerFn) { fn->eraseFromParent(); continue; }
+                auto* savedFn = currentFn_;
+                auto* savedInsert = builder_.GetInsertBlock();
+                currentFn_ = fn;
+                auto* entry = llvm::BasicBlock::Create(llvm_, "entry", fn);
+                builder_.SetInsertPoint(entry);
+                if (isSet) {
+                    llvm::Value* valueArg = &*fn->args().begin();
+                    builder_.CreateCall(innerFn->getFunctionType(), innerFn,
+                                        {valueArg});
+                    builder_.CreateRetVoid();
+                } else {
+                    llvm::Value* result = builder_.CreateCall(
+                        innerFn->getFunctionType(), innerFn, {});
+                    builder_.CreateRet(result);
+                }
+                currentFn_ = savedFn;
+                if (savedInsert) builder_.SetInsertPoint(savedInsert);
+            }
+        }
+    }
+}
+
+
 // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): the INDEXER
 // analog of emitExportedPropertyGetters — emit a named, ExternalLinkage getter
 // wrapper `bz$<Class>$idxget$<arity>(ptr %this, idx...) -> T` for every public
@@ -2497,6 +2589,60 @@ void Emitter::declareImportedPropertySetters() {
         auto* fn = llvm::Function::Create(
             fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
         importedPropSetterFns_[ps] = fn;
+    }
+}
+
+
+// fix #2885 (§22.12/§22.13/§2.8.2 clause 1/§23, v0.240): the importer half of
+// the static-property accessor ABI — declare the no-`this` stubs
+// emitExportedStaticPropertyAccessors defines. The gate MIRRORS that emitter's
+// gate exactly, on the metadata the importer holds for the same facts, so this
+// can only ever declare a symbol the exporter defined:
+//   * parent is a public, non-generic Class or Record  (ts->genericParams etc.)
+//   * the property is public, static, not an indexer   (modifiers/visibility,
+//     both carried verbatim by ModuleLoader's Property branch)
+//   * a getter/setter is declared at all (ctx_.importedPropertyHas{Getter,
+//     Setter} — the #2461/#2400 bits; the exporter's own half of this is
+//     ensurePropertyAccessorFn returning nullptr and the stub being erased).
+// A static property is never virtual and never an interface member (§11.8:
+// static interface members "may be methods or operators; static constants and
+// properties are deferred"), so no vtable/itable exclusion is needed here — the
+// instance twins' propGetSlot_/propSetSlot_ checks have nothing to say about
+// this shape.
+void Emitter::declareImportedStaticPropertyAccessors() {
+    for (sema::Symbol* sym : ctx_.importedSymbols()) {
+        auto* ps = dynamic_cast<sema::PropertySymbol*>(sym);
+        if (!ps || ps->isIndexer) continue;
+        if (!isStaticProperty(ps)) continue;
+        if (ps->visibility != ast::Visibility::Public) continue;
+        if (!ps->parent) continue;
+        if (ps->parent->kind != ast::TypeDeclKind::Class &&
+            ps->parent->kind != ast::TypeDeclKind::Record) continue;
+        if (!ps->parent->genericParams.empty()) continue;
+        if (ps->parent->visibility != ast::Visibility::Public) continue;
+        sema::TypeRef* valRef = ctx_.importedMemberType(ps);
+        llvm::Type* valTy = valRef ? lowerTypeRef(valRef) : i32();
+        std::string clsName = mangledTypeName(ps->parent);
+        std::string propName = std::string(ps->name);
+        for (bool isSet : {false, true}) {
+            if (isSet ? !ctx_.importedPropertyHasSetter(ps)
+                      : !ctx_.importedPropertyHasGetter(ps)) continue;
+            auto& map = isSet ? importedStaticPropSetterFns_
+                              : importedStaticPropGetterFns_;
+            if (map.count(ps)) continue;
+            std::string mangled = "bz$" + clsName + "$" + propName +
+                                  (isSet ? "$spropset" : "$spropget");
+            if (auto* existing = module_->getFunction(mangled)) {
+                map[ps] = existing;
+                continue;
+            }
+            auto* fnTy =
+                isSet ? llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_),
+                                                {valTy}, false)
+                      : llvm::FunctionType::get(valTy, {}, false);
+            map[ps] = llvm::Function::Create(
+                fnTy, llvm::Function::ExternalLinkage, mangled, module_.get());
+        }
     }
 }
 
@@ -3448,6 +3594,12 @@ void Emitter::declareVtables() {
     // check inside declareImportedPropertySetters is accurate. MUST run before
     // Pass D below, its first consumer.
     if (ctx_.hasImports()) declareImportedPropertySetters();
+    // fix #2885 (§22.12/§22.13/§2.8.2 clause 1/§23, v0.240): the STATIC twin of
+    // the two calls above. It has no Pass D obligation of its own (§11.8 defers
+    // static interface properties, so no itable slot can ever hold one), but it
+    // shares their placement so every imported-accessor map is populated at one
+    // point in the pass order rather than three.
+    if (ctx_.hasImports()) declareImportedStaticPropertyAccessors();
     // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): the
     // INDEXER analogs of the two calls immediately above — same ordering
     // requirement (propGetSlot_/propSetSlot_ from the buildVtable loops just

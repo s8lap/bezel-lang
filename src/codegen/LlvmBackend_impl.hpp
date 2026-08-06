@@ -394,6 +394,13 @@ public:
         // non-virtual public properties WITH a setter (exporter side). Same
         // ordering requirement as the getter call above (propSetSlot_ populated).
         emitExportedPropertySetters();
+        // fix #2885 (§22.12/§22.13/§23, v0.240): the STATIC-property accessor
+        // stubs — the shape the two calls above skip entirely. Same ordering
+        // requirement and same reason (ensurePropertyAccessorFn builds the
+        // bodies; ensureInitFns_ is already populated by declareFunctions, so a
+        // static accessor body's own static-field access still emits its
+        // §22.13 init guard).
+        emitExportedStaticPropertyAccessors();
         // fix #2414: the INDEXER analogs of the two calls immediately above —
         // same ordering requirement (propGetSlot_/propSetSlot_ populated by
         // declareVtables, which also runs buildVtable's isVirtualIndexer gate).
@@ -2099,6 +2106,19 @@ private:
     // declareImportedPropertySetters.
     std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
         importedPropSetterFns_;
+    // fix #2885 (§22.12/§22.13/§2.8.2 clause 1/§23, v0.240): the STATIC twins of
+    // the two maps above. A static property's accessors take NO `this`
+    // (§22.12), so they cannot ride the `T get(ptr)` / `void set(ptr, T)` ABI
+    // those maps hold: the symbol is spelled `bz$<Class>$<Prop>$sprop{get,set}`
+    // — a DIFFERENT name for a different signature, deliberately, so a
+    // mismatched call can only ever be an `undefined reference` at link time
+    // and never a silently mis-registered argument. Populated by
+    // declareImportedStaticPropertyAccessors; the definitions come from
+    // emitExportedStaticPropertyAccessors on the other side.
+    std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
+        importedStaticPropGetterFns_;
+    std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
+        importedStaticPropSetterFns_;
     // CG35-itable (§13 / §12): per-interface itable dispatch. For each
     // interface method `ms`, ifaceMethodIndex_[ms] is its 0-based position in
     // the interface's non-static method declaration order. This index is used
@@ -2329,6 +2349,20 @@ private:
         }
         // An interface property is implicitly virtual (§13 / §23).
         return ps->parent && ps->parent->kind == ast::TypeDeclKind::Interface;
+    }
+
+    // fix #2885 (§22.12/§22.13/§23, v0.240): a STATIC property — one whose
+    // accessors run with no receiver (§22.12: "Static methods, properties,
+    // fields, and constructors are declared with `static`"). The one place the
+    // predicate is spelled, so the exporter's stub gate, the importer's
+    // declare gate and every call site cannot drift apart (the drift between
+    // `emitExportedPropertySetters`' static skip and
+    // `declareImportedPropertySetters`' lack of one is exactly what #2885 is).
+    static bool isStaticProperty(const sema::PropertySymbol* ps) {
+        if (!ps) return false;
+        for (auto mod : ps->modifiers)
+            if (mod == "static") return true;
+        return false;
     }
 
     // #1080 / §23.4: a virtual/override/abstract (or interface) INDEXER needs a
@@ -4700,6 +4734,47 @@ private:
     // #2387 already discovered that calling this after declareVtables() returns
     // leaves the map empty during Pass D, silently defeating the fallback.
     void declareImportedPropertySetters();
+
+    // fix #2885 (§22.12/§22.13/§2.8.2 clause 1/§23, v0.240): the STATIC
+    // property's own cross-module accessor ABI — the shape the four functions
+    // above deliberately skip (`if (isStatic) continue;`), which is why an
+    // imported static property's `:=`, `+=` and `++` were all SILENTLY DROPPED
+    // and its READ degraded to 0 (or, in a string-concatenation spelling,
+    // SIGSEGV'd): no stub was ever defined, and the importer's receiver-based
+    // call sites resolved a TYPE NAME as receiver, produced nothing pointer-
+    // shaped, and fell through to a fallback that cannot resolve a
+    // PropertySymbol at all.
+    //
+    // A static accessor takes NO `this` (§22.12: "A static body has no
+    // `this`"), so it gets its OWN symbol shape — `bz$<Class>$<Prop>$spropget()
+    // -> T` and `bz$<Class>$<Prop>$spropset(T value) -> void` — rather than
+    // reusing the instance `$propget`/`$propset` name with a shorter signature:
+    // a C symbol carries no type, so a name shared between two signatures turns
+    // an exporter/importer disagreement into a silently mis-registered argument;
+    // a distinct name makes the same disagreement a link error. (Recorded
+    // choice per CLAUDE.md rule 4 — the spec fixes no mangling.)
+    //
+    // Both sides gate on EXACTLY the same five facts — public non-generic
+    // Class/Record parent, public property, `static`, non-indexer, and an
+    // accessor face that exists at all (hasGetter/hasSetter) — every one of
+    // which the importer holds in metadata, so the exporter defines precisely
+    // the set the importer declares. That symmetry is the whole point: an
+    // importer gate that can be TRUE where the exporter's is FALSE is an
+    // `undefined reference` at link time (this fix's own first draft excluded
+    // an AUTO static property on the exporter side, which the importer cannot
+    // detect — MetaMember::isAutoProperty is deliberately forced false for a
+    // static, it means "instance storage" — and the grid promptly link-failed
+    // on `SAuto.A`). So a static AUTO-property is exported here too, its
+    // accessor bodies reading/writing the module-level global §23.1 (#743)
+    // already allocates for it.
+    //
+    // §22.13's lazy initialization is triggered on the IMPORTER side at each
+    // access, by the same emitEnsureStaticInit call a cross-module static FIELD
+    // access already makes (the exporter emits an exported `bz$<T>$ensureinit`
+    // for every public non-generic type with any static member, static
+    // properties included).
+    void emitExportedStaticPropertyAccessors();
+    void declareImportedStaticPropertyAccessors();
 
     // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): the
     // INDEXER analog of emitExportedPropertyGetters — emit a named
