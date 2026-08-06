@@ -48,9 +48,10 @@
 // the Equals/GetHashCode result coercions cannot diverge between the two.
 //
 // A class with NO user override never reaches condition (e) at all: its thunk is
-// the §8.5/§8.3 compiler-generated default (the type's qualified name /
-// reference identity / identity hash), which reads no field and so has no layout
-// to be wrong about. A slot whose specialized target's SIGNATURE moves under the
+// the compiler-generated default — §8.5's "the type's qualified name" for
+// ToString, and §8.3's table row for a Class, "Reference equality" /
+// "Identity-based" — which reads no field and so has no layout to be wrong
+// about. A slot whose specialized target's SIGNATURE moves under the
 // substitution is REFUSED, keeping today's content rather than a mistyped call.
 //
 // Every case runs end to end under generated-code AddressSanitizer /

@@ -6066,7 +6066,8 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     // class whose storage sequence does not move; all of those keep the shared
     // thunk with no behaviour change. A class with NO user override never
     // reaches here at all: its thunk is the §8.5/§8.3 compiler-generated default
-    // (type name / reference identity / identity hash), which reads no field and
+    // (§8.5's "the type's qualified name"; §8.3's "Reference equality" and
+    // "Identity-based" hash), which reads no field and
     // therefore has no layout to be wrong about.
     //
     // Collection is deliberately SIDE-EFFECT-FREE (map lookups and pure
@@ -25061,8 +25062,9 @@ sema::MethodSymbol* Emitter::classSlotEqualsImpl(
 
 
 // fix #2947: emit slot 4's body into `thunk`, forwarding to `target` when one
-// was resolved (see the ToString twin for why `target` is a parameter). §8.3
-// default when there is none: "Reference identity".
+// was resolved (see the ToString twin for why `target` is a parameter). With no
+// target, §8.3's compiler-generated default for a Class — the table there reads
+// "Reference equality" — which this emits as a pointer comparison.
 void Emitter::emitClassEqualsThunkBody(llvm::Function* thunk,
                                        llvm::Function* target) {
     auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
