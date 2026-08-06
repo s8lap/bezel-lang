@@ -8655,6 +8655,21 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                         dynamic_cast<const sema::MemberSymbol*>(m)
                             ? dynamic_cast<const sema::MemberSymbol*>(m)->parent
                             : nullptr;
+                    // fix #2874 (§17.14 / §2.8.2, v0.240): the message used to
+                    // assert "only a compile-time-constant initializer crosses
+                    // ... and this one does not", which is NOT TRUE of every
+                    // initializer that reaches here. §17.14 admits
+                    // floating-point literals, `if` expressions with constant
+                    // branches, and constant `string` concatenation, and none of
+                    // those fold on the carriage path (#2898's fold is
+                    // integer-only by `sema::foldIntConst`'s domain) — so
+                    // `:= 1.5 + 0.5`, a §17.14 constant expression by the
+                    // section's own list, was told it is not one. Say what is
+                    // actually true: it did not fold. Whether that is because it
+                    // is not a constant expression or because this
+                    // implementation cannot yet fold that constant expression is
+                    // the distinction #2874 tracks, and naming the issue is more
+                    // useful than a claim the reader can falsify.
                     ctx_.diagnostics().report(
                         Severity::Error, importedFieldInitDiagLoc_,
                         "constructing imported generic `" +
@@ -8662,9 +8677,12 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                             "<...>` cannot run the initializer of its field `" +
                             std::string(m->name) + "` (`:= " + *initText +
                             "`): a generic exports no per-type initializer "
-                            "function, so only a compile-time-constant "
-                            "initializer crosses the module boundary and this "
-                            "one does not. Per \xC2\xA7""2.8.2 this construction "
+                            "function, so an initializer crosses the module "
+                            "boundary only as a constant VALUE folded into the "
+                            "interface, and this one did not fold — it is "
+                            "either not a \xC2\xA7""17.14 compile-time-constant "
+                            "expression, or one this implementation cannot yet "
+                            "fold (#2874). Per \xC2\xA7""2.8.2 this construction "
                             "is rejected rather than silently leaving the field "
                             "at its \xC2\xA7""7.9 default (#2860)");
                 }

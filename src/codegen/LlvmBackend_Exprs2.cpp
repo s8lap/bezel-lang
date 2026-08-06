@@ -2994,6 +2994,29 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
     // bottom of lowerNew, before each `return obj`, exactly mirroring
     // lowerCall's loop. // per §22.4, §28.3, §17.13, #1833 (b), #1467
     const std::size_t newDiscardOwnedBase = discardOwnedOutSlots_.size();
+    // fix #2874 (§2.8.2 "No restrictions beyond visibility", v0.240): #2860's
+    // "constructing imported generic ... cannot run the initializer of its
+    // field" diagnostic is located from `importedFieldInitDiagLoc_`, but that
+    // was set only on the no-explicit-ctor branch near the bottom of this
+    // function. An imported generic WITH an explicit constructor reaches
+    // `emitOwnFieldInit` through `inlineCtorBody` instead, so the diagnostic
+    // came out UNLOCATED. MEASURED on 2ddd5b3, two real two-module builds of
+    // the same uncarriable initializer: the no-ctor spelling reported
+    // `app.bzl:5:20:` and the explicit-ctor spelling reported `app.bzl:0:0:` —
+    // and an explicit constructor is the ordinary shape, so the located case
+    // was the exception rather than the rule.
+    //
+    // Set it ONCE here, covering every construction path this function reaches,
+    // and restore on the way out. `lowerNew` has many returns, hence the scope
+    // guard rather than a paired assignment; the save/restore is what keeps a
+    // nested `new Outer(new Inner())` attributing each field to its own `new`.
+    struct ImportedFieldInitDiagLocScope {
+        SourceLocation& slot;
+        SourceLocation saved;
+        ImportedFieldInitDiagLocScope(SourceLocation& s, SourceLocation v)
+            : slot(s), saved(s) { slot = v; }
+        ~ImportedFieldInitDiagLocScope() { slot = saved; }
+    } importedFieldInitDiagLocScope(importedFieldInitDiagLoc_, ne.span.begin);
     // The ast::Type name node used for the builtin-exception / collection
     // dispatch below: the explicit type node when present, else the inferred
     // target's node (a shorthand targeting a builtin collection, e.g.
@@ -5701,9 +5724,10 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // fix #2860 (§2.8.2, v0.240): locate emitOwnFieldInit's "this imported
         // generic's field initializer did not cross the module boundary"
         // diagnostic on the `new` that would have observed the §7.9 default.
-        // This sequence has no early return, so the clear below always runs.
-        SourceLocation savedInitDiagLoc = importedFieldInitDiagLoc_;
-        importedFieldInitDiagLoc_ = ne.span.begin;
+        // fix #2874: the set/restore that used to live here covered ONLY this
+        // no-explicit-ctor branch, which is why the explicit-ctor construction
+        // path reported the same diagnostic unlocated. It now happens once at
+        // the top of `lowerNew` for every path, so nothing is needed here.
         emitImplicitBase(t, obj);
         // §22.7 step 2 (#1291): a throwing OWN field initializer must dispose the
         // earlier owned fields (whose initializers completed, in reverse
@@ -5736,7 +5760,6 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             unwindTarget_ = savedUnwind;
             unwindScopeDepth_ = savedDepth;
         }
-        importedFieldInitDiagLoc_ = savedInitDiagLoc;  // fix #2860
         currentThis_ = savedThisNoCtor;
         // §22.9 / §28.3 (FINDING [4]): the implicit base ctor may throw; the
         // base ctor's own cleanup disposed the base subobject without freeing
