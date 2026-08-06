@@ -483,13 +483,28 @@ BEZEL_TEST(property_compound_import_2862, imported_auto_property_23_1) {
 // dropped write) into a hard `undefined reference` — strictly worse, and
 // exactly the over-broad draft #2474's review caught on the sibling getter
 // path. The body therefore mirrors the exporter's gate and declines. This case
-// pins that the two out-of-gate shapes — a GENERIC imported class's property
-// and a STATIC imported property — still LINK and RUN. They still drop the
-// write (0, unchanged, pre-existing); what is asserted here is that the program
-// builds and runs at all, which is the regression this fix could plausibly have
-// caused. Both are filed: #2884 (the generic case — whose PLAIN `:=` is
-// ALREADY a hard `undefined reference` link error today) and #2885 (the static
-// case — all three spellings silently dropped).
+// pinned that the two out-of-gate shapes — a GENERIC imported class's property
+// and a STATIC imported property — still LINK and RUN with the write dropped.
+//
+// ⚠ REWRITTEN BY #2884/#2885 (v0.240), which closed BOTH out-of-gate shapes in
+// opposite directions. The original single program (both shapes in one Main,
+// asserting `return 7` — "it builds and runs, the writes are dropped") no
+// longer states a true contract, so it is split rather than left asserting a
+// superseded outcome:
+//   * STATIC (#2885): the write now WORKS. The static case got its own
+//     no-`this` accessor ABI (`$spropget`/`$spropset`), so `SP += 1` reaches
+//     the imported setter — the assertion below is the VALUE, not just that it
+//     runs. This direction is what T11 was guarding for: nothing became a link
+//     error.
+//   * GENERIC (#2884): the access is now REJECTED at compile time with a
+//     sourced diagnostic. Still not a link error — the direction T11 exists to
+//     protect is preserved (a mangled `undefined reference` never appears) —
+//     but the program no longer builds, because a generic type's accessors are
+//     not exported per instantiation (§2.8.3 rule 4) and every spelling was
+//     broken: link error for read/`:=`, SIGSEGV for a virtual property, and
+//     this very `+=` silently dropping the write. The diagnostic's TEXT is
+//     pinned in tests/module/xmod_generic_property_2884_test.cpp; here only the
+//     build outcome is asserted, so a re-wording cannot break two files.
 // ===========================================================================
 BEZEL_TEST(property_compound_import_2862, out_of_gate_shapes_still_link_2_8_2) {
     const char* lib =
@@ -509,19 +524,33 @@ BEZEL_TEST(property_compound_import_2862, out_of_gate_shapes_still_link_2_8_2) {
         "    set => do _q := value + 1; end; "
         "  end; "
         "end S2862TB;";
-    int r = compileImportAndRun2862(
+    // STATIC (#2885): links, runs, and the write LANDS. `SP += 1` reads
+    // 0 + 100, adds 1, and the setter stores 101 + 1 = 102 into `_q`.
+    int rs = compileImportAndRun2862(
         lib,
         "module App2862TB; import PropLib2862TB; "
         "public class C2862TB "
         "  public static method Main(): int "
-        "    using var g := new G2862TB<int>(); "
-        "    g.P += 1; "
         "    S2862TB.SP += 1; "
-        "    return 7; "
+        "    return S2862TB._q; "
         "  end Main; "
         "end C2862TB;");
-    if (r == -2) return;
-    BEZEL_EXPECT_EQ(r, 7);   // it LINKS and RUNS; the writes are still dropped
+    if (rs == -2) return;
+    BEZEL_EXPECT_EQ(rs, 102);
+    // GENERIC (#2884): declined at compile time — not a link error, and no
+    // longer a silently dropped write.
+    int rg = compileImportAndRun2862(
+        lib,
+        "module App2862TC; import PropLib2862TB; "
+        "public class C2862TC "
+        "  public static method Main(): int "
+        "    using var g := new G2862TB<int>(); "
+        "    g.P += 1; "
+        "    return 7; "
+        "  end Main; "
+        "end C2862TC;");
+    if (rg == -2) return;
+    BEZEL_EXPECT_EQ(rg, -1);   // build declined (see #2884's own text pin)
 }
 
 }  // namespace bezel::module

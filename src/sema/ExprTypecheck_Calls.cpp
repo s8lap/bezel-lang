@@ -16231,7 +16231,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                          dynamic_cast<MemberSymbol*>(member)
                                              ? dynamic_cast<MemberSymbol*>(member)->parent
                                              : nullptr));
-        } else if (dynamic_cast<PropertySymbol*>(member)) {
+        } else if (auto* ips = dynamic_cast<PropertySymbol*>(member)) {
             // §2.5 / §22.9 (issue #503): an IMPORTED property has no
             // ast::PropertyDecl, so its type rides the importedMemberType side
             // table (set by the loader). Attach it so that `h.N` is typed for
@@ -16242,6 +16242,71 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                                          dynamic_cast<MemberSymbol*>(member)
                                              ? dynamic_cast<MemberSymbol*>(member)->parent
                                              : nullptr));
+            // fix #2884 (§14.1 / §2.8.3 rule 4 / §2.8.2 clause 1, v0.240,
+            // decline-with-reasons): a property declared on an IMPORTED GENERIC
+            // class or record has NO working access path today, in any spelling
+            // — measured on real two-module builds:
+            //   * computed (arrow/block) property, read or `:=`
+            //         -> `undefined reference to bz$<Lib>.<Cls>$<P>$propget`
+            //            / `$propset` — a hard LINK error that aborts the build.
+            //            `emitExportedProperty{Getters,Setters}` define the stub
+            //            only for a NON-generic type (a generic type's accessor
+            //            is per-instantiation, §2.8.3 rule 4, and the exporter
+            //            cannot name the importer's instantiations), while
+            //            `declareImportedProperty{Getters,Setters}` have no
+            //            generic gate and emit the external reference anyway.
+            //   * AUTO-property, read or `:=`  -> the same link error (the
+            //            #2478 instance-storage path does not engage for a
+            //            generic receiver).
+            //   * VIRTUAL property, read or `:=`  -> SIGSEGV at runtime (the
+            //            vtable slot for the instantiation is not populated;
+            //            filed separately, it is a distinct defect from the
+            //            missing-symbol one).
+            //   * `+=` / `++`  -> the write is SILENTLY DROPPED (#2862's
+            //            lowering declines for a generic parent precisely to
+            //            avoid turning it into the link error above).
+            // Rejecting the access with a sourced diagnostic is strictly better
+            // than all four: it names the shape at the access site instead of
+            // surfacing a mangled symbol from the linker, and it converts the
+            // silently dropped compound write into a loud one. Nothing that
+            // works today is rejected — every listed shape is broken NOW, and
+            // the shapes that are NOT broken are outside this gate: a property
+            // reached through an INTERFACE-typed reference resolves to the
+            // interface's own PropertySymbol (parent kind Interface, excluded
+            // here), a method or field on the same generic class is untouched,
+            // and a LOCAL generic class is not imported.
+            //
+            // This mirrors the #783 gate for an imported generic class's METHOD
+            // ("not yet monomorphized (§14.1 / #783)") in both form and
+            // reasoning; the full fix is importer-side property
+            // monomorphization, which needs the accessor bodies carried in the
+            // artifact the way `methodBodyText`/`ctorBodyText` already carry
+            // method and constructor bodies (#2884, #428 family).
+            if (!ips->isIndexer && ips->parent &&
+                ctx_.isImported(ips->parent) &&
+                !ips->parent->genericParams.empty() &&
+                (ips->parent->kind == ast::TypeDeclKind::Class ||
+                 ips->parent->kind == ast::TypeDeclKind::Record)) {
+                // The member-access span is empty for some nested spellings
+                // (e.g. `g.P.ToString()`); fall back to the receiver's, exactly
+                // as the `no member` diagnostics above do with nmLoc.
+                auto loc = ma.span.begin;
+                if (loc.line == 0 && ma.target) loc = ma.target->span.begin;
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "property `" + std::string(ips->name) +
+                    "` on the imported generic type `" +
+                    std::string(ips->parent->name) +
+                    "` is not yet monomorphized (\xC2\xA7""14.1 / \xC2\xA7""2.8.3 "
+                    "rule 4 / #2884): a generic type's accessors are not "
+                    "exported per instantiation, so this access has no correct "
+                    "target — it fails at link time with an `undefined "
+                    "reference` to the property's accessor symbol, crashes for "
+                    "a virtual property, or silently drops the write for "
+                    "`+=`/`++`. Access a field directly, or route through a "
+                    "method, until importer-side property monomorphization "
+                    "lands");
+            }
         } else if (auto* ec = dynamic_cast<EnumConstantSymbol*>(member)) {
             // §10 (issue #328 FINDING [1]): an IMPORTED enum-constant access
             // `Color.Green` has the enum type, exactly like the local-enum case
