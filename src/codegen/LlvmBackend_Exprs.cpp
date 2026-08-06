@@ -5388,7 +5388,34 @@ bool Emitter::lowerVirtualPropertySet(const ast::Expr& target, llvm::Value* v,
     // `this`) and the erased-generic receiver, as it does in the getter.
     llvm::Value* recv = recvExpr ? lowerExpr(*recvExpr) : currentThis_;
     if (!recv || !recv->getType()->isPointerTy()) return false;
-    v = coerceNumericToType(v, valTy, isUnsignedTargetExpr(target));
+    // fix #2927 (§7.2/§5.1/§12.1/§23.3, v0.240): coerce the incoming value to
+    // the SETTER SLOT, not merely through §5.1's numeric widening.
+    //
+    // This site used to be a bare `coerceNumericToType(v, valTy, …)`, which
+    // handles §5.1's widening (`i.LongP := 5` and `i.DblP := 7` through an
+    // interface were both MEASURED correct on 10bd6d3 — the issue's inferred
+    // §5.1 sibling does NOT reproduce) but has no case for a NULLABLE VALUE
+    // slot. §7.2 makes that slot the tagged `{i8 hasValue; T}` struct while
+    // the RHS arrives as the bare payload `T`, so `i.IP := 4` on an `int?`
+    // property handed `i32 4` to a setter declared `void(ptr, {i8, i32})` and
+    // ABORTED THE COMPILE: "Call parameter type does not match function
+    // signature! i32 4 { i8, i32 } call void %pset(ptr %15, i32 4)" — an ICE
+    // on a legal program, with no diagnostic pointing at any source construct.
+    //
+    // The two helpers below are the SAME pair every other store into a
+    // nullable slot uses — #2903's one definition of an initializer's slot
+    // width (§5.1 in BOTH directions, with the nullable slot's payload as the
+    // width to match) followed by §7.2's present-wrap, which also normalizes a
+    // `null` literal to the all-zero form. Applied here rather than in
+    // `lowerStmt`'s `:=` arm on purpose: EVERY caller of this function needs
+    // them, not just that one. `i.IP ??= 4` (#2905) has been pre-wrapping at
+    // its own call site precisely because this one did not — which is how the
+    // gap became visible — and the §22.3 `ref`/`out` write-back and the
+    // compound-assign paths reach the same setter through here too. Both
+    // helpers are no-ops when `v` already IS the slot type, so the callers
+    // that wrap first are unaffected.
+    v = coerceInitializerToSlot(v, valTy, isUnsignedTargetExpr(target));
+    v = coerceToNullableSlot(valTy, v);
     // fix #2500 (§8.6/§23.3/§28.9, v0.236): virtual/interface-dispatch twin of
     // lowerImportedPropertySetValue's boxing — an Object/interface property's
     // setter slot expects a `ptr` (box) value parameter, but a value-typed RHS
