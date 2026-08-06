@@ -2181,12 +2181,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // skipping extra cleanup). Combine via select with any genuinely NEW
         // exception the body itself raised before this point, mirroring the
         // normal-completion restore.
-        if (emittingDisposerBody_ && disposerEntryExc_) {
+        //
+        // fix #2872: via disposerEntryExcHere(), so this restore is emitted ONLY
+        // in the disposer's own function. A `return` inside a NESTED body emitted
+        // mid-destructor-body (a lambda's closure fn, a lazily-built generic
+        // specialization) otherwise built this `select` against the outer
+        // disposer's entry load — a cross-function reference the IR verifier
+        // rejects. Such a body is an ordinary callee: the destructor's bz_exc
+        // park (#1607) already gives it a clean exception context.
+        if (llvm::Value* entryExc = disposerEntryExcHere()) {
             llvm::Value* excNow = builder_.CreateLoad(ptrTy(), emitExcSlot());
             llvm::Value* isNew = builder_.CreateICmpNE(
                 excNow, llvm::ConstantPointerNull::get(ptrTy()));
             llvm::Value* restored = builder_.CreateSelect(
-                isNew, excNow, disposerEntryExc_);
+                isNew, excNow, entryExc);
             builder_.CreateStore(restored, emitExcSlot());
         }
         emitReturn(currentFn_, v);

@@ -1809,6 +1809,41 @@ private:
     // block so it dominates every body block.
     llvm::Value* disposerEntryExc_ = nullptr;
 
+    // fix #2872 (§28.4 "The `destructor`" / §27.3 "Lambda expressions" / §28.3,
+    // v0.240): the ONLY legal way to read `disposerEntryExc_`.
+    //
+    // `disposerEntryExc_` is an `llvm::Instruction` (a CreateLoad in the
+    // DISPOSER's entry block, LlvmBackend_Disposal.cpp ~126). An LLVM value may
+    // only be referenced from within the function that defines it, so every use
+    // must first establish that we are still emitting into THAT function.
+    // `emittingDisposerBody_` alone does not establish it: lowering a destructor
+    // body can emit a SECOND llvm::Function mid-flight — a lambda's closure body
+    // (`lowerLambda`), a lazily-built generic specialization
+    // (`buildSpecializedMethodFn`), an async/iterator thunk — and none of those
+    // emitters neutralise this pair (unlike `NestedBodyScope`, which does; see
+    // LlvmBackend_Assign.cpp ~4092). The two consumers then emitted an `icmp` /
+    // `select` against the outer disposer's entry load from inside the inner
+    // function: "Referring to an instruction in another function!", a
+    // build-stopping IR-verifier failure on ordinary code (#2872 shapes 1 and 2).
+    //
+    // Returning null in a nested function is not merely the safe answer, it is
+    // the CORRECT one: the nested body is compiled ONCE, as an ordinary callee,
+    // and §28.4's bz_exc park (#1607, emitDisposerCore) clears the propagating
+    // exception for the whole run of the destructor body precisely so every
+    // callee sees a clean exception context and its plain `exc != null` check is
+    // right. This is the same treatment a plain method called from a destructor
+    // already gets (it is compiled with `emittingDisposerBody_ == false`).
+    //
+    // Gate on the LLVM property actually needed (same defining function), not on
+    // an enumeration of the emitters that can nest, so a future nested emitter
+    // cannot reopen this.
+    llvm::Value* disposerEntryExcHere() const {
+        if (!emittingDisposerBody_ || !disposerEntryExc_) return nullptr;
+        if (auto* inst = llvm::dyn_cast<llvm::Instruction>(disposerEntryExc_))
+            if (inst->getFunction() != currentFn_) return nullptr;
+        return disposerEntryExc_;
+    }
+
     // Block-form property getter functions (§22.9 `get => do...end;`).
     // Keyed by PropertyDecl so the same getter function is reused across
     // multiple access sites (non-generic; generic getters are specialised).

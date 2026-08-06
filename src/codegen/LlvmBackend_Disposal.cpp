@@ -1309,8 +1309,14 @@ void Emitter::emitPendingCheck() {
     // gate is emittingDisposerBody_, so ONLY user destructor-body emission is
     // affected — the general dispatch and every built-in/runtime disposer (e.g.
     // event-subscription and CancellationTokenSource cleanup) are untouched.
-    if (emittingDisposerBody_ && disposerEntryExc_) {
-        llvm::Value* isNew = builder_.CreateICmpNE(exc, disposerEntryExc_);
+    //
+    // fix #2872: read the entry value through disposerEntryExcHere(), which also
+    // requires that we are still emitting into the DISPOSER's own function. A
+    // lambda body or a lazily-built specialization emitted mid-destructor-body
+    // is a different llvm::Function, and this `icmp` against the disposer's
+    // entry load was then a cross-function reference (malformed IR).
+    if (llvm::Value* entryExc = disposerEntryExcHere()) {
+        llvm::Value* isNew = builder_.CreateICmpNE(exc, entryExc);
         pending = builder_.CreateAnd(pending, isNew);
     }
     emitPendingCheckIf(pending);
