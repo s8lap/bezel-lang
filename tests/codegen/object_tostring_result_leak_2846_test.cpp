@@ -221,7 +221,7 @@ BEZEL_TEST(codegen_object_tostring_result_leak_2846,
 // (`isIfaceRecv`, LlvmBackend_Calls2.cpp) and leaked the same way. Both
 // override shapes are here, and the second is the load-bearing over-release
 // oracle: `Rc.ToString()` returns a stored FIELD, so the value the caller
-// releases is one the object still holds — the callee's §22.9 return mint is
+// releases is one the object still holds — the callee's §28.3 return mint is
 // the only thing that makes the release balanced. `rc.Name` is read AFTER the
 // 20 rounds, so an over-release faults under generated-code ASan instead of
 // passing quietly. The class with NO override (a §8.5 qualified-name literal)

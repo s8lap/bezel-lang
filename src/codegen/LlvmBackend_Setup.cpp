@@ -13865,10 +13865,18 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                                 // receiver dispatches vtable[kToStringSlot],
                                 // whose every filler hands back +1 or a
                                 // sentinel — `classToStringThunk` calls the
-                                // user override, whose §22.9 ReturnStmt
+                                // user override, whose §28.3 ReturnStmt
                                 // lowering mints +1 for a `string` return
                                 // (LlvmBackend_Stmts.cpp) and otherwise returns
                                 // the class-name literal;
+                                // (fix #2910: this cited §22.9, which is
+                                // "Owned fields and exception safety" and says
+                                // nothing about a `string` return handing the
+                                // caller a reference. The rule invoked here is
+                                // §28.3 "Local variables, ownership, and
+                                // borrows" — the same authority the `??` /
+                                // conditional producer arms just above already
+                                // cite for this family.)
                                 // `boxToStringThunk`/`primBoxToStringThunk`/
                                 // `valueBuiltinBoxToStringThunk` likewise mint
                                 // (`emitRecordToString`, `emitPrimitiveToString`)
