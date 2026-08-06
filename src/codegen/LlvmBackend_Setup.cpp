@@ -5186,6 +5186,37 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     std::string suffix = "$spec" + std::to_string(specMap.size());
     std::string tsName = std::string(ts->name);
 
+    // fix #2943 (§2.8.3 rule 4 / §12.1 / §13 / §14.1 / §2.5, v0.240): CREATE AND
+    // REGISTER THE GLOBAL BEFORE EMITTING ANY BODY, which is #2906's change to
+    // `specializedVtableFor` applied to this function's identical hazard.
+    //
+    // The cache was written only on the way OUT, while `emitSpecializedDisposer`
+    // (and now the specialized interface-method bodies below) are full body
+    // emissions that can re-enter this function for the SAME instantiation — a
+    // destructor or an interface method that runs `new Self<T>()`. That re-entry
+    // missed the cache and built a SECOND vtable for one instantiation, so
+    // objects minted inside such a body carried a different global from objects
+    // minted outside it, in flat contradiction of §2.8.3 rule 4's "one runtime
+    // type identity per monomorphization ... regardless of which artifact
+    // produced the value". Registering first makes the re-entry find THIS one.
+    //
+    // The placeholder initializer is a zeroinitializer and is never observed: a
+    // re-entrant caller only takes the global's ADDRESS (to store in a new
+    // object's word 0), and the real initializer is installed below before this
+    // function returns, i.e. long before anything runs. The array TYPE is fixed
+    // up front because `vtableMethods_[ts]` is filled by declareVtables Pass A
+    // and is a pure lookup here.
+    const auto& slots = vtableMethods_[ts];
+    auto* arrTy =
+        llvm::ArrayType::get(ptrTy(), kVirtualMethodsBase + slots.size());
+    auto* gv = new llvm::GlobalVariable(
+        *module_, arrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantAggregateZero::get(arrTy),
+        "vt$" + tsName + suffix);
+    allVtables_.push_back(gv);  // §8.6 #417: string discriminator
+    specMap[specFieldTys] = gv;
+
     // --- (a) Per-instantiation descriptor: [self, null] ---
     // A minimal descriptor that lets emitIsA / type tests recognize the object.
     // We use a 2-element array [selfDesc, null] (no base entries — the imported
@@ -5232,22 +5263,38 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     // importer computes the SAME index k the exporter stored.
     //
     // ⚠ GATED ON THE LAYOUT PROPERTY, and this gate is the whole soundness
-    // argument. Every function that can go in these slots was compiled BY THE
-    // EXPORTER against the erased `T -> i32` template layout (a generic class
-    // exports no per-instantiation code, §2.5 / §2.8.3 rule 4; the accessor BODY
-    // is not even reconstructible importer-side — ModuleLoader attaches no
-    // ast::PropertyDecl to an imported property, which is #2387's finding). When
-    // this instantiation's storage layout MOVES relative to that template, those
-    // bodies GEP offsets the object does not have — so installing them would
-    // convert today's SEGV into a SILENT WRONG VALUE, which is strictly worse.
-    // Such an instantiation therefore keeps the empty itmap and today's exact
-    // behaviour; that residual is filed separately with its own measurement
-    // (it needs importer-side monomorphization of accessor bodies, the #428
-    // core), never guessed at here.
+    // argument. A function compiled BY THE EXPORTER was compiled against the
+    // erased `T -> i32` template layout (a generic class exports no
+    // per-instantiation code, §2.5 / §2.8.3 rule 4). When this instantiation's
+    // storage layout MOVES relative to that template, such a body GEPs offsets
+    // the object does not have — so installing it would convert today's SEGV
+    // into a SILENT WRONG VALUE, which is strictly worse.
+    //
+    // fix #2943 (§2.8.3 rule 4 / §12.1 / §13 / §11.2 / §14.1 / §2.5, v0.240):
+    // #2894 REFUSED THE WHOLE TABLE on that ground, and for the ACCESSOR slots
+    // that refusal is still exactly right — ModuleLoader attaches no
+    // `ast::PropertyDecl` to an imported property (#2387), so there is no body
+    // to re-lower and no honest function to install. But it is NOT right for the
+    // METHOD slots, and the difference was measured rather than reasoned about:
+    // ModuleLoader DOES attach a re-parsed `ast::MethodDecl` from the exported
+    // `methodBodyText` (§14.1 / #783), so `buildSpecializedMethodFn` can compile
+    // the body afresh under THIS substitution, against the layout the objects
+    // actually have. On this fix's parent:
+    //
+    //     interface METHOD  on a layout-moving imported generic -> exit 139
+    //     interface PROPERTY on the same shape                  -> exit 139
+    //
+    // and with this fix the method arm returns its correct value while the
+    // property arm still faults. So the table is now built for EVERY
+    // instantiation, and the layout question is asked PER SLOT KIND — of the
+    // slot that can answer it — instead of once for the whole table. Nothing
+    // that could be a silent wrong value is installed: an accessor slot on a
+    // layout-moving instantiation keeps the null it has today, and so does a
+    // method whose body the loader did not reconstruct.
     std::vector<llvm::Constant*> itmapElems;
     const bool importedLayoutMoves =
         instanceLayoutDiffersFromErasedTemplate(ts);
-    if (!importedLayoutMoves) {
+    {
         std::vector<const sema::TypeSymbol*> supers;
         collectTypeAndBases(ts, supers);
         for (const sema::TypeSymbol* iface : supers) {
@@ -5271,9 +5318,43 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
                 sema::MethodSymbol* impl = findInterfaceImpl(ts, im);
                 if (!impl) continue;
                 auto mit = methodFns_.find(impl);
-                if (mit != methodFns_.end())
-                    itabElems[xi->second] =
-                        llvm::cast<llvm::Constant>(mit->second);
+                if (mit == methodFns_.end()) continue;
+                if (importedLayoutMoves) {
+                    // fix #2943: this instantiation's objects do NOT have the
+                    // layout the exporter's `bz$<Class>$<M>` was compiled
+                    // against, so that symbol may not go in the slot. Re-lower
+                    // the body under THIS substitution instead.
+                    //
+                    // THE GATE IS "THE LOADER RECONSTRUCTED A BODY", asked of
+                    // `impl->decl` — the SAME question every other importer-side
+                    // monomorphization site asks (LlvmBackend_Calls2.cpp's
+                    // imported-generic-class route). A method whose body was not
+                    // exported (abstract, no span, a parse/sema failure) has no
+                    // `ast::MethodDecl`, and the slot then keeps the null it has
+                    // today rather than a body compiled for another layout.
+                    // Guessing here is the silent-wrong-value direction, which
+                    // is why nothing falls back to `methodFns_`.
+                    if (!dynamic_cast<const ast::MethodDecl*>(impl->decl))
+                        continue;
+                    CallableInfo ci;
+                    if (!callableInfo(impl, ci)) continue;
+                    // The slot's ABI is fixed by the INTERFACE's declared
+                    // signature at every dispatch site, so a specialization
+                    // whose signature moves cannot go in it — refuse, exactly as
+                    // #2906/#2928 do for the local twin.
+                    llvm::FunctionType* concFnTy =
+                        mit->second->getFunctionType();
+                    std::vector<llvm::Type*> paramTys(concFnTy->param_begin(),
+                                                      concFnTy->param_end());
+                    llvm::Function* specFn =
+                        buildSpecializedMethodFn(impl, ci, paramTys);
+                    if (specFn && specFn->getFunctionType() == concFnTy)
+                        itabElems[xi->second] =
+                            llvm::cast<llvm::Constant>(specFn);
+                    continue;
+                }
+                itabElems[xi->second] =
+                    llvm::cast<llvm::Constant>(mit->second);
             }
             // An interface EVENT's slot is left null, deliberately and stated
             // rather than implied. §24 is titled "Events (retired member kind)"
@@ -5398,6 +5479,18 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
                 };
                 auto fill = [&](bool isSet, unsigned si) {
                     if (si >= nSlots) return;
+                    // fix #2943: THE ACCESSOR SLOTS KEEP #2894's REFUSAL. The
+                    // method arm above can be re-lowered under this
+                    // substitution because the loader reconstructs an
+                    // `ast::MethodDecl`; an imported PROPERTY has no
+                    // `ast::PropertyDecl` at all (#2387), so on a layout-moving
+                    // instantiation there is nothing honest to install and the
+                    // only alternative — the exporter's template accessor —
+                    // would read `_w` out of the `_t2` slot and return a
+                    // plausible WRONG number with no crash to announce it
+                    // (#2896 measured 44 where 149 was correct). Declined with
+                    // its own measurement and filed; never guessed at here.
+                    if (importedLayoutMoves) return;
                     if (!exporterDefinesAccessor(isSet)) return;
                     // fix #2946: `indexerItableAccessor` resolves an IMPORTED
                     // indexer to the cross-module `bz$<Class>$idxget|idxset$
@@ -5470,19 +5563,32 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
 
     // --- (d) Virtual method slots (from methodFns_ for any imported methods
     //         that were resolved and stored by declareImportedFunctions) ---
-    const auto& slots = vtableMethods_[ts];  // filled by declareVtables Pass A
+    // `slots` and the global `gv` were bound at the top of this function (fix
+    // #2943), before any body emission. `elems` is sized from the GLOBAL'S OWN
+    // array type rather than from `slots.size()` a second time: the two are
+    // equal by construction, and taking the size from `arrTy` makes the
+    // initializer match the declared type by construction too, instead of by an
+    // invariant that a future edit between the two points could break.
     std::vector<llvm::Constant*> elems(
-        kVirtualMethodsBase + slots.size(),
-        llvm::ConstantPointerNull::get(ptrTy()));
+        arrTy->getNumElements(), llvm::ConstantPointerNull::get(ptrTy()));
     elems[0] = llvm::cast<llvm::Constant>(descGV);
     elems[1] = llvm::ConstantExpr::getPointerCast(itmapGV, ptrTy());
     elems[2] = llvm::cast<llvm::Constant>(specDispose);
+    // ⚠ THESE THREE HOLD THE ERASED TEMPLATE THUNK, which is WRONG for a
+    // layout-moving instantiation and is #2953, filed with its own measurement
+    // rather than folded into #2943: `field=21` beside `s=w=0` in one run — a
+    // SILENT WRONG VALUE, not the fault its single-module twin (#2947) produced.
+    // #2947 factored the class-chain walks and the thunk BODY emitters out of
+    // the three builders precisely so a second caller can wrap a different
+    // target, and #2943's early registration above now makes a body emission
+    // here safe; what is still missing is the re-lowered target itself.
     elems[kToStringSlot] = classToStringThunk(ts);
     // §9.6 (#946/#947/#948): fixed Equals/GetHashCode slots, same as a local
     // class vtable, so an Object-typed receiver of this specialization dispatches.
     elems[kEqualsSlot] = classEqualsThunk(ts);
     elems[kGetHashCodeSlot] = classHashCodeThunk(ts);
-    for (std::size_t i = 0; i < slots.size(); ++i) {
+    for (std::size_t i = 0;
+         i < slots.size() && kVirtualMethodsBase + i < elems.size(); ++i) {
         const VSlot& vs = slots[i];
         if (vs.method) {
             auto mit = methodFns_.find(vs.method);
@@ -5505,14 +5611,10 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
         // error for every consumer.
     }
 
-    auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
-    auto* init  = llvm::ConstantArray::get(arrTy, elems);
-    auto* gv = new llvm::GlobalVariable(
-        *module_, arrTy, /*isConstant=*/true,
-        llvm::GlobalValue::InternalLinkage, init,
-        "vt$" + tsName + suffix);
-    allVtables_.push_back(gv);  // §8.6 #417: string discriminator
-    specMap[specFieldTys] = gv;
+    // fix #2943: finalize the initializer of the global registered at the top of
+    // this function (see there for why it is created early). The array type is
+    // the same one it was created with — `slots` has not moved.
+    gv->setInitializer(llvm::ConstantArray::get(arrTy, elems));
     return gv;
 }
 
