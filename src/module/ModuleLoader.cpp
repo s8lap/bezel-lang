@@ -1340,6 +1340,14 @@ static bool parseAndAttachCtorBody(
     for (const auto& [lam, syms] : freshCtx.allLambdaParams())
         if (lam) mainCtx.setLambdaParams(lam, syms);
 
+    // fix #2857 (§19.3/#1853 / §2.8.2 clause 2, v0.240): and the FIFTH — the
+    // body's bare-name local-const `case` patterns. See the identical copy in
+    // parseAndAttachMethodBody for the full reasoning; verbatim for the same
+    // reason as #2818's LocalSymbols (declared inside the body, no
+    // importer-side twin), with both key and value kept alive below.
+    for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
+        if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
+
     // Attach the parsed ConstructorDecl and keep the AST alive.
     // Keep the backing source string alive too: all string_view fields in the
     // re-parsed AST (IdentifierExpr::name, AssignmentStmt::op, …) point into
@@ -1547,6 +1555,14 @@ static bool parseAndAttachDtorBody(
     // closure takes ZERO user parameters and the lambda's value is lost.
     for (const auto& [lam, syms] : freshCtx.allLambdaParams())
         if (lam) mainCtx.setLambdaParams(lam, syms);
+
+    // fix #2857 (§19.3/#1853 / §2.8.2 clause 2, v0.240): and the FIFTH — the
+    // body's bare-name local-const `case` patterns. See the identical copy in
+    // parseAndAttachMethodBody for the full reasoning; verbatim for the same
+    // reason as #2818's LocalSymbols (declared inside the body, no
+    // importer-side twin), with both key and value kept alive below.
+    for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
+        if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
 
     // Create a DestructorSymbol on the imported type and attach the parsed decl.
     auto* importedDs = mainCtx.makeImportedSymbol<sema::DestructorSymbol>();
@@ -1828,6 +1844,33 @@ static bool parseAndAttachMethodBody(
     // exactly as for the TypeRefs.
     for (const auto& [lam, syms] : freshCtx.allLambdaParams())
         if (lam) mainCtx.setLambdaParams(lam, syms);
+
+    // fix #2857 (§19.3/#1853 / §2.8.2 clause 2, v0.240): patternSymbols_ is the
+    // FIFTH AST-keyed side table this reconstruction has to carry, and it was
+    // the last one nothing copied. sema writes it (ExprTypecheck.cpp) for
+    // exactly one shape — a bare-name NamedPattern resolving to a
+    // compile-time-classified local `const` used as a `case` pattern constant
+    // (a Pattern is not an Expr, so exprSymbols_ cannot key it). codegen reads
+    // it in constValueForPatternName to fold that const's value at the case
+    // site; with no entry in mainCtx it got null and REJECTED the arm:
+    //   `const K := 9; case sel of K => …` in an imported generic body failed
+    //   with "the `case`/`when` pattern `K` is not supported by the backend",
+    // while the same source compiled as ONE module returned 105.
+    //
+    // Unlike its silent siblings (#2818 every local reads 0, #2839 the lambda's
+    // value is lost) this one fails LOUDLY — but it is the same §2.8.2 clause 2
+    // break: "An external instantiation behaves identically to a same-module
+    // instantiation of the same generic at the same arguments". A program that
+    // compiles as one module must not fail through the artifact boundary.
+    //
+    // Copied VERBATIM like the tables above: keys are the re-parsed
+    // ast::Pattern nodes (unique to the fresh AST, kept alive by
+    // ownImportedAst) and the value is a symbol declared INSIDE the body, so —
+    // exactly as for #2818's LocalSymbols — there is no importer-side twin to
+    // remap to. The fresh context that owns it is kept alive below
+    // (ownImportedAuxiliary).
+    for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
+        if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
 
     // Attach the parsed MethodDecl to the imported MethodSymbol and keep the
     // backing source + AST alive (string_view fields point into them), plus the
@@ -2161,6 +2204,14 @@ static bool parseAndAttachFieldInit(
     // parameter's exprSymbol binding was already crossing.)
     for (const auto& [lam, syms] : freshCtx.allLambdaParams())
         if (lam) mainCtx.setLambdaParams(lam, syms);
+
+    // fix #2857 (§19.3/#1853 / §2.8.2 clause 2, v0.240): and the FIFTH — the
+    // initializer's bare-name local-const `case` patterns. See the identical
+    // copy in parseAndAttachMethodBody for the full reasoning; verbatim for the
+    // same reason as #2818's LocalSymbols (declared inside the re-parsed
+    // expression, no importer-side twin), with both kept alive below.
+    for (const auto& [pat, sym] : freshCtx.allPatternSymbols())
+        if (pat && sym) mainCtx.setPatternSymbol(pat, sym);
 
     // Attach: importedFs->decl now points at a live ast::FieldDecl whose
     // `initializer` genericInstSfinitFn's existing loop lowers and stores.

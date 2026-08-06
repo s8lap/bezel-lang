@@ -60,7 +60,11 @@ const Entry kAstKeyedTables[] = {
      "#2855 dtor), lambda Parameter carried (#2839 method+ctor, #2855 dtor; "
      "field-init carries it via #2375's verbatim else)"},
     {"patternSymbols_",
-     "CARRIED NOWHERE - reachable and broken, tracked by #2857"},
+     "CARRIED verbatim by all four paths (#2857). Method + ctor + dtor are "
+     "EXERCISED by xmod_generic_body_pattern_const_2857_test. The field-init "
+     "path is carried for consistency but has NO KNOWN REACHABLE SHAPE: "
+     "setPatternSymbol fires only for a compile-time-const LocalSymbol, and a "
+     "field initializer is an expression with no locals in scope"},
     {"lambdaParams_",
      "CARRIED verbatim by all four paths: method + ctor (#2839), "
      "field-init (#2856), dtor (#2855)"},

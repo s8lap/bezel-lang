@@ -197,6 +197,26 @@ public:
         return lambdaParams_;
     }
 
+    // fix #2857 (§19.3/#1853 / §2.8.2 clause 2, v0.240): patternSymbols_ is the
+    // FIFTH AST-keyed side table the body-reconstruction remap loops must carry
+    // — the last one nothing copied. Without it `patternSymbol(p)` is null in
+    // the importer and codegen's `constValueForPatternName` cannot fold the
+    // local const's compile-time value, so a `case` arm whose pattern is a
+    // bare-name local `const` is rejected outright. Unlike its two silent
+    // siblings (#2818, #2839) this one fails LOUDLY — but it is still the same
+    // §2.8.2 clause 2 divergence: a body that compiles as ONE module fails to
+    // compile through the artifact boundary.
+    //
+    // Keys are the re-parsed ast::Pattern nodes (kept alive by ownImportedAst);
+    // values point into the fresh context's symbol arena (kept alive by
+    // ownImportedAuxiliary). Copied verbatim for the same reason as #2818's
+    // LocalSymbols: the symbol is declared INSIDE the re-parsed body and has no
+    // importer-side twin to remap to.
+    const std::unordered_map<const ast::Pattern*, Symbol*>&
+    allPatternSymbols() const {
+        return patternSymbols_;
+    }
+
     // --- Cross-module imports (§2.2 / §2.5, issue #328 increment 3) ---------
     //
     // A dependency's `.bezel.meta` is loaded (ModuleLoader) into THIS context,
