@@ -149,7 +149,7 @@ BEZEL_TEST(user_indexer_record_23_4, block_getter_record_local_then_return) {
         "  end Main; end C;"), "15025");
 }
 
-// §23.4 / §22.9: a block-form getter with control flow (the `return` is inside
+// §23.4 / §21.7: a block-form getter with control flow (the `return` is inside
 // an `if`) returning a record — the standalone getter terminates correctly and
 // the chosen record is returned.
 BEZEL_TEST(user_indexer_record_23_4, block_getter_record_conditional_return) {

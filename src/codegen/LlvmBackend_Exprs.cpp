@@ -4488,7 +4488,7 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         }
         // CG33b: block-form getter (`get => do … end;`) — emit as a
         // standalone function so that `return` inside the body terminates
-        // only the getter, not the enclosing method (§22.9).
+        // only the getter, not the enclosing method (§21.7).
         if (const ast::PropertyAccessor* acc =
                 blockGetterOf(ctx_.exprSymbol(*ma))) {
             if (!ma->target) return nullptr;

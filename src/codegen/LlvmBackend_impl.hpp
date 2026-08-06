@@ -1591,7 +1591,7 @@ private:
     llvm::Function*       excAddrFn_ = nullptr;   // fix #704: cached bz_exc_addr decl
     llvm::BasicBlock* unwindTarget_ = nullptr;   // innermost catch dispatch
     llvm::BasicBlock* propagateBB_ = nullptr;    // per-function, lazy
-    // §22.9 (#739): when non-null, a property accessor (setter) body is being
+    // §21.7 (#739): when non-null, a property accessor (setter) body is being
     // INLINED at an assignment site; a `return;` in it ends the accessor by
     // branching here, NOT by emitting a function return (which would exit the
     // enclosing method or, unconditionally, leave a malformed block).

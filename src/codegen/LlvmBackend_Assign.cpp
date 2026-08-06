@@ -1831,7 +1831,7 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (!getterExpr && !getterBlock) return nullptr;
 
     // --- Block-form getter: emit/call a standalone getter function. ---
-    // §23.4 / §22.9 / §9.4: the body's `return` must terminate only the getter,
+    // §23.4 / §21.7: the body's `return` must terminate only the getter,
     // and the (possibly record/aggregate) result flows back by value through the
     // function's declared return type — exactly as a record-returning method
     // does. Inlining the block would (a) discard the value and (b) ret out of
@@ -2643,7 +2643,7 @@ bool Emitter::lowerIndexerSet(const ast::IndexExpr& ix, llvm::Value* val,
     if (setterExpr) {
         lowerExpr(*setterExpr);
     } else if (setterStmts) {
-        // §23.3 / §23.5 (#1236): mirror lowerPropertySetValue (§22.9 / #739) —
+        // §23.3 / §23.5 (#1236): mirror lowerPropertySetValue (§21.7 / #739) —
         // set up an accessor-end block so `return;` inside the block body ends
         // only this setter, not the enclosing method. Without this, `return;`
         // falls through to the enclosing method's return path, emitting a
@@ -5593,7 +5593,7 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
         // `ps->indexerParams` is empty for a named property, so this call is
         // about `value` alone. See lowerIndexerSet for the full argument.
         retainAssignedStringParams(setter->stmts, ps->indexerParams, pd);
-        // §22.9 (#739): inline the setter body with an accessor-end target so a
+        // §21.7 (#739): inline the setter body with an accessor-end target so a
         // `return;` ends the setter rather than the enclosing method.
         llvm::BasicBlock* savedAccEnd = inlinedAccessorEnd_;
         auto* accEndBB = llvm::BasicBlock::Create(llvm_, "setter.end", currentFn_);
@@ -5686,7 +5686,7 @@ bool Emitter::lowerPropertySetValue(const ast::Expr& target, llvm::Value* v,
     retainAssignedStringParams(setter->stmts, ps->indexerParams, pd);
     llvm::Value* savedThis = currentThis_;
     currentThis_ = recv;
-    // §22.9 (#739): accessor-end target — a `return;` ends the setter, not the
+    // §21.7 (#739): accessor-end target — a `return;` ends the setter, not the
     // enclosing method (the setter body is inlined here).
     llvm::BasicBlock* savedAccEnd = inlinedAccessorEnd_;
     auto* accEndBB = llvm::BasicBlock::Create(llvm_, "setter.end", currentFn_);

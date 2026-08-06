@@ -57,7 +57,7 @@
 // WHAT WAS ALREADY CORRECT, and is pinned below as a control: the BLOCK-bodied
 // getter (`get => do return null; end;`) — it routes through
 // `ensureIndexerBlockGetter`, whose `accessorReturnTypeNode_` wiring puts the
-// body's `return` on the ordinary §22.9 return path — and every named-property
+// body's `return` on the ordinary §21.7 return path — and every named-property
 // form, virtual or not.
 
 #include "support/aot_support.hpp"

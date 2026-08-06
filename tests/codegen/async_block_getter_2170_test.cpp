@@ -23,7 +23,7 @@
 //   §23.3 — block-bodied accessor (`get => do … end;`).
 //   §30.5 — async method return completes the outer task; the completion
 //            pathway must not fire inside a non-async helper function.
-//   §22.9 — property accessors are standalone functions; a `return` inside a
+//   §21.7 — property accessors are standalone functions; a `return` inside a
 //            block getter terminates the getter, not its caller.
 
 #include "support/aot_support.hpp"   // runAot — AOT test harness
