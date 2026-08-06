@@ -2468,7 +2468,27 @@ void Emitter::emitExportedIndexerGetters() {
         if (!ts || (ts->kind != ast::TypeDeclKind::Class &&
                     ts->kind != ast::TypeDeclKind::Record)) continue;
         if (ts->visibility != ast::Visibility::Public) continue;
-        if (!ts->genericParams.empty()) continue;
+        // fix #2946 (§23.4 "Indexers" / §13 "Interfaces" / §11.2 / §2.5 /
+        // §2.8.3 rule 4 / §14.1, v0.240): a public GENERIC class's instance
+        // indexer accessors ARE exported, where they previously were not — the
+        // INDEXER twin of the exporter half #2894 had to add for named
+        // properties, and the third time this same gate has needed widening
+        // (Class-only → Class+Record was #2474/#2489, above).
+        //
+        // The importer's own half (declareImportedIndexerGetters/-Setters)
+        // never carried a generic gate, so it already DECLARED
+        // `bz$<GenericClass>$idxget$<arity>` — the asymmetry was invisible only
+        // because nothing ever created a RELOCATION to it. #2946's itable fill
+        // does, and an itable is an INITIALIZED GLOBAL: an unresolved slot is a
+        // link error at every consumer, including one that never dispatches
+        // (exactly what #2894's first probe measured for the property twin).
+        // The body emitted here is the ERASED `T -> i32` template accessor,
+        // which is precisely what the importer is allowed to call:
+        // buildImportedGenericVtable installs it ONLY for an instantiation
+        // whose layout matches that template AND whose accessor ABI still fits.
+        // As with #2474/#2489, only the GATE needs widening and not the body
+        // builder — ensureIndexerGetterFn already declares `this` as `ptr`
+        // unconditionally.
         for (sema::Symbol* m : ts->members) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
             if (!ps || !ps->isIndexer) continue;
@@ -2543,7 +2563,11 @@ void Emitter::emitExportedIndexerSetters() {
         if (!ts || (ts->kind != ast::TypeDeclKind::Class &&
                     ts->kind != ast::TypeDeclKind::Record)) continue;
         if (ts->visibility != ast::Visibility::Public) continue;
-        if (!ts->genericParams.empty()) continue;
+        // fix #2946: the SETTER twin of the generic-gate widening on
+        // emitExportedIndexerGetters just above — same §23.4 authority, same
+        // exporter/importer asymmetry (declareImportedIndexerSetters declares
+        // `bz$<Class>$idxset$<arity>` with no generic gate), same reason only
+        // the gate and not ensureIndexerSetterFn needs to change.
         for (sema::Symbol* m : ts->members) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
             if (!ps || !ps->isIndexer) continue;
@@ -5282,15 +5306,32 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
                 // already records for the static ABI. Anything outside it keeps
                 // a null slot, i.e. today's exact behaviour.
                 auto exporterDefinesAccessor = [&](bool isSet) {
-                    // An INDEXER is excluded because emitExportedIndexerGetters
-                    // /-Setters still carry their own `genericParams.empty()`
-                    // gate, so no `bz$<Class>$idxget$<arity>` symbol exists for
-                    // a generic class — installing one would be an unresolved
-                    // relocation. An interface INDEXER on an imported generic
-                    // therefore keeps its null slot, exactly as today; filed
-                    // separately with its own measurement rather than widened
-                    // into this fix.
-                    if (pimpl->isIndexer) return false;
+                    // fix #2946 (§23.4 "Indexers" / §13 / §11.2 / §2.5 /
+                    // §2.8.3 rule 4, v0.240): an INDEXER used to be excluded
+                    // here, because emitExportedIndexer{Getters,Setters} still
+                    // carried their own `genericParams.empty()` gate — no
+                    // `bz$<Class>$idxget$<arity>` symbol existed for a generic
+                    // class, and filling the slot would have been an unresolved
+                    // relocation in an initialized global. That gate is now
+                    // widened (see those two functions), so the symbol exists
+                    // and the slot can be filled under exactly the conditions
+                    // below. Measured on the issue's own two-module build,
+                    // which links clean and then calls the null slot:
+                    //
+                    //     SEGV on unknown address 0x0 (pc 0x0) ... in main
+                    //
+                    // An indexer that still has a LOCAL body (a live
+                    // `ast::PropertyDecl`) is refused, and that is a true
+                    // mirror rather than defensiveness: "the EXPORTER defines
+                    // this symbol" is precisely "this accessor is imported".
+                    // It also keeps this function free of body emission — it
+                    // writes its cache only on the way OUT, so a body that
+                    // re-entered would build a second vtable for one
+                    // instantiation (the hazard #2906 removed from
+                    // `specializedVtableFor` and did not remove here).
+                    if (pimpl->isIndexer &&
+                        dynamic_cast<const ast::PropertyDecl*>(pimpl->decl))
+                        return false;
                     if (!pimpl->parent) return false;
                     if (pimpl->parent->kind != ast::TypeDeclKind::Class &&
                         pimpl->parent->kind != ast::TypeDeclKind::Record)
@@ -5319,24 +5360,57 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
                 // storage identical. The exported stub was declared with no
                 // substitution active, so comparing it against the type lowered
                 // under THIS substitution is exactly that question.
+                //
+                // fix #2946: an INDEXER's ABI carries its INDEX PARAMETERS
+                // between `this` and the value, so the shape is
+                // `T get(ptr this, idx...)` / `void set(ptr this, idx...,
+                // T value)`. Every one of those types is a separate way the ABI
+                // can move under the substitution (`property [i: T]: int` moves
+                // an index parameter while leaving both the storage AND the
+                // indexer's own type identical), so each is compared, not just
+                // the count. Checking arity alone would be the "correct
+                // predicate over an incomplete population" shape this family
+                // keeps producing.
                 auto accessorAbiFits = [&](llvm::Function* acc, bool isSet) {
                     sema::TypeRef* mt = ctx_.importedMemberType(pimpl);
                     if (!mt) return false;
                     llvm::Type* conc = lowerTypeRef(mt);
                     if (!conc) return false;
                     llvm::FunctionType* ft = acc->getFunctionType();
+                    const unsigned nIdx =
+                        pimpl->isIndexer
+                            ? static_cast<unsigned>(pimpl->indexerParams.size())
+                            : 0u;
+                    if (ft->getNumParams() != nIdx + (isSet ? 2u : 1u))
+                        return false;
+                    for (unsigned k = 0; k < nIdx; ++k) {
+                        auto* pps = dynamic_cast<const sema::ParameterSymbol*>(
+                            pimpl->indexerParams[k]);
+                        sema::TypeRef* pt = pps ? pps->resolvedDeclType
+                                                : nullptr;
+                        llvm::Type* pc = pt ? lowerTypeRef(pt) : nullptr;
+                        if (!pc || ft->getParamType(k + 1) != pc) return false;
+                    }
                     if (isSet)
-                        return ft->getNumParams() == 2 &&
-                               ft->getParamType(1) == conc &&
+                        return ft->getParamType(nIdx + 1) == conc &&
                                ft->getReturnType()->isVoidTy();
-                    return ft->getNumParams() == 1 &&
-                           ft->getReturnType() == conc;
+                    return ft->getReturnType() == conc;
                 };
                 auto fill = [&](bool isSet, unsigned si) {
                     if (si >= nSlots) return;
                     if (!exporterDefinesAccessor(isSet)) return;
+                    // fix #2946: `indexerItableAccessor` resolves an IMPORTED
+                    // indexer to the cross-module `bz$<Class>$idxget|idxset$
+                    // <arity>` stub #2414 declared — the same helper Pass D
+                    // uses for a local class's interface-indexer slot, so the
+                    // two paths cannot install different functions for one
+                    // shape. `exporterDefinesAccessor` above has already
+                    // established that `pimpl` is imported, so this resolves
+                    // through the map and emits nothing.
                     llvm::Function* acc =
-                        ensurePropertyAccessorFn(ts, pimpl, isSet);
+                        pimpl->isIndexer
+                            ? indexerItableAccessor(ts, pimpl, isSet)
+                            : ensurePropertyAccessorFn(ts, pimpl, isSet);
                     if (!acc || !accessorAbiFits(acc, isSet)) return;
                     itabElems[si] = llvm::cast<llvm::Constant>(acc);
                 };
