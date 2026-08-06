@@ -2215,6 +2215,42 @@ private:
     std::unordered_map<llvm::Type*, llvm::GlobalVariable*> spanBoxVtables_;
     llvm::GlobalVariable* ensureSpanBoxVtable(llvm::Type* elemTy);
 
+    // fix #2804 (§8.6 "Boxing of inline arrays", v0.240): per-`[N]T` box
+    // descriptor + box vtable, minted on demand. Unlike every other boxable
+    // kind these have no stable NAME to key on — `[3]int` and `[4]int` are
+    // "distinct types that do not interconvert" (§15.1) and so are `[3]int`
+    // and `[3]string` — so the key is the STRUCTURAL identity key
+    // (typeRefIdentityKey / appendDescKey), which already encodes the size,
+    // the ownedness and the element type (#2001). Both maps are filled
+    // together by ensureInlineArrayBoxVtable().
+    std::unordered_map<std::string, llvm::GlobalVariable*> inlineArrayBoxDesc_;
+    std::unordered_map<std::string, llvm::GlobalVariable*> inlineArrayBoxVtable_;
+    // The one shared empty (null-terminated) itmap every inline-array box
+    // vtable points at: §15.1.2 — "inline arrays are not class types and do
+    // not implement interfaces" — so a stray itable lookup must find nothing
+    // rather than dereference a null itmap.
+    llvm::GlobalVariable* inlineArrayBoxItmap_ = nullptr;
+
+    // fix #2804: the ONE predicate deciding whether a `[N]T` value has a
+    // runtime box identity. isBoxableValueType, boxVtableFor and
+    // boxDescriptorFor all ask THIS function so they cannot drift (the #2793
+    // three-list defect); the alignment is load-bearing, since the §28.9
+    // box-release machinery fires on isBoxableValueType and would hand the
+    // RAW array bytes to bz_box_release for a type this admitted but the
+    // minter could not build (the #2796 SIGSEGV shape).
+    bool inlineArrayBoxable(const sema::TypeRef* rt);
+    // §8.5: the source spelling of a type ("[3]int", "[2]Point", "[4]int?") —
+    // §8.5 makes exactly this the boxed inline array's ToString.
+    std::string inlineArrayTypeSpelling(const sema::TypeRef* rt);
+    // fix #2804: mint (or return the cached) box vtable for a boxable `[N]T`,
+    // filling inlineArrayBoxDesc_ at the same key. nullptr when
+    // inlineArrayBoxable(rt) is false.
+    llvm::GlobalVariable* ensureInlineArrayBoxVtable(const sema::TypeRef* rt);
+    // fix #2804: the box DESCRIPTOR for a boxable `[N]T` — the type-test
+    // target counterpart of ensureInlineArrayBoxVtable (the same global, so
+    // `o is [3]int` compares equal to what boxValue stored at vtable[0]).
+    llvm::GlobalVariable* inlineArrayBoxDescriptor(const sema::TypeRef* rt);
+
     llvm::Type* i8() { return llvm::Type::getInt8Ty(llvm_); }
     llvm::Type* i16() { return llvm::Type::getInt16Ty(llvm_); }
     llvm::Type* i32() { return llvm::Type::getInt32Ty(llvm_); }

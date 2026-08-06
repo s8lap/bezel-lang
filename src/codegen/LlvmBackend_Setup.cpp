@@ -25061,6 +25061,289 @@ llvm::GlobalVariable* Emitter::ensureSpanBoxVtable(llvm::Type* elemTy) {
 }
 
 
+// fix #2804 (§8.6 "Boxing of inline arrays" / §15.1, v0.240): the ONE predicate
+// deciding whether a `[N]T` value has a runtime box identity.
+//
+// §8.6 states the rule and names its only exception:
+//   "Non-owning inline arrays (`[N]T` and `[N]T?`) are ordinary value types and
+//    box per the general rule."
+//   "Move-only value types — owning inline arrays (`[N owned]T` and
+//    `[N owned]T?`) and owning-classified choices — cannot be boxed."
+//
+// isBoxableValueType, boxVtableFor and boxDescriptorFor all route here rather
+// than each re-deriving the condition — the #2793 lesson, where three
+// hand-maintained lists had to agree and one name fell out of all three. The
+// alignment is load-bearing rather than tidy: the §28.9 box-release machinery
+// (isBoxFieldLvalue / collectBoxStorageFields / isPlusOneBoxProducer) fires on
+// isBoxableValueType, so a type this predicate admitted but the minter could
+// not build would have its RAW array bytes handed to bz_box_release — the
+// #2796 SIGSEGV shape.
+bool Emitter::inlineArrayBoxable(const sema::TypeRef* rt) {
+    if (!rt || rt->kind != sema::TypeRef::Kind::InlineArray) return false;
+    if (rt->arrayOwned) return false;                 // move-only (§8.6/§15.3)
+    // §15.1: "The size N is part of the type. `[3]int` and `[4]int` are
+    // distinct types that do not interconvert." An UNFOLDED size
+    // (arraySizeValue < 0 — a size sema could not evaluate) carries no
+    // distinguishing runtime tag, so a descriptor keyed on it would collapse
+    // the two onto ONE identity: the #2001 type-confusion class (the object has
+    // the small layout, an `as` would admit the large one). Leave such a value
+    // unboxed; #2775's guard then reports the dropped test rather than letting
+    // it read silently false.
+    if (rt->arraySizeValue <= 0) return false;
+    // Same reasoning one level down, using the predicate the per-monomorphization
+    // descriptor factory already applies to a type argument: a `[3]T` under an
+    // unsubstituted type parameter, or an element of runtime-erased function
+    // type (#2012), is not distinguishable from its siblings.
+    if (!descTypeArgConcrete(rt->arrayElement)) return false;
+    // Finally the type must actually LOWER to `[N x elem]`: lowerTypeRef needs
+    // the AST size node, so a metadata-reconstructed ref carrying a folded size
+    // but no `arraySize` lowers to a bare i32 and has no array payload to box.
+    llvm::Type* lt = lowerTypeRef(rt);
+    return lt && lt->isArrayTy();
+}
+
+
+// §8.5 (v0.240): the source spelling of a type. §8.5's inline-array row makes
+// exactly this the boxed value's ToString: "For inline arrays (all forms,
+// including move-only `[N owned]…` arrays …) and for the unit type: the type's
+// name — `"[3]int"`-style for an inline array … (element-listing output is
+// deliberately not synthesized — an inline array's elements may be class-typed
+// borrows whose formatting is not the container's business)."
+std::string Emitter::inlineArrayTypeSpelling(const sema::TypeRef* rt) {
+    if (!rt) return "?";
+    using K = sema::TypeRef::Kind;
+    using P = sema::PrimitiveType;
+    std::string s;
+    switch (rt->kind) {
+        case K::InlineArray:
+            s = "[";
+            s += rt->arraySizeValue >= 0 ? std::to_string(rt->arraySizeValue)
+                                         : std::string("N");
+            if (rt->arrayOwned) s += " owned";
+            s += "]";
+            s += inlineArrayTypeSpelling(rt->arrayElement);
+            break;
+        case K::Primitive:
+            // Deliberately without a `default:` so a new sema::PrimitiveType
+            // enumerator is a -Wswitch diagnostic here, not a silent "?".
+            switch (rt->primitive) {
+                case P::Bool:    s = "bool";    break;
+                case P::Char:    s = "char";    break;
+                case P::String:  s = "string";  break;
+                case P::Byte:    s = "byte";    break;
+                case P::SByte:   s = "sbyte";   break;
+                case P::Short:   s = "short";   break;
+                case P::UShort:  s = "ushort";  break;
+                case P::Int:     s = "int";     break;
+                case P::UInt:    s = "uint";    break;
+                case P::Long:    s = "long";    break;
+                case P::ULong:   s = "ulong";   break;
+                case P::Float:   s = "float";   break;
+                case P::Double:  s = "double";  break;
+                case P::Decimal: s = "decimal"; break;
+                case P::Object:  s = "Object";  break;
+                case P::None:    s = "?";       break;
+            }
+            break;
+        case K::Named:
+            s = rt->declaration ? std::string(rt->declaration->name)
+                                : std::string(rt->headName());
+            if (s.empty()) s = "?";
+            break;
+        case K::Unit:
+            s = "()";
+            break;
+        case K::Function:
+            s = "function";
+            break;
+        case K::Error:
+            s = "?";
+            break;
+    }
+    // §15.1 parses `[3]int?` greedily as "inline array of `int?`", so the `?`
+    // belongs to the ELEMENT spelling — which is where this lands, because the
+    // inline-array arm above recurses into arrayElement before this runs.
+    if (rt->nullable) s += "?";
+    return s;
+}
+
+
+// fix #2804 (§8.6 "Boxing of inline arrays", v0.240): mint (or return the
+// cached) box descriptor + box vtable for a boxable `[N]T`.
+//
+// Every other boxable kind is keyed by a stable NAME (primBoxName for the
+// primitives, valueBuiltinBoxName for the value-builtins, the TypeSymbol* for
+// records/enums). An inline array has none: §15.1 makes the size part of the
+// type, so `[3]int` and `[4]int` — and `[3]int` and `[3]string` — must not
+// share an identity. The key is therefore the STRUCTURAL identity key
+// (typeRefIdentityKey → appendDescKey), which already encodes ownedness, the
+// folded size and the element type for exactly this reason (#2001).
+//
+// LINKAGE: InternalLinkage, matching the span box (`btd$spanbox`) and the
+// value-builtin fallback — deliberately NOT the LinkOnceODR the primitives use.
+// A LinkOnceODR global merges by NAME at link time, and the readable name here
+// is a lossy mangle of the type; two distinct inline-array types whose mangles
+// collided would then become ONE runtime identity, which is the very confusion
+// this keying exists to prevent. Cross-artifact box identity is separately
+// broken for every boxable kind (#2301/#2797) and is not made worse here.
+llvm::GlobalVariable* Emitter::ensureInlineArrayBoxVtable(
+        const sema::TypeRef* rt) {
+    if (!inlineArrayBoxable(rt)) return nullptr;
+    const std::string key = typeRefIdentityKey(rt);
+    auto cached = inlineArrayBoxVtable_.find(key);
+    if (cached != inlineArrayBoxVtable_.end()) return cached->second;
+
+    auto* arrTy = llvm::cast<llvm::ArrayType>(lowerTypeRef(rt));
+    const std::string spelling = inlineArrayTypeSpelling(rt);
+    // A readable, LLVM-legal suffix for the globals (cosmetic — the identity is
+    // `key`, and LLVM uniquifies these Internal names on collision).
+    std::string sfx;
+    for (char c : spelling)
+        sfx += (std::isalnum(static_cast<unsigned char>(c)) ? c : '_');
+
+    // The descriptor chain: `[self, null]`. An inline array has no base types
+    // and implements no interfaces (§15.1.2), so `o is [3]int` matches exactly
+    // this one element and nothing else.
+    auto* descTy = llvm::ArrayType::get(ptrTy(), 2);
+    auto* desc = new llvm::GlobalVariable(
+        *module_, descTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage, nullptr, "btd$iabox$" + sfx);
+    desc->setInitializer(llvm::ConstantArray::get(
+        descTy, {desc, llvm::ConstantPointerNull::get(ptrTy())}));
+    inlineArrayBoxDesc_[key] = desc;
+
+    // --- ToString: §8.5's "the type's name" -------------------------------
+    llvm::Function* toStrFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()},
+                                             /*isVarArg=*/false);
+        toStrFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                         "bz$iatostr$" + sfx, module_.get());
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", toStrFn);
+        ThunkScope scope(currentFn_, builder_, toStrFn, entry);
+        builder_.CreateRet(lowerStringLiteral("\"" + spelling + "\"", false));
+    }
+
+    // --- Equals: §8.3's inline-array row ----------------------------------
+    // "Inline array `[N]T`, `[N]T?` | Element-by-element value equality
+    //  (§15.1.2)". Guard first that `other` is a box of the SAME inline-array
+    // type (same vtable[0] descriptor — which, being keyed structurally, is
+    // false for `[4]int` and for `[3]string`), then run the SAME walker the
+    // statically-typed `=` uses (emitInlineArrayEquality, reached from
+    // emitValueEquality), so the boxed and unboxed answers cannot disagree.
+    llvm::Function* eqFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
+                                             /*isVarArg=*/false);
+        eqFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$iaeq$" + sfx, module_.get());
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", eqFn);
+        ThunkScope scope(currentFn_, builder_, eqFn, entry);
+        llvm::Value* self  = eqFn->getArg(0);
+        llvm::Value* other = eqFn->getArg(1);
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+        auto* notNullBB = llvm::BasicBlock::Create(llvm_, "iaeq.nonnull", eqFn);
+        auto* checkBB   = llvm::BasicBlock::Create(llvm_, "iaeq.check",   eqFn);
+        auto* endBB     = llvm::BasicBlock::Create(llvm_, "iaeq.end",     eqFn);
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(other, nullP), endBB, notNullBB);
+
+        builder_.SetInsertPoint(notNullBB);
+        llvm::Value* otherVtbl =
+            builder_.CreateLoad(ptrTy(), other, "iaeq.ovtbl");
+        llvm::Value* otherDesc =
+            builder_.CreateLoad(ptrTy(), otherVtbl, "iaeq.odesc");
+        llvm::Value* myDesc = llvm::ConstantExpr::getPointerCast(desc, ptrTy());
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(otherDesc, myDesc), checkBB, endBB);
+
+        builder_.SetInsertPoint(checkBB);
+        llvm::Value* selfPay = builder_.CreateGEP(
+            ptrTy(), self,  {builder_.getInt32(2)}, "iaeq.spay");
+        llvm::Value* otherPay = builder_.CreateGEP(
+            ptrTy(), other, {builder_.getInt32(2)}, "iaeq.opay");
+        llvm::Value* sv = builder_.CreateLoad(arrTy, selfPay,  "iaeq.sv");
+        llvm::Value* ov = builder_.CreateLoad(arrTy, otherPay, "iaeq.ov");
+        llvm::Value* eq =
+            emitInlineArrayEquality(sv, ov, arrTy, rt->arrayElement);
+        llvm::BasicBlock* checkEnd = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 3, "iaeq.res");
+        phi->addIncoming(builder_.getFalse(), entry);      // other was null
+        phi->addIncoming(builder_.getFalse(), notNullBB);  // descriptor mismatch
+        phi->addIncoming(eq, checkEnd);                    // element-wise result
+        builder_.CreateRet(phi);
+    }
+
+    // --- GetHashCode: §8.3's "Hash combining element hashes in slot order" --
+    // emitValueHashCode's inline-array arm IS that fold (h = h*31 + elemHash,
+    // slot order), and it is the same one the statically-typed hash uses — so
+    // §8.3's invariant "if a.Equals(b) then a.GetHashCode() = b.GetHashCode()"
+    // holds by construction against the Equals thunk above.
+    llvm::Function* hashFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()},
+                                             /*isVarArg=*/false);
+        hashFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                        "bz$iahash$" + sfx, module_.get());
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", hashFn);
+        ThunkScope scope(currentFn_, builder_, hashFn, entry);
+        llvm::Value* payload = builder_.CreateGEP(
+            ptrTy(), hashFn->getArg(0), {builder_.getInt32(2)}, "iahash.pay");
+        llvm::Value* val = builder_.CreateLoad(arrTy, payload, "iahash.val");
+        llvm::Value* h = emitValueHashCode(val, rt);
+        if (h->getType() != i32()) h = builder_.CreateZExtOrTrunc(h, i32());
+        builder_.CreateRet(h);
+    }
+
+    // §15.1.2: "inline arrays are not class types and do not implement
+    // interfaces" — so the itmap is the shared EMPTY (null-terminated) one, not
+    // null: a stray itable lookup must find nothing rather than dereference a
+    // null vtable[1] (the crash the primitive block warns about).
+    if (!inlineArrayBoxItmap_) {
+        auto* itmapTy = llvm::ArrayType::get(ptrTy(), 1);
+        inlineArrayBoxItmap_ = new llvm::GlobalVariable(
+            *module_, itmapTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(
+                itmapTy, {llvm::ConstantPointerNull::get(ptrTy())}),
+            "itmap$box$inlinearray");
+    }
+
+    std::vector<llvm::Constant*> vtElems(
+        kVirtualMethodsBase, llvm::ConstantPointerNull::get(ptrTy()));
+    vtElems[0] = desc;
+    vtElems[1] = llvm::ConstantExpr::getPointerCast(inlineArrayBoxItmap_,
+                                                    ptrTy());
+    if (builtinDisposeFn_)  // boxed values are runtime-managed (§28.9) — no-op
+        vtElems[2] = llvm::cast<llvm::Constant>(builtinDisposeFn_);
+    vtElems[kToStringSlot]    = toStrFn;
+    vtElems[kEqualsSlot]      = eqFn;
+    vtElems[kGetHashCodeSlot] = hashFn;
+    auto* vtTy = llvm::ArrayType::get(ptrTy(), kVirtualMethodsBase);
+    auto* vtGV = new llvm::GlobalVariable(
+        *module_, vtTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(vtTy, vtElems), "bvt$iabox$" + sfx);
+    allVtables_.push_back(vtGV);  // §8.6 #417: bz_obj_is_string discriminator
+    inlineArrayBoxVtable_[key] = vtGV;
+    return vtGV;
+}
+
+
+// fix #2804 (§8.6): the box descriptor for a boxable `[N]T` type-test target.
+// Minting is shared with the vtable so the descriptor a test compares against
+// IS the global boxValue stored at vtable[0], whichever site runs first.
+llvm::GlobalVariable* Emitter::inlineArrayBoxDescriptor(
+        const sema::TypeRef* rt) {
+    if (!ensureInlineArrayBoxVtable(rt)) return nullptr;
+    auto it = inlineArrayBoxDesc_.find(typeRefIdentityKey(rt));
+    return it != inlineArrayBoxDesc_.end() ? it->second : nullptr;
+}
+
+
 // §8.6: is `rt` a value type that boxes when coerced to Object/interface?
 bool Emitter::isBoxableValueType(const sema::TypeRef* rt) {
     if (!rt) return false;
@@ -25092,7 +25375,15 @@ bool Emitter::isBoxableValueType(const sema::TypeRef* rt) {
                rt->declaration->kind == ast::TypeDeclKind::Enum;
     // §4.16 / §8.6 (#970): span value structs box into IReadOnlySpan<T>.
     if (isSpanLikeTypeName(rt)) return true;
-    return false;  // inline arrays / unit: deferred (not among the findings)
+    // fix #2804 (§8.6 "Boxing of inline arrays"): "Non-owning inline arrays
+    // (`[N]T` and `[N]T?`) are ordinary value types and box per the general
+    // rule." This used to be `return false` with an "inline arrays / unit:
+    // deferred" note, so an `Object`-typed `[3]int` held the raw `[3 x i32]`
+    // aggregate and every type test on it silently answered false. The
+    // move-only exclusion §8.6 names (`[N owned]T`) and the identity
+    // preconditions live in the ONE predicate, not re-listed here.
+    if (rt->kind == K::InlineArray) return inlineArrayBoxable(rt);
+    return false;  // unit: deferred (§4.7 / §8.6 "Boxing of the unit value")
 }
 
 
@@ -25130,6 +25421,10 @@ llvm::GlobalVariable* Emitter::boxDescriptorFor(const sema::TypeRef* rt) {
         auto it = primBoxDesc_.find(nm);
         return it != primBoxDesc_.end() ? it->second : nullptr;
     }
+    // fix #2804 (§8.6 "Boxing of inline arrays"): `o is [3]int` — minted on
+    // demand, keyed structurally, so the target resolves the same global the
+    // box carries at vtable[0].
+    if (rt->kind == K::InlineArray) return inlineArrayBoxDescriptor(rt);
     return nullptr;
 }
 
@@ -25276,6 +25571,11 @@ llvm::GlobalVariable* Emitter::boxVtableFor(const sema::TypeRef* rt) {
         auto it = primBoxVtable_.find(nm);
         return it != primBoxVtable_.end() ? it->second : nullptr;
     }
+    // fix #2804 (§8.6 "Boxing of inline arrays"): a non-owning `[N]T` boxes with
+    // an on-demand, structurally-keyed vtable. Gated by the SAME predicate
+    // isBoxableValueType uses, so boxValue never leaves an admitted value
+    // unboxed (which would hand raw array bytes to the §28.9 box-release path).
+    if (rt->kind == K::InlineArray) return ensureInlineArrayBoxVtable(rt);
     // §4.16 / §8.6 (#970): span types box into IReadOnlySpan<T>.
     if (isSpanLikeTypeName(rt)) {
         llvm::Type* elemTy = i32();  // fallback: int element

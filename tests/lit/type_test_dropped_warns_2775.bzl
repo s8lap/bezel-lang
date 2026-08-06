@@ -11,22 +11,30 @@
 //
 // The shape pinned here is measured, not hypothetical. §8.6 says "When a value
 // type is used where `Object` (or an interface implemented by the value type)
-// is expected, the value is boxed", and its "Boxing of inline arrays" paragraph
-// says "Non-owning inline arrays (`[N]T` and `[N]T?`) are ordinary value types
-// and box per the general rule". `isBoxableValueType` does not box them (its
-// own closing comment says "inline arrays / unit: deferred"), so `o is [3]int`
-// below has no runtime descriptor to compare against and the test is dropped.
-// Before this fix the program compiled silently and answered false.
+// is expected, the value is boxed", so a value type whose runtime identity the
+// implementation cannot mint has no descriptor for `is` to compare against and
+// the test is dropped. Before this fix such a program compiled silently and
+// answered false.
 //
-// ⚠ MAINTENANCE NOTE: this test asserts the GUARD, not the boxing gap. If a
-// later change makes inline arrays box per §8.6, the CHECK stops matching —
-// that is a correct signal, and the right response is to re-point the test at
-// whatever value-type category remains unboxed (`decimal` was the other live
-// one when this landed), NOT to delete the assertion.
+// ⚠ MAINTENANCE NOTE: this test asserts the GUARD, not any particular boxing
+// gap. RE-POINTED TWICE by design, exactly as the note below directs: the
+// original pin was `o is [3]int` on a non-owning inline array (both `decimal`
+// and inline arrays were unboxed when this landed); #2793 boxed `decimal` and
+// #2804 boxed non-owning inline arrays, so the pin now sits on the category
+// that remains — and durably so — runtime-ERASED element types. §12.9 / #2012
+// make a function type runtime-indistinguishable from its siblings, so
+// `[2](int) -> int` deliberately gets no box identity: minting one would
+// collapse `[2](int) -> int` and `[2](string) -> string` onto a single
+// descriptor, which is the #2001 type-confusion class. If a later change ever
+// reifies function types, the CHECK stops matching — that is a correct signal,
+// and the right response is to re-point the test at whatever value-type
+// category remains unboxed (`unit`, §4.7 / §8.6 "Boxing of the unit value", is
+// the next one), NOT to delete the assertion.
 //
 // The CHECK-NOT half is the accept-control: a correctly-boxed operand and a
 // concrete class target must stay SILENT, so the guard cannot be satisfied by
-// a predicate that simply warns on every type test.
+// a predicate that simply warns on every type test. Since #2804 the non-owning
+// inline array is one of those accept-controls rather than the pinned shape.
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck %s
@@ -49,10 +57,21 @@ class C
     var asObj: Object := w;
     if asObj is Widget then else return 2; end;
 
-    // The pinned shape: a non-owning inline array in an Object location.
+    // Accept-control since #2804: a NON-OWNING inline array boxes per §8.6
+    // ("Non-owning inline arrays (`[N]T` and `[N]T?`) are ordinary value types
+    // and box per the general rule") and the test answers correctly — silent.
     var ia: [3]int := [1, 2, 3];
     var o: Object := ia;
-    if o is [3]int then return 3; end;
+    if o is [3]int then else return 3; end;
+
+    // The pinned shape: an inline array whose ELEMENT type is runtime-erased.
+    // §15.1 admits function values as elements, but §12.9 / #2012 make two
+    // function types runtime-indistinguishable, so no box identity may be
+    // minted for `[2](int) -> int` and the test is dropped — with this
+    // diagnostic rather than in silence.
+    var fs: [2](int) -> int := [lambda(x: int) => x, lambda(x: int) => x + 1];
+    var of: Object := fs;
+    if of is [2](int) -> int then return 4; end;
 
     return 0;
   end Main;
