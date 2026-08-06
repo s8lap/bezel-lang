@@ -2394,9 +2394,33 @@ static void loadMetadataPass2(
                     break;
                 }
             }
-            if (importedFs)
+            if (!importedFs) continue;
+            // fix #2860 (§2.8.2 "No restrictions beyond visibility", v0.240):
+            // #2351's re-parse+attach is a STATIC-field mechanism — it sets
+            // `FieldSymbol::decl`, which for an INSTANCE field is the key every
+            // decl-null fallback in the backend keys the imported-member layout
+            // path on (`storageType`'s `mem->decl == nullptr` guard above all),
+            // so attaching one would silently re-route an imported generic's
+            // instance layout through a TypeRef resolved in the throwaway
+            // context. `fieldInitText` now also rides an INSTANCE field of a
+            // generic class (ModuleMetadataBuilder), so gate the attach on the
+            // `static` modifier — the shape #2351 was written for — and record
+            // the instance field's text for the §2.8.2 construction-site
+            // diagnostic instead. Running an instance initializer importer-side
+            // (the strictly better outcome §2.8.2 asks for) needs the storage
+            // predicates that classify a member's runtime-managed kind to stop
+            // returning false for an imported member; that is FILED, not guessed
+            // at here.
+            bool isStaticMember = false;
+            for (const std::string& mod : mm.modifiers)
+                if (mod == "static") { isStaticMember = true; break; }
+            if (isStaticMember) {
                 parseAndAttachFieldInit(td, md.moduleName, mm, importedFs, *t,
                                         ctx);
+            } else {
+                ctx.setImportedInstanceFieldInitText(importedFs,
+                                                     mm.fieldInitText);
+            }
         }
 
         // Dtor body: the dtorBodyText is on the MetaTypeDecl itself.

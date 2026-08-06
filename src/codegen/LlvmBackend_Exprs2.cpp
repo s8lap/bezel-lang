@@ -5061,7 +5061,29 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         return obj;
     }
 
-    if (ctx_.isImported(t)) {
+    // fix #2860 (§2.8.2 clause 2 / §22.8 step 2 / §7.9, v0.240): `&&
+    // !importedGenericNoBody`. This branch's every exit is a `return obj`, so
+    // it swallowed the no-explicit-ctor construction sequence below for EVERY
+    // imported type. For a NON-generic import that is right — its field
+    // initializers ran in the exported `bz$<Type>$init` called at the top of
+    // lowerNew (declareImportedInit). An imported GENERIC has no such symbol
+    // (it is monomorphized per instantiation, §14.1), so `emitInstanceInit`
+    // installed the per-instantiation vtable and NOTHING ever ran §22.8 step 2:
+    // every field of `new ImportedGeneric<T>()` kept its §7.9 default, with no
+    // diagnostic at any severity. §2.8.2 clause 2 is the rule broken — "An
+    // external instantiation behaves identically to a same-module instantiation
+    // of the same generic at the same arguments" — and the same declarations
+    // compiled as ONE module initialize correctly.
+    //
+    // Falling through instead of duplicating the sequence here is deliberate:
+    // `importedGenericNoBody` implies `!hasAnyConstructor(t)`, so `ctorForArgs`
+    // below returns null and control reaches the `else if (!hasAnyConstructor)`
+    // branch — the SAME code path a local no-explicit-ctor class takes, with its
+    // §22.7-step-2 throwing-initializer cleanup (#1291) and its `currentThis_ =
+    // obj` discipline already correct. Everything this branch would have done
+    // for a ctor-less type is a no-op anyway (no ctor to call; its trailing
+    // emitNewPendingCheck is re-emitted by the no-ctor branch).
+    if (ctx_.isImported(t) && !importedGenericNoBody) {
         // fix #2639 (§22.3 "Parameter modifiers" / §22.4, v0.236): a BY-REF
         // argument modifier does not make an argument non-positional. This
         // predicate is the branch's only admission gate and it originally
@@ -5650,6 +5672,12 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // `this` (which was restored after the vtable install above).
         llvm::Value* savedThisNoCtor = currentThis_;
         currentThis_ = obj;
+        // fix #2860 (§2.8.2, v0.240): locate emitOwnFieldInit's "this imported
+        // generic's field initializer did not cross the module boundary"
+        // diagnostic on the `new` that would have observed the §7.9 default.
+        // This sequence has no early return, so the clear below always runs.
+        SourceLocation savedInitDiagLoc = importedFieldInitDiagLoc_;
+        importedFieldInitDiagLoc_ = ne.span.begin;
         emitImplicitBase(t, obj);
         // §22.7 step 2 (#1291): a throwing OWN field initializer must dispose the
         // earlier owned fields (whose initializers completed, in reverse
@@ -5682,6 +5710,7 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             unwindTarget_ = savedUnwind;
             unwindScopeDepth_ = savedDepth;
         }
+        importedFieldInitDiagLoc_ = savedInitDiagLoc;  // fix #2860
         currentThis_ = savedThisNoCtor;
         // §22.9 / §28.3 (FINDING [4]): the implicit base ctor may throw; the
         // base ctor's own cleanup disposed the base subobject without freeing

@@ -526,6 +526,26 @@ public:
         return it == importedConstValues_.end() ? nullptr : &it->second;
     }
 
+    // fix #2860 (§2.8.2 "No restrictions beyond visibility" / §22.8 step 2,
+    // v0.240): the source text of an IMPORTED GENERIC class's INSTANCE field
+    // initializer (MetaMember::fieldInitText, recorded by ModuleLoader). A
+    // generic class exports no `bz$<Type>$init`, so the consumer monomorphizes
+    // construction and replays each initializer itself — but it can only replay
+    // one that crossed the boundary as a foldable constant (importedConstValue
+    // above). This table says "this field HAS an initializer", so a construction
+    // site whose replay produced no store can name the shape in a diagnostic
+    // (§2.8.2) instead of silently observing the §7.9 default. Absent → the
+    // field genuinely has no initializer and its §7.9 default is correct.
+    void setImportedInstanceFieldInitText(const Symbol* m,
+                                          std::string_view text) {
+        importedInstanceFieldInitTexts_[m] = std::string(text);
+    }
+    const std::string* importedInstanceFieldInitText(const Symbol* m) const {
+        auto it = importedInstanceFieldInitTexts_.find(m);
+        return it == importedInstanceFieldInitTexts_.end() ? nullptr
+                                                           : &it->second;
+    }
+
     // §9.8 / §2.3 / issue #922: allocate-and-cache a compiler-intrinsic
     // TypeSymbol for a builtin class name (e.g. "Range", "DateTime",
     // "TimeSpan").  The SAME pointer is returned on every call with the same
@@ -639,6 +659,10 @@ private:
     std::unordered_map<const Symbol*, bool> importedEventIsAsync_;
     // §22.12 imported const values (issue #328 FINDING [3] BUG A), textual.
     std::unordered_map<const Symbol*, std::string> importedConstValues_;
+    // fix #2860 (§2.8.2): imported GENERIC class instance-field initializer
+    // source text, keyed by the reconstructed FieldSymbol. See the accessors.
+    std::unordered_map<const Symbol*, std::string>
+        importedInstanceFieldInitTexts_;
     // §14 / #662c: imported SourceFile objects that own re-parsed ctor/dtor
     // AST nodes for imported generic classes.  The re-parsed AST carries
     // ConstructorDecl / DestructorDecl nodes whose decl pointers are attached

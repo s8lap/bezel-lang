@@ -866,8 +866,26 @@ bool convertMember(const sema::MemberSymbol& m, bool inInterface,
             if (mod == "static") isStaticField = true;
         if (!isStaticField && fd->initializer) {
             out.valueText = renderConstExpr(fd->initializer.get());
-        } else if (isStaticField && isGenericType && fd->initializer &&
-                   !source.empty()) {
+        }
+        // fix #2860 (§2.8.2 "No restrictions beyond visibility" / §22.8 step 2,
+        // v0.240): also carry a GENERIC type's INSTANCE field initializer text.
+        // A non-generic public class replays every instance field initializer
+        // through its exported `bz$<Type>$init` (#328 FINDING [7]), so the
+        // `valueText` fold is only a shortcut there. A GENERIC class exports no
+        // such symbol — the importer monomorphizes construction — so an
+        // initializer `valueText` cannot render (`new Cell()`, `[1,2,3]`, a
+        // reference to another member) reaches the consumer as NOTHING, and the
+        // field is silently left at its §7.9 default: a non-nullable `owned`
+        // field parked on the null watermark. §2.8.2 requires an implementation
+        // "unable to carry some body shape in its interface format" to "reject
+        // the export, or the import, with a diagnostic naming the shape"; this
+        // text is what lets the IMPORT side name the shape at the construction
+        // site (SemaContext::importedInstanceFieldInitText → emitOwnFieldInit)
+        // instead of shipping the silent default. It is emitted for EVERY
+        // generic instance-field initializer, foldable or not, so the consumer's
+        // test is the category-blind "did a value actually reach the slot?"
+        // rather than a guess about which initializer shapes fold.
+        if (isGenericType && fd->initializer && !source.empty()) {
             const ast::Expr* init = fd->initializer.get();
             if (init->span.begin.offset < init->span.end.offset &&
                 init->span.end.offset <= source.size()) {
@@ -1405,7 +1423,21 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
             // above already documents for the same reason).
             if (includeForLayout && !exported && !includeForMethodBody) {
                 mm.valueText.clear();
-                mm.fieldInitText.clear();
+                // fix #2860 (§2.8.2 definition-site visibility, v0.240): keep
+                // `fieldInitText` for a GENERIC class. The whole reason this
+                // clears the initializer carriage — "the default value is not
+                // needed to reconstruct the physical layout" — holds only where
+                // some OTHER mechanism replays the initializer, which for a
+                // non-generic class is the exported `bz$<Type>$init`. A generic
+                // class has none: its construction is monomorphized in the
+                // consumer, so a private field's initializer that does not cross
+                // is silently dropped there, exactly like a public one (and
+                // §2.8.2's definition-site clause is explicit that the interface
+                // "must therefore carry whatever internal machinery its exported
+                // generic bodies reach"). This is the text the consumer names in
+                // the §2.8.2 diagnostic; it adds no member, no slot and no ABI —
+                // the member itself was already being carried for layout.
+                if (!isGenericClass) mm.fieldInitText.clear();
             }
             out.members.push_back(std::move(mm));
         }

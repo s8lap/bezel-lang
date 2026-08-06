@@ -7689,13 +7689,84 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
         if (!init && m->decl == nullptr) {
             // fix #2524: imported generic no-ctor bases are monomorphized here,
             // so replay their constant-foldable wire initializer locally.
+            bool replayed = false;
             const std::string* text = ctx_.importedConstValue(m);
             if (text && !text->empty() && idxIt != fieldIndex_.end()) {
                 const sema::TypeRef* rt = ctx_.importedMemberType(
                     dynamic_cast<const sema::MemberSymbol*>(m));
-                if (llvm::Value* v = foldImportedConstText(*text, rt))
-                    builder_.CreateStore(
-                        v, builder_.CreateStructGEP(st, obj, idxIt->second));
+                llvm::Type* slotTy = st->getElementType(idxIt->second);
+                if (llvm::Value* v = foldImportedConstText(*text, rt)) {
+                    // fix #2860 (§23.1 / §5.1 / §8.6, v0.240): the folded
+                    // constant is the initializer's OWN lowered type; the SLOT
+                    // may be wider (§5.1: `l: long := 41`) or a tagged
+                    // `{i8 hasValue; T}` nullable-value slot (§23.1/#1169:
+                    // `n: int? := 7`). This branch stored the bare constant
+                    // verbatim, so `int? := 7` wrote i32 7 over the {i8,i32}
+                    // slot — clobbering the hasValue byte and leaving the value
+                    // half stale, i.e. a field that reads as PRESENT-and-0. The
+                    // non-imported path two blocks below already applies both
+                    // coercions; apply the same two here.
+                    //
+                    // Then a CATEGORY-BLIND final guard: store only if the
+                    // coerced value's type IS the slot's. Anything else (an
+                    // `Object`/interface field whose §8.6 box this path cannot
+                    // mint, a struct-typed slot) keeps its §7.9 default — the
+                    // behaviour before #2860 widened this replay to the direct
+                    // `new ImportedGeneric<T>()` site — rather than emitting a
+                    // width-mismatched store into a neighbouring field's bytes.
+                    v = coerceNumericToType(v, slotTy, /*srcUnsigned=*/false);
+                    if (rt && isNullableValueTy(rt))
+                        v = coerceReturnToNullableValue(v, rt);
+                    if (v && v->getType() == slotTy) {
+                        builder_.CreateStore(
+                            v, builder_.CreateStructGEP(st, obj,
+                                                        idxIt->second));
+                        replayed = true;
+                    }
+                }
+            }
+            // fix #2860 (§2.8.2 "No restrictions beyond visibility" / §7.9 /
+            // §22.13, v0.240): the field HAS an initializer in the exporting
+            // module (that is exactly what `importedInstanceFieldInitText` says,
+            // ModuleMetadataBuilder) and nothing above put a value in its slot.
+            // An imported GENERIC class exports no `bz$<Type>$init` to run it,
+            // and only a constant-foldable initializer crosses as `valueText` —
+            // so the field would be left at its §7.9 default with no diagnostic
+            // at any severity. For an `owned` / non-nullable reference field
+            // that default is the null watermark, which §22.13 itself calls out
+            // as raising NullReferenceException in checked-disposal mode and
+            // being undefined behaviour to use unchecked. §2.8.2 governs the
+            // outcome: "An implementation unable to carry some body shape in its
+            // interface format must reject the export, or the import, with a
+            // diagnostic naming the shape; it must not alter the instantiation's
+            // semantics." Name the shape here, at the construction site that
+            // would have observed the wrong value — so a module that imports
+            // such a generic without ever constructing it still builds. The
+            // guard is category-BLIND: it asks whether a value actually reached
+            // the slot, not which initializer shapes are foldable.
+            // `idxIt != end()` is required as well: a member with no slot in
+            // THIS struct is not one this walk is responsible for, and
+            // complaining about it would be a false reject.
+            if (!replayed && idxIt != fieldIndex_.end()) {
+                if (const std::string* initText =
+                        ctx_.importedInstanceFieldInitText(m)) {
+                    const sema::TypeSymbol* owner =
+                        dynamic_cast<const sema::MemberSymbol*>(m)
+                            ? dynamic_cast<const sema::MemberSymbol*>(m)->parent
+                            : nullptr;
+                    ctx_.diagnostics().report(
+                        Severity::Error, importedFieldInitDiagLoc_,
+                        "constructing imported generic `" +
+                            std::string(owner ? owner->name : t->name) +
+                            "<...>` cannot run the initializer of its field `" +
+                            std::string(m->name) + "` (`:= " + *initText +
+                            "`): a generic exports no per-type initializer "
+                            "function, so only a compile-time-constant "
+                            "initializer crosses the module boundary and this "
+                            "one does not. Per \xC2\xA7""2.8.2 this construction "
+                            "is rejected rather than silently leaving the field "
+                            "at its \xC2\xA7""7.9 default (#2860)");
+                }
             }
             continue;
         }
@@ -8135,7 +8206,8 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             // an imported class. Try the imported no-ctor path first; it
             // returns false (no-op) for a LOCAL targetCls, falling through
             // to the original sequence unchanged.
-            if (!emitImportedBaseFieldInit(targetCls, currentThis_)) {
+            if (!emitImportedBaseFieldInit(targetCls, currentThis_,
+                                           cs ? cs->parent : nullptr)) {
                 emitImplicitBase(targetCls, currentThis_);
                 emitOwnFieldInit(targetCls, currentThis_,
                                  classStruct(targetCls));
@@ -8587,7 +8659,8 @@ void Emitter::inlineCtorBody(sema::ConstructorSymbol* cs, llvm::Value* obj) {
 // #662's own generic-import boundary; a generic import has no stable
 // per-instantiation `bz$<Type>$init` symbol to link against).
 bool Emitter::emitImportedBaseFieldInit(const sema::TypeSymbol* base,
-                                        llvm::Value* obj) {
+                                        llvm::Value* obj,
+                                        const sema::TypeSymbol* derived) {
     if (!ctx_.isImported(base) || hasAnyConstructor(base))
         return false;
     if (!base->genericParams.empty()) {
@@ -8598,6 +8671,37 @@ bool Emitter::emitImportedBaseFieldInit(const sema::TypeSymbol* base,
         // while emitInstanceInit builds the per-instantiation vtable.  Run
         // those two steps locally instead of falling through to a nonexistent
         // `bz$<Base>$init` reference.
+        //
+        // fix #2860 (§2.8.2 clause 2 / §14.1 / §22.8 step 2, v0.240): run that
+        // monomorphized sequence under the BASE INSTANTIATION's substitution.
+        // #2524 inherited whatever substitution happened to be active at the
+        // call, which is the base's own only when the derived class is itself
+        // generic AND spells the base's parameter names (`D<T>: B<T>` — the
+        // shape #2524's test pins). For a NON-generic derived class
+        // (`class D: B<string>`) the active substitution is EMPTY, so
+        // `classStruct(base)` below was the T→i32 PLACEHOLDER layout while the
+        // object `obj` was allocated with the instantiation's layout (#2840):
+        // every initializer store landed at the template's offset and the read
+        // — correct since #2840 — saw the §7.9 default. `computeAncestorGenericSubst`
+        // seeds from `recvTy->genericArgs` against the receiver's own parameter
+        // names, so a non-generic derived class is the 0 == 0 case and its base
+        // chain (including intermediate non-generic links) resolves; it returns
+        // false and leaves the substitution untouched whenever the chain cannot
+        // be resolved, so this cannot install a WRONG one — the generic-derived
+        // case above keeps exactly today's behaviour.
+        auto savedGenericSubst = genericSubst_;
+        auto savedGenericSema  = genericSubstSemaTy_;
+        if (derived && derived != base) {
+            sema::TypeRef synth;
+            synth.kind = sema::TypeRef::Kind::Named;
+            synth.declaration = const_cast<sema::TypeSymbol*>(derived);
+            std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+            std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+            if (computeAncestorGenericSubst(&synth, base, ancSubst, ancSema)) {
+                genericSubst_ = std::move(ancSubst);
+                genericSubstSemaTy_ = std::move(ancSema);
+            }
+        }
         llvm::StructType* bst = classStruct(base);
         llvm::Value* vtSlot = builder_.CreateStructGEP(bst, obj, 0, "b.vt.slot");
         llvm::Value* savedVt = builder_.CreateLoad(ptrTy(), vtSlot, "b.vt.save");
@@ -8605,6 +8709,8 @@ bool Emitter::emitImportedBaseFieldInit(const sema::TypeSymbol* base,
         emitImplicitBase(base, obj);
         emitOwnFieldInit(base, obj, bst);
         builder_.CreateStore(savedVt, vtSlot);
+        genericSubst_ = std::move(savedGenericSubst);
+        genericSubstSemaTy_ = std::move(savedGenericSema);
         return true;
     }
     // Route through `bz$<Base>$init` — the SAME entry point a *direct*
@@ -8711,7 +8817,7 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
         if (it != ctorFns_.end() && it->second->arg_size() == 1) {
             builder_.CreateCall(it->second, {obj});
         }
-    } else if (!emitImportedBaseFieldInit(b, obj)) {
+    } else if (!emitImportedBaseFieldInit(b, obj, cls)) {
         // fix #2452 (§22.8 step 1-2 / §2.5, v0.235): `b` may be an IMPORTED
         // no-explicit-ctor class — emitImportedBaseFieldInit (above) handles
         // that shape by running the base's OWN exported `bz$<Base>$init`

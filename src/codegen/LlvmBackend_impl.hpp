@@ -8250,8 +8250,23 @@ private:
     // installed. Returns true if it handled construction (caller should NOT
     // also call emitOwnFieldInit); false if `base` is not an eligible
     // imported no-ctor class (caller falls back to the local path).
+    // fix #2860 (§2.8.2 clause 2 / §14.1, v0.240): `derived` is the class whose
+    // construction reached `base` (the receiver of the base chain). For an
+    // imported GENERIC base it is what binds `base`'s type parameters to the
+    // instantiation's concrete arguments — see the definition.
     bool emitImportedBaseFieldInit(const sema::TypeSymbol* base,
-                                   llvm::Value* obj);
+                                   llvm::Value* obj,
+                                   const sema::TypeSymbol* derived);
+
+    // fix #2860 (§2.8.2, v0.240): the source location of the `new` expression
+    // whose construction sequence is currently being emitted, or `{}` outside
+    // one. Only consumer: emitOwnFieldInit's §2.8.2 "initializer did not cross
+    // the module boundary" diagnostic, which walks members of an IMPORTED
+    // generic and so has no AST node of its own to locate against. Set and
+    // cleared around the no-explicit-ctor construction sequence in lowerNew (the
+    // one that reaches an imported generic); every other emitOwnFieldInit caller
+    // leaves it `{}` and reports unlocated, exactly as before.
+    SourceLocation importedFieldInitDiagLoc_{};
 
     // CG16: if `s` is a leading constructor chain call (`base(...)` or
     // `this(...)` as an ExpressionStmt-of-CallExpr), return the call and
