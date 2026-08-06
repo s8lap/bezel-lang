@@ -259,17 +259,41 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         phi->addIncoming(valStr, valEnd);
         phi->addIncoming(nullStr, nullEnd);
         strPtr = phi;
-        // Note: releaseRender stays false here (it was `freeTransient` before
-        // #2875 — same reasoning).  The valStr may be a
-        // transient heap string (for numeric inner types) or a constant
-        // global (for bool/string).  Freeing a PHI result conditionally after
-        // the write requires a second hasValue check; the minor leak matches
-        // what the interpolation path accepts.  Tracking this is a follow-up
-        // to issue #421 for nullable arguments.
-        emitConsoleWrite(strPtr, isWriteLine, stdfd);
-        return true;
+        // fix #2880 / §8.5 / §28.9 (v0.240): DISCHARGE this render too. The old
+        // note here said releasing a PHI result "requires a second hasValue
+        // check"; since #2875 the discharge is `emitStringRelease`, which is
+        // rc-aware and sentinel-safe, so no second check is needed — one
+        // unconditional release covers both arms:
+        //   • the `null` arm is `lowerStringLiteral("null")`, whose rc is the
+        //     #422 sentinel — release is a NO-OP, not a free of a constant
+        //     global (the hazard the raw free() of the pre-#2875 code posed);
+        //   • the hasValue arm is `emitValueToString` on the NON-nullable inner
+        //     type, which #2066 records as "a fresh +1 producer" for every
+        //     value-typed rendering (`bz_int_to_string`, `bz_double_to_string`,
+        //     `bz_char_to_string`, `bz_decimal_to_string`, a nested record's
+        //     final concat) and a sentinel literal for the rest (`bool` →
+        //     "True"/"False", an enum without a user `ToString` → §8.5's type
+        //     name). Release is exactly-once on the first group, a no-op on the
+        //     second.
+        // The one shape #2066 calls a BORROW — `string`'s identity render
+        // (stdlib §9.6 `String.ToString`: "returns this") — cannot reach here:
+        // `isNullableValueTy` admits only nullable PRIMITIVE-value / enum /
+        // record / choice / value-builtin types, and `string?` is a nullable
+        // REFERENCE (a plain `ptr`, so both this branch's guards fail). Nor can
+        // a nullable CLASS or INTERFACE, so the callee-side unknown #2879
+        // records for an `Object`/class `ToString` is structurally out of reach
+        // of this branch. Verified by re-reading every source after the write.
+        //
+        // Falls through to the SHARED write+discharge tail instead of doing its
+        // own — one write site, one discharge site.
+        releaseRender = true;
     }
-    if (argTy) {
+    // `strPtr == arg` — i.e. no conversion has happened yet. The nullable-value
+    // branch above is the one path that leaves this block with a converted
+    // `strPtr`, and it must NOT be re-converted: `emitPrimitiveToString` on the
+    // raw `{i8; T}` struct is exactly the #581/#583 crash/misprint that branch
+    // exists to prevent.
+    if (argTy && strPtr == arg) {
         if (argTy->kind == sema::TypeRef::Kind::Primitive &&
             argTy->primitive != sema::PrimitiveType::String) {
             strPtr = emitPrimitiveToString(arg, argTy->primitive);
