@@ -6856,6 +6856,217 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                     const sema::TypeRef* recvTy = ctx_.exprType(*ma->target);
                     using K = sema::TypeRef::Kind;
                     using P = sema::PrimitiveType;
+                    // Reaching here means the whole `if (!ms)` dispatch chain
+                    // above — every hand-written receiver arm, every builtin
+                    // family, the vtable slots, the structural collection
+                    // dispatch — declined to lower this member call. Nothing
+                    // was emitted; the caller will substitute a zero.
+                    auto receiverName = [&]() -> std::string {
+                        if (!recvTy) return "<unknown>";
+                        if (recvTy->kind == K::Primitive &&
+                            recvTy->astNode && recvTy->astNode->name &&
+                            !recvTy->astNode->name->parts.empty())
+                            return std::string(
+                                recvTy->astNode->name->parts.back());
+                        if (recvTy->declaration)
+                            return std::string(recvTy->declaration->name);
+                        return std::string(recvTy->headName());
+                    };
+                    // fix #2922 (language spec §8.1/§8.5/§8.3, v0.240): the
+                    // §8.1 universal-Object instance surface, on ANY receiver
+                    // whose lowering does not exist, is an ERROR here — not a
+                    // degrade.
+                    //
+                    // §8.1 declares `Object` with `Equals`, `GetHashCode` and
+                    // `ToString` as virtual instance members and states
+                    // verbatim: "`Object` is the universal root. Every type
+                    // derives from it". §8.5 then fixes the default ToString
+                    // ("For classes: the type's qualified name"). So a call to
+                    // one of those three names is NEVER an "unknown member" a
+                    // permissive rule may shrug at (the §3/#605 story the
+                    // Shape-1 branch below serves): the member is guaranteed to
+                    // exist on every receiver, and reaching this fallthrough
+                    // means only that THIS COMPILER has no lowering for it.
+                    // Substituting a zero for such a call is silently unsafe —
+                    // #2922 measured a null `string` from a degraded
+                    // `ToString()` whose `.Length` read then faulted at address
+                    // 0x8 (ASan: "address points to the zero page"), a constant
+                    // 0 from every `GetHashCode()`, and an `i32` value where
+                    // the language type is `bool` from `Equals`.
+                    //
+                    // ⚠ The gate is on the MEMBER — and it has to be, for a
+                    // second, independent reason found while measuring a
+                    // WIDER version of this check against the lit corpus.
+                    // `lowerCallExpr` returning nullptr is OVERLOADED: it
+                    // means "no arm lowered this" AND "an arm lowered it and
+                    // the result is unit". `tryLowerChannelAndDomainCall` is
+                    // reached from `if (auto* v = …(call)) return v;` a few
+                    // thousand lines up, so its `Send` arm emits a real
+                    // `bz_channel_sender_send` call and then `return nullptr`
+                    // — and execution CONTINUES here. A receiver-keyed check
+                    // ("any unlowered member on a built-in") therefore
+                    // false-rejected five green lit programs (`sender.Send(42)`
+                    // and `scope.Spawn(…)`) that work perfectly — filed as
+                    // #2963, since retiring that ambiguity is what would let
+                    // this whole fallthrough become a located error. §8.1 gives
+                    // `Equals`/`GetHashCode`/`ToString` the return types
+                    // `bool`/`int`/`string`; NONE is unit, so for these three
+                    // names — and only for them — a null return is
+                    // unambiguously "nothing lowered". That is what makes this
+                    // check sound where the general one is not.
+                    //
+                    // The gate is a closed, normative member set fixed by
+                    // §8.1's own declaration — never a RECEIVER list.
+                    // That is deliberate and is the whole point of this fix:
+                    // #2457's loud "not yet implemented" guard was landed as a
+                    // slice-by-slice POSITIVE LIST of receiver names, and every
+                    // receiver no slice had reached got the silent-unsafe
+                    // degrade instead of the loud reject — the same missing
+                    // feature, safe for the listed types and memory-unsafe for
+                    // the rest. A receiver-keyed condition here would recreate
+                    // exactly that gap for the next builtin added. Gating on
+                    // "this is an §8.1 member and nothing lowered it" is
+                    // receiver-independent by construction, so a future type
+                    // starts out loud and can be made to WORK at its own pace
+                    // (#2457's remaining slices) without ever passing through a
+                    // silently-unsafe intermediate state.
+                    //
+                    // The message is #2465's established wording verbatim, so
+                    // the sliced receivers that already reject in sema and the
+                    // ones that now reject here read identically.
+                    //
+                    // GetType is excluded: §8.2/#487 gives it its own, more
+                    // accurate deferral error in sema, which always fires and
+                    // therefore makes `hasErrors()` true before codegen runs.
+                    // ReferenceEquals is excluded: §8.1 declares it `static`,
+                    // so it is not an instance-call shape at all. Dispose is
+                    // excluded: §8.7 says outright it is NOT on `Object`, and
+                    // its unit-typed lowering legitimately returns nullptr from
+                    // the arms above (which return early, before this point).
+                    //
+                    // FALSE-REJECT ANALYSIS. #2434's own comment
+                    // (LlvmBackend_Setup.cpp, the zero-init fallback) records
+                    // the empirical corpus check that made THAT site a Warning:
+                    // six lit programs legitimately reach the degrade, under
+                    // §3/#605 permissive typing and §14.1/§14.2's `new T()`.
+                    // Of those six, exactly one names an §8.1 member —
+                    // tests/lit/sema/method_constraint_callsite_746__object_
+                    // members_on_unconstrained_t_accepted_1078.bzl, which calls
+                    // `x.ToString()`/`x.GetHashCode()` on an unconstrained `T`
+                    // in a generic method that is never instantiated, i.e. the
+                    // DEAD template body. `emittingGenericTemplateBody_`
+                    // excludes it (the same guard Shape 2 below already relies
+                    // on): in the dead template no substitution exists, the
+                    // body is never called, and the §14.2 promise is about the
+                    // LIVE specializations — where `T` is concrete and the
+                    // ordinary primitive/class/vtable ToString paths above
+                    // lower the call before it can reach here. The other five
+                    // use non-Object member names (`o.Anything()`,
+                    // `s.SomethingNotDeclared()`, `new T()`) and are untouched.
+                    if (!emittingGenericTemplateBody_) {
+                        const auto& um = ma->member;
+                        bool isObjectContractMember =
+                            um == "ToString" || um == "Equals" ||
+                            um == "GetHashCode";
+                        // ⚠ THE RECEIVER MUST BE A DECLARATION-LESS NAMED
+                        // BUILT-IN — the population #2922 actually measured,
+                        // and the ONLY one for which reaching this point says
+                        // anything at all about the MEMBER.
+                        //
+                        // This narrowing was forced by a false reject an
+                        // earlier, member-only version of this gate caused
+                        // (`sema_this_indexer_typing_2795`, bisected to it by
+                        // the integration gate), and the mechanism is worth
+                        // stating because that version had it exactly
+                        // backwards. Every OTHER receiver kind HAS a real §8.1
+                        // dispatch path, and each of those paths asks for the
+                        // RECEIVER'S value first:
+                        //
+                        //   Primitive          CG27c (LlvmBackend_Exprs.cpp):
+                        //                      `recv = lowerExpr(*ma->target);
+                        //                       if (recv) return
+                        //                       emitPrimitiveToString(...)`
+                        //   class / interface / `Object` / the built-in
+                        //                      exception family: the
+                        //                      `isNamedClassRecv || …` arm a
+                        //                      few dozen lines up — same
+                        //                      shape, `lowerExpr` and then
+                        //                      `lowerObjectToString`
+                        //   Array/Stack/Queue/DrainedEntry: return an §8.5
+                        //                      literal and never reach here
+                        //   Unit               #2915 boxes it; §8.5 gives "()"
+                        //   InlineArray        tryLowerInlineArrayCall's §8.5
+                        //                      "[3]int"-style literal
+                        //
+                        // So for all of those, arriving here means the RECEIVER
+                        // failed to lower, and NOTHING follows about the
+                        // member. MEASURED, on a 2x2x6 grid (enclosing class
+                        // generic or not x expression or block body x six
+                        // receiver spellings): a `Primitive(int)` receiver and
+                        // a plain user class `R` receiver each reached this
+                        // gate — through `this[i]` inside a GENERIC class's
+                        // EXPRESSION body, a composition where every
+                        // single-axis relaxation compiles — and were told their
+                        // perfectly working `ToString` "is not yet
+                        // implemented". That is this file's own #2963 hazard
+                        // one level up: inferring "no lowering exists for M on
+                        // R" from "this call site did not lower HERE".
+                        //
+                        // A declaration-less Named built-in is different in
+                        // KIND, not degree: no TypeSymbol and no vtable, so
+                        // there is no thunk for `lowerObjectToString` to
+                        // dispatch through and no `emitPrimitiveToString` to
+                        // call — which is precisely why #2457 exists. For that
+                        // receiver alone, "every arm declined" IS "this
+                        // compiler has no lowering for this member here", and
+                        // the sentence below is true. The 20x4 receiver matrix
+                        // is byte-identical before and after this narrowing, so
+                        // it costs no true positive.
+                        bool isDeclLessNamedBuiltinRecv =
+                            recvTy && recvTy->kind == K::Named &&
+                            !recvTy->declaration;
+                        if (isObjectContractMember &&
+                                isDeclLessNamedBuiltinRecv) {
+                            // #2874's rule: locate the diagnostic on EVERY
+                            // path. A body re-lowered from a RECONSTRUCTED AST
+                            // carries no spans (`line == 0`, which renders as a
+                            // useless `file:0:0` — the shape the false reject
+                            // above surfaced with), so fall back through the
+                            // callee and then the receiver, exactly as sema's
+                            // own degenerate-span handling does.
+                            SourceLocation at = call.span.begin;
+                            if (at.line == 0) at = ma->span.begin;
+                            if (at.line == 0 && ma->target)
+                                at = ma->target->span.begin;
+                            ctx_.diagnostics().report(
+                                Severity::Error, at,
+                                "member `" + std::string(um) + "` on `" +
+                                receiverName() +
+                                "` is declared via the universal Object "
+                                "contract (language spec \xC2\xA7""8.1) but is "
+                                "not yet implemented by this compiler for this "
+                                "receiver (tracked #2457)");
+                            return nullptr;
+                        }
+                        // ⚠ NOT extended to a receiver with NO inferred
+                        // type, though the identical hazard is there and was
+                        // measured for this fix: `var h := a.GetHashCode();`
+                        // leaves `h` untyped — for EVERY class receiver, a
+                        // plain user class included, not only the built-ins —
+                        // and the following `h.ToString()` then has its whole
+                        // enclosing statement silently DROPPED
+                        // (`Console.WriteLine(h.ToString())` emitted zero bytes
+                        // and zero diagnostics, while the surrounding
+                        // `Console.WriteLine("A")` printed normally). Rejecting
+                        // that here was tried and reverted: it is a DIFFERENT
+                        // defect — sema never types `GetHashCode()`'s result,
+                        // although §8.1 declares it `GetHashCode(): int` — and
+                        // its right close is to TYPE the call, not to reject
+                        // every program that reads the result. Filed as #2964
+                        // with the repro rather than folded in here, where it
+                        // would make #2922's fix reject programs that have
+                        // nothing to do with #2922.
+                    }
                     // Shape 1: receiver is a concrete type whose declared
                     // member set is known to the type system (Named +
                     // declaration, or a primitive) — the silent-zero
@@ -6891,17 +7102,10 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             recvTy->astNode->name->parts.back());
                     if (isConcreteType ? !isUniversalObjMember
                                         : isBareTypeParamInDeadTemplate) {
-                        std::string recvName;
-                        if (recvTy->kind == K::Primitive &&
-                            recvTy->astNode && recvTy->astNode->name &&
-                            !recvTy->astNode->name->parts.empty()) {
-                            recvName = std::string(
-                                recvTy->astNode->name->parts.back());
-                        } else if (recvTy->declaration) {
-                            recvName = recvTy->declaration->name;
-                        } else {
-                            recvName = std::string(recvTy->headName());
-                        }
+                        // Same derivation the §8.1 reject above uses — one
+                        // `receiverName` lambda, not two copies (#2924's
+                        // four-way-mirror finding).
+                        std::string recvName = receiverName();
                         ctx_.diagnostics().report(
                             Severity::Warning, call.span.begin,
                             "internal: codegen cannot dispatch member '" +
