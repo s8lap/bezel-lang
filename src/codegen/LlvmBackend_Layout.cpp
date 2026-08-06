@@ -81,12 +81,19 @@ bool Emitter::isCharTargetExpr(const ast::Expr& e) {
     // §6.6/§5.2 (#1961): the compound/increment write-back applies the §5.2
     // code-point narrowing only for a `char` target. Resolve a T-typed target
     // through the active substitution first (a generic body specialized on
-    // T = char), mirroring isUnsignedTargetExpr. A `char?` target does not
-    // reach the built-in emitCompoundOp path (it is a nullable-value struct),
-    // so only the non-nullable primitive is treated as char here.
+    // T = char), mirroring isUnsignedTargetExpr.
+    //
+    // §7.11 (#2888): `char?` is included. The pre-#2888 `!rt->nullable` clause
+    // was correct only while a `char?` LHS never reached emitCompoundOp — the
+    // open-coded #1964 lifting in lowerStmt computed its own `isCharU` from the
+    // target TypeRef and passed it down. emitCompoundOp now owns the lifting,
+    // unwraps the `{i8, i32}` payload BEFORE its char arm and passes this flag
+    // through, so excluding `char?` here would drop §5.2's code-point check on
+    // the both-present branch — a silently invalid `char`, which is the
+    // type-invariant violation #1961 exists to prevent. This predicate's ONLY
+    // consumers are emitCompoundOp's `charTarget` argument.
     const sema::TypeRef* rt = resolveTypeParamRef(ctx_.exprType(e));
-    return rt && !rt->nullable &&
-           rt->kind == sema::TypeRef::Kind::Primitive &&
+    return rt && rt->kind == sema::TypeRef::Kind::Primitive &&
            rt->primitive == sema::PrimitiveType::Char;
 }
 
@@ -144,9 +151,126 @@ llvm::Value* Emitter::lvalueAddr(const ast::Expr& target, llvm::Type*& elemTy) {
 }
 
 
+llvm::Value* Emitter::emitImplicitOne(llvm::Type* t) {
+    if (!t) return nullptr;
+    if (t->isFloatingPointTy()) return llvm::ConstantFP::get(t, 1.0);
+    // §6.4: `decimal` is a STRUCT-typed primitive — `ConstantInt::get` does not
+    // build a constant of that type at all.
+    if (t == decimalStructType()) return emitDecimalOne();
+    if (t->isIntegerTy()) return llvm::ConstantInt::get(t, 1);
+    // §7.11 (#2888): for a nullable value LHS the implicit `1` is the BARE
+    // payload `1`, not a wrapped `T?`. §7.11, verbatim: "A mixed expression in
+    // which one operand is `T?` and the other is the non-nullable `T` lifts as
+    // well — the non-nullable operand is treated as present (never `null`)" —
+    // which is exactly how emitCompoundOp's lifting arm reads a non-tagged
+    // right operand. (`n++` on a `null` `int?` therefore stays `null`, per
+    // §17.6's identification of `x++` with `x := x + 1`.)
+    if (llvm::Type* pay = nullableValuePayloadTy(t)) return emitImplicitOne(pay);
+    return nullptr;
+}
+
+
 llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
                             llvm::Value* r, bool fp, bool uns, bool charTarget,
                             bool rUns) {
+    // §7.11 (#2888): a nullable VALUE left operand. It must be tested FIRST —
+    // ahead of the char arm, which would otherwise hand the whole tagged struct
+    // to emitCharRangeCheck, and ahead of the integer tail, which handed it to
+    // `llvm.sadd.with.overflow` (an IR-verifier abort:
+    // "Call parameter type does not match function signature! … { i8, i32 }").
+    //
+    // §7.11, verbatim (the document's inline section links rendered as bare
+    // `§N`): "A lifted binary operator produces `null` if *either* operand is
+    // `null`", and "The runtime checks each operator already performs —
+    // `OverflowException` on integer overflow (§6.1), `DivideByZeroException`
+    // on integer or `decimal` division/`mod` by zero (§6.1) — apply only when
+    // both operands are present (non-null); when the lifted result is `null` by
+    // reason of a null operand, no underlying operation runs and no check
+    // fires." That is a CONTROL-FLOW construct: a
+    // hasValue-guarded branch whose present arm runs the ordinary checked
+    // operation on the unwrapped payloads and rewraps, joined by a PHI with a
+    // `null` incoming from the guard.
+    //
+    // THE ARM LIVES HERE, in the one function every compound/increment lowering
+    // funnels through, rather than at the callers (#2888). It was open-coded in
+    // exactly ONE of them — lowerStmt's `#1964` AssignmentStmt block — so every
+    // ACCESSOR-mediated and COLLECTION spelling was a live defect: `b.NP += 3`
+    // (lowerPropertyCompound), `b[0] += 4` (lowerIndexerCompoundCore),
+    // `iface.P += 5.0` (the #481 arm of lowerStmt), the imported-property path
+    // (lowerImportedPropertyCompoundCore) and `arr[0] += 3` / `dict[k] += 4`
+    // (lowerCollectionIndexerCompound) all aborted the compile on malformed IR.
+    // Putting it in the callers would have made SIX copies of one rule; #2883
+    // had just made the same call for the `decimal` arm below.
+    //
+    // §7.11's "A mixed expression in which one operand is `T?` and the other is
+    // the non-nullable `T` lifts as well — the non-nullable operand is treated
+    // as present (never `null`)": a right operand that is not itself tagged
+    // contributes a constant-true tag. For a `decimal?` LHS "is the RHS tagged"
+    // cannot be "is it a struct", because the bare `decimal` payload is ALSO a
+    // struct — it is "a struct that is not the bare `%bz.decimal`" (#2149),
+    // which covers both a `decimal?` RHS and a nullable-INT RHS.
+    if (llvm::Type* payTy = nullableValuePayloadTy(l->getType())) {
+        llvm::Type* nty = l->getType();
+        const bool decimalPayload = (payTy == decimalStructType());
+        llvm::Value* lTag = nullablePrimHasValue(l);   // i1
+        llvm::Value* lPay = nullablePrimValue(l);      // payTy
+        const bool rNullable =
+            decimalPayload ? (r->getType()->isStructTy() &&
+                              r->getType() != decimalStructType())
+                           : r->getType()->isStructTy();
+        llvm::Value* rTag = rNullable ? nullablePrimHasValue(r)
+                                      : builder_.getTrue();
+        llvm::Value* rPay = rNullable ? nullablePrimValue(r) : r;
+        llvm::Value* both = builder_.CreateAnd(lTag, rTag, "ncmp.both");
+        auto* entryBB = builder_.GetInsertBlock();
+        auto* opBB = llvm::BasicBlock::Create(llvm_, "ncmp.op", currentFn_);
+        auto* endBB = llvm::BasicBlock::Create(llvm_, "ncmp.end", currentFn_);
+        builder_.CreateCondBr(both, opBB, endBB);
+        // --- opBB: BOTH present → the ordinary checked operation on payloads.
+        builder_.SetInsertPoint(opBB);
+        llvm::Value* pay = nullptr;
+        if (decimalPayload) {
+            // §6.4/§5.1 (#2141): an integer RHS (`d += 5`, or the unwrapped
+            // payload of an `int?` RHS — #2149) §5.1-converts to `decimal`; a
+            // decimal RHS is used as-is. §6.2 admits no decimal/binary-float
+            // mixing, so sema has already rejected anything else.
+            rPay = coerceNumericToType(rPay, decimalStructType(), rUns);
+            if (rPay->getType() == decimalStructType())
+                pay = emitDecimalArith(op, lPay, rPay);
+        } else {
+            // §5.1 widening of the RHS payload to the LHS payload width
+            // (int→i64, int→double, float→double). Integer same-width and
+            // narrowing cases are handled by the recursion itself, exactly as
+            // on the non-nullable path.
+            rPay = coerceNumericToType(rPay, payTy, rUns);
+            pay = emitCompoundOp(op, lPay, rPay, payTy->isFloatingPointTy(),
+                                 uns, charTarget, rUns);
+        }
+        // The payload op may have spun off guard-throw blocks (§6.1 overflow,
+        // §5.2 char range, §6.1 divide-by-zero), so the PHI's predecessor is
+        // the CURRENT block, not opBB.
+        llvm::Value* wrapped = nullptr;
+        if (pay) {
+            wrapped = builder_.CreateInsertValue(
+                llvm::UndefValue::get(nty),
+                llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+            wrapped = builder_.CreateInsertValue(wrapped, pay, {1u});
+        }
+        auto* opEndBB = builder_.GetInsertBlock();
+        builder_.CreateBr(endBB);
+        builder_.SetInsertPoint(endBB);
+        // A payload the underlying op cannot lower DECLINES (the caller reports
+        // its own "could not lower the RHS/operator" diagnostic). Returning a
+        // PHI whose present arm is `null` would be a SILENT wrong value — the
+        // program would store `null` where §7.11 defines a value.
+        if (!pay) return nullptr;
+        llvm::PHINode* res = builder_.CreatePHI(nty, 2, "ncmp.res");
+        res->addIncoming(wrapped, opEndBB);
+        // Null-by-null-operand: the lifted result is `null`, and no underlying
+        // operation ran on this edge.
+        res->addIncoming(llvm::ConstantAggregateZero::get(nty), entryBB);
+        return res;
+    }
     // §6.6/§5.2 (#1961): a `char` LHS compound assignment/increment desugars to
     // `c := char(c OP e)` — the arithmetic runs at int width with the §6.1/§6.2
     // checked posture (as for any integer), and the result is narrowed back to

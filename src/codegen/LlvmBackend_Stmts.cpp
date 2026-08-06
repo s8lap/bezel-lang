@@ -58,32 +58,22 @@ bool Emitter::lowerVirtualPropertyIncrDecr(const ast::IncrementStmt& inc) {
 
     llvm::Value* cur = lowerExpr(*inc.target);   // the dispatched getter
     if (!cur) return false;
-    // §17.6's implicit `1`, synthesized at the getter's result type. Gated on
-    // the LOWERED type, not a source category: any non-numeric lowering (a
-    // `string` property, say) declines rather than emitting a malformed
-    // constant — `ConstantInt::get` ASSERTS on a non-integer type.
+    // §17.6's implicit `1`, synthesized at the getter's result type by the ONE
+    // definition of that rule (#2888). Gated on the LOWERED type, not a source
+    // category: a type with no `1` (a `string` property, say) declines rather
+    // than emitting a malformed constant. The `decimal` special case this
+    // function used to open-code is gone — emitCompoundOp owns the §6.4 arm
+    // (#2883), so `d.P++` and `nullable.P++` take the same call as every other
+    // numeric type.
     llvm::Type* t = cur->getType();
     const std::string binOp = inc.op == "++" ? "+" : "-";
     const bool fp = t->isFloatingPointTy();
-    llvm::Value* res = nullptr;
-    if (t == decimalStructType()) {
-        // §6.4: `decimal` is a struct-typed primitive. `emitCompoundOp` would
-        // feed it to the integer overflow intrinsic and emit IR that fails
-        // verification ("Intrinsic has incorrect return type ...
-        // llvm.sadd.with.overflow.s_bz.decimals" — measured); the decimal
-        // arithmetic helper is what this same statement handler's `lvalueAddr`
-        // path already uses for `d++` on a decimal LOCAL.
-        res = emitDecimalArith(binOp, cur, emitDecimalOne());
-    } else {
-        llvm::Value* one = nullptr;
-        if (fp) one = llvm::ConstantFP::get(t, 1.0);
-        else if (t->isIntegerTy()) one = llvm::ConstantInt::get(t, 1);
-        if (!one) return false;
-        res = emitCompoundOp(
-            binOp, cur, one, fp,
-            isUnsignedTargetExpr(*inc.target),
-            isCharTargetExpr(*inc.target));    // §6.6/§5.2 #1961
-    }
+    llvm::Value* one = emitImplicitOne(t);
+    if (!one) return false;
+    llvm::Value* res = emitCompoundOp(
+        binOp, cur, one, fp,
+        isUnsignedTargetExpr(*inc.target),
+        isCharTargetExpr(*inc.target));    // §6.6/§5.2 #1961
     if (!res) return false;
     // valueIsPlusOne mirrors the AssignmentStmt compound arm's #2586 call: the
     // operation's RESULT has no source AST node, so the setter cannot recognise
@@ -1092,137 +1082,22 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     }
                     return false;
                 }
-                // §7.11 / §6.6 (#1964): a nullable-VALUE compound assignment
-                // `n OP= e` where n has a nullable value type (`int?`, `char?`,
-                // `long?`, `double?`, …). The target slot is the tagged
-                // `{i8 hasValue; T}` struct, which the built-in emitCompoundOp
-                // path below CANNOT consume — feeding the struct to
-                // `llvm.*add.with.overflow` emits malformed IR
-                // (`llvm.sadd.with.overflow.sl_i8i32s`, an IR-verify abort).
-                // Lift per §7.11: the desugared `n := n OP e` yields `null` when
-                // EITHER operand is `null` (no underlying op and none of its
-                // §6.1 overflow / §5.2 char / §6.1 div-zero checks run), and
-                // otherwise applies the SAME checked arithmetic + narrow-integer
-                // / char §5.2 write-back as the non-nullable path (emitCompoundOp
-                // on the unwrapped payloads), rewrapped into `T?`. §7.11 (#2141):
-                // `decimal?`, whose payload is the %bz.decimal struct rather than
-                // an int/FP scalar, lifts the SAME way — routed through the §6.4
-                // decimal intrinsic (emitDecimalArith) on the unwrapped payloads
-                // instead of the scalar emitCompoundOp; §7.11 names decimal
-                // DivideByZeroException explicitly, and that guard runs only on
-                // the both-present branch. Without this the `{i8; %bz.decimal}`
-                // struct fell to emitCompoundOp and aborted on malformed IR
-                // (`llvm.sadd.with.overflow.sl_i8s_bz.decimalss`).
-                if (auto* nst = llvm::dyn_cast<llvm::StructType>(elemTy)) {
-                    const sema::TypeRef* ntgt = ctx_.exprType(*as->target);
-                    bool decimalPayload =
-                        nst->getNumElements() == 2 &&
-                        nst->getElementType(0) == nullablePrimHasValTy() &&
-                        nst->getElementType(1) == decimalStructType();
-                    if (nst->getNumElements() == 2 &&
-                        nst->getElementType(0) == nullablePrimHasValTy() &&
-                        (nst->getElementType(1)->isIntegerTy() ||
-                         nst->getElementType(1)->isFloatingPointTy() ||
-                         decimalPayload) &&
-                        ntgt && ntgt->nullable) {
-                        llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
-                        // Operand tags/payloads. A nullable RHS carries its own
-                        // hasValue tag (`d += otherNullable`); a non-nullable RHS
-                        // (`d += 2.0m`, `c += 1`, or a wrapped literal) is present
-                        // always. For a scalar payload a struct-typed RHS is the
-                        // nullable form; for a `decimal?` payload the bare
-                        // %bz.decimal is ALSO a struct, so nullability cannot be
-                        // "is a struct" — it is "is a struct that is NOT the bare
-                        // %bz.decimal" (#2149). That covers both a `decimal?` RHS
-                        // (`{i8; %bz.decimal}`, != decimalStructType()) AND a
-                        // nullable-INT RHS (`decimal? += int?`, `{i8; i32}`): both
-                        // must have their payload unwrapped (and, for the int, be
-                        // §5.1-coerced to decimal below). The pre-#2149 `== elemTy`
-                        // test matched only a `decimal?` RHS, so a nullable-int RHS
-                        // was treated always-present and its whole `{i8; i32}`
-                        // struct flowed to coerceNumericToType (whose int→decimal
-                        // branch requires an INTEGER source, so it fell through
-                        // unchanged) and then emitDecimalArith — a silent miscompile
-                        // (the struct's bits reinterpreted as a decimal).
-                        llvm::Value* lTag = nullablePrimHasValue(cur);      // i1
-                        llvm::Value* lPay = nullablePrimValue(cur);         // T
-                        bool rNullable = decimalPayload
-                            ? (rhs->getType()->isStructTy() &&
-                               rhs->getType() != decimalStructType())
-                            : rhs->getType()->isStructTy();
-                        llvm::Value* rTag = rNullable
-                            ? nullablePrimHasValue(rhs) : builder_.getTrue();
-                        llvm::Value* rPay = rNullable
-                            ? nullablePrimValue(rhs) : rhs;
-                        llvm::Value* both =
-                            builder_.CreateAnd(lTag, rTag, "ncmp.both");
-                        auto* entryBB = builder_.GetInsertBlock();
-                        auto* opBB =
-                            llvm::BasicBlock::Create(llvm_, "ncmp.op", currentFn_);
-                        auto* endBB =
-                            llvm::BasicBlock::Create(llvm_, "ncmp.end", currentFn_);
-                        builder_.CreateCondBr(both, opBB, endBB);
-                        // --- opBB: both present → run the checked op on payloads.
-                        builder_.SetInsertPoint(opBB);
-                        llvm::Value* pay = nullptr;
-                        if (decimalPayload) {
-                            // §6.4 / §5.1 (#2141): an integer RHS (`d += 5`, or
-                            // the unwrapped payload of an `int?`/`long?` RHS —
-                            // #2149) §5.1-converts to `decimal`; a decimal RHS
-                            // (bare `decimal` or the unwrapped `decimal?` payload)
-                            // is used as-is (a `double`/`float` RHS is a §6.2
-                            // compile error, rejected in sema). Route through the
-                            // §6.4 decimal intrinsic — its div/mod §7.11
-                            // DivideByZeroException guard runs on this present
-                            // branch only.
-                            rPay = coerceNumericToType(
-                                rPay, decimalStructType(),
-                                isUnsignedTargetExpr(*as->value));
-                            pay = emitDecimalArith(op, lPay, rPay);
-                        } else {
-                            bool isCharU =
-                                ntgt->kind == sema::TypeRef::Kind::Primitive &&
-                                ntgt->primitive == sema::PrimitiveType::Char;
-                            // §5.1 widening of the RHS payload to the LHS payload
-                            // width (int→i64, int→double, float→double). Integer
-                            // same-width and narrowing cases are handled inside
-                            // emitCompoundOp exactly as the non-nullable path.
-                            rPay = coerceNumericToType(
-                                rPay, nst->getElementType(1),
-                                isUnsignedTargetExpr(*as->value));
-                            pay = emitCompoundOp(
-                                op, lPay, rPay,
-                                lPay->getType()->isFloatingPointTy(),
-                                isUnsignedTargetExpr(*as->target), isCharU,
-                                isUnsignedTargetExpr(*as->value));  // #2140 rUns
-                        }
-                        llvm::Value* wrapped =
-                            llvm::ConstantAggregateZero::get(elemTy);
-                        if (pay) {
-                            wrapped = builder_.CreateInsertValue(
-                                llvm::UndefValue::get(elemTy),
-                                llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
-                                {0u});
-                            wrapped =
-                                builder_.CreateInsertValue(wrapped, pay, {1u});
-                        }
-                        // emitCompoundOp may have spun off guard-throw blocks, so
-                        // the current block (not opBB) is the PHI predecessor.
-                        auto* opEndBB = builder_.GetInsertBlock();
-                        builder_.CreateBr(endBB);
-                        builder_.SetInsertPoint(endBB);
-                        llvm::PHINode* res = builder_.CreatePHI(elemTy, 2,
-                                                               "ncmp.res");
-                        res->addIncoming(wrapped, opEndBB);
-                        // Null-by-null-operand path: the lifted result is `null`.
-                        res->addIncoming(
-                            llvm::ConstantAggregateZero::get(elemTy), entryBB);
-                        builder_.CreateStore(res, addr);
-                        if (llvm::AllocaInst* ns = localSlot(*as->target))
-                            syncCellToOrigSlot(ns, res);
-                        return false;
-                    }
-                }
+                // §7.11 / §6.6 (#1964/#2141/#2149): a nullable-VALUE compound
+                // assignment `n OP= e` (`int?`, `char?`, `long?`, `double?`,
+                // `decimal?`, …) LIFTS — the desugared `n := n OP e` yields
+                // `null` when EITHER operand is `null` (no underlying op and
+                // none of its §6.1 overflow / §5.2 char / §6.1 div-zero checks
+                // run), and otherwise applies the same checked arithmetic and
+                // §6.6 write-back to the unwrapped payloads, rewrapped as `T?`.
+                //
+                // fix #2888: that lifting used to be OPEN-CODED here, ~110
+                // lines, and this was the only place it existed — so the
+                // property, indexer, virtual-property, imported-property and
+                // heap-collection spellings of the SAME statement all fed the
+                // tagged struct to `llvm.sadd.with.overflow` and aborted the
+                // compile. It now lives inside emitCompoundOp, which every one
+                // of those callers already funnels through, so this site is the
+                // plain call below with nothing special about it.
                 // CG31: built-in numeric compound assignment — read,
                 // apply OP (overflow-checked like plain arithmetic),
                 // write back.
@@ -1397,17 +1272,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     }
                 } else {
                     // Built-in numeric increment/decrement.
+                    // §17.6/§7.11 (#2888): `one` comes from the ONE definition
+                    // of §17.6's implicit right operand. `ConstantInt::get` on
+                    // a nullable slot type (`{i8, i32}` for `n: int?`) is not a
+                    // constant of that type at all — in a no-assert build it is
+                    // an unchecked cast that fabricated a nonsense `i5 1` and
+                    // aborted the compile, so even the LOCAL `n++` on an `int?`
+                    // was an ICE while `n += 1` right beside it lifted fine.
                     bool fp = elemTy->isFloatingPointTy();
                     llvm::Value* cur = builder_.CreateLoad(elemTy, addr);
-                    llvm::Value* one =
-                        fp ? llvm::cast<llvm::Value>(
-                                 llvm::ConstantFP::get(elemTy, 1.0))
-                           : llvm::cast<llvm::Value>(
-                                 llvm::ConstantInt::get(elemTy, 1));
-                    llvm::Value* res = emitCompoundOp(
+                    llvm::Value* one = emitImplicitOne(elemTy);
+                    llvm::Value* res = one ? emitCompoundOp(
                         inc->op == "++" ? "+" : "-", cur, one, fp,
                         isUnsignedTargetExpr(*inc->target),
-                        isCharTargetExpr(*inc->target));  // §6.6/§5.2 #1961
+                        isCharTargetExpr(*inc->target))  // §6.6/§5.2 #1961
+                        : nullptr;
                     if (res) {
                         builder_.CreateStore(res, addr);
                         // §27.5 / #673: sync to original alloca.
@@ -1438,9 +1317,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     llvm::Value* cur = lowerExpr(*inc->target);  // getter read
                     if (cur) {
                         // §17.6's implicit `1`, synthesized at the getter's
-                        // result type. Gated on the LOWERED type, exactly as
-                        // lowerVirtualPropertyIncrDecr and
-                        // lowerIndexerCompoundCore's `lowerRhs` already gate it.
+                        // result type by the ONE definition of that rule
+                        // (#2888 — this was one of six hand-maintained copies).
                         // §6.4/#2883: `decimal` is a STRUCT-typed primitive, so
                         // `ConstantInt::get` on it does not build a constant of
                         // that type at all — it produced a nonsense `i33 1`
@@ -1448,17 +1326,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // compile ("Call parameter type does not match function
                         // signature! i33 1 … llvm.sadd.with.overflow.
                         // s_bz.decimals"), measured on `d.P++` for a block-form
-                        // `decimal` property. Its `1` comes from the decimal
-                        // helper, and emitCompoundOp's own #2883 decimal arm
-                        // does the arithmetic. A non-numeric lowering (a
-                        // `string` property, which sema rejects for `++`)
-                        // declines rather than materializing a bad constant.
+                        // `decimal` property. §7.11/#2888: a NULLABLE property
+                        // (`b.NP++` where `NP: int?`) hit the same hole from the
+                        // other side — `one` came out null, `res` came out null,
+                        // and the increment was SILENTLY DROPPED with no
+                        // diagnostic (measured 5 where 6 is correct). A type
+                        // with no `1` still declines rather than materializing a
+                        // bad constant.
                         llvm::Type* t = cur->getType();
                         bool fp = t->isFloatingPointTy();
-                        llvm::Value* one = nullptr;
-                        if (fp) one = llvm::ConstantFP::get(t, 1.0);
-                        else if (t == decimalStructType()) one = emitDecimalOne();
-                        else if (t->isIntegerTy()) one = llvm::ConstantInt::get(t, 1);
+                        llvm::Value* one = emitImplicitOne(t);
                         llvm::Value* res =
                             one ? emitCompoundOp(
                                       binOp, cur, one, fp,

@@ -2738,19 +2738,16 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
     // fix #2848: §17.6's right operand for the `++`/`--` spelling — the
     // implicit literal `1`, synthesized at the GETTER's result type (`cur`)
     // rather than lowered from an AST node, because the desugaring has none.
-    // `decimal` is a struct-typed primitive, so its `1` comes from the decimal
-    // helper, not ConstantInt (which would assert on a struct type — the
-    // pre-fix mirror's own latent crash on a decimal-element indexer). A type
-    // that is none of the three yields null, which declines the whole lowering
-    // rather than emitting a malformed constant.
+    // fix #2888: from the ONE definition of that rule (emitImplicitOne), which
+    // also covers a `decimal` element (a struct-typed primitive) and a NULLABLE
+    // element (`b[0]++` where the indexer yields `long?` — this copy returned
+    // null for it, and the whole lowering then declined with an internal
+    // "#1386" error on a legal program). A type with no `1` still yields null,
+    // which declines rather than emitting a malformed constant.
     auto lowerRhs = [&](llvm::Value* cur) -> llvm::Value* {
         if (valueExpr) return lowerExpr(*valueExpr);
         if (!cur) return nullptr;
-        llvm::Type* t = cur->getType();
-        if (t->isFloatingPointTy()) return llvm::ConstantFP::get(t, 1.0);
-        if (t == decimalStructType()) return emitDecimalOne();
-        if (t->isIntegerTy()) return llvm::ConstantInt::get(t, 1);
-        return nullptr;
+        return emitImplicitOne(cur->getType());
     };
     // §6.2/#2140's `rUns` (is the RIGHT operand unsigned?) — §17.6's implicit
     // `1` is a signed literal, so `false` for the `++`/`--` spelling, which is
@@ -3954,13 +3951,15 @@ bool Emitter::lowerCollectionIndexerIncrDecr(
         builder_.CreateCall(getFn, {recv, idx, getSlot, builder_.getInt64(esz)});
         llvm::Value* cur = builder_.CreateLoad(elemTy, getSlot, "cid.cur");
 
+        // §17.6's implicit `1` from the ONE definition of that rule (#2888):
+        // an `Array<int?>` / `Array<decimal>` element lowers to a STRUCT, and
+        // `ConstantInt::get` on a struct type is not a constant of that type.
         bool fp = cur->getType()->isFloatingPointTy();
-        llvm::Value* one = fp
-            ? llvm::cast<llvm::Value>(llvm::ConstantFP::get(cur->getType(), 1.0))
-            : llvm::cast<llvm::Value>(llvm::ConstantInt::get(cur->getType(), 1));
-        llvm::Value* newVal = emitCompoundOp(
+        llvm::Value* one = emitImplicitOne(cur->getType());
+        llvm::Value* newVal = one ? emitCompoundOp(
             binOp, cur, one, fp, isUnsignedTargetExpr(*inc.target),
-            isCharTargetExpr(*inc.target));  // §6.6/§5.2 #1961
+            isCharTargetExpr(*inc.target))  // §6.6/§5.2 #1961
+            : nullptr;
         if (!newVal) return false;
 
         llvm::AllocaInst* setSlot = entryAlloca(newVal->getType());
@@ -3993,13 +3992,14 @@ bool Emitter::lowerCollectionIndexerIncrDecr(
     // --- Dictionary<K,V> path: read, ±1, write via the helpers. ---
     llvm::Value* cur = lowerCollectionIndexerGet(*ix);
     if (!cur) return false;
+    // §17.6's implicit `1` from the ONE definition of that rule (#2888) — see
+    // the Array<T> branch above for why `ConstantInt::get` was wrong here.
     bool fp = cur->getType()->isFloatingPointTy();
-    llvm::Value* one = fp
-        ? llvm::cast<llvm::Value>(llvm::ConstantFP::get(cur->getType(), 1.0))
-        : llvm::cast<llvm::Value>(llvm::ConstantInt::get(cur->getType(), 1));
-    llvm::Value* newVal = emitCompoundOp(
+    llvm::Value* one = emitImplicitOne(cur->getType());
+    llvm::Value* newVal = one ? emitCompoundOp(
         binOp, cur, one, fp, isUnsignedTargetExpr(*inc.target),
-        isCharTargetExpr(*inc.target));  // §6.6/§5.2 #1961
+        isCharTargetExpr(*inc.target))  // §6.6/§5.2 #1961
+        : nullptr;
     if (!newVal) return false;
     return lowerCollectionIndexerSet(*ix, newVal, /*valueExpr=*/nullptr);
 }
@@ -6129,14 +6129,11 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
         rhs = lowerExpr(*valueExpr);
     } else {
         // §17.6's right operand for the `++`/`--` spelling, synthesized at the
-        // getter's result type because the desugaring has no AST node for it.
-        // `decimal` is a struct-typed primitive, so its `1` comes from the
-        // decimal helper — ConstantInt would assert on a struct type. Mirrors
-        // lowerIndexerCompoundCore's lowerRhs exactly.
-        llvm::Type* t = cur->getType();
-        if (t->isFloatingPointTy()) rhs = llvm::ConstantFP::get(t, 1.0);
-        else if (t == decimalStructType()) rhs = emitDecimalOne();
-        else if (t->isIntegerTy()) rhs = llvm::ConstantInt::get(t, 1);
+        // getter's result type because the desugaring has no AST node for it —
+        // from the ONE definition of that rule (#2888), which covers the
+        // struct-typed `decimal` and the tagged nullable-value shapes that
+        // `ConstantInt::get` cannot express.
+        rhs = emitImplicitOne(cur->getType());
     }
     if (!rhs) {
         // #1386/#2509 precedent: an ICE beats a silently dropped store.

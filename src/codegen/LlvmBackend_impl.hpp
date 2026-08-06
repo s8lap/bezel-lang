@@ -3318,11 +3318,15 @@ private:
     // CG31: is the assignment/increment target an unsigned-typed lvalue?
     bool isUnsignedTargetExpr(const ast::Expr& e);
 
-    // §6.6/§5.2 (#1961): is the compound-assignment/increment target a
-    // (non-nullable) `char` lvalue? A `char` LHS desugars `c OP= e` to
-    // `c := char(c OP e)`, so the write-back must apply the §5.2 code-point
-    // narrowing — emitCompoundOp cannot see the char-ness (char lowers to i32
-    // exactly like int/uint), so the caller supplies this flag.
+    // §6.6/§5.2 (#1961): is the compound-assignment/increment target a `char`
+    // lvalue? A `char` LHS desugars `c OP= e` to `c := char(c OP e)`, so the
+    // write-back must apply the §5.2 code-point narrowing — emitCompoundOp
+    // cannot see the char-ness (char lowers to i32 exactly like int/uint), so
+    // the caller supplies this flag.
+    // §7.11 (#2888): `char?` counts too. emitCompoundOp's nullable arm unwraps
+    // the `{i8, i32}` payload BEFORE the char arm sees it and passes this flag
+    // through, so the §5.2 write-back applies on the both-present branch — the
+    // same posture the open-coded #1964 lifting used to compute for itself.
     bool isCharTargetExpr(const ast::Expr& e);
 
     // CG31: the address (and element type) of an assignable target — a
@@ -3341,9 +3345,55 @@ private:
     // wider operand's. Defaults to the LHS signedness's role being sufficient
     // (callers whose RHS is never wider than the LHS — `++`/`--`, an already-
     // width-matched RHS — leave it), so existing call sites are unaffected.
+    // §7.11 (#2888): emitCompoundOp also owns the LIFTING of the operator over
+    // a nullable VALUE left operand (`int?`, `char?`, `double?`, `decimal?`,
+    // `DateTime?`, …). §7.11, verbatim: "A lifted binary operator produces
+    // `null` if *either* operand is `null`", and the runtime checks "apply only
+    // when both operands are present (non-null); when the lifted result is
+    // `null` by reason of a null operand, no underlying operation runs and no
+    // check fires." That is a CONTROL-FLOW construct (a hasValue-guarded branch
+    // with a PHI over the null arm), which is why it lives in the ONE function
+    // every compound/increment caller already funnels through rather than in a
+    // per-caller copy — see the arm's own comment in LlvmBackend_Layout.cpp.
     llvm::Value* emitCompoundOp(const std::string& op, llvm::Value* l,
                                 llvm::Value* r, bool fp, bool uns,
                                 bool charTarget = false, bool rUns = false);
+
+    // §7.2/§7.11 (#2888): the PAYLOAD type of the tagged `{i8 hasValue; T}`
+    // lowering of a nullable VALUE type, or null when `t` is not that shape.
+    //
+    // The test is on the LLVM shape, not a source category, because
+    // emitCompoundOp has only the lowered operands. It is exact: every nullable
+    // value type is built by `nullablePrimStructTy` / `nullableValueStructTy`
+    // with `StructType::get` — a LITERAL struct — while every class, record and
+    // choice is built with `StructType::create` and is therefore NAMED, and
+    // `decimal` itself is the named `%bz.decimal`. Restricting the payload to
+    // an integer / floating-point / `%bz.decimal` scalar is what emitCompoundOp
+    // and emitDecimalArith can actually operate on; a nullable record, choice
+    // or Guid payload (an aggregate) yields null and takes no lifted path.
+    llvm::Type* nullableValuePayloadTy(llvm::Type* t) {
+        auto* st = llvm::dyn_cast_or_null<llvm::StructType>(t);
+        if (!st || !st->isLiteral() || st->getNumElements() != 2) return nullptr;
+        if (st->getElementType(0) != nullablePrimHasValTy()) return nullptr;
+        llvm::Type* pay = st->getElementType(1);
+        if (pay->isIntegerTy() || pay->isFloatingPointTy() ||
+            pay == decimalStructType())
+            return pay;
+        return nullptr;
+    }
+
+    // §17.6 (#2888): the ONE definition of the implicit right operand of
+    // `x++` / `x--` — §17.6, verbatim: "For built-in numeric types, `x++` is
+    // equivalent to `x := x + 1` (and likewise `x--` to `x := x - 1`)". The
+    // desugaring has no AST node for that `1`, so every increment lowering
+    // synthesizes it at the read's own LLVM type; there were SIX hand-written
+    // copies of that rule and they had drifted apart (#2883 fixed `decimal` in
+    // three of them; the other three still called `ConstantInt::get` on a
+    // struct type, which in a no-assert build is an unchecked cast that
+    // fabricated a nonsense `i5 1` / `i37 1` constant and aborted the compile).
+    // Returns null for a type with no `1` — the caller must DECLINE rather than
+    // materialize a malformed constant.
+    llvm::Value* emitImplicitOne(llvm::Type* t);
 
     // §5.2 (#1961): apply the char code-point narrowing check to an integer
     // value — valid U+0000–U+10FFFF excluding the surrogate range
