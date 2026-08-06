@@ -2663,6 +2663,33 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
         phi->addIncoming(nullStr, nullEnd);
         return phi;
     }
+    // fix #2913 (spec §8.5 inline-array row / §18.5, v0.240): an INLINE ARRAY
+    // renders as its type's NAME. §8.5 is explicit, and explicit about why:
+    //
+    //   "For inline arrays (all forms, including move-only `[N owned]…` arrays,
+    //    whose receiver is borrowed for the call) and for the unit type: the
+    //    type's name — `"[3]int"`-style for an inline array … (element-listing
+    //    output is deliberately not synthesized — an inline array's elements may
+    //    be class-typed borrows whose formatting is not the container's
+    //    business)."
+    //
+    // #2804 gave the BOXED path this rendering, through the same
+    // `inlineArrayTypeSpelling` called here, so `o.ToString()` on an
+    // `Object`-typed inline array already answered `"[3]int"`. The UNBOXED
+    // interpolation path had no arm at all and fell through to the trailing
+    // empty-string fallback, so `$"{a}"` rendered the EMPTY STRING with no
+    // diagnostic — a silent wrong value, and one that disagreed with the boxed
+    // spelling of the very same value in the very same program.
+    //
+    // Deliberately the SAME function the box thunk uses rather than a second
+    // renderer: two spellings of one rule must not be able to drift, which is
+    // this run's recurring lesson. It is also why no `arrayOwned` special case
+    // is needed — §8.5 puts move-only arrays in the same row, and the spelling
+    // function already emits the `owned` marker.
+    if (fieldTy && fieldTy->kind == K::InlineArray) {
+        return lowerStringLiteral(
+            "\"" + inlineArrayTypeSpelling(fieldTy) + "\"", false);
+    }
     if (fieldTy && fieldTy->kind == K::Primitive) {
         // §9.1: strings are formatted by their own ToString — which for
         // string is identity (§9.6); the value is the bz_string itself.

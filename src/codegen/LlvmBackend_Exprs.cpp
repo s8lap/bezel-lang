@@ -421,6 +421,29 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             bn == "TimeOnly" || bn == "Guid")
                             pv = emitValueToString(ev, rt);
                     }
+                    // fix #2913 (spec §8.5 inline-array row / §18.5, v0.240):
+                    // an INLINE ARRAY interpolates as its type's NAME. Same
+                    // reason as the builtin value types just above — without
+                    // this it reaches the LLVM-type fallback below, matches no
+                    // integer/float width, and leaves `pv` null, which renders
+                    // as the EMPTY STRING with no diagnostic.
+                    //
+                    // MEASURED before: `$"[{a}]"` on `var a: [3]int` printed
+                    // `[]`, while `o.ToString()` on the SAME value boxed into
+                    // `Object` printed `[[3]int]` — two spellings of one §8.5
+                    // rule disagreeing inside one program. #2804 fixed the boxed
+                    // half; this is the unboxed half.
+                    //
+                    // Delegates to `emitValueToString` rather than rendering
+                    // here, so this path and the boxed one cannot drift: both
+                    // now bottom out in the single `inlineArrayTypeSpelling`.
+                    // That is deliberate — the interpolation chain is already a
+                    // second dispatch mirroring emitValueToString's, and adding
+                    // a rendering rather than a delegation would make it a third
+                    // place the §8.5 answer lives.
+                    if (!pv && rt &&
+                        rt->kind == sema::TypeRef::Kind::InlineArray)
+                        pv = emitValueToString(ev, rt);
                     if (!pv) {
                     if (llvmTy->isIntegerTy(1))
                         pv = emitPrimitiveToString(ev, P::Bool);
