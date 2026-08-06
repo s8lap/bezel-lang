@@ -6312,6 +6312,88 @@ bool Emitter::lowerPropertyCompound(const ast::AssignmentStmt& as) {
 }
 
 
+// fix #2905 / §7.7 / §6.6 / §23.3 / §23.4: see the declaration comment in
+// LlvmBackend_impl.hpp for the defect, the measurement and the contract.
+bool Emitter::lowerAccessorNullCoalescingAssign(const ast::AssignmentStmt& as) {
+    if (as.op != "??=" || !as.target || !as.value) return false;
+    auto* ps = dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(*as.target));
+    auto* ix = dynamic_cast<const ast::IndexExpr*>(as.target.get());
+    // The POSITIVE gate: §6.6's "when the final segment is accessor-mediated (a
+    // property or an indexer)". Everything else — a local, a parameter, a
+    // field, a static, an auto-property — has an address and keeps the caller's
+    // existing (correct, well-tested) `lvalueAddr` path.
+    if (!ps && !ix) return false;
+
+    // §6.6: "The LHS chain is evaluated once as above, the getter once".
+    llvm::Value* cur = lowerExpr(*as.target);
+    if (!cur) return false;
+
+    // The null test. §7.2: a nullable VALUE type is the tagged
+    // `{i8 hasValue; T}` struct; a nullable REFERENCE (`string?`, a class) is a
+    // bare pointer. A target of neither shape cannot be null, so §7.7's
+    // assignment can never occur and there is nothing to emit — decline rather
+    // than branch on a fabricated condition.
+    llvm::Value* isNull = nullptr;
+    if (cur->getType()->isPointerTy())
+        isNull = builder_.CreateICmpEQ(
+            cur, llvm::ConstantPointerNull::get(ptrTy()), "coaleq.isnull");
+    else if (auto* st = llvm::dyn_cast<llvm::StructType>(cur->getType()))
+        if (st->isLiteral() && st->getNumElements() == 2 &&
+            st->getElementType(0) == nullablePrimHasValTy())
+            isNull = builder_.CreateNot(nullablePrimHasValue(cur));
+    if (!isNull) return false;
+
+    auto* assignBB =
+        llvm::BasicBlock::Create(llvm_, "coaleq.acc.do", currentFn_);
+    auto* endBB =
+        llvm::BasicBlock::Create(llvm_, "coaleq.acc.end", currentFn_);
+    builder_.CreateCondBr(isNull, assignBB, endBB);
+    builder_.SetInsertPoint(assignBB);
+
+    // §6.6: "`e` is evaluated — and the setter invoked — only when the
+    // assignment actually occurs." Both live inside this branch, and nothing
+    // above this point lowered `e`.
+    bool stored = false;
+    llvm::Value* rhs = lowerExpr(*as.value);
+    if (rhs) {
+        // §5.1 to the target's slot, then §7.2's present-wrap of a bare payload
+        // (and the `null` literal's normalization to the all-zero form) — the
+        // same two steps, from the same two helpers, that every other store
+        // into a nullable slot uses.
+        rhs = coerceInitializerToSlot(rhs, cur->getType(),
+                                      isUnsignedTargetExpr(*as.value));
+        rhs = coerceToNullableSlot(cur->getType(), rhs);
+        // The store, dispatched in the SAME order the plain `:=` arm of
+        // lowerStmt uses: the virtual/interface vtable path first (so an
+        // override is not bypassed), then the local block-form setter, then the
+        // imported-property ABI stub, then the user indexer, then the built-in
+        // heap collection.
+        if (ps && !ps->isIndexer &&
+            (propSetSlot_.count(ps) || ifacePropertySetIndex_.count(ps)))
+            stored = lowerVirtualPropertySet(*as.target, rhs, as.value.get());
+        if (!stored)
+            stored = lowerPropertySetValue(*as.target, rhs, as.value.get());
+        if (!stored)
+            stored =
+                lowerImportedPropertySetValue(*as.target, rhs, as.value.get());
+        if (!stored && ix) stored = lowerIndexerSet(*ix, rhs, as.value.get());
+        if (!stored && ix)
+            stored = lowerCollectionIndexerSet(*ix, rhs, as.value.get());
+    }
+    if (!builder_.GetInsertBlock()->getTerminator())
+        builder_.CreateBr(endBB);
+    builder_.SetInsertPoint(endBB);
+    if (!stored && !ctx_.diagnostics().hasErrors())
+        // #1386/#2509 precedent: an ICE beats a silently dropped store. The
+        // whole point of #2905 is that this shape produced NO diagnostic.
+        ctx_.diagnostics().report(
+            Severity::Error, as.target->span.begin,
+            "internal: could not lower the setter of a null-coalescing "
+            "assignment to an accessor-mediated target — #2905");
+    return true;
+}
+
+
 // per §24.3 / §24.4: inside the declaring class, `event += handler` and
 // `event -= handler` are a fixed, language-defined desugaring to
 // `event.Add(handler)` and `event.Remove(handler)`. They are NOT the

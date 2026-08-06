@@ -4421,6 +4421,35 @@ private:
     // side effects, which are not expressible as assignment targets here.
     bool lowerPropertyCompound(const ast::AssignmentStmt& as);
 
+    // fix #2905 (§7.7/§6.6/§23.3/§23.4/§12.1, v0.240): `target ??= e` where
+    // `target` is ACCESSOR-MEDIATED — a property or an indexer, i.e. exactly
+    // the targets `lvalueAddr` cannot produce an address for.
+    //
+    // §6.6, verbatim: "**`??=`** is not a read-modify-write: `x ??= e` assigns
+    // `e` only when `x`'s current value is null, with the typing and ownership
+    // rules of §7.7. The LHS chain is evaluated once as above, the getter once;
+    // `e` is evaluated — and the setter invoked — only when the assignment
+    // actually occurs." So `??=` is a CONTROL-FLOW construct, not an operator
+    // `emitCompoundOp` could ever have an arm for — which is why every one of
+    // the read-modify-write handlers declined it and the statement fell to an
+    // `lvalueAddr` gate that returns null for an accessor. Measured on c7404bf,
+    // SILENTLY DROPPED with no diagnostic in every accessor spelling: a
+    // block-form `int?` property, a block-form `string?` property, an INTERFACE
+    // property, a user indexer, an `Array<int?>` element and a
+    // `Dictionary<K,int?>` element — while `b.NP := 77` and every other §6.6
+    // operator on the same property were correct.
+    //
+    // Emits: the getter read (ONCE), the null test, and — on the null branch
+    // ONLY — `e` and the setter. The store is dispatched through the SAME
+    // ordered helper chain the plain `:=` arm of `lowerStmt` uses, so the
+    // property this gates on is "can the `:=` spelling write this target?",
+    // not an enumeration of accessor kinds. If no helper claims it, an internal
+    // diagnostic is reported: the write is never silently dropped again.
+    //
+    // Returns true when it emitted the construct (handled), false when the
+    // target is not accessor-mediated (the caller keeps the addressed path).
+    bool lowerAccessorNullCoalescingAssign(const ast::AssignmentStmt& as);
+
     // fix #2862 (§6.6/§17.6/§2.8.2/§12.1/§23.3, v0.240): the READ-MODIFY-WRITE
     // twin of lowerImportedPropertySet — `importedObj.P OP= e` and
     // `importedObj.P++` / `--` on a plain (non-virtual, non-interface,

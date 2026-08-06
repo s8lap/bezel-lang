@@ -347,7 +347,19 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         coerceToNullableSlot(elemTy2, rhsOnce), addr2);
                     return false;
                 }
-            } else {
+            } else if (as->op != "??=") {
+                // fix #2905 (§7.7/§6.6, v0.240): `??=` skips this whole
+                // read-modify-write chain. §6.6, verbatim: "**`??=`** is not a
+                // read-modify-write: `x ??= e` assigns `e` only when `x`'s
+                // current value is null … `e` is evaluated — and the setter
+                // invoked — only when the assignment actually occurs." None of
+                // the handlers below can lower it (each ends in an
+                // `emitCompoundOp` call with the operator `??`, which has no
+                // arm and returns null), but `lowerPropertyCompound` EMITS the
+                // getter read AND `lowerExpr(*as->value)` before discovering
+                // that — an unconditional evaluation of `e` that §6.6 forbids
+                // outright. The `??=` arm below owns the shape end to end.
+                //
                 // #481: a VIRTUAL/INTERFACE property compound assignment
                 // `obj.P OP= v` is a read-modify-write — both the getter read
                 // and the setter write dispatch dynamically.
@@ -591,8 +603,42 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // non-null LHS never runs (nor produces) the RHS. Lowering it
                 // eagerly here would violate short-circuit and, for an owned
                 // RHS, leave an unobserved owned value (leak / double-free).
+                //
+                // fix #2905 (§12.1/§23.3/§6.6, v0.240): a VIRTUAL or INTERFACE
+                // property is checked BEFORE lvalueAddr, with the SAME gate the
+                // #481 compound arm uses. §12.1 requires the getter and setter
+                // to dispatch on the RUNTIME type, so an addressed store is
+                // wrong for this shape by construction — and MEASURED on
+                // c7404bf it is wrong in the worst way: `lvalueAddr` resolves
+                // `iface.P` to the receiver's FIELD INDEX 0 and the write lands
+                // in an unrelated field (a class with `_z`, `_n`, `_v` and
+                // `i.IP ??= 9` gave `z=9, n=-1, v=-1`), with no diagnostic.
+                {
+                    auto* tps = dynamic_cast<sema::PropertySymbol*>(
+                        ctx_.exprSymbol(*as->target));
+                    if (tps && !tps->isIndexer &&
+                        (propSetSlot_.count(tps) ||
+                         ifacePropertySetIndex_.count(tps)) &&
+                        (propGetSlot_.count(tps) ||
+                         ifacePropertyGetIndex_.count(tps)) &&
+                        lowerAccessorNullCoalescingAssign(*as))
+                        return false;
+                }
                 addr = lvalueAddr(*as->target, elemTy);
-                if (!addr) return false;
+                // fix #2905 (§7.7/§6.6/§23.3/§23.4, v0.240): no address means
+                // an ACCESSOR-MEDIATED target — a property or an indexer, which
+                // has no backing slot and is reachable only through its
+                // accessor bodies. `return false` here dropped the write with
+                // NO diagnostic (measured: `b.NP ??= 77` left `b.NP` null,
+                // exit 5 where 3 is correct — and identically for a `string?`
+                // property, an interface property, a user indexer, an
+                // `Array<int?>` element and a `Dictionary<K,int?>` element).
+                // The accessor form is the same construct with the getter and
+                // setter in place of the load and the store.
+                if (!addr) {
+                    lowerAccessorNullCoalescingAssign(*as);
+                    return false;
+                }
             } else if (as->op == ":=" &&
                 dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) &&
                 localSlot(*as->target) != nullptr) {
