@@ -1437,16 +1437,34 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 } else if (computedSetterOf(*inc->target)) {
                     llvm::Value* cur = lowerExpr(*inc->target);  // getter read
                     if (cur) {
-                        bool fp = cur->getType()->isFloatingPointTy();
-                        llvm::Value* one =
-                            fp ? llvm::cast<llvm::Value>(
-                                     llvm::ConstantFP::get(cur->getType(), 1.0))
-                               : llvm::cast<llvm::Value>(
-                                     llvm::ConstantInt::get(cur->getType(), 1));
-                        llvm::Value* res = emitCompoundOp(
-                            binOp, cur, one, fp,
-                            isUnsignedTargetExpr(*inc->target),
-                            isCharTargetExpr(*inc->target));  // §6.6/§5.2 #1961
+                        // §17.6's implicit `1`, synthesized at the getter's
+                        // result type. Gated on the LOWERED type, exactly as
+                        // lowerVirtualPropertyIncrDecr and
+                        // lowerIndexerCompoundCore's `lowerRhs` already gate it.
+                        // §6.4/#2883: `decimal` is a STRUCT-typed primitive, so
+                        // `ConstantInt::get` on it does not build a constant of
+                        // that type at all — it produced a nonsense `i33 1`
+                        // that then reached emitCompoundOp and aborted the
+                        // compile ("Call parameter type does not match function
+                        // signature! i33 1 … llvm.sadd.with.overflow.
+                        // s_bz.decimals"), measured on `d.P++` for a block-form
+                        // `decimal` property. Its `1` comes from the decimal
+                        // helper, and emitCompoundOp's own #2883 decimal arm
+                        // does the arithmetic. A non-numeric lowering (a
+                        // `string` property, which sema rejects for `++`)
+                        // declines rather than materializing a bad constant.
+                        llvm::Type* t = cur->getType();
+                        bool fp = t->isFloatingPointTy();
+                        llvm::Value* one = nullptr;
+                        if (fp) one = llvm::ConstantFP::get(t, 1.0);
+                        else if (t == decimalStructType()) one = emitDecimalOne();
+                        else if (t->isIntegerTy()) one = llvm::ConstantInt::get(t, 1);
+                        llvm::Value* res =
+                            one ? emitCompoundOp(
+                                      binOp, cur, one, fp,
+                                      isUnsignedTargetExpr(*inc->target),
+                                      isCharTargetExpr(*inc->target))  // §6.6/§5.2 #1961
+                                : nullptr;
                         if (res) lowerPropertySetValue(*inc->target, res);
                     }
                 // --- (a2) IMPORTED non-virtual property: `obj.P++` / `--` ---

@@ -6046,28 +6046,16 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
             "assignment to an imported property — #2862");
         return false;
     }
-    // §5.1/§6.4: `decimal` is a STRUCT-typed primitive. emitCompoundOp has no
-    // decimal arm — it would feed the struct to `sadd.with.overflow`, which the
-    // IR verifier rejects ("Intrinsic has incorrect return type"). Found by this
-    // fix's own probe grid, not inferred: the first draft ICE'd on
-    // `importedObj.M++` where `M: decimal`. Route decimal through the same
-    // helper the local `d++` branch uses (LlvmBackend_Stmts.cpp's IncrementStmt
-    // arm), which also carries §6.4's overflow raise.
-    //
-    // The SAME gap exists at emitCompoundOp's other callers and is a live ICE
-    // there today — `d.P += 1m` on a LOCAL block-form decimal property, and
-    // `d[0] += 1m` / `d[0]++` on a local decimal indexer, both abort the
-    // compile with "Intrinsic has incorrect return type!". Reproduced and
-    // filed as #2883, whose fix belongs in emitCompoundOp itself; this
-    // caller-side check should be deleted when that lands.
-    llvm::Value* res =
-        (cur->getType() == decimalStructType())
-            ? emitDecimalArith(binOp, cur, rhs)
-            : emitCompoundOp(
-                  binOp, cur, rhs, cur->getType()->isFloatingPointTy(),
-                  isUnsignedTargetExpr(targetExpr),
-                  isCharTargetExpr(targetExpr),                 // §6.6/§5.2 #1961
-                  valueExpr && isUnsignedTargetExpr(*valueExpr));  // §6.2 #2140
+    // §5.1/§6.4 (#2883): the caller-side `decimal` check #2862 added here — a
+    // ternary routing a `%bz.decimal` `cur` to emitDecimalArith — is GONE.
+    // emitCompoundOp now owns the decimal arm itself (LlvmBackend_Layout.cpp),
+    // so this call site holds one fewer copy of the same knowledge; #2862's
+    // note said the check "should be deleted when that lands".
+    llvm::Value* res = emitCompoundOp(
+        binOp, cur, rhs, cur->getType()->isFloatingPointTy(),
+        isUnsignedTargetExpr(targetExpr),
+        isCharTargetExpr(targetExpr),                     // §6.6/§5.2 #1961
+        valueExpr && isUnsignedTargetExpr(*valueExpr));   // §6.2 #2140
     if (!res) return false;
 
     // --- then the store. ---

@@ -194,6 +194,37 @@ llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
         if (!res) return nullptr;
         return emitCharRangeCheck(res);
     }
+    // §6.4/§5.1 (#2883): `decimal` is a STRUCT-typed primitive (`%bz.decimal`),
+    // not a scalar — every arm below assumes a scalar, and the integer tail
+    // hands the struct straight to `llvm.sadd.with.overflow`, which the IR
+    // verifier rejects ("Intrinsic has incorrect return type!") so the compile
+    // ABORTS on a legal program. Route it to the §6.4 decimal helper, which
+    // carries §6.4's "raises `OverflowException` on overflow and
+    // `DivideByZeroException` on division by zero" — exactly what the LOCAL
+    // `d += x` / `d++` statement paths already do (LlvmBackend_Stmts.cpp).
+    //
+    // The arm lives HERE rather than at each caller because the hole was one
+    // missing arm reached from FOUR call sites, each a separate live ICE:
+    // `d.P += 1m` on a block-form property (lowerPropertyCompound),
+    // `d[0] += 1m` / `d[0]++` on an indexer (lowerIndexerCompoundCore, whose
+    // own `lowerRhs` already synthesized `emitDecimalOne()` one line earlier),
+    // `i.P += 1m` through a virtual/interface property (the #481 arm of
+    // lowerStmt), and the imported-property path #2862 had to open-code a
+    // caller-side check to dodge — that check is deleted with this fix.
+    //
+    // §5.1/§6.2: an integer RHS widens to `decimal` (`d.P += 5`). The local
+    // path pre-coerces the RHS to the slot type before it reaches this function
+    // (`coerceNumericToType(rhs, elemTy, …)`), but the property/indexer callers
+    // pass the RHS at its own natural width, so the widening is applied here —
+    // without it `emitDecimalArith` would store an i32 into a `%bz.decimal`
+    // slot. If the RHS is still not a decimal afterwards, DECLINE (a diagnostic
+    // beats malformed IR); §6.2 admits no decimal/binary-float mixing, so sema
+    // has already rejected any program that could reach that.
+    if (l->getType() == decimalStructType()) {
+        r = coerceNumericToType(r, decimalStructType(), rUns);
+        if (r->getType() != decimalStructType()) return nullptr;
+        return emitDecimalArith(op, l, r);
+    }
     // §4.6 (#857): string compound concatenation when BOTH operands are string
     // pointers (e.g. an indexer/property `s[i] += t`). A string is a pointer, not
     // a number, so the integer checked-add intrinsic below emits malformed IR.
