@@ -6324,9 +6324,65 @@ bool Emitter::lowerAccessorNullCoalescingAssign(const ast::AssignmentStmt& as) {
     // existing (correct, well-tested) `lvalueAddr` path.
     if (!ps && !ix) return false;
 
+    // fix #2929 (§6.6/§7.7/§23.4, v0.240): EVALUATE THE LHS CHAIN ONCE.
+    //
+    // §6.6, verbatim, on the chain (the clause `??=`'s own paragraph points
+    // back to with "The LHS chain is evaluated once as above"): "every
+    // constituent of the left-hand side's lvalue chain (grammar A.6 `LValue`)
+    // is evaluated exactly once, left to right: the base identifier or `this`,
+    // each mid-chain member hop (a property hop's getter is invoked once as
+    // part of locating the target), and every index expression in the chain".
+    //
+    // This function reads through `lowerExpr(*as.target)` and writes through a
+    // setter helper that re-lowers the target's own subexpressions from the
+    // AST, so every such constituent ran TWICE. MEASURED on 10bd6d3 with a
+    // counter-returning index — `b[Ctr.NextIdx()] ??= Ctr.Val()` gave `idx=2`
+    // where §6.6 requires 1 (getter 1, setter 1, RHS 1 were already right).
+    //
+    // The mechanism is the one §22.3's accessor `ref`/`out` bracket already
+    // uses for the identical requirement (`emitAccessorRefArgCopyIn`, this
+    // file): lower each constituent ONCE and pin it in `exprValueOverride_`,
+    // which `lowerExpr` consults first (LlvmBackend_Exprs.cpp), so the getter
+    // read below AND the setter's internal re-lowering both reuse the pinned
+    // value instead of re-running the expression. The pins are dropped at
+    // every exit. An expression already pinned by an enclosing bracket is left
+    // alone (and not erased) so the two cannot fight over one node.
+    std::vector<const ast::Expr*> pins;
+    auto pin = [&](const ast::Expr* e) -> bool {
+        if (!e || exprValueOverride_.count(e)) return true;
+        llvm::Value* v = lowerExpr(*e);
+        if (!v) return false;
+        exprValueOverride_[e] = v;
+        pins.push_back(e);
+        return true;
+    };
+    auto unpinAll = [&] {
+        for (const ast::Expr* e : pins) exprValueOverride_.erase(e);
+        pins.clear();
+    };
+    if (ix) {
+        // §6.6's "the base identifier or `this`, each mid-chain member hop …
+        // and every index expression in the chain", left to right. A.6 keeps
+        // the base itself an `Identifier`/`this`, but a MID-CHAIN hop may be a
+        // property (`a.Inner[i] ??= v`), whose getter §6.6 says is "invoked
+        // once as part of locating the target" — so the receiver is pinned
+        // too, not just the indices.
+        if (!pin(ix->target.get())) { unpinAll(); return false; }
+        for (const auto& iv : ix->indices)
+            if (!pin(iv.value.get())) { unpinAll(); return false; }
+    } else if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                   as.target.get())) {
+        // The same mid-chain hop for the PROPERTY spelling (`a.Inner.P ??=
+        // v`): the setter helper re-lowers `ma->target`, re-invoking the
+        // `Inner` getter. #2905 recorded this as "nothing observable re-runs"
+        // on the grounds that A.6 forbids a method-call base — but a property
+        // hop is not a method call and §6.6 names it explicitly.
+        if (!pin(ma->target.get())) { unpinAll(); return false; }
+    }
+
     // §6.6: "The LHS chain is evaluated once as above, the getter once".
     llvm::Value* cur = lowerExpr(*as.target);
-    if (!cur) return false;
+    if (!cur) { unpinAll(); return false; }
 
     // The null test. §7.2: a nullable VALUE type is the tagged
     // `{i8 hasValue; T}` struct; a nullable REFERENCE (`string?`, a class) is a
@@ -6341,7 +6397,7 @@ bool Emitter::lowerAccessorNullCoalescingAssign(const ast::AssignmentStmt& as) {
         if (st->isLiteral() && st->getNumElements() == 2 &&
             st->getElementType(0) == nullablePrimHasValTy())
             isNull = builder_.CreateNot(nullablePrimHasValue(cur));
-    if (!isNull) return false;
+    if (!isNull) { unpinAll(); return false; }
 
     auto* assignBB =
         llvm::BasicBlock::Create(llvm_, "coaleq.acc.do", currentFn_);
@@ -6383,6 +6439,12 @@ bool Emitter::lowerAccessorNullCoalescingAssign(const ast::AssignmentStmt& as) {
     if (!builder_.GetInsertBlock()->getTerminator())
         builder_.CreateBr(endBB);
     builder_.SetInsertPoint(endBB);
+    // fix #2929: the getter (unconditional) and the setter (assign branch) are
+    // both behind us, so the pins have no further readers — drop them at the
+    // JOIN, where any later lowering of the same nodes is a genuinely new
+    // evaluation. Kept until here rather than released early because the
+    // setter helpers re-lower from the AST inside `assignBB`.
+    unpinAll();
     if (!stored && !ctx_.diagnostics().hasErrors())
         // #1386/#2509 precedent: an ICE beats a silently dropped store. The
         // whole point of #2905 is that this shape produced NO diagnostic.

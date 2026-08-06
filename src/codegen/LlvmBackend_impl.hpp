@@ -4430,6 +4430,19 @@ private:
     // `Dictionary<K,int?>` element — while `b.NP := 77` and every other §6.6
     // operator on the same property were correct.
     //
+    // fix #2929 (§6.6, v0.240): and the LHS CHAIN once. §6.6's "as above" is
+    // the clause "every constituent of the left-hand side's lvalue chain
+    // (grammar A.6 `LValue`) is evaluated exactly once, left to right: the base
+    // identifier or `this`, each mid-chain member hop (a property hop's getter
+    // is invoked once as part of locating the target), and every index
+    // expression in the chain". This function reads through `lowerExpr` and
+    // writes through setter helpers that re-lower the target's subexpressions
+    // FROM THE AST, so each constituent ran TWICE — measured `idx=2` for
+    // `b[Next()] ??= v` and `inner=2` for the mid-chain property hop of
+    // `h.Inner.NP ??= v`. Each is now lowered ONCE and pinned in
+    // `exprValueOverride_`, the same memo §22.3's accessor `ref`/`out` bracket
+    // uses for the identical requirement; pins are dropped at the join.
+    //
     // Emits: the getter read (ONCE), the null test, and — on the null branch
     // ONLY — `e` and the setter. The store is dispatched through the SAME
     // ordered helper chain the plain `:=` arm of `lowerStmt` uses, so the
