@@ -110,7 +110,18 @@ case "${GATE_FAST_ASAN:-}" in
   0) ASAN=0 ;;
 esac
 
-SHARD_ENV=(); ARB_ENV=(); SHARD_NOTE=""; SHARD_LABEL="crash/undercount-checked"
+# SHARD_ENV is spliced in as a COMMAND PREFIX at the run sites below, and
+# dev_heavy.sh ends in `exec systemd-run ... -- "$@"` — systemd-run execs the
+# first word after `--` as a FILENAME, so a bare `VAR=value` word there is not a
+# shell assignment, it is a nonexistent program. The leading `env` is therefore
+# load-bearing, and it is seeded here rather than in the ASan branch because as
+# of #2918 the PLAIN pass also contributes a variable (its shard ceiling).
+SHARD_ENV=(env); ARB_ENV=(); SHARD_NOTE=""; SHARD_LABEL="crash/undercount-checked"
+# An explicit caller-supplied BEZEL_SHARD_TIMEOUT wins unconditionally, in BOTH
+# oracles (#2918 — this used to be read only in the ASan branch, so an operator
+# exporting it for a plain gate had it silently ignored by this script and only
+# honoured by run_parallel's own default-expansion).
+GATE_EXPLICIT_STO="${BEZEL_SHARD_TIMEOUT:-}"
 if [ "$ASAN" -eq 1 ]; then
   # The ASan per-shard ceiling is COLD-AWARE (#2100): a WARM ASan pass (k2
   # bincache populated) fits 900s with wide margin, but a COLD one — the first
@@ -124,7 +135,6 @@ if [ "$ASAN" -eq 1 ]; then
   # so a generous cold ceiling no longer delays broken-tree detection. A
   # caller's explicit BEZEL_SHARD_TIMEOUT always wins.
   SHARD_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
-  GATE_EXPLICIT_STO="${BEZEL_SHARD_TIMEOUT:-}"
   ARB_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
   SHARD_NOTE="asan-instrumented"
   SHARD_LABEL="crash/undercount + generated-code ASan"
@@ -382,47 +392,90 @@ while IFS= read -r _b; do
   echo "   binary: $(basename "$_b")  $(ls -la --time-style=+%H:%M:%S "$_b" | awk '{print $6}')"
 done < <(test_binaries)
 
-# Decide the ASan per-shard ceiling now that coldness is knowable (#2100; see
-# the SHARD_ENV note above). Cold predicate: core.a rebuilt this gate (k2
-# identity changed => every cache key new) OR a near-empty bincache (fresh box
-# or eviction — a warm full-suite state holds ~11k+ entries; the find is
-# cheap and uncapped). Explicit BEZEL_SHARD_TIMEOUT wins unconditionally.
+# Decide the per-shard ceiling now that coldness is knowable (#2100; see the
+# SHARD_ENV note above). Cold predicate: core.a rebuilt this gate (k2 identity
+# changed => every cache key new) OR a near-empty bincache (fresh box or
+# eviction — a warm full-suite state holds ~11k+ entries; the find is cheap and
+# uncapped). Explicit BEZEL_SHARD_TIMEOUT wins unconditionally.
+#
+# fix #2918: this block used to sit inside `if [ "$ASAN" -eq 1 ]`, so BOTH
+# oracles were gated on it but only ONE got it. The plain pass fell through to
+# tests/run_parallel.sh's hardcoded `${BEZEL_SHARD_TIMEOUT:-300}` — 300s per
+# shard, cold or warm — which is the mechanical reason every gate on 2026-08-06
+# needed 2+ attempts on the PLAIN oracle. The workaround was an operator-
+# remembered env pair (BEZEL_AOT_CACHE=0 + BEZEL_SHARD_TIMEOUT=1800); it bought
+# 4 attempt-1 greens out of 6 oracles versus roughly 0 of 8 before — a strong
+# improvement, NOT a cure, and one that lived only in a human's memory of which
+# variables to export. Same shape as #2917/#2100: a gate lesson that is
+# remembered rather than structural.
+#
+# ⚠ THE IDENTITY MARKER MUST BE KEYED PER ORACLE, and that is not cosmetic. The
+# AOT cache key hashes the sanitize bit (aot_support.hpp:1121-1122, `s += "sa=";
+# s += opts.sanitizeAddress ? '1' : '0';`), so plain and ASan entries are
+# DISJOINT POPULATIONS IN ONE STORE. Before this change only the ASan pass wrote
+# the marker, so nothing was contaminated; the moment the plain pass also writes
+# it, a gate_full_cycle run would go: plain completes -> records the new identity
+# -> the ASan pass that follows reads "match" -> predicts WARM -> takes 900s ->
+# while holding ZERO ASan entries under that identity. That is exactly the
+# mis-prediction this marker exists to prevent (2026-07-29: gates C and D given
+# 900s for a ~2400s cold run, killed at it having completed ~37% of the suite).
+# Hence .gate-identity vs .gate-identity-asan.
+#
+# For the same reason `cache_n` below is ORACLE-BLIND: entry filenames are
+# content-addressed, so the `sa=` bit is not inspectable and a store holding 11k
+# plain entries and 0 ASan entries reads "warm" to both. The count can therefore
+# only ever err toward warm; the per-oracle identity marker is the load-bearing
+# signal and is what actually forces the cold verdict.
+core_post=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo -1)
+GATE_CACHE_ROOT="${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}"
+cache_n=$(find "$GATE_CACHE_ROOT" -type f 2>/dev/null | wc -l)
+GATE_COLD=0
+{ [ "$core_post" != "$CORE_MTIME_PRE" ] || [ "$cache_n" -lt 2000 ]; } && GATE_COLD=1
+# IDENTITY CHECK (2026-07-29). The mtime comparison above only asks "did THIS
+# gate's build touch core.a", which is the wrong question. The AOT bincache
+# keys on a hash of libbezel_core.a AND libbezel_runtime.a (the "k2 identity",
+# tests/support/aot_support.hpp), so a RUNTIME-only change invalidates every
+# entry while core.a's mtime is unchanged relative to this build — and a
+# previous gate that timed out leaves the store full of entries under the OLD
+# identity, so the raw count looks warm too. Both signals said "warm" for a
+# fully cold tree on 2026-07-29: gates C and D were given the 900s ceiling for
+# a ~2400s cold run and were killed at it, having completed ~37% of the suite.
+#
+# Record the identity the cache is actually populated FOR, next to the store,
+# and refresh it only after a COMPLETED pass (see the write at the end) so a
+# timed-out gate cannot mark a half-populated store as warm.
+GATE_CACHE_ID=$(cat build/libbezel_core.a build/libbezel_runtime.a 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1)
 if [ "$ASAN" -eq 1 ]; then
-  core_post=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo -1)
-  GATE_CACHE_ROOT="${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}"
-  cache_n=$(find "$GATE_CACHE_ROOT" -type f 2>/dev/null | wc -l)
-  GATE_COLD=0
-  { [ "$core_post" != "$CORE_MTIME_PRE" ] || [ "$cache_n" -lt 2000 ]; } && GATE_COLD=1
-  # IDENTITY CHECK (2026-07-29). The mtime comparison above only asks "did THIS
-  # gate's build touch core.a", which is the wrong question. The AOT bincache
-  # keys on a hash of libbezel_core.a AND libbezel_runtime.a (the "k2 identity",
-  # tests/support/aot_support.hpp), so a RUNTIME-only change invalidates every
-  # entry while core.a's mtime is unchanged relative to this build — and a
-  # previous gate that timed out leaves the store full of entries under the OLD
-  # identity, so the raw count looks warm too. Both signals said "warm" for a
-  # fully cold tree on 2026-07-29: gates C and D were given the 900s ceiling for
-  # a ~2400s cold run and were killed at it, having completed ~37% of the suite.
-  #
-  # Record the identity the cache is actually populated FOR, next to the store,
-  # and refresh it only after a COMPLETED pass (see the write at the end) so a
-  # timed-out gate cannot mark a half-populated store as warm.
-  GATE_CACHE_ID=$(cat build/libbezel_core.a build/libbezel_runtime.a 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1)
+  GATE_CACHE_ID_FILE="$GATE_CACHE_ROOT/.gate-identity-asan"
+else
   GATE_CACHE_ID_FILE="$GATE_CACHE_ROOT/.gate-identity"
-  gate_id_note="match"
-  if [ -n "${GATE_CACHE_ID:-}" ]; then
-    if [ "$GATE_CACHE_ID" != "$(cat "$GATE_CACHE_ID_FILE" 2>/dev/null || echo none)" ]; then
-      GATE_COLD=1; gate_id_note="CHANGED (cache is cold for this tree)"
-    fi
-  else
-    gate_id_note="unavailable"
-  fi
-  sto="$GATE_EXPLICIT_STO"
-  if [ -z "$sto" ]; then sto=900; [ "$GATE_COLD" -eq 1 ] && sto=1800; fi
-  SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
-  core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebuilt"
-  cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
-  echo "   ASan shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n, identity $gate_id_note)"
 fi
+gate_id_note="match"
+if [ -n "${GATE_CACHE_ID:-}" ]; then
+  if [ "$GATE_CACHE_ID" != "$(cat "$GATE_CACHE_ID_FILE" 2>/dev/null || echo none)" ]; then
+    GATE_COLD=1; gate_id_note="CHANGED (cache is cold for this tree)"
+  fi
+else
+  gate_id_note="unavailable"
+fi
+# Warm ceilings differ because the two oracles cost differently: a warm ASan
+# pass needs 900s, while a warm plain pass is far cheaper (2026-08-06: 96 shards,
+# 336s TOTAL wall, i.e. ~50s of shard time each — 300s is ~6x headroom). The COLD
+# ceiling is the same 1800s for both: it is only a coarse backstop, since a
+# genuine per-test hang is still bounded by the harness's 120s compile / 30s run
+# deadlines and the canary is the fail-fast layer, so a generous cold value costs
+# nothing on a healthy tree and is what stops a store under eviction pressure
+# from killing shards and printing an undercount.
+sto="$GATE_EXPLICIT_STO"
+if [ -z "$sto" ]; then
+  if [ "$ASAN" -eq 1 ]; then sto=900; else sto=300; fi
+  [ "$GATE_COLD" -eq 1 ] && sto=1800
+fi
+SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
+core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebuilt"
+cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
+_sto_label="plain"; [ "$ASAN" -eq 1 ] && _sto_label="ASan"
+echo "   $_sto_label shard ceiling: ${sto}s ($cold_note: core.a $core_note, bincache entries=$cache_n, identity $gate_id_note)"
 
 # lit + FileCheck diagnostic track (tests/lit/): drives the REAL bezelc over .bzl
 # files and matches diagnostics with FileCheck. Fast (~0.1s/test, no JIT) and
