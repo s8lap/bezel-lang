@@ -8082,6 +8082,49 @@ private:
     // Maps alloca slot → frame field index (spill at suspend, restore at state entry).
     std::unordered_map<llvm::AllocaInst*, unsigned> smAllocaToField_;
 
+    // fix #2891 (§31.2 "`try`/`catch`/`finally`" / §30.1 "`async` methods" /
+    // §29.3 "Iterator methods" / §29.7, v0.240): the only legal way to read
+    // `smStateGEP_` from a site that can also be reached while emitting a
+    // function OTHER than the state machine's own MoveNext/Resume body.
+    //
+    // `smStateGEP_` is an `llvm::Instruction` (a `CreateStructGEP` on the resume
+    // function's frame argument — `emitResumeDispatch`, LlvmBackend_Iterators.cpp
+    // ~387). An LLVM value may only be referenced from inside the function that
+    // defines it, so every use must first establish that we are still emitting
+    // into THAT function. Non-nullness alone does not establish it: none of the
+    // three state-machine emitters clears this member when it finishes
+    // (`emitIteratorMethod` LlvmBackend_Iterators.cpp ~1541, `emitAsyncMethod`
+    // LlvmBackend_Async.cpp ~1340 and `emitAsyncIteratorMethod` ~2575 each clear
+    // `smStateStruct_`/`smSelf_` and leave the GEP behind), so the pointer
+    // OUTLIVES its function and reaches whatever is emitted next — and the body
+    // loop that decides what that is iterates
+    // `std::unordered_map<sema::MethodSymbol*, llvm::Function*> methodFns_`
+    // (~710 above), POINTER-HASH order, not declaration order. Two consumers in
+    // `lowerTry` (LlvmBackend_Stmts.cpp: the §29.7 "mark the iterator done"
+    // store on the unwind edge, and the mode-4 `yield break` dispatch) then
+    // emitted `store i32 -1, ptr <gep>` into an ordinary method's `finally`:
+    // "Referring to an instruction in another function!", a build-stopping
+    // IR-verifier failure on a class that merely declares an `async` method
+    // alongside a plain method containing a `try`/`finally` (#2891). The same
+    // pointer also outlives MoveNext into the iterator's own Dispose body, which
+    // re-lowers user `finally` bodies (LlvmBackend_Iterators.cpp ~2007).
+    //
+    // Returning null in another function is not merely the safe answer, it is
+    // the CORRECT one: the §29.7 exhaustion sentinel and the §29.3 `yield break`
+    // exit belong to the state machine's own advance function. A plain method's
+    // `finally` has no state machine to mark done, and a Dispose body has
+    // already taken its own state transition (state = -2, ~1906/~1927).
+    //
+    // Gate on the LLVM property actually needed (same defining function), not on
+    // an enumeration of the emitters that fail to clear the member, so the next
+    // emitter added cannot reopen this. Mirrors `disposerEntryExcHere()` (#2872).
+    llvm::Value* smStateGEPHere() const {
+        if (!smStateGEP_) return nullptr;
+        if (auto* inst = llvm::dyn_cast<llvm::Instruction>(smStateGEP_))
+            if (inst->getFunction() != currentFn_) return nullptr;
+        return smStateGEP_;
+    }
+
     // fix #2702 (§23.3/§23.4/§30.5/§28.4, v0.240): ONE place that saves,
     // neutralises and restores the emitter state a NESTED body emission must
     // not inherit. `ensurePropertyBlockGetter`, `ensureIndexerBlockGetter` and

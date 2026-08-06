@@ -3670,8 +3670,19 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         // machine (Yield/AsyncYield) — the only place mode 4 is produced. A
         // plain async METHOD (SuspendKind::Await) also has smStateGEP_ set but
         // returns void, so emitting the iterator return here would be malformed.
-        if (smStateGEP_ && (smKind_ == SuspendKind::Yield ||
-                            smKind_ == SuspendKind::AsyncYield)) {
+        //
+        // fix #2891 (§29.3/§29.7/§31.2, v0.240): read the frame's state pointer
+        // through smStateGEPHere(), which additionally establishes that the GEP
+        // is defined in the function being emitted RIGHT NOW. `smStateGEP_`
+        // survives the emitter that published it (none of the three clears it),
+        // so a plain method lowered afterwards — pointer-hash order, not
+        // declaration order — otherwise opened this dispatch on the PREVIOUS
+        // function's frame and emitted a cross-function store plus a `ret i1
+        // false` from a function with an unrelated return type. See the
+        // accessor's definition in LlvmBackend_impl.hpp.
+        llvm::Value* smStateGEPForTry = smStateGEPHere();
+        if (smStateGEPForTry && (smKind_ == SuspendKind::Yield ||
+                                 smKind_ == SuspendKind::AsyncYield)) {
             auto* ybDispBB =
                 llvm::BasicBlock::Create(llvm_, "finally.yieldbrk", currentFn_);
             sw->addCase(builder_.getInt32(4), ybDispBB);
@@ -3693,7 +3704,7 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // perform the terminal iterator exit. Pre-v0.182 this range was
                 // never disposed on the yield-break edge at all.
                 emitDisposalsInRange(0, bodyScopeIdx);
-                builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
+                builder_.CreateStore(builder_.getInt32(-1), smStateGEPForTry);
                 if (smKind_ == SuspendKind::AsyncYield) {
                     emitAsyncIterComplete(/*hasValue=*/false);
                     builder_.CreateRetVoid();
@@ -3747,10 +3758,18 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         // no-op — otherwise the finally would run a second time.  We set -1
         // before the finally (not after) so that any finally-body code that
         // calls MoveNext/Dispose on the same iterator also sees it as done.
-        // smStateGEP_ is non-null exactly when we are emitting inside a
-        // sync/async iterator MoveNext / Resume function.
-        if (smStateGEP_) {
-            builder_.CreateStore(builder_.getInt32(-1), smStateGEP_);
+        // fix #2891 (§29.7/§31.2/§30.1, v0.240): "we are emitting inside a
+        // sync/async iterator MoveNext / Resume function" is exactly what
+        // smStateGEPHere() establishes and what a bare `smStateGEP_ != null`
+        // does NOT: the member outlives the emitter that published it, so on a
+        // plain method whose body merely contains a `try`/`finally` this store
+        // referenced a GEP defined in a DIFFERENT function ("Referring to an
+        // instruction in another function!" — a hard compile failure on the
+        // spec-legal shape of §31.2's own finally example sitting next to a
+        // §30.1 `async` method). A plain method has no iterator to mark done, so
+        // emitting nothing here is the correct lowering, not merely the safe one.
+        if (llvm::Value* smGEP = smStateGEPHere()) {
+            builder_.CreateStore(builder_.getInt32(-1), smGEP);
         }
         if (finallyAwaits) {
             // §30.9 / §31.2 (#438): an `await` in the finally on the EXCEPTION
