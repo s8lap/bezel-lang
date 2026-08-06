@@ -3298,6 +3298,51 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 // #720 B1).
                 builder_.CreateStore(
                     llvm::ConstantPointerNull::get(ptrTy()), emitExcSlot());
+                // fix #2881 / §31.2 + §31.2.1 (v0.240): a guard that THROWS must
+                // still run THIS try's `finally`. §31.2: "`finally` runs whether
+                // the protected block completed normally, was exited by an
+                // exception (caught or uncaught), or was exited by `return` — or
+                // by a `break` or `continue` targeting an enclosing loop."; the
+                // guard's new exception "propagates to the enclosing handler"
+                // (§31.2.1), i.e. it LEAVES this try statement, so the try is
+                // exited by an exception and its finally owes a run. Pre-fix the
+                // guard was lowered while `unwindTarget_` was still the ENCLOSING
+                // handler (restored right after the try body) — the redirect to
+                // finUnwindBB happened only in armBB below, i.e. after the guard
+                // had already selected the arm — so a guard throw branched
+                // straight past this try's finally.
+                //
+                // WHICH exception finUnwindBB re-propagates is settled by
+                // §31.2.1: "If the guard itself throws, that new exception
+                // supersedes the in-flight one — the superseded exception is
+                // disposed by the runtime exactly once, as if its handling had
+                // completed ... — and propagates to the enclosing handler". The
+                // NEW one propagates; that is what finUnwindBB does unchanged —
+                // it captures whatever is in `bz$exc` on entry, which on this
+                // edge is the guard's exception (the in-flight E1 was cleared
+                // just above, #720 B2), and restores it after the finally body.
+                // E1's single dispose is unchanged too: it is performed at the
+                // guard's own throw/pending-check site by the #1108/#1216 path
+                // set up immediately below, which fires iff `caughtExcArmTarget_`
+                // equals the throw's resolved unwind target — both are computed
+                // from `unwindTarget_`, so they still compare equal once both are
+                // finUnwindBB.
+                //
+                // DISPOSAL IS RELOCATED, NOT DUPLICATED. With `unwindScopeDepth_`
+                // raised to this try's depth for the guard, the guard's throw site
+                // no longer disposes the try body scope and the scopes between
+                // this try and its enclosing handler; finUnwindBB's
+                // emitUnwindDisposalsInRange(savedDepth, thisTryDepth) disposes
+                // exactly that same range after the finally body — the §28.3
+                // finally-first ordering. Scopes pushed INSIDE the guard
+                // expression (temporaries) sit above the new depth and are still
+                // disposed at the throw site.
+                llvm::BasicBlock* savedGuardUnwind = unwindTarget_;
+                std::size_t savedGuardUnwindDepth = unwindScopeDepth_;
+                if (hasFin) {
+                    unwindTarget_ = finUnwindBB;
+                    unwindScopeDepth_ = disposeStack_.size();
+                }
                 // #1108: a `when` guard that THROWS supersedes the in-flight
                 // exception (E1); E1 must be freed exactly once. Expose E1 as
                 // the caught object LEAVING this arm for the duration of the
@@ -3323,6 +3368,12 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
                 currentCaughtExc_ = savedGuardCaught;
                 currentCaughtName_ = savedGuardCaughtName;
                 caughtExcArmTarget_ = savedGuardArmTarget;
+                // fix #2881: the guard is lowered; restore the enclosing unwind
+                // context. armBB re-establishes its own redirect below, and the
+                // not-thrown continuation (armBB/nextBB) is reached by an explicit
+                // branch, never by an unwind edge.
+                unwindTarget_ = savedGuardUnwind;
+                unwindScopeDepth_ = savedGuardUnwindDepth;
                 if (diverged_) {
                     // §31.2.1 / §31.5 (#1097): the guard expression ITSELF threw
                     // (e.g. `catch E when throw new F()` — a `throw` is a
