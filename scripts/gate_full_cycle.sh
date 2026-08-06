@@ -69,7 +69,12 @@ run_until_trustworthy() {
   local mode_desc="${1:-plain}"; shift || true
   local i rc
   for i in $(seq 1 "$MAX_ATTEMPTS"); do
-    BEZEL_NO_GC=1 scripts/gate.sh "$@" > "$log" 2>&1
+    # BEZEL_GATE_CYCLE=1 tells gate.sh that a DUAL-oracle run is driving it, so
+    # it suppresses its "this is one oracle, not an acceptance verdict" note
+    # (#2917). The note exists for direct single-mode callers; inside the cycle
+    # it would be false — both oracles are being run and this wrapper applies
+    # the real acceptance condition.
+    BEZEL_NO_GC=1 BEZEL_GATE_CYCLE=1 scripts/gate.sh "$@" > "$log" 2>&1
     rc=$?
     if [ "$rc" -eq 2 ]; then
       say "$mode_desc attempt $i: preflight refused (builders active) — waiting"

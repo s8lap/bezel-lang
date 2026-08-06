@@ -627,3 +627,26 @@ if [ "${rc:-1}" -eq 0 ] && [ "${COV_GTESTS:-0}" -gt 0 ] && [ -n "${GATE_CACHE_ID
 fi
 
 echo "== GATE PASS =="
+
+# fix #2917 (follow-on to #2633): a SINGLE-mode gate is not an acceptance verdict.
+#
+# This script runs ONE oracle per invocation (MODE is the first arg only). #2633
+# measured that the two are different oracles, not two strengths of one: ASan
+# replaces the allocator and changes layout, so a wild read that FAULTS on the
+# plain build can land in mapped memory and pass under --full. Same binary, same
+# filter, in #2633's evidence: 3 failures plain, 0 under ASan.
+#
+# The banner above says only that THIS oracle is green. Without this note a log
+# ending in `== GATE PASS ==` reads as a full acceptance when pasted into a
+# report — which is how runs came to gate almost exclusively with --full,
+# leaving that whole defect class invisible however many times the gate ran.
+#
+# Suppressed when scripts/gate_full_cycle.sh is driving (it runs both modes and
+# applies its own acceptance condition), so the note appears exactly when the
+# result really is partial.
+if [ "${BEZEL_GATE_CYCLE:-0}" != 1 ]; then
+  echo "== gate: NOTE — this is ONE oracle (mode=$MODE), NOT a full acceptance verdict. =="
+  echo "==   #2633: plain and --full catch DIFFERENT defect classes; neither dominates. =="
+  echo "==   To accept a batch (and to push), run scripts/gate_full_cycle.sh — or just  =="
+  echo "==   scripts/gate_and_push.sh, which now gates on both oracles by default.      =="
+fi

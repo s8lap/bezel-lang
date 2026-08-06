@@ -219,13 +219,28 @@ preview, `--apply` to act; `scripts/reap_orphans.sh` clears processes a dead
 agent orphaned. Per-worktree build dirs live *inside* the worktree, so reaping
 the worktree reclaims them too.
 
-**Delicate merges (object layout, disposal machinery, runtime).** Gate these
-with `scripts/gate_and_push.sh --full` (or `gate.sh --full`): `--full` runs the
-whole suite with generated-code AddressSanitizer forced on
-(`BEZEL_AOT_FORCE_SANITIZE=address`) — the former standalone whole-suite ASan
-sweep is folded into that one sharded pass (#1861). No separate serial pass or
-`asan_sweep.sh` is needed: AOT process-isolation makes serial-order corruption
-structurally impossible, so the sharded `--full` run is the whole oracle.
+**Gating a batch: BOTH oracles, always.** Land with `scripts/gate_and_push.sh`
+— it runs `scripts/gate_full_cycle.sh` (plain, then `--full`), requires each to
+be trustworthy-green, and only then pushes. `--full` forces generated-code
+AddressSanitizer on every test program (`BEZEL_AOT_FORCE_SANITIZE=address`), so
+the whole suite runs under ASan in that one sharded pass — the former standalone
+`asan_sweep.sh` is folded in (#1861), and no serial pass is needed because AOT
+process-isolation makes serial-order corruption structurally impossible.
+
+⚠ **`--full` is a DIFFERENT oracle, not a stronger one (#2633) — neither
+dominates, so one is never sufficient.** ASan replaces the allocator and changes
+layout, so a wild read that FAULTS on the plain build can land in mapped memory
+and pass under `--full`; conversely a silent overflow the plain build tolerates
+is only caught by ASan. #2633's evidence is one binary, one filter: 3 failures
+plain, 0 under ASan, where the bug was a SIGSEGV on the default build. Because
+runs had been gating almost exclusively with `--full`, that whole defect class
+was "structurally invisible to the gate, however many times it ran".
+
+`scripts/gate_and_push.sh --full` still works and is now a **no-op** (the cycle
+always runs ASan). `--quick` is REFUSED for a push. A deliberate one-oracle gate
+is `--single-oracle MODE`, which says loudly that it is not a full acceptance.
+Running `scripts/gate.sh` directly gates ONE oracle and now prints that its
+`GATE PASS` is not an acceptance verdict — use it for diagnosis, not to land.
 
 ## When in doubt
 
