@@ -5574,19 +5574,118 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     elems[0] = llvm::cast<llvm::Constant>(descGV);
     elems[1] = llvm::ConstantExpr::getPointerCast(itmapGV, ptrTy());
     elems[2] = llvm::cast<llvm::Constant>(specDispose);
-    // ⚠ THESE THREE HOLD THE ERASED TEMPLATE THUNK, which is WRONG for a
-    // layout-moving instantiation and is #2953, filed with its own measurement
-    // rather than folded into #2943: `field=21` beside `s=w=0` in one run — a
-    // SILENT WRONG VALUE, not the fault its single-module twin (#2947) produced.
-    // #2947 factored the class-chain walks and the thunk BODY emitters out of
-    // the three builders precisely so a second caller can wrap a different
-    // target, and #2943's early registration above now makes a body emission
-    // here safe; what is still missing is the re-lowered target itself.
-    elems[kToStringSlot] = classToStringThunk(ts);
+    // fix #2953 (§8.5 "`ToString`" / §8.3 "`Equals` and `GetHashCode`" / §12
+    // "Inheritance and Dispatch" / §14.1 "Generic declarations" / §2.8.3 rule 4,
+    // v0.240): the FIXED Object slots 3/4/5 are the CROSS-MODULE twin of #2947's
+    // condition (e), and they held the ERASED TEMPLATE THUNK for every imported
+    // generic instantiation — a thunk that calls `methodFns_[user]`, which for an
+    // imported method is the ExternalLinkage declaration of the exporter's
+    // `T -> i32` template body. On a layout-moving instantiation that body GEPs
+    // offsets the object does not have.
+    //
+    // WORSE IN KIND THAN #2947, which is why it is its own fix: the single-module
+    // twin SEGV'd, so it announced itself. Here the wrong offset lands inside the
+    // object's own allocation and nothing faults. ALL THREE ARMS MEASURED on this
+    // fix's parent — #2953 labelled `Equals`/`GetHashCode` "inferred, not probed",
+    // so they were probed rather than assumed — in ONE two-module run of a
+    // `GTs12<T>` with two `T`-typed fields, `_w: int := 21`, and all three
+    // overrides:
+    //
+    //     field=21   the storage IS 21 at the composed offset
+    //     s=w=0      slot 3, WRONG: "w=21" is correct
+    //     eq=0       slot 4, WRONG: the body is `_w = 21`, so 1 is correct
+    //     hash=23    slot 5, WRONG: the body is `_w + 23`, so 44 is correct
+    //
+    // `hash=23` is the sharpest of the three: not a null, not a crash, an
+    // arithmetically plausible number computed from a field read as 0.
+    //
+    // THE THUNK IS NOT THE BROKEN PART — what had to change is what it forwards
+    // TO — so the fix asks #2947's question (which is #2019's predicate) of the
+    // class that DECLARES the override, `instanceLayoutDiffersFromErasedTemplate
+    // (user->parent)`, and on true wraps `buildSpecializedMethodFn`'s re-lowered
+    // body in a fresh `...$specN` thunk through the SAME body emitters the
+    // template thunks use, so the Equals i1-coercion and the GetHashCode width
+    // coercion cannot diverge between the two. False for a non-generic declarer,
+    // at `T = int`, and for every generic class whose storage does not move: those
+    // keep the shared thunk, byte-identical to before. A class with NO override
+    // never reaches the specialization at all — its thunk is the §8.5/§8.3
+    // compiler-generated default ("For classes: the type's qualified name" /
+    // "Reference equality" / "Identity-based"), which reads no field and so has no
+    // layout to be wrong about.
+    //
+    // THE SECOND GATE IS #2943's, and it is the one this cross-module twin needs
+    // that #2947 did not: `dynamic_cast<const ast::MethodDecl*>(user->decl)` —
+    // "the loader reconstructed a body". ModuleLoader attaches a re-parsed
+    // `ast::MethodDecl` from the exported `methodBodyText` (§14.1 / #783), and
+    // without one there is nothing honest to re-lower. Such a slot, and one whose
+    // specialization's SIGNATURE moves under the substitution, KEEP TODAY'S
+    // CONTENT rather than get a guess — the same refusal (c)/(d)/(e) make.
+    //
+    // The template thunk is built LAZILY (only on the keep path) because nothing
+    // else in this module needs it: unlike `specializedVtableFor`, which patches a
+    // shared `vt$<T>` that already holds it, a generic exports no shared vtable
+    // (§2.5), so this function is its only consumer.
+    //
+    // Body emission here is safe because #2943 registers `gv` before it; that was
+    // not true before.
+    auto objectSlotSpecTarget =
+        [&](sema::MethodSymbol* user) -> llvm::Function* {
+        if (!user || !user->parent) return nullptr;
+        if (!instanceLayoutDiffersFromErasedTemplate(user->parent))
+            return nullptr;
+        if (!dynamic_cast<const ast::MethodDecl*>(user->decl)) return nullptr;
+        auto mit = methodFns_.find(user);
+        if (mit == methodFns_.end() || !mit->second) return nullptr;
+        // The thunk calls the target with the slot's own FIXED arguments, so a
+        // specialization whose signature moves cannot go in it.
+        llvm::FunctionType* concFnTy = mit->second->getFunctionType();
+        CallableInfo ci;
+        if (!callableInfo(user, ci)) return nullptr;
+        std::vector<llvm::Type*> paramTys(concFnTy->param_begin(),
+                                          concFnTy->param_end());
+        llvm::Function* specFn = buildSpecializedMethodFn(user, ci, paramTys);
+        if (!specFn || specFn == mit->second ||
+            specFn->getFunctionType() != concFnTy)
+            return nullptr;
+        return specFn;
+    };
+    if (llvm::Function* t3 = objectSlotSpecTarget(classSlotToStringImpl(ts))) {
+        // The `$specN` suffix is evidence, not cosmetics (#2928's reason): LLVM
+        // would otherwise uniquify the InternalLinkage name to
+        // `bz$tostr$GTs12.1`, and this family's whole trail is which function
+        // name appears in the faulting / mis-answering frame.
+        auto* thunk = llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false),
+            llvm::Function::InternalLinkage, "bz$tostr$" + tsName + suffix,
+            module_.get());
+        emitClassToStringThunkBody(ts, thunk, t3);
+        elems[kToStringSlot] = llvm::cast<llvm::Constant>(thunk);
+    } else {
+        elems[kToStringSlot] = classToStringThunk(ts);
+    }
     // §9.6 (#946/#947/#948): fixed Equals/GetHashCode slots, same as a local
     // class vtable, so an Object-typed receiver of this specialization dispatches.
-    elems[kEqualsSlot] = classEqualsThunk(ts);
-    elems[kGetHashCodeSlot] = classHashCodeThunk(ts);
+    if (llvm::Function* t4 = objectSlotSpecTarget(classSlotEqualsImpl(ts))) {
+        auto* thunk = llvm::Function::Create(
+            llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
+                                    /*isVarArg=*/false),
+            llvm::Function::InternalLinkage, "bz$eq$" + tsName + suffix,
+            module_.get());
+        emitClassEqualsThunkBody(thunk, t4);
+        elems[kEqualsSlot] = llvm::cast<llvm::Constant>(thunk);
+    } else {
+        elems[kEqualsSlot] = classEqualsThunk(ts);
+    }
+    if (llvm::Function* t5 = objectSlotSpecTarget(classSlotHashCodeImpl(ts))) {
+        auto* thunk = llvm::Function::Create(
+            llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false),
+            llvm::Function::InternalLinkage, "bz$hash$" + tsName + suffix,
+            module_.get());
+        emitClassHashCodeThunkBody(thunk, t5);
+        elems[kGetHashCodeSlot] = llvm::cast<llvm::Constant>(thunk);
+    } else {
+        elems[kGetHashCodeSlot] = classHashCodeThunk(ts);
+    }
     for (std::size_t i = 0;
          i < slots.size() && kVirtualMethodsBase + i < elems.size(); ++i) {
         const VSlot& vs = slots[i];
