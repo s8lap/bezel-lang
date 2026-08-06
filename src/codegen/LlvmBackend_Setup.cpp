@@ -5149,7 +5149,20 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
 //          concrete object's memory even when the method's own signature
 //          doesn't involve T at all. §12/§14 (#1240).
 //
-// Falls back to the shared vtable when neither condition holds. Cached per
+// (c) fix #2906 (§14.1 / §12 / §12.1 / §12.7 / §2.8.3 rule 4, v0.240): a
+//     VIRTUAL METHOD slot
+//     whose implementation is declared on a class whose instance-storage layout
+//     under this substitution differs from its erased template's. Same question
+//     (b2) asks about the itable and #2019 asks about the base disposer, asked
+//     for the ORDINARY vtable slots — where nobody was asking it, so every
+//     per-instantiation vtable still pointed its virtual slots at the shared
+//     `bz$<Class>$<M>` template. §12.1 makes `virtual` the ONLY difference
+//     between a shape #2896's call-site machinery repairs and one it cannot
+//     reach at all (`class D2<U> : GBase<string>` dispatched through the base:
+//     the candidate's own argument is not derivable from the receiver's static
+//     type, and the reachable instantiation set is not statically enumerable).
+//
+// Falls back to the shared vtable when no condition holds. Cached per
 // (class, spec-field-type vector) so each distinct instantiation builds once.
 llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) {
     llvm::GlobalVariable* shared = vtableOf(ts);
@@ -5263,7 +5276,80 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
         }
     }
 
-    if (!needsSpecDispose && !needsSpecItable && !needsSpecDescriptor)
+    // fix #2906 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
+    // §12.1 "Members are non-virtual by default" / §12.7 "Type tests: `is`, `is
+    // not`, `as`" / §2.8.3 rule 4, v0.240): condition (c) — a VIRTUAL METHOD
+    // slot whose compiled body was emitted against a layout this instantiation's
+    // objects do not have. Slots 0/1/2 (descriptor, itmap, Dispose) were the only ones this
+    // function ever patched, so `vt$D2$spec0` still pointed its `Show` slot at
+    // `bz$H.D2$Show` — the erased `T -> i32` TEMPLATE — and ordinary vtable
+    // dispatch through it GEP'd the placeholder offsets: `SEGV on unknown address
+    // 0xc ... in bz$H.D2$Show` for `class D2<U> : GBase<string>` reached through
+    // a `GBase<string>`-typed variable, on legal single-module code with no
+    // diagnostic at any severity.
+    //
+    // This is the shape #2896's CALL-SITE machinery deliberately refuses:
+    // `deriveDescendantGenericSubst` cannot invert `D2<U> : GBase<string>` (a
+    // `GBase<string>` really can hold a `D2<int>` and a `D2<double>` at once), so
+    // `emitVirtualGenericDispatch` abandons the dispatch and control falls
+    // through to exactly this vtable. Nothing at a call site can close it — the
+    // set of instantiations reachable there is not statically enumerable — so the
+    // body has to be right in the SLOT.
+    //
+    // THE QUESTION ASKED IS PER DECLARING CLASS, not per method shape:
+    // `instanceLayoutDiffersFromErasedTemplate(impl->parent)` (#2019's predicate,
+    // exposed by #2896) — "was the compiled body emitted against the struct this
+    // object actually has?" — asked about the class that DECLARES the
+    // implementation, which is the class whose `classStruct` that body GEPs. It
+    // is false for a non-generic declarer (`class Plain` whose virtual `G<T>`
+    // inherits without overriding — its prefix does not move), for `T = int`, and
+    // for every generic class whose storage sequence does not move, so all of
+    // those keep the shared slot with no behaviour change.
+    std::vector<std::pair<unsigned, sema::MethodSymbol*>> virtualSlotsToSpec;
+    {
+        auto vmIt = vtableMethods_.find(ts);
+        auto* sharedInitPeek =
+            llvm::dyn_cast<llvm::ConstantArray>(shared->getInitializer());
+        unsigned nElems =
+            sharedInitPeek
+                ? llvm::cast<llvm::ArrayType>(shared->getValueType())
+                      ->getNumElements()
+                : 0u;
+        if (vmIt != vtableMethods_.end() && sharedInitPeek) {
+            for (std::size_t i = 0; i < vmIt->second.size(); ++i) {
+                sema::MethodSymbol* impl = vmIt->second[i].method;
+                // A virtual PROPERTY/indexer accessor slot carries no
+                // MethodSymbol; its accessor body has the same exposure and is
+                // filed separately rather than guessed at here.
+                if (!impl || !impl->parent) continue;
+                unsigned slot =
+                    kVirtualMethodsBase + static_cast<unsigned>(i);
+                if (slot >= nElems) continue;
+                auto mit = methodFns_.find(impl);
+                if (mit == methodFns_.end() || !mit->second) continue;
+                // Only a slot that still holds the SHARED template body is ours
+                // to replace.
+                if (sharedInitPeek->getAggregateElement(slot) !=
+                    llvm::cast<llvm::Constant>(mit->second))
+                    continue;
+                if (!instanceLayoutDiffersFromErasedTemplate(impl->parent))
+                    continue;
+                // The slot's ABI is fixed by the receiver's static method type at
+                // every call site, so a specialization whose signature MOVES
+                // under the substitution (`virtual method Get(): T`) cannot go in
+                // it. Refuse — leaving today's path — rather than install a
+                // function the indirect call would mistype.
+                llvm::FunctionType* concFnTy = methodFnType(impl);
+                if (!concFnTy || concFnTy != mit->second->getFunctionType())
+                    continue;
+                virtualSlotsToSpec.push_back({slot, impl});
+            }
+        }
+    }
+    const bool needsSpecVirtuals = !virtualSlotsToSpec.empty();
+
+    if (!needsSpecDispose && !needsSpecItable && !needsSpecDescriptor &&
+        !needsSpecVirtuals)
         return shared;
 
     // #1843: when the instantiation needs a per-monomorphization descriptor,
@@ -5293,6 +5379,40 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
 
     std::string suffix = "$spec" + std::to_string(
         specMap.size() + specVtablesByDesc_[ts].size());
+
+    // fix #2906 (§14.1 / §12 / §2.8.3 rule 4, v0.240): CREATE AND REGISTER THE
+    // GLOBAL
+    // BEFORE EMITTING ANY SPECIALIZED BODY. Every specialized piece below —
+    // the disposer, the itable slots, and now the virtual-method slots — is a
+    // full body emission that can re-enter this function for the SAME
+    // instantiation (a destructor or a `virtual method Clone()` that runs
+    // `new Self<T>()`), and the cache was only written on the way out. That
+    // re-entry used to miss and build a SECOND vtable for one instantiation, so
+    // objects minted inside such a body carried a different global from objects
+    // minted outside it. Registering first makes the re-entry find this one; the
+    // initializer starts as a faithful clone of the shared vtable (already
+    // correct for every slot nothing below patches) and is finalized at the end.
+    auto* arrTy = llvm::cast<llvm::ArrayType>(shared->getValueType());
+    auto* sharedInit = llvm::cast<llvm::ConstantArray>(shared->getInitializer());
+    std::vector<llvm::Constant*> elems;
+    elems.reserve(arrTy->getNumElements());
+    for (unsigned i = 0; i < arrTy->getNumElements(); ++i)
+        elems.push_back(sharedInit->getAggregateElement(i));
+    if (instDesc)
+        elems[0] = instDesc;  // #1843: slot 0 = per-monomorphization descriptor
+    auto* gv = new llvm::GlobalVariable(
+        *module_, arrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(arrTy, elems),
+        "vt$" + std::string(ts->name) + suffix);
+    // §8.6 #417: a specialized vtable is a word-0 vtable an object can carry, so
+    // register it in the string discriminator's whitelist (bz$vtable$table) —
+    // otherwise bz_obj_is_string misreads such an instance as a string and
+    // `is`/`as` on it silently fails (#1843). finalizeVtableTable emits the table
+    // after this push.
+    allVtables_.push_back(gv);
+    if (needsSpecDescriptor) specVtablesByDesc_[ts][instDesc] = gv;
+    else specMap[specFieldTys] = gv;
 
     // (a) Specialized disposer — only when the class has an owned T field.
     llvm::Function* specDispose = nullptr;
@@ -5381,32 +5501,39 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
             "itmap$" + std::string(ts->name) + suffix);
     }
 
-    // Clone the shared vtable initializer and patch the needed slots.
-    auto* arrTy = llvm::cast<llvm::ArrayType>(shared->getValueType());
-    auto* sharedInit = llvm::cast<llvm::ConstantArray>(shared->getInitializer());
-    std::vector<llvm::Constant*> elems;
-    elems.reserve(arrTy->getNumElements());
-    for (unsigned i = 0; i < arrTy->getNumElements(); ++i)
-        elems.push_back(sharedInit->getAggregateElement(i));
+    // (c) fix #2906: the VIRTUAL METHOD slots proved above to hold a body
+    // compiled against a layout this instantiation's objects do not have. Each is
+    // re-emitted under the active substitution — the same vehicle (b) uses for an
+    // itable slot, for the same reason: `buildSpecializedMethodFn` re-lowers the
+    // body, so its GEPs run against `classStruct(impl->parent)` under THIS
+    // substitution rather than against the erased template struct.
+    //
+    // A slot whose specialization could not be built, or whose built signature
+    // does not match the slot's fixed ABI, is LEFT ALONE — falling back to
+    // exactly today's (template) content rather than installing a function the
+    // indirect call at the receiver's static type would mistype.
+    for (const auto& [slot, impl] : virtualSlotsToSpec) {
+        auto mit = methodFns_.find(impl);
+        if (mit == methodFns_.end()) continue;
+        llvm::FunctionType* concFnTy = mit->second->getFunctionType();
+        CallableInfo ci;
+        if (!callableInfo(impl, ci)) continue;
+        std::vector<llvm::Type*> paramTys;
+        paramTys.reserve(concFnTy->getNumParams());
+        for (unsigned pi = 0; pi < concFnTy->getNumParams(); ++pi)
+            paramTys.push_back(concFnTy->getParamType(pi));
+        llvm::Function* specFn = buildSpecializedMethodFn(impl, ci, paramTys);
+        if (!specFn || specFn->getFunctionType() != concFnTy) continue;
+        elems[slot] = llvm::cast<llvm::Constant>(specFn);
+    }
+
+    // Patch the remaining slots and finalize the initializer of the global
+    // registered above (fix #2906 — see there for why it is created early).
     if (specDispose)
         elems[2] = llvm::cast<llvm::Constant>(specDispose);  // slot 2 = Dispose
     if (specItmapGV)
         elems[1] = llvm::ConstantExpr::getPointerCast(specItmapGV, ptrTy());  // slot 1 = itmap
-    if (instDesc)
-        elems[0] = instDesc;  // #1843: slot 0 = per-monomorphization descriptor
-    auto* init = llvm::ConstantArray::get(arrTy, elems);
-    auto* gv = new llvm::GlobalVariable(
-        *module_, arrTy, /*isConstant=*/true,
-        llvm::GlobalValue::InternalLinkage, init,
-        "vt$" + std::string(ts->name) + suffix);
-    // §8.6 #417: a specialized vtable is a word-0 vtable an object can carry, so
-    // register it in the string discriminator's whitelist (bz$vtable$table) —
-    // otherwise bz_obj_is_string misreads such an instance as a string and
-    // `is`/`as` on it silently fails (#1843). finalizeVtableTable emits the table
-    // after this push.
-    allVtables_.push_back(gv);
-    if (needsSpecDescriptor) specVtablesByDesc_[ts][instDesc] = gv;
-    else specMap[specFieldTys] = gv;
+    gv->setInitializer(llvm::ConstantArray::get(arrTy, elems));
     return gv;
 }
 
