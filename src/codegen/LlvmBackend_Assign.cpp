@@ -1589,6 +1589,13 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         llvm::Function* fn = git->second;
         llvm::Value* obj = lowerExpr(*ix.target);
         if (!obj) return nullptr;
+        // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): establish the
+        // temporary's disposal AT ITS PRODUCTION — before the INDEX ARGUMENTS
+        // are lowered and before the accessor runs — so a throw from either
+        // unwinds through it. Discharged by the reclaim below.
+        llvm::AllocaInst* recvUnwindSlot = registerFreshNewReceiverTempUnwind(
+            ix.target.get(), obj, ctx_.exprType(ix),
+            /*calleeReturnsOwned=*/false);
         if (!obj->getType()->isPointerTy()) {
             if (!obj->getType()->isAggregateType()) return nullptr;
             llvm::AllocaInst* tmp = entryAlloca(obj->getType());
@@ -1629,7 +1636,8 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         // That is what keeps this clear of #2261's fresh-receiver UAF shape.
         if (!diverged_)
             disposeFreshNewReceiverTemp(ix.target.get(), obj, ctx_.exprType(ix),
-                                        /*calleeReturnsOwned=*/false);
+                                        /*calleeReturnsOwned=*/false,
+                                        recvUnwindSlot);
         return r;
     }
     // #730 / §13 / §23.4: an indexer accessed through an INTERFACE-typed receiver
@@ -1668,6 +1676,11 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         auto* gFnTy = llvm::FunctionType::get(retTy, paramTys, false);
         llvm::Value* obj = lowerExpr(*ix.target);
         if (!obj || !obj->getType()->isPointerTy()) return nullptr;
+        // fix #2816 / §28.3 (v0.240): establish the temporary's disposal at its
+        // production — before the index arguments and the dispatched accessor.
+        llvm::AllocaInst* recvUnwindSlot = registerFreshNewReceiverTempUnwind(
+            ix.target.get(), obj, ctx_.exprType(ix),
+            /*calleeReturnsOwned=*/false);
         llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
         auto* lookupFn =
             declareC("bz_itable_lookup", ptrTy(), {ptrTy(), ptrTy()});
@@ -1709,7 +1722,8 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         // That is what keeps this clear of #2261's fresh-receiver UAF shape.
         if (!diverged_)
             disposeFreshNewReceiverTemp(ix.target.get(), obj, ctx_.exprType(ix),
-                                        /*calleeReturnsOwned=*/false);
+                                        /*calleeReturnsOwned=*/false,
+                                        recvUnwindSlot);
         return r;
     }
     // #1080 / §23.4: a virtual/override/abstract indexer on a CLASS receiver
@@ -1745,6 +1759,13 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
             auto* gFnTy = llvm::FunctionType::get(retTy, paramTys, false);
             llvm::Value* obj = lowerExpr(*ix.target);
             if (obj && obj->getType()->isPointerTy()) {
+                // fix #2816 / §28.3 (v0.240): establish the temporary's disposal
+                // at its production — before the index arguments and the
+                // vtable-dispatched accessor.
+                llvm::AllocaInst* recvUnwindSlot =
+                    registerFreshNewReceiverTempUnwind(
+                        ix.target.get(), obj, ctx_.exprType(ix),
+                        /*calleeReturnsOwned=*/false);
                 llvm::Value* vptr = builder_.CreateLoad(ptrTy(), obj);
                 llvm::Value* fnPtr = builder_.CreateLoad(
                     ptrTy(),
@@ -1783,7 +1804,8 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
                 // That is what keeps this clear of #2261's fresh-receiver UAF shape.
                 if (!diverged_)
                     disposeFreshNewReceiverTemp(ix.target.get(), obj, ctx_.exprType(ix),
-                                                /*calleeReturnsOwned=*/false);
+                                                /*calleeReturnsOwned=*/false,
+                                                recvUnwindSlot);
                 return r;
             }
         }
@@ -1817,6 +1839,11 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     if (getterBlock) {
         llvm::Value* obj = lowerExpr(*ix.target);
         if (!obj) return nullptr;
+        // fix #2816 / §28.3 (v0.240): establish the temporary's disposal at its
+        // production — before the index arguments and the standalone getter.
+        llvm::AllocaInst* recvUnwindSlot = registerFreshNewReceiverTempUnwind(
+            ix.target.get(), obj, ctx_.exprType(ix),
+            /*calleeReturnsOwned=*/false);
         // §9.2: a record receiver is a by-value struct; spill it and pass the
         // address (the getter takes `this` as a pointer), mirroring the
         // block-form property-getter call path.
@@ -1864,7 +1891,8 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
         // That is what keeps this clear of #2261's fresh-receiver UAF shape.
         if (!diverged_)
             disposeFreshNewReceiverTemp(ix.target.get(), obj, ctx_.exprType(ix),
-                                        /*calleeReturnsOwned=*/false);
+                                        /*calleeReturnsOwned=*/false,
+                                        recvUnwindSlot);
         return res;
     }
 
@@ -1872,6 +1900,12 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // Bind `this` to the target object and indexer params to the args.
     llvm::Value* obj = lowerExpr(*ix.target);
     if (!obj) return nullptr;
+    // fix #2816 / §28.3 (v0.240): establish the temporary's disposal at its
+    // production — before the index arguments (lowered just below, in the
+    // CALLER's scope) and before the inlined getter body, either of which may
+    // throw. Discharged by the reclaim at the end of this function.
+    llvm::AllocaInst* recvUnwindSlot = registerFreshNewReceiverTempUnwind(
+        ix.target.get(), obj, ctx_.exprType(ix), /*calleeReturnsOwned=*/false);
     // #794: lower the index ARGUMENTS in the CALLER's scope — BEFORE clearing
     // locals_/paramSlots_ for the inline getter body. An index expression may
     // reference the enclosing method's locals or parameters (e.g. `x[i]` where
@@ -1975,7 +2009,8 @@ llvm::Value* Emitter::lowerIndexerGet(const ast::IndexExpr& ix) {
     // That is what keeps this clear of #2261's fresh-receiver UAF shape.
     if (!diverged_)
         disposeFreshNewReceiverTemp(ix.target.get(), obj, ctx_.exprType(ix),
-                                    /*calleeReturnsOwned=*/false);
+                                    /*calleeReturnsOwned=*/false,
+                                    recvUnwindSlot);
     return result;
 }
 

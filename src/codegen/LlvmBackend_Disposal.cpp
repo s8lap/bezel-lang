@@ -2150,17 +2150,17 @@ void Emitter::emitInlineArrayStringReleases_impl(
 }
 
 
-void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
-                                          llvm::Value* recvPtr,
-                                          const sema::TypeRef* resultTy,
-                                          bool calleeReturnsOwned) {
+bool Emitter::freshNewReceiverTempEligible(const ast::Expr* recvExpr,
+                                           llvm::Value* recvPtr,
+                                           const sema::TypeRef* resultTy,
+                                           bool calleeReturnsOwned) const {
     // #1039 / #1053 / §28.3: a fresh owned-class producer used ONLY as the
     // receiver of a member access or method call — never bound to a variable —
     // is owned by nothing and leaks. Dispose it after the value result has been
     // extracted, when the receiver is a fresh `new`/`owned`-returning producer
     // (#1039/#1053-case-2) and the result cannot alias into it.
-    if (!recvExpr || !recvPtr || !resultTy) return;
-    if (!isFreshOwnedClassProducer(recvExpr)) return;
+    if (!recvExpr || !recvPtr || !resultTy) return false;
+    if (!isFreshOwnedClassProducer(recvExpr)) return false;
     // The extracted result must be a NON-REFERENCE value — provably free of any
     // reference or borrow into the receiver: a numeric/bool/char/decimal
     // primitive, an enum, or unit. EXCLUDED, because each may alias into the
@@ -2226,7 +2226,108 @@ void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
             valueResult = true;
         }
     }
-    if (!valueResult) return;
+    return valueResult;
+}
+
+
+// fix #2816 / §28.3 "Unbound owned temporaries" (v0.240) — the EXCEPTION-PATH
+// half of the #1039 family. See the declaration comment (LlvmBackend_impl.hpp)
+// for the mechanism; this is the soundness argument.
+//
+// WHY A REGISTRATION IS OWED. §28.3, immediately after the sentence #1039/#2751/
+// #2814 implement: "When the full expression is instead exited by an
+// **exception** — an operand or argument evaluated later throws before the
+// temporary's transfer or consumption point — every already-produced,
+// not-yet-consumed unbound owned temporary is disposed during unwinding by the
+// same implicit `try`/`finally` mechanism as named locals … each temporary's
+// disposal is established at its production, so the pass runs in reverse order
+// of production on the establishment-ordered cleanup stack". The whole
+// disposeFreshNewReceiverTemp family emitted its reclaim INLINE after the
+// accessor call, in the `emitPendingCheck` continuation — so a getter/indexer/
+// method that threw skipped it and the receiver leaked (#2816: MEASURED live
+// count 20 for 20 throwing iterations, against 0 for 20 normal ones).
+//
+// WHY IT CANNOT DOUBLE-DISPOSE. The entry is `unwindOnly`, so emitDisposals
+// skips it on every NORMAL exit; and it is DISCHARGED AT RUNTIME by the reclaim,
+// which stores null into the slot before freeing the block (the same
+// null-guarded discharge #1918 uses for a transferred owned local, and for the
+// same reason it gives there: "nulls at runtime instead of erasing the
+// registration"). Every unwindOnly disposal loads the slot, skips a null, and
+// nulls it again after disposing — so on any concrete execution the block is
+// disposed by exactly one of {the reclaim, the first unwind pass that reaches a
+// non-null slot}, never both. Registration and reclaim share ONE eligibility
+// predicate (freshNewReceiverTempEligible), so the two can never disagree about
+// whether a given temporary is covered.
+//
+// WHY THE DISCHARGE IS RUNTIME AND NOT AN ERASURE OF THE ENTRY. An erasure at
+// the reclaim would be cheaper IR, and was the first draft — but it silently
+// loses the try-WITH-`finally` shape: lowerTry pushes the try body's disposal
+// scope BELOW `unwindScopeDepth_` on purpose (#1263, §28.3's "the explicit
+// finally runs first … then the implicit auto-dispose runs as the scope unwinds
+// further"), so that scope's unwind pass is emitted LATER, at `finUnwindBB` —
+// after the whole body, and therefore after the reclaim would have erased the
+// entry. MEASURED: the erasing draft left the `finally` spelling of the issue's
+// own repro leaking all 20 receivers while every non-`finally` spelling was
+// clean. The runtime null is edge-order-independent, so it covers the deferred
+// pass too.
+//
+// The slot is `entryAllocaNullPtr` (#2733), NOT a bare `entryAlloca`: a disposal
+// pass can be reached on a path that never executed the production store (a
+// sibling branch of an `if`, an unwind out of an operand evaluated before it),
+// and a bare alloca would hand it an undef pointer to free.
+//
+// WHY IT CANNOT UAF. The value is a fresh `new`-produced heap class instance
+// whose only use in the expression is as this receiver (isFreshOwnedClassProducer
+// + the non-reference-result gate). On the unwind edge no result was produced at
+// all, so nothing can alias into it; on the normal edge the slot is nulled
+// before the inline reclaim frees the block, so no later pass reads a freed
+// pointer.
+llvm::AllocaInst* Emitter::registerFreshNewReceiverTempUnwind(
+        const ast::Expr* recvExpr, llvm::Value* recvPtr,
+        const sema::TypeRef* resultTy, bool calleeReturnsOwned) {
+    if (!freshNewReceiverTempEligible(recvExpr, recvPtr, resultTy,
+                                      calleeReturnsOwned))
+        return nullptr;
+    // No enclosing scope to unwind through (a disposer body, or a function whose
+    // scopes are not yet established) — nothing to register against.
+    if (disposeStack_.empty()) return nullptr;
+    if (emittingDisposerBody_) return nullptr;
+    // The eligibility gate already restricts to a heap CLASS producer, so this
+    // is belt-and-braces: a non-pointer or literal-null receiver is never a
+    // disposable heap instance.
+    if (!recvPtr->getType()->isPointerTy()) return nullptr;
+    if (llvm::isa<llvm::ConstantPointerNull>(recvPtr)) return nullptr;
+    llvm::AllocaInst* slot = entryAllocaNullPtr();
+    builder_.CreateStore(recvPtr, slot);
+    Disposal d{slot, nullptr};
+    d.unwindOnly = true;
+    d.dynamicDispose = false;
+    disposeStack_.back().push_back(d);
+    return slot;
+}
+
+
+void Emitter::dischargeFreshNewReceiverTempUnwind(llvm::AllocaInst* slot) {
+    if (!slot) return;
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), slot);
+}
+
+
+void Emitter::disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
+                                          llvm::Value* recvPtr,
+                                          const sema::TypeRef* resultTy,
+                                          bool calleeReturnsOwned,
+                                          llvm::AllocaInst* unwindSlot) {
+    // fix #2816: the normal path is about to reclaim the temporary, so retire
+    // its exception-edge registration FIRST — a slot left holding the pointer
+    // would make a later unwind through this scope dispose an already-freed
+    // block. Discharged unconditionally (before the eligibility test): the slot
+    // is non-null only when registerFreshNewReceiverTempUnwind accepted the same
+    // arguments, so this pairs exactly with a registration that happened.
+    dischargeFreshNewReceiverTempUnwind(unwindSlot);
+    if (!freshNewReceiverTempEligible(recvExpr, recvPtr, resultTy,
+                                      calleeReturnsOwned))
+        return;
     // Dispose (idempotent vtable Dispose + reclaim exactly once). A fresh `new`
     // is non-null, but null-guard for safety/uniformity (folded away for a
     // provably-non-null pointer).

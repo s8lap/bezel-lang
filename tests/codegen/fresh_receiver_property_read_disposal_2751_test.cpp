@@ -331,19 +331,29 @@ BEZEL_TEST(fresh_receiver_property_2751, record_result_receiver_not_disposed) {
         88);
 }
 
-// §31: the accessor throws. The reclaim is emitted behind the pending-exception
-// check, so it runs on the NORMAL return path only — on the unwind edge the
-// temporary leaks, the pre-existing safe direction shared with every other
-// fresh-receiver site. What must hold is that nothing is freed twice and the
-// exception still propagates: eight catches, eight receivers still live.
+// §31: the accessor throws.
+//
+// UPDATED BY #2816 (§28.3 *Unbound owned temporaries*, v0.240). When this case
+// was written the reclaim was emitted behind the pending-exception check, so it
+// ran on the NORMAL return path only and the temporary leaked on the unwind
+// edge; this case pinned that leak (8 live) as the then-safe direction. §28.3
+// requires the disposal on the exception edge too — "every already-produced,
+// not-yet-consumed unbound owned temporary is disposed during unwinding by the
+// same implicit `try`/`finally` mechanism as named locals" — so #2816 registers
+// the temporary at its production as a null-guarded `unwindOnly` disposal and
+// the expected live count is now 0, i.e. 8 (== 0 * 10 + 8 made). The
+// double-dispose half of the assertion is unchanged and is the reason the case
+// stays: `expectBoth` runs it under generated-code ASan+LSan, so an over-release
+// would fault rather than read as a smaller count. The dedicated coverage for
+// the edge lives in fresh_receiver_temp_unwind_disposal_2816_test.cpp.
 BEZEL_TEST(fresh_receiver_property_2751, getter_throw_edge_no_double_dispose) {
-    expectBothLenient(
+    expectBoth(
         prog("  public property Boom: int "
              "    get => do throw new InvalidOperationException(\"no\"); end; "
              "  end Boom; ",
              "try total := total + (new Src()).Boom; "
              "catch var e: InvalidOperationException => total := total + 1; end; "),
-        88);
+        8);
 }
 
 }  // namespace

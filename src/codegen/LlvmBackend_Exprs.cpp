@@ -4289,6 +4289,14 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             }
             llvm::Value* obj = lowerExpr(*ma->target);
             if (!obj) return nullptr;
+            // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): establish
+            // the temporary's disposal AT ITS PRODUCTION, so an inlined getter
+            // body that throws unwinds through it. Discharged by the reclaim
+            // below. See registerFreshNewReceiverTempUnwind.
+            llvm::AllocaInst* recvUnwindSlot =
+                registerFreshNewReceiverTempUnwind(ma->target.get(), obj,
+                                                   ctx_.exprType(*ma),
+                                                   /*calleeReturnsOwned=*/false);
             // issue #347 / §9.2: a record is a by-value struct, not a heap
             // pointer. The getter body reads its fields against `this` via a
             // StructGEP, which requires a pointer base; binding a struct
@@ -4451,7 +4459,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (!diverged_)
                 disposeFreshNewReceiverTemp(ma->target.get(), obj,
                                             ctx_.exprType(*ma),
-                                            /*calleeReturnsOwned=*/false);
+                                            /*calleeReturnsOwned=*/false,
+                                            recvUnwindSlot);
             return v;
         }
         // CG33b: block-form getter (`get => do … end;`) — emit as a
@@ -4462,6 +4471,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (!ma->target) return nullptr;
             llvm::Value* obj = lowerExpr(*ma->target);
             if (!obj) return nullptr;
+            // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): establish
+            // the temporary's disposal AT ITS PRODUCTION so the standalone
+            // getter's throw edge (emitPendingCheck below) unwinds through it.
+            llvm::AllocaInst* recvUnwindSlot =
+                registerFreshNewReceiverTempUnwind(ma->target.get(), obj,
+                                                   ctx_.exprType(*ma),
+                                                   /*calleeReturnsOwned=*/false);
             // issue #347 / §9.2: the block getter is a function taking a
             // `this` pointer; a record receiver is a by-value struct, so spill
             // it to a stack slot and pass that slot's address (see the
@@ -4494,7 +4510,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (!diverged_)
                 disposeFreshNewReceiverTemp(ma->target.get(), obj,
                                             ctx_.exprType(*ma),
-                                            /*calleeReturnsOwned=*/false);
+                                            /*calleeReturnsOwned=*/false,
+                                            recvUnwindSlot);
             return res;
         }
         // §2.5 / §23 (issue #503): imported non-virtual property getter.
@@ -4568,6 +4585,13 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     obj = tmp;
                 }
                 if (obj && obj->getType()->isPointerTy()) {
+                    // fix #2816 / §28.3 (v0.240): establish the temporary's
+                    // disposal at its production, so the imported getter's
+                    // throw edge (emitPendingCheck below) unwinds through it.
+                    llvm::AllocaInst* recvUnwindSlot =
+                        registerFreshNewReceiverTempUnwind(
+                            ma->target.get(), obj, ctx_.exprType(*ma),
+                            /*calleeReturnsOwned=*/false);
                     llvm::Value* res = builder_.CreateCall(
                         git->second->getFunctionType(), git->second, {obj});
                     emitPendingCheck();
@@ -4578,7 +4602,8 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     if (!diverged_)
                         disposeFreshNewReceiverTemp(ma->target.get(), obj,
                                                     ctx_.exprType(*ma),
-                                                    /*calleeReturnsOwned=*/false);
+                                                    /*calleeReturnsOwned=*/false,
+                                                    recvUnwindSlot);
                     return res;
                 }
             }
@@ -5164,6 +5189,18 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
             ptrTy(), vptr, {builder_.getInt32(getIt->second)});
         fnPtr = builder_.CreateLoad(ptrTy(), slotPtr);
     }
+    // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): establish the
+    // temporary's disposal BEFORE the dispatched accessor runs, so its throw
+    // edge (the emitPendingCheck immediately below) unwinds through it. Placed
+    // here rather than at `recv`'s own lowering (line ~5022) because every
+    // early return between the two — the non-pointer guard, the missing
+    // type-descriptor guard — hands the read back to the static getter paths,
+    // which lower the receiver again; registering before them could strand an
+    // entry for a receiver this path no longer owns. A property read takes no
+    // arguments, so the accessor call is the whole throw window and nothing is
+    // lost by registering at its edge.
+    llvm::AllocaInst* recvUnwindSlot = registerFreshNewReceiverTempUnwind(
+        recvExpr, recv, ctx_.exprType(e), /*calleeReturnsOwned=*/false);
     llvm::Value* r = builder_.CreateCall(fnTy, fnPtr, {recv});
     emitPendingCheck();  // the accessor body may throw (§23.3)
     // fix #2751 / §28.3 "Unbound owned temporaries" (v0.240) — THE SHARED
@@ -5211,7 +5248,8 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
     // a bare `P` read (implicit `this`), where the helper returns immediately.
     if (!diverged_)
         disposeFreshNewReceiverTemp(recvExpr, recv, ctx_.exprType(e),
-                                    /*calleeReturnsOwned=*/false);
+                                    /*calleeReturnsOwned=*/false,
+                                    recvUnwindSlot);
     return r;
 }
 

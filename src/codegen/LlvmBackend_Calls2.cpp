@@ -6882,6 +6882,11 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // call in an argument position flushes its own records before this one
     // builds any, so no stack discipline is needed.
     std::vector<AccessorRefArg> accessorRefArgs;
+    // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): the discharge
+    // handle for this call's fresh-`new` RECEIVER temporary, registered at the
+    // receiver's production point below and retired by the reclaim at the end
+    // of this function. Null when the receiver is not such a temporary.
+    llvm::AllocaInst* recvUnwindSlot = nullptr;
     bool baseQualified = false;  // `base.M()` → non-virtual (§12.3)
     if (!isStaticMethod(ms)) {
         // Receiver: the member-access target, else the current `this`.
@@ -7116,6 +7121,29 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         }
         args.push_back(recv);
         argExprs.push_back(nullptr);  // receiver has no widening signedness
+        // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): establish the
+        // receiver temporary's disposal AT ITS PRODUCTION — before the ARGUMENTS
+        // are evaluated (buildOrderedArgs, below) and before the call runs — so
+        // that "an operand or argument evaluated later throws before the
+        // temporary's transfer or consumption point" disposes it during
+        // unwinding, as does a throw from the callee itself. Discharged by the
+        // reclaim at the end of this function, whose gate this mirrors exactly:
+        // an explicit `(new C()).Dispose()` never reaches here (the dedicated
+        // `obj.Dispose()` path above reclaims the fresh producer itself,
+        // #1053-case-1) but is excluded by name for the same reason the reclaim
+        // excludes it — registering a temporary that path frees would leave a
+        // dangling slot on a later unwind.
+        if (ms->name != "Dispose") {
+            const ast::Expr* recvTempExpr = nullptr;
+            if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    call.callee.get()))
+                recvTempExpr = ma->target.get();
+            bool recvCalleeReturnsOwned = false;
+            if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
+                recvCalleeReturnsOwned = md->returnOwned;
+            recvUnwindSlot = registerFreshNewReceiverTempUnwind(
+                recvTempExpr, recv, ctx_.exprType(call), recvCalleeReturnsOwned);
+        }
     }
     // per §14.1/§14.2 (issue #505): a generic *method* with a closure-typed
     // parameter (e.g. `GetV<T>(obj:T, getter:(T)->int):int`) may have lambda
@@ -7981,7 +8009,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
         if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl))
             calleeReturnsOwned = md->returnOwned;
         disposeFreshNewReceiverTemp(recvExpr, args[0], ctx_.exprType(call),
-                                    calleeReturnsOwned);
+                                    calleeReturnsOwned, recvUnwindSlot);
     }
 
     // #1467 / §22.4 / §28.3: dispose each `out owned` (class/interface) value

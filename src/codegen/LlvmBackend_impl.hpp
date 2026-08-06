@@ -10096,10 +10096,55 @@ private:
     // Defaults to false so the field-read call site (which can never reach
     // an `owned` producing position — accessor reads are lend-only, axiom
     // A4) is unaffected.
+    // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): `unwindSlot` is
+    // the registration handle returned by registerFreshNewReceiverTempUnwind at
+    // the receiver's PRODUCTION point (null when nothing was registered). It is
+    // DISCHARGED here — before the inline reclaim — so the normal path disposes
+    // the temporary exactly once and the unwind-edge entry never survives the
+    // full expression to see a freed pointer.
     void disposeFreshNewReceiverTemp(const ast::Expr* recvExpr,
                                      llvm::Value* recvPtr,
                                      const sema::TypeRef* resultTy,
-                                     bool calleeReturnsOwned = false);
+                                     bool calleeReturnsOwned = false,
+                                     llvm::AllocaInst* unwindSlot = nullptr);
+
+    // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): the eligibility
+    // predicate disposeFreshNewReceiverTemp used to carry inline — a fresh
+    // owned-class producer receiver whose extracted result is provably a
+    // NON-REFERENCE value. Factored out so the production-site registration and
+    // the reclaim site cannot drift apart: registering a temporary the reclaim
+    // would decline (or vice versa) is exactly how a stale unwind entry — and
+    // then a double dispose — would arise.
+    bool freshNewReceiverTempEligible(const ast::Expr* recvExpr,
+                                      llvm::Value* recvPtr,
+                                      const sema::TypeRef* resultTy,
+                                      bool calleeReturnsOwned) const;
+
+    // fix #2816 / §28.3 "Unbound owned temporaries" (v0.240): the EXCEPTION-edge
+    // half of the #1039 family's unbound-receiver reclaim. §28.3: "every
+    // already-produced, not-yet-consumed unbound owned temporary is disposed
+    // during unwinding by the same implicit `try`/`finally` mechanism as named
+    // locals … each temporary's disposal is established at its production, so
+    // the pass runs in reverse order of production on the establishment-ordered
+    // cleanup stack". Call at the receiver's PRODUCTION point (right after the
+    // receiver expression is lowered, before the accessor call / index arguments
+    // that may throw): spills the receiver pointer to a slot and pushes a
+    // null-guarded `unwindOnly` Disposal onto the CURRENT scope, so every unwind
+    // edge emitted between here and the reclaim disposes it. Returns the slot
+    // (the discharge handle) or null when nothing was registered. Mirrors #993's
+    // owned-`new`-ARGUMENT temporary registration in buildOrderedArgs exactly —
+    // register at production, discharge before the normal-path consumption.
+    llvm::AllocaInst* registerFreshNewReceiverTempUnwind(
+        const ast::Expr* recvExpr, llvm::Value* recvPtr,
+        const sema::TypeRef* resultTy, bool calleeReturnsOwned = false);
+
+    // fix #2816: discharge the registration for `slot` AT RUNTIME by nulling it,
+    // so the null-guarded `unwindOnly` disposal becomes a no-op on every later
+    // unwind edge. Null-safe (a no-op when nothing was registered). Deliberately
+    // NOT an erasure of the Disposal entry — see the definition's comment: the
+    // try-with-`finally` body scope's unwind pass is emitted after the whole
+    // body, so an erasure at the reclaim would lose it.
+    void dischargeFreshNewReceiverTempUnwind(llvm::AllocaInst* slot);
 
     // #913 / #1054 / §28.7: dispose the displaced old value of an owned class
     // local before a reassignment store overwrites it. Fires only when `target`
