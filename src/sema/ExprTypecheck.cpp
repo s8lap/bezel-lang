@@ -10671,6 +10671,32 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     if ((ps = dynamic_cast<PropertySymbol*>(
                              ctx_.exprSymbol(*as->target))))
                         propName = std::string(id->name);
+                } else if (dynamic_cast<const ast::IndexExpr*>(
+                               as->target.get())) {
+                    // fix #2851 (§23.3/§23.4, v0.240): the INDEXER twin of the
+                    // read-only rejection below. §23.4 makes an indexer "a
+                    // property whose name is replaced by `[parameters]`", so
+                    // §23.3's setter rule governs it identically — but only the
+                    // two NAMED spellings resolved a PropertySymbol here, so an
+                    // indexer target left `ps` null and the whole check was
+                    // skipped. Measured: `b[0] := 99;` on a getter-only indexer
+                    // compiled clean, ran, and SILENTLY DISCARDED the write
+                    // (read back 7), while the named twin `b.P := 99;` was
+                    // correctly rejected with the §23.3 diagnostic.
+                    //
+                    // The symbol is the one #2530 attaches to the IndexExpr, so
+                    // this asks the type-checker what the access resolved to
+                    // rather than re-deriving it. A BUILTIN collection index
+                    // (`Array`, `Dictionary`, a span) resolves no user
+                    // PropertySymbol, so `ps` stays null and those are
+                    // untouched by construction.
+                    ps = dynamic_cast<PropertySymbol*>(
+                        ctx_.exprSymbol(*as->target));
+                    if (ps && !ps->isIndexer) ps = nullptr;
+                    // An indexer's PropertySymbol::name is the synthetic
+                    // ".this", which would render as gibberish in the message,
+                    // so the diagnostic names the construct instead.
+                    if (ps) propName.clear();
                 }
                 if (ps) {
                         if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(
@@ -10693,11 +10719,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                                         break;
                                     }
                             if (!hasSetter) {
+                                // #2851: `propName` is empty for an indexer
+                                // (its symbol name is the synthetic ".this"),
+                                // so name the construct rather than print it.
                                 ctx_.diagnostics().report(
                                     Severity::Error, as->span.begin,
-                                    "cannot assign to read-only property `" +
-                                    propName +
-                                    "` — it has no setter (§23.3)");
+                                    propName.empty()
+                                        ? std::string(
+                                              "cannot assign through a "
+                                              "read-only indexer — it has no "
+                                              "setter (§23.3)")
+                                        : "cannot assign to read-only property `" +
+                                          propName +
+                                          "` — it has no setter (§23.3)");
                             } else if (isReadonlyAuto && !inConstructor_) {
                                 ctx_.diagnostics().report(
                                     Severity::Error, as->span.begin,
