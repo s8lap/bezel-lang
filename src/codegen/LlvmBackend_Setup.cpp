@@ -68,6 +68,22 @@ static bool isBakedStaticFieldInit(const sema::FieldSymbol* fs,
     return isConstantLiteralStaticInit(e) && isReadonlyStaticField(fs);
 }
 
+// fix #2899 (#1309 / §22.13): `constInitForExpr`'s INTEGER arms build their
+// llvm::Constant directly against the requested type, which asserts inside LLVM
+// when that type is not an integer; every other arm builds its own type and so
+// is caught by a caller's `getType() == ty` comparison afterwards. A caller that
+// did not itself derive `ty` from the very declaration it is folding must
+// therefore check this one shape agreement first. (Sema already guarantees it —
+// the initializer typechecked against the field's declared type — so this is a
+// belt-and-braces guard that keeps a future divergence a missed bake rather than
+// a compiler crash.)
+static bool constInitShapeFits(const ast::Expr* e, llvm::Type* ty) {
+    if (dynamic_cast<const ast::IntLiteralExpr*>(e) ||
+        dynamic_cast<const ast::BoolLiteralExpr*>(e))
+        return ty != nullptr && ty->isIntegerTy();
+    return true;
+}
+
 std::string Emitter::functionName(sema::MethodSymbol* ms) {
     if (isMain(ms)) return "main";
     // §26 (#433): an extension method has no parent type — name it after its
@@ -1049,10 +1065,53 @@ llvm::GlobalVariable* Emitter::getOrCreateGenericInstStaticGlobal(
     // When instTy differs from base->getValueType() (e.g. ptr vs
     // {i8,i32}), the base's typed initializer cannot be reused — use a
     // fresh null of the concrete type instead.
-    llvm::Constant* instInit =
-        (instTy == base->getValueType() && base->hasInitializer())
+    const bool copiedFromBase =
+        (instTy == base->getValueType() && base->hasInitializer());
+    llvm::Constant* instInit = copiedFromBase
             ? base->getInitializer()
             : llvm::Constant::getNullValue(instTy);
+    // fix #2899 (§22.12 rule 1 / §22.13 / §2.8.2 clause 2, v0.240): the
+    // paragraph above is right that an imported generic's template-level global
+    // has no initializer to copy — but "use zero-init" then SILENTLY DROPS the
+    // one initializer shape that never reaches the runtime store either. A
+    // `readonly` static's constant-literal initializer is BAKED into the backing
+    // global (isBakedStaticFieldInit, #1309), and genericInstSfinitFn skips its
+    // store for exactly that reason. Locally that composes: `base` carries the
+    // baked constant and it is copied here. For an IMPORT both halves decline —
+    // nothing to copy, and no store — so the field reads its zero forever.
+    //
+    // MEASURED on c7404bf, real two-module builds, single-module control = 107
+    // in every row: `static readonly S: int := 107` read 0; `: bool := true`
+    // read false; `: double := 107.5` read 0.0; `: long := 107` read 0; and
+    // `: string := "abcdefg"` read a NULL string and SIGSEGV'd on `.Length`.
+    // Generic RECORD and generic CLASS behaved identically, and the plain
+    // `static` (mutable) spelling was correct throughout — so the axis is
+    // `static` vs `static readonly`, not the record-vs-class one #2871 named.
+    //
+    // Restoring the bake here — rather than dropping the sfinit skip — is what
+    // keeps the LinkOnceODR merge sound. `bz$<Cls>$<args>$<field>` and
+    // `bz$...$sfinit` are BOTH LinkOnceODR and are merged INDEPENDENTLY, so a
+    // program where the declaring module also instantiates this type can link
+    // one module's global against the other module's sfinit. Making the sfinit
+    // store instead would leave the pairing {importer's zero global, declaring
+    // module's store-free sfinit} reading zero; baking makes EVERY module's
+    // definition of the global carry the value, so every pairing is correct.
+    //
+    // The ODR-determinism claim below is preserved exactly for an
+    // int/bool/float/decimal literal (the constants are byte-identical). For a
+    // STRING literal the baked constant is a pointer to a module-private,
+    // immutable, sentinel-refcount literal (lowerStringLiteralConst), so the
+    // merged definitions are content-identical rather than byte-identical —
+    // every merge outcome is the same string value, where today the outcomes
+    // differ between the right string and a null dereference.
+    if (!copiedFromBase && fieldDecl &&
+        isBakedStaticFieldInit(fs, fieldDecl->initializer.get()) &&
+        constInitShapeFits(fieldDecl->initializer.get(), instTy)) {
+        if (llvm::Constant* baked =
+                constInitForExpr(fieldDecl->initializer.get(), instTy);
+            baked != nullptr && baked->getType() == instTy)
+            instInit = baked;
+    }
     // #1513 / §2.8.3 rule 4 / §2.8.4 rule 5: LinkOnceODR (not Internal) — "a
     // process contains exactly ONE copy of ... each type's ... static state
     // ... exactly one runtime identity ... regardless of how many compilations
