@@ -5029,17 +5029,6 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     }
     bool needsSpecDescriptor = instDesc != nullptr;
 
-    // #1247 (§28.3/§28.4): a generic class whose user-defined destructor body
-    // references instantiation-dependent symbols (e.g. a static field of
-    // GBox<T>: `GBox<T>._m := GBox<T>._m - 1`) must also get a specialized
-    // disposer.  The shared type-erased disposer runs WITHOUT an active
-    // genericSubst_, so staticFieldGlobal() resolves the access to the
-    // TEMPLATE-LEVEL global (bz$GBox$_m) instead of the per-instantiation one
-    // (bz$GBox$int$_m).  Emitting a specialized disposer (with genericSubst_
-    // active) ensures the correct per-instantiation symbol is referenced.
-    bool needsSpecDispose = classHasOwnedTypeParamField(ts)
-                         || findDestructor(ts) != nullptr;
-
     // #1240 (§12/§14): detect when the concrete struct layout under the active
     // genericSubst_ differs from the template layout (built with T→i32 erasing).
     // structs_[ts] is the template struct created without a substitution active;
@@ -5053,6 +5042,45 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
         if (sit != structs_.end() && classStruct(ts) != sit->second)
             layoutDiffers = true;
     }
+
+    // #1247 (§28.3/§28.4): a generic class whose user-defined destructor body
+    // references instantiation-dependent symbols (e.g. a static field of
+    // GBox<T>: `GBox<T>._m := GBox<T>._m - 1`) must also get a specialized
+    // disposer.  The shared type-erased disposer runs WITHOUT an active
+    // genericSubst_, so staticFieldGlobal() resolves the access to the
+    // TEMPLATE-LEVEL global (bz$GBox$_m) instead of the per-instantiation one
+    // (bz$GBox$int$_m).  Emitting a specialized disposer (with genericSubst_
+    // active) ensures the correct per-instantiation symbol is referenced.
+    //
+    // fix #2873 (§28.4 / §28.5 / §14.1, v0.240): `|| layoutDiffers` is the third
+    // clause, and it is the SAME question #1240 asks for the itable and #2019
+    // asks for the BASE core in emitBaseDisposeChain — "was the compiled body
+    // emitted against the struct this object actually has?" — asked for the
+    // class's OWN disposer, where nobody was asking it. `structs_[ts]` is the
+    // T→i32 placeholder struct the shared `bz$<T>$DisposeCore` was emitted
+    // against; when the instantiation's struct is a different llvm::StructType,
+    // every GEP in that shared body lands at the wrong BYTE offset (the field
+    // INDEX is unchanged — only the widths before it move), so the disposer
+    // reads a managed field out of a neighbouring slot. Measured on
+    // `G<T> { v: T; i: int := 41; s: string := "hi" }` at T = string: the
+    // template is {ptr, i8, i32, i32, ptr} (s at byte 24) and the instantiation
+    // is {ptr, i8, ptr, i32, ptr} (s at byte 32), so bz_string_release was
+    // handed the i32 41 and SEGV'd on scope exit. With an `owned` field in that
+    // position the same off-by-one-slot read finds the (null) T slot instead,
+    // the null guard skips it, and the owned field is SILENTLY NEVER DISPOSED —
+    // a §28.4-violating leak with no diagnostic at any severity.
+    //
+    // Note the two existing clauses do NOT subsume this one and it does not
+    // subsume them: `owned _f: T` at T = int leaves the layout bit-identical to
+    // the placeholder yet still needs classification (clause 1), a destructor
+    // body needs the per-instantiation statics whatever the layout (clause 2),
+    // and this class's fields can all be concretely typed (`owned cell: Cell`)
+    // — nothing owned or user-written about it — while a preceding `v: T`
+    // moves them. Conversely, when the layouts agree the shared disposer is
+    // exactly right, which is why `T = int` costs nothing here.
+    bool needsSpecDispose = classHasOwnedTypeParamField(ts)
+                         || findDestructor(ts) != nullptr
+                         || layoutDiffers;
 
     // Condition (b): scan the class's interfaces for any method whose concrete
     // function type (under the active genericSubst_) differs from the compiled
@@ -8206,11 +8234,18 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
             // an imported class. Try the imported no-ctor path first; it
             // returns false (no-op) for a LOCAL targetCls, falling through
             // to the original sequence unchanged.
+            // fix #2873 half (b) (§22.8 step 2 / §14.1, v0.240): the LOCAL
+            // fall-through is the second call site of the same defect the
+            // implicit-base path had — an explicit `base()` from a derived
+            // class that HAS its own constructor reaches a no-explicit-ctor
+            // generic base here, and ran its initializers at the T→i32
+            // placeholder layout. Same helper, same reasoning; #2452 needed
+            // both sites for the imported side for exactly this reason.
             if (!emitImportedBaseFieldInit(targetCls, currentThis_,
                                            cs ? cs->parent : nullptr)) {
                 emitImplicitBase(targetCls, currentThis_);
-                emitOwnFieldInit(targetCls, currentThis_,
-                                 classStruct(targetCls));
+                emitLocalBaseFieldInit(targetCls, currentThis_,
+                                       cs ? cs->parent : nullptr);
             }
         } else if (!isThis && n == 0) {
             // base() into a class whose own base still needs an implicit chain.
@@ -8832,10 +8867,61 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
         // initializers (step 2) — there is no `b` ctor to do so. (If `b` had
         // only parameterized ctors, an implicit `base()` is a sema error and
         // never reaches codegen.)
+        //
+        // fix #2873 half (b) (§22.8 step 2 / §14.1 / §12, v0.240): the plain
+        // `emitOwnFieldInit(b, obj, classStruct(b))` this used to be is the
+        // LOCAL twin of the imported branch above, and it had the same gap
+        // #2860 closed there — see emitLocalBaseFieldInit.
         emitImplicitBase(b, obj);
         if (!hasAnyConstructor(b))
-            emitOwnFieldInit(b, obj, classStruct(b));
+            emitLocalBaseFieldInit(b, obj, cls);
     }
+}
+
+
+// fix #2873 half (b) (§22.8 step 2 / §14.1 / §12, v0.240). See the declaration
+// comment in LlvmBackend_impl.hpp.
+//
+// `classStruct(base)` is evaluated under whatever substitution happens to be
+// active, which for a NON-generic derived class (`class DS : GBase<string>`)
+// is EMPTY — so `base`'s field initializers stored at the T→i32 PLACEHOLDER
+// offsets while `obj` was allocated with the instantiation's (correct,
+// #617/#1101-B/#2840) layout. Measured on
+// `GBase<T> { v: T; owned cell: Cell; a: int }` at T = string: `cell` was
+// written 8 bytes early, over `v`, and the read of `d.cell` — correct since
+// #585/#2840 — loaded the still-zero slot and SEGV'd with no output at all.
+// This is the CONSTRUCTION face of the placeholder leak whose DISPOSAL face is
+// #2873's other half; both are repros of that issue.
+//
+// `computeAncestorGenericSubst` seeds `curArgs` from `recvTy->genericArgs`
+// against the receiver's own parameter names, so a non-generic derived class is
+// the 0 == 0 case and its chain (including intermediate non-generic links,
+// `Leaf : Mid : GBase<string>`) resolves; it returns false and leaves the maps
+// untouched whenever the chain cannot be resolved — notably `class D<U> : B<U>`
+// (the synthesized receiver carries no arguments while `D` declares one) and
+// the renamed-parameter `class Sub<U> : Base<T>` shape that is still #2289 — so
+// this cannot install a WRONG substitution: an unresolvable chain keeps exactly
+// today's behaviour.
+void Emitter::emitLocalBaseFieldInit(const sema::TypeSymbol* base,
+                                     llvm::Value* obj,
+                                     const sema::TypeSymbol* derived) {
+    if (!base) return;
+    auto savedGenericSubst = genericSubst_;
+    auto savedGenericSema  = genericSubstSemaTy_;
+    if (derived && derived != base && !base->genericParams.empty()) {
+        sema::TypeRef synth;
+        synth.kind = sema::TypeRef::Kind::Named;
+        synth.declaration = const_cast<sema::TypeSymbol*>(derived);
+        std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+        if (computeAncestorGenericSubst(&synth, base, ancSubst, ancSema)) {
+            genericSubst_ = std::move(ancSubst);
+            genericSubstSemaTy_ = std::move(ancSema);
+        }
+    }
+    emitOwnFieldInit(base, obj, classStruct(base));
+    genericSubst_ = std::move(savedGenericSubst);
+    genericSubstSemaTy_ = std::move(savedGenericSema);
 }
 
 

@@ -8323,6 +8323,24 @@ private:
                                    llvm::Value* obj,
                                    const sema::TypeSymbol* derived);
 
+    // fix #2873 half (b) (§22.8 step 2 / §14.1 / §12, v0.240): run a LOCAL,
+    // no-explicit-ctor `base`'s own field initializers at the layout the
+    // INSTANTIATION has, rather than at whatever substitution happens to be
+    // active. This is the local twin of emitImportedBaseFieldInit's generic
+    // arm (which #2860 fixed for the imported side), and it has exactly the
+    // two call sites #2452 needed for the imported one: the implicit base
+    // chain (emitImplicitBase) and an explicit `base()` that reaches a base
+    // with no matching ConstructorSymbol (emitChainCall). `derived` is the
+    // class whose construction reached `base`; when it is NON-generic the
+    // active substitution is EMPTY and `classStruct(base)` would be the
+    // T→i32 placeholder while `obj` carries the instantiation's layout.
+    // computeAncestorGenericSubst returns false rather than installing a
+    // substitution it cannot resolve, so an unresolvable chain keeps today's
+    // behaviour exactly.
+    void emitLocalBaseFieldInit(const sema::TypeSymbol* base,
+                                llvm::Value* obj,
+                                const sema::TypeSymbol* derived);
+
     // fix #2860 (§2.8.2, v0.240): the source location of the `new` expression
     // whose construction sequence is currently being emitted, or `{}` outside
     // one. Only consumer: emitOwnFieldInit's §2.8.2 "initializer did not cross
