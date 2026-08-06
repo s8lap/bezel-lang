@@ -8567,6 +8567,37 @@ void Emitter::emitChainCall(const ast::CallExpr* call, bool isThis,
                 restoredSubstForBase = true;
             }
         }
+    } else if (!genericSubst_.empty() && targetCls && cs &&
+               cs->parent != targetCls && !targetCls->genericParams.empty()) {
+        // fix #2889 (§14.1 "Generic declarations" / §12 "Inheritance and
+        // Dispatch" / §22.8 "Field initializers", v0.240): the inline path
+        // below assumes "the param `T` of the base/sibling generic class shares
+        // the name bound in genericSubst_" (see the #585 comment right after
+        // this block). That holds for `Wrapper<T> : Container<T>` and is what the
+        // block above establishes for a NON-generic derived class, but it is
+        // false for a GENERIC derived class that renames or concretises the
+        // base's argument — `class D<U> : B<U>` and `class D<U> : B<string>`.
+        // There the active substitution binds only `U`, so the inlined base
+        // ctor's stores used the T→i32 PLACEHOLDER offsets while the object
+        // (correct since #2889's classStruct half) is the specialized one:
+        // measured on `GCtor<T> { v: T; owned cell: Cell; a: int }` at
+        // T = string, `cell := new Cell()` landed 8 bytes early over `v` and
+        // `d.cell.tag` then dereferenced the still-zero slot — SEGV.
+        //
+        // Same helper, same discipline as #2860/#2873/#2882: derive the base
+        // instantiation's own substitution from the derived class's chain and
+        // install it only when it resolves; an unresolvable chain leaves the
+        // active substitution untouched and keeps today's behaviour.
+        sema::TypeRef synth;
+        synth.kind = sema::TypeRef::Kind::Named;
+        synth.declaration = const_cast<sema::TypeSymbol*>(cs->parent);
+        std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+        if (computeAncestorGenericSubst(&synth, targetCls, ancSubst, ancSema)) {
+            genericSubst_ = std::move(ancSubst);
+            genericSubstSemaTy_ = std::move(ancSema);
+            restoredSubstForBase = true;
+        }
     }
     // §12 / §14 (issue #585): when a generic substitution is active, the target
     // ctor function in ctorFns_ is the T→i32 TEMPLATE — calling it would store

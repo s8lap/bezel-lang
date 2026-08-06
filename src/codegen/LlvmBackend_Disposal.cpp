@@ -3286,6 +3286,20 @@ void Emitter::emitBaseDisposeChain(const sema::TypeSymbol* ts) {
             std::vector<llvm::Type*> tmplLayout = baseFieldLayout();
             genericSubst_ = std::move(newSubst);
             genericSubstSemaTy_ = std::move(newSema);
+            // fix #2889 (§14.1 / §12 / §28.4 step 3, v0.240): when `base` is
+            // ITSELF a generic derived class (`L<X> : M<W> : B<T>`), the
+            // substitution built just above binds only `M`'s parameter `W`.
+            // `baseFieldLayout` walks M's INHERITED storage too, and `v: T` is
+            // named in B's parameter — unbound here, so `storageType` produced
+            // the same i32 placeholder under BOTH substitutions and the #2019
+            // layout-identity test concluded "identical ⇒ the erased template
+            // disposer is already right". It is not: the object is laid out at
+            // the composed offsets, so the erased core read the wrong slot and
+            // the owned base field was never disposed — measured as a 16-byte
+            // Cell leak on a three-level generic chain, with no crash. Compose
+            // the rest of the chain so BOTH the comparison and the specialized
+            // core see the real layout.
+            mergeAncestorGenericSubst(base);
             std::vector<llvm::Type*> specLayout = baseFieldLayout();
             bool needSpec =
                 classHasOwnedTypeParamField(base) || (tmplLayout != specLayout);

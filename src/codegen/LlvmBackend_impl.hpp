@@ -4382,6 +4382,43 @@ private:
     // Box<int> and Box<string> get distinct LLVM struct types.
     llvm::StructType* classStruct(const sema::TypeSymbol* t);
 
+    // fix #2889 (§14.1 / §12 / §22.8, v0.240): the bindings a GENERIC class
+    // `t` inherits from its GENERIC ancestors, expressed in the ANCESTORS' own
+    // parameter names, that the ACTIVE substitution does not already carry.
+    //
+    // Every site that installs a substitution for a generic class binds that
+    // class's OWN parameter names; storage inherited from a generic base is
+    // declared in the base's names (`class D<U> : B<U>` — `B`'s field is `v: T`),
+    // so nothing named it and `storageType` produced the erased i32 placeholder
+    // for the inherited slot. That is the ALLOCATION face of the placeholder-
+    // layout family (#2840/#2860/#2873/#2882): `lowerNew` sizes its calloc from
+    // `classStruct`, so the object was allocated at the erased size while every
+    // reader GEP'd the specialized offsets — a heap-buffer-overflow on ordinary
+    // single-module code.
+    //
+    // Returns false (leaving both maps untouched) when there is nothing to add,
+    // when `t` is not generic, when no substitution is active, or when the chain
+    // cannot be resolved — the callers install only what is proven. Most-derived
+    // wins on a name collision; see the definition for what that costs.
+    bool ancestorGenericSubstAdditions(
+        const sema::TypeSymbol* t,
+        std::unordered_map<std::string_view, llvm::Type*>& addSubst,
+        std::unordered_map<std::string_view, const sema::TypeRef*>& addSema);
+
+    // fix #2889: install what `ancestorGenericSubstAdditions` proves into the
+    // ACTIVE substitution, for callers that hold a substitution for `t` across
+    // more than a single layout query (the §22.8 construction sequence, the
+    // §28.4 base dispose chain). Returns whether anything was added. The caller
+    // owns the save/restore of genericSubst_/genericSubstSemaTy_.
+    bool mergeAncestorGenericSubst(const sema::TypeSymbol* t) {
+        std::unordered_map<std::string_view, llvm::Type*> add;
+        std::unordered_map<std::string_view, const sema::TypeRef*> addSema;
+        if (!ancestorGenericSubstAdditions(t, add, addSema)) return false;
+        for (const auto& [nm, ty] : add) genericSubst_[nm] = ty;
+        for (const auto& [nm, tr] : addSema) genericSubstSemaTy_[nm] = tr;
+        return true;
+    }
+
     // CG29 (§9.4): the LLVM struct backing a record value. Unlike a class,
     // a record has no vtable header — its data fields start at index 0. The
     // fields are the record's storage members in declaration order: positional

@@ -1087,10 +1087,106 @@ llvm::Type* Emitter::storageType(const sema::Symbol* m) {
 }
 
 
+// fix #2889 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
+// §22.8 "Field initializers", v0.240). See the declaration comment in
+// LlvmBackend_impl.hpp.
+//
+// The layout/substitution machinery keys type-parameter bindings by PARAMETER
+// NAME in one flat map. When `t` is a GENERIC class, every site that installs a
+// substitution for it binds `t`'s OWN parameter names only (`lowerNew` from the
+// `new` site's type arguments, method emission from the receiver's). Storage
+// INHERITED from a generic ancestor is declared in terms of the ANCESTOR's
+// parameter names, so unless `t` happens to spell the base's argument with the
+// same name (`class D<T> : B<T>` — the one shape that worked), no binding named
+// it and `storageType` fell to its i32 placeholder for every inherited
+// parameter-typed field.
+//
+// This composes the missing half: for each generic ancestor on `t`'s class base
+// chain, ask `computeAncestorGenericSubst` (the shared #2840 helper #2860/#2873/
+// #2882 already use, which resolves each level's base arguments through the
+// level below and refuses rather than guessing) for that ancestor's own
+// parameter bindings, and report the ones the active substitution does not
+// already carry.
+//
+// MOST-DERIVED WINS. The chain is walked outward-in and a name already bound —
+// by the active substitution, or by a nearer ancestor — is never overwritten.
+// That keeps `t`'s own parameters meaning `t`'s own type arguments for `t`'s own
+// fields. It also means a base that REUSES a derived parameter's spelling for a
+// different argument (`class D<T> : B<string>` where `B`'s parameter is also
+// named `T`) keeps today's behaviour: one flat name-keyed map cannot represent
+// two bindings of `T` at once. That is a pre-existing limitation of the
+// substitution representation, not of this composition — filed separately rather
+// than papered over here.
+bool Emitter::ancestorGenericSubstAdditions(
+        const sema::TypeSymbol* t,
+        std::unordered_map<std::string_view, llvm::Type*>& addSubst,
+        std::unordered_map<std::string_view, const sema::TypeRef*>& addSema) {
+    if (!t || t->genericParams.empty() || genericSubst_.empty()) return false;
+    sema::TypeRef synth;
+    synth.kind = sema::TypeRef::Kind::Named;
+    synth.declaration = const_cast<sema::TypeSymbol*>(t);
+    for (const sema::TypeSymbol* anc = baseClassOf(t); anc;
+         anc = baseClassOf(anc)) {
+        if (anc->genericParams.empty()) continue;
+        std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+        if (!computeAncestorGenericSubst(&synth, anc, ancSubst, ancSema))
+            continue;
+        for (const auto& [nm, ty] : ancSubst) {
+            if (genericSubst_.count(nm) || addSubst.count(nm)) continue;
+            addSubst[nm] = ty;
+            auto sit = ancSema.find(nm);
+            if (sit != ancSema.end()) addSema[nm] = sit->second;
+        }
+    }
+    return !addSubst.empty();
+}
+
+
 llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
     // CG29: a record has no vtable header; route to recordStruct so every
     // classStruct caller (field access, etc.) gets the right layout.
     if (t->kind == ast::TypeDeclKind::Record) return recordStruct(t);
+
+    // fix #2889 (§14.1 "Generic declarations" / §12 "Inheritance and
+    // Dispatch" / §22.8 "Field initializers", v0.240) — the ALLOCATION face of
+    // the placeholder-layout family (#2840 access, #2860 imported field init,
+    // #2873 disposer + local field init, #2882 implicit base ctor). See
+    // `ancestorGenericSubstAdditions` for the full rationale.
+    //
+    // The specialized path below substitutes field types by PARAMETER NAME, and
+    // the active substitution binds only `t`'s OWN parameter names. For a
+    // GENERIC derived class over a generic base (`class D<U> : B<U>`, or
+    // `class D<U> : B<string>`) the inherited storage is declared in terms of
+    // `B`'s parameter `T`, which no active binding names — so `storageType` fell
+    // to its i32 placeholder and `class.D$specN` was built at the ERASED size.
+    // `lowerNew` sizes its calloc from exactly this struct, so `new D<string>()`
+    // allocated the T→i32 object while every reader (correct since #2840) GEP'd
+    // the T→ptr offsets: a heap-buffer-overflow on every inherited field past
+    // the first widened one, on ordinary single-module code (#2889).
+    //
+    // The non-generic-derived walk further down already composes exactly these
+    // bindings, but it is gated on `t->genericParams.empty()` and so never ran
+    // for a generic derived class.
+    //
+    // Bounded re-entry: the merged map is installed and `classStruct(t)` is
+    // re-entered ONCE. On the re-entry the same helper proves the same bindings,
+    // all of which are now present, so nothing new is added and control falls
+    // through to the specialized path.
+    if (!genericSubst_.empty() && !t->genericParams.empty()) {
+        std::unordered_map<std::string_view, llvm::Type*> addSubst;
+        std::unordered_map<std::string_view, const sema::TypeRef*> addSema;
+        if (ancestorGenericSubstAdditions(t, addSubst, addSema)) {
+            auto savedSubst = genericSubst_;
+            auto savedSemaTy = genericSubstSemaTy_;
+            for (const auto& [nm, ty] : addSubst) genericSubst_[nm] = ty;
+            for (const auto& [nm, tr] : addSema) genericSubstSemaTy_[nm] = tr;
+            llvm::StructType* result = classStruct(t);
+            genericSubst_ = std::move(savedSubst);
+            genericSubstSemaTy_ = std::move(savedSemaTy);
+            return result;
+        }
+    }
 
     // CG-generic: if we have an active substitution, compute the concrete
     // field types first and look them up in the specialization cache.

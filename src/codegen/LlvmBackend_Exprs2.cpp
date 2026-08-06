@@ -4630,6 +4630,32 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         return rec;
     }
 
+    // fix #2889 (§14.1 "Generic declarations" / §12 "Inheritance and
+    // Dispatch" / §22.8 "Field initializers", v0.240): a GENERIC class over a
+    // GENERIC ancestor needs the ANCESTOR's parameter names bound too, and it
+    // needs them bound for the WHOLE construction, not just for the layout
+    // query below.
+    //
+    // `classStruct` composes these bindings transiently for its own layout
+    // (so a field read / disposer / method body gets the right offsets from
+    // wherever it is called), but §22.8's construction sequence runs many more
+    // steps against the same object — the implicit base chain, each ancestor's
+    // field initializers, the inlined base constructor bodies. Those recurse
+    // level by level and hand each level's IMMEDIATE derived class to
+    // `computeAncestorGenericSubst`; at a middle link (`L<X> : M<W> : B<T>`)
+    // the receiver is `M`, whose parameter `W` the `new` site's substitution
+    // does not name, so the chain went unresolved and the base's initializers
+    // stored at the erased T→i32 offsets into a correctly sized object —
+    // measured: `cell := new Cell()` 8 bytes early, `l.cell.tag` SEGV.
+    //
+    // Composing the whole chain ONCE here, into the substitution `lowerNew`
+    // already keeps active until after the constructor runs (and already
+    // restores on every exit), makes every one of those steps resolvable
+    // without threading a most-derived receiver through the recursion.
+    // A no-op for a non-generic `t`, a `t` with no generic ancestor, and a
+    // `class D<T> : B<T>` whose base already shares the name.
+    mergeAncestorGenericSubst(t);
+
     llvm::StructType* st = classStruct(t);
     // Note: genericSubst_ stays active until after the constructor runs,
     // so that inline constructor bodies (for generic types) use concrete

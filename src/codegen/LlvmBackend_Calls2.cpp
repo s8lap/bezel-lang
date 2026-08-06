@@ -8218,8 +8218,41 @@ bool Emitter::computeAncestorGenericSubst(
     // each base level by resolving the base ref's args through this map.
     std::unordered_map<std::string_view, const sema::TypeRef*> curArgs;
     const std::vector<std::string_view> curParams = genericParamNames(cur);
-    if (curParams.size() != recvTy->genericArgs.size()) return false;
+    // fix #2889 (§14.1 "Generic declarations" / §12 "Inheritance and
+    // Dispatch" / §2.5 "Dependency resolution", v0.240): seed a GENERIC
+    // receiver whose ref carries NO arguments from the ACTIVE substitution.
+    //
+    // Every synthesized-receiver caller (emitLocalBaseFieldInit,
+    // emitSpecializedImplicitBaseCtor, emitImportedBaseFieldInit, the
+    // `this`/`base`-keyword and bare-identifier dispatch branches, and #2889's
+    // new classStruct caller) builds a bare `sema::TypeRef` carrying only
+    // `declaration`. For a NON-generic derived class that is the 0 == 0 case and
+    // the walk proceeds; for a GENERIC one (`class D<U> : B<U>` — the shape
+    // #2882's obligation 2 and emitLocalBaseFieldInit's comment both record as
+    // unresolvable) `curParams.size() != 0` and the seed check below rejected it,
+    // so every caller kept the erased T→i32 base layout: the base's own
+    // initializers, its ctor body, its disposer and #2889's allocation all used
+    // the placeholder offsets. The information those callers lack is exactly what
+    // `genericSubstSemaTy_` already holds — they call this WITH the derived
+    // class's own instantiation substitution active (lowerNew installs it before
+    // `classStruct`, method emission before the body), so `U` is bound there.
+    //
+    // Strictly additive: an EMPTY argument list against a non-empty parameter
+    // list is today's unconditional `return false`, so no call that resolves
+    // today changes. It still refuses rather than guessing — any parameter the
+    // active map does not bind bails out, keeping the "never install a
+    // substitution we cannot prove" discipline of #2840/#2860/#2873/#2882.
+    const bool seedFromActiveSubst =
+        recvTy->genericArgs.empty() && !curParams.empty();
+    if (!seedFromActiveSubst &&
+        curParams.size() != recvTy->genericArgs.size()) return false;
     for (std::size_t gi = 0; gi < curParams.size(); ++gi) {
+        if (seedFromActiveSubst) {
+            auto ait = genericSubstSemaTy_.find(curParams[gi]);
+            if (ait == genericSubstSemaTy_.end() || !ait->second) return false;
+            curArgs[curParams[gi]] = ait->second;
+            continue;
+        }
         // §14.1 / §19.3 (v0.226, #2202): the receiver may itself have been
         // instantiated transitively inside an enclosing generic body, e.g.
         // `Outer<X>` creates `Sub<X>` where `Sub<U>: Base<U>`.  Its recorded
