@@ -431,4 +431,56 @@ BEZEL_TEST(xmod_imported_generic_self_new_2954, reentrant_object_slot_one_identi
     BEZEL_EXPECT_EQ(r, 44);
 }
 
+// ===========================================================================
+// T8 — AN EXPLICIT CONSTRUCTOR, i.e. the WHOLE §22.8 sequence rather than step
+// 2 alone. Every other case here has no user constructor, so it only ever
+// proved that step 2 (field initializers) runs. This one has both: `_w := 21`
+// is step 2 and `_k := 5` is step 3, the constructor body.
+//
+// This is the shape that made the fix's direction worth checking rather than
+// assuming: with an explicit constructor the inner `new` reaches a DIFFERENT
+// branch of `lowerNew` (`importedGenericWithBody` → `inlineCtorBody`) than the
+// no-constructor cases above, and the fix has to be right for both. Measured
+// on the fix's parent:
+//
+//     outer_w=21  outer_k=5   the importing module's own `new` — always correct
+//     nested=26   = 0 + 0 + 21 + 5
+//
+// 26 says the inner object got NEITHER the initializer NOR the constructor
+// body; 52 = 21 + 5 + 21 + 5 is correct. The asserted value therefore
+// distinguishes "step 2 runs" from "steps 2 AND 3 run": a fix that ran only the
+// field initializers returns 47, not 52. §22.8 steps 1-3 / §22.7 / §2.5.
+// ===========================================================================
+BEZEL_TEST(xmod_imported_generic_self_new_2954, explicit_constructor_full_sequence_spec_22_8) {
+    const char* lib =
+        "module GSelfLib2954T8; "
+        "public class GSelf2954T8<T> "
+        "  public _t: T; "
+        "  public _t2: T; "
+        "  public _w: int := 21; "
+        "  public _k: int; "
+        "  public constructor() "
+        "    _k := 5; "
+        "  end constructor; "
+        "  public method Nested(): int "
+        "    using var inner := new GSelf2954T8<T>(); "
+        "    return inner._w + inner._k + _w + _k; "
+        "  end Nested; "
+        "end GSelf2954T8;";
+    int r = compileImportAndRun2954(
+        lib,
+        "module GSelfApp2954T8; import GSelfLib2954T8; "
+        "public class M2954T8 "
+        "  public static method Main(): int "
+        "    using var g := new GSelf2954T8<string>(); "
+        "    if g._w <> 21 then return 91; end; "
+        "    if g._k <> 5 then return 92; end; "
+        "    return g.Nested(); "
+        "  end Main; "
+        "end M2954T8;");
+    if (r == -2) return;
+    // (21 + 5) inner + (21 + 5) outer.
+    BEZEL_EXPECT_EQ(r, 52);
+}
+
 }  // namespace bezel::module
