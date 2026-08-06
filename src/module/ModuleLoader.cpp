@@ -1092,6 +1092,79 @@ static std::string buildMethodStub(const MetaMember& mm) {
     return s;
 }
 
+// fix #2954 (§22.8 "Field initializers" / §2.8.3 rule 4 / §14.1 "Generic
+// declarations" / §2.5, v0.240): REBIND every TypeRef in a re-parsed body that
+// resolved to the SYNTHETIC reconstruction's own class so it names the IMPORTED
+// TypeSymbol instead.
+//
+// THE SIXTH SIDE TABLE, AND THE ONE WHOSE ENTRIES ARE WRONG RATHER THAN MISSING.
+// All four re-parse paths below copy `allResolvedTypes()` / `allExprTypes()` into
+// mainCtx verbatim (#2855's fix added the last of them). Verbatim is right for
+// every TypeRef naming an outside type — but a TypeRef naming the class being
+// reconstructed points at the FRESH TypeSymbol collected from
+// `buildSyntheticClassSource` / `buildSyntheticMethodSource`, and that symbol is
+// a DIFFERENT TYPE from the imported one in every way codegen cares about:
+//
+//   * its fields carry NO initializers — those functions emit each field as
+//     `name : Type;`, never `:= <fieldInitText>` — so §22.8's "Field
+//     initializers run as part of construction in textual declaration order" had
+//     nothing to run;
+//   * `ctx_.isImported()` is FALSE for it, so `lowerNew` takes neither the
+//     imported-generic branch nor the local branch and NO VTABLE is installed;
+//   * `classStruct` mints it a SECOND `%class.<Name>$spec0`, so one
+//     monomorphization has two LLVM struct types and two identities — flatly
+//     against §2.8.3 rule 4's "one runtime type identity ... regardless of which
+//     artifact produced the value".
+//
+// MEASURED on this fix's parent, `new GRe10<T>()` inside an imported generic's
+// own re-lowered `Nested()` body (the issue's repro): `w=21` beside
+// `nested=21` — the outer construction ran the initializer, the inner one read
+// `inner._w` as 0, so the sum was 21 where 42 is correct. The emitted IR for the
+// inner `new` is a bare `calloc` with no vtable store and no `store i32 21`,
+// against the outer's calloc + `store ptr @"vt$GRe10$spec0"` + `store i32 21`.
+//
+// #2954 REQUIRES THIS DIRECTION IN AS MANY WORDS — "whatever runs the
+// initializers has to be the SAME sequence the importing module's own `new
+// GRe10<string>()` runs, not a second reconstruction of it". Teaching the
+// synthetic source to re-emit each field's initializer would have been the
+// second reconstruction, and would still have left the type identity split.
+// Rebinding the reference makes the inner `new` reach the very same `lowerNew`
+// path as the outer one, so the two spellings cannot diverge again.
+//
+// The walk is over the whole TypeRef GRAPH, not just the top level, because the
+// self type can appear nested (`new Box<GRe10<T>>()`, a `[4]GRe10<T>` element, a
+// `(GRe10<T>) -> int` parameter). `seen` is required for termination: TypeRefs
+// are arena-owned and a self-referential generic argument would otherwise
+// recurse forever.
+static void rebindSelfTypeRefs(sema::TypeRef* ref,
+                               const sema::TypeSymbol* freshType,
+                               sema::TypeSymbol* importedType,
+                               std::unordered_set<sema::TypeRef*>& seen) {
+    if (!ref || !freshType || !importedType) return;
+    if (!seen.insert(ref).second) return;
+    if (ref->declaration == freshType) ref->declaration = importedType;
+    for (sema::TypeRef* a : ref->genericArgs)
+        rebindSelfTypeRefs(a, freshType, importedType, seen);
+    rebindSelfTypeRefs(ref->arrayElement, freshType, importedType, seen);
+    rebindSelfTypeRefs(ref->funcReturn, freshType, importedType, seen);
+    for (const auto& fp : ref->funcParams)
+        rebindSelfTypeRefs(fp.type, freshType, importedType, seen);
+}
+
+// fix #2954: the whole-table form — run over both type side tables of a fresh
+// re-parse context before they are copied into mainCtx. Every one of the four
+// reconstruction paths calls this, because the defect is a property of the
+// reconstruction (a synthetic self-class), not of any one member kind.
+static void rebindSelfTypeRefsIn(sema::SemaContext& freshCtx,
+                                 const sema::TypeSymbol* freshType,
+                                 sema::TypeSymbol* importedType) {
+    std::unordered_set<sema::TypeRef*> seen;
+    for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
+        rebindSelfTypeRefs(ref, freshType, importedType, seen);
+    for (const auto& [expr, ref] : freshCtx.allExprTypes())
+        rebindSelfTypeRefs(ref, freshType, importedType, seen);
+}
+
 // Build a synthetic Bezel source string for a mini class containing only the
 // imported fields, stub method declarations (for self-call resolution), and the
 // given ctor body text.  Used to re-parse + sema-check the ctor body with proper
@@ -1328,6 +1401,13 @@ static bool parseAndAttachCtorBody(
     // arena, kept alive via ownImportedAuxiliary below; the AST-node keys are
     // the re-parsed nodes, kept alive via ownImportedAst. Copying the whole map
     // is harmless — the keys are unique to the fresh AST.
+    //
+    // fix #2954: but NOT verbatim for a TypeRef naming the class being
+    // reconstructed — that one points at the SYNTHETIC self-class, which has no
+    // field initializers, no vtable and its own struct identity. Rebind it to the
+    // imported TypeSymbol first (see rebindSelfTypeRefs).
+    rebindSelfTypeRefsIn(freshCtx, freshType,
+                         const_cast<sema::TypeSymbol*>(&importedType));
     for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
         if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
     for (const auto& [expr, ref] : freshCtx.allExprTypes())
@@ -1548,6 +1628,11 @@ static bool parseAndAttachDtorBody(
     // the keys are the re-parsed AST nodes (unique to the fresh AST, so no
     // collision with mainCtx's own) and the TypeRef* values point into the
     // fresh arena, kept alive at the tail.
+    //
+    // fix #2954: with the same one exception the three sibling paths make — a
+    // TypeRef naming the class being reconstructed is rebound to the IMPORTED
+    // TypeSymbol, not carried as the synthetic self-class.
+    rebindSelfTypeRefsIn(freshCtx, freshType, &importedType);
     for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
         if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
     for (const auto& [expr, ref] : freshCtx.allExprTypes())
@@ -1824,6 +1909,18 @@ static bool parseAndAttachMethodBody(
     // re-parsed nodes, kept alive via ownImportedAst. Only nodes that belong to
     // the re-parsed body matter; copying the whole map is harmless because the
     // keys are unique to the fresh AST (no collision with mainCtx's own nodes).
+    //
+    // fix #2954 (§22.8 / §2.8.3 rule 4, v0.240): with ONE entry that must not be
+    // carried verbatim — a TypeRef naming the class being reconstructed, which
+    // resolves to the SYNTHETIC self-class this function's own
+    // `buildSyntheticMethodSource` declared. That class has no field
+    // initializers, is not `isImported`, and gets its own `classStruct`, so a
+    // `new Self<T>()` inside the body allocated a vtable-less, zero-initialized
+    // object of a second identity. Rebind it to the imported TypeSymbol so the
+    // inner `new` takes the SAME `lowerNew` path the importing module's own
+    // `new Self<Arg>()` takes. This is the direct arm of #2954's repro.
+    rebindSelfTypeRefsIn(freshCtx, freshType,
+                         const_cast<sema::TypeSymbol*>(&importedType));
     for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
         if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
     for (const auto& [expr, ref] : freshCtx.allExprTypes())
@@ -2176,6 +2273,12 @@ static bool parseAndAttachFieldInit(
     // Copy resolved-type / expr-type entries so codegen's lowerExpr finds a
     // type for every sub-expression of the initializer (e.g. `new
     // AtomicInteger<int>(0)`'s constructed-type node).
+    //
+    // fix #2954: and — as in the three sibling paths — a TypeRef naming the
+    // class being reconstructed is rebound to the IMPORTED TypeSymbol first,
+    // rather than left pointing at this path's synthetic self-class.
+    rebindSelfTypeRefsIn(freshCtx, freshType,
+                         const_cast<sema::TypeSymbol*>(&importedType));
     for (const auto& [astTy, ref] : freshCtx.allResolvedTypes())
         if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
     for (const auto& [expr, ref] : freshCtx.allExprTypes())
