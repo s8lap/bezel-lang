@@ -6357,6 +6357,13 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             auto* fn = declareC("bz_stopwatch_free",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
                             builder_.CreateCall(fn, {recv});
+                            // fix #2967 (§28.2 / §28.3, v0.240): bz_stopwatch_free
+                            // is a plain free(), so the `d.stopwatch` scope-exit
+                            // auto-drop reloading this slot freed the SAME object
+                            // a second time — MEASURED as ASan "attempting
+                            // double-free" over a 200-iteration `using var sw :=
+                            // new Stopwatch(); sw.Dispose();` loop.
+                            nullExplicitlyDisposedBuiltinSlot(*ma->target);
                         }
                         return nullptr;
                     }
@@ -6410,6 +6417,13 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             auto* fn = declareC("bz_cts_dispose",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
                             builder_.CreateCall(fn, {recv});
+                            // fix #2967 (§28.2 / §28.3, v0.240): state the
+                            // exactly-once rule here too. This arm is measurably
+                            // clean today only because bz_cts_dispose tolerates a
+                            // repeat — a property of the runtime, not of the
+                            // disposal — so the discharge is nulled like every
+                            // other built-in's rather than left to that luck.
+                            nullExplicitlyDisposedBuiltinSlot(*ma->target);
                         }
                         return nullptr;
                     }
@@ -6466,6 +6480,16 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             auto* fn = declareC("bz_weak_release",
                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
                             builder_.CreateCall(fn, {recv2});
+                            // fix #2967 (§28.2 / §28.3, v0.240): bz_weak_release
+                            // drops ONE weak handle, so the scope-exit auto-drop
+                            // reloading this slot dropped a handle that was
+                            // already gone — MEASURED as an 8000-byte LSan leak
+                            // over a 200-iteration `using var w := s.Downgrade();
+                            // w.Dispose();` loop (the control block's weak count
+                            // never reaches its free point again). Mirrors the
+                            // Shared<T> arm directly above, which nulls for the
+                            // same reason.
+                            nullExplicitlyDisposedBuiltinSlot(*ma->target);
                         }
                         return nullptr;
                     }
@@ -6482,11 +6506,35 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         auto* fn = declareC("bz_subscription_dispose",
                             llvm::Type::getVoidTy(llvm_), {ptrTy()});
                         builder_.CreateCall(fn, {recv});
+                        // fix #2967 (§28.2 / §28.3, v0.240): same exactly-once
+                        // rule as every other built-in arm — the handler is
+                        // removed from its source once, not once per path that
+                        // reloads the slot.
+                        nullExplicitlyDisposedBuiltinSlot(*ma->target);
                     }
                     return nullptr;
                 }
                 llvm::Value* recv = lowerExpr(*ma->target);
                 if (recv && recv->getType()->isPointerTy()) {
+                    // fix #2967 (spec §28.2 / §28.3, v0.240): every branch of
+                    // the chain below EXCEPT the final `else` performs a
+                    // BUILT-IN's release right here, and therefore owes the
+                    // §28.2 exactly-once obligation that comes with it — null
+                    // the receiver's slot so §28.3's scope-exit / unwind
+                    // auto-drop reloads null and discharges nothing. That
+                    // obligation used to be a per-arm habit (the
+                    // `isDictTypeName` arm wrote it out; the collection,
+                    // linked-list and dict-backed-`Set` arms did not), which is
+                    // exactly the shape a new arm silently joins on the wrong
+                    // side of: MEASURED, twelve receivers double-freed. It is
+                    // now discharged ONCE, at the chain's single exit, so a
+                    // branch added here inherits it instead of having to
+                    // remember it. The final `else` clears the flag because it
+                    // is the USER-class path, which reclaims and nulls through
+                    // `explicitDisposeOwnedReceiverSlot`'s own ownership test
+                    // (a borrow's slot must NOT be nulled there — its real
+                    // owner reclaims through it).
+                    bool builtinReleasedHere = true;
                     // §3: collection types use bz_array_free / bz_dict_free.
                     auto* recvTy = ctx_.exprType(*ma->target);
                     // issues #343 / D8: a Set is dict-backed (records,
@@ -6598,28 +6646,16 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             auto* fn = declareC(freeName,
                                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
                             builder_.CreateCall(fn, {recv, disp});
-                            // §28.2 idempotency: in UNCHECKED mode, null the slot so
-                            // any subsequent bz_dict_free reloads null and no-ops
-                            // (bz_dict_free(null) returns immediately). In CHECKED
-                            // mode, the slot is intentionally NOT nulled — the pointer
-                            // must stay valid for guard checks; bz_dict_free is safe
-                            // because it returns early when disposed==1 (#627).
-                            if (!checkedDisposal_) {
-                                bool lvalueRecv =
-                                    dynamic_cast<const ast::IdentifierExpr*>(
-                                        ma->target.get()) ||
-                                    dynamic_cast<const ast::MemberAccessExpr*>(
-                                        ma->target.get());
-                                llvm::Type* slotTy = nullptr;
-                                if (lvalueRecv) {
-                                    if (llvm::Value* slot =
-                                            lvalueAddr(*ma->target, slotTy)) {
-                                        builder_.CreateStore(
-                                            llvm::ConstantPointerNull::get(ptrTy()),
-                                            slot);
-                                    }
-                                }
-                            }
+                            // §28.2 idempotency: in UNCHECKED mode the slot is
+                            // nulled so any subsequent bz_dict_free reloads null
+                            // and no-ops (bz_dict_free(null) returns
+                            // immediately); in CHECKED mode it is deliberately
+                            // NOT nulled — the pointer must stay valid for guard
+                            // checks, and bz_dict_free is safe there because it
+                            // returns early when disposed==1 (#627). Both are
+                            // now the chain's single exit below (#2967); this
+                            // arm's inline copy of them was the one the
+                            // collection arms next door were missing.
                         }
                     } else if (common::isVtableLessBuiltinClassName(
                                    builtinTypeName(recvTy))) {
@@ -6652,7 +6688,7 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         // in place of corrupted control flow, the trade recorded
                         // on #2874 and #2823.
                         //
-                        // §28.2 exactly-once: null the receiver's slot in
+                        // §28.2 exactly-once: the receiver's slot is nulled in
                         // unchecked mode, exactly as the Mutex / Semaphore /
                         // Shared / Channel arms above do, so a following
                         // `using var` scope-exit or unwind auto-drop reloads
@@ -6660,8 +6696,11 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         // call release would have turned #2921's SIGSEGV into a
                         // double free for the built-ins whose auto-drop already
                         // releases (StringBuilder, EventSource, the TCS family).
-                        // Checked mode deliberately does NOT null (the pointer
-                        // must stay readable for the disposed-flag guard).
+                        // That store is now the chain's single exit below
+                        // (#2967); it is emitted UNCONDITIONALLY there rather
+                        // than only on the non-null path, which is equivalent
+                        // (when `recv` is null the slot already holds null) and
+                        // keeps one rule for the whole family.
                         auto* nnBB = llvm::BasicBlock::Create(
                             llvm_, "bidisp.nn", currentFn_);
                         auto* ctBB = llvm::BasicBlock::Create(
@@ -6674,22 +6713,16 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                         builder_.SetInsertPoint(nnBB);
                         emitVtablelessBuiltinRelease(builtinTypeName(recvTy),
                                                      recv);
-                        bool lvalueRecv =
-                            dynamic_cast<const ast::IdentifierExpr*>(
-                                ma->target.get()) ||
-                            dynamic_cast<const ast::MemberAccessExpr*>(
-                                ma->target.get());
-                        if (!checkedDisposal_ && lvalueRecv) {
-                            llvm::Type* slotTy = nullptr;
-                            if (llvm::Value* slot =
-                                    lvalueAddr(*ma->target, slotTy))
-                                builder_.CreateStore(
-                                    llvm::ConstantPointerNull::get(ptrTy()),
-                                    slot);
-                        }
                         builder_.CreateBr(ctBB);
                         builder_.SetInsertPoint(ctBB);
                     } else {
+                        // fix #2967 (§28.2 / §28.3, v0.240): NOT a built-in
+                        // release — this branch owns its own §28.2 bookkeeping
+                        // (see explicitDisposeOwnedReceiverSlot below), and its
+                        // ownership test is strictly narrower than "is a named
+                        // lvalue": a BORROW's slot must not be nulled, because
+                        // the borrow's real owner reclaims through it.
+                        builtinReleasedHere = false;
                         // #415 / §28.2 / §28.4: an explicit `.Dispose()` on a
                         // class/interface instance. After #411 split dispatch
                         // from reclamation, emitDynamicDispose only DISPATCHES
@@ -6790,6 +6823,13 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                             emitDynamicDispose(recv);
                         }
                     }
+                    // fix #2967 (spec §28.2 / §28.3, v0.240): THE chain's single
+                    // exit. Every built-in branch above released the receiver
+                    // here, so the slot is nulled here — once, for the whole
+                    // family — and §28.3's scope-exit / unwind auto-drop
+                    // reloads null and discharges nothing.
+                    if (builtinReleasedHere)
+                        nullExplicitlyDisposedBuiltinSlot(*ma->target);
                     return nullptr;
                 }
             }

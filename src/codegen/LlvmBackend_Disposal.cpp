@@ -1760,6 +1760,64 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     return false;
 }
 
+
+// fix #2967 (spec §28.2 / §28.3, v0.240): an explicit `x.Dispose()` on a
+// BUILT-IN receiver performs that built-in's release right here; this is the
+// one spelling of the obligation that comes with having done so — null the
+// receiver's slot, so §28.3's scope-exit (or unwind) auto-drop reloads null and
+// discharges nothing. Without it the SAME object is released twice.
+//
+// WHY IT IS A PROPERTY OF THE RELEASE, NOT A PER-ARM HABIT. The explicit-
+// `Dispose()` lowering (LlvmBackend_Calls2.cpp) is a chain of per-built-in arms,
+// and most of them ended with a hand-copied nine-line "null the slot" block —
+// while the collection arms (`isCollectionTypeName` → `bz_array_free`,
+// `isLinkedListTypeName` → `bz_llist_free`, the dict-backed-`Set` arm), the
+// `Stopwatch` arm and the `Weak` arm did not. Those arms are not safe by
+// design; they were safe only where the runtime free HAPPENED to tolerate a
+// repeat (`bz_dict_free` returns early on a disposed table), which is an
+// accident of the runtime rather than a rule about disposal. Where it did not,
+// the second discharge was a double free with no diagnostic.
+//
+// MEASURED on this fix's parent, 200-iteration loops of
+// `using var x := new T(…); x.Dispose();` under generated-code ASan — TWELVE
+// receivers, against the three the issue named: `Array<T>`, `OwningArray<T>`,
+// `Set<T>`, `SortedSet<T>`, `Stack<T>`, `OwningStack<T>`, `Queue<T>`,
+// `OwningQueue<T>`, `LinkedList<T>`, `OwningLinkedList<T>` and `OwningBuffer<T>`
+// SEGV in the allocator on the second free; `Stopwatch` reports "attempting
+// double-free"; `Weak<T>`'s repeat release corrupts the handle count into an
+// 8000-byte leak. Each is clean in BOTH single-spelling controls (the explicit
+// call alone, and the `using var` auto-drop alone) — the signature of a double
+// DISCHARGE, not of a broken release. `objdump` of the `Array<int>` body shows
+// it directly: `bz_array_alloc` → store to the slot → `bz_array_free` →
+// unconditional reload of that same slot → `bz_array_free`, with no null test
+// anywhere between.
+//
+// So this is asked once, from one place, for the whole family; the arms it
+// serves state the rule by CALLING it rather than by re-typing it.
+//
+// Two deliberate silences:
+//   * CHECKED disposal mode (§28.2 v0.135) quarantines instead of freeing and
+//     the disposed-flag guard reads THROUGH the slot at the next member entry,
+//     so the pointer must stay readable — the same exclusion every arm that
+//     already nulled applied. (`FileStream` is the one arm that nulls even in
+//     checked mode, because it has no quarantine, and it keeps its own store.)
+//   * A receiver that is not a NAMED lvalue has no slot to null — a temporary
+//     (`new Array<int>(2).Dispose()`) owns nothing that outlives the statement.
+//     Restricting to `IdentifierExpr` / `MemberAccessExpr` — the test the
+//     `isDictTypeName` arm already used — also keeps this from re-lowering an
+//     `a[i].Dispose()` subscript through `lvalueAddr`, which would re-evaluate
+//     the index expression and re-emit its §15.1 bounds check.
+// // per §28.2 / §28.3
+void Emitter::nullExplicitlyDisposedBuiltinSlot(const ast::Expr& recvExpr) {
+    if (checkedDisposal_) return;
+    if (!dynamic_cast<const ast::IdentifierExpr*>(&recvExpr) &&
+        !dynamic_cast<const ast::MemberAccessExpr*>(&recvExpr))
+        return;
+    llvm::Type* slotTy = nullptr;
+    if (llvm::Value* slot = lvalueAddr(recvExpr, slotTy))
+        builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()), slot);
+}
+
 // #1833 (b) / #1467 / §22.4 / §28.3: dispose every `out _` discard-owned
 // scratch slot recorded by buildOrderedArgs in the `[base, end)` range,
 // on the normal-return path (`!diverged_`). Byte-identical pattern to

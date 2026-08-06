@@ -6877,6 +6877,17 @@ private:
     // trade a false return deliberately takes.
     bool emitVtablelessBuiltinRelease(std::string_view bn, llvm::Value* recv);
 
+    // fix #2967 (spec §28.2 / §28.3, v0.240): the one spelling of "an explicit
+    // `x.Dispose()` on a BUILT-IN receiver has just performed that built-in's
+    // release HERE, so null the receiver's slot" — which is what makes §28.2's
+    // exactly-once hold when §28.3's scope-exit / unwind auto-drop later reloads
+    // the same slot. Emits nothing in CHECKED mode (the quarantine needs the
+    // pointer readable) and for a receiver that is not a named lvalue (a
+    // temporary has no slot to null). See the definition for the measured
+    // double-free population and why this is a property of the release rather
+    // than a per-arm habit.
+    void nullExplicitlyDisposedBuiltinSlot(const ast::Expr& recvExpr);
+
     // #1833 (b) / #1467 / §22.4 / §28.3: for a `discardOwnedOutSlots_` range
     // `[base, end)` recorded by buildOrderedArgs on the constructor call path,
     // emit the disposal+reclaim of each slot that was written by a normal
