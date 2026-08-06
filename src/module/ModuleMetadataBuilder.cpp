@@ -1315,6 +1315,16 @@ MetaTypeDecl convertTypeDecl(const sema::TypeSymbol& t, sema::SemaContext& ctx,
     for (sema::TypeRef* baseRef : t.baseTypeRefs)
         out.baseTypes.push_back(convertType(baseRef));
 
+    // fix #2950 (§12 / §31.4 / §2.8.2, v0.240): the BUILT-IN exception base,
+    // which the loop above structurally cannot carry — a built-in exception has
+    // no user TypeSymbol, so it is never in `baseTypeRefs` in the first place.
+    // It decides the class's LAYOUT (the §31.4 header), so an importer that
+    // cannot see it lays the class out 32 bytes shorter than this exporter did
+    // and then calls this exporter's own compiled constructor on the short
+    // block. Only the DIRECT base is carried; an ancestor chain reconstructs
+    // itself, because each exported ancestor carries its own.
+    out.builtinExceptionBase = t.builtinExceptionBase;
+
     // §22.16 / §2.8.2 (#2054): carry invariant records in base-first order.
     // The record list is declaration-derived; no per-call-site discharge is
     // consulted while emitting an interface.

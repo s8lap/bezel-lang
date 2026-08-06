@@ -726,6 +726,35 @@ struct MetaTypeDecl {
     // Empty means "no user destructor body" (structural disposal still runs).
     std::string dtorBodyText;         // §14/#662c: dtor source text for generics
 
+    // §12 / §31.4 / §2.8.2 (#2950, additive within v7): the name of the
+    // BUILT-IN exception type this class names directly as its base
+    // ("Exception", "IOException", …), empty when it names none.
+    //
+    // It cannot ride `baseTypes`: that list is built from
+    // `sema::TypeSymbol::baseTypeRefs`, and a built-in exception has no user
+    // TypeSymbol at all (its TypeRef carries `declaration == nullptr`), so it
+    // is never pushed there on the exporter side either. Without this field the
+    // importer had NO channel for the fact — and the fact is part of the
+    // class's LAYOUT (§31.4's Message@8 / InnerException@16 / CauseChain@24 /
+    // ParamName@32 header), so the importer laid the class out 32 bytes shorter
+    // than the exporter and `calloc`'d to its own size while the exporter's
+    // compiled constructor stored at the larger offsets. §2.8.2's carriage
+    // requirement is explicit that an implementation "must not alter the
+    // instantiation's semantics", and §2.8.3 rule 4 requires "one runtime type
+    // identity — `is` tests, `catch` clauses, and §19 patterns over values of
+    // the instantiation match identically regardless of which artifact produced
+    // the value or performs the test".
+    //
+    // Carried as its own REC_EXC_BASE record inside TYPE_BLOCK rather than as a
+    // second trailing REC_STRING, so it has no ordering relationship with
+    // #662c's trailing `dtorBodyText` string and cannot be mistaken for it. NO
+    // schema bump: the rule above kSchemaVersion reserves a bump for a change
+    // that makes an OLD reader MISINTERPRET an existing field, and an unknown
+    // record code is `skipRecord()`'d by every reader this format has ever had.
+    // A module with no exception subclass produces byte-identical metadata to
+    // before (the record is emitted only when non-empty).
+    std::string builtinExceptionBase;
+
     bool operator==(const MetaTypeDecl&) const;
 };
 

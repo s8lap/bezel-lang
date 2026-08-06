@@ -336,6 +336,11 @@ struct Loader {
         t->moduleName = parent.moduleName;
         // §9.2 (issue #501): propagate positional-record flag.
         t->hasPositionalFields = td.hasPositionalFields;
+        // fix #2950 (§12 / §31.4 / §2.8.3 rule 4, v0.240): restore the built-in
+        // exception base. Without it this reconstructed symbol answers "no
+        // built-in base" to every layout consumer and the §31.4 header is
+        // dropped on the importing side only.
+        t->builtinExceptionBase = td.builtinExceptionBase;
         t->invariantContracts = toContractRecords(td.invariants);
         t->genericParams = convertGenericParams(td.genericParams, t->memberScope);
         for (const MetaType& base : td.baseTypes) {
@@ -2298,6 +2303,13 @@ static void loadMetadataPass1(
         // §9.2 auto-equality check in ExprTypecheck_Exprs.cpp reads it from
         // TypeSymbol::hasPositionalFields (no ast::TypeDecl exists for imported types).
         t->hasPositionalFields = td.hasPositionalFields;
+        // fix #2950 (§12 / §31.4 / §2.8.3 rule 4, v0.240): the built-in
+        // exception base, i.e. whether this class carries the §31.4 header. It
+        // is set in PASS 1 (not pass 2, where the other base-type work happens)
+        // because it decides the class's LAYOUT and is a property of the class
+        // itself, not of any resolvable base symbol — nothing about it needs
+        // the other dependencies' shells to exist yet.
+        t->builtinExceptionBase = td.builtinExceptionBase;
         t->invariantContracts = toContractRecords(td.invariants);
         // #1488 / §2.8.3 rule 3: this type's declaring-module identity, as
         // reconstructed from the dependency's own metadata — the far side of

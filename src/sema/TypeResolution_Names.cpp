@@ -1,5 +1,6 @@
 #include "sema/TypeResolution_impl.hpp"
 
+#include "common/BuiltinRegistry.hpp"  // isBuiltinExceptionName — §31.4 (#2950)
 #include "sema/ConstFold.hpp"
 
 namespace bezel::sema {
@@ -580,6 +581,25 @@ void Resolver::resolveTypeDecl(const ast::TypeDecl& td, Scope* parent) {
         if (tsym && td.kind == ast::TypeDeclKind::Enum && ref &&
             ref->kind == TypeRef::Kind::Primitive) {
             tsym->enumUnderlyingType = ref;
+        }
+        // §12 / §31.4 (#2950): a BUILT-IN exception base resolves to a Named
+        // TypeRef with `declaration == nullptr` — it has no user TypeSymbol —
+        // so the `baseTypes`/`baseTypeRefs` push below can never record it and
+        // the module metadata built from `baseTypeRefs` never carried it. That
+        // is why the §31.4 header is part of the class's LAYOUT but was
+        // invisible to every consumer without an AST in hand, i.e. to the whole
+        // importing side. Record it here, on the symbol, where local and
+        // imported types can be asked the same question. The `!ref->declaration`
+        // gate is what keeps a USER class that happens to be named `Exception`
+        // (which does resolve to a declaration) from being mistaken for the
+        // built-in — the AST-name walks this replaces had no such guard.
+        if (tsym && td.kind == ast::TypeDeclKind::Class &&
+            tsym->builtinExceptionBase.empty() && bt->name &&
+            !bt->name->parts.empty() &&
+            !(ref && ref->kind == TypeRef::Kind::Named && ref->declaration)) {
+            std::string_view bn = bt->name->parts.back();
+            if (common::isBuiltinExceptionName(bn))
+                tsym->builtinExceptionBase = std::string(bn);
         }
         if (tsym && ref && ref->kind == TypeRef::Kind::Named &&
             ref->declaration) {

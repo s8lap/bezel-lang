@@ -5801,30 +5801,30 @@ private:
     // entire user-exception subtree.
     //
     // Returns the built-in exception base name (e.g. "Exception"), or "" if none.
+    //
+    // fix #2950 (§12 / §31.4 / §2.8.3 rule 4, v0.240): this used to BE the AST
+    // walk described above, and that walk answers "no built-in base" for every
+    // IMPORTED class — an imported symbol has no `ast::TypeDecl` at all, so the
+    // `td` cast is null and the loop finds nothing, silently. Because this is
+    // the predicate `classStruct` / `disposedFlagIndex` /
+    // `buildImportedGenericVtable` gate the §31.4 header on, the importer laid
+    // an imported exception subclass out WITHOUT the header (measured: exporter
+    // `{ptr,ptr,ptr,ptr,ptr,i8,i32}` = 48 B, importer `{ptr,i8,i32}` = 16 B),
+    // `calloc`'d 16 bytes, and then called the EXPORTER's own compiled
+    // constructor, which stored the field 28 bytes past the end of the block.
+    // The same `b->decl` gate on the ancestor step stopped the walk at the
+    // module boundary in the other direction too, so a LOCAL class deriving
+    // from an IMPORTED exception subclass lost the header as well.
+    //
+    // The walk now lives in `sema::builtinExceptionBaseOf`, which reads
+    // `TypeSymbol::builtinExceptionBase` — populated by Type Resolution for
+    // local types and restored by ModuleLoader from the artifact for imported
+    // ones — and falls back to the AST for anything that predates it. The name
+    // set there is `common::isBuiltinExceptionName`, i.e. the same
+    // `kBuiltinExceptionHierarchy` table `builtinVtable_` is built from
+    // (verified name-for-name identical), so this is not a widening.
     std::string directBuiltinExceptionBase(const sema::TypeSymbol* t) const {
-        if (!t || t->kind != ast::TypeDeclKind::Class) return {};
-        // Walk up the user-class chain (TypeSymbol::baseTypes gives us user bases).
-        for (const sema::TypeSymbol* cur = t; cur;) {
-            auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl);
-            if (td) {
-                // Check each AST-declared base for a builtin exception name.
-                for (const auto& bt : td->baseTypes) {
-                    if (!bt || !bt->name || bt->name->parts.empty()) continue;
-                    std::string n(bt->name->parts.back());
-                    if (builtinVtable_.find(n) != builtinVtable_.end()) return n;
-                }
-            }
-            // Advance to the next user-class base via the TypeSymbol chain.
-            const sema::TypeSymbol* next = nullptr;
-            for (const sema::TypeSymbol* b : cur->baseTypes) {
-                if (b && b->kind == ast::TypeDeclKind::Class && b->decl) {
-                    next = b;
-                    break;
-                }
-            }
-            cur = next;
-        }
-        return {};
+        return std::string(sema::builtinExceptionBaseOf(t));
     }
 
     // #595: true when `t` (or any user-class ancestor) inherits a built-in

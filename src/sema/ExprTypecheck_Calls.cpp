@@ -16083,67 +16083,38 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             retTy->declaration = targetType;
             ctx_.setExprType(&ma, retTy);
         }
-        // #595 / §12 / §31: `Message` is an inherited member on any user class
-        // that derives (directly or via a user-class chain) from a built-in
+        // #595 / §12 / §31: `Message` is an inherited member on any class that
+        // derives (directly or through its class-ancestor chain) from a built-in
         // exception type (Exception, ArgumentException, …).  Built-in exception
-        // types are absent from TypeSymbol::baseTypes so we walk the AST
-        // TypeDecl::baseTypes chain to detect the inheritance.  When `Message` is
-        // found valid here, also set its resolved type to `string` so callers
-        // (e.g. `.Length` on the result) can infer the chain type.
+        // types are absent from TypeSymbol::baseTypes — they have no user
+        // TypeSymbol at all — so the inheritance is detected through
+        // `sema::builtinExceptionBaseOf`, which reads the symbol field #2950
+        // added for exactly that (see Symbol.hpp).  When `Message` is found
+        // valid here, also set its resolved type to `string` so callers (e.g.
+        // `.Length` on the result) can infer the chain type.
         bool isBuiltinExInheritedMember = false;
         if (mm == "Message" && knownCompleteUserType &&
                 targetType->kind == ast::TypeDeclKind::Class) {
-            // Walk the user-class TypeSymbol chain checking each AST TypeDecl's
-            // base-type list for a built-in exception name.
-            auto isBuiltinExName = [](std::string_view n) -> bool {
-                return n == "Exception"             ||
-                       n == "ArgumentException"     ||
-                       n == "ArgumentNullException" ||
-                       // stdlib §2.5/§4.4 (v0.183, #1396).
-                       n == "ArgumentOutOfRangeException" ||
-                       n == "ArithmeticException"   ||
-                       n == "OverflowException"     ||
-                       n == "DivideByZeroException" ||
-                       n == "InvalidOperationException" ||
-                       n == "NotImplementedException"   ||
-                       n == "NullReferenceException"    ||
-                       n == "IndexOutOfRangeException"  ||
-                       n == "KeyNotFoundException"      ||
-                       n == "MatchFailureException"     ||
-                       n == "OperationCanceledException"||
-                       n == "TypeInitializationException" ||
-                       n == "FormatException"           ||
-                       n == "StackOverflowException"    ||
-                       // #976 / stdlib §7.4 / §7.5: System.Threading + System.IO.
-                       n == "TimeoutException"          ||
-                       n == "IOException"               ||
-                       n == "FileNotFoundException"     ||
-                       n == "DirectoryNotFoundException"||
-                       n == "EndOfStreamException"      ||
-                       n == "PathTooLongException"      ||
-                       // §22.16 (v0.203, #2053): clause-violation type.
-                       n == "ContractViolationException";
-            };
-            for (const TypeSymbol* cur = targetType; cur && !isBuiltinExInheritedMember;) {
-                auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl);
-                if (td) {
-                    for (const auto& bt : td->baseTypes) {
-                        if (!bt || !bt->name || bt->name->parts.empty()) continue;
-                        if (isBuiltinExName(bt->name->parts.back())) {
-                            isBuiltinExInheritedMember = true;
-                            break;
-                        }
-                    }
-                }
-                // Advance to next user-class base.
-                const TypeSymbol* next = nullptr;
-                for (const TypeSymbol* b : cur->baseTypes) {
-                    if (b && b->kind == ast::TypeDeclKind::Class && b->decl) {
-                        next = b; break;
-                    }
-                }
-                cur = next;
-            }
+            // fix #2950 (§12 / §31.4 / §2.8.2, v0.240): ask the ONE walk
+            // (`sema::builtinExceptionBaseOf`) that codegen's layout gate also
+            // asks. Two things were wrong with the hand-rolled copy this
+            // replaces, and they pulled in opposite directions:
+            //
+            //   * It read `ast::TypeDecl::baseTypes` and required `b->decl` on
+            //     each ancestor step, so it answered "no" for every IMPORTED
+            //     exception subclass — `e.Message` on one did not compile at
+            //     all ("no member `Message` on type `MyEx`"), while the same
+            //     declaration compiled fine as a local class.
+            //   * Its name list was a hand-listed positive set that had drifted
+            //     from the `kBuiltinExceptionHierarchy` table: it omitted
+            //     DisposedAccessException, SerializationException,
+            //     ChannelClosedException, ChannelFullException and
+            //     DomainFaultedException, every one of which codegen's own gate
+            //     DID carry. So a class deriving from one of those five was
+            //     laid out WITH the §31.4 header while sema rejected reading
+            //     the header's own `Message`.
+            isBuiltinExInheritedMember =
+                !builtinExceptionBaseOf(targetType).empty();
             if (isBuiltinExInheritedMember) {
                 // `e.Message` returns a string (§31 / stdlib Exception.Message).
                 ctx_.setExprType(&ma,

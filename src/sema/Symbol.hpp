@@ -150,7 +150,46 @@ struct TypeSymbol : Symbol {
     // TypeSymbol with no real module (builtins materialized on demand,
     // ts->decl == nullptr); those are never part of the cross-module ABI.
     std::string moduleName;
+    // §12 / §31.4 (#2950): the name of the BUILT-IN exception type this class
+    // names DIRECTLY as its base ("Exception", "IOException", …), or empty when
+    // it names none. A built-in exception has no user TypeSymbol at all (its
+    // TypeRef carries `declaration == nullptr`), so it can never appear in
+    // `baseTypes`/`baseTypeRefs` — this field is the only place the
+    // relationship is recorded on the symbol, and it is what makes the fact
+    // available where no AST exists.
+    //
+    // Why it must live on the symbol rather than be re-derived from the AST at
+    // each use site: the §31.4 exception header (Message@8, InnerException@16,
+    // CauseChain@24, ParamName@32) is part of the class's LAYOUT. Every
+    // consumer that walked `ast::TypeDecl::baseTypes` instead saw nothing for
+    // an IMPORTED class — an imported symbol has no AST — so the importer laid
+    // the very same class out 32 bytes shorter than the exporter did and
+    // `calloc`'d to its own size, while the exporter's own compiled constructor
+    // stored through the 48-byte offsets (#2950, measured: exporter
+    // `{ptr,ptr,ptr,ptr,ptr,i8,i32}` vs importer `{ptr,i8,i32}` for one
+    // `public class MyEx: Exception` with a single `int` field). §2.8.3 rule 4
+    // requires "one runtime type identity — `is` tests, `catch` clauses, and
+    // §19 patterns over values of the instantiation match identically
+    // regardless of which artifact produced the value or performs the test",
+    // so the two sides must agree: ModuleMetadata carries this
+    // field and ModuleLoader restores it. Populated for LOCAL types by Type
+    // Resolution and for IMPORTED types by ModuleLoader. Read it through
+    // `builtinExceptionBaseOf` below, never directly, so the ancestor walk
+    // stays in one place.
+    std::string builtinExceptionBase;
 };
+
+// §12 / §31.4 (#595 / #2950): the built-in exception type `t` inherits — its
+// own `builtinExceptionBase` when it names one directly, else the first one
+// found walking its class-ancestor chain — or "" when it inherits none.
+//
+// The ancestor walk crosses module boundaries in BOTH directions: a class whose
+// base is an IMPORTED exception subclass carries the same header as one whose
+// base is local, because the §31.4 slots sit at fixed byte offsets that every
+// artifact's compiled member access uses. That is why the walk must not require
+// an ancestor to have an `ast::TypeDecl` (an imported one never does), and why
+// `builtinExceptionBase` is consulted at every level rather than only the first.
+std::string_view builtinExceptionBaseOf(const TypeSymbol* t);
 
 // A.2 TypeAliasDecl — its target type is resolved by Type Resolution.
 struct TypeAliasSymbol : Symbol {

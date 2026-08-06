@@ -256,64 +256,22 @@ static bool isLiteralDerivedExpr(const ast::Expr* e) {
     return false;
 }
 
-// #625 / §12 / §31: true when `name` is a built-in exception type identifier.
-// Mirrors the isBuiltinExName lambda in ExprTypecheck_Calls.cpp (kept in sync).
-static bool isBuiltinExceptionTypeName(std::string_view n) {
-    return n == "Exception"              ||
-           n == "ArgumentException"      ||
-           n == "ArgumentNullException"  ||
-           // stdlib §2.5/§4.4 (v0.183, #1396).
-           n == "ArgumentOutOfRangeException" ||
-           n == "ArithmeticException"    ||
-           n == "OverflowException"      ||
-           n == "DivideByZeroException"  ||
-           n == "InvalidOperationException" ||
-           n == "NotImplementedException"   ||
-           n == "NullReferenceException"    ||
-           n == "IndexOutOfRangeException"  ||
-           n == "KeyNotFoundException"      ||
-           n == "MatchFailureException"     ||
-           n == "OperationCanceledException"||
-           n == "TypeInitializationException" ||
-           n == "FormatException"           ||
-           n == "StackOverflowException"    ||
-           // #976 / stdlib §7.4 / §7.5: System.Threading + System.IO families.
-           n == "TimeoutException"          ||
-           n == "IOException"               ||
-           n == "FileNotFoundException"     ||
-           n == "DirectoryNotFoundException"||
-           n == "EndOfStreamException"      ||
-           n == "PathTooLongException"      ||
-           // §22.16 (v0.203, #2053): clause-violation exception type.
-           n == "ContractViolationException";
-}
-
-// #625 / §12 / §31: true when `ts` (a user class TypeSymbol) or any user-class
-// ancestor has a direct AST-declared base that is a built-in exception.
-// Used by the unqualified identifier resolver to allow bare `Message` in the
-// body of an exception-derived class without "unresolved identifier".
+// #625 / §12 / §31: true when `ts` or any of its class ancestors inherits a
+// built-in exception. Used by the unqualified identifier resolver to allow bare
+// `Message` in the body of an exception-derived class without "unresolved
+// identifier".
+//
+// fix #2950 (§12 / §31.4 / §2.8.2, v0.240): this was a THIRD hand-rolled copy
+// of the same walk — AST base list, `b->decl` required on each ancestor step,
+// and its own positive name list — carrying both of that shape's defects. A
+// LOCAL class whose base is an IMPORTED exception subclass got "unresolved
+// identifier `Message`" for a bare `Message` in its own method body, where the
+// identical hierarchy declared in ONE module resolves it; and the name list had
+// drifted from `kBuiltinExceptionHierarchy` exactly as its siblings had. Both
+// go away by asking `sema::builtinExceptionBaseOf`, which every other consumer
+// of this fact now asks.
 static bool inheritsBuiltinException(const TypeSymbol* ts) {
-    if (!ts || ts->kind != ast::TypeDeclKind::Class) return false;
-    for (const TypeSymbol* cur = ts; cur;) {
-        auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl);
-        if (td) {
-            for (const auto& bt : td->baseTypes) {
-                if (!bt || !bt->name || bt->name->parts.empty()) continue;
-                if (isBuiltinExceptionTypeName(bt->name->parts.back()))
-                    return true;
-            }
-        }
-        // Walk to the next user-class base.
-        const TypeSymbol* next = nullptr;
-        for (const TypeSymbol* b : cur->baseTypes) {
-            if (b && b->kind == ast::TypeDeclKind::Class && b->decl) {
-                next = b;
-                break;
-            }
-        }
-        cur = next;
-    }
-    return false;
+    return !builtinExceptionBaseOf(ts).empty();
 }
 
 // §14.1 (#2006): does `t` mention a free/rigid type variable anywhere — a Named

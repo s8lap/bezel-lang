@@ -1,6 +1,7 @@
 #include "sema/SymbolCollection.hpp"
 
 #include "ast/Node.hpp"
+#include "common/BuiltinRegistry.hpp"  // isBuiltinExceptionName — §31.4 (#2950)
 #include "common/OwnershipFacts.hpp"  // classifyChoiceType — §35.7 equality-bearing choice edge (#2083/#2087)
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
@@ -457,6 +458,59 @@ std::size_t formalParamCount(const ConstructorSymbol& cs) {
     if (auto* d = dynamic_cast<const ast::ConstructorDecl*>(cs.decl))
         return d->params.size();
     return cs.params.size();
+}
+
+// §12 / §31.4 (#595 / #2950): see Symbol.hpp for the contract. Two sources,
+// exactly like the constructor-formal helpers above: the LOCAL source is the
+// `ast::TypeDecl`'s base-type list; the IMPORTED source is
+// `TypeSymbol::builtinExceptionBase`, which ModuleLoader restores from the
+// artifact and which Type Resolution also populates for local types.
+//
+// The symbol field is consulted FIRST at every level so the two sources can
+// never disagree about a class both of them describe, and so a chain that
+// alternates local and imported ancestors resolves at whichever level actually
+// names the built-in.
+//
+// Membership is `common::isBuiltinExceptionName` — the single
+// `kBuiltinExceptionHierarchy` table — rather than a hand-listed set. The
+// hand-listed copies this replaces had already drifted: the §12 `Message`
+// member check in ExprTypecheck_Calls.cpp omitted DisposedAccessException,
+// SerializationException, ChannelClosedException, ChannelFullException and
+// DomainFaultedException, all five of which codegen's `builtinVtable_` gate DID
+// carry — so a class deriving from one of them was laid out WITH the header
+// while sema rejected `e.Message` on it.
+std::string_view builtinExceptionBaseOf(const TypeSymbol* t) {
+    if (!t || t->kind != ast::TypeDeclKind::Class) return {};
+    // Bound the walk. Sema rejects an inheritance cycle before codegen runs, so
+    // this can only be reached with an acyclic chain — but the walk no longer
+    // requires an `ast::TypeDecl` at each level (an imported ancestor has
+    // none), so it must not be able to spin on a malformed symbol graph either.
+    unsigned guard = 0;
+    for (const TypeSymbol* cur = t; cur != nullptr && guard < 256u; ++guard) {
+        if (!cur->builtinExceptionBase.empty()) return cur->builtinExceptionBase;
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(cur->decl)) {
+            for (const auto& bt : td->baseTypes) {
+                if (!bt || !bt->name || bt->name->parts.empty()) continue;
+                std::string_view n = bt->name->parts.back();
+                if (common::isBuiltinExceptionName(n)) return n;
+            }
+        }
+        // Advance to the next CLASS ancestor. #2950: an imported ancestor has
+        // `decl == nullptr`, and the pre-#2950 walks required `b->decl` here —
+        // which stopped the walk dead at the module boundary, so a LOCAL class
+        // deriving from an IMPORTED exception subclass lost the header too
+        // (measured: `%class.Local = type { ptr, i8, i32, i32 }` against the
+        // exporter's 52-byte `ExA` chain, and its inherited field read 0).
+        const TypeSymbol* next = nullptr;
+        for (const TypeSymbol* b : cur->baseTypes) {
+            if (b && b != cur && b->kind == ast::TypeDeclKind::Class) {
+                next = b;
+                break;
+            }
+        }
+        cur = next;
+    }
+    return {};
 }
 
 // §9.2 / §22.9: see Symbol.hpp. An auto-property is a non-static, non-indexer
