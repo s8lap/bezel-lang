@@ -5660,6 +5660,27 @@ private:
     // boxable value (already a reference) or when no descriptor is available.
     llvm::Value* boxValue(llvm::Value* value, const sema::TypeRef* srcTy);
 
+    // fix #2865 (§8.6 "Boxing" / §28.9 "Runtime-managed types" / §28.3, v0.240):
+    // the LAST box `boxValue` minted, as an SSA value. Written on every mint;
+    // read by exactly one consumer — `lowerTypeTest`, which snapshots it to
+    // NULL before lowering its operand and compares it to the operand's result
+    // afterwards. A MATCH proves two things at once: the box was created while
+    // lowering THAT operand (so it is fresh, rc == 1) and it IS the operand's
+    // value (so no store consumed it — every boxForTarget site that STORES a box
+    // is a statement whose expression value is something else: the object for a
+    // field/ctor init, the array for a collection element, the call's result for
+    // an argument). That is what makes the §28.3 unbound-temporary release at
+    // `is`/`is not`/`as <value type>` exactly-once rather than a double free.
+    //
+    // Deliberately NOT a set/stack: the only claim we need is "this exact SSA
+    // value is a fresh box", and pointer identity answers it without any
+    // bookkeeping a consumer could forget to update (the failure mode a
+    // claim-list design would have). Any expression shape that does not hand the
+    // mint straight through — a PHI from an if-expression, a call result, a load
+    // from a slot — simply does not match, and the box keeps leaking: the SAFE
+    // direction, and what the residuals filed against this fix cover.
+    llvm::Value* lastBoxMint_ = nullptr;
+
     // §8.6: given a coercion of `init`'s lowered value `v` into a declared
     // location of type `declTy`, box `v` if the location is Object/interface
     // and the source expression is a value type. Returns the (possibly boxed)

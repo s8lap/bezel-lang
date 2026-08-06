@@ -14668,6 +14668,41 @@ void collectPatternBindings(const ast::Pattern* pat,
     ok = false;  // an unrecognized Pattern kind — fail closed
 }
 
+// #1994 / stdlib §2.1 / §4.6 / §28.3 / §28.9: is argument `i` of a call whose
+// callee is `callee` the VALUE argument of a `Console.Write`/`Console.WriteLine`
+// (or of the `Console.Out`/`Console.Error` TextWriter facets, which route
+// through the SAME tryLowerConsoleCall lowering)? `emitConsoleWrite` reads the
+// argument's bytes into the write(2) syscall and returns; it never stores,
+// retains, or otherwise extends the argument's lifetime, so the value position
+// is a CALL-BOUNDED BORROW, not an escape.
+//
+// Recognized structurally by the same callee shapes `tryLowerConsoleCall` keys
+// on, so the escape decision and the lowering stay in lockstep. Only index 0
+// qualifies; every other position stays ESCAPED (leak over UAF).
+//
+// fix #2865 (§8.6/§28.9, v0.240): hoisted out of StringEscapeWalker so the BOX
+// walker uses the SAME definition rather than a second copy — the #2787 lesson
+// (three copies of one predicate drifted, and `decimal` fell out of one).
+bool isConsoleNonRetainingArg(const ast::Expr* callee, size_t i) {
+    if (i != 0) return false;
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
+    if (!ma || !ma->target) return false;
+    if (ma->member != "Write" && ma->member != "WriteLine") return false;
+    // Direct `Console.Write`/`Console.WriteLine`.
+    if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+        return id->name == "Console";
+    // `Console.Out.<m>` / `Console.Error.<m>` — the stdout/stderr TextWriter
+    // facets that lower through the same tryLowerConsoleCall stdfd path.
+    if (auto* inner =
+            dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
+        if (inner->member != "Out" && inner->member != "Error") return false;
+        if (auto* iid =
+                dynamic_cast<const ast::IdentifierExpr*>(inner->target.get()))
+            return iid->name == "Console";
+    }
+    return false;
+}
+
 struct StringEscapeWalker {
     const sema::SemaContext& ctx;
     const void* target;   // the LocalDecl node we are testing
@@ -14933,33 +14968,17 @@ struct StringEscapeWalker {
     // StringBuilder.Append relaxation and the #1430 plain-method relaxation, but
     // for an INTRINSIC callee (Console is a §2.3 built-in class matched
     // structurally by name — it has no resolved user MethodSymbol, so walkCallArgs'
-    // #1430 `ms` path is null and never fires here). Recognized structurally by
-    // the SAME callee shapes tryLowerConsoleCall keys on (name "Console", member
-    // "Write"/"WriteLine", or the "Console.Out"/"Console.Error" facet), so the
-    // escape decision and the lowering stay in lockstep. Only the single string
-    // arg (index 0) qualifies; everything else stays ESCAPED (leak over UAF). The
-    // caller gates this on stringReleaseMode (the #1997 narrowing) so the shared
-    // dict/grouping/borrowing-Array walks — which have no release-old machinery —
-    // keep their conservative ESCAPE for any collection passed to the WriteLine
-    // Object overload.
+    // #1430 `ms` path is null and never fires here). The caller gates this on
+    // stringReleaseMode (the #1997 narrowing) so the shared dict/grouping/
+    // borrowing-Array walks — which have no release-old machinery — keep their
+    // conservative ESCAPE for any collection passed to the WriteLine Object
+    // overload.
+    //
+    // fix #2865: the RECOGNITION itself now has ONE definition, shared with
+    // BoxEscapeWalker — isConsoleNonRetainingArg, above this struct, which
+    // carries the structural-matching rationale.
     bool isConsoleNonRetainingStringArg(const ast::Expr* callee, size_t i) {
-        if (i != 0) return false;
-        auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(callee);
-        if (!ma || !ma->target) return false;
-        if (ma->member != "Write" && ma->member != "WriteLine") return false;
-        // Direct `Console.Write`/`Console.WriteLine`.
-        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
-            return id->name == "Console";
-        // `Console.Out.<m>` / `Console.Error.<m>` — the stdout/stderr TextWriter
-        // facets that lower through the same tryLowerConsoleCall stdfd path.
-        if (auto* inner =
-                dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
-            if (inner->member != "Out" && inner->member != "Error") return false;
-            if (auto* iid =
-                    dynamic_cast<const ast::IdentifierExpr*>(inner->target.get()))
-                return iid->name == "Console";
-        }
-        return false;
+        return isConsoleNonRetainingArg(callee, i);
     }
 
     // Call arguments (#1430): a bare read of the target passed in a PLAIN
@@ -19043,6 +19062,26 @@ struct BoxEscapeWalker {
                static_cast<const void*>(loc->decl) == target;
     }
 
+    // fix #2865 (§8.6/§28.9/§28.3, v0.240): call ARGUMENTS. Every position is
+    // an escape (a plain parameter may be `owned`, and the callee could retain)
+    // EXCEPT the value argument of `Console.Write`/`Console.WriteLine` and its
+    // `Console.Out`/`Console.Error` facets, which `emitConsoleWrite` renders
+    // into the write(2) syscall and never stores — a CALL-BOUNDED BORROW. This
+    // is the BOX twin of the #1994 relaxation StringEscapeWalker already
+    // carries for a string local, sharing its one predicate
+    // (isConsoleNonRetainingArg). MEASURED before the fix: `var o: Object := k;
+    // Console.WriteLine(o);` in a 20-iteration loop leaked 480 bytes in 20
+    // objects. The relaxation cannot double-release: the console lowering does
+    // not release a box argument (that is exactly why the shape leaked).
+    void walkArgs(const ast::Expr* callee,
+                  const std::vector<ast::CallArgument>& args) {
+        for (std::size_t i = 0; i < args.size(); ++i) {
+            bool safe = args[i].name.empty() && args[i].modifier.empty() &&
+                        isConsoleNonRetainingArg(callee, i) && !inLambda;
+            expr(args[i].value.get(), safe);
+        }
+    }
+
     void expr(const ast::Expr* e, bool safeRead) {
         if (!e || escaped) return;
         if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
@@ -19114,7 +19153,7 @@ struct BoxEscapeWalker {
                 } else {
                     expr(mem->target.get(), /*safeRead=*/false);
                 }
-                for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+                walkArgs(c->callee.get(), c->args);
                 return;
             }
             if (auto* mem = dynamic_cast<const ast::NullCondMemberExpr*>(
@@ -19124,11 +19163,11 @@ struct BoxEscapeWalker {
                 } else {
                     expr(mem->target.get(), /*safeRead=*/false);
                 }
-                for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+                walkArgs(c->callee.get(), c->args);
                 return;
             }
             expr(c->callee.get(), /*safeRead=*/false);
-            for (auto& a : c->args) expr(a.value.get(), /*safeRead=*/false);
+            walkArgs(c->callee.get(), c->args);
             return;
         }
         if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
@@ -19204,8 +19243,27 @@ struct BoxEscapeWalker {
             for (auto& k : cl->keys) expr(k.get(), /*safeRead=*/false);
             return;
         }
+        // fix #2865 (§18.5 "Interpolated strings" / §8.6 / §28.9, v0.240): an
+        // interpolation HOLE is a NON-CONSUMING READ of a boxed Object, exactly
+        // as StringEscapeWalker has always treated it for a string (its own
+        // arm, ~15475: "Interpolation parts are reads"). The renderer lowers the
+        // hole and hands it to `emitPrimitiveToString(ev, P::Object)` →
+        // `lowerObjectToString`, which dispatches the box's vtable ToString slot
+        // and returns a FRESH string; `emitStringConcat` then copies that
+        // string's bytes. Nothing retains the box or stores it anywhere the
+        // expression outlives — `bz_box_retain` is emitted for lambda capture
+        // and class-field store only, never here.
+        //
+        // MEASURED before the fix: `var op: Object := new Pt(k,k); var s :=
+        // $"[{op}]";` in a 20-iteration loop leaked 480 bytes in 20 objects,
+        // while the byte-identical program with `op.ToString()` (the CallExpr
+        // arm's receiver relaxation above) was clean — the same local, the same
+        // box, the same rendering, differing only in this walker's verdict.
+        // safeRead=true makes only a BARE occurrence of the tracked local safe;
+        // a hole containing a sub-expression (`$"{f(op)}"`) still recurses into
+        // the CallExpr arm and escapes on the argument.
         if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
-            for (auto& part : is->parts) expr(part.expr.get(), /*safeRead=*/false);
+            for (auto& part : is->parts) expr(part.expr.get(), /*safeRead=*/true);
             return;
         }
         if (auto* r = dynamic_cast<const ast::RangeExpr*>(e)) {

@@ -1738,7 +1738,48 @@ llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
 
 llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     if (!te.operand || !te.testType) return nullptr;
+    // fix #2865 (§8.6 "Boxing" / §28.9 / §28.3, v0.240): an UNBOUND +1 box
+    // temporary. §8.6 mints a fresh heap wrapper whenever a value type reaches
+    // an `Object`/interface location, and §28.9 makes it runtime-managed —
+    // "exempt from MANUAL disposal", which removes the obligation from the USER,
+    // not from codegen. When the box is BOUND to a local, `collectBoxRelease
+    // Eligible` already arms a scope-end `bz_box_release`; when it is a bare
+    // temporary — `if m.M() is int then`, `if e[i] is int then` — nothing ever
+    // held it and nothing ever freed it: one 24-byte box per evaluation, growing
+    // without bound in a loop (#2865 shapes 1 and 2, 480 B / 20 iterations).
+    //
+    // `is` / `is not` / `as <value type>` are precisely the positions
+    // BoxEscapeWalker already classifies as NON-CONSUMING reads: `is` walks the
+    // descriptor chain and keeps nothing, and a value-target `as` COPIES the
+    // payload bytes out of the wrapper. So once the operand is proven to be a
+    // fresh, solely-owned box, releasing it here is exactly-once.
+    //
+    // TWO independent proofs, either of which suffices:
+    //   * the mint-identity check below (`lastBoxMint_`), which covers every
+    //     box minted IN THIS FRAME while lowering the operand — the inline
+    //     indexer/property read paths (shape 2);
+    //   * `isUserMethodBoxReturnCall`, the SAME predicate `isPlusOneBoxProducer`
+    //     case (b) uses to arm the bound-local release, which covers a box
+    //     minted by a locally-compiled `boxReturnMethods_` callee at its return
+    //     edge and transferred to us (shape 1).
+    // Anything else keeps leaking — the safe direction (a bounded leak over a
+    // double free), and what the filed residuals track.
+    llvm::Value* savedBoxMint = lastBoxMint_;
+    lastBoxMint_ = nullptr;
     llvm::Value* obj = lowerExpr(*te.operand);
+    const bool freshBoxTemp =
+        obj && obj->getType()->isPointerTy() &&
+        ((lastBoxMint_ && obj == lastBoxMint_) ||
+         isUserMethodBoxReturnCall(te.operand.get()));
+    lastBoxMint_ = savedBoxMint;
+    // Release the operand's wrapper. Call ONLY where `obj` is provably dead:
+    // never on an `as` whose target is a REFERENCE type, because that arm
+    // RETURNS `obj` itself (`o as Object`, and `o as IShape` on a boxed record
+    // whose descriptor matches) — releasing there would hand the caller a
+    // dangling box.
+    auto releaseFreshBoxTemp = [&] {
+        if (freshBoxTemp) emitBoxRelease(obj);
+    };
     if (!obj) return nullptr;
     sema::TypeRef* rt = ctx_.resolvedType(*te.testType);
     if (!rt) return nullptr;
@@ -1807,9 +1848,11 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             isStrFn, {obj, vtableTablePtr()}, "is.string");
         llvm::Value* isStrBit =
             builder_.CreateICmpNE(isStr, builder_.getInt32(0));
-        if (te.op == "is") return isStrBit;
-        if (te.op == "is not")
+        if (te.op == "is") { releaseFreshBoxTemp(); return isStrBit; }
+        if (te.op == "is not") {
+            releaseFreshBoxTemp();
             return builder_.CreateXor(isStrBit, builder_.getInt1(true));
+        }
         if (te.op == "as")
             // §17.4: `o as string` → the bz_string* on success, null otherwise.
             return builder_.CreateSelect(
@@ -1828,9 +1871,12 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         }
         llvm::Value* nonNull = builder_.CreateICmpNE(
             obj, llvm::ConstantPointerNull::get(ptrTy()), "is.object");
-        if (te.op == "is") return nonNull;
-        if (te.op == "is not")
+        if (te.op == "is") { releaseFreshBoxTemp(); return nonNull; }
+        if (te.op == "is not") {
+            releaseFreshBoxTemp();
             return builder_.CreateXor(nonNull, builder_.getInt1(true));
+        }
+        // `as Object` RETURNS the operand — no release (see releaseFreshBoxTemp).
         if (te.op == "as")
             return builder_.CreateSelect(
                 nonNull, obj, llvm::ConstantPointerNull::get(ptrTy()));
@@ -1962,9 +2008,11 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
     } else {
         isA = emitIsA(obj, targetDesc);
     }
-    if (te.op == "is") return isA;
-    if (te.op == "is not")
+    if (te.op == "is") { releaseFreshBoxTemp(); return isA; }
+    if (te.op == "is not") {
+        releaseFreshBoxTemp();
         return builder_.CreateXor(isA, builder_.getInt1(true));
+    }
     if (te.op == "as") {
         // §17.4: `x as T` for a VALUE-type target unboxes — load the value
         // bytes out of the box `{ vtable*, rc, value-bytes }` (payload at two
@@ -2004,6 +2052,18 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             builder_.CreateBr(contBB);
 
             builder_.SetInsertPoint(contBB);
+            // fix #2865: the payload has been LOADED out of the wrapper (a
+            // by-value copy of the scalar/struct bytes — `loaded` above), so on
+            // this arm, and only on this arm, `obj` is dead and a fresh temporary
+            // wrapper can be reclaimed. Both PHI predecessors join here, so the
+            // release runs exactly once on the matched and the unmatched path
+            // alike (bz_box_release is null-safe for the null-operand case).
+            // The reference-target `as` below deliberately does NOT release.
+            //
+            // ⚠ The call is emitted AFTER this block's PHI nodes, never before:
+            // an emitBoxRelease at the top of contBB put a `call` ahead of them
+            // and the verifier rejected the module ("PHI nodes not grouped at
+            // top of basic block!") — caught by this fix's own `as int` probe.
             if (rt->kind == sema::TypeRef::Kind::Primitive ||
                 isNullableRecordTy(rt) ||
                 valueBuiltinName(rt) != nullptr ||
@@ -2034,6 +2094,7 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
                     llvm::ConstantInt::get(nullablePrimHasValTy(), 1), loadBB);
                 hvPhi->addIncoming(
                     llvm::ConstantInt::get(nullablePrimHasValTy(), 0), preBB);
+                releaseFreshBoxTemp();  // fix #2865 — after the PHIs
                 llvm::Value* res = builder_.CreateInsertValue(
                     llvm::UndefValue::get(nst), hvPhi, {0u});
                 return builder_.CreateInsertValue(res, valPhi, {1u});
@@ -2044,6 +2105,7 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
             auto* recPhi = builder_.CreatePHI(valTy, 2);
             recPhi->addIncoming(loaded, loadBB);
             recPhi->addIncoming(llvm::Constant::getNullValue(valTy), preBB);
+            releaseFreshBoxTemp();  // fix #2865 — after the PHI
             return recPhi;
         }
         return builder_.CreateSelect(
@@ -2158,7 +2220,14 @@ llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
         return box;
     };
 
-    if (!nullableValue) return emitBox();
+    if (!nullableValue) {
+        // fix #2865 (§8.6/§28.9/§28.3, v0.240): record the mint so a consumer
+        // that provably DISCARDS it can reclaim it — see `lastBoxMint_`'s note
+        // in LlvmBackend_impl.hpp and its one reader, lowerTypeTest.
+        llvm::Value* b = emitBox();
+        lastBoxMint_ = b;
+        return b;
+    }
 
     // Nullable source: branch on hasValue — box only when present, else null.
     auto* boxBB = llvm::BasicBlock::Create(llvm_, "box.some", currentFn_);
@@ -2173,6 +2242,9 @@ llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
     auto* phi = builder_.CreatePHI(ptrTy(), 2);
     phi->addIncoming(boxed, boxEndBB);
     phi->addIncoming(llvm::ConstantPointerNull::get(ptrTy()), preBB);
+    // fix #2865: the nullable arm's mint is the PHI (null when the source was
+    // absent — bz_box_release is null-safe, so the reader needs no extra guard).
+    lastBoxMint_ = phi;
     return phi;
 }
 
