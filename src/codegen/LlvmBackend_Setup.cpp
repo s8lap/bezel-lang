@@ -10838,7 +10838,14 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // wrapper whose first word is the value type's box vtable, so `is`/`as`/
     // dispatch recognize the boxed value (findings 05/06/08/12/13). A reference
     // source (class/string/interface) is left as its bare pointer (#399).
-    if (v && declType)
+    // fix #2915: the guard used to be `if (v && declType)`. A unit-typed
+    // initializer has NO lowered value (§4.7's `()` lowers to LLVM `void`), so
+    // that `v &&` was exactly what kept `var o: Object := ();` from boxing —
+    // the slot stayed zero (a NULL Object) and only the #2434 `internal:` note
+    // was emitted. boxForTarget is a no-op for every other null-`v` shape (it
+    // bails on a null value once past the unit case), so dropping the guard
+    // changes nothing else.
+    if (declType)
         v = boxForTarget(v, ctx_.resolvedType(*declType), init);
     // §29.2 (#552): when a user class (implementing IEnumerable<T>) is assigned
     // to a local declared as IEnumerable<T>, wrap it in a thin sm-compatible
@@ -11298,7 +11305,18 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // that also mislabels an explained "not yet implemented" limitation
         // as "internal: …". The guard only suppresses THIS diagnostic, never
         // the zero-init store below.
-        if (init && !ctx_.diagnostics().hasErrors()) {
+        // fix #2915 (§4.7): a UNIT-typed initializer is exempt for the same
+        // reason as its #2491 return-path twin — `()` lowers to LLVM `void`,
+        // so having no lowered value IS the type's representation, not a
+        // lowering failure. (`var u: () := ();` stores nothing into the
+        // one-byte placeholder slot #1619 substitutes, which is correct: there
+        // is exactly one unit value, so no byte pattern distinguishes it.) An
+        // `Object`-typed target no longer reaches here at all — boxForTarget
+        // now supplies the box above.
+        const sema::TypeRef* initTy = init ? ctx_.exprType(*init) : nullptr;
+        const bool unitInitializer =
+            initTy && initTy->kind == sema::TypeRef::Kind::Unit;
+        if (init && !unitInitializer && !ctx_.diagnostics().hasErrors()) {
             ctx_.diagnostics().report(
                 Severity::Warning, init->span.begin,
                 "internal: lowerLocalDecl's initializer expression failed "
@@ -26598,6 +26616,189 @@ llvm::GlobalVariable* Emitter::inlineArrayBoxDescriptor(
 }
 
 
+// fix #2915 (§4.7 / §8.6 "Boxing of the unit value", v0.240): mint (or return
+// the cached) box descriptor + box vtable for the unit type `()`.
+//
+// §4.7: "The unit type is a value type and can in principle be boxed via the
+// `Object` derivation chain ([§8.6]) — `var o: Object := ();` is grammatically
+// valid and produces a boxed `()`." §8.1 lists the unit type among the kinds
+// that "derive via boxing". Both readings §8.6 permits — interned or fresh —
+// require a real heap object; the null reference this produced before is
+// neither.
+//
+// The three Object-virtual members:
+//   * ToString — §8.5 fixes it: "For inline arrays … and for the unit type: the
+//     type's name — … `"()"` for unit". A constant.
+//   * Equals / GetHashCode — §8.3's table has NO unit row, so this is a reading
+//     the spec does not state and the commit message records it: the unit type
+//     has exactly ONE value, so §8.3's "Value comparison" (the Primitive row's
+//     shape) can only mean "the other operand is also a boxed unit", and
+//     "Value-based" hashing of a one-valued type can only be a constant. §8.3's
+//     invariant ("if a.Equals(b) then a.GetHashCode() = b.GetHashCode()") then
+//     holds BY CONSTRUCTION rather than by agreement between two computations.
+//   * itmap — the unit type implements no interfaces, so the vtable's interface
+//     slot points at a shared EMPTY null-terminated itmap (the inline-array
+//     box's, minted by the same rule): a stray lookup finds nothing rather than
+//     dereferencing a null vtable[1].
+//
+// LINKAGE is InternalLinkage, matching the inline-array box and the span box
+// rather than the primitives' LinkOnceODR. Cross-artifact box identity is
+// separately broken for every boxable kind (#2301/#2797) and is not made worse
+// here.
+llvm::GlobalVariable* Emitter::ensureUnitBoxVtable() {
+    if (unitBoxVtable_) return unitBoxVtable_;
+
+    // The descriptor chain: `[self, null]` — the unit type has no base types
+    // and implements no interfaces, so `o is ()` matches this one element.
+    auto* descTy = llvm::ArrayType::get(ptrTy(), 2);
+    auto* desc = new llvm::GlobalVariable(
+        *module_, descTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage, nullptr, "btd$unitbox");
+    desc->setInitializer(llvm::ConstantArray::get(
+        descTy, {desc, llvm::ConstantPointerNull::get(ptrTy())}));
+    unitBoxDesc_ = desc;
+
+    // --- ToString: §8.5's `"()"` ------------------------------------------
+    llvm::Function* toStrFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()},
+                                             /*isVarArg=*/false);
+        toStrFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                         "bz$unittostr", module_.get());
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", toStrFn);
+        ThunkScope scope(currentFn_, builder_, toStrFn, entry);
+        builder_.CreateRet(lowerStringLiteral("\"()\"", false));
+    }
+
+    // --- Equals: "is `other` also a boxed unit" ---------------------------
+    // The guard is the SAME descriptor comparison the inline-array box uses, so
+    // a boxed unit is equal to every other boxed unit and to nothing else — in
+    // particular not to a boxed `int` or a class instance, whose vtable[0] is a
+    // different global.
+    llvm::Function* eqFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
+                                             /*isVarArg=*/false);
+        eqFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                      "bz$uniteq", module_.get());
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", eqFn);
+        ThunkScope scope(currentFn_, builder_, eqFn, entry);
+        llvm::Value* other = eqFn->getArg(1);
+        auto* nullP = llvm::ConstantPointerNull::get(ptrTy());
+        auto* notNullBB = llvm::BasicBlock::Create(llvm_, "uniteq.nonnull", eqFn);
+        auto* endBB     = llvm::BasicBlock::Create(llvm_, "uniteq.end",     eqFn);
+        builder_.CreateCondBr(
+            builder_.CreateICmpEQ(other, nullP), endBB, notNullBB);
+
+        builder_.SetInsertPoint(notNullBB);
+        llvm::Value* otherVtbl =
+            builder_.CreateLoad(ptrTy(), other, "uniteq.ovtbl");
+        llvm::Value* otherDesc =
+            builder_.CreateLoad(ptrTy(), otherVtbl, "uniteq.odesc");
+        llvm::Value* same = builder_.CreateICmpEQ(
+            otherDesc, llvm::ConstantExpr::getPointerCast(desc, ptrTy()));
+        builder_.CreateBr(endBB);
+
+        builder_.SetInsertPoint(endBB);
+        auto* phi = builder_.CreatePHI(i1(), 2, "uniteq.res");
+        phi->addIncoming(builder_.getFalse(), entry);  // other was null
+        phi->addIncoming(same, notNullBB);
+        builder_.CreateRet(phi);
+    }
+
+    // --- GetHashCode: a constant (see the note above) ---------------------
+    llvm::Function* hashFn;
+    {
+        auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()},
+                                             /*isVarArg=*/false);
+        hashFn = llvm::Function::Create(fnTy, llvm::Function::InternalLinkage,
+                                        "bz$unithash", module_.get());
+        auto* entry = llvm::BasicBlock::Create(llvm_, "entry", hashFn);
+        ThunkScope scope(currentFn_, builder_, hashFn, entry);
+        // Deliberately NOT 0: a degenerate 0 is the value every UNBOXED /
+        // dropped path already produces (#2804 recorded that exact trap — three
+        // distinct boxes all "agreeing" at hash 0), so a test asserting the
+        // unit box's hash would pass vacuously against the pre-fix behaviour.
+        // Any constant satisfies §8.3 for a one-valued type; this one is
+        // recognizable in a failure report.
+        builder_.CreateRet(builder_.getInt32(0x756E6974));  // 'u','n','i','t'
+    }
+
+    if (!inlineArrayBoxItmap_) {
+        auto* itmapTy = llvm::ArrayType::get(ptrTy(), 1);
+        inlineArrayBoxItmap_ = new llvm::GlobalVariable(
+            *module_, itmapTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(
+                itmapTy, {llvm::ConstantPointerNull::get(ptrTy())}),
+            "itmap$box$inlinearray");
+    }
+
+    std::vector<llvm::Constant*> vtElems(
+        kVirtualMethodsBase, llvm::ConstantPointerNull::get(ptrTy()));
+    vtElems[0] = desc;
+    vtElems[1] = llvm::ConstantExpr::getPointerCast(inlineArrayBoxItmap_,
+                                                    ptrTy());
+    if (builtinDisposeFn_)  // boxed values are runtime-managed (§28.9) — no-op
+        vtElems[2] = llvm::cast<llvm::Constant>(builtinDisposeFn_);
+    vtElems[kToStringSlot]    = toStrFn;
+    vtElems[kEqualsSlot]      = eqFn;
+    vtElems[kGetHashCodeSlot] = hashFn;
+    auto* vtTy = llvm::ArrayType::get(ptrTy(), kVirtualMethodsBase);
+    auto* vtGV = new llvm::GlobalVariable(
+        *module_, vtTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(vtTy, vtElems), "bvt$unitbox");
+    allVtables_.push_back(vtGV);  // §8.6 #417: bz_obj_is_string discriminator
+    unitBoxVtable_ = vtGV;
+    return vtGV;
+}
+
+
+// fix #2915 (§8.6): the unit box descriptor for a `o is ()` type-test target.
+// Minting is shared with the vtable so the descriptor a test compares against
+// IS the global boxUnitValue stored at vtable[0], whichever site runs first.
+llvm::GlobalVariable* Emitter::unitBoxDescriptor() {
+    ensureUnitBoxVtable();
+    return unitBoxDesc_;
+}
+
+
+// fix #2915 (§4.7 / §8.6): mint a boxed `()`.
+//
+// This does NOT go through boxValue, and the reason is structural rather than
+// stylistic: the unit type lowers to LLVM `void` (lowerTypeRef's Kind::Unit
+// case), so a unit-typed expression has NO lowered llvm::Value at all — a
+// `UnitExpr` lowers to nullptr, which is why every boxing site's `if (v)` guard
+// skipped it and the `Object` slot was left zero-initialized (a NULL reference,
+// with only lowerLocalDecl's #2434 `internal:` note to show for it). The box
+// therefore carries a one-byte placeholder payload; there is exactly one unit
+// value, so no byte pattern distinguishes one placeholder from another, and
+// nothing ever reads it. The layout is otherwise byte-identical to every other
+// box — `{ vtable*, i64 rc, payload }`, rc := 1 at the fixed BZ_BOX_RC_OFFSET —
+// so bz_box_release and the §28.9 placement machinery need no unit special
+// case at all.
+llvm::Value* Emitter::boxUnitValue() {
+    llvm::GlobalVariable* vt = ensureUnitBoxVtable();
+    auto* payloadTy = i8();
+    auto* boxTy = llvm::StructType::get(llvm_, {ptrTy(), i64(), payloadTy});
+    uint64_t sz = module_->getDataLayout().getTypeAllocSize(boxTy);
+    llvm::Value* box = builder_.CreateCall(
+        callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)sz)});
+    builder_.CreateStore(vt, box);
+    llvm::Value* rcPtr =
+        builder_.CreateGEP(i64(), box, {builder_.getInt32(1)}, "box.rcptr");
+    builder_.CreateStore(builder_.getInt64(1), rcPtr);
+    llvm::Value* pptr =
+        builder_.CreateGEP(ptrTy(), box, {builder_.getInt32(2)}, "box.valptr");
+    builder_.CreateStore(llvm::ConstantInt::get(payloadTy, 0), pptr);
+    // fix #2865's consumer hook: record the mint so a consumer that provably
+    // DISCARDS it can reclaim it, exactly as boxValue's non-nullable arm does.
+    lastBoxMint_ = box;
+    return box;
+}
+
+
 // §8.6: is `rt` a value type that boxes when coerced to Object/interface?
 bool Emitter::isBoxableValueType(const sema::TypeRef* rt) {
     if (!rt) return false;
@@ -26637,7 +26838,19 @@ bool Emitter::isBoxableValueType(const sema::TypeRef* rt) {
     // move-only exclusion §8.6 names (`[N owned]T`) and the identity
     // preconditions live in the ONE predicate, not re-listed here.
     if (rt->kind == K::InlineArray) return inlineArrayBoxable(rt);
-    return false;  // unit: deferred (§4.7 / §8.6 "Boxing of the unit value")
+    // fix #2915 (§4.7 / §8.6 "Boxing of the unit value"): "The unit type is a
+    // value type and can in principle be boxed via the `Object` derivation
+    // chain (§8.6) — `var o: Object := ();` … produces a boxed `()`" (§4.7),
+    // and §8.1 lists the unit type among the kinds that "derive via boxing".
+    // This used to be `return false` with a "deferred" note, so the `Object`
+    // slot held the NULL reference: `o is Object` was false and ToString
+    // rendered "null" where §8.5 requires "()". Admitting it here is what makes
+    // the §28.9 box-release placement see the slot as holding a box, so the
+    // wrapper boxUnitValue mints is released at scope end rather than leaked;
+    // the minter can build every type this admits (boxUnitValue is total), so
+    // the #2796 "admitted but unbuildable" hazard does not arise.
+    if (rt->kind == K::Unit) return true;
+    return false;
 }
 
 
@@ -26679,6 +26892,9 @@ llvm::GlobalVariable* Emitter::boxDescriptorFor(const sema::TypeRef* rt) {
     // demand, keyed structurally, so the target resolves the same global the
     // box carries at vtable[0].
     if (rt->kind == K::InlineArray) return inlineArrayBoxDescriptor(rt);
+    // fix #2915 (§8.6 "Boxing of the unit value"): `o is ()` — the same global
+    // boxUnitValue stores at vtable[0], so the box and the target agree.
+    if (rt->kind == K::Unit) return unitBoxDescriptor();
     return nullptr;
 }
 
@@ -26830,6 +27046,10 @@ llvm::GlobalVariable* Emitter::boxVtableFor(const sema::TypeRef* rt) {
     // isBoxableValueType uses, so boxValue never leaves an admitted value
     // unboxed (which would hand raw array bytes to the §28.9 box-release path).
     if (rt->kind == K::InlineArray) return ensureInlineArrayBoxVtable(rt);
+    // fix #2915 (§8.6 "Boxing of the unit value"): the ONE unit box vtable.
+    // Gated by the same predicate isBoxableValueType uses (Kind::Unit), so
+    // boxValue never leaves an admitted unit unboxed.
+    if (rt->kind == K::Unit) return ensureUnitBoxVtable();
     // §4.16 / §8.6 (#970): span types box into IReadOnlySpan<T>.
     if (isSpanLikeTypeName(rt)) {
         llvm::Type* elemTy = i32();  // fallback: int element

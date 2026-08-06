@@ -2297,6 +2297,24 @@ private:
     // `o is [3]int` compares equal to what boxValue stored at vtable[0]).
     llvm::GlobalVariable* inlineArrayBoxDescriptor(const sema::TypeRef* rt);
 
+    // fix #2915 (§4.7 / §8.6 "Boxing of the unit value", v0.240): the ONE box
+    // descriptor + box vtable for the unit type. Unlike `[N]T` there is nothing
+    // to key on — `()` is a single type with a single value — so these are two
+    // module-level globals minted on first use, not a map. `ensureUnitBoxVtable`
+    // fills both; `unitBoxDescriptor` is the type-test-target counterpart and
+    // returns the SAME global boxValue stores at vtable[0].
+    llvm::GlobalVariable* unitBoxDesc_ = nullptr;
+    llvm::GlobalVariable* unitBoxVtable_ = nullptr;
+    llvm::GlobalVariable* ensureUnitBoxVtable();
+    llvm::GlobalVariable* unitBoxDescriptor();
+    // fix #2915: mint a boxed `()`. §8.6 permits (but does not require)
+    // interning boxed units; this mints a FRESH box per boxing, which is the
+    // conforming reading that reuses the §28.9 release machinery unchanged (an
+    // interned singleton would have to be excluded from bz_box_release, a
+    // special case with no upside — §8.4 already declares the reference
+    // comparison unspecified either way).
+    llvm::Value* boxUnitValue();
+
     llvm::Type* i8() { return llvm::Type::getInt8Ty(llvm_); }
     llvm::Type* i16() { return llvm::Type::getInt16Ty(llvm_); }
     llvm::Type* i32() { return llvm::Type::getInt32Ty(llvm_); }
@@ -6191,6 +6209,12 @@ private:
     // value; a no-op for reference sources and non-Object targets.
     llvm::Value* boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
                               const ast::Expr* init);
+
+    // fix #2915 (§4.7 / §8.6): rescue a unit-typed `:=` RHS, which lowers to no
+    // llvm::Value at all and was therefore dropped SILENTLY by the assignment
+    // arms' `if (!rhs) return false;` exits. Defined in LlvmBackend_Stmts.cpp.
+    llvm::Value* rescueUnitAssignRhs(llvm::Value* rhs,
+                                     const ast::AssignmentStmt& as);
 
     // §29.2 (#437): wrap a raw bz_array_t* in a type-specific vtable-backed
     // enumerator whose MoveNext → i1 and Current → T match the iterator state

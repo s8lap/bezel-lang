@@ -85,6 +85,26 @@ bool Emitter::lowerVirtualPropertyIncrDecr(const ast::IncrementStmt& inc) {
 }
 
 
+// fix #2915 (§4.7 / §8.6 "Boxing of the unit value", v0.240): the unit-RHS
+// rescue for `x := ();`.
+//
+// `()` lowers to LLVM `void`, so a unit-typed expression has NO lowered value
+// and `lowerExpr` returns null for it. Every `:=` arm below then took its
+// `if (!rhs) return false;` exit — SILENTLY, with no diagnostic at all: measured
+// on f069645, `var p: Object := "seed"; p := ();` left `p` holding `"seed"`,
+// so the assignment simply did not happen. §4.7 requires a boxed `()` at an
+// `Object` location, so supply it here, through the SAME boxForTarget the
+// local-decl, argument and return positions use (boxForTarget is a no-op for a
+// non-Object/interface target and for every non-unit source, so this rescue
+// only ever converts "silently dropped" into "boxed"). A null return still
+// means "nothing to store" for every other shape.
+llvm::Value* Emitter::rescueUnitAssignRhs(llvm::Value* rhs,
+                                          const ast::AssignmentStmt& as) {
+    if (rhs || !as.target || !as.value) return rhs;
+    return boxForTarget(rhs, ctx_.exprType(*as.target), as.value.get());
+}
+
+
 bool Emitter::lowerStmt(const ast::Stmt& s) {
     if (auto* ld = dynamic_cast<const ast::LocalDecl*>(&s)) {
         lowerLocalDecl(ld, ld->initializer.get(), ld->type.get());
@@ -643,6 +663,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 dynamic_cast<const ast::IdentifierExpr*>(as->target.get()) &&
                 localSlot(*as->target) != nullptr) {
                 rhs = lowerExpr(*as->value);
+                rhs = rescueUnitAssignRhs(rhs, *as);
                 if (!rhs) return false;
                 addr = lvalueAddr(*as->target, elemTy);
                 if (!addr) return false;
@@ -650,6 +671,7 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 addr = lvalueAddr(*as->target, elemTy);
                 if (!addr) return false;
                 rhs = lowerExpr(*as->value);
+                rhs = rescueUnitAssignRhs(rhs, *as);
                 if (!rhs) return false;
             }
             // §7.7 (#1190): null-coalescing assignment `x ??= e`. Mirror the
@@ -1592,7 +1614,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         //     unhandled `in` form) — same message-quality guard #2434 used.
         // The zero/null degrade still happens downstream; this only makes
         // the failure observable instead of invisible.
-        if (rs->value && !v && !ctx_.diagnostics().hasErrors()) {
+        // fix #2915 (§4.7): a UNIT-typed return value is exempt. `()` lowers to
+        // LLVM `void` (lowerTypeRef's Kind::Unit case), so it legitimately has
+        // no lowered value — that is the type's representation, not a lowering
+        // failure — and for an `Object`/interface return the §8.6 boxing below
+        // supplies the box. Without this exemption both `return ();` from a
+        // unit-returning method and the now-correct `return ();` through an
+        // `Object` return printed an `internal:` note on a program with nothing
+        // wrong with it.
+        const sema::TypeRef* retValTy =
+            rs->value ? ctx_.exprType(*rs->value) : nullptr;
+        const bool unitReturnValue =
+            retValTy && retValTy->kind == sema::TypeRef::Kind::Unit;
+        if (rs->value && !v && !unitReturnValue &&
+            !ctx_.diagnostics().hasErrors()) {
             ctx_.diagnostics().report(
                 Severity::Warning, rs->value->span.begin,
                 "internal: return-value expression failed to lower to a "
@@ -1720,8 +1755,14 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // declared type. Pre-fix an `Object`-typed block getter returning an
         // `int` emitted `ret i32` from a `ptr`-returning function and the
         // module failed IR verification.
+        // fix #2915: the guard was `if (v && rs->value)`. A unit-typed
+        // `return ();` through an `Object` return has NO lowered value (§4.7's
+        // `()` lowers to LLVM `void`), so the `v &&` skipped the box and the
+        // caller received null. boxForTarget bails on a null value for every
+        // other shape, and is a no-op whenever the declared return type is not
+        // Object/interface, so dropping the guard changes nothing else.
         if (const ast::Type* rn = returnReprTypeNode())
-            if (v && rs->value)
+            if (rs->value)
                 v = boxForTarget(v, ctx_.resolvedType(*rn), rs->value.get());
         // §29.2 / §4.3 (#1310): a value returned as `IEnumerable<T>` must be a
         // vtable-backed enumerator, not a raw bz_array_t* / class instance — the

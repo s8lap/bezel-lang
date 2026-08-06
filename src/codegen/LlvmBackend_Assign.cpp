@@ -9780,6 +9780,17 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             v = lowerExpr(*a.value);
             expectedFunctionType_ = savedExpected;
         }
+        // fix #2915 (§4.7 / §8.6 "Boxing of the unit value", v0.240): a
+        // unit-typed argument has NO lowered value — `()` lowers to LLVM
+        // `void`, so lowerExpr returns null for it — and at an `Object`/
+        // interface parameter §4.7 requires a boxed `()` rather than nothing.
+        // Routed through the SAME boxForTarget the local-decl, assignment and
+        // return positions use, so all four agree by construction. A no-op for
+        // every other null-`v` shape and for a non-Object parameter, so the
+        // #1386 ICE below still fires for the cases it was written for.
+        if (!v && params[idx].type)
+            v = boxForTarget(v, ctx_.resolvedType(*params[idx].type),
+                             a.value.get());
         if (!v) {
             // #1386: ICE — lowerExpr returned null for a call argument value;
             // the expression kind is not yet handled by codegen.

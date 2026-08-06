@@ -2576,7 +2576,17 @@ llvm::Value* Emitter::lowerTypeTest(const ast::TypeTestExpr& te) {
         // target keeps the #399 behavior (the pointer IS the value). The payload
         // load is guarded by `isA` so a failed cast (or a null operand) never
         // dereferences the box.
-        if (isBoxableValueType(rt)) {
+        // fix #2915: `rt->kind == Unit` is excluded EXPLICITLY rather than by
+        // isBoxableValueType (which now admits it, so the boxed `()` has a
+        // runtime identity — §4.7/§8.6). This arm loads the payload as
+        // `lowerTypeRef(rt)`, and the unit type lowers to LLVM `void`: a
+        // `load void` is not constructible and would abort the compiler. The
+        // unboxing direction `o as ()` therefore keeps EXACTLY its pre-fix
+        // lowering (it falls through to the reference-target arm below) — this
+        // change makes the boxing and type-TEST directions correct and leaves
+        // the unbox untouched, rather than inventing a `()?` representation.
+        // Filed separately; it is the unit twin of #2911's `x as [N]T`.
+        if (isBoxableValueType(rt) && rt->kind != sema::TypeRef::Kind::Unit) {
             // §17.4: the result of `as` is ALWAYS nullable, so the target may be
             // written either bare (`o as int`) or already-nullable (`o as int?`).
             // The box stores the BARE value bytes, and the result struct built
@@ -2809,7 +2819,13 @@ llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
 // pointer) is preserved by only boxing boxable VALUE sources.
 llvm::Value* Emitter::boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
                                    const ast::Expr* init) {
-    if (!v || !declTy || !init) return v;
+    // ⚠ MERGE NOTE (#2901 + #2915): the opening guard deliberately does NOT
+    // test `!v`. #2915 needs a null `v` to reach the unit rescue below (unit
+    // lowers to LLVM `void`, so `lowerExpr` returns nullptr for `()`), and that
+    // rescue is placed BEFORE this function's own `!v` bail for exactly that
+    // reason. #2901's type-parameter resolution below is null-`v`-safe: it
+    // reads only `declTy`.
+    if (!declTy || !init) return v;
     // fix #2901 (§8.6 / §14.1, v0.240): resolve a bare TYPE-PARAMETER target
     // through the active monomorphization before classifying it. §8.6 states,
     // verbatim: "When a value type is used where `Object` (or an interface
@@ -2841,6 +2857,27 @@ llvm::Value* Emitter::boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
     }
     const sema::TypeRef* srcTy = ctx_.exprType(*init);
     if (!srcTy) return v;
+    // fix #2915 (§4.7 / §8.6 "Boxing of the unit value", v0.240): the unit
+    // source is the one boxable kind with NO lowered value — `()` lowers to
+    // LLVM `void`, so `lowerExpr` returns nullptr for it and every caller's
+    // `if (v)` guard skipped the box, leaving the `Object` slot zero — the NULL
+    // reference. §4.7 is explicit that `var o: Object := ();` "produces a boxed
+    // `()`", and §8.1 lists the unit type among the kinds that derive from
+    // Object via boxing; neither reading §8.6 permits (interned or fresh) is
+    // satisfiable by null. Handled BEFORE the `!v` bail below for exactly that
+    // reason. Callers that already had a value are untouched.
+    //
+    // ⚠ The `!v` in this condition is load-bearing, not defensive. Several
+    // positions call boxForTarget TWICE on the same argument (the arm that
+    // rescues the null value, then the shared boxing site downstream); without
+    // it the second call minted a SECOND wrapper and the first leaked —
+    // measured under LSan as 48 bytes in 2 allocations for `p := ();` and for
+    // `Take(())`, against 24/1 and 0/0 for the same shapes with an `int`. With
+    // it, the second call reaches the "already a pointer" bail below and the
+    // count matches the int baseline exactly.
+    if (!v && srcTy->kind == sema::TypeRef::Kind::Unit && !srcTy->nullable)
+        return boxUnitValue();
+    if (!v) return v;
     // #1279 / §8.6 / §14.1: a generic value-type parameter `T` / `T?` (declared
     // `where T: value`) returned where `Object`/`Object?` is expected must be
     // boxed like its CONCRETE monomorphized type. Under an active

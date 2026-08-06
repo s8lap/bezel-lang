@@ -7020,7 +7020,16 @@ llvm::Value* Emitter::lowerCaseExpr(const ast::CaseExpr& ce) {
                 if (!disposeStack_.empty())
                     declScopeDepth_[bp] = disposeStack_.size();
                 locals_[bp] = slot;
+            // fix #2915: Kind::Unit is excluded EXPLICITLY rather than by
+            // isBoxableValueType (which now admits it — §4.7/§8.6 — so a boxed
+            // `()` has a runtime identity). This arm allocas and loads
+            // `lowerTypeRef(btyRef)`, and the unit type lowers to LLVM `void`:
+            // neither an `alloca void` nor a `load void` is constructible, and
+            // this arm has no `void`→`i8` placeholder substitution of the kind
+            // lowerLocalDecl applies (#1619). A `var u: ()` typed binding
+            // therefore keeps EXACTLY its pre-fix lowering.
             } else if (btyRef && isBoxableValueType(btyRef) &&
+                       btyRef->kind != sema::TypeRef::Kind::Unit &&
                        scrut->getType()->isPointerTy()) {
                 // #746 / §19.3 / §8.6: a typed binding `var n: T` where T is a
                 // boxable VALUE type (int/bool/long/enum/record) over a BOXED
