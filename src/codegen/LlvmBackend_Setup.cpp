@@ -8924,7 +8924,10 @@ bool Emitter::emitImportedBaseFieldInit(const sema::TypeSymbol* base,
         llvm::Value* vtSlot = builder_.CreateStructGEP(bst, obj, 0, "b.vt.slot");
         llvm::Value* savedVt = builder_.CreateLoad(ptrTy(), vtSlot, "b.vt.save");
         emitInstanceInit(base, obj, bst);
-        emitImplicitBase(base, obj);
+        // fix #2908: `derived` is the most-derived class this construction
+        // reached `base` from; carry it further up the chain as the root rather
+        // than letting the recursion narrow to `base`.
+        emitImplicitBase(base, obj, derived ? derived : base);
         emitOwnFieldInit(base, obj, bst);
         builder_.CreateStore(savedVt, vtSlot);
         genericSubst_ = std::move(savedGenericSubst);
@@ -8964,9 +8967,19 @@ bool Emitter::emitImportedBaseFieldInit(const sema::TypeSymbol* base,
 }
 
 
-void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
+void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
+                               const sema::TypeSymbol* root) {
     const sema::TypeSymbol* b = baseClassOf(cls);
     if (!b) return;
+    // fix #2908 (§14.1 / §12 / §22.8 step 1-2, v0.240): the class this
+    // construction sequence started at — see the declaration comment. At an
+    // entry point (`root == nullptr`) this is `cls`, so nothing changes there;
+    // it is the RECURSION below that stops narrowing the receiver level by
+    // level. Every helper this hands it to uses it for one purpose only: as the
+    // synthesized receiver of `computeAncestorGenericSubst`, whose walk is
+    // positional from the receiver's base clauses and therefore both correct and
+    // strictly more resolvable from the most-derived end.
+    const sema::TypeSymbol* mostDerived = root ? root : cls;
     // §11.1 / §22.8 (#929): a primary-ctor class `cls(...): b(baseArgs)` chains to
     // b's constructor. If b has an EXPLICIT constructor of matching arity, call it
     // with the evaluated inheritance-clause arguments (running its body), so a
@@ -9031,7 +9044,10 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
         // instantiation's substitution instead, exactly as emitChainCall already
         // does for an explicit `base()`. Returns false (and this falls through
         // unchanged) for every shape whose layout it cannot prove differs.
-        if (emitSpecializedImplicitBaseCtor(cls, b, target, obj)) return;
+        // fix #2908: ask about the base chain from the MOST-DERIVED class, not
+        // from `cls` — obligation 2 below synthesizes a receiver out of this
+        // argument and needs no seed when that receiver is non-generic.
+        if (emitSpecializedImplicitBaseCtor(mostDerived, b, target, obj)) return;
         auto it = ctorFns_.find(target);
         // §2.5 / §12 (issue #328 / #103): an implicit base chain into an IMPORTED
         // base runs the dependency's `bz$<Base>$ctor`; declare it on demand so
@@ -9043,7 +9059,7 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
         if (it != ctorFns_.end() && it->second->arg_size() == 1) {
             builder_.CreateCall(it->second, {obj});
         }
-    } else if (!emitImportedBaseFieldInit(b, obj, cls)) {
+    } else if (!emitImportedBaseFieldInit(b, obj, mostDerived)) {
         // fix #2452 (§22.8 step 1-2 / §2.5, v0.235): `b` may be an IMPORTED
         // no-explicit-ctor class — emitImportedBaseFieldInit (above) handles
         // that shape by running the base's OWN exported `bz$<Base>$init`
@@ -9063,9 +9079,21 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
         // `emitOwnFieldInit(b, obj, classStruct(b))` this used to be is the
         // LOCAL twin of the imported branch above, and it had the same gap
         // #2860 closed there — see emitLocalBaseFieldInit.
-        emitImplicitBase(b, obj);
+        // fix #2908 (§14.1 / §12 / §22.8 step 1-2, v0.240): carry the SAME root
+        // down the recursion, and hand it — not `cls` — to the field-init helper.
+        // Measured on `class Leaf : Mid<int>` over `class Mid<U> : Base<string>`:
+        // one level down this used to call `emitLocalBaseFieldInit(Base, obj,
+        // Mid)`, whose synthesized `Mid` receiver needs `U` bound in the ACTIVE
+        // substitution — empty at a `new Leaf()` in a non-generic caller, because
+        // #2889's whole-chain composition in `lowerNew` is gated on the NEW'd
+        // class being generic. So `Base`'s `owned cell` / `ba` initializers ran
+        // through the ERASED `%class.Base` while the object was allocated as
+        // `%class.Leaf$spec0`, overwriting the inherited `bv: string` slot:
+        // `SEGV ... WRITE ... in __asan::Allocator::Deallocate` under
+        // `bz_string_release`, on legal single-module code with no diagnostic.
+        emitImplicitBase(b, obj, mostDerived);
         if (!hasAnyConstructor(b))
-            emitLocalBaseFieldInit(b, obj, cls);
+            emitLocalBaseFieldInit(b, obj, mostDerived);
     }
 }
 

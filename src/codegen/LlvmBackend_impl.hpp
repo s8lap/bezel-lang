@@ -8655,6 +8655,13 @@ private:
     // computeAncestorGenericSubst returns false rather than installing a
     // substitution it cannot resolve, so an unresolvable chain keeps today's
     // behaviour exactly.
+    // fix #2908 (§14.1 / §12 / §22.8 step 2, v0.240): `derived` is the class the
+    // whole construction sequence STARTED at — the most-derived class `obj` is
+    // known to be — not the immediate derived link. Only the most-derived end
+    // determines every ancestor's bindings without a seed: at a middle link the
+    // synthesized receiver is itself generic, and its own parameter has to be
+    // bound in the ACTIVE substitution, which a `new Leaf()` in a non-generic
+    // caller does not do.
     void emitLocalBaseFieldInit(const sema::TypeSymbol* base,
                                 llvm::Value* obj,
                                 const sema::TypeSymbol* derived);
@@ -8788,7 +8795,27 @@ private:
     // CG16 (§12.8): the implicit `base()` — run the base class's
     // parameterless ctor (which chains further). If the base has no ctor,
     // recurse to its base so a deeper ctor still runs.
-    void emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj);
+    //
+    // fix #2908 (§14.1 / §12 / §22.8 step 1-2, v0.240): `root` is the class this
+    // construction sequence STARTED at — the most-derived class `obj` is known to
+    // be, which is what determines every ancestor's type-parameter bindings.
+    // Null at an entry point means "cls is the root"; the recursion below passes
+    // it down unchanged, so a deeper level asks about the base chain from the
+    // MOST-DERIVED class rather than from its own immediate derived class.
+    //
+    // WHY IT MATTERS. `computeAncestorGenericSubst` resolves a chain positionally
+    // from the receiver's base clauses, and needs a seed only for the receiver's
+    // OWN parameters. Handing it the immediate derived class made the seed
+    // mandatory at every middle link: for `class Leaf : Mid<int>` over
+    // `class Mid<U> : Base<string>`, one level down the receiver is `Mid`, whose
+    // `U` a `new Leaf()` in a non-generic caller does not bind (#2889's
+    // composition is gated on the NEW'd class being generic, so a non-generic
+    // leaf composes nothing) — the chain went unresolved and `Base`'s own field
+    // initializers ran at the ERASED `T -> i32` layout inside an object allocated
+    // at the composed one. From `Leaf` the same walk needs NO seed (a non-generic
+    // receiver is the 0 == 0 case) and resolves `U -> int` then `T -> string`.
+    void emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj,
+                          const sema::TypeSymbol* root = nullptr);
 
     // fix #2882 (§22.8 step 1 "The base or chained constructor call" / §14.1 /
     // §12, v0.240): the implicit-base twin of emitChainCall's #585/#617 inline.
@@ -8815,6 +8842,10 @@ private:
     // unresolvable ancestor substitution (`computeAncestorGenericSubst` returns
     // false rather than installing a wrong one), or a layout that is provably
     // identical to the template's.
+    // fix #2908 (§14.1 / §12 / §22.8 step 1, v0.240): `cls` is the class the
+    // construction sequence STARTED at (the most-derived class `obj` is known to
+    // be), not the immediate derived link — obligation 2 synthesizes a receiver
+    // out of it, and only the most-derived end resolves the chain without a seed.
     bool emitSpecializedImplicitBaseCtor(const sema::TypeSymbol* cls,
                                          const sema::TypeSymbol* base,
                                          sema::ConstructorSymbol* target,
