@@ -3342,7 +3342,19 @@ void Emitter::disposeDisplacedOwnedClassLocal(const ast::Expr* target,
 }
 
 
-void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
+void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind,
+                            bool undischargedOwned) {
+    // fix #2869 / §28.3 "Exception-path discharge" (v0.240): the predicate for the
+    // UNWIND-EXCLUSIVE entries (`unwindOnly`, `releaseOnUnwindOnly`) is "the owned
+    // local never reached its static discharge point", NOT "an exception is in
+    // flight right now". Those coincide on every edge except the one a catch arm
+    // of a try-WITH-`finally` leaves after handling the exception: the try body
+    // WAS left by the throw, so its owned locals are undischarged, but no
+    // exception is in flight any more. `undischargedOwned` is that first question
+    // asked on its own; every other isUnwind-gated behavior below (caughtException
+    // stays in flight, asyncDispose/taskScope lose their `await`, #2334's
+    // skipCellFreeOnUnwind) keeps asking the second and so keeps reading isUnwind.
+    const bool dropUndischarged = isUnwind || undischargedOwned;
     for (auto it = scope.rbegin(); it != scope.rend(); ++it) {
         // #422 / §4.6 / §28.9: a provably-non-escaping `var` string local.
         // Release its single (producer) reference at scope end — on BOTH the
@@ -3657,7 +3669,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
         // order iteration) unwind path and skips. The unbox is load → null-
         // check → release → store null, identical shape to the class path.
         if (it->unwindOnly) {
-            if (!isUnwind) continue;
+            if (!dropUndischarged) continue;   // fix #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr);
@@ -3918,7 +3930,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // releases here only on unwind (the discharge site owns the normal
             // exit). A `using var` / auto-dropped owner leaves the flag false and
             // releases on both exits.
-            if (it->releaseOnUnwindOnly && !isUnwind) continue;
+            if (it->releaseOnUnwindOnly && !dropUndischarged) continue;   // fix #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* h = builder_.CreateLoad(ptrTy(), addr);
@@ -4446,7 +4458,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // #1957: an `owned` Channel<T> PARAMETER discharged on the normal
             // path disposes here only on unwind; a `using var` / auto-dropped
             // owner leaves the flag false and disposes on both exits.
-            if (it->releaseOnUnwindOnly && !isUnwind) continue;
+            if (it->releaseOnUnwindOnly && !dropUndischarged) continue;   // fix #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* ch = builder_.CreateLoad(ptrTy(), addr);
@@ -4536,7 +4548,7 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind) {
             // AUTO-DROPPED owned sender (§28.3, the never-discharged owner) leaves
             // the flag false and releases on both exits. As the last sender this
             // release closes the channel (§30.15).
-            if (it->releaseOnUnwindOnly && !isUnwind) continue;
+            if (it->releaseOnUnwindOnly && !dropUndischarged) continue;   // fix #2869
             llvm::Type* ety = nullptr;
             llvm::Value* addr = boxedStorage(it->slot, ety);
             llvm::Value* tx = builder_.CreateLoad(ptrTy(), addr);
@@ -4775,9 +4787,19 @@ void Emitter::emitDisposalsInRange(std::size_t lo, std::size_t hi) {
     // skipped. A `return` routing through a `finally` uses this to dispose only
     // the try-body scopes before the finally and, in the finally's normal-exit
     // dispatch, the enclosing scopes after it — reverse establishment order.
+    //
+    // fix #2869 / §28.3 "Exception-path discharge" (v0.240): a scope listed in
+    // unwoundBodyScopes_ is a try body scope control ALREADY left by an exception
+    // (a catch arm of that same try is handling it), so its `unwindOnly` /
+    // `releaseOnUnwindOnly` entries — §28.3's auto-dispose of owned locals that
+    // never reached a discharge point — must fire even though this edge is not an
+    // unwind. Passing it as `undischargedOwned` rather than as `isUnwind` keeps
+    // caughtException / asyncDispose / taskScope / skipCellFreeOnUnwind on their
+    // existing normal-edge behavior (no `await` is lost, no boxed cell leaks).
     if (hi > disposeStack_.size()) hi = disposeStack_.size();
     for (std::size_t i = hi; i-- > lo;)
-        emitDisposals(disposeStack_[i]);
+        emitDisposals(disposeStack_[i], /*isUnwind=*/false,
+                      /*undischargedOwned=*/scopeLeftByException(i));
 }
 
 

@@ -1471,7 +1471,11 @@ private:
     // Each active try-with-finally pushes a frame; innermost is at back.
     struct FinallyFrame {
         llvm::BasicBlock* finNormalBB;  // the finally block for normal exits
-        llvm::AllocaInst* exitModSlot;  // i32: 0=fall-through,1=return,2=break,3=cont,4=yield-break,5=async-return
+        // i32: 0=fall-through,1=return,2=break,3=cont,4=yield-break,5=async-return,
+        // 6=handled-catch-arm fall-through (fix #2869 — same destination as mode 0
+        // but the try BODY scope was left by an exception, so its §28.3
+        // exception-path discharge must still run; see lowerTry's mode-6 block)
+        llvm::AllocaInst* exitModSlot;
         llvm::AllocaInst* retValSlot;   // alloca for return value (null if void)
         llvm::Type*       retTy;        // function return type
         llvm::BasicBlock* afterBB;      // continuation after the try
@@ -1502,14 +1506,16 @@ private:
         // valueless `return` / a `Task` method / a non-async frame.
         llvm::AllocaInst* asyncRetSlot = nullptr;
         // §21.5 (v0.201, #2051): labeled `break`/`continue` that CROSS this
-        // finally to reach an OUTER loop. The fixed modes 0-5 name only the
+        // finally to reach an OUTER loop. The fixed modes 0-6 name only the
         // innermost-loop break/continue (mode 2/3), so a labeled jump to an
         // outer loop — or one with a loop between the target and this try — needs
         // its own exit mode carrying the true target block and scope-floor. Each
         // distinct (isBreak, target loop) routed through this finally gets a
-        // fresh mode >= 6 (deduped); the dispatch switch emits a case per entry.
+        // fresh mode >= 7 (deduped); the dispatch switch emits a case per entry.
+        // (The floor moved 6 → 7 with fix #2869, which claimed 6 for the
+        // handled-catch-arm fall-through.)
         struct LabeledRoute {
-            int mode;                        // exit-mode value (>= 6)
+            int mode;                        // exit-mode value (>= 7)
             bool isBreak;
             llvm::BasicBlock* targetBlock;   // target loop's break/continue block
             std::size_t targetScopeDepth;    // dispose floor (target's scopeDepth)
@@ -1517,7 +1523,7 @@ private:
                                              // frame's inside-loop test
         };
         std::vector<LabeledRoute> labeledRoutes;
-        int nextLabeledMode = 6;
+        int nextLabeledMode = 7;   // fix #2869: 6 is the handled-catch-arm mode
     };
     std::vector<FinallyFrame> finallyStack_;
     // §29.7 (#623): parallel to finallyStack_ — holds the finallyBody AST
@@ -6229,7 +6235,32 @@ private:
     // dispose the scopes between two successive finally bodies in reverse
     // establishment order, so an enclosing `using var` is disposed AFTER an inner
     // finally rather than before it.
+    //
+    // fix #2869 / §28.3 (v0.240): a scope whose index is in `unwoundBodyScopes_`
+    // is emitted with `undischargedOwned=true` — it is a try body scope that was
+    // left by an EXCEPTION even though this edge is not itself an unwind (a catch
+    // arm of that try handled it). See unwoundBodyScopes_'s declaration.
     void emitDisposalsInRange(std::size_t lo, std::size_t hi);
+
+    // fix #2869 / §28.3 "Exception-path discharge" (v0.240): disposeStack_ indices
+    // of try BODY scopes that control has already left by an EXCEPTION, but whose
+    // disposal is being emitted on a NON-unwind edge. A try-WITH-`finally` defers
+    // its body scope's disposal past the finally (#1263), so the body scope is
+    // still on disposeStack_ while a catch arm of that same try is lowered; the
+    // edges leaving that arm (fall-through, `return`, `break`/`continue`, `yield
+    // break`, async return) are ordinary normal-exit edges, yet the body's owned
+    // locals never reached their discharge point — §28.3 requires them disposed.
+    // Pushed around the catch-arm lowering and around the mode-6 dispatch block,
+    // and consulted by emitDisposalsInRange, which is what every one of those exit
+    // sites uses. NOT pushed for a try without a `finally`: there the throw site's
+    // own emitUnwindDisposals already disposed the body scope (it sits above
+    // unwindScopeDepth_) and lowerScopedBlock has already popped it.
+    std::vector<std::size_t> unwoundBodyScopes_;
+    bool scopeLeftByException(std::size_t idx) const {
+        for (std::size_t i : unwoundBodyScopes_)
+            if (i == idx) return true;
+        return false;
+    }
 
     // CG20/CG21: after a call that may throw, branch to the unwind target
     // when the exception global is non-null (disposing unwound using-vars
@@ -9640,7 +9671,25 @@ private:
     // (the exception-propagation path), a `caughtException` entry is SKIPPED —
     // a re-raise/throw leaving a catch arm keeps the exception in flight for
     // the enclosing handler to free.
-    void emitDisposals(const std::vector<Disposal>& scope, bool isUnwind = false);
+    //
+    // fix #2869 / §28.3 "Exception-path discharge" (v0.240): `isUnwind` conflates
+    // two independent questions, and the answers diverge on exactly one edge —
+    // the edge a catch arm of a try-WITH-`finally` leaves by after handling the
+    // exception:
+    //   (a) "was this scope left ABNORMALLY, i.e. did its owned locals miss their
+    //       static discharge point?" — the question `unwindOnly` /
+    //       `releaseOnUnwindOnly` ask, since §28.3 auto-disposes an owned local
+    //       "live when an exception propagates out of [its] enclosing block".
+    //   (b) "is an exception in flight RIGHT NOW?" — the question `caughtException`
+    //       (keep it in flight for the outer handler), `asyncDispose` /
+    //       `taskScope` (no `await` is available mid-unwind, use the synchronous
+    //       fallback) and `skipCellFreeOnUnwind` (#2334's quiescence proof) ask.
+    // On the handled-catch edge (a) is TRUE and (b) is FALSE. `undischargedOwned`
+    // answers (a) alone: it makes the unwind-EXCLUSIVE entries fire without
+    // flipping any of the (b) behaviors. Every other caller leaves it false, so
+    // `isUnwind` keeps answering both as before.
+    void emitDisposals(const std::vector<Disposal>& scope, bool isUnwind = false,
+                       bool undischargedOwned = false);
 
     // CG13: dispose every open scope (innermost → outermost) — the
     // cleanup a `return` runs before leaving the method.

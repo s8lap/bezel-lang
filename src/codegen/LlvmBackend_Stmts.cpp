@@ -3127,6 +3127,23 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
     unwindScopeDepth_ = savedDepth;
     if (!bodyTerm) builder_.CreateBr(normalExit);
 
+    // fix #2869 / §28.3 "Exception-path discharge" (v0.240): control only reaches
+    // the catch dispatch by an EXCEPTION leaving the try body. For a try WITH a
+    // finally the body scope is still on disposeStack_ (#1263 defers its disposal
+    // past the finally), so every disposal emitted from here on that names it —
+    // the `return`/`break`/`continue`/`yield break`/async-return exit sites inside
+    // an arm, which all call emitDisposalsInRange(fr.disposeDepthAtEntry, top) —
+    // must run its `unwindOnly` entries: §28.3 "Owned locals and owned parameters
+    // that are live when an exception propagates out of their enclosing block are
+    // disposed implicitly during stack unwinding." Marking the scope index (rather
+    // than passing isUnwind=true) leaves caughtException / asyncDispose / taskScope
+    // on their normal-edge behavior. Popped after the arm loop so the genuine
+    // fall-through dispatch (mode 0, fallDispBB) is emitted unmarked — there the
+    // body's owned locals DID reach their discharge point and disposing them would
+    // be a double dispose. A try without a finally needs no marking: the throw site
+    // already unwind-disposed the body scope, which lowerScopedBlock has popped.
+    if (hasFin) unwoundBodyScopes_.push_back(bodyScopeIdx);
+
     // Catch dispatch: test arms in order against the in-flight exception.
     builder_.SetInsertPoint(dispatchBB);
     llvm::Value* exc = builder_.CreateLoad(ptrTy(), emitExcSlot());
@@ -3340,10 +3357,26 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         currentCaughtExc_ = savedCaught;
         currentCaughtName_ = savedCaughtName;
         caughtExcArmTarget_ = savedArmTarget;
-        if (!armTerm) builder_.CreateBr(normalExit);
+        if (!armTerm) {
+            // fix #2869 / §28.3 (v0.240): this arm HANDLED the exception and is
+            // falling through to the finally. That is the same destination as a
+            // genuine body fall-through (mode 0) but NOT the same disposal: the
+            // try body was left by the throw, so its owned locals never reached a
+            // discharge point and §28.3's exception-path discharge still owes them
+            // a dispose. Mode 6 selects the dispatch block that performs it (see
+            // caughtDispBB below); mode 0 must keep skipping them, or a body local
+            // discharged on the normal path would be disposed twice.
+            if (hasFin)
+                builder_.CreateStore(builder_.getInt32(6), exitModSlot);
+            builder_.CreateBr(normalExit);
+        }
 
         builder_.SetInsertPoint(nextBB);
     }
+    // fix #2869: the arms are lowered; the remaining dispatch blocks are emitted
+    // below on their own edges (mode 0 is the genuine normal fall-through and must
+    // NOT see the mark; the mode-6 block re-pushes it for its own emission).
+    if (hasFin) unwoundBodyScopes_.pop_back();
     // No arm matched → exception still pending; run finally (if any)
     // then re-propagate to the enclosing unwind target.
     if (hasFin) {
@@ -3394,6 +3427,29 @@ bool Emitter::lowerTry(const ast::TryStmt& trys) {
         auto* sw = builder_.CreateSwitch(mode, fallDispBB, 3);
         builder_.SetInsertPoint(fallDispBB);
         emitDisposalsInRange(thisTryDepth - 1, thisTryDepth);
+        builder_.CreateBr(afterBB);
+
+        // fix #2869 / §28.3 "Exception-path discharge" (v0.240): mode=6 — a catch
+        // arm of THIS try handled the exception and fell through. Same destination
+        // and same scope range as mode 0, but the try body was left by the THROW,
+        // so §28.3's "Owned locals and owned parameters that are live when an
+        // exception propagates out of their enclosing block are disposed
+        // implicitly during stack unwinding" still owes the body's owned locals a
+        // dispose: mark the body scope so its `unwindOnly` / `releaseOnUnwindOnly`
+        // entries fire here (after the finally body — the #1263 ordering, shared
+        // with the auto-drop entries mode 0 already disposes). Pre-fix this edge
+        // reused mode 0's block, whose isUnwind=false pass skips every
+        // `unwindOnly` entry, so a plain owned `var` (or an `owned` param, an
+        // `out owned` recipient, a #993/#1918/#2816 temporary, a builtin owned
+        // handle) declared in the body and discharged on the normal path LEAKED
+        // whenever a catch arm of a try-with-finally caught the throw.
+        auto* caughtDispBB = llvm::BasicBlock::Create(
+            llvm_, "finally.caughtdisp", currentFn_);
+        sw->addCase(builder_.getInt32(6), caughtDispBB);
+        builder_.SetInsertPoint(caughtDispBB);
+        unwoundBodyScopes_.push_back(bodyScopeIdx);
+        emitDisposalsInRange(thisTryDepth - 1, thisTryDepth);
+        unwoundBodyScopes_.pop_back();
         builder_.CreateBr(afterBB);
 
         // mode=1: return — propagate through outer finally or emit ret.
