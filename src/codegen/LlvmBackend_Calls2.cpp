@@ -7675,6 +7675,72 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     // target-inferred result type. Factored into applyMethodGenericSubst so
     // lowerNullCondCall (`?.`) shares the exact same trigger.
     applyMethodGenericSubst(call, ms);
+    // fix #2901 (§8.6 / §14.1, v0.240): §8.6 states, verbatim: "When a value
+    // type is used where `Object` (or an interface implemented by the value
+    // type) is expected, the value is **boxed**: a heap-allocated wrapper holds
+    // the value. Boxed values are runtime-managed ([§28.9])." A RECORD passed to
+    // a generic parameter whose type argument is an INTERFACE it implements —
+    // `Nm<IArea>(rb)` — is exactly that sentence's case, and it was never boxed.
+    //
+    // The §8.6 box IS already applied to every argument, by `boxForTarget`
+    // inside `buildOrderedArgs`. But that runs ABOVE, and the method-level
+    // substitution is only installed by the `applyMethodGenericSubst` call on
+    // the line before this one — measured: at `buildOrderedArgs` time
+    // `genericSubstSemaTy_` is EMPTY, so the formal `v: T` is still the bare
+    // type-parameter ref (Named, `declaration == nullptr`) that
+    // `isObjectOrInterfaceTarget` cannot classify. It answered "not an
+    // Object/interface target" and the box was skipped. (The pre-pass that does
+    // install a substitution early is gated on `hasLambdaArg`, so it never fires
+    // for this shape; widening it is not equivalent, because it infers from
+    // argument types BEFORE consulting the explicit call-site type args and
+    // would bind `T` to `RBox` rather than to the written `IArea`.)
+    //
+    // The damage was not a mis-typed argument alone: `emitGenericSpecialization`
+    // builds the specialized signature from `args[i]->getType()` ("each param
+    // type defaults to its argument's LLVM type"), so the monomorphization took
+    // `%record.RBox` by value while its BODY was emitted with `T` bound to the
+    // interface. `v.ToString()` then found no dispatch, hit #2477's zero-init
+    // fallback, and the `var s: string` slot was `store ptr null` — after which
+    // `s.Length` read `null + 8`: `SEGV on unknown address 0x8`. The sibling
+    // spelling `v.Area()` under `where T: IArea` degraded its return to 0
+    // through #2491 instead, printing `0` for an expected `6`. Both are this one
+    // missing box; the `internal:` degrade lines are the symptom, not a second
+    // defect.
+    //
+    // SCOPE. This re-runs `boxForTarget` ONLY for a formal that is a bare type
+    // parameter — precisely the case the earlier call could not classify and
+    // therefore left untouched. A written-out `Object`/interface formal was
+    // already boxed above and is deliberately not revisited, so no argument can
+    // be boxed twice. `boxForTarget` itself remains the sole decision-maker:
+    // after resolving the target it applies the same `isObjectOrInterfaceTarget`
+    // predicate, so a `T` bound to a value type, to a class, or to nothing at
+    // all is still a no-op — the class-implementor spelling that already worked
+    // (pinned by object_tostring_producer_residual_2867) lowers byte-identically.
+    if (!genericSubstSemaTy_.empty()) {
+        if (auto* mdBox = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+            if (args.size() >= mdBox->params.size()) {
+                // `argExprs` is index-aligned with `args` (the receiver, when
+                // present, carries a null expression), so the parameter at
+                // position `pi` is `args[pi + off]`.
+                std::size_t off = args.size() - mdBox->params.size();
+                for (std::size_t pi = 0; pi < mdBox->params.size(); ++pi) {
+                    std::size_t ai = pi + off;
+                    if (ai >= argExprs.size() || !args[ai] || !argExprs[ai])
+                        continue;
+                    if (!mdBox->params[pi].type) continue;
+                    // ref/out pass an ADDRESS (CG50) — never a boxed value.
+                    if (isByRefMod(mdBox->params[pi].modifier)) continue;
+                    sema::TypeRef* formalTy =
+                        ctx_.resolvedType(*mdBox->params[pi].type);
+                    if (!formalTy ||
+                        formalTy->kind != sema::TypeRef::Kind::Named ||
+                        formalTy->declaration)
+                        continue;  // not a bare type parameter
+                    args[ai] = boxForTarget(args[ai], formalTy, argExprs[ai]);
+                }
+            }
+        }
+    }
     // #1864 / §27.5 / §29.2 / §28.9: an inline-closure PRODUCER (a lambda or
     // method reference — isPlusOneClosureProducer) passed DIRECTLY as an
     // argument to a SYNC ITERATOR method is a +1 TEMPORARY (the producer's

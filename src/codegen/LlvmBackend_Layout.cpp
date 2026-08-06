@@ -2810,7 +2810,35 @@ llvm::Value* Emitter::boxValue(llvm::Value* value, const sema::TypeRef* srcTy) {
 llvm::Value* Emitter::boxForTarget(llvm::Value* v, const sema::TypeRef* declTy,
                                    const ast::Expr* init) {
     if (!v || !declTy || !init) return v;
-    if (!isObjectOrInterfaceTarget(declTy)) return v;
+    // fix #2901 (§8.6 / §14.1, v0.240): resolve a bare TYPE-PARAMETER target
+    // through the active monomorphization before classifying it. §8.6 states,
+    // verbatim: "When a value type is used where `Object` (or an interface
+    // implemented by the value type) is expected, the value is **boxed**: a
+    // heap-allocated wrapper holds the value. Boxed values are runtime-managed
+    // ([§28.9])." Under `Nm<IArea>(rb)` the formal `v: T` IS "an interface
+    // implemented by the value type" — but only after substitution. Before it,
+    // `declTy` is the bare `T` ref (Named, `declaration == nullptr`), which
+    // `isObjectOrInterfaceTarget` cannot classify, so it answered "not an
+    // Object/interface target" and the box was skipped for EVERY generic
+    // parameter at EVERY call site.
+    //
+    // This is the exact mirror of what #1279 already did on the SOURCE side a
+    // few lines below (a `T` bound to a value type, returned where `Object` is
+    // expected, must be boxed as its concrete type). The two halves were never
+    // symmetric: the source got its substitution, the target never did.
+    //
+    // The gate stays a PROPERTY, not a list: after resolution the same
+    // `isObjectOrInterfaceTarget` decides, so nothing is admitted that a
+    // written-out `Object`/interface target would not admit. A bare `T` bound
+    // to a value type, a class, or nothing at all resolves to something that
+    // predicate still rejects, leaving those paths byte-identical.
+    if (!isObjectOrInterfaceTarget(declTy)) {
+        const sema::TypeRef* concreteTarget = resolveTypeParamRef(declTy);
+        if (concreteTarget == declTy ||
+            !isObjectOrInterfaceTarget(concreteTarget))
+            return v;
+        declTy = concreteTarget;
+    }
     const sema::TypeRef* srcTy = ctx_.exprType(*init);
     if (!srcTy) return v;
     // #1279 / §8.6 / §14.1: a generic value-type parameter `T` / `T?` (declared
