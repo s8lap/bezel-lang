@@ -18,12 +18,16 @@
 // very same statement were all correct.
 //
 // THE CAUSE — one rule, three hand-written copies, and a fan of callers with
-// none. §25.1, verbatim: the compound assignment operators "are not
-// user-overloadable … the compound forms desugar mechanically to
-// read-modify-write using the underlying binary operator's overload, with the
-// evaluation counts and result typing of §6.6"; §25.2's candidate set is "the
-// union of the `operator <op>` overloads declared on the static types of BOTH
-// operands", with "parameters match operands in order". `Emitter::
+// none. §25.1's not-overloadable list, verbatim: "Assignment and
+// compound-assignment operators (`:=`, `+=`, `-=`, `*=`, `/=`, `&=`, `|=`,
+// `^=`, `<<=`, `>>=`, `??=`) — Bezel has no compound-operator overload
+// mechanism; the compound forms desugar mechanically to read-modify-write using
+// the underlying binary operator's overload, with the evaluation counts and
+// result typing of [§6.6](#sec-compound-assignments)." §25.2 "Resolution",
+// verbatim: "the candidate set is the union of the `operator <op>` overloads
+// declared on the **static types of both operands, including declarations
+// inherited from their base classes** … Parameters match operands **in order**
+// — there is no automatic commutation". `Emitter::
 // emitCompoundOp` structurally CANNOT apply that rule — it sees only the two
 // lowered LLVM values, and an overload is selected from the operands' SEMA
 // types — so the lookup has to happen at the caller. It existed in exactly
@@ -226,11 +230,15 @@ BEZEL_TEST(codegen_accessor_compound_operator_overload_2904, single_evaluation_6
 
 // ===========================================================================
 // T5 — OVER-ACCEPTANCE CONTROL. `++` on a record-typed property must stay a
-// sourced REJECT: §17.6 identifies `x++` with `x := x + 1` only "For built-in
-// numeric types", so a record's `operator +` does NOT make `b.PP++` legal. The
-// fix widens what an accessor compound may dispatch to, so this pins that it
-// did not widen the INCREMENT spelling with it — and that the reject is a
-// diagnostic, not an IR-verifier abort.
+// sourced REJECT. §17.6 identifies `x++` with `x := x + 1` only "For built-in
+// numeric types", and §25.2 gives a record its own route — "`++` and `--` are
+// postfix-only and statement-only. There is no separate prefix overload; the
+// single overload is used in the one permitted position" — i.e. an
+// `operator ++` the record must DECLARE. `Pair2904` declares `operator +` and
+// no `operator ++`, so this must be rejected. The fix widens what an accessor
+// COMPOUND may dispatch to; this pins that it did not widen the INCREMENT
+// spelling with it (a `+` overload must not become a `++`), and that the reject
+// is a diagnostic, not an IR-verifier abort.
 // ===========================================================================
 BEZEL_TEST(codegen_accessor_compound_operator_overload_2904, record_property_increment_rejected_17_6) {
     auto r = runAot(std::string("module M2904f; ") + kTypes2904 +

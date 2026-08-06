@@ -171,21 +171,44 @@ llvm::Value* Emitter::emitImplicitOne(llvm::Type* t) {
 
 
 // fix #2904 / §25.1 / §25.2 / §6.6: see the declaration comment in
-// LlvmBackend_impl.hpp. §25.2 selects from "the union of the `operator <op>`
-// overloads declared on the static types of BOTH operands", with "parameters
-// match operands in order" (no commutation) — so the target's type is searched
-// first (the common LHS-declared case) and then the value's (#2156's
-// RHS-declared shape, e.g. `operator *(int, Scale)` living on `Scale`).
+// LlvmBackend_impl.hpp. §25.2 "Resolution", verbatim: "For `a <op> b` on
+// non-primitive operands, the candidate set is the union of the `operator <op>`
+// overloads declared on the **static types of both operands, including
+// declarations inherited from their base classes** … Parameters match operands
+// **in order** — there is no automatic commutation". So the target's type is
+// searched first (the common LHS-declared case) and then the value's (#2156's
+// RHS-declared shape, e.g. `operator *(int, Scale)` living on `Scale`), each
+// through its own base chain.
 sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
         const std::string& binOp, const sema::TypeRef* leftTy,
         const sema::TypeRef* rightTy) {
     if (binOp.empty()) return nullptr;
+    // fix #2932 (§25.2, v0.240): the CLASS base chain of a type symbol, walked
+    // by `classBaseOf`. `baseTypes` carries interfaces too; only a CLASS base
+    // participates here (§11.8's static interface members are the
+    // type-parameter path, resolved at instantiation, not this one).
+    auto classBaseOf = [](const sema::TypeSymbol* t) -> const sema::TypeSymbol* {
+        if (!t) return nullptr;
+        for (const sema::TypeSymbol* b : t->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) return b;
+        return nullptr;
+    };
     // §25.2: match the operator's parameter types against the operand types IN
     // ORDER (left→param0, right→param1). Sema has already validated that the
     // compound is well-typed, so this only DISAMBIGUATES when one type declares
-    // several overloads of the same token. A Named parameter matches a Named
-    // operand by declaration; a Primitive parameter matches a Primitive operand
-    // by kind (numeric widening is downstream, as for the binary form).
+    // several overloads of the same token. A Primitive parameter matches a
+    // Primitive operand by kind (numeric widening is downstream, as for the
+    // binary form).
+    //
+    // fix #2932 (§25.2, v0.240): a Named parameter matches a Named operand by
+    // declaration OR by the operand's CLASS BASE CHAIN — §25.2, verbatim: "A
+    // derived-typed operand satisfies a base-typed parameter by the ordinary
+    // argument rules." The exact-declaration test this had was half of why
+    // `n += d` with `operator +(int, Base)` and `d: Derived` aborted the
+    // compile: even reaching the declaration on `Base`, `Derived` did not match
+    // its `Base`-typed parameter. (Interface conformance is deliberately NOT
+    // admitted here: the measured defect is the class chain, and widening to
+    // interfaces would newly SELECT operators for shapes nothing has measured.)
     auto paramMatches = [&](sema::Symbol* paramSym,
                             const sema::TypeRef* operandTy) -> bool {
         auto* ps = dynamic_cast<sema::ParameterSymbol*>(paramSym);
@@ -193,22 +216,46 @@ sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
         sema::TypeRef* pt = ps->declType ? ctx_.resolvedType(*ps->declType)
                                          : ps->resolvedDeclType;
         if (!pt || !operandTy) return false;
-        if (pt->kind == sema::TypeRef::Kind::Named)
-            return operandTy->kind == sema::TypeRef::Kind::Named &&
-                   pt->declaration == operandTy->declaration;
+        if (pt->kind == sema::TypeRef::Kind::Named) {
+            if (operandTy->kind != sema::TypeRef::Kind::Named ||
+                !pt->declaration || !operandTy->declaration)
+                return false;
+            std::unordered_set<const sema::TypeSymbol*> seen;
+            for (const sema::TypeSymbol* t = operandTy->declaration;
+                 t && seen.insert(t).second; t = classBaseOf(t))
+                if (t == pt->declaration) return true;
+            return false;
+        }
         if (pt->kind == sema::TypeRef::Kind::Primitive)
             return operandTy->kind == sema::TypeRef::Kind::Primitive;
         return false;
     };
+    // fix #2932 (§25.2, v0.240): "including declarations inherited from their
+    // base classes (a derived-typed operand reaches its base's operators …)".
+    // The scan this function was extracted from (`#610`/`#2156`) looked at a
+    // type's OWN members only, so a DERIVED-typed operand contributed no
+    // candidates at all: measured on 20cc955, `n += d` with
+    // `operator +(int, Base)` declared on `d`'s base ABORTED the compile
+    // ("Call parameter type does not match function signature! … call
+    // { i32, i1 } @llvm.sadd.with.overflow.i32(i32 %56, ptr %55)") while the
+    // plain binary `n + d` one line above was correct — `lowerBinary` walks the
+    // chain and this did not. §12.2's no-hiding rule "prevents a derived class
+    // from redeclaring an operator token its base declares, so one chain
+    // contributes no duplicate candidates" — so the FIRST match up the chain is
+    // THE match and there is no ambiguity to resolve. The visited set guards a
+    // malformed cyclic chain.
     auto findOnType = [&](const sema::TypeSymbol* ts) -> sema::MethodSymbol* {
-        if (!ts) return nullptr;
-        for (sema::Symbol* m : ts->members) {
-            auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
-            if (ms && ms->isOperator && ms->operatorToken == binOp &&
-                ms->params.size() == 2 &&
-                paramMatches(ms->params[0], leftTy) &&
-                paramMatches(ms->params[1], rightTy))
-                return ms;
+        std::unordered_set<const sema::TypeSymbol*> seen;
+        for (const sema::TypeSymbol* t = ts; t && seen.insert(t).second;
+             t = classBaseOf(t)) {
+            for (sema::Symbol* m : t->members) {
+                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+                if (ms && ms->isOperator && ms->operatorToken == binOp &&
+                    ms->params.size() == 2 &&
+                    paramMatches(ms->params[0], leftTy) &&
+                    paramMatches(ms->params[1], rightTy))
+                    return ms;
+            }
         }
         return nullptr;
     };

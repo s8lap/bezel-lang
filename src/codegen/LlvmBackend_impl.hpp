@@ -3398,12 +3398,16 @@ private:
     // fix #2904 (§25.1 / §25.2 / §6.6, v0.240): the §25 USER-OPERATOR arm
     // `emitCompoundOp` structurally cannot have — it sees only the two lowered
     // LLVM values, and an overload is selected from the operands' SEMA types.
-    // §25.1, verbatim: assignment and compound-assignment operators "are not
-    // user-overloadable … the compound forms desugar mechanically to
-    // read-modify-write using the underlying binary operator's overload, with
-    // the evaluation counts and result typing of §6.6"; §25.2's candidate set is
-    // "the union of the `operator <op>` overloads declared on the static types
-    // of BOTH operands", with "parameters match operands in order".
+    // §25.1's not-overloadable list, verbatim: "Assignment and
+    // compound-assignment operators (`:=`, `+=`, `-=`, `*=`, `/=`, `&=`, `|=`,
+    // `^=`, `<<=`, `>>=`, `??=`) — Bezel has no compound-operator overload
+    // mechanism; the compound forms desugar mechanically to read-modify-write
+    // using the underlying binary operator's overload, with the evaluation
+    // counts and result typing of §6.6." §25.2 "Resolution", verbatim: "the
+    // candidate set is the union of the `operator <op>` overloads declared on
+    // the **static types of both operands, including declarations inherited
+    // from their base classes** … Parameters match operands **in order** —
+    // there is no automatic commutation".
     //
     // That lookup had been hand-copied THREE times — `lowerStmt`'s local
     // compound arm (#610/#2156, the full in-order match) and the two
