@@ -30,6 +30,13 @@
 // its own check — and that gap is wider than this issue: `b.P++` on a
 // getter-only NAMED property is silently discarded too.  Measured, and filed
 // separately; it is not an asymmetry introduced here.
+//   ↳ CLOSED by #2868: the assignment-target check moved into
+//     `ExprTC::checkPropertyWriteTarget` and `IncrementStmt` now calls it too,
+//     so `b[0]++` and `b.P++` are rejected on §17.6's own authority ("Read-only
+//     locations cannot be incremented").  Covered by
+//     tests/sema/getter_only_increment_2868_test.cpp.  This file's cases are
+//     unchanged: the `:=`/`+=` diagnostics are byte-identical after that
+//     extraction, which is exactly what these assertions pin.
 
 #include <string>
 

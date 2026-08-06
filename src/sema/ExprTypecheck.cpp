@@ -4006,6 +4006,238 @@ void ExprTC::checkLValueChainNotCallBased(const ast::Expr& target) {
     }
 }
 
+// §23.3 / §23.1 / §13.6 / §17.6 (v0.240, #2868). The shared
+// property-or-indexer WRITE-TARGET check, called from BOTH statement forms
+// that write through grammar A.6's `LValue`: AssignmentStmt (`x := e`,
+// `x op= e`) and IncrementStmt (`x++` / `x--`).
+//
+// WHY IT IS SHARED (fix #2868): this body used to be inline in visitStmt's
+// AssignmentStmt arm, and the IncrementStmt arm — which never reaches it —
+// carried a hand-maintained mirror of the assignment rules. That mirror has
+// now been found missing a check twice: #2309 (a positional record's
+// auto-generated property) and #2868 (a getter-only property OR indexer,
+// where `b.P++` and `b[0]++` both compiled clean, ran, and SILENTLY
+// DISCARDED the write while the `:=` and `+=` spellings of the same write
+// were correctly rejected). §17.6 states the increment operand rule in the
+// very terms the assignment target already obeys, verbatim: "The operand
+// must be an assignable lvalue (a local variable, a writable field, an
+// indexer slot, or a property with a setter — the same storage categories
+// §22.3's `ref`/`out` arguments reuse). Read-only locations cannot be
+// incremented." §6.6 makes the same identification for the compound form
+// ("§17.6's indexer desugaring is the indexer instance of this rule"), and
+// #2848 already removed the CODEGEN mirror on that authority. So the two
+// statement forms now share ONE implementation rather than a third copy.
+//
+// `incOp` is null for an assignment target and the operator token ("++" /
+// "--") for an increment target. It selects the diagnostic's verb and adds
+// the §17.6 citation; with `incOp == nullptr` every message below is
+// byte-identical to what it was before the extraction.
+//
+// §23.3 (#747 R42): a write to a property with NO setter — an
+// expression-bodied property (`P: T => e;`) or a block-form property with
+// only a getter — is rejected outright (no setter exists).
+// §23.1 (#747 R42): a readonly AUTO-property has an implicit setter, but is
+// assignable only in a field initializer or constructor (like a readonly
+// field), so a write OUTSIDE a constructor is also rejected. Without these
+// the write was silently accepted/dropped.
+// per §23.1 (#1173): the target may be a qualified member access (`this.X`,
+// `obj.X`) OR an UNQUALIFIED implicit-this identifier (`X := 9` inside the
+// declaring class). Both resolve to the same PropertySymbol and must obey
+// the readonly / no-setter / setter-visibility rules below. Previously only
+// the MemberAccessExpr shape was guarded, so an unqualified self-write to a
+// readonly auto-property slipped through (an ACCEPT_TRAP). A local variable
+// that shadows the property resolves to a LocalSymbol, so the dynamic_cast
+// below leaves it untouched.
+void ExprTC::checkPropertyWriteTarget(const ast::Expr& target,
+                                      const SourceLocation& loc,
+                                      const char* incOp) {
+    PropertySymbol* ps = nullptr;
+    std::string propName;
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&target)) {
+        if ((ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(target))))
+            propName = std::string(ma->member);
+    } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(&target)) {
+        if ((ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(target))))
+            propName = std::string(id->name);
+    } else if (dynamic_cast<const ast::IndexExpr*>(&target)) {
+        // fix #2851 (§23.3/§23.4, v0.240): the INDEXER twin of the
+        // read-only rejection below. §23.4 makes an indexer "a
+        // property whose name is replaced by `[parameters]`", so
+        // §23.3's setter rule governs it identically — but only the
+        // two NAMED spellings resolved a PropertySymbol here, so an
+        // indexer target left `ps` null and the whole check was
+        // skipped. Measured: `b[0] := 99;` on a getter-only indexer
+        // compiled clean, ran, and SILENTLY DISCARDED the write
+        // (read back 7), while the named twin `b.P := 99;` was
+        // correctly rejected with the §23.3 diagnostic.
+        //
+        // The symbol is the one #2530 attaches to the IndexExpr, so
+        // this asks the type-checker what the access resolved to
+        // rather than re-deriving it. A BUILTIN collection index
+        // (`Array`, `Dictionary`, a span) resolves no user
+        // PropertySymbol, so `ps` stays null and those are
+        // untouched by construction.
+        ps = dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(target));
+        if (ps && !ps->isIndexer) ps = nullptr;
+        // An indexer's PropertySymbol::name is the synthetic
+        // ".this", which would render as gibberish in the message,
+        // so the diagnostic names the construct instead.
+        if (ps) propName.clear();
+    }
+    if (!ps) return;
+    // #2868: the verb and citation differ between the two callers; the rule
+    // and every branch below do not.
+    const std::string verb = incOp ? "increment/decrement " : "assign to ";
+    const std::string throughVerb =
+        incOp ? "increment/decrement through " : "assign through ";
+    const std::string cite = incOp ? "§17.6 / " : "";
+    if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl)) {
+        bool hasSetter = true;
+        if (pd->bodyKind == ast::PropertyBodyKind::Expression) {
+            hasSetter = false;
+        } else if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+            hasSetter = false;
+            for (const auto& acc : pd->accessors)
+                if (acc.isSet) { hasSetter = true; break; }
+        }
+        bool isReadonlyAuto = false;
+        if (pd->bodyKind == ast::PropertyBodyKind::Auto)
+            for (auto mod : pd->modifiers)
+                if (mod == "readonly") {
+                    isReadonlyAuto = true;
+                    break;
+                }
+        if (!hasSetter) {
+            // #2851: `propName` is empty for an indexer (its symbol name is
+            // the synthetic ".this"), so name the construct rather than
+            // print it.
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                propName.empty()
+                    ? ("cannot " + throughVerb +
+                       "a read-only indexer — it has no setter (" + cite +
+                       "§23.3)")
+                    : ("cannot " + verb + "read-only property `" + propName +
+                       "` — it has no setter (" + cite + "§23.3)"));
+        } else if (isReadonlyAuto && !inConstructor_) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "cannot " + verb + "readonly property `" + propName +
+                "` outside a field initializer or constructor (" + cite +
+                "§23.1)");
+        } else if (hasSetter) {
+            // §13.6 (#747 R42): a property write must respect the SETTER
+            // accessor's visibility, which may be more restrictive than the
+            // property's (e.g. `private set`). Compute the setter's
+            // effective visibility and apply the §13.1 access rules;
+            // without this a `private set` was writable from any class.
+            ast::Visibility sv = pd->visibility;
+            if (pd->bodyKind == ast::PropertyBodyKind::Block) {
+                for (const auto& acc : pd->accessors)
+                    if (acc.isSet &&
+                        acc.visibility != ast::Visibility::None) {
+                        sv = acc.visibility;
+                        break;
+                    }
+            } else if (pd->bodyKind == ast::PropertyBodyKind::Auto &&
+                       pd->hasAutoAccessorVis && pd->autoAccessorIsSet) {
+                sv = pd->autoAccessorVis;
+            }
+            TypeSymbol* declaring = ps->parent;
+            bool bad = false;
+            if (sv == ast::Visibility::Private)
+                bad = (currentType_ != declaring);
+            else if (sv == ast::Visibility::Protected)
+                bad = !(currentType_ == declaring ||
+                        (currentType_ && isSubtype(currentType_, declaring)));
+            else if (sv == ast::Visibility::Internal)
+                bad = ctx_.isImported(ps);
+            if (bad) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "cannot " + verb + "property `" + propName +
+                    "` — its setter is not accessible here (" + cite +
+                    "§13.6)");
+            }
+        }
+    } else {
+        // fix #2412 (§23.3, §2.8.2/§2.8.3 rule 4, v0.235): an IMPORTED
+        // PropertySymbol has no ast::PropertyDecl (`ps->decl` is
+        // unconditionally null — ModuleLoader never reconstructs a body-less
+        // imported property's decl), so the `pd`-gated check above silently
+        // skipped every imported property, accepting a write to a
+        // getter-only imported property that the identical same-module shape
+        // correctly rejects (confirmed asymmetry — a #2374-family instance).
+        // Fall back to the hasSetter side table #2400 publishes from
+        // MetaMember::hasSetter, which is false both for a genuinely
+        // getter-only property (expression-bodied or block-getter-only) and
+        // for a readonly auto-property (mirrors ModuleMetadataBuilder.cpp's
+        // export-time computation) — either way, no assignment is ever valid
+        // on it from outside its declaring module, so one message covers
+        // both source shapes the same way the local `!hasSetter` branch's
+        // message already does.
+        if (!ctx_.importedPropertyHasSetter(ps)) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "cannot " + verb + "read-only property `" + propName +
+                "` — it has no setter (" + cite + "§23.3)");
+        } else {
+            // fix #2415 (§13.6, §23.3, §2.8.2 clause 1 / §2.8.3 rule 4,
+            // v0.235): the setter EXISTS (hasSetter above), but its
+            // VISIBILITY was never enforced across the module boundary — a
+            // `private set` / `protected set` / `internal set` imported
+            // property was writable from anywhere through the import, even
+            // though the identical same-module shape is correctly rejected
+            // (§13.6: "A property or indexer's `get` or `set` may carry its
+            // own visibility, which must not be *less* restrictive than the
+            // property's overall visibility").
+            // `ctx_.importedPropertySetterVisibility(ps)` publishes
+            // MetaMember::setterVisibility (#2415), the ALREADY-RESOLVED
+            // effective visibility computed at export time by mirroring the
+            // `sv` computation just above verbatim.
+            //
+            // Applying the §13.1 access levels across a module boundary:
+            //   - Private ("the declaring class only"): always inaccessible
+            //     here — `declaring` is the imported TypeSymbol
+            //     reconstructed by ModuleLoader, and `currentType_` is
+            //     always a type compiled in THIS (importing) module, so the
+            //     two can never be the same symbol — unconditional reject.
+            //   - Protected ("the declaring class and all classes derived
+            //     from it", §13.1 — no module qualifier): reuse `isSubtype`,
+            //     which already walks `baseTypes` through a reconstructed
+            //     imported base (proven by #2400's inherited-setter itable
+            //     tests), so a LOCAL subclass of the imported declaring type
+            //     is still accepted.
+            //   - Internal ("code in the same module", §13.1): the importing
+            //     module is BY DEFINITION a different module than the
+            //     declaring one, so this is also an unconditional reject —
+            //     mirroring how the local check's `ctx_.isImported(ps)` is
+            //     unconditionally true for every ps that reaches this `else`
+            //     branch at all.
+            //   - Public / None (no restriction, or the property's own —
+            //     already-checked — visibility with no accessor override):
+            //     no further restriction.
+            ast::Visibility sv = ctx_.importedPropertySetterVisibility(ps);
+            TypeSymbol* declaring = ps->parent;
+            bool bad = false;
+            if (sv == ast::Visibility::Private) {
+                bad = true;
+            } else if (sv == ast::Visibility::Protected) {
+                bad = !(currentType_ && isSubtype(currentType_, declaring));
+            } else if (sv == ast::Visibility::Internal) {
+                bad = true;
+            }
+            if (bad) {
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "cannot " + verb + "property `" + propName +
+                    "` — its setter is not accessible here (" + cite +
+                    "§13.6)");
+            }
+        }
+    }
+}
+
 // §22.3 "ref and out argument locations" (v0.184, #1682). See the header for
 // the full contract; this covers the DECLARATION-based categories only (the
 // dataflow-based owned-state exclusion is MethodOwnership::
@@ -10642,251 +10874,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     }
                 }
             }
-            // §23.3 (#747 R42): assignment to a property with NO setter — an
-            // expression-bodied property (`P: T => e;`) or a block-form property
-            // with only a getter — is rejected outright (no setter exists).
-            // §23.1 (#747 R42): a readonly AUTO-property has an implicit setter,
-            // but is assignable only in a field initializer or constructor (like
-            // a readonly field), so a write OUTSIDE a constructor is also
-            // rejected. Without these the write was silently accepted/dropped.
-            // per §23.1 (#1173): the assignment target may be a qualified
-            // member access (`this.X`, `obj.X`) OR an UNQUALIFIED implicit-this
-            // identifier (`X := 9` inside the declaring class). Both resolve to
-            // the same PropertySymbol and must obey the readonly / no-setter /
-            // setter-visibility rules below. Previously only the
-            // MemberAccessExpr shape was guarded, so an unqualified self-write
-            // to a readonly auto-property slipped through (an ACCEPT_TRAP). A
-            // local variable that shadows the property resolves to a
-            // LocalSymbol, so the dynamic_cast below leaves it untouched.
-            if (as->target) {
-                PropertySymbol* ps = nullptr;
-                std::string propName;
-                if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(
-                        as->target.get())) {
-                    if ((ps = dynamic_cast<PropertySymbol*>(
-                             ctx_.exprSymbol(*as->target))))
-                        propName = std::string(ma->member);
-                } else if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(
-                               as->target.get())) {
-                    if ((ps = dynamic_cast<PropertySymbol*>(
-                             ctx_.exprSymbol(*as->target))))
-                        propName = std::string(id->name);
-                } else if (dynamic_cast<const ast::IndexExpr*>(
-                               as->target.get())) {
-                    // fix #2851 (§23.3/§23.4, v0.240): the INDEXER twin of the
-                    // read-only rejection below. §23.4 makes an indexer "a
-                    // property whose name is replaced by `[parameters]`", so
-                    // §23.3's setter rule governs it identically — but only the
-                    // two NAMED spellings resolved a PropertySymbol here, so an
-                    // indexer target left `ps` null and the whole check was
-                    // skipped. Measured: `b[0] := 99;` on a getter-only indexer
-                    // compiled clean, ran, and SILENTLY DISCARDED the write
-                    // (read back 7), while the named twin `b.P := 99;` was
-                    // correctly rejected with the §23.3 diagnostic.
-                    //
-                    // The symbol is the one #2530 attaches to the IndexExpr, so
-                    // this asks the type-checker what the access resolved to
-                    // rather than re-deriving it. A BUILTIN collection index
-                    // (`Array`, `Dictionary`, a span) resolves no user
-                    // PropertySymbol, so `ps` stays null and those are
-                    // untouched by construction.
-                    ps = dynamic_cast<PropertySymbol*>(
-                        ctx_.exprSymbol(*as->target));
-                    if (ps && !ps->isIndexer) ps = nullptr;
-                    // An indexer's PropertySymbol::name is the synthetic
-                    // ".this", which would render as gibberish in the message,
-                    // so the diagnostic names the construct instead.
-                    if (ps) propName.clear();
-                }
-                if (ps) {
-                        if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(
-                                ps->decl)) {
-                            bool hasSetter = true;
-                            if (pd->bodyKind ==
-                                ast::PropertyBodyKind::Expression) {
-                                hasSetter = false;
-                            } else if (pd->bodyKind ==
-                                       ast::PropertyBodyKind::Block) {
-                                hasSetter = false;
-                                for (const auto& acc : pd->accessors)
-                                    if (acc.isSet) { hasSetter = true; break; }
-                            }
-                            bool isReadonlyAuto = false;
-                            if (pd->bodyKind == ast::PropertyBodyKind::Auto)
-                                for (auto mod : pd->modifiers)
-                                    if (mod == "readonly") {
-                                        isReadonlyAuto = true;
-                                        break;
-                                    }
-                            if (!hasSetter) {
-                                // #2851: `propName` is empty for an indexer
-                                // (its symbol name is the synthetic ".this"),
-                                // so name the construct rather than print it.
-                                ctx_.diagnostics().report(
-                                    Severity::Error, as->span.begin,
-                                    propName.empty()
-                                        ? std::string(
-                                              "cannot assign through a "
-                                              "read-only indexer — it has no "
-                                              "setter (§23.3)")
-                                        : "cannot assign to read-only property `" +
-                                          propName +
-                                          "` — it has no setter (§23.3)");
-                            } else if (isReadonlyAuto && !inConstructor_) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, as->span.begin,
-                                    "cannot assign to readonly property `" +
-                                    propName +
-                                    "` outside a field initializer or "
-                                    "constructor (§23.1)");
-                            } else if (hasSetter) {
-                                // §13.6 (#747 R42): a property write must respect
-                                // the SETTER accessor's visibility, which may be
-                                // more restrictive than the property's (e.g.
-                                // `private set`). Compute the setter's effective
-                                // visibility and apply the §13.1 access rules;
-                                // without this a `private set` was writable from
-                                // any class.
-                                ast::Visibility sv = pd->visibility;
-                                if (pd->bodyKind ==
-                                    ast::PropertyBodyKind::Block) {
-                                    for (const auto& acc : pd->accessors)
-                                        if (acc.isSet &&
-                                            acc.visibility !=
-                                                ast::Visibility::None) {
-                                            sv = acc.visibility;
-                                            break;
-                                        }
-                                } else if (pd->bodyKind ==
-                                               ast::PropertyBodyKind::Auto &&
-                                           pd->hasAutoAccessorVis &&
-                                           pd->autoAccessorIsSet) {
-                                    sv = pd->autoAccessorVis;
-                                }
-                                TypeSymbol* declaring = ps->parent;
-                                bool bad = false;
-                                if (sv == ast::Visibility::Private)
-                                    bad = (currentType_ != declaring);
-                                else if (sv == ast::Visibility::Protected)
-                                    bad = !(currentType_ == declaring ||
-                                            (currentType_ &&
-                                             isSubtype(currentType_,
-                                                       declaring)));
-                                else if (sv == ast::Visibility::Internal)
-                                    bad = ctx_.isImported(ps);
-                                if (bad) {
-                                    ctx_.diagnostics().report(
-                                        Severity::Error, as->span.begin,
-                                        "cannot assign to property `" +
-                                        propName +
-                                        "` — its setter is not accessible "
-                                        "here (§13.6)");
-                                }
-                            }
-                        } else {
-                            // fix #2412 (§23.3, §2.8.2/§2.8.3 rule 4,
-                            // v0.235): an IMPORTED PropertySymbol has no
-                            // ast::PropertyDecl (`ps->decl` is unconditionally
-                            // null — ModuleLoader never reconstructs a
-                            // body-less imported property's decl), so the
-                            // `pd`-gated check above silently skipped every
-                            // imported property, accepting a write to a
-                            // getter-only imported property that the
-                            // identical same-module shape correctly rejects
-                            // (confirmed asymmetry — a #2374-family instance).
-                            // Fall back to the hasSetter side table #2400
-                            // publishes from MetaMember::hasSetter, which is
-                            // false both for a genuinely getter-only property
-                            // (expression-bodied or block-getter-only) and
-                            // for a readonly auto-property (mirrors
-                            // ModuleMetadataBuilder.cpp's export-time
-                            // computation) — either way, no assignment is
-                            // ever valid on it from outside its declaring
-                            // module, so one message covers both source
-                            // shapes the same way the local `!hasSetter`
-                            // branch's message already does.
-                            if (!ctx_.importedPropertyHasSetter(ps)) {
-                                ctx_.diagnostics().report(
-                                    Severity::Error, as->span.begin,
-                                    "cannot assign to read-only property `" +
-                                    propName +
-                                    "` — it has no setter (§23.3)");
-                            } else {
-                                // fix #2415 (§13.6, §23.3, §2.8.2 clause 1 /
-                                // §2.8.3 rule 4, v0.235): the setter EXISTS
-                                // (hasSetter above), but its VISIBILITY was
-                                // never enforced across the module boundary —
-                                // a `private set` / `protected set` /
-                                // `internal set` imported property was
-                                // writable from anywhere through the import,
-                                // even though the identical same-module shape
-                                // is correctly rejected (§13.6: "A property or
-                                // indexer's `get` or `set` may carry its own
-                                // visibility, which must not be *less*
-                                // restrictive than the property's overall
-                                // visibility"). `ctx_.
-                                // importedPropertySetterVisibility(ps)`
-                                // publishes MetaMember::setterVisibility
-                                // (#2415), the ALREADY-RESOLVED effective
-                                // visibility computed at export time by
-                                // mirroring the `sv` computation just above
-                                // verbatim.
-                                //
-                                // Applying the §13.1 access levels across a
-                                // module boundary:
-                                //   - Private ("the declaring class only"):
-                                //     always inaccessible here — `declaring`
-                                //     is the imported TypeSymbol reconstructed
-                                //     by ModuleLoader, and `currentType_` is
-                                //     always a type compiled in THIS
-                                //     (importing) module, so the two can never
-                                //     be the same symbol — unconditional
-                                //     reject.
-                                //   - Protected ("the declaring class and all
-                                //     classes derived from it", §13.1 — no
-                                //     module qualifier): reuse `isSubtype`,
-                                //     which already walks `baseTypes` through
-                                //     a reconstructed imported base (proven by
-                                //     #2400's inherited-setter itable tests),
-                                //     so a LOCAL subclass of the imported
-                                //     declaring type is still accepted.
-                                //   - Internal ("code in the same module",
-                                //     §13.1): the importing module is BY
-                                //     DEFINITION a different module than the
-                                //     declaring one, so this is also an
-                                //     unconditional reject — mirroring how
-                                //     the local check's `ctx_.isImported(ps)`
-                                //     is unconditionally true for every ps
-                                //     that reaches this `else` branch at all.
-                                //   - Public / None (no restriction, or the
-                                //     property's own — already-checked —
-                                //     visibility with no accessor override):
-                                //     no further restriction.
-                                ast::Visibility sv =
-                                    ctx_.importedPropertySetterVisibility(ps);
-                                TypeSymbol* declaring = ps->parent;
-                                bool bad = false;
-                                if (sv == ast::Visibility::Private) {
-                                    bad = true;
-                                } else if (sv == ast::Visibility::Protected) {
-                                    bad = !(currentType_ &&
-                                            isSubtype(currentType_,
-                                                      declaring));
-                                } else if (sv == ast::Visibility::Internal) {
-                                    bad = true;
-                                }
-                                if (bad) {
-                                    ctx_.diagnostics().report(
-                                        Severity::Error, as->span.begin,
-                                        "cannot assign to property `" +
-                                        propName +
-                                        "` — its setter is not accessible "
-                                        "here (§13.6)");
-                                }
-                            }
-                        }
-                }
-            }
+            // §23.3 / §23.1 / §13.6 (#747 R42 / #1173 / #2412 / #2415 /
+            // #2851): the property-or-indexer write-target check. Extracted
+            // to checkPropertyWriteTarget by #2868 so the IncrementStmt arm
+            // — which cannot reach this point — runs the SAME check instead
+            // of a third hand-maintained mirror of it (§17.6: "Read-only
+            // locations cannot be incremented"). Passing `nullptr` for
+            // `incOp` keeps every diagnostic here byte-identical.
+            if (as->target)
+                checkPropertyWriteTarget(*as->target, as->span.begin,
+                                         /*incOp=*/nullptr);
             // Slice S7: readonly field assignment outside a ctor.
             checkReadonlyAssignment(*as);
             // Slice T2: plain `:=` assignment must be primitive-
@@ -11924,6 +11921,31 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // fix #2868 (§17.6 / §23.3 / §23.4 / §23.1 / §13.6, v0.240): the
+        // §23.3 write-target rule, applied to the increment operand through
+        // the SAME implementation the assignment target uses. §17.6,
+        // verbatim: "The operand must be an assignable lvalue (a local
+        // variable, a writable field, an indexer slot, or a property with a
+        // setter — the same storage categories §22.3's `ref`/`out` arguments
+        // reuse). Read-only locations cannot be incremented." Before this
+        // call the IncrementStmt path reached NO property write-target check
+        // at all, so `b.P++` on a getter-only property and `b[0]++` on a
+        // getter-only indexer both compiled clean, ran, and SILENTLY
+        // DISCARDED the write (measured: read back 7 on both) — while
+        // `b.P := 99` / `b[0] += 1` on the same members were correctly
+        // rejected. Deliberately a CALL to the shared check rather than a
+        // fourth copy of the rules: the hand-maintained mirror was found
+        // missing a check twice (#2309 above, then this), and #2848 removed
+        // codegen's mirror on §6.6's own statement that §17.6's desugaring
+        // "is the indexer instance of this rule". The `is->op` argument
+        // selects the increment wording and adds the §17.6 citation; the
+        // #2309 branch above keeps its own distinct record diagnostic (its
+        // target resolves to a FieldSymbol, so `ps` is null here and the two
+        // can never both fire).
+        if (is->target)
+            checkPropertyWriteTarget(
+                *is->target, is->target->span.begin,
+                /*incOp=*/(is->op == "--" ? "--" : "++"));
         // §17.6 (v0.236, #2585 / #2599): the increment/decrement operators
         // are defined on exactly three operand categories — (1) a value-type
         // operand whose type T overloads `operator ++`, (2) a built-in numeric

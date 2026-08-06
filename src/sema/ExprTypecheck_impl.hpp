@@ -1148,6 +1148,25 @@ private:
     // `LValue` production.
     void checkLValueChainNotCallBased(const ast::Expr& target);
 
+    // §23.3 / §23.1 / §13.6 / §17.6 (v0.240, #2868): the shared
+    // property-or-indexer WRITE-TARGET check — no setter, a readonly
+    // auto-property written outside its assignable context, or a setter that
+    // is not accessible here. Called from BOTH statement forms that write
+    // through grammar A.6's `LValue`: AssignmentStmt (`x := e`, `x op= e`)
+    // and IncrementStmt (`x++` / `x--`). §17.6 states the increment operand
+    // rule in the same terms the assignment target obeys — "The operand must
+    // be an assignable lvalue (a local variable, a writable field, an indexer
+    // slot, or a property with a setter …). Read-only locations cannot be
+    // incremented." — so the two share ONE implementation rather than the
+    // hand-maintained mirror that was found missing this check twice (#2309,
+    // #2868). `incOp` is null for an assignment target and the operator token
+    // ("++"/"--") for an increment target; it selects the diagnostic's verb
+    // and adds the §17.6 citation, leaving every assignment message
+    // byte-identical to what it was before the extraction.
+    void checkPropertyWriteTarget(const ast::Expr& target,
+                                  const SourceLocation& loc,
+                                  const char* incOp);
+
     // §22.3 "ref and out argument locations" (v0.184, #1682): validates a
     // bare `ref`/`out` call argument's operand against the section's
     // assignable-storage-location categories — a mutable local variable, a

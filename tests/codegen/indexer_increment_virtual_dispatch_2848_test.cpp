@@ -65,8 +65,9 @@
 // Related: #2836 (the compound twin whose branches this now shares), #2833 (the
 // receiver recovery), #2832 (`base[i]`), #1080, #730, #2509 (the imported-indexer
 // branch, also now shared), #587, #613 (the built-in-collection arm, which still
-// runs FIRST and is unaffected — T17), #2851 (a write to a getter-only indexer is
-// silently discarded; unchanged here, T16).
+// runs FIRST and is unaffected — T17), #2851 / #2868 (a write to a getter-only
+// indexer: silently discarded when this file was written, now REJECTED in sema
+// — T16 was updated accordingly and asserts the rejection).
 
 #include "support/aot_support.hpp"
 #include "test_harness.hpp"
@@ -654,13 +655,23 @@ BEZEL_TEST(codegen_indexer_increment_virtual_2848,
 }
 
 // T16 — a GETTER-ONLY (expression-bodied) virtual indexer. §23.2's `=>` form is
-// read-only by shape, so there is no setter to write through; the write is
-// SILENTLY DISCARDED. That is a pre-existing sema gap (#2851 — the correct
-// answer is a rejection, not a lowering), and this change deliberately
-// preserves the outcome rather than papering over it: 7 before and after.
+// read-only by shape, so there is no setter to write through.
+//
+// ⚠ UPDATED BY #2868. When this case was written it asserted the DEFECT: the
+// write was silently discarded and the field stayed at 7, a pre-existing sema
+// gap this test deliberately pinned rather than papered over (the comment then
+// read "#2851 — the correct answer is a rejection, not a lowering"). #2868
+// supplied that rejection: `IncrementStmt` now reaches the SAME §23.3
+// write-target check the `:=`/`+=` spellings already reached, so this program
+// no longer compiles. The case is kept — it is still the codegen-side control
+// that a getter-only indexer never reaches this file's lowering — but it now
+// asserts the REJECTION, which is the correct outcome, instead of the value 7.
+// Asserted on diagnostic TEXT, not the coarse "did not run" signal: runAot's
+// WIFSIGNALED branch synthesizes an Error for a runtime SIGSEGV too, so a
+// bare `!ran` cannot tell a genuine rejection from a crash.
 BEZEL_TEST(codegen_indexer_increment_virtual_2848,
-           getter_only_indexer_write_unchanged_23_2) {
-    BEZEL_EXPECT_EQ(run(runAot(
+           getter_only_indexer_write_rejected_23_2_2868) {
+    auto r = runAot(
         "module M; "
         "class B "
         "  public _s: int := 7; "
@@ -668,7 +679,17 @@ BEZEL_TEST(codegen_indexer_increment_virtual_2848,
         "end B; "
         "class C public static method Main(): int "
         "  using var b := new B(); b[0]++; return b._s; "
-        "end Main; end C;")), 7);
+        "end Main; end C;");
+    bool found = false;
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("read-only indexer") != std::string::npos &&
+            d.message.find("no setter") != std::string::npos &&
+            d.message.find("17.6") != std::string::npos)
+            found = true;
+    }
+    BEZEL_EXPECT_TRUE(found);
+    BEZEL_EXPECT_FALSE(r.ran);
 }
 
 // T17 — the BUILT-IN heap-collection arm (#613 / stdlib §4.4 / §4.8) still runs
