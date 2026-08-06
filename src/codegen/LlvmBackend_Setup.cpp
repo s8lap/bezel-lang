@@ -8841,6 +8841,14 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
         }
     }
     if (sema::ConstructorSymbol* target = ctorByArity(b, 0, nullptr)) {
+        // fix #2882 (§22.8 step 1 / §14.1 / §12, v0.240): when `b` is a generic
+        // instantiation whose lowered layout differs from the erased template's,
+        // `ctorFns_[target]` is the WRONG body for this object — see the
+        // declaration comment. Inline the target's body under the base
+        // instantiation's substitution instead, exactly as emitChainCall already
+        // does for an explicit `base()`. Returns false (and this falls through
+        // unchanged) for every shape whose layout it cannot prove differs.
+        if (emitSpecializedImplicitBaseCtor(cls, b, target, obj)) return;
         auto it = ctorFns_.find(target);
         // §2.5 / §12 (issue #328 / #103): an implicit base chain into an IMPORTED
         // base runs the dependency's `bz$<Base>$ctor`; declare it on demand so
@@ -8876,6 +8884,123 @@ void Emitter::emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj) {
         if (!hasAnyConstructor(b))
             emitLocalBaseFieldInit(b, obj, cls);
     }
+}
+
+
+// fix #2882 (§22.8 step 1 "The base or chained constructor call" / §14.1 / §12,
+// v0.240). See the declaration comment in LlvmBackend_impl.hpp.
+//
+// This is the CONSTRUCTOR-BODY face of the placeholder-layout family whose other
+// faces are #2840 (access), #2860 (imported field init), #2873 (disposer + local
+// field init) and, right below, emitLocalBaseFieldInit. In every one of them the
+// shared, type-erased body compiled against `T -> i32` was called for a concrete
+// instantiation whose layout it was not compiled against. Measured on
+// `GCtor<T> { v: T; owned cell: Cell; a: int }` at T = string, reached through
+// `class DCtor : GCtor<string>` with NO derived constructor: the base ctor's
+// `cell := new Cell()` stored 8 bytes early, over `v`, and the read of `d.cell`
+// loaded the still-zero slot — `SEGV on unknown address 0x35`, no output at all.
+//
+// WHY INLINING AND NOT A "SPECIALIZED CONSTRUCTOR FACTORY". The issue's own lead
+// asked for a per-instantiation ctor function analogous to
+// specializedDisposerCoreFor. None is needed: the codebase already solves this
+// exact problem for the EXPLICIT `base()` spelling by INLINING the target's body
+// under the base substitution (emitChainCall's #585/#617 block above), which is
+// why the issue's own narrowing found `class DChain : GCtor<string>` with
+// `constructor() base(); end` to be correct today. Inlining the same body from
+// the implicit chain reuses that proven mechanism verbatim — including its
+// recursion into the base's OWN chain and its §22.9 cleanup discipline — rather
+// than introducing a second, parallel specialization mechanism to keep in sync.
+//
+// THREE PROOF OBLIGATIONS, and the code refuses to act unless all three hold:
+//   1. There is a real body to inline (`target->decl` is a live
+//      ast::ConstructorDecl). An IMPORTED base ctor has none; that shape keeps
+//      today's declareImportedCtor call. See the note at the end of the commit.
+//   2. The base instantiation's substitution is KNOWN.
+//      `computeAncestorGenericSubst` (#2840, reused by #2860 and #2873) returns
+//      false rather than installing one it cannot resolve — notably for
+//      `class D<U> : B<U>`, where the synthesized receiver carries no arguments
+//      while `D` declares one.
+//   3. The layout under that substitution actually DIFFERS from the erased
+//      template's. This is #2019's predicate, spelled exactly as
+//      emitBaseDisposeChain spells it: compare the base's instance-storage
+//      LLVM-type sequence under the empty (placeholder) substitution against the
+//      sequence under the concrete one. Identical sequences ⇒ identical offsets
+//      ⇒ the shared ctor is already right, so `T = int` and every base with no
+//      parameter-typed storage keep the existing call with no behaviour change.
+bool Emitter::emitSpecializedImplicitBaseCtor(const sema::TypeSymbol* cls,
+                                              const sema::TypeSymbol* base,
+                                              sema::ConstructorSymbol* target,
+                                              llvm::Value* obj) {
+    if (!cls || !base || !target || !obj) return false;
+    if (base->genericParams.empty()) return false;
+    // Obligation 1: a real, parameterless body to inline. `inlineCtorBody`
+    // requires an ast::ConstructorDecl and reads no arguments here (an implicit
+    // base chain is always arity 0), so nothing needs binding in paramSlots_.
+    if (!target->params.empty()) return false;
+    if (!dynamic_cast<const ast::ConstructorDecl*>(target->decl)) return false;
+
+    // Obligation 2: the base instantiation's substitution.
+    sema::TypeRef synth;
+    synth.kind = sema::TypeRef::Kind::Named;
+    synth.declaration = const_cast<sema::TypeSymbol*>(cls);
+    std::unordered_map<std::string_view, llvm::Type*> ancSubst;
+    std::unordered_map<std::string_view, const sema::TypeRef*> ancSema;
+    if (!computeAncestorGenericSubst(&synth, base, ancSubst, ancSema))
+        return false;
+
+    // Obligation 3: the #2019 layout-identity question. collectInstanceStorage /
+    // storageType only READ the substitution — no fieldIndex_ / classStruct side
+    // effects — so measuring both sequences is free of emission consequences.
+    // (llvm::Type* are context-unique, so `==` on the vectors is structural.)
+    auto baseFieldLayout = [&]() {
+        std::vector<const sema::Symbol*> storage;
+        collectInstanceStorage(base, storage);
+        std::vector<llvm::Type*> tys;
+        tys.reserve(storage.size());
+        for (const sema::Symbol* m : storage) tys.push_back(storageType(m));
+        return tys;
+    };
+    auto savedGenericSubst = genericSubst_;
+    auto savedGenericSema  = genericSubstSemaTy_;
+    genericSubst_.clear();
+    genericSubstSemaTy_.clear();
+    std::vector<llvm::Type*> tmplLayout = baseFieldLayout();
+    genericSubst_ = ancSubst;
+    genericSubstSemaTy_ = ancSema;
+    std::vector<llvm::Type*> specLayout = baseFieldLayout();
+    if (tmplLayout == specLayout) {
+        // The shared template body writes at exactly this object's offsets —
+        // leave the existing call in place (the `T = int` accept-control).
+        genericSubst_ = std::move(savedGenericSubst);
+        genericSubstSemaTy_ = std::move(savedGenericSema);
+        return false;
+    }
+
+    // Inline the base ctor's body onto this object, with the base
+    // instantiation's substitution active. The frame save/restore mirrors
+    // emitChainCall's inline path exactly (its documented precondition is that
+    // the caller owns currentThis_ / locals_ / paramSlots_ / the unwind state);
+    // `locals_`/`paramSlots_` are cleared so the base body cannot see the
+    // enclosing frame's bindings, and there are no arguments to bind.
+    llvm::Value* subObj = obj;
+    llvm::Value* savedThis = currentThis_;
+    auto savedLocals = locals_;
+    auto savedParams = paramSlots_;
+    auto savedRefParams = refParams_;
+    llvm::BasicBlock* savedUnwindTarget = unwindTarget_;
+    std::size_t savedUnwindDepth = unwindScopeDepth_;
+    locals_.clear();
+    paramSlots_.clear();
+    inlineCtorBody(target, subObj);
+    unwindTarget_ = savedUnwindTarget;
+    unwindScopeDepth_ = savedUnwindDepth;
+    currentThis_ = savedThis;
+    locals_ = std::move(savedLocals);
+    paramSlots_ = std::move(savedParams);
+    refParams_ = std::move(savedRefParams);
+    genericSubst_ = std::move(savedGenericSubst);
+    genericSubstSemaTy_ = std::move(savedGenericSema);
+    return true;
 }
 
 

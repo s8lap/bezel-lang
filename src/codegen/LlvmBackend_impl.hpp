@@ -8507,6 +8507,36 @@ private:
     // recurse to its base so a deeper ctor still runs.
     void emitImplicitBase(const sema::TypeSymbol* cls, llvm::Value* obj);
 
+    // fix #2882 (§22.8 step 1 "The base or chained constructor call" / §14.1 /
+    // §12, v0.240): the implicit-base twin of emitChainCall's #585/#617 inline.
+    //
+    // `ctorFns_[target]` is the SHARED, type-erased `bz$<Base>$ctor`, emitted
+    // once against the base template's `T -> i32` placeholder layout. When
+    // `base` is a generic class instantiated at an argument whose lowered
+    // layout DIFFERS from that placeholder (`class D : GCtor<string>`), the
+    // object was allocated with the instantiation's layout (#617/#1101-B/#2840)
+    // but every store in that shared body lands at the placeholder's offsets —
+    // a single-module SEGV with no diagnostic at any severity.
+    //
+    // An EXPLICIT `base()` never had this: emitChainCall INLINES the target's
+    // body under the base instantiation's substitution rather than calling the
+    // template (LlvmBackend_Setup.cpp, the #585 block). This helper does the
+    // same for the implicit chain, gated on the #2019 layout-identity question
+    // so `T = int` (layout == placeholder) and every non-generic base keep
+    // calling the shared ctor exactly as before.
+    //
+    // Returns true when it emitted the specialized construction (the caller
+    // must not also call the template). Returns FALSE — leaving today's path
+    // untouched — whenever it cannot PROVE which layout applies: a non-generic
+    // base, an imported base whose ctor has no reconstructed body, an
+    // unresolvable ancestor substitution (`computeAncestorGenericSubst` returns
+    // false rather than installing a wrong one), or a layout that is provably
+    // identical to the template's.
+    bool emitSpecializedImplicitBaseCtor(const sema::TypeSymbol* cls,
+                                         const sema::TypeSymbol* base,
+                                         sema::ConstructorSymbol* target,
+                                         llvm::Value* obj);
+
     // §12 / §14 (issue #585): inline a constructor's body INTO the current
     // function with the active generic substitution, having already bound
     // `this` (= obj) and its parameters in paramSlots_. Runs the leading
