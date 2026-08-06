@@ -27,6 +27,7 @@
 #include "ast/Node.hpp"
 #include "codegen/LlvmBackend.hpp"
 #include "common/BuiltinRegistry.hpp"  // #1414 stage 3: builtin name registry
+#include "common/IntLiteral.hpp"       // #2936: the one integer-literal parser
 #include "sema/SemaContext.hpp"
 #include "sema/TypeResolution.hpp"  // typeRefEqual — §14.2 exact type identity
 #include "sema/Symbol.hpp"
@@ -108,46 +109,15 @@ inline bool indexerElementCannotAliasIndex(const sema::TypeRef* t) {
     }
 }
 
-// Parse a Bezel integer literal lexeme to its value. Slice CG1 handles
-// decimal and the `0x` / `0b` / `0o` bases, with `_` digit separators
-// stripped and any trailing type-suffix letters ignored. Returns 0 on a
-// shape it doesn't recognize (the lexer already validated the literal).
+// Parse a Bezel integer literal lexeme to its value.
+//
+// fix #2936: the implementation MOVED to common/IntLiteral.hpp and this is a
+// forwarder, so codegen and `sema::foldIntConst` decode a lexeme through one
+// function instead of two. They had two, and sema's was a base-10
+// `std::stoll` that silently returned 0 for `0x60` and 5 for `5_0`. The name is
+// kept because ~8 call sites in this backend use it.
 inline std::int64_t parseIntLiteral(std::string_view text) {
-    std::string digits;
-    int base = 10;
-    std::size_t i = 0;
-    if (text.size() >= 2 && text[0] == '0') {
-        char b = text[1];
-        if (b == 'x' || b == 'X') { base = 16; i = 2; }
-        else if (b == 'b' || b == 'B') { base = 2; i = 2; }
-        else if (b == 'o' || b == 'O') { base = 8; i = 2; }
-    }
-    for (; i < text.size(); ++i) {
-        char c = text[i];
-        if (c == '_') continue;
-        // Stop at a type-suffix letter (e.g. `u`, `l`) for decimal; for
-        // hex, hex-digits are consumed and only non-hex letters stop us.
-        bool isDigit = (c >= '0' && c <= '9');
-        bool isHex = isDigit || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
-        if (base == 16 ? !isHex : !isDigit) break;
-        digits.push_back(c);
-    }
-    if (digits.empty()) return 0;
-    // §4.2 / A.1: parse the magnitude with the UNSIGNED strtoull regardless of
-    // the trailing IntSuffix. The caller always stores the result as a 64-bit
-    // pattern (int64 -> uint64 -> i64 LLVM constant), and `digits` is the bare
-    // magnitude — the sign of a negative literal is a separate UnaryExpr — so
-    // the full [0, 2^64) range is meaningful. Signed strtoll SATURATES at
-    // long.MaxValue (and sets ERANGE) for any magnitude in [2^63, 2^64):
-    //   - a `ulong` value above long.MaxValue (e.g. 18000000000000000000UL)
-    //     lost its value (issue #421 — already handled for the `U` case), and
-    //   - the 2^63 magnitude of `-9223372036854775808L` (long.MinValue)
-    //     saturated to 2^63-1, so the literal lowered to INT64_MIN+1 instead of
-    //     INT64_MIN (the codegen counterpart of the #749 fold bug).
-    // strtoull preserves the bit pattern across the whole range; the
-    // out-of-range guard lives in sema (the literal type-check, §5).
-    return static_cast<std::int64_t>(
-        std::strtoull(digits.c_str(), nullptr, base));
+    return common::parseIntLiteral(text);
 }
 
 // CG32 / #527: decode a char literal lexeme (`'A'`, `'\n'`, `'A'`, …)

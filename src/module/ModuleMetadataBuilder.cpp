@@ -11,7 +11,9 @@
 #include <vector>
 
 #include "ast/Node.hpp"
+#include "common/IntLiteral.hpp"
 #include "lexer/Lexer.hpp"
+#include "sema/ConstFold.hpp"
 #include "sema/SemaContext.hpp"
 #include "sema/Symbol.hpp"
 #include "sema/TypeRef.hpp"
@@ -238,14 +240,12 @@ std::string renderConstExpr(const ast::Expr* e) {
 bool tryEvalIntLiteral(const ast::Expr* e, std::int64_t& out) {
     auto* i = dynamic_cast<const ast::IntLiteralExpr*>(e);
     if (i == nullptr) return false;
-    // The lexeme may carry a sign or suffix in richer programs; for the §10.2
-    // continuation rule we only need plain decimal literals (the common case).
-    // std::strtoll parses the leading integer and ignores a trailing suffix.
-    char* end = nullptr;
-    std::string text(i->text);
-    long long v = std::strtoll(text.c_str(), &end, 0);
-    if (end == text.c_str()) return false;  // not a number
-    out = static_cast<std::int64_t>(v);
+    // fix #2936: decode through the ONE literal parser. This was
+    // `std::strtoll(text, &end, 0)`, whose base-0 auto-detection covers `0x`
+    // but NOT grammar A.8's `0b` binary form and not `_` digit separators — so
+    // a §10.2 explicit enum value written `0b101` continued as if it were 0,
+    // and `1_000` as if it were 1.
+    out = common::parseIntLiteral(i->text);
     return true;
 }
 

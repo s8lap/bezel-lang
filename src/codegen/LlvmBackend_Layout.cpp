@@ -1254,10 +1254,18 @@ llvm::Type* Emitter::lowerTypeRef(const sema::TypeRef* rt) {
             // type recurses.
             if (!rt->arrayElement || !rt->arraySize) return i32();
             llvm::Type* elem = lowerTypeRef(rt->arrayElement);
+            // fix #2936: decode the lexeme with the ONE literal parser. This
+            // was `std::stoull(text)` — base 10 — so `[0x5]int` became a
+            // 0-element array and `[5_0]int` a 5-element one, SILENTLY. Note
+            // this arm is tried BEFORE the folded `arraySizeValue` below, so a
+            // bare literal never reached sema's (correct) fold: `[0x3 + 2]int`
+            // was right while `[0x5]int` was wrong, which is what made the
+            // split visible.
             if (auto* lit =
                     dynamic_cast<const ast::IntLiteralExpr*>(rt->arraySize))
                 return llvm::ArrayType::get(
-                    elem, std::stoull(std::string(lit->text)));
+                    elem,
+                    static_cast<std::uint64_t>(parseIntLiteral(lit->text)));
             if (rt->arraySizeValue >= 0)  // #734: folded member-const size
                 return llvm::ArrayType::get(
                     elem, static_cast<uint64_t>(rt->arraySizeValue));
