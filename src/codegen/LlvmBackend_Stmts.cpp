@@ -363,8 +363,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     if (cur && rhs) {
                         std::string op(as->op);
                         if (!op.empty() && op.back() == '=') op.pop_back();
-                        llvm::Value* res = emitCompoundOp(
-                            op, cur, rhs, cur->getType()->isFloatingPointTy(),
+                        // fix #2904 (§25.1/§25.2/§6.6, v0.240): via
+                        // emitCompoundOpTyped so a RECORD- or class-typed
+                        // VIRTUAL/INTERFACE property takes §25's overload —
+                        // measured on c7404bf, `i.VP += one` through an
+                        // interface aborted the compile on
+                        // `llvm.sadd.with.overflow.s_record.Pairs`.
+                        llvm::Value* res = emitCompoundOpTyped(
+                            op, cur, rhs, ctx_.exprType(*as->target),
+                            ctx_.exprType(*as->value),
+                            cur->getType()->isFloatingPointTy(),
                             isUnsignedTargetExpr(*as->target),
                             isCharTargetExpr(*as->target),      // §6.6/§5.2 #1961
                             isUnsignedTargetExpr(*as->value));  // §6.2 #2140 rUns
@@ -901,65 +909,18 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // which fed the record struct to llvm.smul.with.overflow.i32 →
                 // malformed IR (IR verification failed). Search the VALUE's type
                 // too when the target's type declares no applicable overload.
+                //
+                // fix #2904 (§25.1/§25.2/§6.6, v0.240): the ~50-line scan that
+                // stood here is now `findCompoundOperatorOverload`, because it
+                // was MISSING from every accessor-mediated caller (block-form
+                // property, virtual/interface property, user indexer, imported
+                // property) — each of which therefore aborted the compile on
+                // `llvm.sadd.with.overflow.s_record.Pairs` for a legal program.
+                // One definition; this site is now the plain call.
                 std::string op(as->op);
                 if (!op.empty() && op.back() == '=') op.pop_back();
-                // §25.2: match the operator's parameter types against the
-                // operand types IN ORDER (left→param0, right→param1). Sema has
-                // already validated the compound is well-typed, so this only
-                // DISAMBIGUATES when one type declares several overloads of the
-                // same token. A Named parameter matches a Named operand by
-                // declaration; a Primitive parameter matches a Primitive operand
-                // by kind (numeric widening is downstream, as for the binary
-                // form).
-                auto paramMatches = [&](sema::Symbol* paramSym,
-                                        const sema::TypeRef* operandTy) -> bool {
-                    auto* ps = dynamic_cast<sema::ParameterSymbol*>(paramSym);
-                    if (!ps) return false;
-                    sema::TypeRef* pt = ps->declType
-                                            ? ctx_.resolvedType(*ps->declType)
-                                            : ps->resolvedDeclType;
-                    if (!pt || !operandTy) return false;
-                    if (pt->kind == sema::TypeRef::Kind::Named)
-                        return operandTy->kind == sema::TypeRef::Kind::Named &&
-                               pt->declaration == operandTy->declaration;
-                    if (pt->kind == sema::TypeRef::Kind::Primitive)
-                        return operandTy->kind == sema::TypeRef::Kind::Primitive;
-                    return false;
-                };
-                auto findOnType = [&](const sema::TypeSymbol* ts,
-                                      const sema::TypeRef* leftTy,
-                                      const sema::TypeRef* rightTy)
-                        -> sema::MethodSymbol* {
-                    if (!ts) return nullptr;
-                    for (sema::Symbol* m : ts->members) {
-                        auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
-                        if (ms && ms->isOperator && ms->operatorToken == op &&
-                            ms->params.size() == 2 &&
-                            paramMatches(ms->params[0], leftTy) &&
-                            paramMatches(ms->params[1], rightTy))
-                            return ms;
-                    }
-                    return nullptr;
-                };
-                sema::MethodSymbol* opMethod = nullptr;
-                {
-                    const sema::TypeRef* targetTy = ctx_.exprType(*as->target);
-                    const sema::TypeRef* valueTy  = ctx_.exprType(*as->value);
-                    // §25.2: try the target's type first (the common
-                    // LHS-declared case), then the value's type (#2156:
-                    // RHS-declared operator with a primitive param0, e.g.
-                    // `operator *(int, Scale)`).
-                    if (targetTy &&
-                        targetTy->kind == sema::TypeRef::Kind::Named &&
-                        targetTy->declaration)
-                        opMethod = findOnType(targetTy->declaration,
-                                               targetTy, valueTy);
-                    if (!opMethod && valueTy &&
-                        valueTy->kind == sema::TypeRef::Kind::Named &&
-                        valueTy->declaration)
-                        opMethod = findOnType(valueTy->declaration,
-                                              targetTy, valueTy);
-                }
+                sema::MethodSymbol* opMethod = findCompoundOperatorOverload(
+                    op, ctx_.exprType(*as->target), ctx_.exprType(*as->value));
                 if (opMethod) {
                     // §25.1 / §25.2: dispatch to the user-defined binary
                     // operator with args in source order {target, value} (the

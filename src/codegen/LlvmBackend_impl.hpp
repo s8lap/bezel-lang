@@ -3395,6 +3395,45 @@ private:
                                 llvm::Value* r, bool fp, bool uns,
                                 bool charTarget = false, bool rUns = false);
 
+    // fix #2904 (§25.1 / §25.2 / §6.6, v0.240): the §25 USER-OPERATOR arm
+    // `emitCompoundOp` structurally cannot have — it sees only the two lowered
+    // LLVM values, and an overload is selected from the operands' SEMA types.
+    // §25.1, verbatim: assignment and compound-assignment operators "are not
+    // user-overloadable … the compound forms desugar mechanically to
+    // read-modify-write using the underlying binary operator's overload, with
+    // the evaluation counts and result typing of §6.6"; §25.2's candidate set is
+    // "the union of the `operator <op>` overloads declared on the static types
+    // of BOTH operands", with "parameters match operands in order".
+    //
+    // That lookup had been hand-copied THREE times — `lowerStmt`'s local
+    // compound arm (#610/#2156, the full in-order match) and the two
+    // heap-collection branches of `lowerCollectionIndexerCompound` (#626, a
+    // weaker element-type-only scan) — and was MISSING from every
+    // accessor-mediated caller, each of which therefore fed the record struct
+    // straight to `llvm.sadd.with.overflow` and ABORTED the compile on a legal
+    // program. Measured on c7404bf, all three ICE with "Intrinsic has incorrect
+    // return type! ptr @llvm.sadd.with.overflow.s_record.Pairs":
+    // `b.PP += one` (a block-form property, #2904's own repro), `i.VP += one`
+    // (an interface property) and `b[0] += one` (a user indexer).
+    //
+    // `emitCompoundOpTyped` is `emitCompoundOp` PLUS that arm, so a caller that
+    // has the operand types gets §25 by using it — one call, not a copy of the
+    // scan. Types are passed explicitly rather than derived from the target
+    // expression because the collection callers' authority is the CONTAINER's
+    // element type, not `exprType` of the index expression. A null type on
+    // either side simply finds no overload (the `++`/`--` spelling has no RHS
+    // node, and §17.6's identification of `x++` with `x := x + 1` is scoped
+    // "For built-in numeric types" anyway).
+    sema::MethodSymbol* findCompoundOperatorOverload(
+        const std::string& binOp, const sema::TypeRef* leftTy,
+        const sema::TypeRef* rightTy);
+    llvm::Value* emitCompoundOpTyped(const std::string& op, llvm::Value* l,
+                                     llvm::Value* r,
+                                     const sema::TypeRef* leftTy,
+                                     const sema::TypeRef* rightTy, bool fp,
+                                     bool uns, bool charTarget = false,
+                                     bool rUns = false);
+
     // §7.2/§7.11 (#2888): the PAYLOAD type of the tagged `{i8 hasValue; T}`
     // lowering of a nullable VALUE type, or null when `t` is not that shape.
     //

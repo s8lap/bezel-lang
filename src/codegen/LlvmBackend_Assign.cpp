@@ -2753,6 +2753,19 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
     // `1` is a signed literal, so `false` for the `++`/`--` spelling, which is
     // exactly what the pre-fix mirror passed (it omitted the argument).
     const bool rhsUnsigned = valueExpr && isUnsignedTargetExpr(*valueExpr);
+    // fix #2904 (§25.1/§25.2/§6.6, v0.240): the operand SEMA types the §25
+    // overload lookup selects from. Every one of this function's three
+    // compound-value sites (imported indexer, the two dynamic-dispatch
+    // branches, the local block-getter path) called `emitCompoundOp` directly,
+    // so a RECORD-typed indexer element with a user `operator <op>` aborted the
+    // compile — measured on c7404bf, `b[0] += one` ICEd with "Intrinsic has
+    // incorrect return type! ptr @llvm.sadd.with.overflow.s_record.Pairs".
+    // The `++`/`--` spelling has no RHS node and so finds no overload, which is
+    // correct: §17.6's identification of `x++` with `x := x + 1` is scoped
+    // "For built-in numeric types".
+    const sema::TypeRef* opLeftTy = ctx_.exprType(targetExpr);
+    const sema::TypeRef* opRightTy =
+        valueExpr ? ctx_.exprType(*valueExpr) : nullptr;
     // The ICE report below needs a source position; the `++`/`--` spelling has
     // no RHS node, so it points at the target.
     const auto rhsSpanBegin =
@@ -2878,8 +2891,9 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
                 "assignment RHS (imported-indexer path) — #2509");
             return false;
         }
-        llvm::Value* newVal = emitCompoundOp(
-            binOp, cur, rhs, cur->getType()->isFloatingPointTy(),
+        llvm::Value* newVal = emitCompoundOpTyped(
+            binOp, cur, rhs, opLeftTy, opRightTy,   // §25.1/§25.2 #2904
+            cur->getType()->isFloatingPointTy(),
             isUnsignedTargetExpr(targetExpr),
             isCharTargetExpr(targetExpr),      // §6.6/§5.2 #1961
             rhsUnsigned);                      // §6.2 #2140 rUns
@@ -2970,8 +2984,9 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
             return nullptr;
         }
         rhsOut = rhs;
-        return emitCompoundOp(
-            binOp, cur, rhs, cur->getType()->isFloatingPointTy(),
+        return emitCompoundOpTyped(
+            binOp, cur, rhs, opLeftTy, opRightTy,   // §25.1/§25.2 #2904
+            cur->getType()->isFloatingPointTy(),
             isUnsignedTargetExpr(targetExpr),
             isCharTargetExpr(targetExpr),      // §6.6/§5.2 #1961
             rhsUnsigned);                      // §6.2 #2140 rUns
@@ -3371,8 +3386,9 @@ bool Emitter::lowerIndexerCompoundCore(const ast::Expr& targetExpr,
             "assignment RHS (block-getter path) — #1386");
         return false;
     }
-    llvm::Value* newVal = emitCompoundOp(
-        binOp, cur, rhs, cur->getType()->isFloatingPointTy(),
+    llvm::Value* newVal = emitCompoundOpTyped(
+        binOp, cur, rhs, opLeftTy, opRightTy,   // §25.1/§25.2 #2904
+        cur->getType()->isFloatingPointTy(),
         isUnsignedTargetExpr(targetExpr),
         isCharTargetExpr(targetExpr),      // §6.6/§5.2 #1961
         rhsUnsigned);                      // §6.2 #2140 rUns
@@ -3547,22 +3563,21 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
         // mirrors the #610 overload check in lowerStmt.  emitCompoundOp cannot
         // handle struct operands (LLVM rejects sadd.with.overflow on struct
         // types), so the overload must be checked BEFORE emitCompoundOp.
+        //
+        // fix #2904 (§25.2, v0.240): the LOOKUP is now the one shared
+        // definition (findCompoundOperatorOverload), which also gives this site
+        // §25.2's in-order parameter match — "parameters match operands in
+        // order" — that this hand-written copy never had. The LEFT type stays
+        // the CONTAINER's declared value type, not `exprType` of the index
+        // expression: that is this branch's own authority for what a `d[k]`
+        // element is. The WRITE-BACK stays local (it must reuse the already-
+        // evaluated receiver/index, see the Array branch's §17.6 note).
         {
             const sema::TypeRef* valTy =
                 (recvTy && recvTy->genericArgs.size() > 1)
                     ? recvTy->genericArgs[1] : nullptr;
-            sema::MethodSymbol* opMethod = nullptr;
-            if (valTy && valTy->kind == sema::TypeRef::Kind::Named &&
-                valTy->declaration) {
-                for (sema::Symbol* m : valTy->declaration->members) {
-                    auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
-                    if (ms && ms->isOperator && ms->operatorToken == op &&
-                        ms->params.size() == 2) {
-                        opMethod = ms;
-                        break;
-                    }
-                }
-            }
+            sema::MethodSymbol* opMethod = findCompoundOperatorOverload(
+                op, valTy, ctx_.exprType(*as.value));
             if (opMethod) {
                 // §25.1: desugar to get → overload call → set.
                 std::vector<llvm::Value*> args{cur, rhs};
@@ -3706,23 +3721,19 @@ bool Emitter::lowerCollectionIndexerCompound(const ast::AssignmentStmt& as) {
     // mirrors the #610 overload check in lowerStmt and the dict branch above.
     // emitCompoundOp cannot handle struct operands (LLVM rejects
     // sadd.with.overflow on struct types), so this must be checked FIRST.
+    //
+    // fix #2904 (§25.2, v0.240): the LOOKUP is the one shared definition
+    // (findCompoundOperatorOverload), which also gives this site §25.2's
+    // in-order parameter match. LEFT type = the CONTAINER's element type (this
+    // branch's own authority for what `arr[i]` is); the write-back below stays
+    // local for the §17.6 single-evaluation reason stated there.
     llvm::Value* newVal = nullptr;
     {
         const sema::TypeRef* elemTyRef =
             (recvTy && !recvTy->genericArgs.empty())
                 ? recvTy->genericArgs[0] : nullptr;
-        sema::MethodSymbol* opMethod = nullptr;
-        if (elemTyRef && elemTyRef->kind == sema::TypeRef::Kind::Named &&
-            elemTyRef->declaration) {
-            for (sema::Symbol* m : elemTyRef->declaration->members) {
-                auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
-                if (ms && ms->isOperator && ms->operatorToken == op &&
-                    ms->params.size() == 2) {
-                    opMethod = ms;
-                    break;
-                }
-            }
-        }
+        sema::MethodSymbol* opMethod = findCompoundOperatorOverload(
+            op, elemTyRef, ctx_.exprType(*as.value));
         if (opMethod) {
             // §25.1: desugar to get → overload call → set. The write-back MUST
             // reuse the already-evaluated recv/idx (the shared block below)
@@ -6149,8 +6160,17 @@ bool Emitter::lowerImportedPropertyCompoundCore(const ast::Expr& targetExpr,
     // emitCompoundOp now owns the decimal arm itself (LlvmBackend_Layout.cpp),
     // so this call site holds one fewer copy of the same knowledge; #2862's
     // note said the check "should be deleted when that lands".
-    llvm::Value* res = emitCompoundOp(
-        binOp, cur, rhs, cur->getType()->isFloatingPointTy(),
+    // fix #2904 (§25.1/§25.2/§6.6, v0.240): via emitCompoundOpTyped, so a
+    // RECORD- or class-typed IMPORTED property with a user `operator <op>`
+    // takes §25's desugaring instead of feeding the struct to
+    // `llvm.sadd.with.overflow`. (NOT separately probed across a two-module
+    // build: this is the same missing arm the block-form, interface and
+    // indexer spellings were MEASURED to have, reached through the same one
+    // function.)
+    llvm::Value* res = emitCompoundOpTyped(
+        binOp, cur, rhs, ctx_.exprType(targetExpr),
+        valueExpr ? ctx_.exprType(*valueExpr) : nullptr,
+        cur->getType()->isFloatingPointTy(),
         isUnsignedTargetExpr(targetExpr),
         isCharTargetExpr(targetExpr),                     // §6.6/§5.2 #1961
         valueExpr && isUnsignedTargetExpr(*valueExpr));   // §6.2 #2140
@@ -6201,8 +6221,16 @@ bool Emitter::lowerPropertyCompound(const ast::AssignmentStmt& as) {
     if (!cur || !rhs) return false;
     std::string op(as.op);
     if (!op.empty() && op.back() == '=') op.pop_back();
-    llvm::Value* res = emitCompoundOp(
-        op, cur, rhs, cur->getType()->isFloatingPointTy(),
+    // fix #2904 (§25.1/§25.2/§6.6, v0.240): via emitCompoundOpTyped, so a
+    // RECORD- or class-typed property whose type declares `operator <op>` takes
+    // §25's read-modify-write desugaring. Before this, `b.PP += one` on a
+    // `Pair`-typed block-form property handed the record struct to
+    // `llvm.sadd.with.overflow` and ABORTED the compile — while the LOCAL
+    // spelling (#610) and the heap-collection spelling (#626) each did the
+    // lookup from their own copy of it.
+    llvm::Value* res = emitCompoundOpTyped(
+        op, cur, rhs, ctx_.exprType(*as.target), ctx_.exprType(*as.value),
+        cur->getType()->isFloatingPointTy(),
         isUnsignedTargetExpr(*as.target),
         isCharTargetExpr(*as.target),      // §6.6/§5.2 #1961
         isUnsignedTargetExpr(*as.value));  // §6.2 #2140 rUns

@@ -170,6 +170,83 @@ llvm::Value* Emitter::emitImplicitOne(llvm::Type* t) {
 }
 
 
+// fix #2904 / §25.1 / §25.2 / §6.6: see the declaration comment in
+// LlvmBackend_impl.hpp. §25.2 selects from "the union of the `operator <op>`
+// overloads declared on the static types of BOTH operands", with "parameters
+// match operands in order" (no commutation) — so the target's type is searched
+// first (the common LHS-declared case) and then the value's (#2156's
+// RHS-declared shape, e.g. `operator *(int, Scale)` living on `Scale`).
+sema::MethodSymbol* Emitter::findCompoundOperatorOverload(
+        const std::string& binOp, const sema::TypeRef* leftTy,
+        const sema::TypeRef* rightTy) {
+    if (binOp.empty()) return nullptr;
+    // §25.2: match the operator's parameter types against the operand types IN
+    // ORDER (left→param0, right→param1). Sema has already validated that the
+    // compound is well-typed, so this only DISAMBIGUATES when one type declares
+    // several overloads of the same token. A Named parameter matches a Named
+    // operand by declaration; a Primitive parameter matches a Primitive operand
+    // by kind (numeric widening is downstream, as for the binary form).
+    auto paramMatches = [&](sema::Symbol* paramSym,
+                            const sema::TypeRef* operandTy) -> bool {
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(paramSym);
+        if (!ps) return false;
+        sema::TypeRef* pt = ps->declType ? ctx_.resolvedType(*ps->declType)
+                                         : ps->resolvedDeclType;
+        if (!pt || !operandTy) return false;
+        if (pt->kind == sema::TypeRef::Kind::Named)
+            return operandTy->kind == sema::TypeRef::Kind::Named &&
+                   pt->declaration == operandTy->declaration;
+        if (pt->kind == sema::TypeRef::Kind::Primitive)
+            return operandTy->kind == sema::TypeRef::Kind::Primitive;
+        return false;
+    };
+    auto findOnType = [&](const sema::TypeSymbol* ts) -> sema::MethodSymbol* {
+        if (!ts) return nullptr;
+        for (sema::Symbol* m : ts->members) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(m);
+            if (ms && ms->isOperator && ms->operatorToken == binOp &&
+                ms->params.size() == 2 &&
+                paramMatches(ms->params[0], leftTy) &&
+                paramMatches(ms->params[1], rightTy))
+                return ms;
+        }
+        return nullptr;
+    };
+    if (leftTy && leftTy->kind == sema::TypeRef::Kind::Named &&
+        leftTy->declaration)
+        if (sema::MethodSymbol* m = findOnType(leftTy->declaration)) return m;
+    if (rightTy && rightTy->kind == sema::TypeRef::Kind::Named &&
+        rightTy->declaration)
+        return findOnType(rightTy->declaration);
+    return nullptr;
+}
+
+
+// fix #2904 / §25.1 / §25.2 / §6.6: `emitCompoundOp` with the §25 overload arm
+// in front of it — see the declaration comment in LlvmBackend_impl.hpp. The
+// lookup must run BEFORE emitCompoundOp, not after it: emitCompoundOp's integer
+// tail hands a record struct to `llvm.sadd.with.overflow`, which the IR verifier
+// rejects, so the compile ABORTS rather than falling through to anything.
+llvm::Value* Emitter::emitCompoundOpTyped(const std::string& op, llvm::Value* l,
+                                          llvm::Value* r,
+                                          const sema::TypeRef* leftTy,
+                                          const sema::TypeRef* rightTy, bool fp,
+                                          bool uns, bool charTarget,
+                                          bool rUns) {
+    if (sema::MethodSymbol* om =
+            findCompoundOperatorOverload(op, leftTy, rightTy)) {
+        // §25.1 / §25.2: dispatch to the user-defined binary operator with the
+        // arguments in SOURCE order {target, value} — the §25.2 in-order match.
+        // A failed call DECLINES (returns null) so the caller reports its own
+        // diagnostic; falling through to emitCompoundOp would abort the compile
+        // on malformed IR, which is the very defect this arm exists to remove.
+        std::vector<llvm::Value*> args{l, r};
+        return emitMethodCall(om, args, /*baseQualified=*/false);
+    }
+    return emitCompoundOp(op, l, r, fp, uns, charTarget, rUns);
+}
+
+
 llvm::Value* Emitter::emitCompoundOp(const std::string& op, llvm::Value* l,
                             llvm::Value* r, bool fp, bool uns, bool charTarget,
                             bool rUns) {
