@@ -2083,7 +2083,18 @@ void Emitter::emitExportedPropertyGetters() {
         if (!ts || (ts->kind != ast::TypeDeclKind::Class &&
                     ts->kind != ast::TypeDeclKind::Record)) continue;
         if (ts->visibility != ast::Visibility::Public) continue;
-        if (!ts->genericParams.empty()) continue;
+        // fix #2894 (§2.5 / §2.8.3 rule 4 / §13 / §23 / §14.1, v0.240): a public
+        // GENERIC class's instance property accessors ARE exported, where they
+        // previously were not. The importer's own half
+        // (declareImportedProperty{Getters,Setters}) never carried a generic
+        // gate, so it already DECLARED `bz$<GenericClass>$<Prop>$propget` — the
+        // asymmetry was invisible only because nothing ever created a
+        // RELOCATION to it. #2894's itable fill does, and an itable is an
+        // INITIALIZED GLOBAL: an unresolved slot is a link error at every
+        // consumer, including one that never dispatches. The body emitted here
+        // is the ERASED `T -> i32` template accessor, which is exactly what the
+        // importer is allowed to call: buildImportedGenericVtable installs it
+        // ONLY for an instantiation whose layout matches that template.
         for (sema::Symbol* m : ts->members) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
             if (!ps || ps->isIndexer) continue;
@@ -2201,7 +2212,18 @@ void Emitter::emitExportedPropertySetters() {
         if (!ts || (ts->kind != ast::TypeDeclKind::Class &&
                     ts->kind != ast::TypeDeclKind::Record)) continue;
         if (ts->visibility != ast::Visibility::Public) continue;
-        if (!ts->genericParams.empty()) continue;
+        // fix #2894 (§2.5 / §2.8.3 rule 4 / §13 / §23 / §14.1, v0.240): a public
+        // GENERIC class's instance property accessors ARE exported, where they
+        // previously were not. The importer's own half
+        // (declareImportedProperty{Getters,Setters}) never carried a generic
+        // gate, so it already DECLARED `bz$<GenericClass>$<Prop>$propget` — the
+        // asymmetry was invisible only because nothing ever created a
+        // RELOCATION to it. #2894's itable fill does, and an itable is an
+        // INITIALIZED GLOBAL: an unresolved slot is a link error at every
+        // consumer, including one that never dispatches. The body emitted here
+        // is the ERASED `T -> i32` template accessor, which is exactly what the
+        // importer is allowed to call: buildImportedGenericVtable installs it
+        // ONLY for an instantiation whose layout matches that template.
         for (sema::Symbol* m : ts->members) {
             auto* ps = dynamic_cast<sema::PropertySymbol*>(m);
             if (!ps || ps->isIndexer) continue;
@@ -5099,13 +5121,198 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     descGV->setInitializer(
         llvm::ConstantArray::get(descArrTy, descElems));
 
-    // --- (b) Per-instantiation itmap: [null] (no interfaces) ---
-    auto* itmapArrTy = llvm::ArrayType::get(ptrTy(), 1);
+    // --- (b) Per-instantiation itmap ---
+    //
+    // fix #2894 (§2.8.3 rule 4 "one runtime type identity per monomorphization"
+    // / §12.1 "Inheritance and dispatch" / §13 "Interfaces" / §11.2 / §23
+    // "Properties and Indexers" / §14.1, v0.240). This was a LITERAL one-element
+    // `[null]` — "no interfaces" — for EVERY imported generic instantiation,
+    // whatever the class actually implements. So a `GIface<T>: IHas` constructed
+    // in an importing module carried a dispatch table that answers "I implement
+    // nothing": `bz_itable_lookup(itmap, td$IHas)` returned null and the very
+    // next `load ptr` from it faulted. Measured on the issue's two-module repro,
+    // `bezelc -c lib.bzl` + `bezelc --import lib.o app.bzl`, which compiles and
+    // LINKS clean and then:
+    //
+    //     Segmentation fault (core dumped)     exit=139
+    //     AddressSanitizer: SEGV on unknown address 0x000000000000 ... in main
+    //
+    // §2.8.3 rule 4 requires one runtime type identity per monomorphization
+    // "regardless of which artifact produced the value", and §11.2's
+    // interface-matching contract draws no artifact distinction — so an
+    // instantiation minted importer-side must dispatch exactly as the
+    // same-module one does. Everything needed to build the real table is already
+    // importer-side: `baseTypes` (ModuleLoader), `descArray_` for an imported
+    // interface, and the per-interface slot numbering `ifaceMethodIndex_` /
+    // `ifaceEventIndex_` / `ifacePropertyGet|SetIndex_` / `ifaceItabSlotCount_`,
+    // which #2401/#2506 already mirror for IMPORTED interfaces precisely so the
+    // importer computes the SAME index k the exporter stored.
+    //
+    // ⚠ GATED ON THE LAYOUT PROPERTY, and this gate is the whole soundness
+    // argument. Every function that can go in these slots was compiled BY THE
+    // EXPORTER against the erased `T -> i32` template layout (a generic class
+    // exports no per-instantiation code, §2.5 / §2.8.3 rule 4; the accessor BODY
+    // is not even reconstructible importer-side — ModuleLoader attaches no
+    // ast::PropertyDecl to an imported property, which is #2387's finding). When
+    // this instantiation's storage layout MOVES relative to that template, those
+    // bodies GEP offsets the object does not have — so installing them would
+    // convert today's SEGV into a SILENT WRONG VALUE, which is strictly worse.
+    // Such an instantiation therefore keeps the empty itmap and today's exact
+    // behaviour; that residual is filed separately with its own measurement
+    // (it needs importer-side monomorphization of accessor bodies, the #428
+    // core), never guessed at here.
+    std::vector<llvm::Constant*> itmapElems;
+    const bool importedLayoutMoves =
+        instanceLayoutDiffersFromErasedTemplate(ts);
+    if (!importedLayoutMoves) {
+        std::vector<const sema::TypeSymbol*> supers;
+        collectTypeAndBases(ts, supers);
+        for (const sema::TypeSymbol* iface : supers) {
+            if (iface->kind != ast::TypeDeclKind::Interface) continue;
+            auto descIt = descArray_.find(iface);
+            auto cntIt = ifaceItabSlotCount_.find(iface);
+            if (descIt == descArray_.end() ||
+                cntIt == ifaceItabSlotCount_.end() || cntIt->second == 0)
+                continue;
+            const unsigned nSlots = cntIt->second;
+            // nSlots fn-ptr slots + the #2506 trailing owner-kind flag, read at
+            // exactly index nSlots by lowerVirtualPropertySet.
+            std::vector<llvm::Constant*> itabElems(
+                nSlots + 1, llvm::ConstantPointerNull::get(ptrTy()));
+            for (sema::Symbol* m : iface->members) {
+                auto* im = dynamic_cast<sema::MethodSymbol*>(m);
+                if (!im || isStaticMethod(im)) continue;
+                auto xi = ifaceMethodIndex_.find(im);
+                if (xi == ifaceMethodIndex_.end() || xi->second >= nSlots)
+                    continue;
+                sema::MethodSymbol* impl = findInterfaceImpl(ts, im);
+                if (!impl) continue;
+                auto mit = methodFns_.find(impl);
+                if (mit != methodFns_.end())
+                    itabElems[xi->second] =
+                        llvm::cast<llvm::Constant>(mit->second);
+            }
+            // An interface EVENT's slot is left null, deliberately and stated
+            // rather than implied. §24 is titled "Events (retired member kind)"
+            // in v0.240, so there is no shape here to regression-test; and
+            // filling it would mean calling `emitEventAccessor`, a BODY emission
+            // — this function still writes its cache only on the way OUT, so a
+            // body that re-enters it would build a second vtable for one
+            // instantiation (the hazard #2906 removed from `specializedVtableFor`
+            // and did not remove here). Neither cost is worth paying for an arm
+            // no measurement covers.
+            for (sema::Symbol* m : iface->members) {
+                auto* ip = dynamic_cast<sema::PropertySymbol*>(m);
+                if (!ip) continue;
+                const sema::PropertySymbol* pimpl =
+                    ip->isIndexer ? classIndexerImplementing(ts, ip)
+                                  : classPropertyByName(ts, ip->name);
+                if (!pimpl) continue;
+                // ⚠ AN ITABLE IS AN INITIALIZED GLOBAL, so a slot may only hold
+                // a symbol the EXPORTER is guaranteed to have DEFINED — an
+                // unresolved relocation is a LINK ERROR at every consumer,
+                // including one that never dispatches through the interface. A
+                // DECLARATION is not that guarantee: declareImportedProperty-
+                // {Getters,Setters} declares a stub for shapes the exporter
+                // skips, which is exactly how this fix's first probe produced
+                // `undefined reference to bz$L5.GIface$W$propget`.
+                //
+                // So this gate MIRRORS emitExportedProperty{Getters,Setters}'s
+                // own gate, on the metadata the importer holds for the same
+                // facts — the pattern declareImportedStaticPropertyAccessors
+                // already records for the static ABI. Anything outside it keeps
+                // a null slot, i.e. today's exact behaviour.
+                auto exporterDefinesAccessor = [&](bool isSet) {
+                    // An INDEXER is excluded because emitExportedIndexerGetters
+                    // /-Setters still carry their own `genericParams.empty()`
+                    // gate, so no `bz$<Class>$idxget$<arity>` symbol exists for
+                    // a generic class — installing one would be an unresolved
+                    // relocation. An interface INDEXER on an imported generic
+                    // therefore keeps its null slot, exactly as today; filed
+                    // separately with its own measurement rather than widened
+                    // into this fix.
+                    if (pimpl->isIndexer) return false;
+                    if (!pimpl->parent) return false;
+                    if (pimpl->parent->kind != ast::TypeDeclKind::Class &&
+                        pimpl->parent->kind != ast::TypeDeclKind::Record)
+                        return false;
+                    if (pimpl->parent->visibility != ast::Visibility::Public)
+                        return false;
+                    if (pimpl->visibility != ast::Visibility::Public)
+                        return false;
+                    if (isStaticProperty(pimpl)) return false;
+                    // The exporter routes a VIRTUAL property through the vtable
+                    // slot instead and emits no `$propget`/`$propset` for it;
+                    // the importer's own declare half skips the same shape via
+                    // propGet/SetSlot_. That residual (a virtual property on an
+                    // imported generic) is #2884's, declined there.
+                    if (isSet ? propSetSlot_.count(pimpl)
+                              : propGetSlot_.count(pimpl))
+                        return false;
+                    return isSet ? ctx_.importedPropertyHasSetter(pimpl)
+                                 : ctx_.importedPropertyHasGetter(pimpl);
+                };
+                // A second, INDEPENDENT question from "does the symbol exist":
+                // does its ABI still fit this instantiation? The layout gate
+                // above says every FIELD keeps its width, which does NOT imply
+                // the PROPERTY's own type does — `class G<T> { _w: int; property
+                // P: T … }` moves the accessor's return type while leaving the
+                // storage identical. The exported stub was declared with no
+                // substitution active, so comparing it against the type lowered
+                // under THIS substitution is exactly that question.
+                auto accessorAbiFits = [&](llvm::Function* acc, bool isSet) {
+                    sema::TypeRef* mt = ctx_.importedMemberType(pimpl);
+                    if (!mt) return false;
+                    llvm::Type* conc = lowerTypeRef(mt);
+                    if (!conc) return false;
+                    llvm::FunctionType* ft = acc->getFunctionType();
+                    if (isSet)
+                        return ft->getNumParams() == 2 &&
+                               ft->getParamType(1) == conc &&
+                               ft->getReturnType()->isVoidTy();
+                    return ft->getNumParams() == 1 &&
+                           ft->getReturnType() == conc;
+                };
+                auto fill = [&](bool isSet, unsigned si) {
+                    if (si >= nSlots) return;
+                    if (!exporterDefinesAccessor(isSet)) return;
+                    llvm::Function* acc =
+                        ensurePropertyAccessorFn(ts, pimpl, isSet);
+                    if (!acc || !accessorAbiFits(acc, isSet)) return;
+                    itabElems[si] = llvm::cast<llvm::Constant>(acc);
+                };
+                if (auto gi = ifacePropertyGetIndex_.find(ip);
+                    gi != ifacePropertyGetIndex_.end())
+                    fill(/*isSet=*/false, gi->second);
+                if (auto si2 = ifacePropertySetIndex_.find(ip);
+                    si2 != ifacePropertySetIndex_.end())
+                    fill(/*isSet=*/true, si2->second);
+            }
+            // fix #2506's trailing owner-kind flag: an imported generic CLASS is
+            // a class, so the flag is NON-NULL — its auto-property setter body
+            // retains, exactly as a local class implementor's does (§23.3).
+            itabElems[nSlots] = llvm::ConstantExpr::getIntToPtr(
+                llvm::ConstantInt::get(llvm::Type::getInt64Ty(llvm_), 1),
+                ptrTy());
+            auto* itabArrTy =
+                llvm::ArrayType::get(ptrTy(), itabElems.size());
+            auto* itabGV = new llvm::GlobalVariable(
+                *module_, itabArrTy, /*isConstant=*/true,
+                llvm::GlobalValue::InternalLinkage,
+                llvm::ConstantArray::get(itabArrTy, itabElems),
+                "itab$" + tsName + "$" + std::string(iface->name) + suffix);
+            itmapElems.push_back(
+                llvm::cast<llvm::Constant>(descIt->second));
+            itmapElems.push_back(
+                llvm::ConstantExpr::getPointerCast(itabGV, ptrTy()));
+        }
+    }
+    itmapElems.push_back(llvm::ConstantPointerNull::get(ptrTy()));
+    auto* itmapArrTy = llvm::ArrayType::get(ptrTy(), itmapElems.size());
     auto* itmapGV = new llvm::GlobalVariable(
         *module_, itmapArrTy, /*isConstant=*/true,
         llvm::GlobalValue::InternalLinkage,
-        llvm::ConstantArray::get(itmapArrTy,
-                                 {llvm::ConstantPointerNull::get(ptrTy())}),
+        llvm::ConstantArray::get(itmapArrTy, itmapElems),
         "itmap$" + tsName + suffix);
 
     // --- (c) Specialized disposer ---
@@ -5150,8 +5357,19 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
                 elems[kVirtualMethodsBase + i] =
                     llvm::cast<llvm::Constant>(mit->second);
         }
-        // Property accessor slots for imported generics: not yet supported
-        // (their bodies are also in the exporter) — slots stay null.
+        // A VIRTUAL PROPERTY / INDEXER accessor slot stays NULL, and #2894
+        // deliberately does not fill it — measured, not assumed.
+        //
+        // The exporter routes a virtual property through the vtable slot instead
+        // of the `$propget`/`$propset` ABI (emitExportedPropertyGetters skips
+        // `isVirtualProperty`), and emits no per-instantiation vtable for a
+        // generic class at all (§2.5 / §2.8.3 rule 4) — so NO symbol exists for
+        // this slot to hold. That is the missing-SYMBOL half of the problem,
+        // which is #2884's, declined there at compile time; #2894 is the
+        // unpopulated-TABLE half, fixed in the itmap above where the exporter's
+        // `$propget`/`$propset` ABI does exist. Installing anything here would
+        // be an unresolved relocation in an initialized global, i.e. a link
+        // error for every consumer.
     }
 
     auto* arrTy = llvm::ArrayType::get(ptrTy(), elems.size());
