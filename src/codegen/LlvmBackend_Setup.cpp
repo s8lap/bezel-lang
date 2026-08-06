@@ -13921,16 +13921,46 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                     //
                     // This mirrors LlvmBackend_Calls2.cpp's own gate
                     // (`isIfaceRecv || isNamedClassRecv`) rather than
-                    // re-deriving it. A BUILTIN-EXCEPTION receiver
-                    // (`isBuiltinExRecv` there) is deliberately NOT included:
-                    // its vtable slot 3 is filled by machinery this lane did
-                    // not audit for the +1 contract, and an unaudited widening
-                    // here is the over-release direction. It keeps the
-                    // pre-existing leak — the safe direction — and is filed.
+                    // re-deriving it.
                     if (tt && tt->kind == sema::TypeRef::Kind::Named &&
                         tt->declaration &&
                         (tt->declaration->kind == ast::TypeDeclKind::Interface ||
                          tt->declaration->kind == ast::TypeDeclKind::Class) &&
+                        !dynamic_cast<sema::MethodSymbol*>(
+                            ctx_.exprSymbol(*call->callee)))
+                        return true;
+                    // fix #2867 (§8.5 / §8.6 / §28.9 / §31.4, v0.240): the
+                    // FOURTH spelling of the same shape — a BUILTIN-EXCEPTION
+                    // receiver (`isBuiltinExRecv` at the call site, the same
+                    // `isBuiltinExceptionTypeRef` name-check, under the same
+                    // `if (!ms)`). #2846 left this arm out because it had not
+                    // audited what fills such a vtable's slot 3; that audit is
+                    // this fix, and the answer is +1-or-sentinel like every
+                    // other arm:
+                    //   • a genuine built-in instance carries `bvt$<name>`,
+                    //     whose slot 3 is `bz$extostr$<name>` — a thunk that
+                    //     returns `lowerStringLiteral("\"<name>\"")`, i.e.
+                    //     §8.5's "for classes: the type's qualified name" as an
+                    //     immortal constant global (setupBuiltinExceptions,
+                    //     this file). Retain/release on it are no-ops;
+                    //   • a USER class deriving from a built-in exception
+                    //     (§31.1 admits any class; `class MyEx: Exception`)
+                    //     carries its OWN class vtable, so slot 3 is
+                    //     `classToStringThunk(ts)` — exactly the filler the
+                    //     `isNamedClassRecv` arm just above already relies on:
+                    //     the user `override ToString()`, whose ReturnStmt
+                    //     lowering (LlvmBackend_Stmts.cpp) mints +1 for a
+                    //     `string` return per §28.3's classification of an
+                    //     announced return as a transfer to the caller, else
+                    //     the class-name literal. That is the shape that LEAKED
+                    //     (MEASURED, 20 iterations: 711 bytes / 40 allocations
+                    //     from `bz$App.MyEx$ToString` via `bz$tostr$MyEx`);
+                    //   • the `null` and `string` arms of `lowerObjectToString`
+                    //     are unreachable for this receiver at runtime (an
+                    //     exception object's word 0 is one of the vtables
+                    //     `bz_obj_is_string` scans, so it answers "not a
+                    //     string") and are +1-or-sentinel regardless.
+                    if (isBuiltinExceptionTypeRef(tt) &&
                         !dynamic_cast<sema::MethodSymbol*>(
                             ctx_.exprSymbol(*call->callee)))
                         return true;
@@ -13973,10 +14003,11 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
     // a heap allocation — confirmed empirically to NOT leak either way
     // (retaining a sentinel and releasing it once is a no-op, so recognizing
     // it here would change nothing; omitted rather than adding an untested
-    // branch). Class/Interface are excluded too: that substitution dispatches
-    // through `lowerObjectToString`, which "may or may not allocate" (the
-    // SAME conservative exclusion the Object.ToString() comment above
-    // already documents for the non-generic case). A non-auto-equality-
+    // branch). Class/Interface were excluded too, on the premise that the
+    // substitution "dispatches through `lowerObjectToString`, which may or may
+    // not allocate" — fix #2867 (v0.240) lifts that exclusion, because the
+    // premise stopped being true when #2846 made every arm of that lowering
+    // +1-or-sentinel; see the Class/Interface branch below. A non-auto-equality-
     // bearing Choice substitution is excluded: it is rejected at compile
     // time by lowerValueSemMethodOn's own diagnostic (#2479's undecided
     // classification) before this could ever matter.
@@ -14018,6 +14049,55 @@ bool Emitter::isPlusOneStringProducer(const ast::Expr* init) const {
                                            concrete->declaration, ctx_,
                                            concrete)) {
                                 return true;
+                            } else if (concrete->kind == K::Named &&
+                                       concrete->declaration &&
+                                       (concrete->declaration->kind ==
+                                            ast::TypeDeclKind::Class ||
+                                        concrete->declaration->kind ==
+                                            ast::TypeDeclKind::Interface)) {
+                                // fix #2867 (§14.1 / §8.5 / §8.6 / §28.9,
+                                // v0.240): a bare-`T` receiver whose active
+                                // monomorphization binds T to a CLASS or an
+                                // INTERFACE. #2475 excluded these because
+                                // `lowerObjectToString` — the lowering
+                                // LlvmBackend_Calls2.cpp's `genericSubstSemaTy_`
+                                // branch redirects them to — "may or may not
+                                // allocate". #2846 removed that premise: every
+                                // arm of that function now hands back +1 or an
+                                // immortal sentinel (null → the "null" literal;
+                                // a string receiver → itself, RETAINED; a
+                                // class/box receiver → vtable[3], i.e.
+                                // `classToStringThunk`'s user override, which
+                                // the ReturnStmt lowering
+                                // (LlvmBackend_Stmts.cpp) mints +1 for per
+                                // §28.3's classification of an announced
+                                // return as a transfer to the caller, or
+                                // one of the box thunks, which mint via
+                                // `emitRecordToString`/`emitPrimitiveToString`,
+                                // or a type-name literal). So the result is
+                                // uniformly discharge-once, exactly like the
+                                // primitive/record/choice substitutions above.
+                                // MEASURED before the change (T bound to a
+                                // class with a minting `override ToString()`,
+                                // 20 iterations): 711 bytes / 40 allocations
+                                // from `bz$App.K$ToString` via `bz$tostr$K`.
+                                //
+                                // The `!ms` condition mirrors the call site
+                                // VERBATIM: LlvmBackend_Calls2.cpp reaches the
+                                // `genericSubstSemaTy_` redirect only inside
+                                // `if (!ms)`. It is spelled on this branch only
+                                // — the sibling branches above predate #2867
+                                // and widening THEIR gate is not this fix's
+                                // business — and it matters here because a
+                                // `where T: IFoo` constraint can give the
+                                // receiver a member surface on which sema DOES
+                                // resolve a MethodSymbol, in which case the
+                                // ordinary method-call path runs and
+                                // `isUserMethodStringReturnCall` below is the
+                                // arm that decides.
+                                if (!dynamic_cast<sema::MethodSymbol*>(
+                                        ctx_.exprSymbol(*call->callee)))
+                                    return true;
                             }
                         }
                     }
