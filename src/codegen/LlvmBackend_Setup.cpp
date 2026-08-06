@@ -10666,6 +10666,55 @@ void Emitter::mapSuspendLocalSlot(const ast::Node* declNode,
         smAllocaToField_[slot] = fit->second;
 }
 
+// fix #2935 (stdlib closed surfaces; language spec §3/#605, v0.240) — see the
+// header for the contract, and lowerLocalDecl's call site below for the full
+// derivation of why the value-demanding half of the property is essential.
+//
+// A user type that merely SHARES a built-in's name is excluded: it carries a
+// real `decl`, or (imported) a non-empty `moduleName`, neither of which a
+// synthetic built-in TypeSymbol has (sema/Symbol.hpp: moduleName is "Empty
+// only for a synthetic TypeSymbol with no real module").
+std::string Emitter::builtinReceiverOfMemberCall(const ast::Expr* e,
+                                                 std::string* outMember) {
+    auto* call = dynamic_cast<const ast::CallExpr*>(e);
+    if (!call) return {};
+    // SEMA MUST BE AS IGNORANT AS CODEGEN. A caller has already established
+    // that lowering produced no value; that alone is NOT enough, because a
+    // real, documented, working member can legitimately produce no value at a
+    // value-shaped site. The counterexample that forced this conjunct is
+    // #2167's BOUND drain view:
+    //
+    //     var d := arr.Drain();          // stdlib §4.5 — real and implemented
+    //     for var item in d do … end;
+    //
+    // `d`'s slot is DELIBERATELY dead: `lowerOwnedSeqDrainFor` recognises the
+    // bound form by walking back to `d`'s LocalDecl initializer and lowers the
+    // for-in through the receiver, so nothing ever needs a value in the slot.
+    // Requiring `!ctx_.exprType(*call)` excludes it exactly — sema types
+    // `Drain()` `IOwningEnumerable<T>` — while a member that does not exist is
+    // typed by nobody. The conjunction also keeps the mirror-image case out:
+    // `Array<T>.GetHashCode()` is dispatched structurally and sema never types
+    // it either, but codegen DOES produce a value for it, so it never reaches
+    // a caller of this predicate.
+    //
+    // Residual, deliberate and narrow: `var v: int := r.Bogus();` supplies the
+    // local's type from the ANNOTATION, so sema types nothing but the CallExpr
+    // still has no type — that shape is still caught — whereas anything sema
+    // manages to type is not. A missed detection is the safe direction here; a
+    // false reject is not.
+    if (ctx_.exprType(*call)) return {};
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
+    if (!ma || !ma->target) return {};
+    const sema::TypeRef* rt = ctx_.exprType(*ma->target);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return {};
+    const sema::TypeSymbol* rd = rt->declaration;
+    if (rd && (rd->decl || !rd->moduleName.empty())) return {};  // user type
+    std::string rn = rd ? std::string(rd->name) : std::string(rt->headName());
+    if (rn.empty() || !sema::isBuiltinTypeName(rn)) return {};
+    if (outMember) *outMember = std::string(ma->member);
+    return rn;
+}
+
 void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     const ast::Type* declType) {
     // §27.5 / §28.9 (#969): record this local's block-nesting depth so the
@@ -11404,6 +11453,99 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // that also mislabels an explained "not yet implemented" limitation
         // as "internal: …". The guard only suppresses THIS diagnostic, never
         // the zero-init store below.
+        // ── THREE OUTCOMES, and why THIS order (#2915 + #2935) ──────────────
+        //
+        // "The initializer produced no lowered value" is not one situation but
+        // three, and they must be told apart before anything is reported:
+        //
+        //   (a) NOTHING IS WRONG — the type's representation simply has no
+        //       value. #2915: `()` lowers to LLVM `void`, so a unit-typed
+        //       initializer legitimately has no `llvm::Value`. Exempt, silent.
+        //   (b) SOMETHING IS DEFINITELY WRONG — #2935: a member call on a
+        //       BUILT-IN receiver that neither sema nor codegen could make
+        //       sense of. Located Error.
+        //   (c) EVERYTHING ELSE — the §3/#605 permissive surface. The
+        //       pre-existing #2434 Warning, which must stay a Warning (see the
+        //       corpus analysis above).
+        //
+        // ORDER: (a) is tested first because it is the only one of the three
+        // that says "this site is not a degrade at all"; (b) and (c) both
+        // presuppose that something failed. Asking "did anything fail?" before
+        // "how loudly do we say so?" is the reading that survives a new
+        // representation being added later.
+        //
+        // ⚠ THE ORDER IS PROVABLY IMMATERIAL HERE, which is worth stating so
+        // nobody re-derives it under pressure: (a) requires
+        // `ctx_.exprType(init)` to be NON-null and of `Kind::Unit`, and (b)
+        // requires `ctx_.exprType(call)` — the SAME node, since (b) only fires
+        // when `init` IS the call — to be null. An expression cannot both have
+        // a unit type and have no type, so the two conditions are DISJOINT and
+        // no expression can be claimed by both, in either order.
+        //
+        // ⚠ WHAT THAT DISJOINTNESS DOES *NOT* BUY, measured rather than
+        // assumed — and the reason (b)'s wording is what it is. It would be
+        // natural to conclude that a UNIT-returning built-in member call is
+        // therefore (a)'s business and can never reach (b). It is not, because
+        // sema does not type such a call UNIT — it does not type it AT ALL:
+        //
+        //     var x := sender.Send(42);   // ChannelSender<int>, stdlib §6.9
+        //
+        // has no sema type, is not rejected by sema, and lands squarely in (b).
+        // Rejecting it is CORRECT (`Send` yields nothing, so it cannot
+        // initialize a local; before this it silently zero-initialized `x`) —
+        // but an earlier wording of (b) said "no member `Send` on built-in type
+        // `ChannelSender`", which is FALSE: `Send` is documented and
+        // implemented. The diagnostic below therefore states only what is
+        // actually known at this point — the call produced no value — and
+        // offers BOTH readings, instead of asserting the member does not exist.
+        //
+        // ── (b), in full ────────────────────────────────────────────────────
+        // fix #2935 (stdlib closed surfaces; language spec §3/#605, v0.240):
+        // ONE shape reaching this degrade is never legitimate, and it is the
+        // shape #2935 reports — the initializer is a MEMBER CALL ON A BUILT-IN
+        // RECEIVER. `r.TotallyBogusMember(1, 2)` on a `Random` compiled clean
+        // and evaluated to 0; #2935 was found by writing `Random.NextInt(1, 3)`
+        // (the real stdlib §2.7 API is `Next(min, max)`) and having the
+        // compiler accept it. A plain user typo silently becoming a plausible
+        // numeric 0 is the worst outcome available, and it composes with #2922
+        // and #2921 into memory-unsafety rather than mere wrongness.
+        //
+        // WHY THIS SITE AND NOT THE CODEGEN DISPATCH FALLTHROUGH. That is
+        // where "no lowering exists" is known, and it was the first version of
+        // this fix — but measuring it against the whole lit corpus refuted it:
+        // `lowerCallExpr` returns nullptr BOTH for "no arm lowered this" and
+        // for "an arm lowered it and the result is unit"
+        // (`tryLowerChannelAndDomainCall`'s `Send` arm emits a real
+        // `bz_channel_sender_send` and then returns nullptr — #2963), so a
+        // check there false-rejected five green lit programs. This site adds
+        // the missing half of the property: a LOCAL DECLARATION DEMANDS A
+        // VALUE. A unit-returning method can never legitimately initialize a
+        // local, so here — unlike at the dispatch fallthrough — "produced no
+        // value" is unambiguously a defect. The same conjunction is applied at
+        // the §21.7-protected `return expr;` site (LlvmBackend_Stmts.cpp); the
+        // three OTHER value-demanding degrades are deliberately NOT covered,
+        // for reasons measured rather than assumed — see that site. (Both
+        // residuals are filed as #2966: those three sites, and the same typo
+        // written as a bare statement — `r.TotallyBogusMember(1, 2);` — which
+        // has no value-demanding consumer at all and stays silent.)
+        //
+        // The receiver test reads `sema::isBuiltinTypeName` (through the
+        // shared `builtinReceiverOfMemberCall`) — the thin predicate over the
+        // `builtinTypeArity` table that DEFINES which names resolve to a type
+        // with no user `TypeDecl` — rather than restating the three receiver
+        // names #2935 lists. That registry is the source collection the
+        // population actually comes from, so a built-in added later is covered
+        // without an edit here; the three-name list was already too small when
+        // written (probing all 18 built-in receivers for this fix found FIVE
+        // that accepted a bogus member: also `OwningBuffer<T>` and
+        // `CancellationTokenSource`).
+        //
+        // None of the six §3/#605 permissive programs #2434's own corpus check
+        // catalogs is affected: their receivers are `Object` (a Primitive
+        // TypeRef), a USER interface, or an unconstrained type parameter —
+        // none is a registry built-in — and `new T()` is not a member call.
+        //
+        // ── (a), in full ────────────────────────────────────────────────────
         // fix #2915 (§4.7): a UNIT-typed initializer is exempt for the same
         // reason as its #2491 return-path twin — `()` lowers to LLVM `void`,
         // so having no lowered value IS the type's representation, not a
@@ -11415,7 +11557,25 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         const sema::TypeRef* initTy = init ? ctx_.exprType(*init) : nullptr;
         const bool unitInitializer =
             initTy && initTy->kind == sema::TypeRef::Kind::Unit;
-        if (init && !unitInitializer && !ctx_.diagnostics().hasErrors()) {
+        std::string initMember;
+        const std::string builtinRecvName =
+            unitInitializer ? std::string()
+                            : builtinReceiverOfMemberCall(init, &initMember);
+        if (unitInitializer) {
+            // (a) — nothing to report.
+        } else if (!builtinRecvName.empty() &&
+                   !ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Error, init->span.begin,
+                "`" + initMember + "` on built-in type `" + builtinRecvName +
+                "` produced no value, so it cannot initialize this local. `" +
+                builtinRecvName + "` has no user declaration, so its member "
+                "surface is exactly what the standard library documents for "
+                "it: either `" + initMember + "` is not on that surface (a "
+                "misspelling), or it is documented but yields nothing here "
+                "(#2935 \xE2\x80\x94 if it is documented and should yield a "
+                "value, it is unimplemented, #2457)");
+        } else if (init && !ctx_.diagnostics().hasErrors()) {
             ctx_.diagnostics().report(
                 Severity::Warning, init->span.begin,
                 "internal: lowerLocalDecl's initializer expression failed "

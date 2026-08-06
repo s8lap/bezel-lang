@@ -1614,6 +1614,26 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         //     unhandled `in` form) — same message-quality guard #2434 used.
         // The zero/null degrade still happens downstream; this only makes
         // the failure observable instead of invisible.
+        //
+        // ── THREE OUTCOMES, and why THIS order (#2915 + #2935) ──────────────
+        // Identical structure to the `lowerLocalDecl` twin (LlvmBackend_Setup
+        // .cpp), which carries the full derivation:
+        //   (a) UNIT-typed return value ⇒ exempt, silent — nothing failed.
+        //   (b) member call on a BUILT-IN receiver that neither sema nor
+        //       codegen could make sense of ⇒ located Error.
+        //   (c) everything else ⇒ the pre-existing #2491 Warning.
+        // (a) first, because it alone says "this site is not a degrade"; and
+        // (a) and (b) are DISJOINT by construction — (a) needs the expression
+        // to HAVE a unit type, (b) needs it to have NO type — so the order
+        // cannot change any outcome, only the reading.
+        //
+        // ⚠ That disjointness does NOT mean a unit-returning built-in member
+        // call is (a)'s business: sema does not type such a call unit, it does
+        // not type it at all, so `return s.Send(42);` from an int-returning
+        // method lands in (b). Rejecting it is correct — it yields nothing —
+        // but (b)'s wording must not claim `Send` does not exist. See the
+        // lowerLocalDecl twin for the measurement.
+        //
         // fix #2915 (§4.7): a UNIT-typed return value is exempt. `()` lowers to
         // LLVM `void` (lowerTypeRef's Kind::Unit case), so it legitimately has
         // no lowered value — that is the type's representation, not a lowering
@@ -1622,12 +1642,58 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
         // unit-returning method and the now-correct `return ();` through an
         // `Object` return printed an `internal:` note on a program with nothing
         // wrong with it.
+        //
+        // fix #2935 (v0.240): the returned expression is a MEMBER CALL ON A
+        // BUILT-IN RECEIVER (`return r.TotallyBogusMember(1, 2);` on a
+        // `Random`, measured degrading to a silent 0 on `f069645`). A built-in
+        // has no user declaration, so its member surface is closed and "no arm
+        // lowered this" means "not on that surface" — but that inference only
+        // holds where a value was DEMANDED, because `lowerCallExpr` returns
+        // nullptr both for "nothing lowered this" and for "an arm lowered it
+        // and the result is unit" (#2963). §21.7 supplies the demand here and
+        // states it as a language rule rather than an assumption: "this
+        // callable has no return type — `return` may not carry a value", so a
+        // `return expr;` that reached codegen is in a callable that has a
+        // return type.
+        //
+        // ⚠ THE THREE SIBLING #2491 SITES ARE DELIBERATELY NOT GIVEN THIS —
+        // and the reason is measured, not assumed. Two of them are the
+        // ARROW-BODY (`=> expr`) faces, and a unit-returning arrow body is
+        // legal Bezel that §21.7 does NOT cover: `public static method
+        // Push(s: ChannelSender<int>) => s.Send(42);` compiles today, WORKS
+        // (the item really is buffered), and reaches that site with `v ==
+        // null` because `Send` lowered as unit. The same gate there would
+        // reject it. Extending to those sites needs a distinct "this callable
+        // has a return type" test (`ci.returnType`) and its own measurement;
+        // filed as #2966 rather than guessed at. The
+        // `builtinReceiverOfMemberCall` helper is deliberately shared with
+        // lowerLocalDecl so that whoever does extend it changes ONE predicate,
+        // not a fifth copy of it — #2924's four-way-mirror finding about this
+        // very diagnostic.
         const sema::TypeRef* retValTy =
             rs->value ? ctx_.exprType(*rs->value) : nullptr;
         const bool unitReturnValue =
             retValTy && retValTy->kind == sema::TypeRef::Kind::Unit;
-        if (rs->value && !v && !unitReturnValue &&
-            !ctx_.diagnostics().hasErrors()) {
+        std::string retMember;
+        const std::string retBuiltinRecv =
+            (rs->value && !v && !unitReturnValue)
+                ? builtinReceiverOfMemberCall(rs->value.get(), &retMember)
+                : std::string();
+        if (unitReturnValue) {
+            // (a) — nothing to report.
+        } else if (!retBuiltinRecv.empty() &&
+                   !ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Error, rs->value->span.begin,
+                "`" + retMember + "` on built-in type `" + retBuiltinRecv +
+                "` produced no value, so it cannot supply this return value. `" +
+                retBuiltinRecv + "` has no user declaration, so its member "
+                "surface is exactly what the standard library documents for "
+                "it: either `" + retMember + "` is not on that surface (a "
+                "misspelling), or it is documented but yields nothing here "
+                "(#2935 \xE2\x80\x94 if it is documented and should yield a "
+                "value, it is unimplemented, #2457)");
+        } else if (rs->value && !v && !ctx_.diagnostics().hasErrors()) {
             ctx_.diagnostics().report(
                 Severity::Warning, rs->value->span.begin,
                 "internal: return-value expression failed to lower to a "

@@ -9123,6 +9123,23 @@ private:
     void lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                         const ast::Type* declType);
 
+    // fix #2935 (stdlib closed surfaces; language spec §3/#605, v0.240): is `e`
+    // a member CALL whose receiver is a compiler BUILT-IN type — one the
+    // `builtinTypeArity` registry resolves without any user `TypeDecl`? Returns
+    // the receiver's name (and, via `outMember`, the member's) when it is, and
+    // an empty string otherwise.
+    //
+    // Callers use it at the sites where a VALUE IS DEMANDED and lowering
+    // produced none. That conjunction is the whole property: a built-in's
+    // member surface is closed by construction (there is no declaration a user
+    // could extend), so "no lowering exists" means "not on that surface" — but
+    // ONLY where a value was required, because `lowerCallExpr` returns nullptr
+    // both for "nothing lowered this" and for "an arm lowered it and the result
+    // is unit". See the call site in lowerLocalDecl for the full derivation and
+    // the measured counterexamples.
+    std::string builtinReceiverOfMemberCall(const ast::Expr* e,
+                                            std::string* outMember);
+
     // #2182 / §28.3: consume lastLambdaCapturedCells_ — for each freshly-boxed
     // capture cell of a cellFreeEligible_ local (populated by lowerLambda),
     // register a boxedCellFree (or boxedCellFreeDeferred / inline-array-cell
