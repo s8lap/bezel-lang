@@ -4455,6 +4455,31 @@ private:
         std::unordered_map<std::string_view, llvm::Type*>& addSubst,
         std::unordered_map<std::string_view, const sema::TypeRef*>& addSema);
 
+    // fix #2897 (§14.1 / §12 / §22.8, v0.240): the instance-storage LLVM type
+    // sequence for `t`, with EVERY member resolved under the substitution of the
+    // class that DECLARES it instead of under one flat name-keyed map.
+    //
+    // `genericSubst_` is keyed by parameter NAME, so when a derived class and one
+    // of its ancestors both spell a parameter `T` and the derived class binds the
+    // ancestor's to a DIFFERENT argument (`class Coll<T> : Base<string>`, `Base`'s
+    // parameter also `T`), the two bindings cannot coexist: `storageType` looks
+    // `T` up once and gets whichever won. Every composing walk in this file has to
+    // pick a winner and says so in its comment. The ancestor's own binding is
+    // recoverable exactly — `computeAncestorGenericSubst` re-derives it
+    // POSITIONALLY from the base clause, so a shared spelling never reaches it —
+    // and this applies it per member.
+    //
+    // Provably inert without a collision: an ancestor's own map and the flat map
+    // agree on that ancestor's parameter names whenever nothing overwrote them,
+    // and an ancestor whose substitution cannot be resolved keeps the flat map.
+    std::vector<llvm::Type*> instanceStorageTypes(const sema::TypeSymbol* t);
+
+    // fix #2897: the DECLARING class of each entry of `collectInstanceStorage(t)`,
+    // derived from that function alone (per-level prefix lengths) so the two can
+    // never drift on what counts as storage.
+    std::vector<const sema::TypeSymbol*> instanceStorageOwners(
+        const sema::TypeSymbol* t, std::size_t n);
+
     // fix #2896 (§14.1 / §12 / §22.8, v0.240): #2019's layout-identity question,
     // asked about `t` under the ACTIVE substitution. True when `t`'s instance-
     // storage LLVM-type sequence under the active substitution DIFFERS from the

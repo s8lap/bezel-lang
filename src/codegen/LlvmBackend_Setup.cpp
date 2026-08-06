@@ -9135,13 +9135,14 @@ bool Emitter::emitSpecializedImplicitBaseCtor(const sema::TypeSymbol* cls,
     // storageType only READ the substitution — no fieldIndex_ / classStruct side
     // effects — so measuring both sequences is free of emission consequences.
     // (llvm::Type* are context-unique, so `==` on the vectors is structural.)
+    // fix #2897 (§14.1 / §12 / §22.8, v0.240): resolve each slot under the
+    // substitution of the class that DECLARES it, for the same reason
+    // emitBaseDisposeChain does — one flat name-keyed map cannot hold a derived
+    // class's `T` and an ancestor's differently-bound `T` at once, and this
+    // comparison would then wrongly conclude "identical" and leave the erased
+    // template constructor writing at the placeholder's offsets.
     auto baseFieldLayout = [&]() {
-        std::vector<const sema::Symbol*> storage;
-        collectInstanceStorage(base, storage);
-        std::vector<llvm::Type*> tys;
-        tys.reserve(storage.size());
-        for (const sema::Symbol* m : storage) tys.push_back(storageType(m));
-        return tys;
+        return instanceStorageTypes(base);
     };
     auto savedGenericSubst = genericSubst_;
     auto savedGenericSema  = genericSubstSemaTy_;

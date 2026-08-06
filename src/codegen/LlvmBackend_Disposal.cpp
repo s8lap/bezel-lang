@@ -3271,13 +3271,17 @@ void Emitter::emitBaseDisposeChain(const sema::TypeSymbol* ts) {
             // identical offsets; llvm::Type* are context-unique so `==` is
             // structural.) collectInstanceStorage/storageType only read the subst —
             // no fieldIndex_ / classStruct side effects here.
+            // fix #2897 (§14.1 / §12 / §28.4, v0.240): resolve each slot under
+            // the substitution of the class that DECLARES it. With the flat
+            // name-keyed map, a base that REUSES a derived parameter's spelling
+            // for a different argument (`class Mid<T> : Base<string>`, `Base`'s
+            // parameter also `T`) measured the SAME i32 placeholder on both
+            // sides — the test concluded "identical ⇒ the erased template
+            // disposer is already right", and that disposer then read `owned
+            // cell` 8 bytes short of where the object (correct since #2897's
+            // allocation half) has it: `SEGV in __asan::Allocator::Deallocate`.
             auto baseFieldLayout = [&]() {
-                std::vector<const sema::Symbol*> storage;
-                collectInstanceStorage(base, storage);
-                std::vector<llvm::Type*> tys;
-                tys.reserve(storage.size());
-                for (const sema::Symbol* m : storage) tys.push_back(storageType(m));
-                return tys;
+                return instanceStorageTypes(base);
             };
             auto savedSubst = genericSubst_;
             auto savedSema = genericSubstSemaTy_;

@@ -1267,6 +1267,107 @@ bool Emitter::ancestorGenericSubstAdditions(
 }
 
 
+// fix #2897 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
+// §22.8 "Field initializers", v0.240). See the declaration comment in
+// LlvmBackend_impl.hpp.
+std::vector<const sema::TypeSymbol*> Emitter::instanceStorageOwners(
+        const sema::TypeSymbol* t, std::size_t n) {
+    // Default every slot to `t` itself, so a slot no level claims (which the
+    // prefix accounting below cannot produce, but a future change might) is
+    // resolved exactly as today rather than under some ancestor's map.
+    std::vector<const sema::TypeSymbol*> owners(n, t);
+    std::vector<const sema::TypeSymbol*> chain;
+    for (const sema::TypeSymbol* c = t; c; c = baseClassOf(c))
+        chain.push_back(c);
+    // Root-first: `collectInstanceStorage(L)` is L's ancestors' storage followed
+    // by L's own (§ prefix layout), so the slots it adds beyond the level above
+    // are exactly the ones L declares.
+    std::size_t prev = 0;
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        std::vector<const sema::Symbol*> s;
+        collectInstanceStorage(*it, s);
+        for (std::size_t i = prev; i < s.size() && i < n; ++i) owners[i] = *it;
+        prev = s.size();
+    }
+    return owners;
+}
+
+
+// fix #2897 (§14.1 / §12 / §22.8, v0.240). See the declaration comment in
+// LlvmBackend_impl.hpp.
+std::vector<llvm::Type*> Emitter::instanceStorageTypes(
+        const sema::TypeSymbol* t) {
+    std::vector<const sema::Symbol*> storage;
+    collectInstanceStorage(t, storage);
+    std::vector<llvm::Type*> tys(storage.size(), nullptr);
+    if (storage.empty()) return tys;
+    if (genericSubst_.empty()) {
+        for (std::size_t i = 0; i < storage.size(); ++i)
+            tys[i] = storageType(storage[i]);
+        return tys;
+    }
+    const std::vector<const sema::TypeSymbol*> owners =
+        instanceStorageOwners(t, storage.size());
+
+    // Phase 1: each generic ANCESTOR's OWN parameter bindings, resolved while the
+    // ACTIVE substitution is still installed — `computeAncestorGenericSubst`
+    // seeds a bare synthesized receiver out of it (#2889) and re-derives every
+    // level POSITIONALLY from the base clause, which is why a shared parameter
+    // spelling cannot confuse it. An ancestor it cannot resolve is left out and
+    // keeps the flat map, exactly as today.
+    std::vector<const sema::TypeSymbol*> ancs;
+    std::vector<std::unordered_map<std::string_view, llvm::Type*>> ancSubsts;
+    std::vector<std::unordered_map<std::string_view, const sema::TypeRef*>>
+        ancSemas;
+    sema::TypeRef synth;
+    synth.kind = sema::TypeRef::Kind::Named;
+    synth.declaration = const_cast<sema::TypeSymbol*>(t);
+    for (const sema::TypeSymbol* o : owners) {
+        if (!o || o == t || o->genericParams.empty()) continue;
+        bool seen = false;
+        for (const sema::TypeSymbol* a : ancs) if (a == o) { seen = true; break; }
+        if (seen) continue;
+        std::unordered_map<std::string_view, llvm::Type*> s;
+        std::unordered_map<std::string_view, const sema::TypeRef*> sm;
+        if (!computeAncestorGenericSubst(&synth, o, s, sm)) continue;
+        ancs.push_back(o);
+        ancSubsts.push_back(std::move(s));
+        ancSemas.push_back(std::move(sm));
+    }
+    if (ancs.empty()) {
+        for (std::size_t i = 0; i < storage.size(); ++i)
+            tys[i] = storageType(storage[i]);
+        return tys;
+    }
+
+    // Phase 2: each member under its declaring class's substitution. `installed`
+    // tracks which map is currently in place (ancs.size() == the caller's own),
+    // so the maps are copied only when the declaring class actually changes —
+    // storage is grouped by level, so that is once per level.
+    auto savedSubst = genericSubst_;
+    auto savedSema = genericSubstSemaTy_;
+    std::size_t installed = ancs.size();
+    for (std::size_t i = 0; i < storage.size(); ++i) {
+        std::size_t ai = ancs.size();
+        for (std::size_t k = 0; k < ancs.size(); ++k)
+            if (ancs[k] == owners[i]) { ai = k; break; }
+        if (ai != installed) {
+            if (ai == ancs.size()) {
+                genericSubst_ = savedSubst;
+                genericSubstSemaTy_ = savedSema;
+            } else {
+                genericSubst_ = ancSubsts[ai];
+                genericSubstSemaTy_ = ancSemas[ai];
+            }
+            installed = ai;
+        }
+        tys[i] = storageType(storage[i]);
+    }
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSema);
+    return tys;
+}
+
 
 // fix #2896 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
 // §22.8 "Field initializers", v0.240). See the declaration comment in
@@ -1279,21 +1380,13 @@ bool Emitter::ancestorGenericSubstAdditions(
 // for the inherited slots and the test wrongly concludes "identical".
 bool Emitter::instanceLayoutDiffersFromErasedTemplate(const sema::TypeSymbol* t) {
     if (!t || t->genericParams.empty() || genericSubst_.empty()) return false;
-    auto fieldLayout = [&]() {
-        std::vector<const sema::Symbol*> storage;
-        collectInstanceStorage(t, storage);
-        std::vector<llvm::Type*> tys;
-        tys.reserve(storage.size());
-        for (const sema::Symbol* m : storage) tys.push_back(storageType(m));
-        return tys;
-    };
     auto savedSubst = genericSubst_;
     auto savedSema = genericSubstSemaTy_;
     mergeAncestorGenericSubst(t);
-    std::vector<llvm::Type*> specLayout = fieldLayout();
+    std::vector<llvm::Type*> specLayout = instanceStorageTypes(t);
     genericSubst_.clear();
     genericSubstSemaTy_.clear();
-    std::vector<llvm::Type*> tmplLayout = fieldLayout();
+    std::vector<llvm::Type*> tmplLayout = instanceStorageTypes(t);
     genericSubst_ = std::move(savedSubst);
     genericSubstSemaTy_ = std::move(savedSema);
     return tmplLayout != specLayout;
@@ -1364,8 +1457,16 @@ llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
             specFieldTys.push_back(ptrTy());        // [4] ParamName
         }
         specFieldTys.push_back(disposedFlagTy());   // [1 or 5] disposed run-once flag
-        for (const sema::Symbol* m : storage)
-            specFieldTys.push_back(storageType(m));
+        // fix #2897 (§14.1 / §12 / §22.8, v0.240): resolve each slot under the
+        // substitution of the class that DECLARES it. The flat name-keyed map
+        // cannot hold two bindings of one spelling at once, so a base that reuses
+        // a derived parameter's name for a DIFFERENT argument
+        // (`class Coll<T> : Base<string>`, `Base`'s parameter also `T`) laid the
+        // inherited slot out at the DERIVED argument's width while `fieldAddr`'s
+        // inherited branch (correct since #2840) GEP'd the base's — an 8-byte
+        // store into a 4-byte slot, corrupting the field after it.
+        for (llvm::Type* fty : instanceStorageTypes(t))
+            specFieldTys.push_back(fty);
         // Cache lookup: specializedStructs_[t][specFieldTys] → existing
         auto& specMap = specializedStructs_[t];
         auto sit = specMap.find(specFieldTys);
