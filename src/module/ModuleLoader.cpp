@@ -2050,6 +2050,35 @@ static bool parseAndAttachFieldInit(
         if (astTy && ref) mainCtx.setResolvedType(astTy, ref);
     for (const auto& [expr, ref] : freshCtx.allExprTypes())
         if (expr && ref) mainCtx.setExprType(expr, ref);
+    // fix #2856 (§22.8 Field initializers / §27.3 Lambda expressions, v0.240):
+    // carry the initializer's per-lambda parameter lists too — the same table
+    // and the same one-line copy #2839 added to the method and ctor paths, and
+    // the last of the four reconstruction paths to lack it. §22.8 admits a
+    // lambda here verbatim: "Field initializers may reference: constants,
+    // literals, static members of any class, `new` expressions, lambdas that
+    // capture only the above, primary-constructor parameters (§22.10), and
+    // `typeof` expressions."
+    //
+    // codegen's lowerLambda reads `ctx_.lambdaParams(&lam)` to (a) build the
+    // closure function's user parameter type list and (b) bind each incoming
+    // argument to its ParameterSymbol in paramSlots_. With no entry it got
+    // null, declared the closure with ZERO user parameters, and the value was
+    // lost: `public static readonly Seed: int := (lambda(x: int) => x + 1)(6);`
+    // in an imported generic class read 0 in the importer and 7 as one module.
+    // §2.8.2 clause 2 is the rule broken: "An external instantiation behaves
+    // identically to a same-module instantiation of the same generic at the
+    // same arguments."
+    //
+    // Verbatim copy, exactly as for the two type tables above: the keys are the
+    // re-parsed ast::LambdaExpr nodes (unique to the fresh AST) and the values
+    // are fresh ParameterSymbols with no importer-side twin. The lifetime
+    // contract the copy needs is already in place — ownImportedAuxiliary below
+    // keeps the fresh context alive. (No ParameterSymbol ARM is needed in the
+    // remap loop above, unlike the ctor/method paths: this path's `else` branch
+    // already carries every other symbol kind verbatim (#2375), so a lambda
+    // parameter's exprSymbol binding was already crossing.)
+    for (const auto& [lam, syms] : freshCtx.allLambdaParams())
+        if (lam) mainCtx.setLambdaParams(lam, syms);
 
     // Attach: importedFs->decl now points at a live ast::FieldDecl whose
     // `initializer` genericInstSfinitFn's existing loop lowers and stores.

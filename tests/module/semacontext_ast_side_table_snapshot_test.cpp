@@ -61,7 +61,8 @@ const Entry kAstKeyedTables[] = {
     {"patternSymbols_",
      "CARRIED NOWHERE - reachable and broken, tracked by #2857"},
     {"lambdaParams_",
-     "CARRIED verbatim in method + ctor (#2839); field-init #2856, dtor #2855"},
+     "CARRIED verbatim in method + ctor (#2839) and field-init (#2856); "
+     "dtor still missing - #2855"},
     {"exprExtBindings_",
      "NOT carried, and proven UNREACHABLE: a body naming an extension method "
      "declines reconstruction at #783's gate before this table is consulted"},
