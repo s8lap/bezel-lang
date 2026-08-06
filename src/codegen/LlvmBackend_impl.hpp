@@ -5984,6 +5984,22 @@ private:
     // string, or nullptr if the receiver cannot be lowered.
     llvm::Value* lowerObjectToString(llvm::Value* recv);
 
+    // stdlib §3.1 / §8.5 / §18.5: `StringBuilder.ToString()` — concatenate the
+    // parts array into one fresh `%bz.string` (rc := 1, a `+1` the consumer
+    // discharges once). Shared by the direct call `sb.ToString()` and the
+    // interpolation hole `$"{sb}"` (#2923), which must not drift apart.
+    llvm::Value* emitStringBuilderToString(llvm::Value* sb);
+
+    // fix #2923 (spec §8.5 / §8.1 / §18.5 / §28.9, v0.240): render a receiver
+    // whose static type is a VTABLE-LESS BUILT-IN CLASS
+    // (common::isVtableLessBuiltinClassName) — the §8.5 class default (the
+    // type's name) unless the stdlib declares that built-in its own
+    // `ToString()`. Returns nullptr when `rt` is not such a type, so it chains
+    // ahead of `lowerObjectToString`, whose `bz_obj_is_string` premise these
+    // receivers violate. See the definition for the measured failure.
+    llvm::Value* emitVtablelessBuiltinToString(llvm::Value* val,
+                                               const sema::TypeRef* rt);
+
     // §9.6 (#946/#947/#948): emit (once) an Equals thunk `i1(ptr this, ptr other)`
     // for a CLASS — the user `Equals(Object?)` override if present (walking the
     // class chain), else the §8.3 reference-identity default (`this == other`).

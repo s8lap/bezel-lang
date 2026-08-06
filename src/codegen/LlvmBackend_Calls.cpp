@@ -6274,32 +6274,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* total = builder_.CreateLoad(i64(), sumSlot);
             return builder_.CreateTrunc(total, i32());
         }
-        if (m == "ToString" && call.args.empty()) {
-            // Use the runtime helper to concatenate all string parts.
-            auto* outDataSlot = entryAlloca(ptrTy());
-            auto* outLenSlot  = entryAlloca(i64());
-            auto* fn = declareC("bz_strbuilder_to_string",
-                                llvm::Type::getVoidTy(llvm_),
-                                {ptrTy(), ptrTy(), ptrTy()});
-            builder_.CreateCall(fn, {recv, outDataSlot, outLenSlot});
-            llvm::Value* data = builder_.CreateLoad(ptrTy(), outDataSlot);
-            llvm::Value* len  = builder_.CreateLoad(i64(), outLenSlot);
-            // Build a bz.string object from the malloc'd buffer.
-            // #422: allocate the full header size (now 32 bytes incl. rc), not
-            // a hardcoded 24 — writing rc into field 3 of a 24-byte block would
-            // overflow. getTypeAllocSize is the single source of truth.
-            uint64_t sobjSz = module_->getDataLayout().getTypeAllocSize(stringType());
-            auto* sobj = builder_.CreateCall(
-                callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)sobjSz)});
-            builder_.CreateStore(data,
-                builder_.CreateStructGEP(stringType(), sobj, 0));
-            builder_.CreateStore(len,
-                builder_.CreateStructGEP(stringType(), sobj, 1));
-            builder_.CreateStore(builder_.getInt8(1),
-                builder_.CreateStructGEP(stringType(), sobj, 2));
-            initStringRc(sobj);  // #422: producer's reference, rc := 1
-            return sobj;
-        }
+        // stdlib §3.1 / §8.5 / §18.5: `sb.ToString()` — the builder's OWN
+        // declared `ToString(): string`, not the §8.5 type-name default.
+        // fix #2923 (v0.240): the body moved to `emitStringBuilderToString` so
+        // the §18.5 interpolation hole `$"{sb}"` reaches the SAME lowering
+        // instead of a second, drifting spelling of it (interpolation used to
+        // reach `lowerObjectToString`, which mis-read the builder's parts array
+        // as a `%bz.string`).
+        if (m == "ToString" && call.args.empty())
+            return emitStringBuilderToString(recv);
     }
 
     return nullptr;  // not a collection call

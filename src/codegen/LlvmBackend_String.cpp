@@ -2595,6 +2595,96 @@ const sema::TypeRef* Emitter::recordMemberType(const sema::Symbol* m) {
     return nullptr;
 }
 
+// stdlib §3.1 / §8.5: `StringBuilder.ToString()` — concatenate the parts array
+// into ONE freshly malloc'd `%bz.string` with rc := 1 (a `+1` the consumer
+// discharges once). Factored out of the collection-call lowering by #2923 so
+// the direct call `sb.ToString()` and the §18.5 interpolation hole `$"{sb}"`
+// share one lowering instead of two hand-maintained spellings of stdlib §3.1's
+// declared member. // per stdlib §3.1 / §8.5 / §18.5
+llvm::Value* Emitter::emitStringBuilderToString(llvm::Value* sb) {
+    if (!sb || !sb->getType()->isPointerTy()) return nullptr;
+    // Use the runtime helper to concatenate all string parts.
+    auto* outDataSlot = entryAlloca(ptrTy());
+    auto* outLenSlot  = entryAlloca(i64());
+    auto* fn = declareC("bz_strbuilder_to_string",
+                        llvm::Type::getVoidTy(llvm_),
+                        {ptrTy(), ptrTy(), ptrTy()});
+    builder_.CreateCall(fn, {sb, outDataSlot, outLenSlot});
+    llvm::Value* data = builder_.CreateLoad(ptrTy(), outDataSlot);
+    llvm::Value* len  = builder_.CreateLoad(i64(), outLenSlot);
+    // Build a bz.string object from the malloc'd buffer.
+    // #422: allocate the full header size (now 32 bytes incl. rc), not
+    // a hardcoded 24 — writing rc into field 3 of a 24-byte block would
+    // overflow. getTypeAllocSize is the single source of truth.
+    uint64_t sobjSz = module_->getDataLayout().getTypeAllocSize(stringType());
+    auto* sobj = builder_.CreateCall(
+        callocFn(), {builder_.getInt64(1), builder_.getInt64((int64_t)sobjSz)});
+    builder_.CreateStore(data,
+        builder_.CreateStructGEP(stringType(), sobj, 0));
+    builder_.CreateStore(len,
+        builder_.CreateStructGEP(stringType(), sobj, 1));
+    builder_.CreateStore(builder_.getInt8(1),
+        builder_.CreateStructGEP(stringType(), sobj, 2));
+    initStringRc(sobj);  // #422: producer's reference, rc := 1
+    return sobj;
+}
+
+
+// fix #2923 (spec §8.5 / §8.1 / §18.5 / §28.9, v0.240): render a VTABLE-LESS
+// BUILT-IN CLASS receiver, i.e. one whose runtime value is a plain runtime C
+// struct (`bz_array_t*`, `bz_mutex_t*`, `bz_random_t*`, `bz_event_source_t*`,
+// …) with no Bezel object header. Returns null when `rt` is not such a type, so
+// callers can chain it ahead of their existing fallback.
+//
+// WHY THIS EXISTS. `lowerObjectToString`'s contract is that the dynamic value
+// is either a `%bz.string` or a vtable-bearing object; it separates the two
+// with `bz_obj_is_string`, which is a NEGATIVE test — "word 0 is not one of the
+// emitted vtables ⇒ it is a string" (bezel_runtime_refcounting.cpp). A built-in
+// class satisfies neither half of the premise: it has no vtable, so the test
+// answers "string", and the receiver is then read as a `%bz.string` (garbage
+// data/len/width) and — since #2846 made that arm RETAIN what it returns —
+// retained through the receiver's own bytes at the rc offset and RELEASED by
+// the consumer. MEASURED on f069645: `using var x := new Mutex();
+// Console.WriteLine($"val={x}")` printed `val=` and aborted with
+// "free(): double free detected in tcache 2" (exit 134); the same receiver
+// twice in one interpolation escalated to SIGSEGV; `new Random()` under ASan
+// gave a heap-buffer-overflow READ. Every built-in class receiver tested
+// reproduced some form of it — including `Array<int>` and `Dictionary<K,V>`,
+// which #2923's own scoping had classified as unaffected.
+//
+// WHAT IT RENDERS. §8.5's class bullet is unconditional — "For classes: the
+// type's qualified name" — so that is the answer for every one of them except
+// the two whose stdlib declaration DOES include a `ToString(): string` of its
+// own (`StringBuilder`, stdlib §3.1; `JsonSerializer`, stdlib §2.15 — the only
+// two among the pointer-shaped reserved built-in classes, checked against the
+// stdlib document). Those dispatch their own member instead, exactly as §18.5's
+// "A hole *without* a format spec formats via the value's ordinary
+// `ToString()`" requires. The type-name literal is a constant global with a
+// SENTINEL rc, so the caller's ordinary release of a rendered hole is a no-op
+// on it — the same discharge shape the user-class-without-override default
+// (`lowerStringLiteral(ts->name)`, just above `emitValueToString`'s tail)
+// already relies on.
+llvm::Value* Emitter::emitVtablelessBuiltinToString(llvm::Value* val,
+                                                    const sema::TypeRef* rt) {
+    if (!val || !val->getType()->isPointerTy()) return nullptr;
+    std::string_view bn = builtinTypeName(rt);
+    if (bn.empty() || !common::isVtableLessBuiltinClassName(bn)) return nullptr;
+    // stdlib §3.1: `StringBuilder` declares `public method ToString(): string`,
+    // so §8.5's type-name default does NOT apply to it — it renders its content.
+    if (bn == "StringBuilder") return emitStringBuilderToString(val);
+    // stdlib §2.15: `JsonSerializer` declares `public method ToString(): string`
+    // ("convenience: UTF-8 → string"), lowered to bz_jser_to_string by the §2.15
+    // instance-method handler (LlvmBackend_Serialization.cpp).
+    if (bn == "JsonSerializer")
+        return builder_.CreateCall(
+            declareC("bz_jser_to_string", ptrTy(), {ptrTy()}), {val},
+            "jser.str");
+    // §8.5: "For classes: the type's qualified name."
+    return lowerStringLiteral(std::string("\"") + std::string(bn) + "\"",
+                              false);
+}
+
+
 // Format a single field/element value of static type `fieldTy` as a string,
 // recursing for nested records (§9.1) and using each type's own ToString.
 llvm::Value* Emitter::emitValueToString(llvm::Value* val,
@@ -2817,6 +2907,21 @@ llvm::Value* Emitter::emitValueToString(llvm::Value* val,
         if (sit != genericSubstSemaTy_.end() && sit->second &&
             sit->second != fieldTy)
             return emitValueToString(val, sit->second);
+    }
+    // fix #2923 (spec §8.5 / §8.1 / §18.5 / §28.9, v0.240): a declaration-less
+    // Named ref is one of exactly two things — a RESERVED BUILT-IN or a generic
+    // type PARAMETER (common/BuiltinRegistry.hpp, `isReservedBuiltinTypeName`).
+    // The #1118 fallback directly below is written for the second ("an
+    // unresolved generic-T operand"), and its premise is FALSE for the first: a
+    // built-in class is not a heap object with a vtable, so handing it to
+    // `lowerObjectToString` makes `bz_obj_is_string` mis-answer "string" and the
+    // receiver is retained + released as one — the #2923 double free. Ask the
+    // built-in question FIRST; a generic-T operand is unaffected (its head is a
+    // type-parameter name, which is in no builtin table).
+    if (fieldTy && fieldTy->kind == K::Named && !fieldTy->declaration &&
+        val->getType()->isPointerTy()) {
+        if (llvm::Value* r = emitVtablelessBuiltinToString(val, fieldTy))
+            return r;
     }
     // §8.5 (#1118 fallback): an unresolved generic-T operand whose substitution
     // is unavailable but whose runtime value is a heap object (class/interface
