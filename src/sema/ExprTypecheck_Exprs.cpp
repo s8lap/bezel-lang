@@ -4792,14 +4792,46 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
         // Task<bool> through this path, which IS a Named Task type and is NOT
         // flagged; any unresolved / unknown type (ot == nullptr) is left
         // undiagnosed to avoid false positives.
-        if (ot) {
-            bool isTaskType = false;
-            if (ot->kind == TypeRef::Kind::Named && !ot->nullable &&
-                ot->astNode && ot->astNode->name &&
-                ot->astNode->name->parts.size() == 1) {
-                std::string_view head = ot->headName();
-                isTaskType = (head == "Task" || head == "OwningTask");
+        // fix #2822 (spec §30.2/§30.3/§2.5/§2.8.2, v0.240): recover the awaited
+        // type's head NAME without requiring an ast::Type node.
+        //
+        // Both blocks below used to gate on `ot->astNode && ot->astNode->name`,
+        // which is an AST-SHAPE test standing in for the question actually being
+        // asked — "is this named type spelled `Task` / `OwningTask`?". An
+        // IMPORTED type has NO AST node by construction (ModuleLoader builds its
+        // TypeRefs from metadata; there is no ast::Type to point at), so an
+        // imported `Task<int>` failed the guard and `await` on a legal
+        // cross-module async call was REJECTED:
+        //
+        //   app.bzl:5:14: `await` requires a `Task`, `Task<T>`, or
+        //   `OwningTask<T>` operand (§30.2 / §30.3).
+        //
+        // The identical program in ONE module compiles — a §2.8.2 clause 2
+        // divergence, and one that makes every imported `async` method
+        // unusable, since §30 gives no other way to consume a `Task<T>`.
+        //
+        // `TypeRef::headName()` already falls back to `importedName` for exactly
+        // this case (TypeRef.hpp), so the head is recoverable; only the
+        // precondition was wrong. This is the #2374 `astNode`-only gate family.
+        //
+        // The `parts.size() == 1` half is KEPT where an AST node exists — it
+        // rejects a QUALIFIED spelling (`Foo.Task`), which must not be taken for
+        // the builtin. For an imported ref the metadata's name is already the
+        // bare head, so a non-empty `importedName` is the equivalent condition.
+        // One definition, used by both blocks, so they cannot drift the way
+        // these two mirrors already had.
+        auto awaitedTaskHead = [](const TypeRef* t) -> std::string_view {
+            if (!t || t->kind != TypeRef::Kind::Named || t->nullable) return {};
+            if (t->astNode && t->astNode->name) {
+                if (t->astNode->name->parts.size() != 1) return {};
+            } else if (t->importedName.empty()) {
+                return {};
             }
+            return t->headName();
+        };
+        if (ot) {
+            std::string_view head = awaitedTaskHead(ot);
+            bool isTaskType = (head == "Task" || head == "OwningTask");
             if (!isTaskType) {
                 ctx_.diagnostics().report(
                     Severity::Error, ue.span.begin,
@@ -4808,10 +4840,11 @@ void ExprTC::typeUnary(const ast::UnaryExpr& ue) {
                 return;
             }
         }
-        if (ot && ot->kind == TypeRef::Kind::Named && !ot->nullable &&
-            ot->astNode && ot->astNode->name &&
-            ot->astNode->name->parts.size() == 1) {
-            std::string_view head = ot->headName();
+        // Same predicate as the guard above — see its comment. Sharing it is the
+        // point: when these were two copies, lifting only the rejection would
+        // have left the await UNTYPED rather than typed, which is a silent wrong
+        // value in place of a loud reject.
+        if (std::string_view head = awaitedTaskHead(ot); !head.empty()) {
             if (head == "Task") {
                 if (ot->genericArgs.empty()) {
                     // `await Task` → unit (no result value).
