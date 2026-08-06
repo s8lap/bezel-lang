@@ -8175,6 +8175,37 @@ void Emitter::applyMethodGenericSubst(const ast::CallExpr& call,
     }
 }
 
+// §14.1 / §2.5 (fix #711): a type's generic PARAMETER NAMES, from whichever
+// source exists — the AST decl for a locally-declared type, the TypeSymbol
+// (built by ModuleLoader::convertGenericParams) for an IMPORTED one, which has
+// no ast::TypeDecl at all. Hoisted out of computeAncestorGenericSubst so #2896's
+// descendant walk reads the names the same way rather than re-deriving them.
+static std::vector<std::string_view> genericParamNamesOf(
+        const sema::TypeSymbol* ts) {
+    std::vector<std::string_view> names;
+    if (!ts) return names;
+    if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl)) {
+        names.reserve(td->genericParams.size());
+        for (const auto& gp : td->genericParams) names.push_back(gp.name);
+        return names;
+    }
+    names.reserve(ts->genericParams.size());
+    for (const sema::Symbol* gp : ts->genericParams)
+        if (gp) names.push_back(gp->name);
+    return names;
+}
+
+// §14.1 / §2.5 (fix #711): is `arg` a BARE generic-parameter reference (as
+// opposed to a concrete or constructed type)? Locally that is a single-part
+// Named ref with no declaration; an IMPORTED base ref has no astNode at all and
+// carries the name on `importedName` (ModuleLoader::convert, §2.5/#495).
+static bool isBareTypeParamRef(const sema::TypeRef* arg) {
+    return arg && arg->kind == sema::TypeRef::Kind::Named && !arg->declaration &&
+           ((arg->astNode && arg->astNode->name &&
+             arg->astNode->name->parts.size() == 1) ||
+            (!arg->astNode && !arg->importedName.empty()));
+}
+
 // §12 / §14 (issue #585): see the header comment in LlvmBackend_impl.hpp. Walk
 // the base-class chain from `recvTy`'s declaration up to `ancestor`, resolving
 // each level's base type-arguments through the level below, then fill the
@@ -8199,19 +8230,7 @@ bool Emitter::computeAncestorGenericSubst(
     // `Box<string> : Container<string>` (both imported), so the inherited base
     // field `item` was read through the unspecialized T→i32 `%class.Container`
     // template layout — `b.item.Length` loaded padding and returned 0.
-    auto genericParamNames =
-        [](const sema::TypeSymbol* ts) -> std::vector<std::string_view> {
-        std::vector<std::string_view> names;
-        if (auto* td = dynamic_cast<const ast::TypeDecl*>(ts->decl)) {
-            names.reserve(td->genericParams.size());
-            for (const auto& gp : td->genericParams) names.push_back(gp.name);
-            return names;
-        }
-        names.reserve(ts->genericParams.size());
-        for (const sema::Symbol* gp : ts->genericParams)
-            if (gp) names.push_back(gp->name);
-        return names;
-    };
+    const auto& genericParamNames = genericParamNamesOf;
 
     // curArgs: the concrete TypeRefs bound to `cur`'s generic params at this
     // level. Seeded from the receiver's own generic args, then re-derived for
@@ -8304,13 +8323,7 @@ bool Emitter::computeAncestorGenericSubst(
                 // bound T to the bare-param ref and lowerTypeRef produced the
                 // i32 placeholder — a specialized-looking `Container$specN`
                 // with the WRONG (template) field layout.
-                const bool bareParam =
-                    arg && arg->kind == sema::TypeRef::Kind::Named &&
-                    !arg->declaration &&
-                    ((arg->astNode && arg->astNode->name &&
-                      arg->astNode->name->parts.size() == 1) ||
-                     (!arg->astNode && !arg->importedName.empty()));
-                if (bareParam) {
+                if (isBareTypeParamRef(arg)) {
                     auto it = curArgs.find(arg->headName());
                     if (it != curArgs.end()) arg = it->second;
                 }
@@ -8329,6 +8342,96 @@ bool Emitter::computeAncestorGenericSubst(
         outSema[gp->name] = it->second;
     }
     return !outSubst.empty();
+}
+
+
+// fix #2896 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
+// §12.9, v0.240). See the declaration comment in LlvmBackend_impl.hpp.
+//
+// THE OPPOSITE DIRECTION from computeAncestorGenericSubst, and it is opposite in
+// a way that matters. That helper propagates a DERIVED class's known arguments
+// UP to an ancestor — always possible, because a base clause spells the base's
+// arguments in the derived class's own parameters. Here the receiver's STATIC
+// type is the ancestor (`g: GBase<string>`) and the candidate whose descriptor a
+// dynamic dispatch must compare against is a DERIVED class, so the same relation
+// has to be INVERTED. That is solvable only when every one of the derived
+// class's parameters occurs as a BARE parameter among the arguments it passes up
+// the chain: `class DGen<U> : GBase<U>` pins `U = string`, while
+// `class D2<U> : GBase<string>` and `class D3<U> : GBase<Wrap<U>>` leave `U`
+// genuinely undetermined — a `GBase<string>` really can hold a `D2<int>` and a
+// `D2<double>` at once.
+//
+// So: prove every parameter at every level, or return false. The caller
+// (emitVirtualGenericDispatch) then abandons the whole dispatch rather than
+// emitting a comparison it cannot make correct.
+bool Emitter::deriveDescendantGenericSubst(
+        const sema::TypeSymbol* ancestor, const sema::TypeSymbol* descendant,
+        std::vector<DescendantLevelSubst>& outLevels) {
+    if (!ancestor || !descendant || ancestor == descendant) return false;
+    // The chain descendant → … → ancestor, then reversed so it is walked from
+    // the ancestor's immediate child downward (each level's bindings feed the
+    // next).
+    std::vector<const sema::TypeSymbol*> chain;
+    const sema::TypeSymbol* t = descendant;
+    for (; t && t != ancestor; t = baseClassOf(t)) chain.push_back(t);
+    if (t != ancestor) return false;  // not on the class base chain
+    std::reverse(chain.begin(), chain.end());
+
+    // Seed: the ancestor's own parameters, as the ACTIVE substitution binds them
+    // (the call site installed exactly those — see emitMethodCall's receiver
+    // block). A parameter the active map does not bind is not derivable.
+    std::unordered_map<std::string_view, const sema::TypeRef*> known;
+    for (std::string_view pn : genericParamNamesOf(ancestor)) {
+        auto it = genericSubstSemaTy_.find(pn);
+        if (it == genericSubstSemaTy_.end() || !it->second) return false;
+        known[pn] = it->second;
+    }
+
+    const sema::TypeSymbol* above = ancestor;
+    for (const sema::TypeSymbol* level : chain) {
+        std::unordered_map<std::string_view, const sema::TypeRef*> bound;
+        const std::vector<std::string_view> aboveParams =
+            genericParamNamesOf(above);
+        if (!aboveParams.empty()) {
+            // The base clause `level : above<args…>`, whose arguments are
+            // written in `level`'s own parameter names.
+            const sema::TypeRef* baseRef = nullptr;
+            for (std::size_t bi = 0; bi < level->baseTypes.size(); ++bi)
+                if (level->baseTypes[bi] == above) {
+                    baseRef = (bi < level->baseTypeRefs.size())
+                                  ? level->baseTypeRefs[bi] : nullptr;
+                    break;
+                }
+            if (!baseRef || baseRef->genericArgs.size() != aboveParams.size())
+                return false;
+            for (std::size_t gi = 0; gi < aboveParams.size(); ++gi) {
+                const sema::TypeRef* arg = baseRef->genericArgs[gi];
+                if (!isBareTypeParamRef(arg)) continue;  // nothing to invert
+                auto kit = known.find(aboveParams[gi]);
+                if (kit == known.end() || !kit->second) return false;
+                // One parameter passed to two positions (`class D<U> : B<U, U>`)
+                // must receive the SAME argument at both, or this candidate
+                // cannot be the receiver's dynamic type at all — refuse rather
+                // than keep whichever assignment came last.
+                auto prevIt = bound.find(arg->headName());
+                if (prevIt != bound.end() && prevIt->second != kit->second &&
+                    typeRefIdentityKey(prevIt->second) !=
+                        typeRefIdentityKey(kit->second))
+                    return false;
+                bound[arg->headName()] = kit->second;
+            }
+        }
+        // Every parameter this level declares must now be pinned; a level that
+        // declares none is trivially satisfied (a non-generic intermediate link).
+        for (std::string_view pn : genericParamNamesOf(level)) {
+            auto bit = bound.find(pn);
+            if (bit == bound.end() || !bit->second) return false;
+        }
+        outLevels.push_back({level, bound});
+        known = std::move(bound);
+        above = level;
+    }
+    return true;
 }
 
 
@@ -8610,6 +8713,43 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             if (md && !md->genericParams.empty())
                 for (const auto& gp : md->genericParams)
                     if (genericSubst_.count(gp.name)) { genericMethodBound = true; break; }
+            // fix #2896 (§14.1 / §12 / §12.1 / §22.8, v0.240): the SECOND reason
+            // the fixed vtable/itable slot cannot be used — the slot's function
+            // was compiled against the PARENT's erased template LAYOUT. A
+            // `virtual`/`override` method on ANY generic class hits this with no
+            // inheritance and no method-level `<T>` at all: `Show(): int` lowers
+            // to `(ptr) -> i32` under EVERY substitution, so the signature test
+            // ~30 lines below (and the `genericMethodBound` test just above)
+            // both see "nothing to specialize" and the call lands in
+            // `bz$<Class>$Show`, the template — which GEPs `classStruct(parent)`
+            // at the T→i32 placeholder offsets while the object was allocated at
+            // the instantiation's (correct since #617/#1101-B/#2840/#2889).
+            // Measured: `SEGV on unknown address 0xc` reading an `owned cell:
+            // Cell` field that the template places at offset 12 and the object
+            // has at 24. Signatures are simply the wrong question: the two bodies
+            // differ in LAYOUT, and the NON-virtual twin further down already
+            // says so in as many words ("we must specialize the call — even for
+            // methods with non-generic param/return types (like `Size(): int`),
+            // because the struct layout changes ...").
+            //
+            // Ask #2019's layout-identity question instead — the property the
+            // call actually needs, not an enumeration of method shapes. It is
+            // false for `T = int` and for every generic parent whose storage
+            // sequence does not move under the substitution, so those keep
+            // today's vtable path unchanged.
+            //
+            // NOT `emitInlineGenericMethod` (the non-virtual twin's vehicle):
+            // `canDispatch` is true here, so the receiver's dynamic type may be a
+            // derived override and inlining `ms`'s own body would devirtualize —
+            // the wrong body. `emitVirtualGenericDispatch` (#580) is the vehicle
+            // that keeps the dynamic dispatch: it monomorphizes per (class, type
+            // argument) and selects by the receiver's runtime descriptor. It
+            // returns null rather than guessing whenever it cannot prove a
+            // dispatch, and control then falls through to exactly today's path.
+            if (!genericMethodBound && ms->parent &&
+                ms->parent->kind == ast::TypeDeclKind::Class &&
+                instanceLayoutDiffersFromErasedTemplate(ms->parent))
+                genericMethodBound = true;
             if (genericMethodBound) {
                 llvm::Value* r = emitVirtualGenericDispatch(ms, args);
                 if (r != nullptr || diverged_) {
@@ -9780,7 +9920,25 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // Candidate classes whose instances could reach this call: subclasses (class
     // parent) or implementers (interface parent), each paired with the
     // implementation it runs.
-    struct Branch { const sema::TypeSymbol* cls; sema::MethodSymbol* impl; };
+    //
+    // fix #2896 (§12.9 "Type identity", v0.240): `desc`/`subst` carry what a
+    // GENERIC candidate needs and the shared, declaration-level `descArray_[c]`
+    // cannot supply. A `DGen<string>` object's vtable slot 0 holds
+    // `td$DGen_string` — its PER-INSTANTIATION descriptor (#1843) — so a
+    // comparison against `td$H.DGen` is never equal and the candidate silently
+    // loses to the default branch. Left alone that turns #2896's crash into a
+    // WRONG VALUE for `var g: GBase<string> := <a DGen<string>>; g.Show()`, which
+    // is strictly worse. `subst` is the candidate's own parameter binding, needed
+    // because the override's body is written in the candidate's parameter names
+    // while the active substitution is keyed by the static type's.
+    struct Branch {
+        const sema::TypeSymbol* cls;
+        sema::MethodSymbol* impl;
+        llvm::Constant* desc = nullptr;  // #2896: null → descArray_[cls]
+        std::unordered_map<std::string_view, llvm::Type*> substLlvm;
+        std::unordered_map<std::string_view, const sema::TypeRef*> substSema;
+        bool hasSubst = false;
+    };
     std::vector<Branch> branches;
     sema::MethodSymbol* defaultImpl = nullptr;
 
@@ -9798,7 +9956,57 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
             if (!descArray_.count(c)) continue;
             sema::MethodSymbol* impl = mostDerived(c);
             if (!impl || impl == defaultImpl) continue;  // inherits the default
-            branches.push_back({c, impl});
+            Branch b{c, impl};
+            // fix #2896: does any link strictly below `staticType` declare type
+            // parameters? If so this candidate's descriptor and its override's
+            // body are both per-instantiation, and neither is derivable from the
+            // ancestor-keyed active substitution without inverting the chain.
+            bool genericBelow = false;
+            for (const sema::TypeSymbol* t2 = c; t2 && t2 != staticType;
+                 t2 = baseClassOf(t2))
+                if (!t2->genericParams.empty()) { genericBelow = true; break; }
+            if (genericBelow) {
+                std::vector<DescendantLevelSubst> levels;
+                if (!deriveDescendantGenericSubst(staticType, c, levels))
+                    return nullptr;  // undeterminable — abandon the dispatch
+                if (!c->genericParams.empty()) {
+                    // §12.9: name the candidate's own instantiation, exactly as
+                    // the `new` site minted it and as `is Box<int>` resolves it.
+                    std::vector<const sema::TypeRef*> cArgs;
+                    const auto& own = levels.back().args;
+                    for (std::string_view pn : genericParamNamesOf(c)) {
+                        auto ait = own.find(pn);
+                        if (ait == own.end() || !ait->second) return nullptr;
+                        cArgs.push_back(ait->second);
+                    }
+                    llvm::GlobalVariable* pid = instanceDescriptorFor(c, cArgs);
+                    auto dit = descArray_.find(c);
+                    llvm::GlobalVariable* shared =
+                        dit != descArray_.end() ? dit->second : nullptr;
+                    // A fallback to the shared descriptor (a runtime-erased
+                    // argument, §19.6/#2012) cannot distinguish instantiations —
+                    // abandon rather than emit a comparison that could match the
+                    // wrong one.
+                    if (!pid || pid == shared) return nullptr;
+                    b.desc = pid;
+                }
+                // The override's body belongs to whichever level DECLARES it;
+                // compile it under that level's own parameter names.
+                for (const auto& lv : levels) {
+                    if (lv.cls != impl->parent) continue;
+                    for (const auto& [nm, tr] : lv.args) {
+                        b.substLlvm[nm] = lowerTypeRef(tr);
+                        b.substSema[nm] = tr;
+                    }
+                    b.hasSubst = true;
+                    break;
+                }
+                if (!b.hasSubst && !impl->parent->genericParams.empty() &&
+                    impl->parent != staticType &&
+                    !isSubclassOf(staticType, impl->parent))
+                    return nullptr;  // generic declarer we could not bind
+            }
+            branches.push_back(std::move(b));
         }
     } else {
         // INTERFACE parent: there is no instantiable static type, so every
@@ -9827,7 +10035,8 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // Base::Show<T> and Derived::Show<U> may name the parameter differently; the
     // substitution we built keys on the static method's names, so positionally
     // remap to the override's names before building its specialization.
-    auto specForImpl = [&](sema::MethodSymbol* impl) -> llvm::Function* {
+    auto specForImpl = [&](sema::MethodSymbol* impl,
+                           const Branch* br = nullptr) -> llvm::Function* {
         CallableInfo ci;
         if (!callableInfo(impl, ci)) return nullptr;
         auto* implMd = dynamic_cast<const ast::MethodDecl*>(impl->decl);
@@ -9836,6 +10045,15 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
         for (auto* a : args) paramTys.push_back(a->getType());
         auto savedSubst = genericSubst_;
         auto savedSema = genericSubstSemaTy_;
+        // fix #2896: a candidate whose override is declared on a GENERIC class
+        // below the static type must be compiled under THAT class's parameter
+        // names — the active substitution is keyed by the static type's, so
+        // `class DGen<U> : GBase<T=…>` left `U` unbound and the body fell back
+        // to the erased placeholder layout for every `U`-typed slot.
+        if (br && br->hasSubst) {
+            genericSubst_ = br->substLlvm;
+            genericSubstSemaTy_ = br->substSema;
+        }
         if (implMd && implMd->genericParams.size() ==
                           staticMd->genericParams.size() &&
             !implMd->genericParams.empty()) {
@@ -9862,12 +10080,27 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     // none is emitted inline into the current block.
     llvm::Function* defFn = specForImpl(defaultImpl);
     if (!defFn) return nullptr;
-    std::vector<std::pair<const sema::TypeSymbol*, llvm::Function*>> brFns;
+    // fix #2896: carry the descriptor CONSTANT, not the class — for a generic
+    // candidate it is the per-instantiation global, not `descArray_[cls]`.
+    std::vector<std::pair<llvm::Constant*, llvm::Function*>> brFns;
     for (auto& b : branches) {
-        llvm::Function* f = specForImpl(b.impl);
+        llvm::Function* f = specForImpl(b.impl, &b);
         if (!f) return nullptr;
-        brFns.push_back({b.cls, f});
+        llvm::Constant* desc = b.desc;
+        if (!desc) {
+            auto dit = descArray_.find(b.cls);
+            if (dit == descArray_.end()) return nullptr;
+            desc = dit->second;
+        }
+        brFns.push_back({desc, f});
     }
+    // fix #2896: every branch must agree with the default on the CALL SHAPE, or
+    // the phi below is ill-typed. Checked here — before a single instruction has
+    // been emitted into the current block — so a disagreement is a clean bail to
+    // the caller's existing path rather than half an emitted dispatch.
+    for (std::size_t i = 0; i < brFns.size(); ++i)
+        if (brFns[i].second->getFunctionType() != defFn->getFunctionType())
+            return nullptr;
 
     // Common case: no subclass overrides differently — a direct call to the
     // single specialization is correct (the dynamic type always most-derives it).
@@ -9896,8 +10129,7 @@ llvm::Value* Emitter::emitVirtualGenericDispatch(sema::MethodSymbol* ms,
     std::vector<std::pair<llvm::Value*, llvm::BasicBlock*>> incoming;
 
     for (std::size_t i = 0; i < brFns.size(); ++i) {
-        llvm::Value* desc = descArray_[brFns[i].first];
-        llvm::Value* eq = builder_.CreateICmpEQ(td, desc, "vgen.is");
+        llvm::Value* eq = builder_.CreateICmpEQ(td, brFns[i].first, "vgen.is");
         llvm::BasicBlock* thenBB =
             llvm::BasicBlock::Create(llvm_, "vgen.case", currentFn_);
         llvm::BasicBlock* nextBB =

@@ -4455,6 +4455,23 @@ private:
         std::unordered_map<std::string_view, llvm::Type*>& addSubst,
         std::unordered_map<std::string_view, const sema::TypeRef*>& addSema);
 
+    // fix #2896 (§14.1 / §12 / §22.8, v0.240): #2019's layout-identity question,
+    // asked about `t` under the ACTIVE substitution. True when `t`'s instance-
+    // storage LLVM-type sequence under the active substitution DIFFERS from the
+    // sequence under the empty (erased placeholder) one — i.e. when the shared
+    // template body compiled for `t` GEPs offsets this instantiation's objects do
+    // not have. False when no substitution is active, when `t` is not generic, or
+    // when the two sequences agree (`T = int`, and every generic class with no
+    // parameter-typed storage), so those keep whatever path they take today.
+    //
+    // Same predicate `emitBaseDisposeChain` (#2019) and
+    // `emitSpecializedImplicitBaseCtor` (#2882 obligation 3) already spell, but
+    // asked about the class itself rather than about a base: identical field
+    // types ⇒ identical offsets, and `llvm::Type*` are context-unique so `==` on
+    // the vectors is structural. `collectInstanceStorage`/`storageType` only READ
+    // the substitution, so measuring both sequences has no emission consequences.
+    bool instanceLayoutDiffersFromErasedTemplate(const sema::TypeSymbol* t);
+
     // fix #2889: install what `ancestorGenericSubstAdditions` proves into the
     // ACTIVE substitution, for callers that hold a substitution for `t` across
     // more than a single layout query (the §22.8 construction sequence, the
@@ -11671,6 +11688,36 @@ private:
         const sema::TypeRef* recvTy, const sema::TypeSymbol* ancestor,
         std::unordered_map<std::string_view, llvm::Type*>& outSubst,
         std::unordered_map<std::string_view, const sema::TypeRef*>& outSema);
+
+    // fix #2896 (§14.1 / §12 / §12.9, v0.240): one level of the descendant walk
+    // — a class on the chain and the concrete TypeRef bound to each of ITS OWN
+    // generic parameters.
+    struct DescendantLevelSubst {
+        const sema::TypeSymbol* cls;
+        std::unordered_map<std::string_view, const sema::TypeRef*> args;
+    };
+
+    // fix #2896: the INVERSE of computeAncestorGenericSubst — given the ACTIVE
+    // substitution's bindings for `ancestor`'s parameters, derive the bindings
+    // for every class on the chain from `ancestor`'s immediate child down to
+    // `descendant` (in that order, one entry per level, non-generic levels
+    // carrying an empty map).
+    //
+    // A dynamic dispatch off a receiver whose STATIC type is a generic ancestor
+    // (`g: GBase<string>` holding a `DGen<string>`) has to name the candidate's
+    // per-instantiation runtime descriptor (§12.9) and compile the candidate's
+    // override under the candidate's OWN parameter names — neither of which the
+    // ancestor-keyed active substitution supplies.
+    //
+    // Inversion is only sound when each level's parameters all appear as BARE
+    // parameters in the arguments it passes to the level above. Returns false —
+    // leaving the caller to abandon the dispatch rather than guess — for
+    // `class D<U> : B<string>`, `class D<U> : B<Wrap<U>>`, a level whose base
+    // clause carries no usable TypeRef, or an `ancestor` parameter the active
+    // substitution does not bind.
+    bool deriveDescendantGenericSubst(
+        const sema::TypeSymbol* ancestor, const sema::TypeSymbol* descendant,
+        std::vector<DescendantLevelSubst>& outLevels);
 
     // CG-generic: compile a specialized version of a block-body method with
     // the current genericSubst_ applied to all types.  The specialized

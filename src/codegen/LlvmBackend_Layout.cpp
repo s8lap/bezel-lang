@@ -1267,6 +1267,39 @@ bool Emitter::ancestorGenericSubstAdditions(
 }
 
 
+
+// fix #2896 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
+// §22.8 "Field initializers", v0.240). See the declaration comment in
+// LlvmBackend_impl.hpp.
+//
+// The active substitution is composed with whatever `t` inherits from a generic
+// ancestor before the comparison (`mergeAncestorGenericSubst`, #2889) for the
+// same reason `emitBaseDisposeChain` does it: without that, a generic derived
+// class over a generic base measures the SAME erased placeholder on both sides
+// for the inherited slots and the test wrongly concludes "identical".
+bool Emitter::instanceLayoutDiffersFromErasedTemplate(const sema::TypeSymbol* t) {
+    if (!t || t->genericParams.empty() || genericSubst_.empty()) return false;
+    auto fieldLayout = [&]() {
+        std::vector<const sema::Symbol*> storage;
+        collectInstanceStorage(t, storage);
+        std::vector<llvm::Type*> tys;
+        tys.reserve(storage.size());
+        for (const sema::Symbol* m : storage) tys.push_back(storageType(m));
+        return tys;
+    };
+    auto savedSubst = genericSubst_;
+    auto savedSema = genericSubstSemaTy_;
+    mergeAncestorGenericSubst(t);
+    std::vector<llvm::Type*> specLayout = fieldLayout();
+    genericSubst_.clear();
+    genericSubstSemaTy_.clear();
+    std::vector<llvm::Type*> tmplLayout = fieldLayout();
+    genericSubst_ = std::move(savedSubst);
+    genericSubstSemaTy_ = std::move(savedSema);
+    return tmplLayout != specLayout;
+}
+
+
 llvm::StructType* Emitter::classStruct(const sema::TypeSymbol* t) {
     // CG29: a record has no vtable header; route to recordStruct so every
     // classStruct caller (field access, etc.) gets the right layout.
