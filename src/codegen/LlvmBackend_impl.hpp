@@ -5927,6 +5927,31 @@ private:
     // qualified name"). Returned as a Constant for the class vtable's slot 3.
     llvm::Constant* classToStringThunk(const sema::TypeSymbol* ts);
 
+    // fix #2947 (§8.5 / §8.3 / §12 / §14.1 / §2.8.3 rule 4, v0.240): the user
+    // override each FIXED Object slot (3 = ToString, 4 = Equals, 5 =
+    // GetHashCode) forwards to, and the body emitters that build a thunk around
+    // an EXPLICIT target function.
+    //
+    // WHY BOTH HALVES ARE FACTORED OUT of the three thunk builders. The thunk in
+    // slot N is a trivial forwarder to `methodFns_[user]` — the SHARED, erased
+    // `T -> i32` template body. `specializedVtableFor` must be able to put a
+    // per-instantiation body in a per-instantiation slot (#2906 for a virtual
+    // method, #2928 for an accessor), and to decide that it must ask exactly the
+    // question the slot's own content answers. A re-derived second walk is this
+    // family's recurring failure shape; one walk with two callers cannot drift,
+    // and one body emitter means the Equals i1-coercion and the GetHashCode
+    // width coercion cannot diverge between the template and the specialization.
+    sema::MethodSymbol* classSlotToStringImpl(const sema::TypeSymbol* ts) const;
+    sema::MethodSymbol* classSlotEqualsImpl(const sema::TypeSymbol* ts) const;
+    sema::MethodSymbol* classSlotHashCodeImpl(const sema::TypeSymbol* ts) const;
+    void emitClassToStringThunkBody(const sema::TypeSymbol* ts,
+                                    llvm::Function* thunk,
+                                    llvm::Function* target);
+    void emitClassEqualsThunkBody(llvm::Function* thunk,
+                                  llvm::Function* target);
+    void emitClassHashCodeThunkBody(llvm::Function* thunk,
+                                    llvm::Function* target);
+
     // §8.5 / §8.6 (#417): emit (once) a ToString thunk `ptr(ptr boxPtr)` for a
     // boxed RECORD or boxed ENUM. The thunk GEPs past the box header (vtable +
     // rc, two words) to the payload, then builds the §8.5/§9.1/§9.2 string:

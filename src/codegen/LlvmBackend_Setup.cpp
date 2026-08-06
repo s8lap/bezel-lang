@@ -5857,8 +5857,94 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     }
     const bool needsSpecAccessors = !accessorSlotsToSpec.empty();
 
+    // fix #2947 (§8.5 "ToString" / §8.3 "`Equals` and `GetHashCode`" / §12
+    // "Inheritance and Dispatch" / §14.1 "Generic declarations" / §2.8.3 rule 4,
+    // v0.240): condition (e) — the FIXED Object slots 3/4/5. (c) closed the
+    // virtual METHOD slots and (d) the virtual PROPERTY/INDEXER accessor slots;
+    // these three were the last members of the family still copied through
+    // verbatim from the shared vtable. Each holds a thunk that calls
+    // `methodFns_[user]` — the ERASED `T -> i32` TEMPLATE body — non-virtually,
+    // so a per-instantiation vtable whose objects have the COMPOSED layout still
+    // GEP'd the placeholder offsets. All three arms MEASURED on the fix's
+    // parent, none inferred:
+    //
+    //     SEGV @0x0c in bz$H.GBase$ToString      <- bz$tostr$GBase   (slot 3)
+    //     SEGV @0x0c in bz$H3.GBase$Equals       <- bz$eq$GBase      (slot 4)
+    //     SEGV @0x0c in bz$H2.GBase$GetHashCode  <- bz$hash$GBase    (slot 5)
+    //
+    // THIS SLOT PREFIX IS NOT A NICHE PATH, which is why it is worth its own
+    // condition: §8.5 — "`ToString` is invoked implicitly inside string
+    // interpolation (§18.5) via virtual dispatch" — puts slot 3 on the path of
+    // every `Object`-typed `.ToString()` AND of an interpolation hole that
+    // dispatches, with no explicit call in the source; §8.3's
+    // `Equals`/`GetHashCode` are what a hashed collection dispatches to on a
+    // key. (MEASURED CORRECTION to #2947's own text, which claims "every string
+    // interpolation of a class-typed value": a CONCRETE-typed hole resolves the
+    // override statically and emits a direct call, so it never reads this slot
+    // and was already correct. The test file pins both arms.)
+    //
+    // THE QUESTION IS (c)'s PROPERTY, asked about the class that DECLARES the
+    // user override — `instanceLayoutDiffersFromErasedTemplate(user->parent)` —
+    // because that is the class whose `classStruct` the forwarded-to body GEPs.
+    // False for a non-generic declarer, at `T = int`, and for every generic
+    // class whose storage sequence does not move; all of those keep the shared
+    // thunk with no behaviour change. A class with NO user override never
+    // reaches here at all: its thunk is the §8.5/§8.3 compiler-generated default
+    // (type name / reference identity / identity hash), which reads no field and
+    // therefore has no layout to be wrong about.
+    //
+    // Collection is deliberately SIDE-EFFECT-FREE (map lookups and pure
+    // predicates), for #2906's reason: nothing may emit a body before the
+    // specialized vtable global is registered below.
+    struct ObjectSlotSpec {
+        unsigned slot;
+        sema::MethodSymbol* user;
+    };
+    std::vector<ObjectSlotSpec> objectSlotsToSpec;
+    {
+        auto* sharedInitPeek =
+            llvm::dyn_cast<llvm::ConstantArray>(shared->getInitializer());
+        unsigned nElems =
+            sharedInitPeek
+                ? llvm::cast<llvm::ArrayType>(shared->getValueType())
+                      ->getNumElements()
+                : 0u;
+        auto consider =
+            [&](unsigned slot,
+                const std::unordered_map<const sema::TypeSymbol*,
+                                         llvm::Function*>& templateThunks,
+                sema::MethodSymbol* user) {
+                if (!sharedInitPeek || slot >= nElems) return;
+                if (!user || !user->parent) return;
+                // Only a slot that still holds the shared TEMPLATE thunk is ours
+                // to replace (the #2906/#2928 guard). A PURE lookup — the thunk
+                // builders are body emissions and must not run here.
+                auto tit = templateThunks.find(ts);
+                if (tit == templateThunks.end() || !tit->second) return;
+                if (sharedInitPeek->getAggregateElement(slot) !=
+                    llvm::cast<llvm::Constant>(tit->second))
+                    return;
+                auto mit = methodFns_.find(user);
+                if (mit == methodFns_.end() || !mit->second) return;
+                if (!instanceLayoutDiffersFromErasedTemplate(user->parent))
+                    return;
+                // The thunk calls the user body with the slot's own fixed
+                // arguments, so a specialization whose SIGNATURE moves under the
+                // substitution cannot be forwarded to. Refuse — keeping today's
+                // content — rather than emit a mistyped call (#2906's guard).
+                llvm::FunctionType* concFnTy = methodFnType(user);
+                if (!concFnTy || concFnTy != mit->second->getFunctionType())
+                    return;
+                objectSlotsToSpec.push_back({slot, user});
+            };
+        consider(kToStringSlot, classToStringFns_, classSlotToStringImpl(ts));
+        consider(kEqualsSlot, classEqualsFns_, classSlotEqualsImpl(ts));
+        consider(kGetHashCodeSlot, classHashCodeFns_, classSlotHashCodeImpl(ts));
+    }
+    const bool needsSpecObjectSlots = !objectSlotsToSpec.empty();
+
     if (!needsSpecDispose && !needsSpecItable && !needsSpecDescriptor &&
-        !needsSpecVirtuals && !needsSpecAccessors)
+        !needsSpecVirtuals && !needsSpecAccessors && !needsSpecObjectSlots)
         return shared;
 
     // #1843: when the instantiation needs a per-monomorphization descriptor,
@@ -6100,6 +6186,59 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
         if (!specFn || specFn == canon) continue;
         if (specFn->getFunctionType() != canon->getFunctionType()) continue;
         elems[as.slot] = llvm::cast<llvm::Constant>(specFn);
+    }
+
+    // (e) fix #2947: the FIXED Object slots 3/4/5 proved above to hold a thunk
+    // that forwards to a body compiled against a layout this instantiation's
+    // objects do not have. The THUNK ITSELF is layout-agnostic — what has to
+    // change is what it forwards TO — so a fresh thunk is emitted around
+    // `buildSpecializedMethodFn`'s re-lowered body, through the SAME body
+    // emitters the template thunks use so the Equals i1-coercion and the
+    // GetHashCode width coercion cannot diverge between the two.
+    //
+    // The `$specN` suffix is load-bearing evidence, not cosmetics (#2928's
+    // reason): LLVM would otherwise uniquify the InternalLinkage name to
+    // `bz$tostr$GBase.1`, and this whole family's trail is which function name
+    // appears in the faulting stack frame.
+    //
+    // A slot whose specialized target could not be built, or whose built
+    // signature does not match the template's, is LEFT ALONE — today's content
+    // rather than a call the thunk would mistype.
+    for (const auto& os : objectSlotsToSpec) {
+        auto mit = methodFns_.find(os.user);
+        if (mit == methodFns_.end() || !mit->second) continue;
+        llvm::FunctionType* concFnTy = mit->second->getFunctionType();
+        CallableInfo ci;
+        if (!callableInfo(os.user, ci)) continue;
+        std::vector<llvm::Type*> paramTys(concFnTy->param_begin(),
+                                          concFnTy->param_end());
+        llvm::Function* specTarget =
+            buildSpecializedMethodFn(os.user, ci, paramTys);
+        if (!specTarget || specTarget == mit->second ||
+            specTarget->getFunctionType() != concFnTy)
+            continue;
+        llvm::Function* thunk = nullptr;
+        if (os.slot == kToStringSlot) {
+            thunk = llvm::Function::Create(
+                llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false),
+                llvm::Function::InternalLinkage,
+                "bz$tostr$" + std::string(ts->name) + suffix, module_.get());
+            emitClassToStringThunkBody(ts, thunk, specTarget);
+        } else if (os.slot == kEqualsSlot) {
+            thunk = llvm::Function::Create(
+                llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
+                                        /*isVarArg=*/false),
+                llvm::Function::InternalLinkage,
+                "bz$eq$" + std::string(ts->name) + suffix, module_.get());
+            emitClassEqualsThunkBody(thunk, specTarget);
+        } else if (os.slot == kGetHashCodeSlot) {
+            thunk = llvm::Function::Create(
+                llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false),
+                llvm::Function::InternalLinkage,
+                "bz$hash$" + std::string(ts->name) + suffix, module_.get());
+            emitClassHashCodeThunkBody(thunk, specTarget);
+        }
+        if (thunk) elems[os.slot] = llvm::cast<llvm::Constant>(thunk);
     }
 
     // Patch the remaining slots and finalize the initializer of the global
@@ -24624,6 +24763,58 @@ llvm::Constant* Emitter::valueBuiltinBoxToStringThunk(const char* name) {
 }
 
 
+// fix #2947 (§8.5 "ToString" / §12 "Inheritance and Dispatch" / §14.1 "Generic
+// declarations" / §2.8.3 rule 4, v0.240): resolve the user `ToString(): string`
+// the fixed vtable slot 3 thunk forwards to — the class-chain walk that used to
+// be inline in `classToStringThunk`.
+//
+// It is FACTORED OUT, not duplicated, because `specializedVtableFor` must ask
+// the slot the question the slot's own content answers. A second, re-derived
+// walk is this family's recurring failure shape (a correct predicate fed by a
+// population that is not the one in the slot, #2908/#2928); one walk, two
+// callers, cannot drift.
+sema::MethodSymbol* Emitter::classSlotToStringImpl(
+        const sema::TypeSymbol* ts) const {
+    for (const sema::TypeSymbol* cur = ts; cur;) {
+        for (sema::Symbol* sym : cur->members) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+            if (ms && !isStaticMethod(ms) && ms->name == "ToString" &&
+                ms->params.empty())
+                return ms;
+        }
+        const sema::TypeSymbol* nxt = nullptr;
+        for (const sema::TypeSymbol* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
+        cur = nxt;
+    }
+    return nullptr;
+}
+
+
+// fix #2947: emit slot 3's body into `thunk`, forwarding to `target` when one
+// was resolved. `target` is a PARAMETER rather than a `methodFns_` lookup so the
+// per-instantiation caller can hand in `buildSpecializedMethodFn`'s re-lowered
+// body — the thunk is a trivial forwarder, and what had to change was what it
+// forwards TO. §8.5: the compiler-generated default "For classes: the type's
+// qualified name".
+void Emitter::emitClassToStringThunkBody(const sema::TypeSymbol* ts,
+                                         llvm::Function* thunk,
+                                         llvm::Function* target) {
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    ThunkScope scope(currentFn_, builder_, thunk, entry);
+    llvm::Value* result = nullptr;
+    if (target)
+        // Call the real user ToString non-virtually (the thunk IS the
+        // dispatch target; calling it directly avoids re-entry).
+        result = builder_.CreateCall(target->getFunctionType(), target,
+                                     {thunk->getArg(0)});
+    if (!result)
+        result = lowerStringLiteral(
+            std::string("\"") + std::string(ts->name) + "\"", false);
+    builder_.CreateRet(result);
+}
+
+
 // §8.5 / §8.6 (#417): the uniform ToString thunk for a CLASS. Returns the user
 // `ToString()` override if one exists anywhere on the class chain (§8.5 "via
 // virtual dispatch"); otherwise a default that returns the class's name (§8.5
@@ -24633,63 +24824,34 @@ llvm::Constant* Emitter::classToStringThunk(const sema::TypeSymbol* ts) {
     auto it = classToStringFns_.find(ts);
     if (it != classToStringFns_.end()) return it->second;
 
-    // Walk the class chain for a user `ToString(): string` (no params). The
-    // most-derived override wins; vtableSlot_ already routes virtual overrides,
-    // but the thunk is what slot 3 points at for THIS exact class's vtable, so
-    // resolve the override visible from `ts`.
-    sema::MethodSymbol* userToStr = nullptr;
-    for (const sema::TypeSymbol* cur = ts; cur && !userToStr;) {
-        for (sema::Symbol* sym : cur->members) {
-            auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
-            if (ms && !isStaticMethod(ms) && ms->name == "ToString" &&
-                ms->params.empty()) { userToStr = ms; break; }
-        }
-        const sema::TypeSymbol* nxt = nullptr;
-        for (const sema::TypeSymbol* b : cur->baseTypes)
-            if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
-        cur = nxt;
-    }
+    // The most-derived override wins; vtableSlot_ already routes virtual
+    // overrides, but the thunk is what slot 3 points at for THIS exact class's
+    // vtable, so resolve the override visible from `ts`.
+    sema::MethodSymbol* userToStr = classSlotToStringImpl(ts);
 
     auto* fnTy = llvm::FunctionType::get(ptrTy(), {ptrTy()}, /*isVarArg=*/false);
     auto* thunk = llvm::Function::Create(
         fnTy, llvm::Function::InternalLinkage,
         "bz$tostr$" + std::string(ts->name), module_.get());
     classToStringFns_[ts] = thunk;
-    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
-    {
-        ThunkScope scope(currentFn_, builder_, thunk, entry);
-        llvm::Value* result = nullptr;
-        if (userToStr) {
-            auto fit = methodFns_.find(userToStr);
-            if (fit != methodFns_.end()) {
-                // Call the real user ToString non-virtually (the thunk IS the
-                // dispatch target; calling it directly avoids re-entry).
-                result = builder_.CreateCall(fit->second->getFunctionType(),
-                                             fit->second, {thunk->getArg(0)});
-            }
-        }
-        if (!result)
-            result = lowerStringLiteral(
-                std::string("\"") + std::string(ts->name) + "\"", false);
-        builder_.CreateRet(result);
-    }
+    llvm::Function* target = nullptr;
+    if (userToStr)
+        if (auto fit = methodFns_.find(userToStr); fit != methodFns_.end())
+            target = fit->second;
+    emitClassToStringThunkBody(ts, thunk, target);
     return thunk;
 }
 
 
-// §9.6 (#946/#947/#948): the uniform Equals thunk for a CLASS. Returns the user
-// `Equals(other: Object?)` override if one exists anywhere on the class chain
-// (§8.4 "via virtual dispatch"); otherwise the §8.3 reference-identity default
-// (`this == other`). The thunk's signature is the vtable-uniform
-// `i1(ptr this, ptr other)`, so an Object-typed receiver reaches the override.
-llvm::Constant* Emitter::classEqualsThunk(const sema::TypeSymbol* ts) {
-    auto it = classEqualsFns_.find(ts);
-    if (it != classEqualsFns_.end()) return it->second;
-
-    // Walk the class chain for a user `Equals` (single parameter, non-static).
-    // The most-derived override wins (same lookup as classEqualsOverride).
-    sema::MethodSymbol* userEq = nullptr;
-    for (const sema::TypeSymbol* cur = ts; cur && !userEq;) {
+// fix #2947: resolve the user `Equals` the fixed vtable slot 4 thunk forwards
+// to — the class-chain walk that used to be inline in `classEqualsThunk`, and
+// deliberately NOT `classEqualsOverride` (LlvmBackend_Calls.cpp), which answers
+// a neighbouring but different question for collection element comparison and
+// scans the chain with different continuation semantics. `specializedVtableFor`
+// must ask about the accessor that IS in the slot, so it calls this one.
+sema::MethodSymbol* Emitter::classSlotEqualsImpl(
+        const sema::TypeSymbol* ts) const {
+    for (const sema::TypeSymbol* cur = ts; cur;) {
         for (sema::Symbol* sym : cur->members) {
             auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
             if (!(ms && !ms->isOperator && !isStaticMethod(ms) &&
@@ -24711,13 +24873,54 @@ llvm::Constant* Emitter::classEqualsThunk(const sema::TypeSymbol* ts) {
                 fit->second->getFunctionType()->getNumParams() >= 2 &&
                 !fit->second->getFunctionType()->getParamType(1)->isPointerTy())
                 continue;
-            userEq = ms; break;
+            return ms;
         }
         const sema::TypeSymbol* nxt = nullptr;
         for (const sema::TypeSymbol* b : cur->baseTypes)
             if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
         cur = nxt;
     }
+    return nullptr;
+}
+
+
+// fix #2947: emit slot 4's body into `thunk`, forwarding to `target` when one
+// was resolved (see the ToString twin for why `target` is a parameter). §8.3
+// default when there is none: "Reference identity".
+void Emitter::emitClassEqualsThunkBody(llvm::Function* thunk,
+                                       llvm::Function* target) {
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    ThunkScope scope(currentFn_, builder_, thunk, entry);
+    llvm::Value* result = nullptr;
+    if (target) {
+        // Call the real user Equals non-virtually (the thunk IS the
+        // dispatch target; calling it directly avoids re-entry).
+        llvm::Value* r = builder_.CreateCall(
+            target->getFunctionType(), target,
+            {thunk->getArg(0), thunk->getArg(1)});
+        // Coerce to i1 (a bool result may be a wider integer).
+        if (r->getType()->isIntegerTy() && !r->getType()->isIntegerTy(1))
+            r = builder_.CreateICmpNE(
+                r, llvm::ConstantInt::get(r->getType(), 0));
+        if (r->getType()->isIntegerTy(1)) result = r;
+    }
+    if (!result)
+        // §8.3 default: reference identity.
+        result = builder_.CreateICmpEQ(thunk->getArg(0), thunk->getArg(1));
+    builder_.CreateRet(result);
+}
+
+
+// §9.6 (#946/#947/#948): the uniform Equals thunk for a CLASS. Returns the user
+// `Equals(other: Object?)` override if one exists anywhere on the class chain
+// (§8.4 "via virtual dispatch"); otherwise the §8.3 reference-identity default
+// (`this == other`). The thunk's signature is the vtable-uniform
+// `i1(ptr this, ptr other)`, so an Object-typed receiver reaches the override.
+llvm::Constant* Emitter::classEqualsThunk(const sema::TypeSymbol* ts) {
+    auto it = classEqualsFns_.find(ts);
+    if (it != classEqualsFns_.end()) return it->second;
+
+    sema::MethodSymbol* userEq = classSlotEqualsImpl(ts);
 
     auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
                                          /*isVarArg=*/false);
@@ -24725,31 +24928,57 @@ llvm::Constant* Emitter::classEqualsThunk(const sema::TypeSymbol* ts) {
         fnTy, llvm::Function::InternalLinkage,
         "bz$eq$" + std::string(ts->name), module_.get());
     classEqualsFns_[ts] = thunk;
-    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
-    {
-        ThunkScope scope(currentFn_, builder_, thunk, entry);
-        llvm::Value* result = nullptr;
-        if (userEq) {
-            auto fit = methodFns_.find(userEq);
-            if (fit != methodFns_.end()) {
-                // Call the real user Equals non-virtually (the thunk IS the
-                // dispatch target; calling it directly avoids re-entry).
-                llvm::Value* r = builder_.CreateCall(
-                    fit->second->getFunctionType(), fit->second,
-                    {thunk->getArg(0), thunk->getArg(1)});
-                // Coerce to i1 (a bool result may be a wider integer).
-                if (r->getType()->isIntegerTy() && !r->getType()->isIntegerTy(1))
-                    r = builder_.CreateICmpNE(
-                        r, llvm::ConstantInt::get(r->getType(), 0));
-                if (r->getType()->isIntegerTy(1)) result = r;
-            }
-        }
-        if (!result)
-            // §8.3 default: reference identity.
-            result = builder_.CreateICmpEQ(thunk->getArg(0), thunk->getArg(1));
-        builder_.CreateRet(result);
-    }
+    llvm::Function* target = nullptr;
+    if (userEq)
+        if (auto fit = methodFns_.find(userEq); fit != methodFns_.end())
+            target = fit->second;
+    emitClassEqualsThunkBody(thunk, target);
     return thunk;
+}
+
+
+// fix #2947: resolve the user `GetHashCode` the fixed vtable slot 5 thunk
+// forwards to — the class-chain walk that used to be inline in
+// `classHashCodeThunk` (see the ToString twin for why it is factored out).
+sema::MethodSymbol* Emitter::classSlotHashCodeImpl(
+        const sema::TypeSymbol* ts) const {
+    for (const sema::TypeSymbol* cur = ts; cur;) {
+        for (sema::Symbol* sym : cur->members) {
+            auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
+            if (ms && !ms->isOperator && !isStaticMethod(ms) &&
+                ms->name == "GetHashCode" && ms->params.empty())
+                return ms;
+        }
+        const sema::TypeSymbol* nxt = nullptr;
+        for (const sema::TypeSymbol* b : cur->baseTypes)
+            if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
+        cur = nxt;
+    }
+    return nullptr;
+}
+
+
+// fix #2947: emit slot 5's body into `thunk`, forwarding to `target` when one
+// was resolved (see the ToString twin for why `target` is a parameter).
+void Emitter::emitClassHashCodeThunkBody(llvm::Function* thunk,
+                                         llvm::Function* target) {
+    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
+    ThunkScope scope(currentFn_, builder_, thunk, entry);
+    llvm::Value* result = nullptr;
+    if (target) {
+        llvm::Value* r = builder_.CreateCall(target->getFunctionType(), target,
+                                             {thunk->getArg(0)});
+        if (r->getType()->isIntegerTy())
+            result = builder_.CreateZExtOrTrunc(r, i32());
+    }
+    if (!result)
+        // §8.3 (v0.204, #2055): identity hash assigned on first request
+        // from a per-domain deterministic sequence — never derived from
+        // the object's storage address.
+        result = builder_.CreateCall(
+            declareC("bz_obj_identity_hash", i32(), {ptrTy()}),
+            {thunk->getArg(0)});
+    builder_.CreateRet(result);
 }
 
 
@@ -24761,49 +24990,18 @@ llvm::Constant* Emitter::classHashCodeThunk(const sema::TypeSymbol* ts) {
     auto it = classHashCodeFns_.find(ts);
     if (it != classHashCodeFns_.end()) return it->second;
 
-    sema::MethodSymbol* userHash = nullptr;
-    for (const sema::TypeSymbol* cur = ts; cur && !userHash;) {
-        for (sema::Symbol* sym : cur->members) {
-            auto* ms = dynamic_cast<sema::MethodSymbol*>(sym);
-            if (ms && !ms->isOperator && !isStaticMethod(ms) &&
-                ms->name == "GetHashCode" && ms->params.empty()) {
-                userHash = ms; break;
-            }
-        }
-        const sema::TypeSymbol* nxt = nullptr;
-        for (const sema::TypeSymbol* b : cur->baseTypes)
-            if (b && b->kind == ast::TypeDeclKind::Class) { nxt = b; break; }
-        cur = nxt;
-    }
+    sema::MethodSymbol* userHash = classSlotHashCodeImpl(ts);
 
     auto* fnTy = llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false);
     auto* thunk = llvm::Function::Create(
         fnTy, llvm::Function::InternalLinkage,
         "bz$hash$" + std::string(ts->name), module_.get());
     classHashCodeFns_[ts] = thunk;
-    auto* entry = llvm::BasicBlock::Create(llvm_, "entry", thunk);
-    {
-        ThunkScope scope(currentFn_, builder_, thunk, entry);
-        llvm::Value* result = nullptr;
-        if (userHash) {
-            auto fit = methodFns_.find(userHash);
-            if (fit != methodFns_.end()) {
-                llvm::Value* r = builder_.CreateCall(
-                    fit->second->getFunctionType(), fit->second,
-                    {thunk->getArg(0)});
-                if (r->getType()->isIntegerTy())
-                    result = builder_.CreateZExtOrTrunc(r, i32());
-            }
-        }
-        if (!result)
-            // §8.3 (v0.204, #2055): identity hash assigned on first request
-            // from a per-domain deterministic sequence — never derived from
-            // the object's storage address.
-            result = builder_.CreateCall(
-                declareC("bz_obj_identity_hash", i32(), {ptrTy()}),
-                {thunk->getArg(0)});
-        builder_.CreateRet(result);
-    }
+    llvm::Function* target = nullptr;
+    if (userHash)
+        if (auto fit = methodFns_.find(userHash); fit != methodFns_.end())
+            target = fit->second;
+    emitClassHashCodeThunkBody(thunk, target);
     return thunk;
 }
 
