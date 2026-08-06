@@ -9382,12 +9382,42 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // collection init (`var v: Array<T> := [...]`) is unaffected; the
                 // remedy names a concrete backing and (covariantly) assigns it:
                 // `var xs: Array<T> := [...]; var v: IEnumerable<T> := xs;`.
-                if (dynamic_cast<const ast::CollectionLiteralExpr*>(
+                //
+                // per §15.4 (#2914): the interface question above is only the
+                // NEGATIVE half, and the negative half is the wrong shape for a
+                // rule whose target list §15.4 states POSITIVELY and CLOSED
+                // ("The target types that admit collection literals are: …").
+                // Everything outside the list that is not one of the named
+                // interfaces walked straight through: MEASURED on f069645,
+                // `var a: Object := [1,2,3];` — and equally `int`, `string`,
+                // `Object?`, a class with no `FromCollectionLiteral`, and a bare
+                // type parameter `T` — reached codegen's inline-array arm, which
+                // GEPs the (pointer/scalar) slot as an array and aborts the
+                // compile with "Invalid indices for GEP pointer type" (an ICE
+                // with no user-facing diagnostic), while the EMPTY (`[]`) and
+                // DICTIONARY (`["a": 1]`) forms at the same targets lowered to
+                // nothing and degraded to a zero-initialized slot — a silently
+                // wrong value that no diagnostic named. Ask the POSITIVE
+                // predicate instead, so a target can only be admitted by being
+                // ON §15.4's list; the interface arm keeps its own more
+                // specific message.
+                // A null / Kind::Error declType means type resolution already
+                // reported; staying silent there is the standard cascade
+                // suppression, and it is also why the predicate is asked only
+                // for a type that actually resolved.
+                if (ld->initializer && lsym->declType &&
+                    lsym->declType->kind != TypeRef::Kind::Error &&
+                    dynamic_cast<const ast::CollectionLiteralExpr*>(
                         ld->initializer.get()) &&
-                    isCollectionLiteralInterfaceTarget(lsym->declType)) {
-                    reportCollectionLiteralInterfaceTarget(
-                        ctx_.diagnostics(), ld->initializer->span.begin,
-                        namedTypeSimpleName(lsym->declType));
+                    !isCollectionLiteralAdmissibleTarget(lsym->declType)) {
+                    if (isCollectionLiteralInterfaceTarget(lsym->declType))
+                        reportCollectionLiteralInterfaceTarget(
+                            ctx_.diagnostics(), ld->initializer->span.begin,
+                            namedTypeSimpleName(lsym->declType));
+                    else
+                        reportCollectionLiteralBadTarget(
+                            ctx_.diagnostics(), ld->initializer->span.begin,
+                            lsym->declType);
                     currentScope_->names[ld->name] = lsym;
                     return;  // reported; skip the assignability check below
                 }

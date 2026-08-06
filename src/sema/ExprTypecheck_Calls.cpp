@@ -232,6 +232,84 @@ void reportCollectionLiteralInterfaceTarget(
         "`Dictionary`); construct one of those and pass it (§15.4)");
 }
 
+// per §15.4 (#2914): the target type as the user spelled it, for the general
+// rejection below. Deliberately NOT the file-local `typeNameForDiag` above,
+// whose nullable marker is a PREFIX (`?Object`) — a diagnostic that names the
+// target the programmer must change has to spell it the way the grammar does
+// (§7: `T?`), or the remedy reads as a different type.
+static std::string collectionLiteralTargetSpelling(const TypeRef* t) {
+    if (!t) return "<unresolved>";
+    std::string s;
+    switch (t->kind) {
+        case TypeRef::Kind::Primitive:
+            s = primitiveSpellingForDiag(t->primitive);
+            break;
+        case TypeRef::Kind::Function:
+            s = "(fn ...)";
+            break;
+        case TypeRef::Kind::Unit:
+            s = "()";
+            break;
+        case TypeRef::Kind::Error:
+            s = "<unresolved>";
+            break;
+        case TypeRef::Kind::InlineArray:
+            // Unreachable through the caller (an inline array IS admissible),
+            // but spelled rather than defaulted so a future caller cannot get
+            // a "?" here.
+            s = "[";
+            s += t->arraySizeValue >= 0 ? std::to_string(t->arraySizeValue)
+                                        : std::string("N");
+            if (t->arrayOwned) s += " owned";
+            s += "]";
+            s += collectionLiteralTargetSpelling(t->arrayElement);
+            return s + (t->nullable ? "?" : "");
+        case TypeRef::Kind::Named: {
+            std::string_view nm = callsNamedTypeSimpleName(t);
+            s.append(nm.data(), nm.size());
+            if (s.empty()) s = "<unnamed>";
+            if (!t->genericArgs.empty()) {
+                s += "<";
+                for (std::size_t i = 0; i < t->genericArgs.size(); ++i) {
+                    if (i) s += ", ";
+                    s += collectionLiteralTargetSpelling(t->genericArgs[i]);
+                }
+                s += ">";
+            }
+            break;
+        }
+    }
+    if (t->nullable) s += "?";
+    return s;
+}
+
+// per §15.4 (#2914): the general rejection, for a target that is outside
+// §15.4's CLOSED target list but is not one of the interfaces #1174 named.
+// §15.4: "A collection literal has no standalone type. It is well-typed only in
+// a context that provides the target type" and "The target types that admit
+// collection literals are: [inline arrays … `Array<T>`/`OwningArray<T>` … any
+// user-defined type declaring the `FromCollectionLiteral` static factory]" —
+// a closed list that `Object` (and `int`, and a plain class) is not on, so the
+// literal is ill-typed there. Left un-rejected, a NON-EMPTY sequence literal at
+// such a target reached codegen's inline-array arm and emitted malformed IR
+// (an "Invalid indices for GEP pointer type" verifier abort — a compile-time
+// ICE), while an EMPTY or DICTIONARY literal lowered to nothing at all and
+// degraded to a zero-initialized slot — a silently wrong value. The spelling is
+// the target as written, so the message names the shape the user must change.
+void reportCollectionLiteralBadTarget(DiagnosticEngine& diags,
+                                      SourceLocation loc,
+                                      const TypeRef* target) {
+    std::string spelled = collectionLiteralTargetSpelling(target);
+    diags.report(
+        Severity::Error, loc,
+        "a collection literal `[...]` cannot target the type `" + spelled +
+        "` — §15.4 admits only a concrete collection target (an inline array "
+        "`[N]T`, `Array<T>`/`OwningArray<T>`, `Set`, `Stack`, `Queue`, "
+        "`LinkedList`, `Dictionary`, or a type declaring the "
+        "`FromCollectionLiteral` static factory); name one of those as the "
+        "target type and assign that (§15.4)");
+}
+
 // per §15.4 (#1825): the POSITIVE side of `isCollectionLiteralInterfaceTarget`.
 // A collection literal is admissible (i.e. codegen can materialise it
 // against this target) when the target is one of:

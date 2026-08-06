@@ -57,11 +57,20 @@ bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
 // call-arg function-typed slot) is a §15.4 admissible concrete target, the
 // literal is materialised against the target exactly like the call-arg and
 // local-decl paths already do.
+// per §15.4 (#2914): `isCollectionLiteralAdmissibleTarget` is ALSO the gate at
+// the local-declaration position, which until #2914 asked only the NEGATIVE
+// interface question — so every OTHER non-admissible target (`Object`,
+// `Object?`, `int`, `string`, a class with no `FromCollectionLiteral`, a bare
+// type parameter) walked past it into codegen. `reportCollectionLiteralBadTarget`
+// emits the general §15.4 rejection for those; the interface report above stays
+// the more specific message for the shape it names.
 bool isCollectionLiteralInterfaceTarget(const TypeRef* t);
 bool isCollectionLiteralAdmissibleTarget(const TypeRef* t);
 void reportCollectionLiteralInterfaceTarget(DiagnosticEngine& diags,
                                             SourceLocation loc,
                                             std::string_view ifaceName);
+void reportCollectionLiteralBadTarget(DiagnosticEngine& diags,
+                                      SourceLocation loc, const TypeRef* target);
 
 // §27.1.1 (v0.180): exact structural equality of two TypeRefs — the INVARIANT
 // fallback for a function-value slot that is not a bare, non-generic
