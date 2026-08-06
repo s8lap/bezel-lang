@@ -192,15 +192,35 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     // issue #421: a NUMERIC/char primitive conversion (emitPrimitiveToString's
     // snprintf path) heap-allocates BOTH the bz_string object and its data
     // buffer solely to feed this write; nothing else references it, so it must
-    // be freed after the write or it leaks (~26 bytes/call for `WriteLine(7)`).
-    // The bool path returns a constant-global string (not heap) and the named-
-    // type ToString()/placeholder paths may return a retained/constant string,
-    // so only the numeric/char conversion sets this.
-    bool freeTransient = false;
-    auto isFreeablePrim = [](sema::PrimitiveType p) {
-        return p != sema::PrimitiveType::String &&
-               p != sema::PrimitiveType::Bool;  // bool → constant globals
-    };
+    // be reclaimed after the write or it leaks (~26 bytes/call for
+    // `WriteLine(7)`).
+    //
+    // fix #2875 / §8.5 / §28.9 (v0.240): reclaim it with the RC-AWARE release,
+    // never a raw free(), and key that on the PROPERTY "the console converted
+    // the argument" rather than on an enumeration of primitive kinds. The
+    // rendered string is a `+1` the console owns and discharges exactly once
+    // (the same contract #2066 records for the record-field render path) — but
+    // "+1" does not imply "a private malloc". Three of `emitPrimitiveToString`'s
+    // `P::Object` arms hand back something free() destroys or corrupts:
+    //   • a CLASS receiver renders §8.5's "the type's qualified name", an
+    //     immortal string LITERAL — free() on a constant global ABORTED the
+    //     process ("free(): invalid pointer");
+    //   • a STRING receiver gets the RECEIVER back (stdlib §9.6 `String`:
+    //     "public pure override method ToString(): string;  // returns this"),
+    //     retained since #2846 — free() destroyed the caller's own live string,
+    //     silently (a later read SEGV'd in bz_string_to_utf8z);
+    //   • a boxed `bool` or a boxed `enum` with the default rendering reaches
+    //     the box thunk's sentinel answer ("True"/"False", the type's name) —
+    //     a literal again.
+    // The old predicate excluded exactly `String` and `Bool` by name, so
+    // `Object` — which is none of the kinds it was written for — fell through
+    // to the raw free. `bz_string_release` is the one discharge correct for
+    // every arm: a no-op on a sentinel or null, a decrement on a shared
+    // reference, and precisely the `free(data); free(obj)` pair on a private
+    // rc==1 render. `P::String` never reaches the conversion at all (the branch
+    // below skips it), so the BORROWED string argument is still left to the
+    // #1031 producer arm after the write.
+    bool releaseRender = false;
     // fix #581 / fix #583 / §7 / §18.5: nullable VALUE types (int?, bool?,
     // double?, enum?, nullable record) lower to a tagged {i8 hasValue; T}
     // struct.  The existing Primitive dispatch below calls
@@ -239,7 +259,8 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         phi->addIncoming(valStr, valEnd);
         phi->addIncoming(nullStr, nullEnd);
         strPtr = phi;
-        // Note: freeTransient stays false here.  The valStr may be a
+        // Note: releaseRender stays false here (it was `freeTransient` before
+        // #2875 — same reasoning).  The valStr may be a
         // transient heap string (for numeric inner types) or a constant
         // global (for bool/string).  Freeing a PHI result conditionally after
         // the write requires a second hasValue check; the minor leak matches
@@ -252,7 +273,10 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         if (argTy->kind == sema::TypeRef::Kind::Primitive &&
             argTy->primitive != sema::PrimitiveType::String) {
             strPtr = emitPrimitiveToString(arg, argTy->primitive);
-            freeTransient = isFreeablePrim(argTy->primitive);
+            // fix #2875: the render is a `+1` this call owns — discharge it
+            // rc-aware below. `strPtr != arg` is the whole condition: nothing
+            // here needs to know WHICH primitive produced it.
+            releaseRender = (strPtr != arg);
         } else if (argTy->kind == sema::TypeRef::Kind::Named &&
                    argTy->declaration) {
             // Named type (class/record) — call ToString() via virtual
@@ -289,6 +313,12 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
                     std::string("\"") + std::string(ts->name) + "\"",
                     false);
             }
+            // #2875 note: this branch deliberately still leaves its render
+            // un-discharged — a minting `ToString` override on a class argument
+            // leaks its rendered string once per call. That is the BOUNDED
+            // direction and is out of this fix's scope (measured and filed
+            // separately); the branch is listed here so the omission reads as a
+            // decision rather than an oversight.
         }
     }
     // issue #420: fall back on the lowered VALUE's LLVM type when the sema
@@ -306,10 +336,8 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
     if (strPtr == arg && arg->getType() && !arg->getType()->isPointerTy()) {
         if (arg->getType()->isDoubleTy() || arg->getType()->isFloatTy()) {
             strPtr = emitPrimitiveToString(arg, sema::PrimitiveType::Double);
-            freeTransient = true;  // numeric snprintf path heap-allocates
         } else if (arg->getType()->isIntegerTy(1)) {
             strPtr = emitPrimitiveToString(arg, sema::PrimitiveType::Bool);
-            // bool → constant globals, nothing to free.
         } else if (arg->getType()->isIntegerTy()) {
             // Widen to i64 so the %lld snprintf path receives the full value
             // (matches the interpolation path's sign-extension to i64).
@@ -317,16 +345,21 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
                 ? arg
                 : builder_.CreateSExt(arg, i64());
             strPtr = emitPrimitiveToString(iv, sema::PrimitiveType::Long);
-            freeTransient = true;  // numeric snprintf path heap-allocates
         }
+        // fix #2875: same rule as the typed branch — the numeric snprintf path
+        // heap-allocates and the bool path yields a sentinel; a release is
+        // right for both, so no per-kind bookkeeping is needed here either.
+        releaseRender = (strPtr != arg);
     }
     if (!strPtr) return false;
     emitConsoleWrite(strPtr, isWriteLine, stdfd);
-    // issue #421: free the write-only transient (its data buffer first, then
-    // the bz_string object). Done AFTER the write, which only reads the string.
-    if (freeTransient) {
-        builder_.CreateCall(freeFn(), {loadStringData(strPtr)});
-        builder_.CreateCall(freeFn(), {strPtr});
+    // issue #421 / fix #2875: discharge the write-only render. Done AFTER the
+    // write, which only reads the string. `bz_string_release` frees the data
+    // buffer and then the header at rc == 0 — the exact pair the raw free()
+    // here used to emit — and is a no-op on the literal/sentinel and shared
+    // arms that free() corrupted (see the `releaseRender` declaration above).
+    if (releaseRender) {
+        emitStringRelease(strPtr);
     } else if (strPtr == arg && call.args[0].value &&
                isPlusOneStringProducer(call.args[0].value.get())) {
         // #1031 / §4.6 / §28.9: a fresh +1 STRING argument ($"..." interpolation,
@@ -337,8 +370,7 @@ bool Emitter::tryLowerConsoleCall(const ast::CallExpr& call) {
         // A borrow (string local/field/literal) is NOT a plus-one producer, so it
         // is not released (no premature free of the shared reference).
         // emitStringRelease is null/sentinel-safe; gated on `strPtr == arg` so a
-        // converted numeric transient (freed via freeTransient above) is never
-        // double-released here.
+        // converted render (released above) is never double-released here.
         emitStringRelease(strPtr);
     }
     return true;
