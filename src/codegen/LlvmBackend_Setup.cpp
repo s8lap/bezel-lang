@@ -12332,6 +12332,38 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             return;
         }
     }
+    // fix #2921 (spec §28.9 / §28.3, stdlib §3 / stdlib §1, v0.240): a
+    // `using var` bound to a `Random`. stdlib §3 documents its Dispose as a
+    // no-op — "its only state is its internal seed; there is nothing to
+    // release" — but the INSTANCE is still reclaimed: §28.9's trivial-dispose
+    // subsection says "the compiler frees the undischarged value at its owner's
+    // release point", and `bz_random_alloc` mallocs one. No arm registered it, so the scope-exit
+    // path emitted nothing at all: MEASURED on f069645, a 200-iteration loop
+    // over `using var r := new Random()` leaked 3200 bytes in 200 allocations
+    // under LSan, while `Array<int>` and `StringBuilder` in the identical loop
+    // were clean. Detection mirrors the Stopwatch arm directly above; the
+    // release is `emitVtablelessBuiltinRelease`, the same one an explicit
+    // `r.Dispose()` now takes.
+    {
+        bool isRnd = false;
+        if (ld->type)
+            isRnd = builtinTypeName(ctx_.resolvedType(*ld->type)) == "Random";
+        if (!isRnd && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                isRnd = ne->type && ne->type->name &&
+                        !ne->type->name->parts.empty() &&
+                        ne->type->name->parts[0] == "Random";
+        }
+        if (!isRnd && ld->initializer)
+            isRnd = builtinTypeName(ctx_.exprType(*ld->initializer)) == "Random";
+        if (isRnd) {
+            Disposal d{it->second, nullptr};
+            d.vtablelessBuiltin = "Random";
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
     // stdlib §7.2 / issue #645: a `using var` bound to a FileStream — a builtin
     // heap handle (bz_filestream_t*) with no user TypeSymbol, disposed via
     // bz_filestream_dispose (flush + close). Recognised by the same two

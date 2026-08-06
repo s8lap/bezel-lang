@@ -197,6 +197,26 @@ constexpr std::array<std::string_view, 19> kNonHeapReservedBuiltins = {
     "ExceptionInfo",
 };
 
+// #2921 / #2923: the reserved built-in INTERFACE heads — the subset of
+// `isReservedBuiltinTypeName` whose runtime value may be a USER class (a user
+// type may declare `class MyList: IEnumerable<int>`, and an
+// `IEnumerable<int>`-typed slot then holds a real vtable-bearing object).
+// They are therefore the exact complement of `isVtableLessBuiltinClassName`:
+// every OTHER reserved name denotes a concrete built-in whose runtime value is
+// a header-less C struct. See the header for why the derivation runs in this
+// direction (a forgotten entry here costs a leak, never a wild jump).
+constexpr std::array<std::string_view, 21> kBuiltinInterfaceHeads = {
+    // §29 iteration / collection interfaces
+    "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
+    "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
+    "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
+    "ICollection", "IList", "IOwningCollection", "IOwningList",
+    // §24.3 / §6.5 event faces; §5 groupings
+    "IEvent", "IAsyncEvent", "IGrouping",
+    // §2.14–§2.15 serialization vocabulary
+    "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
+};
+
 // §31.4 / #1621: the built-in exception hierarchy (child name -> parent
 // name); the root `Exception` maps to "" (no parent). MIRRORS
 // `Emitter::builtinExceptionHierarchy()` in src/codegen/LlvmBackend_Setup.cpp
@@ -304,6 +324,16 @@ bool isHeapPointerReferenceBuiltin(std::string_view n) {
 bool isReservedBuiltinTypeName(std::string_view n) {
     return contains(kHeapPointerReferenceBuiltins, n) ||
            contains(kNonHeapReservedBuiltins, n);
+}
+
+// #2921 / #2923 / §8.1 / §8.5 / §28.2 / §28.9: the reserved built-in CLASSES —
+// every reserved name that is not an interface head. Their runtime values are
+// plain C structs with no Bezel vtable at word 0, so neither the slot-2 Dispose
+// dispatch nor `bz_obj_is_string`'s negative "not-a-vtable ⇒ a string" test may
+// be applied to them. See the header for the full contract.
+bool isVtableLessBuiltinClassName(std::string_view n) {
+    return isReservedBuiltinTypeName(n) &&
+           !contains(kBuiltinInterfaceHeads, n);
 }
 
 std::string_view builtinExceptionParentOf(std::string_view name) {

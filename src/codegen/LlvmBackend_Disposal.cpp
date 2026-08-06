@@ -1573,6 +1573,193 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
         builder_.CreateCall(freeFn(), {obj});
 }
 
+
+// §6.6 / issue #974 / §30.11: release a NON-NULL TaskCompletionSource<T> /
+// OwningTaskCompletionSource<T> / TaskCompletionSource (`bz_tcs_t*`). The
+// caller supplies the null guard and, where a slot holds `tcs`, nulls it
+// afterwards (§28.2 exactly-once).
+//
+// Factored out by fix #2921 (v0.240) so the `using var` scope-exit auto-drop
+// and an EXPLICIT `tcs.Dispose()` share ONE resolution of "what releases a
+// TCS". Before that, only the scope-exit path had one, and the explicit call
+// fell through to the generic vtable dispatch — which a `bz_tcs_t*` has no
+// vtable for (measured: SIGSEGV out of `Main`).
+//
+// The four steps, all on the non-null path:
+//   1. bz_tcs_fault_if_pending(tcs, ioe_vtable): if the inner task has not been
+//      completed yet, fault it with InvalidOperationException so that any
+//      awaiter wakes up with an error rather than hanging indefinitely.
+//   2. Error-obj cleanup on the inner task (mirrors the d.task arm): if the
+//      task is faulted, dispose the error object exactly once.
+//   3. bz_task_fire_and_forget(inner_task): release the task struct when it has
+//      finished running (immediate if already done, deferred if running).
+//   4. bz_tcs_free(tcs): free the bz_tcs_t wrapper itself.
+void Emitter::emitTcsRelease(llvm::Value* tcs) {
+    // Step 1: fault the inner task if not yet completed.
+    llvm::Value* ioeVt = llvm::ConstantPointerNull::get(ptrTy());
+    {   auto vit = builtinVtable_.find("InvalidOperationException");
+        if (vit != builtinVtable_.end()) ioeVt = vit->second;
+    }
+    auto* faultFn = declareC("bz_tcs_fault_if_pending",
+                              llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+    builder_.CreateCall(faultFn, {tcs, ioeVt});
+
+    // Step 2: get the inner task pointer and clean up its error object.
+    auto* innerFn = declareC("bz_tcs_task", ptrTy(), {ptrTy()});
+    llvm::Value* t = builder_.CreateCall(innerFn, {tcs}, "tcs.inner");
+    {
+        auto* isErrFn = declareC("bz_task_is_error", i1(), {ptrTy()});
+        llvm::Value* err = builder_.CreateCall(isErrFn, {t}, "tcs.task.err");
+        auto* edBB = llvm::BasicBlock::Create(llvm_, "tcs.task.errdisp",
+                                               currentFn_);
+        auto* eaBB = llvm::BasicBlock::Create(llvm_, "tcs.task.errcont",
+                                               currentFn_);
+        builder_.CreateCondBr(err, edBB, eaBB);
+        builder_.SetInsertPoint(edBB);
+        auto* eoFn = declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
+        llvm::Value* eo = builder_.CreateCall(eoFn, {t}, "tcs.task.errobj");
+        llvm::Value* eoNull = builder_.CreateICmpEQ(
+            eo, llvm::ConstantPointerNull::get(ptrTy()));
+        auto* doBB = llvm::BasicBlock::Create(llvm_, "tcs.task.eodisp",
+                                               currentFn_);
+        builder_.CreateCondBr(eoNull, eaBB, doBB);
+        builder_.SetInsertPoint(doBB);
+        // §30.9 in-flight-deferral (v0.179): if the fault is still in
+        // flight (borrowed by an awaiter mid-dispatch — a TCS-backed task
+        // bound inside a `try`, unwound by its own re-raised fault),
+        // defer its disposal to the catch arm's terminal act rather than
+        // freeing the object mid-dispatch (UAF). Otherwise dispose now.
+        auto* isBorrowedFn = declareC("bz_is_exc_borrowed",
+                                      llvm::Type::getInt8Ty(llvm_), {ptrTy()});
+        llvm::Value* bv = builder_.CreateCall(isBorrowedFn, {eo},
+                                              "tcs.eo.borrowed");
+        llvm::Value* isB = builder_.CreateICmpNE(
+            bv, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
+        auto* deferBB = llvm::BasicBlock::Create(llvm_, "tcs.eo.defer",
+                                                 currentFn_);
+        auto* dispBB  = llvm::BasicBlock::Create(llvm_, "tcs.eo.dispnow",
+                                                 currentFn_);
+        builder_.CreateCondBr(isB, deferBB, dispBB);
+        builder_.SetInsertPoint(deferBB);
+        auto* deferFn = declareC("bz_defer_exc_dispose",
+                                 llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(deferFn, {eo});
+        builder_.CreateBr(eaBB);
+        builder_.SetInsertPoint(dispBB);
+        emitDisposeAndReclaim(eo);
+        builder_.CreateBr(eaBB);
+        builder_.SetInsertPoint(eaBB);
+    }
+
+    // Step 2.5: §28.3 / #1250: for OwningTaskCompletionSource<T:class>, dispose
+    // the inner task's owned result if set but never consumed via .Result/await.
+    // bz_tcs_dispose_owned_result is safe on all paths:
+    //   • owned_result_disposer == null → plain TCS or value-type; no-op.
+    //   • task->is_error → TrySetException or fault_if_pending fired; no result.
+    //   • task->result == null → bz_task_take_result already consumed it; no-op.
+    // Must run BEFORE fire-and-forget while inner_task is still alive.
+    {
+        auto* dispOwnedFn = declareC("bz_tcs_dispose_owned_result",
+                                      llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(dispOwnedFn, {tcs});
+    }
+
+    // Step 3: fire-and-forget the inner task.
+    auto* fafFn = declareC("bz_task_fire_and_forget",
+                            llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    builder_.CreateCall(fafFn, {t});
+
+    // Step 4: free the TCS struct itself.
+    auto* freeFn2 = declareC("bz_tcs_free",
+                              llvm::Type::getVoidTy(llvm_), {ptrTy()});
+    builder_.CreateCall(freeFn2, {tcs});
+}
+
+
+// fix #2921 (spec §28.2 / §28.9 / §8.1, v0.240): emit the RELEASE of a
+// vtable-less built-in class receiver `recv` whose built-in name is `bn`, and
+// report whether one was emitted.
+//
+// WHY THIS EXISTS. The explicit-`Dispose()` lowering (LlvmBackend_Calls2.cpp)
+// is a chain of per-built-in arms ending in the generic
+// `emitDisposeAndReclaim`, which loads word 0 as a vtable and calls slot 2. A
+// built-in class has no vtable there — word 0 is payload data — so every
+// built-in the chain did not name fell into a wild indirect jump. MEASURED on
+// f069645: `var sb := new StringBuilder(); sb.Dispose();` emitted
+// `mov (%rax),%rcx ; call *0x10(%rcx)` and SIGSEGV'd at address 0, with no
+// diagnostic; the same for `Random`, `EventSource<T>`, `AsyncEventSource<T>`,
+// `TaskCompletionSource<T>` and `OwningTaskCompletionSource<T>`.
+//
+// The caller gates on `common::isVtableLessBuiltinClassName` and, when this
+// returns false, emits NOTHING rather than the generic dispatch. That is
+// deliberate and is the point of the split: a built-in whose release this
+// function does not yet know leaks a bounded amount of memory, where the old
+// fall-through corrupted control flow. A leak is recoverable; a wild jump is
+// not (the same trade recorded on #2874 and #2823).
+//
+// Each release below is the SAME call the `using var` scope-exit auto-drop
+// already emits for that built-in, reached from the one place it is written:
+// StringBuilder → the borrowing-`Array<string>` free with the string-element
+// release thunk (LlvmBackend_Setup.cpp `registerUsingDisposal`, #1185);
+// EventSource/AsyncEventSource → `bz_event_source_free` (#2026);
+// TaskCompletionSource family → `emitTcsRelease` (#974). `Random` had NO
+// resolution on either path (its `bz_random_free` was declared in the runtime
+// header and referenced by no emitter at all — measured: 3200 bytes leaked in
+// 200 allocations under LSan), so this fix adds the one resolution and wires
+// BOTH paths to it.
+bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
+                                           llvm::Value* recv) {
+    if (bn.empty() || !recv || !recv->getType()->isPointerTy()) return false;
+    auto callVoid = [&](const char* fn, llvm::ArrayRef<llvm::Value*> args) {
+        std::vector<llvm::Type*> ps(args.size(), ptrTy());
+        builder_.CreateCall(declareC(fn, llvm::Type::getVoidTy(llvm_), ps),
+                            args);
+    };
+    // stdlib §3.1 / #1185: a StringBuilder IS a `bz_array_t*` of string parts
+    // and owns a +1 per part; the string-element release thunk discharges each.
+    if (bn == "StringBuilder") {
+        llvm::Value* disp = stringElementReleaseThunk();
+        builder_.CreateCall(
+            declareC("bz_array_free", llvm::Type::getVoidTy(llvm_),
+                     {ptrTy(), ptrTy()}),
+            {recv, disp ? disp
+                        : llvm::cast<llvm::Value>(
+                              llvm::ConstantPointerNull::get(ptrTy()))});
+        return true;
+    }
+    // stdlib §3 (v0.240): `Random`'s Dispose is a documented no-op — "`Random`
+    // is a class with a no-op `Dispose` (its only state is its internal seed;
+    // there is nothing to release)" — but the INSTANCE is still reclaimed:
+    // §28.9's trivial-dispose subsection says "the compiler frees the
+    // undischarged value at its owner's release point", which stdlib §1
+    // restates as "A trivial-dispose class's instances are compiler-freed at
+    // their owner's release point". `bz_random_alloc` mallocs one and
+    // `bz_random_free` is a plain `free`.
+    if (bn == "Random") { callVoid("bz_random_free", {recv}); return true; }
+    // §24.3 / §6.5 / #2026: sync and async sources share one runtime
+    // representation, so both free identically (null-safe).
+    if (bn == "EventSource" || bn == "AsyncEventSource") {
+        callVoid("bz_event_source_free", {recv});
+        return true;
+    }
+    // §6.6 / §30.11 / #974: the four-step TCS release (see emitTcsRelease).
+    if (bn == "TaskCompletionSource" || bn == "OwningTaskCompletionSource") {
+        emitTcsRelease(recv);
+        return true;
+    }
+    // §2.11 / §24.4: disposing a Subscription removes the handler from its
+    // event source. The explicit-Dispose chain reaches this only when
+    // `isSubscriptionExpr`'s STRUCTURAL detection (the local's initializer is an
+    // event `Subscribe(...)` call) did not fire — a Subscription-typed
+    // parameter/field, say — where the fall-through was the wild jump. Same
+    // release call as that arm.
+    if (bn == "Subscription") {
+        callVoid("bz_subscription_dispose", {recv});
+        return true;
+    }
+    return false;
+}
+
 // #1833 (b) / #1467 / §22.4 / §28.3: dispose every `out _` discard-owned
 // scratch slot recorded by buildOrderedArgs in the `[base, end)` range,
 // on the normal-return path (`!diverged_`). Byte-identical pattern to
@@ -4204,86 +4391,33 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind,
             auto* contBB  = llvm::BasicBlock::Create(llvm_, "tcs.cont",     currentFn_);
             builder_.CreateCondBr(isNull, contBB, dispBB);
             builder_.SetInsertPoint(dispBB);
-
-            // Step 1: fault the inner task if not yet completed.
-            llvm::Value* ioeVt = llvm::ConstantPointerNull::get(ptrTy());
-            {   auto vit = builtinVtable_.find("InvalidOperationException");
-                if (vit != builtinVtable_.end()) ioeVt = vit->second;
-            }
-            auto* faultFn = declareC("bz_tcs_fault_if_pending",
-                                      llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
-            builder_.CreateCall(faultFn, {tcs, ioeVt});
-
-            // Step 2: get the inner task pointer and clean up its error object.
-            auto* innerFn = declareC("bz_tcs_task", ptrTy(), {ptrTy()});
-            llvm::Value* t = builder_.CreateCall(innerFn, {tcs}, "tcs.inner");
-            {
-                auto* isErrFn = declareC("bz_task_is_error", i1(), {ptrTy()});
-                llvm::Value* err = builder_.CreateCall(isErrFn, {t}, "tcs.task.err");
-                auto* edBB = llvm::BasicBlock::Create(llvm_, "tcs.task.errdisp",
-                                                       currentFn_);
-                auto* eaBB = llvm::BasicBlock::Create(llvm_, "tcs.task.errcont",
-                                                       currentFn_);
-                builder_.CreateCondBr(err, edBB, eaBB);
-                builder_.SetInsertPoint(edBB);
-                auto* eoFn = declareC("bz_task_error_obj", ptrTy(), {ptrTy()});
-                llvm::Value* eo = builder_.CreateCall(eoFn, {t}, "tcs.task.errobj");
-                llvm::Value* eoNull = builder_.CreateICmpEQ(
-                    eo, llvm::ConstantPointerNull::get(ptrTy()));
-                auto* doBB = llvm::BasicBlock::Create(llvm_, "tcs.task.eodisp",
-                                                       currentFn_);
-                builder_.CreateCondBr(eoNull, eaBB, doBB);
-                builder_.SetInsertPoint(doBB);
-                // §30.9 in-flight-deferral (v0.179): if the fault is still in
-                // flight (borrowed by an awaiter mid-dispatch — a TCS-backed task
-                // bound inside a `try`, unwound by its own re-raised fault),
-                // defer its disposal to the catch arm's terminal act rather than
-                // freeing the object mid-dispatch (UAF). Otherwise dispose now.
-                auto* isBorrowedFn = declareC("bz_is_exc_borrowed",
-                                              llvm::Type::getInt8Ty(llvm_), {ptrTy()});
-                llvm::Value* bv = builder_.CreateCall(isBorrowedFn, {eo},
-                                                      "tcs.eo.borrowed");
-                llvm::Value* isB = builder_.CreateICmpNE(
-                    bv, llvm::ConstantInt::get(llvm::Type::getInt8Ty(llvm_), 0));
-                auto* deferBB = llvm::BasicBlock::Create(llvm_, "tcs.eo.defer",
-                                                         currentFn_);
-                auto* dispBB  = llvm::BasicBlock::Create(llvm_, "tcs.eo.dispnow",
-                                                         currentFn_);
-                builder_.CreateCondBr(isB, deferBB, dispBB);
-                builder_.SetInsertPoint(deferBB);
-                auto* deferFn = declareC("bz_defer_exc_dispose",
-                                         llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                builder_.CreateCall(deferFn, {eo});
-                builder_.CreateBr(eaBB);
-                builder_.SetInsertPoint(dispBB);
-                emitDisposeAndReclaim(eo);
-                builder_.CreateBr(eaBB);
-                builder_.SetInsertPoint(eaBB);
-            }
-
-            // Step 2.5: §28.3 / #1250: for OwningTaskCompletionSource<T:class>, dispose
-            // the inner task's owned result if set but never consumed via .Result/await.
-            // bz_tcs_dispose_owned_result is safe on all paths:
-            //   • owned_result_disposer == null → plain TCS or value-type; no-op.
-            //   • task->is_error → TrySetException or fault_if_pending fired; no result.
-            //   • task->result == null → bz_task_take_result already consumed it; no-op.
-            // Must run BEFORE fire-and-forget while inner_task is still alive.
-            {
-                auto* dispOwnedFn = declareC("bz_tcs_dispose_owned_result",
-                                              llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                builder_.CreateCall(dispOwnedFn, {tcs});
-            }
-
-            // Step 3: fire-and-forget the inner task.
-            auto* fafFn = declareC("bz_task_fire_and_forget",
-                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(fafFn, {t});
-
-            // Step 4: free the TCS struct itself.
-            auto* freeFn2 = declareC("bz_tcs_free",
-                                      llvm::Type::getVoidTy(llvm_), {ptrTy()});
-            builder_.CreateCall(freeFn2, {tcs});
-
+            emitTcsRelease(tcs);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
+        // fix #2921 (spec §28.9 / §28.3 / §28.2, v0.240): a `using var` bound to
+        // a VTABLE-LESS BUILT-IN CLASS whose release no arm above spells (today:
+        // `Random`). Routed through `emitVtablelessBuiltinRelease` — the SAME
+        // resolution an explicit `x.Dispose()` takes — so the scope-exit and
+        // explicit spellings cannot drift about what releases a given built-in,
+        // which is exactly how `Random` came to leak on one path and SIGSEGV on
+        // the other. Null-guarded (a ctor that threw before the local was
+        // assigned, or a moved-out slot), and the slot is nulled after so a
+        // re-entrant / unwind pass is a no-op.
+        if (it->vtablelessBuiltin) {
+            llvm::Type* ety = nullptr;
+            llvm::Value* addr = boxedStorage(it->slot, ety);
+            llvm::Value* obj = builder_.CreateLoad(ptrTy(), addr, "vlb.load");
+            llvm::Value* isNull = builder_.CreateICmpEQ(
+                obj, llvm::ConstantPointerNull::get(ptrTy()));
+            auto* frBB   = llvm::BasicBlock::Create(llvm_, "vlb.free", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(llvm_, "vlb.cont", currentFn_);
+            builder_.CreateCondBr(isNull, contBB, frBB);
+            builder_.SetInsertPoint(frBB);
+            emitVtablelessBuiltinRelease(it->vtablelessBuiltin, obj);
+            builder_.CreateStore(
+                llvm::ConstantPointerNull::get(ptrTy()), addr);
             builder_.CreateBr(contBB);
             builder_.SetInsertPoint(contBB);
             continue;

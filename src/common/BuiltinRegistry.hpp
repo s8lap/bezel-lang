@@ -141,6 +141,39 @@ bool isHeapPointerReferenceBuiltin(std::string_view n);
 // tests/support/builtin_registry_snapshot_test.cpp.
 bool isReservedBuiltinTypeName(std::string_view n);
 
+// #2921 / #2923 / §8.1 / §8.5 / §28.2 / §28.9: is `n` a reserved built-in
+// **class** whose runtime value carries NO Bezel vtable at word 0?
+//
+// The compiler emits vtables (layout `[0]=td$, [1]=itmap$, [2]=Dispose,
+// [3]=ToString, [4+]=virtuals`) for exactly three kinds of object: a user
+// `TypeSymbol`'s instances, a box, and a built-in EXCEPTION. Every other
+// built-in is a plain runtime C struct — `bz_array_t*`, `bz_mutex_t*`,
+// `bz_random_t*`, `bz_event_source_t*`, … — whose word 0 is payload data. Two
+// lowerings assume the vtable unconditionally, and both are memory-unsafe on
+// such a receiver:
+//   * `emitDynamicDispose` loads word 0 and calls slot 2 — the wild jump of
+//     #2921 (measured `mov (%rax),%rcx ; call *0x10(%rcx)` → address 0);
+//   * `lowerObjectToString` asks `bz_obj_is_string`, which is a NEGATIVE test
+//     ("word 0 is not one of the emitted vtables ⇒ it is a string"), so it
+//     answers "string" for every one of them; the receiver is then read as a
+//     `%bz.string` and, since #2846, RETAINED and later RELEASED — the double
+//     free / heap-buffer-overflow of #2923.
+// This predicate is the single gate both consult, so the question "does this
+// receiver carry a Bezel vtable?" is asked once, from one table, rather than
+// re-enumerated per site.
+//
+// Derived, deliberately, rather than hand-listed: it is
+// `isReservedBuiltinTypeName` MINUS `kBuiltinInterfaceHeads`. The subtraction
+// is the whole content of the rule — a built-in INTERFACE head is the one
+// reserved name whose runtime value may be a *user* class (measured: `var e:
+// IEnumerable<int> := new MyList(); e.Dispose();` compiles and runs), so those
+// must keep the dynamic dispatch. Deriving in this direction makes the
+// omission fail SAFE: a newly-added built-in CLASS joins this set
+// automatically and gets the vtable-free treatment, while a forgotten new
+// built-in INTERFACE costs a leak or a type-name rendering — never a wild
+// jump. // per §8.1 / §8.5 / §28.2 / §28.9
+bool isVtableLessBuiltinClassName(std::string_view n);
+
 // §31.4 / #1621: given a built-in exception type's simple name, return the
 // name of its DIRECT parent in the built-in exception hierarchy (e.g.
 // "FileNotFoundException" -> "IOException"), or an empty string_view if

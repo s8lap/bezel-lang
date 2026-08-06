@@ -300,6 +300,81 @@ BEZEL_TEST(builtin_registry_snapshot, reserved_builtin_type_name_set) {
         BEZEL_EXPECT_FALSE(isReservedBuiltinTypeName(n));
 }
 
+// --- isVtableLessBuiltinClassName (#2921 / #2923; spec §8.1 / §8.5 / §28.2 /
+// §28.9, v0.240): the reserved built-in CLASSES — every reserved name that is
+// NOT an interface head.
+//
+// WHY IT IS A DERIVATION, NOT A LIST. Two lowerings assume the receiver carries
+// a Bezel vtable at word 0 and are memory-unsafe without one: the slot-2 Dispose
+// dispatch (`emitDynamicDispose`) jumped to address 0 on a `StringBuilder`
+// (#2921, MEASURED `mov (%rax),%rcx ; call *0x10(%rcx)`), and
+// `lowerObjectToString`'s `bz_obj_is_string` — a NEGATIVE test, "word 0 is not
+// one of the emitted vtables ⇒ it is a string" — mis-answered "string" for every
+// built-in and got each one retained + released as a `%bz.string` (#2923, a
+// double free). Both now gate on this ONE predicate.
+//
+// The set is `isReservedBuiltinTypeName` MINUS the interface heads, and the
+// direction matters: a built-in INTERFACE head is the one reserved name whose
+// runtime value may be a USER class (`var e: IEnumerable<int> := new MyList();`
+// — measured to compile and run), so those must keep the dynamic dispatch. A
+// newly-added built-in CLASS therefore joins this set automatically and cannot
+// land back in the wild jump, while a forgotten new built-in INTERFACE costs a
+// leak or a type-name rendering. Pinned in both directions below.
+BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
+    // (a) IN: concrete built-in CLASSES across every family — collections,
+    // §3 nullary heap classes, sync primitives, tasks/TCS, event sources,
+    // Shared/Weak, serializer handles, and the non-heap reserved names.
+    for (std::string_view n : {"Array", "OwningArray", "Dictionary",
+                               "OwningDictionary", "SortedDictionary",
+                               "SortedSet", "Stack", "Queue", "Set",
+                               "LinkedList", "LinkedListNode",
+                               "StringBuilder", "Random", "Stopwatch",
+                               "FileStream", "Task", "OwningTask",
+                               "Subscription", "CancellationToken",
+                               "CancellationTokenSource", "TaskScope",
+                               "Shared", "Weak", "Channel", "ChannelSender",
+                               "EventSource", "AsyncEventSource",
+                               "Mutex", "Lock", "Semaphore", "SemaphoreToken",
+                               "TaskCompletionSource",
+                               "OwningTaskCompletionSource",
+                               "Atomic", "AtomicInteger", "Buffer",
+                               "OwningBuffer", "BinarySerializer",
+                               "BinaryDeserializer", "JsonSerializer",
+                               "JsonDeserializer", "CString", "WString",
+                               "RawBytes"})
+        BEZEL_EXPECT_TRUE(isVtableLessBuiltinClassName(n));
+    // (b) OUT: every reserved INTERFACE head — the receivers that may hold a
+    // user class and must keep dispatching through its vtable. This is the
+    // whole content of the subtraction, so it is pinned name-for-name.
+    static constexpr std::array<std::string_view, 21> kInterfaceHeads = {
+        "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
+        "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
+        "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
+        "ICollection", "IList", "IOwningCollection", "IOwningList",
+        "IEvent", "IAsyncEvent", "IGrouping",
+        "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
+    };
+    for (auto n : kInterfaceHeads) {
+        BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
+        // ...and each really is a reserved name (so the exclusion is a genuine
+        // subtraction, not a name that was never in the source set).
+        BEZEL_EXPECT_TRUE(isReservedBuiltinTypeName(n));
+    }
+    // (c) OUT: a generic type-PARAMETER spelling and a user type name — the
+    // other inhabitants of the declaration-less Named shape, which must keep
+    // dispatching dynamically.
+    for (std::string_view n : {"T", "U", "TKey", "MyClass", "Stopwatch2",
+                               "stringbuilder", ""})
+        BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
+    // (d) OUT: built-in EXCEPTIONS. They DO carry a vtable (codegen emits one
+    // per built-in exception type), so they must not be routed away from the
+    // dispatch — and they are outside `isReservedBuiltinTypeName` for exactly
+    // that reason, which this pins.
+    for (std::string_view n : {"Exception", "ArgumentException", "IOException",
+                               "DisposedAccessException"})
+        BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
+}
+
 // --- §22.16 (v0.203, #2053): ContractViolationException registration ---
 // Per spec §22.16 "Failure semantics and the enforcement modes",
 // ContractViolationException joins the built-in hierarchy DERIVING DIRECTLY

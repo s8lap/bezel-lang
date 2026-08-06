@@ -1185,6 +1185,18 @@ private:
         // "AsyncEventSource" in the declared type, the NewExpr type name, or the
         // inferred initializer exprType (the #2017 generic-factory shape).
         bool eventSource = false;
+        // fix #2921 (spec §28.9 / §28.3, stdlib §3, v0.240): a `using var` (or
+        // §28.3 auto-drop) bound to a VTABLE-LESS BUILT-IN CLASS that no arm
+        // above claims. `vtablelessBuiltin` is that built-in's name; scope exit
+        // routes it through `emitVtablelessBuiltinRelease` — the SAME resolution
+        // an explicit `x.Dispose()` now takes, so the two spellings cannot
+        // disagree about what releases a given built-in. Added because `Random`
+        // had NO release on EITHER path: `bz_random_free` existed in the runtime
+        // header and was referenced by no emitter, so a `using var r := new
+        // Random()` allocated and returned (MEASURED: 3200 bytes leaked in 200
+        // allocations under LSan, 200-iteration loop), while `r.Dispose()`
+        // SIGSEGV'd through the vtable that is not there.
+        const char* vtablelessBuiltin = nullptr;
         // #628 / stdlib §4.9 v0.135: a `using var` bound to a DrainedEntry<K,V>
         // obtained from `for var entry in d.Drain() do … end`. The loop variable
         // `entry` is a struct {K key; V* value}; `using var e := entry` transfers
@@ -6808,6 +6820,22 @@ private:
     // explicit `obj.Dispose()` whose receiver is a slot/field this scope owns and
     // can null to block a second reclaim. free(null) is a no-op.
     void emitDisposeAndReclaim(llvm::Value* obj);
+
+    // §6.6 / §30.11 (#974): release a NON-NULL `bz_tcs_t*` — fault a pending
+    // inner task, clean up its error object, fire-and-forget the task, free the
+    // wrapper. The caller supplies the null guard (and nulls its slot). Shared
+    // by the `using var` scope-exit auto-drop and, since #2921, by an explicit
+    // `tcs.Dispose()`.
+    void emitTcsRelease(llvm::Value* tcs);
+
+    // fix #2921 (spec §28.2 / §28.9 / §8.1, v0.240): emit the release of a
+    // VTABLE-LESS BUILT-IN CLASS receiver (`common::isVtableLessBuiltinClass
+    // Name(bn)`), returning false when no release is known for `bn`. Callers
+    // must NOT fall back to `emitDisposeAndReclaim` on a false return: such a
+    // receiver has no vtable at word 0, so the slot-2 dispatch is a wild jump.
+    // See the definition for the measured failure and the leak-over-wild-jump
+    // trade a false return deliberately takes.
+    bool emitVtablelessBuiltinRelease(std::string_view bn, llvm::Value* recv);
 
     // #1833 (b) / #1467 / §22.4 / §28.3: for a `discardOwnedOutSlots_` range
     // `[base, end)` recorded by buildOrderedArgs on the constructor call path,

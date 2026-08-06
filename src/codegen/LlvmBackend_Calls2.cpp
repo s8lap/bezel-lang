@@ -6621,6 +6621,74 @@ llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
                                 }
                             }
                         }
+                    } else if (common::isVtableLessBuiltinClassName(
+                                   builtinTypeName(recvTy))) {
+                        // fix #2921 (spec §28.2 / §28.9 / §8.1, stdlib §1 /
+                        // stdlib §3, v0.240): every arm above this `else`
+                        // chain names ONE built-in, and the `else` below ends in
+                        // the generic vtable dispatch (emitDisposeAndReclaim →
+                        // slot 2). That dispatch's precondition is that the
+                        // receiver carries a Bezel vtable at word 0 — and a
+                        // built-in CLASS never does: it is a plain runtime C
+                        // struct whose word 0 is payload data. So the chain's
+                        // shape made every built-in it forgot to name fail as a
+                        // WILD INDIRECT JUMP with no diagnostic. MEASURED on
+                        // f069645: `var sb := new StringBuilder();
+                        // sb.Dispose();` emitted `mov (%rax),%rcx ; call
+                        // *0x10(%rcx)` and died at address 0 (SIGSEGV, exit
+                        // 139); likewise `Random`, `EventSource<T>`,
+                        // `AsyncEventSource<T>`, `TaskCompletionSource<T>`,
+                        // `OwningTaskCompletionSource<T>`. Both calls are legal:
+                        // stdlib §1 says "Every class implicitly
+                        // implements `IDisposable`", and stdlib §3 documents
+                        // `Random`'s Dispose as a no-op outright.
+                        //
+                        // Gate on the PROPERTY ("does this receiver carry a
+                        // Bezel vtable?", asked once via the registry) rather
+                        // than lengthening the name chain, so a built-in this
+                        // fix does not name cannot land back in the jump. When
+                        // no release is known, emitVtablelessBuiltinRelease
+                        // returns false and NOTHING is emitted: a bounded leak
+                        // in place of corrupted control flow, the trade recorded
+                        // on #2874 and #2823.
+                        //
+                        // §28.2 exactly-once: null the receiver's slot in
+                        // unchecked mode, exactly as the Mutex / Semaphore /
+                        // Shared / Channel arms above do, so a following
+                        // `using var` scope-exit or unwind auto-drop reloads
+                        // null and skips — without which making the explicit
+                        // call release would have turned #2921's SIGSEGV into a
+                        // double free for the built-ins whose auto-drop already
+                        // releases (StringBuilder, EventSource, the TCS family).
+                        // Checked mode deliberately does NOT null (the pointer
+                        // must stay readable for the disposed-flag guard).
+                        auto* nnBB = llvm::BasicBlock::Create(
+                            llvm_, "bidisp.nn", currentFn_);
+                        auto* ctBB = llvm::BasicBlock::Create(
+                            llvm_, "bidisp.cont", currentFn_);
+                        builder_.CreateCondBr(
+                            builder_.CreateICmpNE(
+                                recv,
+                                llvm::ConstantPointerNull::get(ptrTy())),
+                            nnBB, ctBB);
+                        builder_.SetInsertPoint(nnBB);
+                        emitVtablelessBuiltinRelease(builtinTypeName(recvTy),
+                                                     recv);
+                        bool lvalueRecv =
+                            dynamic_cast<const ast::IdentifierExpr*>(
+                                ma->target.get()) ||
+                            dynamic_cast<const ast::MemberAccessExpr*>(
+                                ma->target.get());
+                        if (!checkedDisposal_ && lvalueRecv) {
+                            llvm::Type* slotTy = nullptr;
+                            if (llvm::Value* slot =
+                                    lvalueAddr(*ma->target, slotTy))
+                                builder_.CreateStore(
+                                    llvm::ConstantPointerNull::get(ptrTy()),
+                                    slot);
+                        }
+                        builder_.CreateBr(ctBB);
+                        builder_.SetInsertPoint(ctBB);
                     } else {
                         // #415 / §28.2 / §28.4: an explicit `.Dispose()` on a
                         // class/interface instance. After #411 split dispatch
