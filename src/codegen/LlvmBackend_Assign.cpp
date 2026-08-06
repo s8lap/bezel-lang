@@ -5842,7 +5842,30 @@ bool Emitter::lowerImportedPropertySetValue(const ast::Expr& target,
     }
     llvm::Function* fn = isStaticProp ? stIt->second : sit->second;
     llvm::Type* valTy = fn->getFunctionType()->getParamType(isStaticProp ? 0 : 1);
-    v = coerceNumericToType(v, valTy, isUnsignedTargetExpr(target));
+    // fix #2937 (§7.2/§5.1/§2.8.2 clause 1/§23.3, v0.240): the CROSS-MODULE
+    // twin of #2927. This site was a bare `coerceNumericToType`, which covers
+    // §5.1's numeric widening but has no case for §7.2's tagged
+    // `{i8 hasValue; T}` slot, so a NULLABLE-VALUE imported property took the
+    // bare payload and the compile ABORTED. MEASURED against a two-module
+    // build on the #2927 fix: `p.PP := 1` where `public property PP: int?`
+    // lives on an imported class gave "Call parameter type does not match
+    // function signature! i32 1 { i8, i32 } call void
+    // @"bz$XLib.XPlain$PP$propset"(ptr, i32 1)". Found by probing #2927's
+    // sibling helpers across an artifact boundary — the in-module spellings
+    // (`lowerPropertySetValue`) and the virtual/interface one
+    // (`lowerVirtualPropertySet`, #2927) were both already correct, and this
+    // ABI-stub path is reachable ONLY cross-module, which is why no
+    // single-module test could see it.
+    //
+    // Same two helpers, in the same order, for the same reason as #2927:
+    // #2903's one definition of an initializer's slot width (which takes the
+    // nullable slot's PAYLOAD as the width to match, in both of §5.1's
+    // directions), then §7.2's present-wrap — which also normalizes a `null`
+    // literal to the all-zero form. Both are no-ops when `v` is already the
+    // slot type, so the callers that arrive with a tagged value (the §22.3
+    // `ref`/`out` write-back, #2862's compound path) are unaffected.
+    v = coerceInitializerToSlot(v, valTy, isUnsignedTargetExpr(target));
+    v = coerceToNullableSlot(valTy, v);
     // fix #2500 (§8.6/§23.3/§28.9, v0.236): for an Object/interface property
     // the setter's `value` parameter is `ptr` (a box pointer), but the RHS
     // arrived here as the bare lowered value (e.g. an i32 literal) — without
