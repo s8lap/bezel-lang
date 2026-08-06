@@ -4567,6 +4567,57 @@ sema::MemberSymbol* Emitter::storageMemberOf(sema::Symbol* sym) {
     // line was widened too — the layout fix alone was necessary but not
     // sufficient). See isAutoPropertyStorage's own comment
     // (LlvmBackend_impl.hpp) for the full rationale and scope boundary.
+    // fix #2931 (§11.2/§23.1/§22.3/§12.1, v0.240): a property DECLARED IN AN
+    // INTERFACE has NO backing storage — not in the interface (never
+    // instantiated) and not in any implementing object, whose own matching
+    // member owns whatever storage exists. §11.2, verbatim: "Interface members
+    // are implicitly public, have no body, and end with `;`. A class
+    // implements an interface implicitly: by declaring matching public
+    // members." §23.1's "The compiler generates the backing field" is the
+    // AUTO-PROPERTY rule; §23.2 names the two apart in one breath —
+    // "auto-properties (§23.1) and interface properties, whose accessor sets
+    // are declared, not shaped".
+    //
+    // The two forms are SPELLED IDENTICALLY (`property P: T;`) and the parser
+    // records both as `PropertyBodyKind::Auto` (Parser_Decls.cpp, the
+    // interface arm's "simple signature form"), so `isAutoProperty` answers
+    // TRUE for an interface property — and so does the exporter's wire bit
+    // (`ModuleMetadataBuilder.cpp`: `out.isAutoProperty = pd->bodyKind ==
+    // Auto`), which is how an IMPORTED interface property reached the same
+    // wrong answer through `isAutoPropertyStorage`'s decl-null fallback. Both
+    // sources meet at this one line, so excluding here covers the local and
+    // the cross-module spelling alike.
+    //
+    // WHAT IT COST (MEASURED on 10bd6d3). This function is "the central
+    // GEP-address resolution function for a plain member-access read/write",
+    // so `fieldAddr` returned a GEP into the RECEIVER at the interface
+    // property's ORDINAL among the interface's own declarations — not a
+    // constant 0: an interface declaring `A` then `B`, implemented by a class
+    // whose first two fields are `_f0`, `_f1`, sent `ref i.B`'s write into
+    // `_f1` and `ref i.A`'s into `_f0`. With FIVE interface properties and a
+    // ONE-field implementer, `ref i.E` was an ASan heap-buffer-overflow ("12
+    // bytes after 16-byte region"). Three `lvalueAddr` consumers reached it
+    // live and silently: a `ref` argument (`z=5, v=0` where `z=0, v=5` is
+    // correct), an `out` argument (`z=9, v=0`), and a BUILTIN `out`
+    // (`int.TryParse("42", out i.IP)` → `z=42, v=0`).
+    //
+    // Declining here is what routes the whole family at once: every one of
+    // those consumers already falls back to §22.3's copy-in/copy-out bracket
+    // (`emitAccessorRefArgCopyIn`) the moment `lvalueAddr` returns null, and
+    // that bracket drives the getter and the setter through the dispatching
+    // helpers. So the gate is the PROPERTY "does this member have a storage
+    // slot of its own?", not an enumeration of consumers. The concrete-type
+    // spelling of each shape was already correct, because a class's
+    // implementing property carries accessor bodies (`PropertyBodyKind::
+    // Block`) and so was never classified as storage.
+    //
+    // SCOPE: only the ADDRESS-resolution question is answered here.
+    // `isAutoPropertyStorage` deliberately keeps its `true` for an interface
+    // property — see its own comment for the disposal-classification consumers
+    // that would turn a borrow into a use-after-free if it flipped.
+    if (auto* ip = dynamic_cast<sema::PropertySymbol*>(sym))
+        if (ip->parent && ip->parent->kind == ast::TypeDeclKind::Interface)
+            return nullptr;
     if (isAutoPropertyStorage(sym))
         return dynamic_cast<sema::PropertySymbol*>(sym);
     return nullptr;

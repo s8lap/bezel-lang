@@ -4192,6 +4192,23 @@ private:
     // `collectRecordStorage`, immediately below) are widened here; the rest
     // remain open, filed as a follow-up (see #2478's tracking comment).
     bool isAutoPropertyStorage(const sema::Symbol* m) {
+        // fix #2931 (§11.2/§23.1, v0.240) — DELIBERATELY NOT WIDENED HERE.
+        // An INTERFACE property is misclassified by this predicate too (it is
+        // spelled `property P: T;`, which the parser records as
+        // `PropertyBodyKind::Auto` for the interface arm exactly as for a
+        // class auto-property), but the exclusion belongs one level down, in
+        // `storageMemberOf` — see the comment there. This predicate has a
+        // SECOND family of consumers that read it as "is a read of this member
+        // a NAMED borrow rather than a freshly produced value?" (the disposal
+        // classification: `sourceIsNamedOwner` in lowerIEnumerableBuiltinFor
+        // and its async twin, `srcIsNamedOwner` in the using/await paths).
+        // Flipping an interface property to `false` there would reclassify
+        // `for x in iface.Prop` from "borrow, do not dispose" to "fresh value,
+        // dispose it" — the heap-use-after-free direction, and precisely the
+        // misclassification #2485 fixed in the other direction. The static
+        // interface type cannot tell an auto-property implementation (a
+        // borrow) from a computed one (a fresh value), so `true` stays as the
+        // leak-over-UAF conservative answer for those consumers.
         if (isAutoProperty(m)) return true;
         auto* ps = dynamic_cast<const sema::PropertySymbol*>(m);
         if (!ps || ps->isIndexer || ps->decl != nullptr) return false;
