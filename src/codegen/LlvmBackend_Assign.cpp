@@ -4313,7 +4313,10 @@ Emitter::NestedBodyScope::~NestedBodyScope() {
 
 llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
                                           const ast::PropertyAccessor* acc) {
-    auto it = propBlockGetterFns_.find(pd);
+    // fix #2928: the memo key carries the accessor specialization tag; tag 0 is
+    // the shared/erased template every ordinary caller wants.
+    auto bgKey = std::make_pair(pd, accessorSpecTagNow());
+    auto it = propBlockGetterFns_.find(bgKey);
     if (it != propBlockGetterFns_.end()) return it->second;
 
     llvm::Type* retTy = lowerType(pd->type.get());
@@ -4323,7 +4326,7 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     auto* fn = llvm::Function::Create(
         fnTy, llvm::GlobalValue::InternalLinkage,
         "bz$prop$" + std::string(pd->name) + "$get", *module_);
-    propBlockGetterFns_[pd] = fn;
+    propBlockGetterFns_[bgKey] = fn;
     // no capture attribute added (Captures API varies by LLVM version)
 
     auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
@@ -4494,7 +4497,9 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
 llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                                                   const sema::PropertySymbol* ps,
                                                   bool isSet) {
-    auto key = std::make_pair(ps, isSet);
+    // fix #2928: the memo key carries the accessor specialization tag; tag 0 is
+    // the shared/erased template every ordinary caller wants.
+    auto key = std::make_tuple(ps, isSet, accessorSpecTagNow());
     if (auto it = propAccessorFns_.find(key); it != propAccessorFns_.end())
         return it->second;
 
@@ -4621,6 +4626,12 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
     std::string mangled = "bz$" + std::string(cls->name) + "$" +
                           std::string(ps->name) +
                           (isSet ? "$propset" : "$propget");
+    // fix #2928: name a per-instantiation accessor for what it is. Without this
+    // LLVM merely uniquifies the InternalLinkage name to `…$propget.1`, and this
+    // family's whole evidence trail is "which function name is in the stack
+    // frame" (the issue's own measurement was `SEGV … in bz$D2$Score$propget`).
+    if (unsigned specTag = std::get<2>(key))
+        mangled += "$spec" + std::to_string(specTag);
     auto* fn = llvm::Function::Create(
         fnTy, llvm::GlobalValue::InternalLinkage, mangled, *module_);
     propAccessorFns_[key] = fn;
@@ -5048,7 +5059,10 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
 llvm::Function* Emitter::ensureIndexerBlockGetter(
     const ast::PropertyDecl* pd, const ast::PropertyAccessor* acc,
     const sema::PropertySymbol* ps) {
-    auto it = propBlockGetterFns_.find(pd);
+    // fix #2928: the memo key carries the accessor specialization tag; tag 0 is
+    // the shared/erased template every ordinary caller wants.
+    auto bgKey = std::make_pair(pd, accessorSpecTagNow());
+    auto it = propBlockGetterFns_.find(bgKey);
     if (it != propBlockGetterFns_.end()) return it->second;
 
     llvm::Type* retTy = lowerType(pd->type.get());
@@ -5066,7 +5080,7 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
     auto* fn = llvm::Function::Create(
         fnTy, llvm::GlobalValue::InternalLinkage, "bz$indexer$get", *module_);
-    propBlockGetterFns_[pd] = fn;
+    propBlockGetterFns_[bgKey] = fn;
 
     auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
 
@@ -5198,7 +5212,10 @@ const sema::PropertySymbol* Emitter::classIndexerImplementing(
 llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
                                                const sema::PropertySymbol* ps) {
     (void)cls;
-    auto cached = indexerGetterFns_.find(ps);
+    // fix #2928: the memo key carries the accessor specialization tag; tag 0 is
+    // the shared/erased template every ordinary caller wants.
+    auto idxKey = std::make_pair(ps, accessorSpecTagNow());
+    auto cached = indexerGetterFns_.find(idxKey);
     if (cached != indexerGetterFns_.end()) return cached->second;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return nullptr;
@@ -5221,7 +5238,7 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
     // `T get(ptr this, idx...)` signature) — no duplicate emission.
     if (getterBlock) {
         llvm::Function* fn = ensureIndexerBlockGetter(pd, getterBlock, ps);
-        indexerGetterFns_[ps] = fn;
+        indexerGetterFns_[idxKey] = fn;
         return fn;
     }
     if (!getterExpr) return nullptr;
@@ -5236,8 +5253,13 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
     }
     auto* fnTy = llvm::FunctionType::get(retTy, paramTys, false);
     auto* fn = llvm::Function::Create(
-        fnTy, llvm::GlobalValue::InternalLinkage, "bz$indexer$get", *module_);
-    indexerGetterFns_[ps] = fn;
+        fnTy, llvm::GlobalValue::InternalLinkage,
+        // fix #2928: `$specN` names a per-instantiation indexer accessor (see
+        // the property twin in ensurePropertyAccessorFn).
+        idxKey.second ? "bz$indexer$get$spec" + std::to_string(idxKey.second)
+                      : std::string("bz$indexer$get"),
+        *module_);
+    indexerGetterFns_[idxKey] = fn;
 
     auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
     // Save + reset the full per-function emitter state (mirrors
@@ -5338,7 +5360,10 @@ llvm::Function* Emitter::ensureIndexerGetterFn(const sema::TypeSymbol* cls,
 llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
                                                const sema::PropertySymbol* ps) {
     (void)cls;
-    auto cached = indexerSetterFns_.find(ps);
+    // fix #2928: the memo key carries the accessor specialization tag; tag 0 is
+    // the shared/erased template every ordinary caller wants.
+    auto idxKey = std::make_pair(ps, accessorSpecTagNow());
+    auto cached = indexerSetterFns_.find(idxKey);
     if (cached != indexerSetterFns_.end()) return cached->second;
     auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
     if (!pd) return nullptr;
@@ -5366,8 +5391,12 @@ llvm::Function* Emitter::ensureIndexerSetterFn(const sema::TypeSymbol* cls,
     auto* fnTy = llvm::FunctionType::get(
         llvm::Type::getVoidTy(llvm_), paramTys, false);
     auto* fn = llvm::Function::Create(
-        fnTy, llvm::GlobalValue::InternalLinkage, "bz$indexer$set", *module_);
-    indexerSetterFns_[ps] = fn;
+        fnTy, llvm::GlobalValue::InternalLinkage,
+        // fix #2928: see the getter twin just above.
+        idxKey.second ? "bz$indexer$set$spec" + std::to_string(idxKey.second)
+                      : std::string("bz$indexer$set"),
+        *module_);
+    indexerSetterFns_[idxKey] = fn;
 
     auto* entryBB = llvm::BasicBlock::Create(llvm_, "entry", fn);
     // Save + reset the full per-function emitter state (see ensureIndexerGetterFn).

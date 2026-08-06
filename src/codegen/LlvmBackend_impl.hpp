@@ -1824,7 +1824,10 @@ private:
     // Block-form property getter functions (§22.9 `get => do...end;`).
     // Keyed by PropertyDecl so the same getter function is reused across
     // multiple access sites (non-generic; generic getters are specialised).
-    std::unordered_map<const ast::PropertyDecl*, llvm::Function*>
+    // fix #2928: …and by the ACCESSOR SPECIALIZATION TAG, see
+    // `accessorSpecTag_` — tag 0 is the shared/erased template body every
+    // pre-#2928 caller asks for, so the tag-0 key space is exactly today's.
+    std::map<std::pair<const ast::PropertyDecl*, unsigned>, llvm::Function*>
         propBlockGetterFns_;
 
     // #815 / §9.1: standalone getter functions for a positional record field
@@ -1875,9 +1878,11 @@ private:
     // idx..., value)`; both handle expression- and block-bodied accessors. Keyed
     // by PropertySymbol (the class's concrete indexer) so the same function fills
     // the itable slot and is reused across dispatch sites.
-    std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
+    // fix #2928: keyed additionally by the accessor specialization tag (see
+    // `accessorSpecTag_`); tag 0 is the shared/erased template.
+    std::map<std::pair<const sema::PropertySymbol*, unsigned>, llvm::Function*>
         indexerGetterFns_;
-    std::unordered_map<const sema::PropertySymbol*, llvm::Function*>
+    std::map<std::pair<const sema::PropertySymbol*, unsigned>, llvm::Function*>
         indexerSetterFns_;
 
     // fix #2414 (§22.10/§23.4/§2.8.2 clause 1/§2.8.3 rule 4, v0.235): the
@@ -2057,9 +2062,68 @@ private:
     // #481: a virtual property accessor IS just a method shape — `T get(ptr
     // this)` / `void set(ptr this, T value)`. Emitted once per (class, prop,
     // isSet), filled into the vtable slot, and called through the vtable at a
-    // polymorphic access site. Keyed by (prop, isSet).
-    std::map<std::pair<const sema::PropertySymbol*, bool>, llvm::Function*>
+    // polymorphic access site. Keyed by (prop, isSet, accessorSpecTag_).
+    std::map<std::tuple<const sema::PropertySymbol*, bool, unsigned>,
+             llvm::Function*>
         propAccessorFns_;
+
+    // fix #2928 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
+    // §12.1 / §23 "Properties and Indexers" / §2.8.3 rule 4, v0.240): the
+    // ACCESSOR SPECIALIZATION TAG. The four accessor memo caches above are keyed
+    // by the accessor's declaration alone, so the FIRST emission wins and every
+    // later asker gets that body — including a per-instantiation vtable/itable
+    // slot, whose object does NOT have the layout that body was compiled
+    // against. The tag adds the missing key dimension: the substitution the body
+    // was emitted under.
+    //
+    // 0 is "the shared/erased template", which is what every pre-#2928 caller
+    // asks for and leaves those caches' tag-0 key space byte-identical to
+    // today's behaviour. A non-zero tag is minted by `accessorSpecTagFor` for one
+    // (target class, active substitution) pair and installed only for the
+    // duration of `buildSpecializedAccessorFn`, so an accessor built under it is
+    // memoized separately from — and never displaces — the template.
+    unsigned accessorSpecTag_ = 0;
+    // The substitution the live tag NAMES, snapshotted when it was installed.
+    //
+    // ⚠ THIS PAIR IS LOAD-BEARING, not bookkeeping. An accessor body is lowered
+    // like any other user body, so mid-emission it can lower a generic call, a
+    // `new G<X>()`, or another specialization — each of which REBINDS
+    // `genericSubst_`. `ensurePropertyBlockGetter` is reached from ordinary
+    // expression lowering (LlvmBackend_Exprs.cpp / _Stmts.cpp), so a body emitted
+    // under one of those FOREIGN substitutions could otherwise be memoized under
+    // this tag and later handed back as "the accessor for THIS instantiation".
+    // `accessorSpecTagNow()` therefore validates the tag against the LIVE
+    // substitution at every cache access and degrades to 0 — the template key
+    // space, always safe — the moment they disagree. The alternative (trusting a
+    // stored tag) is exactly the "correct predicate fed by the wrong population"
+    // shape this family keeps producing.
+    std::unordered_map<std::string_view, llvm::Type*> accessorSpecSubst_;
+    std::unordered_map<std::string_view, const sema::TypeRef*>
+        accessorSpecSubstSema_;
+    unsigned accessorSpecTagNow() const {
+        if (accessorSpecTag_ == 0) return 0;
+        if (genericSubst_ != accessorSpecSubst_) return 0;
+        if (genericSubstSemaTy_ != accessorSpecSubstSema_) return 0;
+        return accessorSpecTag_;
+    }
+    // Canonicalizes (target class, LLVM type vector, per-type identity keys) to
+    // a tag. Identity keys are `typeRefIdentityKey`'s RECURSIVE structural
+    // encoding, for #1947's reason: erased LLVM types alone conflate `Box<A>`
+    // with `Box<B>` (both `ptr`), and the accessor bodies differ.
+    std::map<std::tuple<const sema::TypeSymbol*, std::vector<llvm::Type*>,
+                        std::vector<std::string>>,
+             unsigned>
+        accessorSpecTags_;
+    unsigned accessorSpecTagFor(const sema::TypeSymbol* ts);
+    llvm::Function* buildSpecializedAccessorFn(const sema::TypeSymbol* ts,
+                                               const sema::PropertySymbol* impl,
+                                               bool isSet);
+    // fix #2928: the memoized TEMPLATE (tag-0) accessor for `ps`, or null when
+    // none has been built. A PURE lookup that never emits — the collection pass
+    // in `specializedVtableFor` runs before the specialized vtable global is
+    // registered, and #2906 records why nothing may emit a body before then.
+    llvm::Function* templateAccessorFn(const sema::PropertySymbol* ps,
+                                       bool isSet);
     // §2.5 / §22.9 (issue #503): IMPORTED non-virtual property getter stubs.
     // Keyed by the imported PropertySymbol; the value is an ExternalLinkage
     // `T(ptr this)` declaration linking against the exporter's getter function

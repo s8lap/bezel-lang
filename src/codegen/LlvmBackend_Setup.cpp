@@ -5166,6 +5166,106 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
 }
 
 
+// fix #2928 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
+// §12.1 / §23 "Properties and Indexers" / §2.8.3 rule 4, v0.240): mint (or
+// return) the ACCESSOR SPECIALIZATION TAG for `ts` under the currently active
+// substitution. See `accessorSpecTag_` in LlvmBackend_impl.hpp for what the tag
+// is for; 0 is reserved for "the shared/erased template", so a caller with no
+// substitution active can never be handed a specialization tag.
+//
+// The key pairs each substituted LLVM type with `typeRefIdentityKey`'s
+// RECURSIVE structural encoding of its sema type, exactly as
+// buildSpecializedMethodFn's cache key does and for #1947's reason: every
+// class/interface type erases to `ptr`, so the LLVM vector ALONE conflates
+// `Box<A>` with `Box<B>` — and their accessor bodies differ. The map is
+// iterated in NAME order because `genericSubst_` is unordered: an
+// iteration-order-dependent key would make the tag (and therefore which bodies
+// get emitted) vary run to run.
+unsigned Emitter::accessorSpecTagFor(const sema::TypeSymbol* ts) {
+    if (genericSubst_.empty()) return 0;
+    std::vector<std::string_view> names;
+    names.reserve(genericSubst_.size());
+    for (const auto& [name, ty] : genericSubst_) names.push_back(name);
+    std::sort(names.begin(), names.end());
+    std::vector<llvm::Type*> substKey;
+    std::vector<std::string> idKey;
+    substKey.reserve(names.size());
+    idKey.reserve(names.size());
+    for (std::string_view name : names) {
+        substKey.push_back(genericSubst_.find(name)->second);
+        auto sit = genericSubstSemaTy_.find(name);
+        idKey.push_back(sit != genericSubstSemaTy_.end()
+                            ? typeRefIdentityKey(sit->second)
+                            : std::string());
+    }
+    auto key = std::make_tuple(ts, substKey, idKey);
+    auto it = accessorSpecTags_.find(key);
+    if (it != accessorSpecTags_.end()) return it->second;
+    unsigned tag = static_cast<unsigned>(accessorSpecTags_.size()) + 1;
+    accessorSpecTags_[key] = tag;
+    return tag;
+}
+
+
+// fix #2928 (§14.1 / §12 / §12.1 / §23 / §2.8.3 rule 4, v0.240): build (or
+// return the cached) PROPERTY or INDEXER accessor for `impl` re-lowered under
+// the currently active substitution, for the per-instantiation vtable/itable
+// slot of `ts`.
+//
+// This is the accessor twin of `buildSpecializedMethodFn` (#2906's vehicle for
+// a virtual METHOD slot). It cannot BE that function: an accessor slot carries
+// no `sema::MethodSymbol` — its body lives on an `ast::PropertyDecl` and is
+// lowered by `ensurePropertyAccessorFn` / `ensureIndexer{Getter,Setter}Fn`,
+// which are memoized by the accessor's DECLARATION alone. That missing key
+// dimension is the whole defect: the first emission (during `declareVtables`,
+// with NO substitution active, i.e. against the ERASED `T -> i32` template
+// layout) is what every later asker gets — including a per-instantiation
+// vtable/itable slot whose objects do not have that layout.
+//
+// So rather than evicting and rebuilding the memo (which would race with the
+// re-entrancy every accessor body can cause), the tag is installed for the
+// duration of the build and the SAME builders memoize under it. Tag 0 remains
+// the template, so nothing any existing caller sees changes.
+llvm::Function* Emitter::templateAccessorFn(const sema::PropertySymbol* ps,
+                                            bool isSet) {
+    if (!ps) return nullptr;
+    if (ps->isIndexer) {
+        const auto& m = isSet ? indexerSetterFns_ : indexerGetterFns_;
+        auto it = m.find(std::make_pair(ps, 0u));
+        return it != m.end() ? it->second : nullptr;
+    }
+    auto it = propAccessorFns_.find(std::make_tuple(ps, isSet, 0u));
+    return it != propAccessorFns_.end() ? it->second : nullptr;
+}
+
+
+llvm::Function* Emitter::buildSpecializedAccessorFn(
+        const sema::TypeSymbol* ts, const sema::PropertySymbol* impl,
+        bool isSet) {
+    if (!ts || !impl) return nullptr;
+    unsigned tag = accessorSpecTagFor(ts);
+    if (tag == 0) return nullptr;
+    // Save/restore rather than assume a clean slate: an accessor body can reach
+    // this function again (it can construct its own or another instantiation),
+    // and the outer build must resume with ITS tag and ITS snapshot.
+    unsigned savedTag = accessorSpecTag_;
+    auto savedSubst = accessorSpecSubst_;
+    auto savedSubstSema = accessorSpecSubstSema_;
+    accessorSpecTag_ = tag;
+    accessorSpecSubst_ = genericSubst_;
+    accessorSpecSubstSema_ = genericSubstSemaTy_;
+    llvm::Function* fn =
+        impl->isIndexer
+            ? (isSet ? ensureIndexerSetterFn(ts, impl)
+                     : ensureIndexerGetterFn(ts, impl))
+            : ensurePropertyAccessorFn(ts, impl, isSet);
+    accessorSpecTag_ = savedTag;
+    accessorSpecSubst_ = std::move(savedSubst);
+    accessorSpecSubstSema_ = std::move(savedSubstSema);
+    return fn;
+}
+
+
 // §28.5 / §14 / #1143 / #1240: the per-instantiation vtable to install in a
 // freshly-constructed instance of the active monomorphization of `ts`, in
 // place of the shared `vt$<T>`. Specialized when:
@@ -5313,6 +5413,35 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
         }
     }
 
+    // fix #2928: (b) is ALSO required when an interface PROPERTY / INDEXER
+    // accessor slot holds an accessor compiled against a layout this
+    // instantiation's objects do not have — the itable rebuild below is the only
+    // place those slots are patched, and #1240's `layoutDiffers` trigger asks
+    // about `ts`'s own struct (which is absent from `structs_` for a class whose
+    // template struct was never built). Asking the accessor's own question here
+    // means the rebuild cannot be missed because the trigger was measured on a
+    // different class than the one whose body is in the slot.
+    if (!needsSpecItable) {
+        std::vector<const sema::TypeSymbol*> supers;
+        collectTypeAndBases(ts, supers);
+        for (const sema::TypeSymbol* iface : supers) {
+            if (iface->kind != ast::TypeDeclKind::Interface) continue;
+            for (sema::Symbol* m : iface->members) {
+                auto* ip = dynamic_cast<sema::PropertySymbol*>(m);
+                if (!ip) continue;
+                const sema::PropertySymbol* pimpl =
+                    ip->isIndexer ? classIndexerImplementing(ts, ip)
+                                  : classPropertyByName(ts, ip->name);
+                if (!pimpl || !pimpl->parent) continue;
+                if (instanceLayoutDiffersFromErasedTemplate(pimpl->parent)) {
+                    needsSpecItable = true;
+                    break;
+                }
+            }
+            if (needsSpecItable) break;
+        }
+    }
+
     // fix #2906 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
     // §12.1 "Members are non-virtual by default" / §12.7 "Type tests: `is`, `is
     // not`, `as`" / §2.8.3 rule 4, v0.240): condition (c) — a VIRTUAL METHOD
@@ -5385,8 +5514,74 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
     }
     const bool needsSpecVirtuals = !virtualSlotsToSpec.empty();
 
+    // fix #2928 (§14.1 "Generic declarations" / §12 "Inheritance and Dispatch" /
+    // §12.1 "Members are non-virtual by default" / §23 "Properties and
+    // Indexers" / §2.8.3 rule 4, v0.240): condition (d) — the same defect as
+    // (c), ONE MEMBER KIND OVER. A virtual PROPERTY or INDEXER accessor slot
+    // carries no `sema::MethodSymbol`, so (c)'s loop skips it and the slot kept
+    // pointing at the accessor `declareVtables` emitted against the ERASED
+    // `T -> i32` template: `SEGV on unknown address 0xc ... in
+    // bz$D2$Score$propget` for `class D2<U> : GBase<string>` read through a
+    // `GBase<string>`-typed variable. The SETTER twin is worse than a fault — it
+    // is a wrong-offset WRITE, measured to overwrite the neighbouring `owned`
+    // field's pointer and then SEGV inside the disposer (§28.4/§28.5), so the
+    // corruption surfaces nowhere near the accessor.
+    //
+    // The QUESTION IS THE SAME PROPERTY (c) asks, not an enumeration of accessor
+    // shapes: `instanceLayoutDiffersFromErasedTemplate(impl->parent)`, asked
+    // about the class that DECLARES the accessor — the class whose `classStruct`
+    // that body GEPs. False for a non-generic declarer, for `T = int`, and for
+    // every generic class whose storage sequence does not move; all of those keep
+    // the shared slot with no behaviour change.
+    //
+    // Collection is deliberately SIDE-EFFECT-FREE (map lookups and the pure
+    // layout predicate only): every body emission must happen AFTER the vtable
+    // global is registered below, for the re-entrancy reason #2906 records.
+    struct AccessorSlotSpec {
+        unsigned slot;
+        sema::PropertySymbol* impl;
+        bool isSet;
+    };
+    std::vector<AccessorSlotSpec> accessorSlotsToSpec;
+    {
+        auto vmIt = vtableMethods_.find(ts);
+        auto* sharedInitPeek =
+            llvm::dyn_cast<llvm::ConstantArray>(shared->getInitializer());
+        unsigned nElems =
+            sharedInitPeek
+                ? llvm::cast<llvm::ArrayType>(shared->getValueType())
+                      ->getNumElements()
+                : 0u;
+        if (vmIt != vtableMethods_.end() && sharedInitPeek) {
+            for (std::size_t i = 0; i < vmIt->second.size(); ++i) {
+                const VSlot& vs = vmIt->second[i];
+                if (vs.method || !vs.prop) continue;
+                unsigned slot = kVirtualMethodsBase + static_cast<unsigned>(i);
+                if (slot >= nElems) continue;
+                // Resolve the most-derived implementation exactly as buildVtable
+                // does, so this asks about the accessor that IS in the slot.
+                sema::PropertySymbol* impl =
+                    vs.prop->isIndexer ? classIndexerMatching(ts, vs.prop)
+                                       : classPropertyByName(ts, vs.prop->name);
+                if (!impl || !impl->parent) continue;
+                llvm::Function* canon =
+                    templateAccessorFn(impl, vs.isSet);
+                // Only a slot that still holds the shared TEMPLATE accessor is
+                // ours to replace (the #2906 guard, verbatim in intent).
+                if (!canon ||
+                    sharedInitPeek->getAggregateElement(slot) !=
+                        llvm::cast<llvm::Constant>(canon))
+                    continue;
+                if (!instanceLayoutDiffersFromErasedTemplate(impl->parent))
+                    continue;
+                accessorSlotsToSpec.push_back({slot, impl, vs.isSet});
+            }
+        }
+    }
+    const bool needsSpecAccessors = !accessorSlotsToSpec.empty();
+
     if (!needsSpecDispose && !needsSpecItable && !needsSpecDescriptor &&
-        !needsSpecVirtuals)
+        !needsSpecVirtuals && !needsSpecAccessors)
         return shared;
 
     // #1843: when the instantiation needs a per-monomorphization descriptor,
@@ -5514,6 +5709,48 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
                         buildSpecializedMethodFn(impl, ci, paramTys))
                     newItabElems[mi] = llvm::cast<llvm::Constant>(specFn);
             }
+            // fix #2928 (§14.1 / §12 / §13 / §23 / §2.8.3 rule 4, v0.240): the
+            // INTERFACE-TYPED face of the accessor defect. The loop above
+            // rewrites METHOD indices only, and the slot-by-slot copy that
+            // precedes it carries an interface PROPERTY / INDEXER accessor slot
+            // forward verbatim — so the specialized itable kept pointing at the
+            // erased template accessor. Measured on a `GBase<T> : IScore` read
+            // through an `IScore` reference at `T = string`:
+            // `SEGV ... in bz$GBase$Score$propget`.
+            //
+            // Same predicate as (d): the layout of the class that DECLARES the
+            // implementation. The slot INDEX comes from ifacePropertyGetIndex_ /
+            // ifacePropertySetIndex_, the maps Pass D's fill and every dispatch
+            // site already agree on, so this cannot drift from that numbering.
+            for (sema::Symbol* m : iface->members) {
+                auto* ip = dynamic_cast<sema::PropertySymbol*>(m);
+                if (!ip) continue;
+                const sema::PropertySymbol* pimpl =
+                    ip->isIndexer ? classIndexerImplementing(ts, ip)
+                                  : classPropertyByName(ts, ip->name);
+                if (!pimpl || !pimpl->parent) continue;
+                if (!instanceLayoutDiffersFromErasedTemplate(pimpl->parent))
+                    continue;
+                auto patchSlot = [&](bool isSet, unsigned si) {
+                    if (si >= newItabElems.size()) return;
+                    llvm::Function* canon = templateAccessorFn(pimpl, isSet);
+                    if (!canon ||
+                        newItabElems[si] != llvm::cast<llvm::Constant>(canon))
+                        return;
+                    llvm::Function* specFn =
+                        buildSpecializedAccessorFn(ts, pimpl, isSet);
+                    if (!specFn || specFn == canon) return;
+                    if (specFn->getFunctionType() != canon->getFunctionType())
+                        return;
+                    newItabElems[si] = llvm::cast<llvm::Constant>(specFn);
+                };
+                if (auto git = ifacePropertyGetIndex_.find(ip);
+                    git != ifacePropertyGetIndex_.end())
+                    patchSlot(/*isSet=*/false, git->second);
+                if (auto sit2 = ifacePropertySetIndex_.find(ip);
+                    sit2 != ifacePropertySetIndex_.end())
+                    patchSlot(/*isSet=*/true, sit2->second);
+            }
             auto* newItabArrTy = llvm::ArrayType::get(ptrTy(), newItabElems.size());
             auto* newItabGV = new llvm::GlobalVariable(
                 *module_, newItabArrTy, /*isConstant=*/true,
@@ -5562,6 +5799,30 @@ llvm::GlobalVariable* Emitter::specializedVtableFor(const sema::TypeSymbol* ts) 
         llvm::Function* specFn = buildSpecializedMethodFn(impl, ci, paramTys);
         if (!specFn || specFn->getFunctionType() != concFnTy) continue;
         elems[slot] = llvm::cast<llvm::Constant>(specFn);
+    }
+
+    // (d) fix #2928: the PROPERTY / INDEXER accessor slots proved above to hold
+    // an accessor compiled against a layout this instantiation's objects do not
+    // have. `buildSpecializedAccessorFn` re-lowers the accessor body under the
+    // active substitution — the accessor twin of (c)'s `buildSpecializedMethodFn`
+    // and for the identical reason: the re-lowered body's GEPs run against
+    // `classStruct(...)` under THIS substitution rather than the erased template
+    // struct.
+    //
+    // A slot whose specialization could not be built, or whose built signature
+    // does not match the slot's fixed ABI (`virtual property Item: T` moves the
+    // getter's return type, and the indirect call at the receiver's static type
+    // would mistype it), is LEFT ALONE — falling back to exactly today's
+    // (template) content rather than installing a function the call would
+    // mistype.
+    for (const auto& as : accessorSlotsToSpec) {
+        llvm::Function* canon = templateAccessorFn(as.impl, as.isSet);
+        if (!canon) continue;
+        llvm::Function* specFn =
+            buildSpecializedAccessorFn(ts, as.impl, as.isSet);
+        if (!specFn || specFn == canon) continue;
+        if (specFn->getFunctionType() != canon->getFunctionType()) continue;
+        elems[as.slot] = llvm::cast<llvm::Constant>(specFn);
     }
 
     // Patch the remaining slots and finalize the initializer of the global
