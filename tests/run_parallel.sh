@@ -173,7 +173,7 @@ for (( b = 0; b < nbin; b++ )); do
             shard_rc=1
             crashed_shards+=("$name/$i")
         fi
-        line="$(grep -E '^[0-9]+ passed, [0-9]+ failed' "$log" 2>/dev/null | tail -1)"
+        line="$(grep -a -E '^[0-9]+ passed, [0-9]+ failed' "$log" 2>/dev/null | tail -1)"
         if [[ -n "$line" ]]; then
             b_summaries=$(( b_summaries + 1 ))
         else
@@ -240,7 +240,7 @@ fi
 end=$(date +%s)
 
 # Surface any failing test names across all shards.
-fail_lines="$(grep -hE '^\[ FAIL \]' "$logdir"/shard.*.log 2>/dev/null || true)"
+fail_lines="$(grep -a -hE '^\[ FAIL \]' "$logdir"/shard.*.log 2>/dev/null || true)"
 if [[ -n "$fail_lines" ]]; then
     echo "--- failing tests ---"
     echo "$fail_lines"
@@ -284,7 +284,7 @@ if [[ "${#crashed_shards[@]}" -gt 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 
     fi
     for s in "${crashed_shards[@]:-}"; do
         [[ -n "$s" ]] || continue
-        last="$(grep -E '^\[ RUN' "$logdir/shard.${s%/*}.${s#*/}.log" 2>/dev/null | tail -1 | sed -E 's/^\[ RUN  \] //')"
+        last="$(grep -a -E '^\[ RUN' "$logdir/shard.${s%/*}.${s#*/}.log" 2>/dev/null | tail -1 | sed -E 's/^\[ RUN  \] //')"
         echo "##   shard $s exited nonzero — died on: ${last:-<none>}"
     done
     echo "############################################################"
@@ -294,7 +294,7 @@ fi
 # imbalance). Harvested from each shard's SHARD_ELAPSED marker before cleanup.
 for (( b = 0; b < nbin; b++ )); do
     for (( i = 0; i < conc; i++ )); do
-        et="$(grep -oE 'SHARD_ELAPSED [0-9.]+' "$logdir/shard.${names[$b]}.$i.log" 2>/dev/null | awk '{print $2}' | tail -1)"
+        et="$(grep -a -oE 'SHARD_ELAPSED [0-9.]+' "$logdir/shard.${names[$b]}.$i.log" 2>/dev/null | awk '{print $2}' | tail -1)"
         [[ -n "$et" ]] && echo "shard ${names[$b]}.$i: ${et}s"
     done
 done

@@ -345,7 +345,7 @@ for f in "$@"; do
     "$DH" suite env BEZEL_TEST_FILTER="$f" "$bin" 2>&1 | tee "$blog"
     [ "${PIPESTATUS[0]}" -ne 0 ] && f_rc=1
     cat "$blog" >> "$log"
-    summ="$(grep -oE '[0-9]+ passed, [0-9]+ failed' "$blog" | tail -1)"
+    summ="$(grep -a -oE '[0-9]+ passed, [0-9]+ failed' "$blog" | tail -1)"
     n="$(printf '%s' "$summ" | awk '{print $1 + $3}')"   # passed + failed
     f_ran=$(( f_ran + ${n:-0} ))
     # Enumeration said this binary holds $want matching tests; anything less
