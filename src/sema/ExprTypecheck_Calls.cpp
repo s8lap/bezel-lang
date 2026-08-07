@@ -722,9 +722,17 @@ bool containsMethodTypeParam(
     return containsMethodTypeParam(t->arrayElement, gpNames);
 }
 
+}  // namespace
+
 // §22.3 / §14.5 (#2266): true when `t` mentions one of `tpNames` ANYWHERE in its
 // structure. It additionally walks function parameter/return slots beyond
 // containsMethodTypeParam's generic arguments and inline-array element.
+//
+// #2926 gave it EXTERNAL linkage (it is declared in ExprTypecheck_impl.hpp and
+// lifted out of this file's anonymous namespace) so the field / auto-property /
+// default-value assignability checks defer on an unsubstituted type parameter
+// through the SAME superset walk, rather than growing a fourth private copy of
+// "does this type mention a type parameter?".
 //
 // It gates a SKIP of a rejection: checkArgsAgainstParams' §22.3 ref/out
 // exact-type check defers every parameter this returns true for to §14.5's
@@ -752,6 +760,8 @@ bool refOutParamTypeMentionsTypeParam(
         if (refOutParamTypeMentionsTypeParam(fp.type, tpNames)) return true;
     return refOutParamTypeMentionsTypeParam(t->funcReturn, tpNames);
 }
+
+namespace {
 
 // A printable spelling for a resolved TypeRef, used by the §14.5 ref/out
 // exact-unification diagnostics (checkGenericRefOutExactUnification below).

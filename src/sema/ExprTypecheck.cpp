@@ -3042,7 +3042,7 @@ TypeRef* ExprTC::narrowIntConstantToTarget(const ast::Expr* fromExpr,
     // checkAssignable's own §5.1 rejection reports them.
     if (!cv || !fitsInIntType(*cv, tgt)) return from;
     // §5.1 "Nullable conversions": "The two rules compose through at most one
-    // `?` on each side (§7.10: `?` is idempotent): `S` converts to `T?` via
+    // `?` on each side ([§7.10]: `?` is idempotent): `S` converts to `T?` via
     // `S → T → T?`". Re-typing to `to` itself (nullability included) is what
     // the local-declaration path has always done — codegen lowers an integer
     // literal at `lowerPrimitive(primitive)` and ignores `nullable`, so the
@@ -3050,6 +3050,25 @@ TypeRef* ExprTC::narrowIntConstantToTarget(const ast::Expr* fromExpr,
     // §7.2's wrap (#2903).
     ctx_.setExprType(const_cast<ast::Expr*>(fromExpr), to);
     return to;
+}
+
+// §14.1 (#2926) — see the declaration comment. The type-parameter names in
+// scope at a member declaration are the enclosing TYPE's (a field / property /
+// parameter slot can name them) plus, for a parameter default, the enclosing
+// METHOD's own. Both sets are collected because a field is checked while
+// visiting the type and a default while visiting the method, and one call site
+// must not have to know which.
+bool ExprTC::mentionsUnsubstitutedTypeParam(const TypeRef* t) const {
+    if (!t) return false;
+    std::unordered_set<std::string_view> tpNames;
+    if (currentType_)
+        for (Symbol* gp : currentType_->genericParams)
+            if (gp) tpNames.insert(gp->name);
+    if (currentMethodDecl_)
+        for (const auto& gp : currentMethodDecl_->genericParams)
+            tpNames.insert(gp.name);
+    if (tpNames.empty()) return false;
+    return refOutParamTypeMentionsTypeParam(t, tpNames);
 }
 
 // Slices T1/T4: assignability check (§5.1, §7, §12 subtyping).
@@ -8568,13 +8587,19 @@ void ExprTC::runMethodBody(
         // halves: the re-type (narrowIntConstantToTarget) for an in-range
         // constant, and the §5.1 rejection for everything the rule does not
         // admit.
+        //
+        // §14.1: a parameter whose declared type MENTIONS an unsubstituted
+        // generic type parameter is checked at the INSTANTIATION — the same
+        // deferral §22.3's ref/out check makes, for the same reason (#1756).
         if (params[i].type) {
             if (TypeRef* pty = ctx_.resolvedType(*params[i].type))
-                checkAssignable(ctx_.exprType(*params[i].defaultValue), pty,
-                                params[i].defaultValue->span.begin,
-                                std::string("default value of parameter `") +
-                                    std::string(params[i].name) + "`",
-                                params[i].defaultValue.get());
+                if (!mentionsUnsubstitutedTypeParam(pty))
+                    checkAssignable(
+                        ctx_.exprType(*params[i].defaultValue), pty,
+                        params[i].defaultValue->span.begin,
+                        std::string("default value of parameter `") +
+                            std::string(params[i].name) + "`",
+                        params[i].defaultValue.get());
         }
     }
     forbiddenForwardParams_.clear();
@@ -8854,6 +8879,53 @@ void ExprTC::visitMember(const ast::Member& m) {
                     }
                 }
             }
+            // fix #2926 (§5.1 / §5.2 / §7.9, v0.240): a field initializer had
+            // NEVER been checked for assignability — not incompletely, ABSENT.
+            // This arm visited the expression, applied §4.2's wide-literal hint
+            // and §17.7's typeless-`new`, and stopped; the LOCAL declaration arm
+            // it otherwise mirrors ends in exactly this `checkAssignable`.
+            // MEASURED on 618c0c8:
+            //
+            //   public _over: byte := 300;    compiles; reads 44 — §5.1 says
+            //                                 verbatim that a constant "whose
+            //                                 value does not fit the target's
+            //                                 range is a **compile error** at
+            //                                 the conversion site — never a
+            //                                 silent truncation"
+            //   public _q: byte := Src._n;    compiles and reads 200, where
+            //                                 §5.1 says "a run-time `int` value
+            //                                 still requires the explicit
+            //                                 `byte(x)` narrowing of [§5.2]"
+            //
+            // and the hole admitted any type mismatch a field initializer can
+            // express, not only numeric ones. #2903 fixed the CODEGEN half of
+            // this same gap (the store now reaches the slot at the slot's
+            // width, so case 1 truncates consistently instead of also
+            // corrupting the neighbouring field); the missing REJECT is here.
+            //
+            // Run with the scope still set (moduleScope_ for a field
+            // initializer, #582) so `narrowIntConstantToTarget`'s fold can
+            // resolve a `const` reference, and BEFORE the restore below.
+            // `checkAssignable` no-ops on a null `from` — an untyped collection
+            // literal (§15.4), an unresolved name — so this reports only what
+            // the type lattice can actually judge.
+            //
+            // §14.1: a field whose declared type MENTIONS an unsubstituted
+            // generic type parameter is checked at the INSTANTIATION, not at
+            // the declaration — `class Box<U> { public V: U := Box.Noop; }`
+            // (#2068) is well-typed at `Box<(int) -> int>`, and judging the
+            // bare `U` here made checkAssignable's Function→non-Function arm
+            // reject it. That is exactly the incompleteness its contract says
+            // not to judge, and #1756's four reverts are the precedent.
+            if (fd->type) {
+                if (TypeRef* fty = ctx_.resolvedType(*fd->type))
+                    if (!mentionsUnsubstitutedTypeParam(fty))
+                        checkAssignable(ctx_.exprType(*fd->initializer), fty,
+                                        fd->initializer->span.begin,
+                                        std::string("initializer for field `") +
+                                            std::string(fd->name) + "`",
+                                        fd->initializer.get());
+            }
             currentScope_ = saveScope;
             inFieldInitializer_ = save;
             // §22.13: a static readonly field may not forward-reference a later
@@ -9115,6 +9187,24 @@ void ExprTC::visitMember(const ast::Member& m) {
             }
             visitExpr(*pd->autoInitializer);
             currentLiteralWideningHint_ = savedPropHint;
+            // fix #2926 (§5.1 / §23.1, v0.240): an AUTO-PROPERTY initializer
+            // initializes the compiler-generated backing field (§23.1) at the
+            // same construction-time step §22.8 governs for an explicit field
+            // initializer — §11.1 speaks of "field and property initializers"
+            // together as one concept, which is why this arm already mirrors
+            // the FieldDecl arm's §4.2 hint. It must mirror its §5.1 check too:
+            // `public property P: byte := 300;` truncated exactly as the field
+            // spelling did. Same scope discipline as the FieldDecl arm.
+            if (pd->type) {
+                if (TypeRef* pty = ctx_.resolvedType(*pd->type))
+                    if (!mentionsUnsubstitutedTypeParam(pty))
+                        checkAssignable(
+                            ctx_.exprType(*pd->autoInitializer), pty,
+                            pd->autoInitializer->span.begin,
+                            std::string("initializer for property `") +
+                                std::string(pd->name) + "`",
+                            pd->autoInitializer.get());
+            }
             currentScope_ = saveScope;
             inFieldInitializer_ = save;
         }

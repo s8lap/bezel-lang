@@ -79,6 +79,16 @@ void reportCollectionLiteralBadTarget(DiagnosticEngine& diags,
 // §27.3 divergent-return check (#2107).
 bool functionSlotTypeRefEqual(const TypeRef* a, const TypeRef* b);
 
+// §14.1 (#1756's lesson, reused by #2926): does `t` mention any of `tpNames`
+// ANYWHERE — as itself, a generic argument, an inline-array element, or a
+// function parameter/return? Defined in ExprTypecheck_Calls.cpp for the §22.3
+// ref/out deferral gate; declared here so the field-initializer check can use
+// the SAME superset walk. Answering true only DEFERS a check, so a superset is
+// the safe direction — a MISSED mention is what makes a check run against an
+// unsubstituted type parameter and false-reject.
+bool refOutParamTypeMentionsTypeParam(
+    const TypeRef* t, const std::unordered_set<std::string_view>& tpNames);
+
 class ExprTC {
 public:
     ExprTC(SemaContext& ctx) : ctx_(ctx) {}
@@ -1042,6 +1052,17 @@ private:
     // hand-maintained list of statement kinds.
     TypeRef* narrowIntConstantToTarget(const ast::Expr* fromExpr,
                                        TypeRef* from, TypeRef* to);
+
+    // §14.1 (#2926): does `t` mention a generic type parameter that is still
+    // UNSUBSTITUTED at this point — one of the enclosing type's (currentType_)
+    // or the enclosing method's (currentMethodDecl_)? Such a slot's real type
+    // is only known at the instantiation, so `checkAssignable`'s contract —
+    // "conservatively skips everything else … so it never false-positives
+    // while the type lattice is incomplete" — says do not judge it here.
+    // Uses the SUPERSET walk `refOutParamTypeMentionsTypeParam`, the same one
+    // §22.3's ref/out deferral uses for the same reason (#1756: a narrower
+    // guard is what made that check false-reject and get reverted four times).
+    bool mentionsUnsubstitutedTypeParam(const TypeRef* t) const;
 
     // Slice S18: a condition must be `bool` (§21.2 if, §21.3 while,
     // §20 if-expression). Only flags when the condition has a resolved
