@@ -10828,7 +10828,8 @@ void Emitter::mapSuspendLocalSlot(const ast::Node* declNode,
 // synthetic built-in TypeSymbol has (sema/Symbol.hpp: moduleName is "Empty
 // only for a synthetic TypeSymbol with no real module").
 std::string Emitter::builtinReceiverOfMemberCall(const ast::Expr* e,
-                                                 std::string* outMember) {
+                                                 std::string* outMember,
+                                                 std::string* outAppliedMember) {
     auto* call = dynamic_cast<const ast::CallExpr*>(e);
     if (!call) return {};
     // SEMA MUST BE AS IGNORANT AS CODEGEN. A caller has already established
@@ -10858,6 +10859,34 @@ std::string Emitter::builtinReceiverOfMemberCall(const ast::Expr* e,
     if (ctx_.exprType(*call)) return {};
     auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call->callee.get());
     if (!ma || !ma->target) return {};
+    // fix #2976 (stdlib §6.5, v0.240): THE FAILING HOP NEED NOT BE THE CALL'S
+    // OWN CALLEE. `src.Event.Subscribe(Handle)` on an `EventSource<int>` is
+    // this exact predicate's shape one hop lower: `Event` names nothing on
+    // §6.5's closed surface (`Subscribe`/`Raise`/`Add`/`Remove` — there is no
+    // `Event` member), and `Subscribe` — a REAL member — is then applied to
+    // that nothing. Testing only `call->callee`'s immediate target asked about
+    // `src.Event`'s TYPE, which sema never set, so the whole initializer
+    // degraded to a zero-initialized slot behind #2434's warning and THE
+    // SUBSCRIPTION WAS NEVER CREATED: the program printed its trailing line
+    // and exited 0 with the handler unfired. Silently omitting work the user
+    // asked for is strictly worse than #2935's plausible numeric 0.
+    //
+    // So walk DOWN the member-access spine to the innermost hop, and stop the
+    // moment sema typed one. That keeps #2935's "sema must be as ignorant as
+    // codegen" conjunct at EVERY hop rather than only at the last: a chain
+    // whose inner hop sema DID type is left alone here exactly as before (that
+    // hop is a real member, so the failure — if any — is above it and this
+    // predicate must not blame the inner name for it). The hop we stop at is
+    // the one reported, because it is the first thing on the spine that
+    // nothing could make sense of; blaming `Subscribe` would be false.
+    const ast::MemberAccessExpr* appliedTo = nullptr;
+    while (auto* inner =
+               dynamic_cast<const ast::MemberAccessExpr*>(ma->target.get())) {
+        if (!inner->target) break;
+        if (ctx_.exprType(*inner)) break;   // sema typed this hop — stop above it
+        appliedTo = ma;
+        ma = inner;
+    }
     const sema::TypeRef* rt = ctx_.exprType(*ma->target);
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return {};
     const sema::TypeSymbol* rd = rt->declaration;
@@ -10865,7 +10894,24 @@ std::string Emitter::builtinReceiverOfMemberCall(const ast::Expr* e,
     std::string rn = rd ? std::string(rd->name) : std::string(rt->headName());
     if (rn.empty() || !sema::isBuiltinTypeName(rn)) return {};
     if (outMember) *outMember = std::string(ma->member);
+    if (outAppliedMember && appliedTo)
+        *outAppliedMember = std::string(appliedTo->member);
     return rn;
+}
+
+
+// fix #2976 (stdlib §6.5, v0.240): the parenthetical the two value-demanding
+// diagnostics append when the failing hop was NOT the call's own callee — see
+// builtinReceiverOfMemberCall. A reader who is told only "`Event` … produced no
+// value" for `src.Event.Subscribe(h)` still has to work out where `Subscribe`
+// went; saying so is the difference between a diagnostic that is merely true
+// and one that identifies the edit to make.
+std::string Emitter::builtinMemberChainNote(const std::string& member,
+                                            const std::string& appliedMember) {
+    if (appliedMember.empty()) return {};
+    return " (the failing hop is `" + member + "`; `." + appliedMember +
+           "(\xE2\x80\xA6)` was then applied to its missing value, so naming `" +
+           appliedMember + "` here would be wrong \xE2\x80\x94 #2976)";
 }
 
 void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
@@ -11760,10 +11806,11 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         const sema::TypeRef* initTy = init ? ctx_.exprType(*init) : nullptr;
         const bool unitInitializer =
             initTy && initTy->kind == sema::TypeRef::Kind::Unit;
-        std::string initMember;
+        std::string initMember, initAppliedMember;
         const std::string builtinRecvName =
             unitInitializer ? std::string()
-                            : builtinReceiverOfMemberCall(init, &initMember);
+                            : builtinReceiverOfMemberCall(init, &initMember,
+                                                          &initAppliedMember);
         if (unitInitializer) {
             // (a) — nothing to report.
         } else if (!builtinRecvName.empty() &&
@@ -11777,7 +11824,8 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 "it: either `" + initMember + "` is not on that surface (a "
                 "misspelling), or it is documented but yields nothing here "
                 "(#2935 \xE2\x80\x94 if it is documented and should yield a "
-                "value, it is unimplemented, #2457)");
+                "value, it is unimplemented, #2457)" +
+                builtinMemberChainNote(initMember, initAppliedMember));
         } else if (init && !ctx_.diagnostics().hasErrors()) {
             ctx_.diagnostics().report(
                 Severity::Warning, init->span.begin,

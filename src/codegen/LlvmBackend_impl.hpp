@@ -9226,8 +9226,21 @@ private:
     // both for "nothing lowered this" and for "an arm lowered it and the result
     // is unit". See the call site in lowerLocalDecl for the full derivation and
     // the measured counterexamples.
-    std::string builtinReceiverOfMemberCall(const ast::Expr* e,
-                                            std::string* outMember);
+    //
+    // fix #2976 (stdlib §6.5, v0.240): the failing hop is found by walking DOWN
+    // the member-access spine while sema typed no hop, so `src.Event.Subscribe(h)`
+    // reports `Event` on `EventSource` rather than falling through untested.
+    // `outAppliedMember` receives the member that was applied to the failing
+    // hop's missing value (empty when the failing hop IS the call's callee);
+    // `builtinMemberChainNote` renders it.
+    std::string builtinReceiverOfMemberCall(
+        const ast::Expr* e, std::string* outMember,
+        std::string* outAppliedMember = nullptr);
+
+    // fix #2976: the trailing clause naming the applied-to member, shared by
+    // both value-demanding diagnostics. Empty when nothing was applied.
+    static std::string builtinMemberChainNote(const std::string& member,
+                                              const std::string& appliedMember);
 
     // #2182 / §28.3: consume lastLambdaCapturedCells_ — for each freshly-boxed
     // capture cell of a cellFreeEligible_ local (populated by lowerLambda),

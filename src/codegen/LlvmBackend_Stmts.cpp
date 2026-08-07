@@ -1674,10 +1674,11 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
             rs->value ? ctx_.exprType(*rs->value) : nullptr;
         const bool unitReturnValue =
             retValTy && retValTy->kind == sema::TypeRef::Kind::Unit;
-        std::string retMember;
+        std::string retMember, retAppliedMember;
         const std::string retBuiltinRecv =
             (rs->value && !v && !unitReturnValue)
-                ? builtinReceiverOfMemberCall(rs->value.get(), &retMember)
+                ? builtinReceiverOfMemberCall(rs->value.get(), &retMember,
+                                              &retAppliedMember)
                 : std::string();
         if (unitReturnValue) {
             // (a) — nothing to report.
@@ -1692,7 +1693,8 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 "it: either `" + retMember + "` is not on that surface (a "
                 "misspelling), or it is documented but yields nothing here "
                 "(#2935 \xE2\x80\x94 if it is documented and should yield a "
-                "value, it is unimplemented, #2457)");
+                "value, it is unimplemented, #2457)" +
+                builtinMemberChainNote(retMember, retAppliedMember));
         } else if (rs->value && !v && !ctx_.diagnostics().hasErrors()) {
             ctx_.diagnostics().report(
                 Severity::Warning, rs->value->span.begin,
