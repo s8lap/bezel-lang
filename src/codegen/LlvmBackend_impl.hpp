@@ -4766,6 +4766,22 @@ private:
     // specialized generic body that is not registered there.
     const sema::TypeSymbol* currentReceiverRecordType();
 
+    // fix #2972 (§12.3 / §11 / §31.4, v0.240): true when `e` is the `this` or
+    // `base` receiver keyword (Appendix A gives both as PrimaryExpr spellings
+    // of the enclosing instance; the parser produces an IdentifierExpr for
+    // each). Sema deliberately gives NEITHER an exprType inside a named-type
+    // member body — `ExprTC::resolveMemberAccess` reads `currentType_` directly
+    // and says so ("`this.X` — currentType_ takes precedence over name lookup
+    // so we don't have to teach `this` to be an expression with type
+    // currentType_") — so every codegen path keyed on the RECEIVER's static
+    // type must recognise these two spellings explicitly or silently miss them.
+    // (`choiceTypeOf` already carries the same recognition for `case this of`,
+    // #2047, and `currentReceiverRecordType` for a record `this`, #1759.)
+    static bool isThisOrBaseExpr(const ast::Expr& e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(&e);
+        return id && (id->name == "this" || id->name == "base");
+    }
+
     // §9 / §9.1 (#1759): a record has value semantics — assignment / return /
     // by-value argument copies the struct. Inside a record method `this` lowers
     // to a POINTER to the by-value receiver (CG29 / §9.2 / #794). When the whole

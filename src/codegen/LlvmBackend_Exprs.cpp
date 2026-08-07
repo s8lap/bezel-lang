@@ -4091,6 +4091,79 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             if (!isBuiltinEx && tt &&
                 tt->kind == sema::TypeRef::Kind::Named && tt->declaration)
                 isUserDerivedEx = hasBuiltinExceptionBase(tt->declaration);
+            // fix #2972 (§31.4 / §12.3 / §11 / §21.7, v0.240): Case B seen from
+            // INSIDE the subclass — `this.Message` (and `base.Message`, when the
+            // class base is itself a user exception subclass, which is the only
+            // spelling of `base` sema admits here today).
+            //
+            // Both tests above start `tt && …`, and `tt` is null for a `this` /
+            // `base` receiver: sema deliberately never types that identifier in
+            // a named-type body (see `isThisOrBaseExpr`). So this whole handler
+            // was skipped, the access fell through every remaining arm of
+            // lowerExpr, and the caller substituted a degrade. MEASURED on
+            // 618c0c8 across five frames — method, constructor, destructor,
+            // property accessor, lambda — every one of them broken, and the
+            // first three showing three DIFFERENT outcomes from the SAME
+            // missing receiver type:
+            //   * method body   — `return this.Message;` printed
+            //     "internal: return-value expression failed to lower … #2491"
+            //     and returned a NULL string; the caller SIGSEGV'd on it
+            //     (exit 139; under ASan "SEGV on unknown address 0x…08 …
+            //     address points to the zero page").
+            //   * constructor body — `_n := this.Message.Length;` compiled with
+            //     NO diagnostic at all and stored 0 (the message was "abcd").
+            //   * destructor body — `Console.WriteLine("…" + this.Message);`
+            //     compiled with NO diagnostic and the whole statement vanished.
+            // (The property accessor lost its access site's whole statement,
+            // also silently; the lambda returned 0.)
+            // The UNQUALIFIED spelling (`Message`, #625) works in all of them:
+            // its own bare-identifier arm keys on `currentThis_`, never on a
+            // receiver type. §11 puts no restriction on `this.`, and §12.3
+            // makes `base.` the ordinary way to reach a base implementation, so
+            // all three spellings must read the one slot.
+            //
+            // THE GATE, and why it reads SEMA'S RESOLUTION rather than
+            // re-deriving the receiver type here.
+            //
+            // What has to be true for the byte-8 read below to be correct is
+            // that the object `this` denotes carries the §31.4 header — which
+            // `classStruct` inserts for exactly the classes
+            // `hasBuiltinExceptionBase` accepts, i.e. `builtinExceptionBaseOf`,
+            // the ONE walk #2950 established. Sema's own arm for this access
+            // (`ExprTC::resolveMemberAccess`'s `isBuiltinExInheritedMember`)
+            // asks that SAME function, of the LEXICALLY ENCLOSING type — which
+            // is precisely the type of `this`. So sema having resolved the
+            // access through that arm IS the property, already decided by the
+            // same predicate the layout gate uses; the two cannot diverge.
+            //
+            // That arm is observable here as: the access is typed `string` and
+            // carries NO member symbol. A class that declares its own `Message`
+            // member instead resolves to that member's FieldSymbol /
+            // PropertySymbol and is excluded (verified: a subclass declaring
+            // `public property Message: string` reads its own property, not the
+            // header). A class with no `Message` at all is rejected by sema
+            // before codegen runs.
+            //
+            // Re-deriving the enclosing type in codegen was written first and
+            // ABANDONED, because there is no premise-free way to do it: the
+            // recovery available (reverse-look `currentFn_` in the emitters'
+            // memo caches, as `currentReceiverRecordType` / `choiceTypeOf` do)
+            // rests on "currentFn_'s owner is the type of currentThis_", and
+            // that is FALSE wherever an accessor body is INLINED at its access
+            // site — `currentThis_` is re-pointed at the receiver while
+            // `currentFn_` still belongs to the enclosing method. It also
+            // covered no lambda body. Keying on sema's resolution is total over
+            // frames — method, constructor, destructor, accessor (inlined or
+            // not), lambda — with no frame enumeration at all.
+            if (!isBuiltinEx && !isUserDerivedEx && !tt &&
+                    isThisOrBaseExpr(*ma->target)) {
+                const sema::TypeRef* accessTy = ctx_.exprType(*ma);
+                isUserDerivedEx =
+                    accessTy &&
+                    accessTy->kind == sema::TypeRef::Kind::Primitive &&
+                    accessTy->primitive == sema::PrimitiveType::String &&
+                    ctx_.exprSymbol(*ma) == nullptr;
+            }
             // #1266 / stdlib §2.17 / §31.4: `ex.InnerException!.Message` (a DIRECT
             // chain). sema does not type `ex.InnerException` (the builtin
             // TypeInitializationException carries no PropertyDecl for it), so `tt`
