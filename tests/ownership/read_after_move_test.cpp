@@ -16,7 +16,7 @@ std::string wrap(const std::string& body, const std::string& sig = "M()") {
     return std::string("module M; "
         "class T end T; class U end U; class Source end Source; "
         "class C "
-        "  public source: Source := null; "
+        "  public source: Source? := null; "
         "  public method ") + sig + " " + body + " end; "
         "end C;";
 }

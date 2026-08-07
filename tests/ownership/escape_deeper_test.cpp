@@ -56,12 +56,12 @@ std::string wrap(const std::string& method) {
         "module M; "
         "class R "
         "  public V: int := 0; "
-        "  public Inner: R := null; "
+        "  public Inner: R? := null; "
         "  destructor end destructor; "
         "end R; "
         "record Holder(Ref: R); "
         "class Box "
-        "  public Ref: R := null; "         // non-`owned` (borrow) field — escape target
+        "  public Ref: R? := null; "         // non-`owned` (borrow) field — escape target
         "  public owned Owned: R? := null; " // owned field for the clean owned-store controls
         "end Box; "
         "class C ") + method + " end C;";
@@ -104,7 +104,7 @@ BEZEL_TEST(own_field_store_escape, store_reborrow_of_using_var_into_this_field_d
     auto r = parseAndCheckOwnership(
         "module M; class R public V: int := 0; destructor end destructor; end R; "
         "class C "
-        "  public Held: R := null; "
+        "  public Held: R? := null; "
         "  public method Leak() "
         "    using var r := new R(); "
         "    this.Held := r; "

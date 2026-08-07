@@ -104,9 +104,7 @@ BEZEL_TEST(static_borrow_return_1547, local_reborrow_of_param_rejected) {
 // parameter with no receiver-rooted proof of outliving the call.
 BEZEL_TEST(static_borrow_return_1547, field_through_param_rejected) {
     auto r = parseAndCheckOwnership(mod(
-        "class Holder "
-        "  public Ref: Res := null; "
-        "end Holder; "
+        "class Holder(Ref: Res) "
         "class P "
         "  public static method GetField(h: Holder): Res => h.Ref; "
         "end P;"));

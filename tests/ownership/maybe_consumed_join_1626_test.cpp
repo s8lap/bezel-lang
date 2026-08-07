@@ -76,8 +76,8 @@ std::string wrap(const std::string& body) {
     return std::string("module M; "
         "class T end T; "
         "class Stream "
-        "  public Inner: Stream := null; "
-        "  public Other: Stream := null; "
+        "  public Inner: Stream? := null; "
+        "  public Other: Stream? := null; "
         "end Stream; "
         "class Sink "
         "  public method Take(owned s: Stream) "
@@ -85,7 +85,7 @@ std::string wrap(const std::string& body) {
         "  end Take; "
         "end Sink; "
         "class C "
-        "  public source: Stream := null; "
+        "  public source: Stream? := null; "
         "  public method M(cond: bool, a: bool, b: bool, sink: Sink) "
         ) + body + " end M; end C;";
 }

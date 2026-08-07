@@ -225,7 +225,7 @@ std::string wrapRefField(const std::string& method) {
         "module M; "
         "class R "
         "  public V: int := 0; "
-        "  public Inner: R := null; "
+        "  public Inner: R? := null; "
         "  destructor end destructor; "
         "end R; "
         "record Holder(Ref: R); "
@@ -254,7 +254,7 @@ BEZEL_TEST(own_indirect_escape, return_reborrow_of_using_var_diagnosed_28_3) {
 // source `obj`); returning `b` outlives `r`.
 BEZEL_TEST(own_indirect_escape, return_reborrow_of_reference_field_diagnosed_28_3) {
     auto r = parseAndCheckOwnership(wrapRefField(
-        "public static method Leak(): R "
+        "public static method Leak(): R? "
         "  using var r := new R(); "
         "  var b := r.Inner; "
         "  return b; "

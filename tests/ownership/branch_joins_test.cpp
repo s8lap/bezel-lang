@@ -21,11 +21,10 @@ std::string wrap(const std::string& body) {
     return std::string("module M; "
         "class T end T; "
         "class Stream "
-        "  public Inner: Stream := null; "
-        "  public Other: Stream := null; "
+        "  public Inner: Stream? := null; "
+        "  public Other: Stream? := null; "
         "end Stream; "
-        "class C "
-        "  public source: Stream := null; "
+        "class C(source: Stream) "
         "  public method M(cond: bool, a: bool, b: bool) "
         ) + body + " end M; end C;";
 }
@@ -34,7 +33,7 @@ std::string wrap(const std::string& body) {
 
 BEZEL_TEST(own_join, owned_vs_borrowed_at_merge_diagnosed) {
     auto r = parseAndCheckOwnership(wrap(
-        "var x: Stream; "
+        "var x: Stream?; "
         "if cond then x := new Stream(); "
         "else x := source.Inner; "
         "end;"));
@@ -64,7 +63,7 @@ BEZEL_TEST(own_join, owned_on_both_branches_and_discharged_clean) {
 
 BEZEL_TEST(own_join, borrowed_on_both_branches_clean) {
     auto r = parseAndCheckOwnership(wrap(
-        "var x: Stream; "
+        "var x: Stream?; "
         "if cond then x := source.Inner; "
         "else x := source.Other; "
         "end;"));
@@ -114,7 +113,7 @@ BEZEL_TEST(own_join, polynull_absorbs_borrowed) {
 BEZEL_TEST(own_join, three_branch_chain_with_clash) {
     // if-elif-else, one branch produces owned, one borrowed → error.
     auto r = parseAndCheckOwnership(wrap(
-        "var x: Stream; "
+        "var x: Stream?; "
         "if a then x := new Stream(); "
         "elif b then x := new Stream(); "
         "else x := source.Inner; "

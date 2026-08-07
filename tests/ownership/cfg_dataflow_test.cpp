@@ -28,11 +28,10 @@ std::string wrap(const std::string& body) {
         "class T end T; "
         "class Stream "
         "  destructor end destructor; "
-        "  public Inner: Stream := null; "
-        "  public Other: Stream := null; "
+        "  public Inner: Stream? := null; "
+        "  public Other: Stream? := null; "
         "end Stream; "
-        "class C "
-        "  public source: Stream := null; "
+        "class C(source: Stream) "
         "  public method M(cond: bool, items: Stream) "
         ) + body + " end M; end C;";
 }
@@ -79,7 +78,7 @@ BEZEL_TEST(own_cfg, while_body_read_after_move_diagnosed) {
 BEZEL_TEST(own_cfg, if_else_clash_inside_do_end) {
     auto r = parseAndCheckOwnership(wrap(
         "do "
-        "  var x: Stream; "
+        "  var x: Stream?; "
         "  if cond then x := new Stream(); "
         "  else x := source.Inner; "
         "  end; "

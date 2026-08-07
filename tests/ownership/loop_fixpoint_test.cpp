@@ -41,7 +41,7 @@ std::string wrap(const std::string& body,
         "class T end T; "
         "class Stream "
         "  destructor end destructor; "
-        "  public Inner: Stream := null; "
+        "  public Inner: Stream? := null; "
         "end Stream; "
         "class C "
         "  public owned source: Stream := new Stream(); "  // owned (the comment's

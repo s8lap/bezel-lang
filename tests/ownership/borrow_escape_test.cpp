@@ -140,8 +140,8 @@ BEZEL_TEST(own_escape, return_value_element_get_on_using_var_collection_clean) {
 BEZEL_TEST(own_escape, return_reference_field_on_using_var_still_diagnosed) {
     auto r = parseAndCheckOwnership(
         "module M; class View end View; "
-        "class Connection public Inner: View := null; end Connection; "
-        "class C public method Leak(): View "
+        "class Connection public Inner: View? := null; end Connection; "
+        "class C public method Leak(): View? "
         "  using var c := new Connection(); "
         "  return c.Inner; "
         "end Leak; end C;");
@@ -193,11 +193,11 @@ BEZEL_TEST(own_escape, return_reference_user_indexer_on_using_var_diagnosed) {
     auto r = parseAndCheckOwnership(
         "module M; class R public V: int := 0; end R; "
         "class C "
-        "  public _slot: R := null; "
-        "  public property [i: int]: R "
+        "  public _slot: R? := null; "
+        "  public property [i: int]: R? "
         "    get => _slot; "
         "  end; "
-        "  public static method Leak(): R "
+        "  public static method Leak(): R? "
         "    using var c := new C(); "
         "    var v := c[0]; "
         "    return v; "
@@ -379,10 +379,10 @@ BEZEL_TEST(own_escape, return_class_field_from_using_var_still_diagnosed_641) {
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Obj "
-        "  public Child: Obj := null; "
+        "  public Child: Obj? := null; "
         "  destructor end destructor; "
         "end Obj; "
-        "class C public static method Leak(): Obj "
+        "class C public static method Leak(): Obj? "
         "  using var popped := new Obj(); "
         "  return popped.Child; "
         "end Leak; end C;");
@@ -396,10 +396,10 @@ BEZEL_TEST(own_escape, return_class_field_indirect_from_using_var_still_diagnose
     auto r = parseAndCheckOwnership(
         "module M; "
         "class Obj "
-        "  public Child: Obj := null; "
+        "  public Child: Obj? := null; "
         "  destructor end destructor; "
         "end Obj; "
-        "class C public static method Leak(): Obj "
+        "class C public static method Leak(): Obj? "
         "  using var popped := new Obj(); "
         "  var x := popped.Child; "
         "  return x; "
@@ -469,8 +469,8 @@ BEZEL_TEST(own_escape, return_member_call_on_plain_var_diagnosed) {
 BEZEL_TEST(own_escape, return_reference_field_on_plain_var_diagnosed) {
     auto r = parseAndCheckOwnership(
         "module M; class View end View; "
-        "class Connection public Inner: View := null; end Connection; "
-        "class C public method Leak(): View "
+        "class Connection public Inner: View? := null; end Connection; "
+        "class C public method Leak(): View? "
         "  var c := new Connection(); "
         "  return c.Inner; "
         "end Leak; end C;");
