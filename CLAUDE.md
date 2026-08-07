@@ -118,7 +118,12 @@ and a **PCH** of the heavy LLVM/std headers for the test target. Build with
 plenty of parallelism — the machine is many-core and each TU peaks well under
 the build cage's memory budget: pass `-j16` (or use `cmake --build --preset
 default`, which sets jobs); the bundled scripts default to `-j16`. A clean build
-is ~2 min and a one-file edit→relink is ~1–2s.
+is ~2 min and a one-file edit→relink is ~1–2s. ⚠ Those two figures were
+measured at ~770 TUs; the tree is now **1,676** (`build/compile_commands.json`),
+so treat them as lower bounds. **Do not re-measure by hand** — every gate has
+appended one JSON record per run to `/var/tmp/bezel-scratch/gate-timings/`
+since 2026-07-14, with per-phase timings. Read it with `scripts/gate_trend.sh`
+(which also fails a push when a gate's telemetry contradicts its verdict, #3010).
 
 **The suite is several per-area binaries, not one.** `tests/CMakeLists.txt`
 splits the test sources along the existing `tests/<area>/` directories into
@@ -144,10 +149,15 @@ Accounting is per binary: each one's `ran` must equal its own registry total and
 every one of its shards must have printed a completion summary, so a dropped or
 crashed slice in any binary still fails loudly. Tests
 drive the *real* `bezelc` AOT path (fork-isolated `Driver::compileFile` + clang
-link + native exec) — the strict oracle. The sharded `--full` run (`scripts/gate.sh`)
-is **authoritative** (#1861): every test is process-isolated (a fork'd compile +
-a separate native exec), so the old serial-order heap-corruption class is
-structurally impossible and the always-on serial pass was retired. The sharded
+link + native exec) — the strict oracle. The sharded run (`scripts/gate.sh`)
+is **authoritative over the retired serial pass** (#1861): every test is
+process-isolated (a fork'd compile + a separate native exec), so the old
+serial-order heap-corruption class is structurally impossible and the always-on
+serial pass was retired. ⚠ That authority is **sharded-vs-serial, NOT
+`--full`-vs-plain** — an earlier wording attached it to `--full` and so read as
+"the ASan oracle is the authoritative one", which is precisely what #2633
+refuted and what the ⚠ block below says. Neither oracle dominates; a batch needs
+BOTH. The sharded
 runner *can* over-report under fork/link contention — but that shows up as a
 whole-suite timeout, not a real failure; to disambiguate, re-run the specific
 suspect test(s) in isolation with `BEZEL_TEST_FILTER=<name>` (a single-process
@@ -158,9 +168,15 @@ is how tooling finds which area binary holds a filter, and how the partition is
 proved.) See `tests/README.md` for the
 harness (`runAot` / `runAotChecked` / lit+FileCheck) and how to write a test;
 `BEZEL_AOT_LINK_TOKENS` caps concurrent compiles when several agents run the
-suite at once. (The former in-process JIT harness — a *lenient* oracle that
-skipped the ownership/definite-assignment passes and `verifyModule` — has been
-retired.)
+suite at once. ⚠ **The in-process JIT harness is DEPRECATED, not retired.** An
+earlier revision of this file said "has been retired" while stating 45 lines
+above that "the in-process JIT is unaffected" — both cannot be true, and the
+code settles it: **60 `runJit(` + 3 `runJitChecked(` live call sites remain**
+(measured 2026-08-08; `grep -rn 'runJit(' tests/`). It is a *lenient* oracle —
+it skips the ownership/definite-assignment passes and `verifyModule`, so a test
+still on it proves less than its name suggests. **Write new tests on `runAot`
+only**, and port a JIT test whenever you touch one. The count above is the
+ratchet: it must only ever go down.
 
 One machine-local, not-tracked step is required for ccache to cache the PCH'd
 compiles: `~/.config/ccache/ccache.conf` must contain
@@ -216,8 +232,14 @@ and the current worktree are never touched), (b) drops stale
 scratch into `/var/tmp/bezel-scratch/root-quarantine/` (moved, not deleted;
 self-purged after 14 days). Run `scripts/gc_scratch.sh` (dry-run) any time to
 preview, `--apply` to act; `scripts/reap_orphans.sh` clears processes a dead
-agent orphaned. Per-worktree build dirs live *inside* the worktree, so reaping
-the worktree reclaims them too.
+agent orphaned. ⚠ **Per-worktree build dirs do NOT necessarily live inside the
+worktree.** `scripts/lane_setup.sh` symlinks a lane's `build/` out to
+`/mnt/fast/lane-builds/<name>` (the NVMe), so `git worktree remove` deletes only
+the symlink and **orphans the tree**. That is not theoretical: 68 GB accumulated
+across 54 orphans in four days and had to be cleared by hand (#3005), while this
+file asserted the invariant that says it cannot happen. `gc_scratch.sh` does not
+yet reap them — check `/mnt/fast/lane-builds` when disk is tight, and re-run
+`lane_setup.sh` in a worktree whose `build/` symlink dangles (it now self-repairs).
 
 **Gating a batch: BOTH oracles, always.** Land with `scripts/gate_and_push.sh`
 — it runs `scripts/gate_full_cycle.sh` (plain, then `--full`), requires each to
