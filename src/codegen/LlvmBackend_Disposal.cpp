@@ -1769,6 +1769,38 @@ void Emitter::emitTcsRelease(llvm::Value* tcs) {
 // header and referenced by no emitter at all — measured: 3200 bytes leaked in
 // 200 allocations under LSan), so this fix adds the one resolution and wires
 // BOTH paths to it.
+// fix #2973 (§28.3 / §28.9, stdlib §6.4, v0.240): which built-ins does the
+// `using var` SCOPE-EXIT auto-drop route through emitVtablelessBuiltinRelease?
+//
+// #2921 wired `Random` by hardcoding the name into `registerUsingDisposal`'s
+// arm. That arm's three DETECTION probes (declared type, NewExpr type name,
+// initializer exprType) are the reusable part and the name is the parameter, so
+// the name lives here and the arm reads it — adding a built-in to the auto-drop
+// is a line in this function, next to the release it must agree with, rather
+// than a fourth copy of the detection code somewhere else.
+//
+// ⚠ THIS IS STILL A POSITIVE LIST, and a positive list fails by omission. What
+// bounds the damage is that it fails toward a LEAK (the pre-existing behaviour)
+// and never toward a double free. The population was MEASURED rather than
+// guessed: a 200-iteration `using var x := new T(…)` loop under generated-code
+// LSan over every constructible built-in — Random, StringBuilder, Stopwatch,
+// Mutex, Semaphore, CancellationTokenSource, EventSource, AsyncEventSource,
+// Channel, TaskCompletionSource, Array, Dictionary, Set, SortedSet,
+// SortedDictionary, Stack, Queue, LinkedList, OwningBuffer, Buffer — found
+// EXACTLY TWO leaking, `Atomic<T>` and `AtomicInteger<T>`, at 4800 bytes in 200
+// allocations each. Everything else is already claimed by an arm. The general
+// defect ("a `using var` on a built-in that no arm claims emits NOTHING, in
+// silence") is filed separately; it needs a "does this built-in own heap?"
+// authority that does not exist yet, and inventing one here would be a negative
+// list — the shape that fails by ACCEPTING garbage.
+const char* Emitter::usingAutoDropVtablelessBuiltin(std::string_view n) {
+    if (n == "Random")        return "Random";           // #2921
+    if (n == "Atomic")        return "Atomic";           // #2973
+    if (n == "AtomicInteger") return "AtomicInteger";    // #2973
+    return nullptr;
+}
+
+
 bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
                                            llvm::Value* recv) {
     if (bn.empty() || !recv || !recv->getType()->isPointerTy()) return false;
@@ -1798,6 +1830,24 @@ bool Emitter::emitVtablelessBuiltinRelease(std::string_view bn,
     // their owner's release point". `bz_random_alloc` mallocs one and
     // `bz_random_free` is a plain `free`.
     if (bn == "Random") { callVoid("bz_random_free", {recv}); return true; }
+    // fix #2973 (§28.3 / §28.9, stdlib §6.4, v0.240): `Atomic<T>` /
+    // `AtomicInteger<T>`. `bz_atomic_dispose` FREES — verified in the runtime,
+    // not inferred: it flips a `disposed.exchange(true)` once and then calls
+    // `atomic_core_release`, which `delete`s the `bz_atomic_t` when the last
+    // core ref drops (bezel_runtime_sync.cpp), while `bz_atomic_new` hands back
+    // refs=1. So a single call here is a complete release, not a mark — the
+    // question #2973 asked to settle before wiring anything, because a mark
+    // would have needed a free as well and a free plus a free is a double free.
+    //
+    // Exactly-once across the two spellings is already structural: #2967 made
+    // the explicit `a.Dispose()` arm NULL the receiver's slot, and the
+    // `vtablelessBuiltin` scope-exit path null-GUARDS its reload — measured
+    // clean here under generated-code ASan for `using var` + explicit
+    // `Dispose()` in the same 200-iteration loop.
+    if (bn == "Atomic" || bn == "AtomicInteger") {
+        callVoid("bz_atomic_dispose", {recv});
+        return true;
+    }
     // §24.3 / §6.5 / #2026: sync and async sources share one runtime
     // representation, so both free identically (null-safe).
     if (bn == "EventSource" || bn == "AsyncEventSource") {

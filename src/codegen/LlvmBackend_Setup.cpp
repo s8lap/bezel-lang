@@ -13017,22 +13017,46 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // were clean. Detection mirrors the Stopwatch arm directly above; the
     // release is `emitVtablelessBuiltinRelease`, the same one an explicit
     // `r.Dispose()` now takes.
+    //
+    // fix #2973 (stdlib §6.4, v0.240): the same hole one receiver over —
+    // `using var a := new Atomic<int>(0);` emitted NO scope-exit release at all
+    // (measured: 4800 bytes in 200 allocations under generated-code LSan, while
+    // the explicit `a.Dispose()` chain's `Atomic` arm was clean). So this arm no
+    // longer hardcodes `Random`: the three DETECTION probes below are the
+    // reusable part and the NAME is the parameter, supplied by
+    // `usingAutoDropVtablelessBuiltin` — which sits next to
+    // `emitVtablelessBuiltinRelease`, the release it has to agree with, and
+    // carries the measured population.
     {
-        bool isRnd = false;
+        const char* vlb = nullptr;
         if (ld->type)
-            isRnd = builtinTypeName(ctx_.resolvedType(*ld->type)) == "Random";
-        if (!isRnd && ld->initializer) {
+            vlb = usingAutoDropVtablelessBuiltin(
+                      builtinTypeName(ctx_.resolvedType(*ld->type)));
+        if (!vlb && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                isRnd = ne->type && ne->type->name &&
-                        !ne->type->name->parts.empty() &&
-                        ne->type->name->parts[0] == "Random";
+                if (ne->type && ne->type->name &&
+                    !ne->type->name->parts.empty()) {
+                    // The AST SPELLING alone does not say whether this is the
+                    // built-in or a user class that merely shares its name, and
+                    // freeing a user object with a built-in's C release is
+                    // memory-unsafe. The pre-#2973 spelling of this branch read
+                    // `ne->type->name->parts[0]` bare; route through the
+                    // resolved TypeRef so the declaration-less test the other
+                    // two probes get from `builtinTypeName` holds here too.
+                    const sema::TypeRef* nrt = ctx_.resolvedType(*ne->type);
+                    if (nrt && nrt->kind == sema::TypeRef::Kind::Named &&
+                        !nrt->declaration)
+                        vlb = usingAutoDropVtablelessBuiltin(
+                                  ne->type->name->parts[0]);
+                }
         }
-        if (!isRnd && ld->initializer)
-            isRnd = builtinTypeName(ctx_.exprType(*ld->initializer)) == "Random";
-        if (isRnd) {
+        if (!vlb && ld->initializer)
+            vlb = usingAutoDropVtablelessBuiltin(
+                      builtinTypeName(ctx_.exprType(*ld->initializer)));
+        if (vlb) {
             Disposal d{it->second, nullptr};
-            d.vtablelessBuiltin = "Random";
+            d.vtablelessBuiltin = vlb;
             disposeStack_.back().push_back(d);
             return;
         }

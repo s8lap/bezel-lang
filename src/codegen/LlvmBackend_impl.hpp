@@ -6966,6 +6966,15 @@ private:
     // trade a false return deliberately takes.
     bool emitVtablelessBuiltinRelease(std::string_view bn, llvm::Value* recv);
 
+    // fix #2973 (§28.3 / §28.9, stdlib §6.4, v0.240): if `n` names a built-in
+    // whose `using var` SCOPE-EXIT auto-drop routes through
+    // emitVtablelessBuiltinRelease, return that built-in's canonical name (a
+    // string literal, so it can be stored in `Disposal::vtablelessBuiltin`);
+    // otherwise null. `registerUsingDisposal` supplies the detection, this
+    // supplies the population — see the definition for the measurement and for
+    // why the list fails toward a leak rather than a double free.
+    static const char* usingAutoDropVtablelessBuiltin(std::string_view n);
+
     // fix #2967 (spec §28.2 / §28.3, v0.240): the one spelling of "an explicit
     // `x.Dispose()` on a BUILT-IN receiver has just performed that built-in's
     // release HERE, so null the receiver's slot" — which is what makes §28.2's
