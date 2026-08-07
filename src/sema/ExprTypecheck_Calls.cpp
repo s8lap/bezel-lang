@@ -8346,6 +8346,65 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 ctx_.setExprType(&ce, rt);
             // If Function with null funcReturn: leave untyped (void/unknown)
         }
+        // fix #2964 (§8.1 / §8.3, v0.240): the §8.1 universal-Object instance
+        // members `GetHashCode` and `Equals` carry §8.1's declared RESULT TYPE
+        // on every receiver.
+        //
+        // §8.1 declares `Object` with `public virtual method GetHashCode():
+        // int;` and `public virtual method Equals(other: Object?): bool;`, and
+        // states verbatim: "`Object` is the universal root. Every type derives
+        // from it". So the result type of these calls is a property of the
+        // MEMBER, decided by §8.1 — never of the receiver. The two siblings are
+        // already typed that way: `ToString` in the `!calleeSym` member-access
+        // block above, and `GetType` right beside it, whose own comment records
+        // the same posture ("Typing is unconditional on receiver kind").
+        //
+        // These two had no such rule. They were typed only where some
+        // receiver-specific handler happened to type the MemberAccessExpr —
+        // records/enums/choices (the `!member` branch of resolveMemberAccess),
+        // `string`, a genuinely-declared type parameter — and the propagation
+        // just above then carried that to the CallExpr. Two receiver families
+        // had no handler at all, measured on 618c0c8 with a 6-receiver grid
+        // (`var h := x.GetHashCode(); Console.WriteLine("h=" + h.ToString());`):
+        // a CLASS receiver (plain user class, and a class through an interface
+        // it implements) and a PRIMITIVE receiver (`int`). Record, enum and
+        // `string` receivers were already typed.
+        //
+        // The consequence is not a diagnostic. The untyped call infects the
+        // local bound to it, so the next member access on that local is
+        // likewise untyped and codegen DROPS THE WHOLE ENCLOSING STATEMENT:
+        // #2964's repro is a `Console.WriteLine(h.ToString())` that emits ZERO
+        // BYTES with zero diagnostics at any severity, between two
+        // `Console.WriteLine`s that print normally, on a program that compiles
+        // and exits. (`h` itself is fine — `if h <> 0` branches correctly and
+        // two calls on one instance agree — so the value IS lowered; only its
+        // type was missing.)
+        //
+        // This is a LAST RESORT: it fires only when nothing above typed the
+        // call, so it can never override a receiver-specific answer, and it
+        // types the CALL, never the MemberAccessExpr — #2465's reject of these
+        // members on the not-yet-sliced collection receivers is gated on
+        // `!ctx_.exprType(ma)`, so it keeps firing untouched (pinned by a
+        // test). Whether this compiler can LOWER the call on a given receiver
+        // is a separate question and is #2922's, which now rejects an unlowered
+        // §8.1 member on a declaration-less built-in receiver loudly instead of
+        // degrading it — so a receiver-kind list here would buy nothing and
+        // would be the same list-shaped mistake #2922 was filed to remove.
+        // `GetType` is not handled here (it returns above, with §8.2's
+        // reflection deferral); `ToString` likewise returns above.
+        if (!ctx_.exprType(ce)) {
+            if (auto* uma = dynamic_cast<const ast::MemberAccessExpr*>(
+                    ce.callee.get())) {
+                if (uma->target) {
+                    if (uma->member == "GetHashCode" && ce.args.empty())
+                        ctx_.setExprType(
+                            &ce, ctx_.primitiveTypeRef(PrimitiveType::Int));
+                    else if (uma->member == "Equals" && ce.args.size() == 1)
+                        ctx_.setExprType(
+                            &ce, ctx_.primitiveTypeRef(PrimitiveType::Bool));
+                }
+            }
+        }
         // stdlib §2.2: Math.Abs is polymorphic — its return type matches the
         // argument type (Abs(int):int, Abs(long):long, Abs(double):double).
         // Math.Min/Max/Clamp<T> are generic and also return T (same-as-arg).
