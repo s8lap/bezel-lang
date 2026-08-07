@@ -12091,7 +12091,84 @@ private:
     // the constructor wrote. Must be called at the start of lowerNew.
     void ensureCtorOutVarSlots(const ast::NewExpr& ne, const sema::TypeRef* rt);
 
+    // ── fix #2963: "nothing lowered this" vs "lowered it, the result is unit" ──
+    //
+    // `lowerCall` returns nullptr for BOTH outcomes, and until this was added
+    // nothing downstream could tell them apart. That ambiguity is not a
+    // curiosity: it is the specific reason #2922 had to gate on the MEMBER and
+    // #2935 on the CONSUMER rather than on the thing both actually wanted
+    // ("nothing lowered this call"), and it made the #2491 return-degrade note
+    // fire on a program with nothing wrong with it.
+    //
+    // The discriminator is NOT a list of the arms that emit-and-return-null —
+    // that list is exactly the hand-maintained mirror this codebase has paid
+    // for twice (#2868, #2888), and a nineteenth arm added later would silently
+    // acquire a FALSE REJECT. It is a fact the compiler already computes: the
+    // IR ITSELF. An arm that lowered the call emitted instructions; an arm that
+    // declined emitted none. `IrFootprint` is an O(1) snapshot of the builder's
+    // position — the insert block, plus the instruction immediately before the
+    // insert point — so "anything at all was appended (or a new block was
+    // entered)" is a pointer comparison.
+    //
+    // ⚠ ITS FAILURE DIRECTION IS DELIBERATE AND ONE-WAY. A helper that lowers
+    // the RECEIVER and only then discovers it does not know the member (
+    // `tryLowerChannelAndDomainCall`'s `isSender` arm does exactly this) leaves
+    // a footprint and is therefore read as "handled". That costs a MISSED
+    // detection, never a false reject — which is the only direction a codegen
+    // gate may err in, since the false reject is what fails a build on correct
+    // code.
+    struct IrFootprint {
+        llvm::BasicBlock* bb = nullptr;
+        const llvm::Instruction* prev = nullptr;
+        bool operator==(const IrFootprint& o) const {
+            return bb == o.bb && prev == o.prev;
+        }
+        bool operator!=(const IrFootprint& o) const { return !(*this == o); }
+    };
+    IrFootprint irFootprint() {
+        IrFootprint f;
+        f.bb = builder_.GetInsertBlock();
+        if (f.bb) {
+            llvm::BasicBlock::iterator ip = builder_.GetInsertPoint();
+            if (ip != f.bb->begin()) f.prev = &*std::prev(ip);
+        }
+        return f;
+    }
+
+    // fix #2963: set by `lowerCall` (the wrapper) on EVERY return — true exactly
+    // when the call produced no value AND emitted IR, i.e. "an arm lowered it
+    // and the result is unit". Assigned in ONE place so no arm has to remember
+    // to participate. Read only where the reader has established that the
+    // expression it just lowered IS an `ast::CallExpr`, which makes the value
+    // exact rather than merely fresh.
+    bool lastCallHandledWithoutValue_ = false;
+
     llvm::Value* lowerCall(const ast::CallExpr& call);
+    // The body of `lowerCall`; see the wrapper for why they are two functions.
+    llvm::Value* lowerCallDispatch(const ast::CallExpr& call);
+
+    // fix #2963 (spec §21.7 / §4.7, v0.240): is an ARROW BODY (`=> expr`) that
+    // produced no lowered value legitimately valueless, rather than degraded?
+    //
+    // Exactly when BOTH hold: the callable declares no return type (§21.7 —
+    // "this callable has no return type — `return` may not carry a value" — so
+    // nothing demands a value here), AND the body is a call that an arm lowered
+    // with a unit result. `public static method Push(s: ChannelSender<int>) =>
+    // s.Send(42);` is that program: it compiles, the item really is buffered,
+    // and before this it printed `internal: return-value expression failed to
+    // lower to a value … — #2491` on a program with nothing wrong with it.
+    //
+    // The `dynamic_cast` is what makes `lastCallHandledWithoutValue_` EXACT
+    // here rather than merely recent: when the body IS an `ast::CallExpr`, the
+    // flag was assigned by the `lowerCall` that just lowered precisely it.
+    // ONE predicate, called from both arrow-body faces of the #2491 diagnostic
+    // — #2924's four-way-mirror finding is that this message is already
+    // hand-copied four times, and this must not make it five.
+    bool arrowBodyLoweredAsUnit(const ast::Expr* body,
+                                const ast::Type* declRet) const {
+        return !declRet && dynamic_cast<const ast::CallExpr*>(body) &&
+               lastCallHandledWithoutValue_;
+    }
 
     // per §14.1/§14.2 + §26.5 (issue #391): bind a generic method's
     // return-only type parameter at the call site. `declRet` is the method's

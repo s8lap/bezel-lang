@@ -3341,7 +3341,25 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
 }
 
 
+// fix #2963 (codegen, v0.240): the one place that classifies a null return.
+//
+// The whole dispatch body lives in `lowerCallDispatch`; this wrapper observes
+// it from outside and records WHICH KIND of nullptr came back. Doing it here
+// rather than inside each arm is the point: `lowerCallDispatch` has ~20
+// `try*Call` arms plus several hand-written `return nullptr; // unit result`
+// exits (`tryLowerConsoleCall`, the serialization void calls, #2967's built-in
+// Dispose chain), and a nineteenth arm added tomorrow participates for free.
 llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
+    const IrFootprint before = irFootprint();
+    llvm::Value* v = lowerCallDispatch(call);
+    // A value came back ⇒ nothing was degraded. No value AND no IR emitted ⇒
+    // nothing lowered this. No value BUT IR emitted ⇒ an arm lowered it and the
+    // result is unit.
+    lastCallHandledWithoutValue_ = !v && irFootprint() != before;
+    return v;
+}
+
+llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     // Pre-create out var slots so lvalueAddr can find them in all paths.
     ensureOutVarSlots(call);
@@ -10206,7 +10224,13 @@ llvm::Function* Emitter::buildSpecializedMethodFn(
             // emitReturn's `v ? v : null` fallback would silently substitute a
             // zero/null return. See the ReturnStmt site in
             // LlvmBackend_Stmts.cpp for the full rationale.
-            if (ci.exprBody && !rv && !ctx_.diagnostics().hasErrors()) {
+            //
+            // fix #2963 (§21.7/§4.7, v0.240): same exemption as the other
+            // arrow-body face — a callable with NO declared return type whose
+            // body is a call an arm lowered with a unit result never degraded.
+            // One shared predicate, deliberately (#2924).
+            if (ci.exprBody && !rv && !ctx_.diagnostics().hasErrors() &&
+                !arrowBodyLoweredAsUnit(ci.exprBody, ci.returnType)) {
                 ctx_.diagnostics().report(
                     Severity::Warning, ci.exprBody->span.begin,
                     "internal: return-value expression failed to lower to a "

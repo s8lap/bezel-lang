@@ -7886,7 +7886,16 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             // silently substitute a zero/null return. See the ReturnStmt site
             // in LlvmBackend_Stmts.cpp for the full rationale (Warning, not
             // Error, per §3/#605's permissive shapes; !hasErrors() guard).
-            if (ci.exprBody && !v && !ctx_.diagnostics().hasErrors()) {
+            //
+            // fix #2963 (§21.7/§4.7, v0.240): EXEMPT a unit-returning arrow
+            // body. `=> s.Send(42)` in a callable with NO declared return type
+            // lowered fine and has no value because that is what `Send` yields;
+            // this note fired on it and claimed a degrade that never happened.
+            // `arrowBodyLoweredAsUnit` is the shared predicate for this face
+            // and the generic-specialization one (#2924: this message is
+            // already hand-copied four times — do not make it five).
+            if (ci.exprBody && !v && !ctx_.diagnostics().hasErrors() &&
+                !arrowBodyLoweredAsUnit(ci.exprBody, ci.returnType)) {
                 ctx_.diagnostics().report(
                     Severity::Warning, ci.exprBody->span.begin,
                     "internal: return-value expression failed to lower to a "
