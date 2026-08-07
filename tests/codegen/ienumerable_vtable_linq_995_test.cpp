@@ -284,8 +284,40 @@ BEZEL_TEST(ienumerable_vtable_linq_995, owned_stack_as_ienumerable_param_1068) {
 BEZEL_TEST(ienumerable_vtable_linq_995, owned_queue_as_ienumerable_param_1068) {
     BEZEL_EXPECT_EQ(run(ifaceParamSum("OwningQueue<Item>")), 7);
 }
+// #1068, RE-POINTED by #2914 (§15.4, v0.240). This case used
+// `ifaceParamSum("OwningBuffer<Item>")`, i.e. it built the buffer from a
+// COLLECTION LITERAL — `using var c: OwningBuffer<Item> := [new Item(3), …];`.
+// §15.4's list of "target types that admit collection literals" is explicit and
+// closed, and `OwningBuffer<T>` is NOT on it: inline arrays, `Array`/`OwningArray`,
+// `Set`/`OwningSet`, `LinkedList`/`OwningLinkedList`, `Stack`/`OwningStack`,
+// `Queue`/`OwningQueue`, `Dictionary`/`OwningDictionary`, and user types
+// declaring `FromCollectionLiteral`. The old gate was a NEGATIVE list
+// (`isCollectionLiteralInterfaceTarget`) that admitted this target by omission;
+// #2914 replaced it with §15.4's positive list, which correctly rejects it.
+//
+// So this case was pinning a spelling the language does not admit. What it is
+// FOR — that an `OwningBuffer` reaches `IEnumerable<T>` dispatch and iterates —
+// is unchanged and still worth pinning, so the construction is re-pointed at
+// stdlib §4.14's real two-argument constructor rather than deleted. Verified
+// equivalent: both spellings produced 7 before #2914.
+//
+// ⚠ MAINTENANCE: if §15.4 ever adds `OwningBuffer<T>` to its admitted targets,
+// this case may go back to the literal spelling — but do NOT change it merely
+// because a future gate accepts the literal again; check §15.4 first, since an
+// accepting gate is exactly what this re-point was needed to correct.
 BEZEL_TEST(ienumerable_vtable_linq_995, owned_buffer_as_ienumerable_param_1068) {
-    BEZEL_EXPECT_EQ(run(ifaceParamSum("OwningBuffer<Item>")), 7);
+    BEZEL_EXPECT_EQ(run(
+        "module M; class Item public V: int := 0; "
+        "  public constructor(v: int) this.V := v; end constructor; end Item; "
+        "class C "
+        "  public static method Sum(xs: IEnumerable<Item>): int "
+        "    var s: int := 0; for var a in xs do s := s + a.V; end; return s; "
+        "  end Sum; "
+        "  public static method Main(): int "
+        "    using var c := new OwningBuffer<Item>(2, "
+        "        lambda(i: int) => new Item(i + 3)); "
+        "    return Sum(c); "
+        "  end Main; end C;"), 7);
 }
 BEZEL_TEST(ienumerable_vtable_linq_995, borrowing_stack_as_ienumerable_param_1068) {
     BEZEL_EXPECT_EQ(run(ifaceParamSum("Stack<Item>")), 7);
