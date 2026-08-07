@@ -4,11 +4,11 @@
   "configurePresets": [
     {
       "name": "default",
-      "displayName": "Debug / clang++ (the project's standard toolchain)",
+      "displayName": "RelWithDebInfo / clang++ (matches what the gate validates, #3013)",
       "binaryDir": "${sourceDir}/build",
       "generator": "Ninja",
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
         "CMAKE_CXX_COMPILER": "clang++",
         "CMAKE_C_COMPILER": "clang"
       }

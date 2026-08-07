@@ -97,7 +97,10 @@ test_groups() { [ -r "$MANIFEST" ] && cut -f1 "$MANIFEST" | paste -sd' ' -; }
 # Reconfigure is quiet unless it fails; the build hard-stops on failure so a
 # stale binary can never be mistaken for a passing run.
 reconfigure() {
-  "$DH" build cmake -S "$ROOT" -B "$BUILD_DIR" >"$SCRATCH/agent_configure.log" 2>&1 \
+  # -DCMAKE_BUILD_TYPE=RelWithDebInfo is REQUIRED (#3013): without it CMake leaves the build type
+  # empty, which drops -DNDEBUG and leaves asserts live — 55 of 59 lane trees
+  # were in that state, validating a different bezelc than the gate accepts.
+  "$DH" build cmake -S "$ROOT" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=RelWithDebInfo >"$SCRATCH/agent_configure.log" 2>&1 \
     || { echo "agent_check: CONFIGURE FAILED (see $SCRATCH/agent_configure.log):" >&2
          tail -20 "$SCRATCH/agent_configure.log" >&2; exit 1; }
 }

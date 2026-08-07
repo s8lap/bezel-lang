@@ -43,7 +43,7 @@ build="$repo/build"
 # it is already configured+built, so this is a fast incremental no-op; standalone
 # it configures (matching gate.sh's `cmake -S . -B build`) and builds.
 if [ ! -f "$build/CMakeCache.txt" ]; then
-  "$repo/scripts/dev_heavy.sh" build cmake -S "$repo" -B "$build" > /dev/null 2>&1 || {
+  "$repo/scripts/dev_heavy.sh" build cmake -S "$repo" -B "$build" -DCMAKE_BUILD_TYPE=RelWithDebInfo > /dev/null 2>&1 || {
     echo "asan_sweep: cmake configure FAILED"; exit 2; }
 fi
 "$repo/scripts/dev_heavy.sh" build cmake --build "$build" -j"${ASAN_SWEEP_JOBS:-16}" \

@@ -11,6 +11,43 @@ cmake_minimum_required(VERSION 3.20)
 # detection — so a plain `cmake -B build` uses clang without a separate
 # toolchain file. The guards leave any -DCMAKE_*_COMPILER=... override in place,
 # so the build stays configurable for environments where clang lives elsewhere.
+# fix #3013: REFUSE AN UNPINNED BUILD TYPE.
+#
+# CMake leaves CMAKE_BUILD_TYPE empty by default, which means no -O2, no -g and
+# — the part that matters — NO -DNDEBUG, so asserts are LIVE. Nothing passed the
+# flag, so a bare `cmake -S . -B build` fell through to empty. Measured across
+# every build tree on this machine on 2026-08-08:
+#
+#     55  CMAKE_BUILD_TYPE:STRING=            <- lanes
+#      4  CMAKE_BUILD_TYPE:STRING=Debug
+#      1  CMAKE_BUILD_TYPE:STRING=RelWithDebInfo   <- the gate
+#
+# So 55 of 59 lane build trees validated a SEMANTICALLY DIFFERENT bezelc than
+# the gate accepts: asserts live in the lane, compiled out in the gate. A lane
+# green and a gate green were not claims about the same program, and no existing
+# check could see the split — the only symptom is a three-way CXX_FLAGS
+# divergence nothing reads.
+#
+# DECISION (recorded per CLAUDE.md rule 4, since the spec does not settle it):
+# converge the LANES UP to the gate's RelWithDebInfo, not the gate down to the
+# lanes' cheap flags. Converging down was considered and declined — asserts-on /
+# no-NDEBUG against Fedora's SHARED libLLVM, which is built without assertions,
+# is an ABI question rather than a speed one, and it would change the oracle for
+# all 16,482 tests to chase 7-12% on a component that is not the bottleneck.
+#
+# This is a FATAL_ERROR rather than a silent default on purpose: a default would
+# fix the flags and hide the fact that a caller was not passing them, which is
+# how the split survived unnoticed. Every configure site in this repo passes it.
+if(NOT CMAKE_BUILD_TYPE)
+    message(FATAL_ERROR
+        "CMAKE_BUILD_TYPE is not set.\n"
+        "An unpinned build type means no -O2, no -g and no -DNDEBUG, so asserts "
+        "are live and this tree would compile a different bezelc than the gate "
+        "validates (#3013).\n"
+        "Configure with:  cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo\n"
+        "or use scripts/agent_check.sh / scripts/gate.sh, which pass it for you.")
+endif()
+
 if(NOT DEFINED CMAKE_C_COMPILER)
     set(CMAKE_C_COMPILER clang CACHE FILEPATH "C compiler")
 endif()

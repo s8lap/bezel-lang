@@ -466,7 +466,7 @@ echo "== gate[1/6]: reconfigure (glob any new test files) =="
 # (core.a rebuilt => cold ASan pass guaranteed) — see the ceiling note above.
 CORE_MTIME_PRE=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo 0)
 PHASE_T0=$(now)
-"$DH" build cmake -S . -B build >"$S/gate_reconf.log" 2>&1; prc=$?
+"$DH" build cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo >"$S/gate_reconf.log" 2>&1; prc=$?
 rec_ran configure "$prc"
 [ "$prc" -ne 0 ] && { tail -15 "$S/gate_reconf.log"; fail "configure"; }
 
