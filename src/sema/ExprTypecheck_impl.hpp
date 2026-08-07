@@ -1143,6 +1143,18 @@ private:
     // the name so `namedRefSimpleName` still reports it correctly.
     TypeRef* builtinAncestorTypeRef(std::string_view name);
 
+    // §31.4 (v0.240, #2971): the type of `Exception.CauseChain` — a synthetic
+    // `Array<ExceptionInfo>` over program-lifetime static astNodes (the pattern
+    // `makeConcreteCollectionResult` uses): `Array` so `.Count` and indexing
+    // resolve, an `ExceptionInfo` element so `chain[i].TypeName` type-checks.
+    // Neither type has a user TypeSymbol.
+    //
+    // Shared rather than rebuilt: #2971 gave the SAME §31.4 member three more
+    // resolution sites (a subclass's own static type, `this.`, `base.`) and a
+    // second copy of this builder would be a second place for the element type
+    // to drift from the receiver's.
+    TypeRef* excCauseChainTypeRef();
+
     // #1621 / §31.2.1: the ancestor-name chain of `ty` (most-specific first,
     // `ty` itself included), walking the TypeSymbol base-type chain, the AST
     // TypeDecl's declared bases (built-in bases have no TypeSymbol and are

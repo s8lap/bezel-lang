@@ -256,23 +256,20 @@ static bool isLiteralDerivedExpr(const ast::Expr* e) {
     return false;
 }
 
-// #625 / §12 / §31: true when `ts` or any of its class ancestors inherits a
-// built-in exception. Used by the unqualified identifier resolver to allow bare
-// `Message` in the body of an exception-derived class without "unresolved
-// identifier".
+// #625 / §12 / §31 / fix #2950 / fix #2971: the "does `ts` inherit a built-in
+// exception" wrapper that used to live here is gone. It answered only half the
+// question the unqualified-identifier resolver actually asks — the other half
+// being WHICH §31.4 member the bare name denotes, which the resolver then
+// hard-coded as `Message` alone. Both halves now come from
+// `sema::builtinExceptionSurfaceMemberOf` (Symbol.hpp), the single statement of
+// §31.4's surface; see the call site below.
 //
-// fix #2950 (§12 / §31.4 / §2.8.2, v0.240): this was a THIRD hand-rolled copy
-// of the same walk — AST base list, `b->decl` required on each ancestor step,
-// and its own positive name list — carrying both of that shape's defects. A
-// LOCAL class whose base is an IMPORTED exception subclass got "unresolved
-// identifier `Message`" for a bare `Message` in its own method body, where the
-// identical hierarchy declared in ONE module resolves it; and the name list had
-// drifted from `kBuiltinExceptionHierarchy` exactly as its siblings had. Both
-// go away by asking `sema::builtinExceptionBaseOf`, which every other consumer
-// of this fact now asks.
-static bool inheritsBuiltinException(const TypeSymbol* ts) {
-    return !builtinExceptionBaseOf(ts).empty();
-}
+// (What #2950 fixed here is preserved by that helper's own walk: this was a
+// THIRD hand-rolled copy of the ancestor walk — AST base list, `b->decl`
+// required on each ancestor step, and its own positive name list — so a LOCAL
+// class whose base was an IMPORTED exception subclass got "unresolved
+// identifier `Message`" where the identical hierarchy declared in ONE module
+// resolved it.)
 
 // §14.1 (#2006): does `t` mention a free/rigid type variable anywhere — a Named
 // TypeRef with no declaration, no generic arguments, and a non-empty head (a
@@ -1090,23 +1087,51 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // as intrinsics.
             auto* ts = builtinClassSym(id->name);
             ctx_.setExprSymbol(&e, ts);
-        } else if (id->name == "Message" && currentType_ &&
-                   !inStaticMember_ &&
-                   inheritsBuiltinException(currentType_)) {
-            // #625 / §12 / §31: unqualified `Message` inside an INSTANCE method
-            // body of a class that inherits (directly or via a user-class chain)
-            // from a built-in exception type resolves as the inherited stdlib
-            // Exception.Message property (a string read of the slot at byte
-            // offset 8 in the exception layout).  No user TypeSymbol or
-            // FieldSymbol exists for it; the codegen's GEP-at-byte-8 path
-            // handles the read (same as `this.Message` — see the
-            // MemberAccessExpr case in LlvmBackend_Exprs.cpp CG22+).
+        } else if (currentType_ && !inStaticMember_ &&
+                   builtinExceptionSurfaceMember(currentType_, id->name) !=
+                       BuiltinExcMember::None) {
+            // #625 / §12 / §31: an unqualified §31.4 surface name inside an
+            // INSTANCE member body of a class that inherits (directly or via a
+            // user-class chain) from a built-in exception type resolves as the
+            // inherited property — a read of the corresponding slot in the
+            // §31.4 header the object carries. No user TypeSymbol or
+            // FieldSymbol exists for it; codegen's fixed-byte-offset path
+            // handles the read (same as `this.X` — see the MemberAccessExpr
+            // case in LlvmBackend_Exprs.cpp CG22+).
             // Static methods are excluded: there is no `this` in a static
-            // context so Message would have no meaningful receiver.
-            // Do NOT set a symbol — there is none; just set the type to string
-            // so downstream (type-assignability, .Length, etc.) can use it.
-            ctx_.setExprType(&e,
-                ctx_.primitiveTypeRef(PrimitiveType::String));
+            // context so the name would have no meaningful receiver.
+            // Do NOT set a symbol — there is none; just set the type so
+            // downstream (type-assignability, .Length, .Count, …) can use it.
+            //
+            // fix #2971 (§31.4 / §12.1 / §11.3, v0.240): this arm read
+            // `id->name == "Message"`, so the bare spelling of the other three
+            // §31.4 members was a THIRD rejection of the same inherited
+            // surface, with a THIRD diagnostic from a THIRD site — measured on
+            // 0dac23f inside `class ExS: Exception`:
+            //     bare.bzl:5:38: unresolved identifier `StackTrace`
+            //     bare.bzl:6:38: unresolved identifier `CauseChain`
+            //     bare.bzl:10:38: unresolved identifier `ParamName`
+            // while bare `Message` in the same bodies resolved. #2971 named the
+            // receiver-typed and `this.`-qualified spellings (both the member-
+            // lookup arm in ExprTypecheck_Calls.cpp); this site is the one it
+            // did not measure, and leaving it would have shipped the same
+            // reachable-but-inconsistent shape the issue is about.
+            switch (builtinExceptionSurfaceMember(currentType_, id->name)) {
+                case BuiltinExcMember::ParamName:
+                    // §31.4: `string?` — "null when not supplied".
+                    ctx_.setExprType(&e,
+                        ctx_.primitiveTypeRef(PrimitiveType::String,
+                                              /*nullable=*/true));
+                    break;
+                case BuiltinExcMember::CauseChain:
+                    ctx_.setExprType(&e, excCauseChainTypeRef());
+                    break;
+                default:
+                    // Message / StackTrace — §31.4 declares both `string`.
+                    ctx_.setExprType(&e,
+                        ctx_.primitiveTypeRef(PrimitiveType::String));
+                    break;
+            }
         } else if (
             // §2.2 v0.164 / §2.7 / #1365: an import alias (e.g. `ML` in
             // `import MathLib as ML;`) or a module-name prefix segment

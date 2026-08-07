@@ -3710,6 +3710,39 @@ TypeRef* ExprTC::builtinAncestorTypeRef(std::string_view name) {
     return ref;
 }
 
+// §31.4 (v0.240, #2971): see ExprTypecheck_impl.hpp. `Exception.CauseChain`'s
+// type, `Array<ExceptionInfo>`, as a synthetic TypeRef over two program-
+// lifetime static AST nodes. Neither `Array` nor `ExceptionInfo` has a user
+// TypeSymbol, so `declaration` stays null on both.
+TypeRef* ExprTC::excCauseChainTypeRef() {
+    static const ast::Type* kArrayNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("Array");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    static const ast::Type* kExcInfoNode = []() -> ast::Type* {
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("ExceptionInfo");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        return t;
+    }();
+    auto* elem = ctx_.makeTypeRef();
+    elem->kind = TypeRef::Kind::Named;
+    elem->declaration = nullptr;
+    elem->astNode = kExcInfoNode;
+    auto* arr = ctx_.makeTypeRef();
+    arr->kind = TypeRef::Kind::Named;
+    arr->declaration = nullptr;
+    arr->astNode = kArrayNode;
+    arr->genericArgs.push_back(elem);
+    return arr;
+}
+
 // #1621 / §31.2.1: the ancestor-name chain of `ty` (most-specific first, `ty`
 // itself included), walking the TypeSymbol base-type chain, the AST
 // TypeDecl's declared bases (built-in bases have no TypeSymbol and are only

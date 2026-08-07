@@ -5769,6 +5769,51 @@ private:
                    std::string(ty->name->parts.back())) != builtinVtable_.end();
     }
 
+    // fix #2971 (§31.4 / §12.1 / §11.3, v0.240): does the member access `ma`
+    // read one of the §31.4 header slots the object INHERITS, rather than a
+    // member the class declares? Applies to `StackTrace` / `CauseChain` /
+    // `ParamName`; `Message` has its own (older, wider) handler above.
+    //
+    // Three receiver shapes carry the header, and before #2971 only the FIRST
+    // was recognised — the other two were rejected by sema, so codegen was
+    // never asked:
+    //
+    //   * a receiver typed as a BUILT-IN exception (`declaration == nullptr`)
+    //     — the original path, left byte-for-byte unconditional so this change
+    //     cannot alter it;
+    //   * a receiver typed as a USER SUBCLASS of one — `classStruct` mirrors
+    //     the full 40-byte header into such a class (Message@8, Inner@16,
+    //     CauseChain@24, ParamName@32; `disposedFlagIndex` returns 5), so the
+    //     very same GEPs are correct. Measured on 0dac23f through a base-typed
+    //     receiver over a subclass instance: `pn=pp`, `cc=1`, `cc0=root`;
+    //   * `this` / `base` inside such a class, where sema deliberately gives
+    //     the receiver NO exprType at all (#2972) — recognised the way #2972
+    //     established, by reading sema's own resolution rather than
+    //     re-deriving the enclosing type here (which is unrecoverable in an
+    //     inlined accessor or a lambda body).
+    //
+    // The two NEW shapes additionally require that the access carry NO member
+    // symbol. That is the same "sema resolved this through the inherited-member
+    // arm" property #2972 keys on, and it is what keeps a subclass that
+    // declares its OWN `StackTrace` reading its own property: sema binds that
+    // access to the PropertySymbol, and this predicate declines it. (#2984
+    // makes such a declaration a §12.2 error outright, but the two fixes must
+    // each be correct on their own.)
+    bool isInheritedExcSurfaceAccess(const ast::MemberAccessExpr* ma) const {
+        if (!ma || !ma->target) return false;
+        const sema::TypeRef* rtt = ctx_.exprType(*ma->target);
+        if (isBuiltinExceptionTypeRef(rtt)) return true;
+        if (ctx_.exprSymbol(*ma) != nullptr) return false;
+        if (rtt) {
+            return rtt->kind == sema::TypeRef::Kind::Named &&
+                   rtt->declaration != nullptr &&
+                   hasBuiltinExceptionBase(rtt->declaration);
+        }
+        // No receiver type: only `this` / `base`, and only when sema typed the
+        // access (which it does exactly when it resolved it as inherited).
+        return isThisOrBaseExpr(*ma->target) && ctx_.exprType(*ma) != nullptr;
+    }
+
     // #405 / §28.5: an `owned` field whose type is a BUILTIN exception (e.g.
     // `private owned _e: Exception?;` or a builtin subtype). Built-in exceptions
     // have no user TypeSymbol, so isOwnedReferenceField (which requires a

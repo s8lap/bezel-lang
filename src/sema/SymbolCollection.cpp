@@ -513,6 +513,62 @@ std::string_view builtinExceptionBaseOf(const TypeSymbol* t) {
     return {};
 }
 
+// §31.4 (v0.240, #2971/#2983/#2984): see Symbol.hpp for the contract and for
+// what is deliberately excluded. The ONLY place the §31.4 surface is stated.
+//
+// It is stated as "which built-in DECLARES this name", then walked up the
+// hierarchy — not as "which built-in type names carry this member". The second
+// form is the positive-list shape this project's own defect taxonomy names: the
+// pre-existing hand-listed `ParamName` receiver set
+// ("ArgumentException" || "ArgumentNullException" || "ArgumentOutOfRangeException")
+// happens to be complete today only because nobody has added a fourth
+// ArgumentException descendant to `kBuiltinExceptionHierarchy`. The walk cannot
+// drift: adding an edge to that table is enough.
+BuiltinExcMember builtinExceptionSurfaceMemberOf(std::string_view builtinBase,
+                                                 std::string_view member) {
+    if (builtinBase.empty() || member.empty()) return BuiltinExcMember::None;
+    // Bound the walk exactly as builtinExceptionBaseOf does: the table is
+    // acyclic by construction, but a malformed edit must not spin.
+    unsigned guard = 0;
+    for (std::string_view cur = builtinBase;
+         !cur.empty() && guard < 64u; ++guard) {
+        // §31.4 `public class ArgumentException: Exception … ParamName: string?`
+        if (cur == "ArgumentException" && member == "ParamName")
+            return BuiltinExcMember::ParamName;
+        // §31.4 `public class Exception … Message / StackTrace / CauseChain`
+        if (cur == "Exception") {
+            if (member == "Message")    return BuiltinExcMember::Message;
+            if (member == "StackTrace") return BuiltinExcMember::StackTrace;
+            if (member == "CauseChain") return BuiltinExcMember::CauseChain;
+        }
+        cur = common::builtinExceptionParentOf(cur);
+    }
+    return BuiltinExcMember::None;
+}
+
+BuiltinExcMember builtinExceptionSurfaceMember(const TypeSymbol* t,
+                                               std::string_view member) {
+    return builtinExceptionSurfaceMemberOf(builtinExceptionBaseOf(t), member);
+}
+
+std::string builtinExceptionSurfaceList(std::string_view builtinBase) {
+    // Built by ASKING the resolver, member by member, rather than by a second
+    // hand-written list: a diagnostic that names a surface the resolver would
+    // reject is the #2983 defect over again (a message whose factual claim is
+    // false), so the two must share one source of truth.
+    static constexpr std::string_view kNames[] = {"Message", "StackTrace",
+                                                  "CauseChain", "ParamName"};
+    std::string out;
+    for (std::string_view n : kNames) {
+        if (builtinExceptionSurfaceMemberOf(builtinBase, n) ==
+            BuiltinExcMember::None)
+            continue;
+        if (!out.empty()) out += ", ";
+        out += std::string(n);
+    }
+    return out;
+}
+
 // §9.2 / §22.9: see Symbol.hpp. An auto-property is a non-static, non-indexer
 // property declared in the auto form (`Name: T;` — no expression body, no
 // accessor block). Mirrors codegen's isAutoProperty so both layers classify

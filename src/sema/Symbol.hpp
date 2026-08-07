@@ -191,6 +191,64 @@ struct TypeSymbol : Symbol {
 // `builtinExceptionBase` is consulted at every level rather than only the first.
 std::string_view builtinExceptionBaseOf(const TypeSymbol* t);
 
+// §31.4 (v0.240, #2971/#2983/#2984): WHICH member of the §31.4 exception
+// surface a name denotes, for a class whose built-in exception base is
+// `builtinBase`. §31.4 declares that surface verbatim:
+//
+//     public class Exception
+//       public readonly property Message: string;
+//       public readonly property StackTrace: string;
+//       public readonly property CauseChain: Array<ExceptionInfo>;
+//     end Exception;
+//     public class ArgumentException: Exception
+//       public readonly property ParamName: string?;
+//     end ArgumentException;
+//
+// so the answer is a function of WHERE `builtinBase` sits in the built-in
+// hierarchy, not of a list of type names: the walk runs
+// `common::builtinExceptionParentOf` from `builtinBase` to the root and reports
+// the first level that DECLARES the name. That is why `ParamName` is available
+// on a subclass of ArgumentNullException and not on one of FormatException
+// without either being named anywhere.
+//
+// The three consumers this replaces each keyed on something narrower and each
+// got a different subset wrong: member lookup on a subclass's own static type
+// tested `mm == "Message"` and so rejected the other three (#2971); `base.X`
+// scanned `TypeSymbol::baseTypes`, which never holds a built-in, and so
+// rejected all four while claiming the class had no class base (#2983); and
+// §12.2's hiding check walked that same collection and so blocked none of them
+// (#2984). One helper, one place to state §31.4's surface.
+//
+// DELIBERATELY EXCLUDED, because the compiler does not implement a reader for
+// them and admitting a member sema cannot lower is worse than rejecting it
+// (#2972's shape — sema accepts, codegen degrades to a null, the caller
+// faults): `TypeInitializationException.InnerException` (§31.4; implemented
+// only for a receiver statically typed as that built-in),
+// `SerializationException.{Offset,Line,Column}` (stdlib §2.15) and
+// `DomainFaultedException.FaultStackTrace` (stdlib §6.8) — the last four are
+// declared-but-never-implemented at any layer, tracked by #2337/#2408.
+enum class BuiltinExcMember {
+    None,
+    Message,     // Exception.Message      : string
+    StackTrace,  // Exception.StackTrace   : string
+    CauseChain,  // Exception.CauseChain   : Array<ExceptionInfo>
+    ParamName,   // ArgumentException.ParamName : string?
+};
+
+BuiltinExcMember builtinExceptionSurfaceMemberOf(std::string_view builtinBase,
+                                                 std::string_view member);
+
+// Convenience over the pair above: the §31.4 surface member `member` names on
+// `t`, or None when `t` derives from no built-in exception at all.
+BuiltinExcMember builtinExceptionSurfaceMember(const TypeSymbol* t,
+                                               std::string_view member);
+
+// The §31.4 surface of `builtinBase`, as a comma-separated list for a
+// diagnostic ("Message, StackTrace, CauseChain" / "…, ParamName"). Derived from
+// the same walk, so a diagnostic can never name a surface the resolver does not
+// actually accept.
+std::string builtinExceptionSurfaceList(std::string_view builtinBase);
+
 // A.2 TypeAliasDecl — its target type is resolved by Type Resolution.
 struct TypeAliasSymbol : Symbol {
     std::vector<Symbol*> genericParams;

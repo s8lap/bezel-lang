@@ -12460,36 +12460,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 }
             }
             if (ma.member == "CauseChain" && isExcType(rtt)) {
-                // Build a synthetic Array<ExceptionInfo> TypeRef (program-lifetime
-                // static astNodes, the pattern makeConcreteCollectionResult uses):
-                // Array so `.Count`/indexing resolve, ExceptionInfo element so
-                // `chain[i].TypeName` type-checks.
-                static const ast::Type* kArrayNode = []() -> ast::Type* {
-                    auto* qn = new ast::QualifiedName;
-                    qn->parts.push_back("Array");
-                    auto* t = new ast::Type;
-                    t->kind = ast::TypeKind::Named;
-                    t->name.reset(qn);
-                    return t;
-                }();
-                static const ast::Type* kExcInfoNode = []() -> ast::Type* {
-                    auto* qn = new ast::QualifiedName;
-                    qn->parts.push_back("ExceptionInfo");
-                    auto* t = new ast::Type;
-                    t->kind = ast::TypeKind::Named;
-                    t->name.reset(qn);
-                    return t;
-                }();
-                auto* elem = ctx_.makeTypeRef();
-                elem->kind = TypeRef::Kind::Named;
-                elem->declaration = nullptr;
-                elem->astNode = kExcInfoNode;
-                auto* arr = ctx_.makeTypeRef();
-                arr->kind = TypeRef::Kind::Named;
-                arr->declaration = nullptr;
-                arr->astNode = kArrayNode;
-                arr->genericArgs.push_back(elem);
-                ctx_.setExprType(&ma, arr);
+                ctx_.setExprType(&ma, excCauseChainTypeRef());
                 return;
             }
         }
@@ -16119,7 +16090,7 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // valid here, also set its resolved type to `string` so callers (e.g.
         // `.Length` on the result) can infer the chain type.
         bool isBuiltinExInheritedMember = false;
-        if (mm == "Message" && knownCompleteUserType &&
+        if (knownCompleteUserType &&
                 targetType->kind == ast::TypeDeclKind::Class) {
             // fix #2950 (§12 / §31.4 / §2.8.2, v0.240): ask the ONE walk
             // (`sema::builtinExceptionBaseOf`) that codegen's layout gate also
@@ -16139,12 +16110,51 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             //     DID carry. So a class deriving from one of those five was
             //     laid out WITH the §31.4 header while sema rejected reading
             //     the header's own `Message`.
-            isBuiltinExInheritedMember =
-                !builtinExceptionBaseOf(targetType).empty();
-            if (isBuiltinExInheritedMember) {
-                // `e.Message` returns a string (§31 / stdlib Exception.Message).
-                ctx_.setExprType(&ma,
-                    ctx_.primitiveTypeRef(PrimitiveType::String));
+            //
+            // fix #2971 (§31.4 / §12.1 / §11.3, v0.240): the member NAME was
+            // the second half of the same defect and outlived the first. This
+            // arm read `mm == "Message"`, so `Message` was the ONLY one of the
+            // four §31.4 members a subclass exposed through its own static
+            // type: `s.StackTrace`, `s.CauseChain` and `l.ParamName` were
+            // rejected "no member `X` on type `Sub1` (§11.3, §12.1)" even
+            // though the object carries all four slots at their fixed byte
+            // offsets and retyping the receiver as the built-in base read the
+            // right values out of them (measured on 0dac23f: the same object
+            // gave `pn=pp` through an `ArgumentException`-typed receiver and a
+            // compile error through its own `ArgSub`). §31.4 declares all four
+            // on the built-in classes and §12.1 makes a base class's members
+            // available on a derived class; nothing carves out three of four.
+            // `sema::builtinExceptionSurfaceMemberOf` now states that surface
+            // once, so this arm can no longer hold a subset of it.
+            switch (builtinExceptionSurfaceMember(targetType, mm)) {
+                case BuiltinExcMember::Message:
+                case BuiltinExcMember::StackTrace:
+                    // §31.4 `readonly property Message/StackTrace: string`.
+                    isBuiltinExInheritedMember = true;
+                    ctx_.setExprType(&ma,
+                        ctx_.primitiveTypeRef(PrimitiveType::String));
+                    break;
+                case BuiltinExcMember::ParamName:
+                    // §31.4 `readonly property ParamName: string?` — NULLABLE
+                    // ("null when not supplied"). A subclass that chained the
+                    // one-argument `base(message)` leaves the slot calloc-
+                    // zeroed, so typing it `string` here would hand a null to
+                    // §7's non-nullable contract.
+                    isBuiltinExInheritedMember = true;
+                    ctx_.setExprType(&ma,
+                        ctx_.primitiveTypeRef(PrimitiveType::String,
+                                              /*nullable=*/true));
+                    break;
+                case BuiltinExcMember::CauseChain:
+                    // §31.4 `readonly property CauseChain: Array<ExceptionInfo>`
+                    // ("empty when no cause") — the same synthetic TypeRef the
+                    // built-in-typed receiver gets, so `.Count` and
+                    // `chain[i].TypeName` resolve identically either way.
+                    isBuiltinExInheritedMember = true;
+                    ctx_.setExprType(&ma, excCauseChainTypeRef());
+                    break;
+                case BuiltinExcMember::None:
+                    break;
             }
         }
         if (knownCompleteUserType && !isUniversalObjectMember &&

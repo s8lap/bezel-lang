@@ -4222,20 +4222,35 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         //  * ParamName  — offset kExcParamOffset (bz_string*; null when absent).
         //  * ExceptionInfo.TypeName/.Message/.StackTrace — fields 0/1/2 of the
         //    24-byte record element.
+        //
+        // fix #2971 (§31.4 / §12.1 / §11.3, v0.240): the receiver test was
+        // `isBuiltinExceptionTypeRef(rtt)`, i.e. a receiver STATICALLY TYPED as
+        // a built-in. That was in lockstep with sema, which admitted only
+        // `Message` on a user subclass — so a subclass exposed one quarter of
+        // its own inherited §31.4 surface. Now that sema admits all four, these
+        // readers must reach the same three receiver shapes sema does, or the
+        // sema half alone would produce #2972's failure mode: accepted at
+        // compile time, degraded to a null/zero at run time. See
+        // `isInheritedExcSurfaceAccess` for the shapes and why the header GEPs
+        // are correct on each (the header is at the SAME byte offsets in a
+        // user subclass — `classStruct` mirrors all four slots).
         if (ma->target) {
-            auto* rtt = ctx_.exprType(*ma->target);
             auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
-            if (ma->member == "StackTrace" && isBuiltinExceptionTypeRef(rtt)) {
+            if (ma->member == "StackTrace" && isInheritedExcSurfaceAccess(ma)) {
+                // §31.4 `StackTrace: string` — "formatted; "" when
+                // unavailable". No debug info yet, so the "" stub, exactly as
+                // for a built-in receiver. (The receiver is deliberately NOT
+                // lowered, matching the pre-#2971 behaviour for built-ins.)
                 return lowerStringLiteral("\"\"", false);
             }
-            if (ma->member == "CauseChain" && isBuiltinExceptionTypeRef(rtt)) {
+            if (ma->member == "CauseChain" && isInheritedExcSurfaceAccess(ma)) {
                 llvm::Value* excObj = lowerExpr(*ma->target);
                 if (!excObj) return nullptr;
                 llvm::Value* ccSlot = builder_.CreateGEP(
                     i8Ty, excObj, builder_.getInt64(kExcCauseOffset));
                 return builder_.CreateLoad(ptrTy(), ccSlot, "exc.causechain");
             }
-            if (ma->member == "ParamName" && isBuiltinExceptionTypeRef(rtt)) {
+            if (ma->member == "ParamName" && isInheritedExcSurfaceAccess(ma)) {
                 llvm::Value* excObj = lowerExpr(*ma->target);
                 if (!excObj) return nullptr;
                 llvm::Value* pnSlot = builder_.CreateGEP(
@@ -5022,11 +5037,42 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
         // (CG22+): the message pointer lives at byte offset 8 in the exception
         // object layout regardless of whether the receiver is the builtin class
         // itself or a user-derived class (§31 / classStruct layout rule).
+        //
+        // fix #2971 (§31.4 / §12.1 / §11.3, v0.240): the other three §31.4
+        // members reach here the same way, through the same sema arm — this
+        // one read `id2->name == "Message"` and so covered a quarter of the
+        // surface. The gate is unchanged in shape (the name, NO resolved
+        // symbol — a local/field/parameter of the same spelling carries one and
+        // is excluded — and a live `this`); only the name set widened, and each
+        // member reads its own fixed §31.4 byte offset out of the header
+        // `currentThis_` points at.
         if (auto* id2 = dynamic_cast<const ast::IdentifierExpr*>(&e)) {
-            if (id2->name == "Message" &&
-                    !ctx_.exprSymbol(e) &&
-                    currentThis_) {
+            const bool bareExcSurface =
+                id2->name == "Message" || id2->name == "StackTrace" ||
+                id2->name == "CauseChain" || id2->name == "ParamName";
+            if (bareExcSurface && !ctx_.exprSymbol(e) && currentThis_) {
                 auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                // §31.4 `StackTrace: string` — the "" stub (no debug info yet),
+                // the same value the qualified spellings produce.
+                if (id2->name == "StackTrace")
+                    return lowerStringLiteral("\"\"", false);
+                if (id2->name == "CauseChain") {
+                    // §31.4 `CauseChain: Array<ExceptionInfo>` @24 — null reads
+                    // as the empty chain (bz_array_len(null) == 0).
+                    llvm::Value* ccSlot = builder_.CreateGEP(
+                        i8Ty, currentThis_,
+                        builder_.getInt64(kExcCauseOffset), "cc.slot");
+                    return builder_.CreateLoad(ptrTy(), ccSlot, "cc.val");
+                }
+                if (id2->name == "ParamName") {
+                    // §31.4 `ParamName: string?` @32 — null when not supplied,
+                    // which is the property's own declared value, so NO
+                    // empty-string substitution here (unlike Message).
+                    llvm::Value* pnSlot = builder_.CreateGEP(
+                        i8Ty, currentThis_,
+                        builder_.getInt64(kExcParamOffset), "pn.slot");
+                    return builder_.CreateLoad(ptrTy(), pnSlot, "pn.val");
+                }
                 llvm::Value* msgSlot = builder_.CreateGEP(
                     i8Ty, currentThis_, builder_.getInt64(8), "msg.slot");
                 llvm::Value* msgPtr =
