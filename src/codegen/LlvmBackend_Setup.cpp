@@ -3917,9 +3917,9 @@ void Emitter::declareVtables() {
     }
     // Pass C: fill each descriptor with [self + transitive bases, null]. A base
     // that is imported is in descArray_ as an EXTERNAL declaration from the loop
-    // above; guard with .find so a not-yet-reconstructed base lowers to null
-    // rather than a default-inserted null map entry (which yields a malformed
-    // ConstantArray and crashes global emission, issue #103).
+    // above; guard with .find so a not-yet-reconstructed base does not
+    // default-insert a null map entry (which yields a malformed ConstantArray and
+    // crashes global emission, issue #103).
     // #596 / §21 / §31 / §12: after user-type supers, also append the builtin
     // ancestor descriptors (builtinDesc_) so emitIsA finds them when testing
     // `e is Exception` or dispatching a `catch var e: Exception` arm.
@@ -3927,9 +3927,41 @@ void Emitter::declareVtables() {
         std::vector<llvm::Constant*> elems;
         for (const sema::TypeSymbol* s : supers) {
             auto it = descArray_.find(s);
+            // fix #2981 (§12.7 "Type tests: `is`, `is not`, `as`" / §12 /
+            // §2.8.3 rule 4, v0.240): A NULL MAY NEVER APPEAR MID-ARRAY. `emitIsA`
+            // walks this array from index 0 and TERMINATES on the first null
+            // (LlvmBackend_Layout.cpp) — null is the array's terminator, not a
+            // "no descriptor" placeholder — so a missing super used to cut the
+            // chain and silently discard every entry after it.
+            //
+            // Reachable, and measured rather than reasoned about: a LOCAL class
+            // deriving from an IMPORTED GENERIC instantiation
+            // (`class D120: GBase120<int>`) is exactly the shape whose super has
+            // no descArray_ entry — a generic CLASS exports no shared descriptor
+            // (§2.5, the exporter gate below) and the importer declares none
+            // (#2379 admits only a generic INTERFACE). The emitted chain was
+            //
+            //     [td$D120, null, td$GBase120_int, null]
+            //
+            // with `td$GBase120_int` correctly minted by the extraInstOf loop
+            // below and sitting at an index nothing could reach, so on a real
+            // two-module build `o is GBase120<int>` answered
+            //
+            //     self=1  gbase=0  wrong=0        (gbase=1 is correct)
+            //
+            // — a §12.7 silent false on a legal program, with no crash and no
+            // diagnostic at any severity.
+            //
+            // The fallback is the SELF descriptor, which is what the extraInstOf
+            // loop 20 lines below already does for its own mint failure and for
+            // this same stated reason. It is the one constant that provably
+            // cannot create a FALSE match: `td$<ts>` is already element 0, so
+            // repeating it re-asserts a match the walk makes anyway. Anything
+            // else — the base's shared descriptor, say — would have to be
+            // *correct*, and the whole premise here is that we do not have it.
             elems.push_back(it != descArray_.end()
                                 ? llvm::cast<llvm::Constant>(it->second)
-                                : llvm::ConstantPointerNull::get(ptrTy()));
+                                : llvm::cast<llvm::Constant>(descArray_[ts]));
         }
         // #596: append builtin exception ancestor descriptors (btd$Exception, …)
         // for any user class that inherits a built-in exception type.
