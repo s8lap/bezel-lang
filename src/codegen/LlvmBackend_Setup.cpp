@@ -5143,7 +5143,8 @@ void Emitter::emitGuardThrow(llvm::Value* cond, const char* name) {
 // public non-generic types export their vtable).
 //
 // Layout (matches declareVtables Pass D):
-//   [0] per-instantiation descriptor  (td$<Type>$specN  = [self, null])
+//   [0] per-instantiation descriptor  (instanceDescriptorFor — the #1843 global
+//       the `is`/`as`/`catch`/§19 test sites resolve; see fix #2977 below)
 //   [1] per-instantiation itmap       (null-terminated, no interfaces yet)
 //   [2] specialized Dispose           (via emitSpecializedDisposer)
 //   [3] ToString thunk                (type-name default or methodFns_ entry)
@@ -5153,12 +5154,30 @@ void Emitter::emitGuardThrow(llvm::Value* cond, const char* name) {
 // emitBaseDisposeChain needs the core fn for any derived class that inherits
 // this imported generic base).
 //
-// Cached in specializedVtables_[ts][specFieldTys] so Box<int> and Box<string>
-// get distinct vtables.
+// Cached by the per-instantiation DESCRIPTOR when there is one, else by the
+// spec-field-types vector (see the two-key note at the cache lookup below).
 llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     const sema::TypeSymbol* ts) {
     if (!ts || ts->kind != ast::TypeDeclKind::Class) return nullptr;
     if (genericSubst_.empty()) return nullptr;
+
+    // fix #2977 / fix #2956 (v0.240): resolve the per-instantiation descriptor
+    // FIRST, because it is also the primary CACHE KEY. See the long note at
+    // section (a) for what it is and why it replaced a private `[self, null]`.
+    llvm::GlobalVariable* instDesc = nullptr;
+    {
+        std::vector<const sema::TypeRef*> args;
+        args.reserve(ts->genericParams.size());
+        for (const sema::Symbol* gp : ts->genericParams) {
+            auto it = genericSubstSemaTy_.find(gp->name);
+            args.push_back(it != genericSubstSemaTy_.end() ? it->second
+                                                           : nullptr);
+        }
+        if (!args.empty()) instDesc = instanceDescriptorFor(ts, args);
+        auto dit = descArray_.find(ts);
+        if (instDesc && dit != descArray_.end() && instDesc == dit->second)
+            instDesc = nullptr;  // the shared fallback — not an identity
+    }
 
     // Cache key: same spec-field-types vector as specializedStructs_ /
     // specializedVtables_ so each concrete instantiation gets exactly one vtable.
@@ -5178,12 +5197,42 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     for (const sema::Symbol* m : storage)
         specFieldTys.push_back(storageType(m));
 
+    // TWO KEYS, and the descriptor one has to WIN where it exists — #1843's
+    // reason, which `specializedVtableFor` already records for the local twin
+    // (`specVtablesByDesc_`) and which became live here the moment slot 0 stopped
+    // being a private per-vtable global.
+    //
+    // `specFieldTys` is a vector of LOWERED LLVM types, and every class type
+    // erases to `ptr` — so `G<Dog>` and `G<Cat>` produce the SAME key and share
+    // one vtable. That was harmless while slot 0 was a private `[self, null]`
+    // that matched nothing; with a real identity in it, the shared vtable would
+    // hand every `G<Cat>` the FIRST instantiation's descriptor, and `catIsDog`
+    // would answer TRUE — a §12.9 invariance break in the FALSE-POSITIVE
+    // direction, i.e. strictly worse than the false negatives #2977/#2956 are
+    // about, because the `as` behind it binds a `Cat` at the `Dog` static type
+    // (the #1843/#2001 type-confusion class). MEASURED, not reasoned about: an
+    // intermediate version of this fix printed
+    //
+    //     dogIsDog=1 dogIsCat=0 catIsCat=0 catIsDog=1
+    //
+    // on a two-module build where 1/0/1/0 is correct. The descriptor global is
+    // keyed by `descIdentityKey` (declaration identity + recursive type
+    // arguments), which is exactly the discrimination the runtime `is` honours,
+    // so keying by it is the property and not a wider enumeration.
     auto& specMap = specializedVtables_[ts];
-    auto sit = specMap.find(specFieldTys);
-    if (sit != specMap.end()) return sit->second;
+    auto& descMap = specVtablesByDesc_[ts];
+    if (instDesc) {
+        auto dvit = descMap.find(instDesc);
+        if (dvit != descMap.end()) return dvit->second;
+    } else {
+        auto sit = specMap.find(specFieldTys);
+        if (sit != specMap.end()) return sit->second;
+    }
 
-    // Suffix for de-duplicating names (Box$spec0, Box$spec1, …).
-    std::string suffix = "$spec" + std::to_string(specMap.size());
+    // Suffix for de-duplicating names (Box$spec0, Box$spec1, …). Counts BOTH
+    // maps, so the two keying regimes cannot mint the same name.
+    std::string suffix =
+        "$spec" + std::to_string(specMap.size() + descMap.size());
     std::string tsName = std::string(ts->name);
 
     // fix #2943 (§2.8.3 rule 4 / §12.1 / §13 / §14.1 / §2.5, v0.240): CREATE AND
@@ -5215,25 +5264,91 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
         llvm::ConstantAggregateZero::get(arrTy),
         "vt$" + tsName + suffix);
     allVtables_.push_back(gv);  // §8.6 #417: string discriminator
-    specMap[specFieldTys] = gv;
+    if (instDesc) descMap[instDesc] = gv;
+    else specMap[specFieldTys] = gv;
 
-    // --- (a) Per-instantiation descriptor: [self, null] ---
-    // A minimal descriptor that lets emitIsA / type tests recognize the object.
-    // We use a 2-element array [selfDesc, null] (no base entries — the imported
-    // generic class has no known base TypeSymbol here; Foundation C can extend
-    // this when base-chain information is available cross-module).
-    auto* descArrTy = llvm::ArrayType::get(ptrTy(), 2);
-    auto* descGV = new llvm::GlobalVariable(
-        *module_, descArrTy, /*isConstant=*/true,
-        llvm::GlobalValue::InternalLinkage, /*init=*/nullptr,
-        "td$" + tsName + suffix);
-    // Self-referential initializer: [self, null].
-    std::vector<llvm::Constant*> descElems = {
-        llvm::cast<llvm::Constant>(descGV),
-        llvm::ConstantPointerNull::get(ptrTy()),
-    };
-    descGV->setInitializer(
-        llvm::ConstantArray::get(descArrTy, descElems));
+    // --- (a) Per-instantiation descriptor ---
+    //
+    // fix #2977 (§2.8.3 rule 4 "Identity is one type at runtime, too" / §2.8.2
+    // clause 2 / §12.7 "Type tests: `is`, `is not`, `as`" / §17.4 / §19.3) and
+    // fix #2956 (§31.2.1 "Arm patterns" / §31.4 / §12), v0.240 — ONE defect,
+    // measured as two.
+    //
+    // This block used to mint its OWN `td$<Name>$specN = [self, null]`, and the
+    // comment it carried — "a minimal descriptor that lets emitIsA / type tests
+    // recognize the object" — was FALSE IN BOTH HALVES. Neither half is a
+    // Foundation-C-sized job; both are this call.
+    //
+    //  * WRONG SELF IDENTITY (#2977). `emitIsA`'s TEST site resolves the target
+    //    through `perInstDescriptorForTarget` → `instanceDescriptorFor`, i.e.
+    //    `td$<readable-mangle>` (#1843). That is a DIFFERENT global from the one
+    //    minted here, under a different name, from a different function, with a
+    //    different cache key, and nothing reconciled them — so the pointer
+    //    comparison could never succeed. Measured on this fix's parent, on a
+    //    two-module build of an imported `GRe14<T>` with a `GRe14<string>`
+    //    receiver, where the object carries `td$GRe14$spec0` and the site
+    //    compares `td$GRe14_string`:
+    //
+    //        outer_is=0   WRONG: 44 is correct (`g is GRe14<string>`)
+    //        obj_is=0     WRONG: 44 is correct (the same test via `Object`)
+    //
+    //    Both spellings, so this is not a devirtualization artifact — and §2.8.3
+    //    rule 4 names the operation verbatim: "`is` tests, `catch` clauses, and
+    //    §19 patterns over values of the instantiation match identically
+    //    regardless of which artifact produced the value or performs the test."
+    //
+    //  * NO ANCESTORS AT ALL (#2956). `[self, null]` lists no bases, so every
+    //    test against ANY ancestor answered false — including a `catch` arm,
+    //    which is dispatched by exactly this walk (§31.2.1: "A bare type:
+    //    `IOException`. Matches any thrown exception that is an instance of the
+    //    type"). An imported generic exception subclass was UNCATCHABLE in the
+    //    importer:
+    //
+    //        throw new GEx8<int>(7)  →  Unhandled exception: GEx8, exit=70
+    //
+    //    where the identical declarations as ONE module print `caught` and exit 0
+    //    (§2.8.2 clause 2: "An external instantiation behaves identically to a
+    //    same-module instantiation of the same generic at the same arguments").
+    //
+    // `instanceDescriptorFor` supplies both halves, because a descriptor is an
+    // IDENTITY CHAIN and not code: it has no ABI and no GEP, so the layout-moves
+    // gate that (rightly) governs every FUNCTION slot in this vtable — #2894's
+    // itable fill, #2943's method slots, #2953's Object slots — has nothing to
+    // say about it. That is why #2956's own "USER ancestors need #2894's
+    // treatment, including its layout-moves gate — that half is larger" does not
+    // hold: the BFS over `ts->baseTypes` (ModuleLoader populates it, which #2894
+    // already relies on) and the `directBuiltinExceptionBase` walk (#2950 carries
+    // it across the boundary) both run importer-side already, and this is the
+    // SAME global the exporter-independent test sites resolve, so §2.8.3 rule 4's
+    // "one runtime type identity per monomorphization" holds by construction
+    // rather than by two functions agreeing.
+    //
+    // The private descriptor is KEPT as the fallback, and the fallback is not
+    // defensive: `instanceDescriptorFor` returns the SHARED `descArray_[ts]` when
+    // an argument is not concrete (a runtime-erased type argument — #2012's
+    // collapse guard), and for an imported generic CLASS there is no such entry
+    // (declareVtables declares one only for a public NON-generic type, or a
+    // public generic INTERFACE per #2379) — so that path yields a null here.
+    // Such an instantiation keeps today's exact behaviour: a private identity
+    // that matches nothing, which is the sound direction, since a shared
+    // declaration-level descriptor would make `GRe14<string>` match a
+    // `GRe14<int>` test (the #1843/#2001 type-confusion class).
+    llvm::GlobalVariable* descGV = instDesc;  // resolved at the top (cache key)
+    if (!descGV) {
+        auto* descArrTy = llvm::ArrayType::get(ptrTy(), 2);
+        auto* privDesc = new llvm::GlobalVariable(
+            *module_, descArrTy, /*isConstant=*/true,
+            llvm::GlobalValue::InternalLinkage, /*init=*/nullptr,
+            "td$" + tsName + suffix);
+        // Self-referential initializer: [self, null].
+        std::vector<llvm::Constant*> descElems = {
+            llvm::cast<llvm::Constant>(privDesc),
+            llvm::ConstantPointerNull::get(ptrTy()),
+        };
+        privDesc->setInitializer(
+            llvm::ConstantArray::get(descArrTy, descElems));
+        descGV = privDesc;
+    }
 
     // --- (b) Per-instantiation itmap ---
     //
