@@ -11724,7 +11724,83 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                     bm == "ToString" || bm == "Equals" ||
                     bm == "GetHashCode" || bm == "GetType" ||
                     bm == "ReferenceEquals";
+                // fix #2983 (§12.3 / §31.4 / §12.1, v0.240): the loop above can
+                // never find a BUILT-IN exception base. §31.4 declares
+                // `public class Exception`, and `class ExB: Exception` plainly
+                // names it — but a built-in has no `TypeSymbol` at all, so it is
+                // absent from `TypeSymbol::baseTypes`. This is the third variant
+                // of the category-defect taxonomy: a correct predicate ("is
+                // there a class entry in baseTypes?") fed by a source collection
+                // that never held the population. Reading the predicate tells
+                // you nothing is wrong.
+                //
+                // Two things were wrong before, and the second is the worse
+                // one. (1) `base.Message` was REJECTED on a direct built-in
+                // exception subclass, while the identical spelling is legal one
+                // level further down the chain (`class ExT2: ExT`, `class ExT:
+                // Exception` — there `baseTypes` does hold the user base) — so
+                // the rule appeared to depend on how deep the class sat.
+                // (2) The diagnostic asserted a FALSEHOOD about the user's own
+                // declaration: "`ExB` has no class base (its base is `Object`)".
+                // Its base is `Exception`. A reader who believes it goes looking
+                // for a missing `: Exception` that is already there. Worse, the
+                // remedy it suggested — "use `this.Message`" — pointed at a
+                // spelling that was itself SIGSEGV'ing until #2972 landed.
+                //
+                // `sema::builtinExceptionBaseOf` is the ONE walk that answers
+                // "does this class derive from a built-in exception" (#2950);
+                // `builtinExceptionSurfaceMemberOf` is the ONE statement of what
+                // that base declares (#2971). Both are asked here, so `base.X`
+                // resolves exactly what `this.X` resolves, and the message can
+                // never name a surface the resolver would reject.
+                std::string_view bex = builtinExceptionBaseOf(currentType_);
+                if (!bex.empty() && !universalObjMember) {
+                    // A §31.4 member: type it exactly as the `this.` path does.
+                    // Codegen already reads `this`/`base` uniformly for these
+                    // (#2972 for Message, #2971 for the rest), because the
+                    // receiver object is the same `this` pointer either way and
+                    // the header sits at the same byte offsets.
+                    switch (builtinExceptionSurfaceMemberOf(bex, bm)) {
+                        case BuiltinExcMember::Message:
+                        case BuiltinExcMember::StackTrace:
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::String));
+                            return;
+                        case BuiltinExcMember::ParamName:
+                            ctx_.setExprType(
+                                &ma, ctx_.primitiveTypeRef(PrimitiveType::String,
+                                                           /*nullable=*/true));
+                            return;
+                        case BuiltinExcMember::CauseChain:
+                            ctx_.setExprType(&ma, excCauseChainTypeRef());
+                            return;
+                        case BuiltinExcMember::None:
+                            break;
+                    }
+                    // Not on the base's surface. Still a reject — but one that
+                    // names the ACTUAL base and the surface it actually has.
+                    // #1307 / #2496: a degenerate MemberAccessExpr can carry a
+                    // zero span; fall back to the target's so this never reports
+                    // `0:0` (MEASURED: the old message did, on
+                    // `return base.CauseChain.Count;`).
+                    auto bLoc = ma.span.begin;
+                    if (bLoc.line == 0 && ma.target)
+                        bLoc = ma.target->span.begin;
+                    ctx_.diagnostics().report(
+                        Severity::Error, bLoc,
+                        "`base." + std::string(bm) +
+                        "` does not name a base-class member: `" +
+                        std::string(currentType_->name) +
+                        "`'s class base is the built-in `" + std::string(bex) +
+                        "` (\xC2\xA7""31.4), whose surface is " +
+                        builtinExceptionSurfaceList(bex) +
+                        " and the universal `ToString`/`Equals`/`GetHashCode`/"
+                        "`GetType` (\xC2\xA7""8.1) — `base.M` calls a base "
+                        "class's implementation (\xC2\xA7""12.3)");
+                    return;
+                }
                 if (!universalObjMember) {
+                    // The class really has no class base — `base` is `Object`.
                     ctx_.diagnostics().report(
                         Severity::Error, ma.span.begin,
                         "`base." + std::string(bm) +

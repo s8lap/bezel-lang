@@ -1637,15 +1637,37 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                                 recv = b;
                                 break;
                             }
-                        if (!recv)
+                        if (!recv) {
+                            // fix #2983 (§12.3 / §31.4, v0.240): the REJECT is
+                            // right — §31.4 declares no indexer on any built-in
+                            // exception, so `base[i]` names nothing either way
+                            // — but the CLAIM was not. This loop scans
+                            // `TypeSymbol::baseTypes`, which never holds a
+                            // built-in exception base (a built-in has no
+                            // TypeSymbol), so a `class ExB: Exception` was told
+                            // "`ExB` has no class base", a falsehood about the
+                            // user's own declaration. A diagnostic can be right
+                            // to fire and wrong in what it says; name the real
+                            // base. `sema::builtinExceptionBaseOf` is the ONE
+                            // walk that knows it (#2950).
+                            std::string_view bex =
+                                builtinExceptionBaseOf(currentType_);
                             ctx_.diagnostics().report(
                                 Severity::Error, e.span.begin,
                                 "`base[...]` does not name a base-class "
                                 "indexer: `" +
                                     std::string(currentType_->name) +
-                                    "` has no class base (its base is "
-                                    "`Object`, which declares no indexer) "
-                                    "(§12.3/§23.4)");
+                                    (bex.empty()
+                                         ? std::string(
+                                               "` has no class base (its base "
+                                               "is `Object`, which declares no "
+                                               "indexer)")
+                                         : ("`'s class base is the built-in `" +
+                                            std::string(bex) +
+                                            "` (\xC2\xA7""31.4), which declares "
+                                            "no indexer")) +
+                                    " (§12.3/§23.4)");
+                        }
                     }
                     if (recv) {
                         TypeRef* rt = ctx_.makeTypeRef();
