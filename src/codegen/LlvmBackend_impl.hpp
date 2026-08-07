@@ -635,6 +635,28 @@ private:
     // in an earlier basic block) and wrongly reuse one stale cell. Keyed by the
     // AllocaInst (module-lifetime, unique across the compilation — no clearing).
     std::unordered_set<llvm::AllocaInst*> loopBodyDeclaredSlots_;
+    // fix #2975 (§29.7 / §28.3 / §28.2, v0.240): the decl nodes whose
+    // pure-`IEnumerable<T>`/`IOwningEnumerable<T>` local-decl coercion
+    // (lowerLocalDecl) ACTUALLY built an iterator-format value — one whose
+    // vtable is [0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current.
+    //
+    // WHY IT IS A RECORDED FACT AND NOT A RE-DERIVED ONE. The scope-end
+    // registrations (registerUsingDisposal's `isSyncIterEnum` arm and
+    // registerIterableSourceDisposal) both PREDICTED the wrap from the static
+    // types alone — "a user-class (declaration-carrying) init is wrapped". That
+    // premise is false: `wrapUserClassAsIEnumerable` has five early
+    // `return src;` paths (no `GetEnumerator`; an unresolvable return type; no
+    // concrete enumerator class found; no `MoveNext`; `MoveNext` not yet in
+    // `methodFns_`) on which it hands back the RAW class instance. A raw class
+    // instance carries the CLASS vtable — [0]=td$, [1]=itmap$, [2]=Dispose —
+    // so the iterator-format slot-1 dispatch calls the interface-map GLOBAL as
+    // a function. MEASURED on 618c0c8: a wild jump into `itmap$MyE`
+    // (AddressSanitizer SEGV, "PC is at a non-executable region"), for a
+    // `using var`, for a plain `var`, and for an alias of a named owner.
+    // Recording what the coercion DID removes the prediction; a decline is then
+    // routed to the class disposal the explicit `.Dispose()` path already takes.
+    // Keyed by the decl ast::Node* (module-lifetime — no clearing).
+    std::unordered_set<const ast::Node*> iterFormatWrappedDecls_;
     // §27.5 / #673: for guarded-boxed (non-for-var) locals, maps each
     // cell-holder alloca (newSlot) to the ORIGINAL pre-boxing alloca
     // (the variable's original storage slot).  After boxing, the original
@@ -9178,6 +9200,17 @@ private:
     // local is disposed at the end of its enclosing block in reverse
     // declaration order. Recorded against the innermost open scope.
     void registerUsingDisposal(const ast::LocalDecl* ld);
+
+    // fix #2975 (§29.7 / §29.3 / §28.3 / §28.2 / §8.1, v0.240): the user class
+    // a local's slot ACTUALLY holds when its declared type is a built-in
+    // (declaration-less) interface head and the §29.2 IEnumerable coercion did
+    // NOT wrap it into iterator format — i.e. the slot holds a plain class
+    // object, Dispose at vtable slot 2, NOT slot 1. Null when the question does
+    // not arise. `*outSrcIsNamedOwner` (optional) reports that a named owner
+    // already disposes the value, so this local must register nothing. See the
+    // definition in LlvmBackend_Setup.cpp for the full derivation.
+    const sema::TypeSymbol* rawUserClassInBuiltinInterfaceSlot(
+        const ast::LocalDecl* ld, bool* outSrcIsNamedOwner);
 
     // §30.5 / #1258 / #1868: attach the per-T owned-result disposer to a task
     // Disposal when `taskTy` is an `OwningTask<T:class>` — the produced owned

@@ -11149,6 +11149,19 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     // `for var x in items do` silently miscompiles (vtable[2] = Dispose, not
     // MoveNext) because lowerIEnumerableBuiltinFor's vtable-dispatch path
     // assumes the IEnumerable<T>-typed value IS already an enumerator.
+    //
+    // fix #2975 (§29.7 / §28.3 / §28.2, v0.240): remember whether this coercion
+    // ACTUALLY produced an iterator-format value. Every arm below either builds
+    // a fresh wrapper/drain (an iterator-format object) or — in
+    // `wrapUserClassAsIEnumerable`'s five decline paths — hands `v` straight
+    // back UNCHANGED, leaving the raw class instance in the slot. The scope-end
+    // registrations used to predict "a user-class init is wrapped" from the
+    // static types and dispatched vtable slot 1 on the decline, calling the
+    // class's `itmap$` GLOBAL as a function (measured wild jump). `v !=
+    // preIterWrap` is the coercion's own report of what it did, so no arm can
+    // drift from it — a new wrap helper is covered the day it is added, and a
+    // new decline path is covered the day it is added.
+    llvm::Value* preIterWrap = v;
     if (v && declType && init) {
         const sema::TypeRef* declTR = ctx_.resolvedType(*declType);
         if (declTR && declTR->kind == sema::TypeRef::Kind::Named &&
@@ -11313,6 +11326,9 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             }
         }
     }
+    // fix #2975: record the coercion's own verdict (see `preIterWrap` above).
+    if (declNode && v && v != preIterWrap)
+        iterFormatWrappedDecls_.insert(declNode);
     llvm::Type* declaredTy = declType ? lowerType(declType) : nullptr;
     // #914: a narrowed value-nullable initializer (sema accepted the assignment
     // because null-flow proved it non-null) lowered to the {flag, value} struct,
@@ -12136,6 +12152,25 @@ bool Emitter::registerIterableSourceDisposal(const ast::LocalDecl* ld) {
     }
     if (!ownsSource) return false;
 
+    // fix #2975 (§29.7 / §29.3 / §28.3 / §28.2, v0.240): the plain-`var` twin of
+    // the `using var` guard in registerUsingDisposal. `wrappedHere` above reads
+    // "a user-class (declaration-carrying) init is wrapped" — a PREDICTION that
+    // `wrapUserClassAsIEnumerable` falsifies on each of its five decline paths,
+    // leaving the RAW class instance in the slot. MEASURED on 618c0c8, both
+    // through this function: `var e: IEnumerable<int> := new MyE();` and
+    // `using var r := new MyE(); var e: IEnumerable<int> := r;` each dispatched
+    // slot 1 of a CLASS vtable and wild-jumped into `itmap$MyE` (ASan SEGV).
+    //
+    // DECLINE (return false) rather than register a corrected disposal here:
+    // this function's contract is "I claimed the iterator-format source", and
+    // returning false is what hands the local back to the ordinary plain-`var`
+    // machinery in `lowerStmt` — §28.3's affine auto-drop (`autoDropAtScopeEnd`
+    // → registerUsingDisposal, which now routes it to the class disposal) or
+    // the exception-unwind-only path for a local that is discharged elsewhere.
+    // Registering a normal-exit disposal here instead would fire for a local
+    // §28.3 requires the PROGRAM to discharge, double-freeing it.
+    if (rawUserClassInBuiltinInterfaceSlot(ld, nullptr)) return false;
+
     // The source value is the IEnumerABLE: dispose it once at scope end (the
     // for-in clones a fresh enumerator per loop and never disposes the source).
     Disposal d{it->second, nullptr};
@@ -12321,6 +12356,91 @@ void Emitter::consumeLastLambdaCapturedCells() {
     lastLambdaCapturedCells_.clear();
 }
 
+// fix #2975 (§29.7 / §29.3 / §28.3 / §28.2 / §8.1, v0.240): ANSWER, for a local
+// whose declared type is a BUILT-IN (declaration-less) interface head, whether
+// its slot actually holds a RAW USER-CLASS INSTANCE — i.e. an object carrying
+// the standard CLASS vtable ([0]=td$, [1]=itmap$, [2]=Dispose, [3]=ToString),
+// not the iterator format ([0]=td, [1]=Dispose, [2]=MoveNext, [3]=Current).
+//
+// WHY THE QUESTION EXISTS. §8.1 makes `class MyE: IEnumerable<int>` legal, and
+// §29.2's local-decl coercion normally converts such an initializer into an
+// iterator-format wrapper so the for-in vtable protocol is satisfied. But
+// `wrapUserClassAsIEnumerable` DECLINES on five paths (no `GetEnumerator`, an
+// unresolvable return type, no concrete enumerator class discoverable, no
+// `MoveNext`, `MoveNext` not yet in `methodFns_`), and on a decline it returns
+// the source UNCHANGED. `iterFormatWrappedDecls_` is the coercion's own report
+// of which it did; this predicate reads that report rather than re-deriving the
+// outcome from the static types, which is exactly the derivation that was
+// WRONG (it read "the init is a user class" as "therefore it was wrapped").
+//
+// The declared type being declaration-less is what makes this a problem at all:
+// a USER interface head (`using var x: IFoo := new Foo();`) resolves to a real
+// TypeSymbol and `classOfLocal` already dispatches it correctly.
+//
+// `*outSrcIsNamedOwner` reports that the value belongs to a NAMED owner
+// (local/parameter/field/auto-property) that disposes it at its own scope end,
+// so this local is an ALIAS and must register NO disposal of its own — the same
+// split `lowerLocalDecl`'s coercion already makes for `ownsSrc`, and the same
+// one `lowerIEnumerableBuiltinFor`'s `sourceIsNamedOwner` makes.
+const sema::TypeSymbol* Emitter::rawUserClassInBuiltinInterfaceSlot(
+        const ast::LocalDecl* ld, bool* outSrcIsNamedOwner) {
+    if (outSrcIsNamedOwner) *outSrcIsNamedOwner = false;
+    if (!ld || !ld->type || !ld->initializer) return nullptr;
+    // The declared type must be a declaration-less Named type: a reserved
+    // built-in name (an interface head such as IEnumerable<T>/IList<T>/
+    // IDisposable), which carries NO user declaration for classOfLocal to
+    // dispatch through. A generic type PARAMETER is also declaration-less, but
+    // it is excluded below by the initializer test (a `new T()` initializer is
+    // declaration-less too, and is resolved through genericSubstSemaTy_ by
+    // classOfLocal, which this predicate leaves alone).
+    const sema::TypeRef* declTR = ctx_.resolvedType(*ld->type);
+    if (!declTR || declTR->kind != sema::TypeRef::Kind::Named ||
+        declTR->declaration)
+        return nullptr;
+    // The initializer's static type must be a USER CLASS — the one shape whose
+    // runtime value is guaranteed to carry the standard class vtable, so
+    // `emitDisposeAndReclaim` (vtable slot 2 + reclaim) is exactly right for it.
+    // A record/enum/interface declaration is not admitted.
+    //
+    // `declaration->decl` is what makes it a USER class and it is load-bearing,
+    // not belt-and-braces. A RESERVED BUILT-IN also carries a `declaration` — a
+    // `builtinClassSym` TypeSymbol, whose `kind` is likewise
+    // `TypeDeclKind::Class` — and differs only in having NO `ast::TypeDecl`
+    // behind it. (This is the same `!declaration->decl` test
+    // `attachOwningTaskResultDisposer` and `builtinTypeName` use to tell the two
+    // apart.) The two TypeRef spellings are not symmetric: a built-in named in
+    // an ANNOTATION resolves declaration-less, while the same built-in as a
+    // CALL's result type resolves to the builtinClassSym — so a declaration-less
+    // declared type paired with a declaration-carrying initializer does NOT
+    // imply a user class. MEASURED: without this test, `using var r: RawBytes
+    // := RawBytes.From([10, 20, 30, 40]);` matched here, took the class
+    // disposal, and never reached the `ffiBuffer` arm that actually frees a
+    // RawBytes — dispatching a vtable through a `{ptr, len}` struct that has
+    // none (#999's `rawbytes_from_loop_no_corruption_15_4` went from green to a
+    // crash).
+    const sema::TypeRef* initTR = ctx_.exprType(*ld->initializer);
+    if (!initTR || initTR->kind != sema::TypeRef::Kind::Named ||
+        !initTR->declaration || !initTR->declaration->decl ||
+        initTR->declaration->kind != ast::TypeDeclKind::Class)
+        return nullptr;
+    // If the §29.2 coercion built an iterator-format wrapper for THIS decl, the
+    // slot does not hold the raw instance and the existing slot-1 dispatch is
+    // correct — say nothing.
+    if (iterFormatWrappedDecls_.count(ld)) return nullptr;
+    if (outSrcIsNamedOwner) {
+        if (sema::Symbol* sym = ctx_.exprSymbol(*ld->initializer)) {
+            if (dynamic_cast<sema::LocalSymbol*>(sym) != nullptr ||
+                dynamic_cast<sema::ParameterSymbol*>(sym) != nullptr ||
+                dynamic_cast<sema::FieldSymbol*>(sym) != nullptr) {
+                *outSrcIsNamedOwner = true;
+            } else if (auto* ps = dynamic_cast<sema::PropertySymbol*>(sym)) {
+                *outSrcIsNamedOwner = isAutoPropertyStorage(ps);
+            }
+        }
+    }
+    return initTR->declaration;
+}
+
 void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (disposeStack_.empty()) return;
     auto it = locals_.find(ld);
@@ -12336,6 +12456,47 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     // pin. (The untyped bare-identifier pin was already handled inside
     // classOfLocal; this generalizes it to the typed and if/case forms.)
     if (ld->usingVarSourceIsBorrow) return;
+
+    // fix #2975 (§29.7 / §29.3 / §28.3 / §28.2 / §8.1, v0.240): a slot declared
+    // at a BUILT-IN INTERFACE HEAD that actually holds a RAW USER-CLASS
+    // INSTANCE. §8.1 makes every such declaration legal (`class MyE:
+    // IEnumerable<int>`, `class MyE: IList<int>`), and the value in the slot is
+    // then an ordinary class object with the CLASS vtable — Dispose at slot 2.
+    //
+    // Two measured failures this replaces, on 618c0c8:
+    //   * `using var e: IEnumerable<int> := new MyE();` took the isSyncIterEnum
+    //     arm below and dispatched vtable slot 1, which for a class object is
+    //     the `itmap$` interface-map GLOBAL — AddressSanitizer reported
+    //     "SEGV ... Maybe a wild jump? #0 itmap$MyE".
+    //   * `using var e: IList<int> := new MyE();` matched NO arm at all
+    //     (`classOfLocal` returns null the moment the declared type carries no
+    //     user declaration), so the instance was never disposed — LSan: "Direct
+    //     leak of 16 byte(s) in 1 object(s)".
+    // Both are answered by the SAME fact, so they are answered in one place:
+    // dispose the object the way the value's own representation requires. This
+    // is exactly the dispatch the explicit `e.Dispose()` spelling already takes
+    // through such a slot (measured clean on the same build) — `dynamicDispose`
+    // → `emitDisposeAndReclaim`: the object's own vtable slot 2 (most-derived
+    // Dispose + base chain, §28.2 idempotent) then reclaim, null-guarded, with
+    // the slot nulled after so any further disposal through it is a no-op.
+    //
+    // A NAMED-owner source registers NOTHING: `using var r := new MyE(); var e:
+    // IEnumerable<int> := r;` is an alias, `r` disposes it once, and a second
+    // registration here would double-free. (On 618c0c8 that shape ALSO wild-
+    // jumped, via the same wrong arm.)
+    //
+    // Checked BEFORE the isSyncIterEnum arm because that arm's whole premise —
+    // "the value in this slot is in iterator format" — is what fails here.
+    {
+        bool srcIsNamedOwner = false;
+        if (rawUserClassInBuiltinInterfaceSlot(ld, &srcIsNamedOwner)) {
+            if (srcIsNamedOwner) return;
+            Disposal d{it->second, nullptr};
+            d.dynamicDispose = true;
+            disposeStack_.back().push_back(d);
+            return;
+        }
+    }
 
     // §29.11 (#943): a sync `using var source := P.Seq();` whose value is a
     // vtable-backed re-iterable IEnumerable<T>/IOwningEnumerable<T> (yield-iterator
