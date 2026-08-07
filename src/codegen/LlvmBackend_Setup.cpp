@@ -12652,6 +12652,33 @@ const sema::TypeSymbol* Emitter::rawUserClassInBuiltinInterfaceSlot(
     return initTR->declaration;
 }
 
+// fix #2991 (spec §11.3 / §28.3 / §28.9, v0.240): see the header for the
+// measured grid and why `builtinTypeName` is the one test that decides this.
+std::string_view Emitter::newExprBuiltinHead(const ast::NewExpr* ne) {
+    if (!ne || !ne->type || !ne->type->name || ne->type->name->parts.empty())
+        return {};
+    const sema::TypeRef* rt = ctx_.resolvedType(*ne->type);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return {};
+    // DECLARATION-LESS, not merely "no `ast::TypeDecl`". `builtinTypeName` also
+    // accepts the `builtinClassSym` shape — a `declaration` with a null `decl` —
+    // and an IMPORTED user class is indistinguishable from it: the module loader
+    // reconstructs the dependency's types as TypeSymbols with no `ast::TypeDecl`
+    // (there is no AST for another module's source), so `builtinTypeName` hands
+    // back the imported class's own name. MEASURED on the first spelling of this
+    // fix: with the colliding user class moved into module A and imported by B,
+    // ALL TWENTY names were still live — including `Random` and `Atomic`, which
+    // #2973's guard does not reach either for the same reason.
+    //
+    // A `new` site's type node never resolves to the `builtinClassSym` shape for
+    // a genuine built-in (that shape is how a CALL's RESULT type arrives, e.g.
+    // `Stopwatch.StartNew()` — which reaches the arms through the separate
+    // exprType probe, not this one). So requiring a declaration-less TypeRef
+    // costs nothing here and is what excludes the imported user class.
+    if (rt->declaration) return {};
+    if (builtinTypeName(rt).empty()) return {};
+    return ne->type->name->parts[0];
+}
+
 void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
     if (disposeStack_.empty()) return;
     auto it = locals_.find(ld);
@@ -12839,9 +12866,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
             if (!isTS) {
                 if (auto* ne = dynamic_cast<const ast::NewExpr*>(
                         ld->initializer.get()))
-                    isTS = ne->type && ne->type->name &&
-                           !ne->type->name->parts.empty() &&
-                           ne->type->name->parts[0] == "TaskScope";
+                    isTS = newExprBuiltinHead(ne) == "TaskScope";
             }
         }
         if (isTS) {
@@ -13040,12 +13065,8 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isBinSer && !isBinDer && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
-                isBinSer = ne->type && ne->type->name &&
-                           !ne->type->name->parts.empty() &&
-                           ne->type->name->parts[0] == "BinarySerializer";
-                isBinDer = ne->type && ne->type->name &&
-                           !ne->type->name->parts.empty() &&
-                           ne->type->name->parts[0] == "BinaryDeserializer";
+                isBinSer = newExprBuiltinHead(ne) == "BinarySerializer";
+                isBinDer = newExprBuiltinHead(ne) == "BinaryDeserializer";
             }
         }
         if (isBinSer) {
@@ -13080,12 +13101,8 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isJsonSer && !isJsonDer && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
-                isJsonSer = ne->type && ne->type->name &&
-                            !ne->type->name->parts.empty() &&
-                            ne->type->name->parts[0] == "JsonSerializer";
-                isJsonDer = ne->type && ne->type->name &&
-                            !ne->type->name->parts.empty() &&
-                            ne->type->name->parts[0] == "JsonDeserializer";
+                isJsonSer = newExprBuiltinHead(ne) == "JsonSerializer";
+                isJsonDer = newExprBuiltinHead(ne) == "JsonDeserializer";
             }
         }
         if (isJsonSer) {
@@ -13113,9 +13130,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isSW && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                isSW = ne->type && ne->type->name &&
-                       !ne->type->name->parts.empty() &&
-                       ne->type->name->parts[0] == "Stopwatch";
+                isSW = newExprBuiltinHead(ne) == "Stopwatch";
         }
         if (!isSW && ld->initializer) {
             if (auto* rt = ctx_.exprType(*ld->initializer))
@@ -13157,22 +13172,21 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
                       builtinTypeName(ctx_.resolvedType(*ld->type)));
         if (!vlb && ld->initializer) {
             if (auto* ne =
-                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                if (ne->type && ne->type->name &&
-                    !ne->type->name->parts.empty()) {
-                    // The AST SPELLING alone does not say whether this is the
-                    // built-in or a user class that merely shares its name, and
-                    // freeing a user object with a built-in's C release is
-                    // memory-unsafe. The pre-#2973 spelling of this branch read
-                    // `ne->type->name->parts[0]` bare; route through the
-                    // resolved TypeRef so the declaration-less test the other
-                    // two probes get from `builtinTypeName` holds here too.
-                    const sema::TypeRef* nrt = ctx_.resolvedType(*ne->type);
-                    if (nrt && nrt->kind == sema::TypeRef::Kind::Named &&
-                        !nrt->declaration)
-                        vlb = usingAutoDropVtablelessBuiltin(
-                                  ne->type->name->parts[0]);
-                }
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
+                // The AST SPELLING alone does not say whether this is the
+                // built-in or a user class that merely shares its name, and
+                // freeing a user object with a built-in's C release is
+                // memory-unsafe. The pre-#2973 spelling of this branch read
+                // `ne->type->name->parts[0]` bare; #2973 guarded it here, and
+                // #2991 moved that guard into `newExprBuiltinHead` so EVERY arm
+                // of this chain gets it from one place instead of one arm at a
+                // time. (This arm's private `!nrt->declaration` test is the
+                // narrower half of what `builtinTypeName` already decides —
+                // which also sees a `builtinClassSym` — so routing through the
+                // shared helper keeps this arm's behaviour and drops the
+                // duplicate.)
+                vlb = usingAutoDropVtablelessBuiltin(newExprBuiltinHead(ne));
+            }
         }
         if (!vlb && ld->initializer)
             vlb = usingAutoDropVtablelessBuiltin(
@@ -13197,9 +13211,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isFS && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                isFS = ne->type && ne->type->name &&
-                       !ne->type->name->parts.empty() &&
-                       ne->type->name->parts[0] == "FileStream";
+                isFS = newExprBuiltinHead(ne) == "FileStream";
         }
         if (!isFS && ld->initializer) {
             if (auto* rt = ctx_.exprType(*ld->initializer))
@@ -13264,9 +13276,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isCTS && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get())) {
-                isCTS = ne->type && ne->type->name &&
-                        !ne->type->name->parts.empty() &&
-                        ne->type->name->parts[0] == "CancellationTokenSource";
+                isCTS = newExprBuiltinHead(ne) == "CancellationTokenSource";
             }
         }
         // Pattern 3 (#463): static factory (e.g. WithCancelAfter) whose sema
@@ -13299,9 +13309,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isMx && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                isMx = ne->type && ne->type->name &&
-                       !ne->type->name->parts.empty() &&
-                       ne->type->name->parts[0] == "Mutex";
+                isMx = newExprBuiltinHead(ne) == "Mutex";
         }
         if (!isMx && ld->initializer)
             isMx = isMutexTypeName(ctx_.exprType(*ld->initializer));
@@ -13355,9 +13363,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isSem && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                isSem = ne->type && ne->type->name &&
-                        !ne->type->name->parts.empty() &&
-                        ne->type->name->parts[0] == "Semaphore";
+                isSem = newExprBuiltinHead(ne) == "Semaphore";
         }
         if (!isSem && ld->initializer)
             isSem = isSemaphoreTypeName(ctx_.exprType(*ld->initializer));
@@ -13413,9 +13419,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isCh && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                isCh = ne->type && ne->type->name &&
-                       !ne->type->name->parts.empty() &&
-                       ne->type->name->parts[0] == "Channel";
+                isCh = newExprBuiltinHead(ne) == "Channel";
         }
         if (!isCh && ld->initializer)
             isCh = isChannelTypeName(ctx_.exprType(*ld->initializer));
@@ -13470,9 +13474,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isShared && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                isShared = ne->type && ne->type->name &&
-                           !ne->type->name->parts.empty() &&
-                           ne->type->name->parts[0] == "Shared";
+                isShared = newExprBuiltinHead(ne) == "Shared";
         }
         if (!isShared && ld->initializer)
             isShared = isSharedTypeName(ctx_.exprType(*ld->initializer));
@@ -13505,9 +13507,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isWeak && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                isWeak = ne->type && ne->type->name &&
-                         !ne->type->name->parts.empty() &&
-                         ne->type->name->parts[0] == "Weak";
+                isWeak = newExprBuiltinHead(ne) == "Weak";
         }
         if (!isWeak && ld->initializer)
             isWeak = isWeakTypeName(ctx_.exprType(*ld->initializer));
@@ -13535,9 +13535,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isBuf && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                isBuf = ne->type && ne->type->name &&
-                        !ne->type->name->parts.empty() &&
-                        ne->type->name->parts[0] == "Buffer";
+                isBuf = newExprBuiltinHead(ne) == "Buffer";
         }
         if (!isBuf && ld->initializer)
             isBuf = isBufferTypeName(ctx_.exprType(*ld->initializer));
@@ -13573,10 +13571,8 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isTcs && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                isTcs = ne->type && ne->type->name &&
-                        !ne->type->name->parts.empty() &&
-                        (ne->type->name->parts[0] == "TaskCompletionSource" ||
-                         ne->type->name->parts[0] == "OwningTaskCompletionSource");
+                isTcs = newExprBuiltinHead(ne) == "TaskCompletionSource" ||
+                        newExprBuiltinHead(ne) == "OwningTaskCompletionSource";
         }
         if (!isTcs && ld->initializer)
             isTcs = isTcsTypeName(ctx_.exprType(*ld->initializer));
@@ -13615,10 +13611,8 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isES && ld->initializer) {
             if (auto* ne =
                     dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
-                isES = ne->type && ne->type->name &&
-                       !ne->type->name->parts.empty() &&
-                       (ne->type->name->parts[0] == "EventSource" ||
-                        ne->type->name->parts[0] == "AsyncEventSource");
+                isES = newExprBuiltinHead(ne) == "EventSource" ||
+                       newExprBuiltinHead(ne) == "AsyncEventSource";
         }
         if (!isES && ld->initializer)
             isES = isEvSrcName(ctx_.exprType(*ld->initializer));
@@ -13930,9 +13924,7 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         if (!isSB && ld->initializer) {
             if (auto* ne = dynamic_cast<const ast::NewExpr*>(
                     ld->initializer.get()))
-                isSB = ne->type && ne->type->name &&
-                       !ne->type->name->parts.empty() &&
-                       ne->type->name->parts[0] == "StringBuilder";
+                isSB = newExprBuiltinHead(ne) == "StringBuilder";
             if (!isSB) isSB = isSbName(ctx_.exprType(*ld->initializer));
         }
         if (isSB) {

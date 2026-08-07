@@ -11400,6 +11400,40 @@ private:
     // Returns an empty string_view if the TypeRef is not a builtin named type.
     static std::string_view builtinTypeName(const sema::TypeRef* rt);
 
+    // fix #2991 (spec §11.3 / §28.3 / §28.9, v0.240): the head SPELLING a `new`
+    // expression writes, returned only when the type it actually constructs is
+    // a BUILT-IN — and `{}` (no match, ever) when it constructs a USER type.
+    //
+    // §11.3 reserves no names, so `class EventSource … using var s := new
+    // EventSource();` is a legal program containing no built-in at all. Every
+    // NewExpr probe in `registerUsingDisposal`'s per-built-in chain used to read
+    // `ne->type->name->parts[0]` BARE, so that program registered the built-in
+    // event source's release and `bz_event_source_free` ran over a user object:
+    // SIGSEGV, no diagnostic (#2991). MEASURED across the whole chain on
+    // 5feaae2, one user class per clashing name in a 200-iteration `using var`
+    // loop under generated-code ASan/LSan: 10 names crashed or hung and 8 more
+    // silently leaked the user object's owned field (the user destructor never
+    // ran) — 18 of the 19 names the chain probes, not the one that was filed.
+    //
+    // The decision is not re-derived here: `builtinTypeName` is the fact the
+    // compiler already computes, and it is the ONE test that separates the two.
+    // Asking it from ONE place rather than per arm is the point: a future arm
+    // copied from its neighbour inherits the guard instead of reintroducing the
+    // defect (the shape #2967 and #2921 chose for the same chain).
+    //
+    // ⚠ The definition ALSO requires the resolved type to be DECLARATION-LESS,
+    // which is stricter than `builtinTypeName` alone — see the definition for
+    // the imported-user-class measurement that forced it, and see issue 2997 for
+    // the sibling probe where the same distinction is still missing.
+    //
+    // Returns the SPELLING, not the resolved head, so this is a pure NARROWING
+    // of the previous `parts[0]` comparison: no genuine built-in that matched an
+    // arm before can stop matching now (measured: 26 constructible built-in
+    // shapes, bare and annotated, clean before and after). Unresolvable → `{}`:
+    // an unclaimed built-in leaks, and a leak is recoverable where a wild free
+    // is not.
+    std::string_view newExprBuiltinHead(const ast::NewExpr* ne);
+
     // fix #2809 / spec §32.5 / stdlib §10.1–§10.3 (v0.240): is `rt` one of the
     // three FFI-boundary BUFFER classes (`CString` / `WString` / `RawBytes`)?
     //
