@@ -113,9 +113,17 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
         "  var v := r.NextInt(1, 3); "
         "  return v; "
         "end Main; end C;";
+    // #2966 (v0.240): the general call-site gate now reports this shape — the
+    // one where NO arm emitted anything — before the local-declaration consumer
+    // does, so the clause after the family's shared opening names the CAUSE
+    // rather than the consumer. The consumer wording is still live and still
+    // pinned, on the half this gate cannot see: see
+    // `unit_returning_builtin_bound_to_local_rejected_without_claiming_the_member_is_absent`
+    // below, where `Send` DOES emit and the local demand is what rejects it.
     BEZEL_EXPECT_TRUE(hasError(program,
                                "`NextInt` on built-in type `Random` produced "
-                               "no value, so it cannot initialize this local"));
+                               "no value, and no dispatch arm emitted any code "
+                               "for this call"));
 }
 
 // ── The rest of the MEASURED population, including the two the issue missed ──
@@ -168,7 +176,15 @@ BEZEL_TEST(builtin_receiver_unlowered_member_2935,
         "    return C.Get(rr); "
         "  end Main; "
         "end C;";
-    BEZEL_EXPECT_TRUE(hasError(program, "cannot supply this return value"));
+    // #2966 (v0.240): with the general call-site gate in place this shape is
+    // reported from the CALL rather than from the return statement — the
+    // rejection and its location are unchanged, the trailing clause names the
+    // cause. §21.7 remains why the RETURN-site gate exists at all; it still
+    // owns the shape where an arm emitted code and produced no value.
+    BEZEL_EXPECT_TRUE(hasError(program, "`TotallyBogusMember` on built-in type "
+                                        "`Random` produced no value, and no "
+                                        "dispatch arm emitted any code for "
+                                        "this call"));
 }
 
 // ── The diagnostic must not assert something FALSE ──────────────────────────

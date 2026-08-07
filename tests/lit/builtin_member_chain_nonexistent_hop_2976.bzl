@@ -43,6 +43,12 @@ class C
   end Handle;
 end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: `Event` on built-in type `EventSource` produced no value, so it cannot initialize this local.
+// #2966 (v0.240) moved WHERE this fires without changing WHETHER it does: the
+// general call-site gate reports it before the local-declaration consumer gets
+// to, so the clause after the family's shared opening names the CAUSE instead
+// of the consumer. The two things this file exists to pin — a REAL location,
+// and the failing hop being `Event` rather than `Subscribe` — are unchanged.
+//
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: `Event` on built-in type `EventSource` produced no value, and no dispatch arm emitted any code for this call.
 // CHECK-SAME: the failing hop is `Event`
 // CHECK-SAME: was then applied to its missing value, so naming `Subscribe` here would be wrong

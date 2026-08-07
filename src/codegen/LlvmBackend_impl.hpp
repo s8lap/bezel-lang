@@ -12104,26 +12104,15 @@ private:
     // that list is exactly the hand-maintained mirror this codebase has paid
     // for twice (#2868, #2888), and a nineteenth arm added later would silently
     // acquire a FALSE REJECT. It is a fact the compiler already computes: the
-    // IR ITSELF. An arm that lowered the call emitted instructions; an arm that
-    // declined emitted none. `IrFootprint` is an O(1) snapshot of the builder's
+    // IR ITSELF. An arm that lowered the call DID something; an arm that
+    // declined did not. `IrFootprint` is an O(1) snapshot of the builder's
     // position — the insert block, plus the instruction immediately before the
-    // insert point — so "anything at all was appended (or a new block was
-    // entered)" is a pointer comparison.
-    //
-    // ⚠ ITS FAILURE DIRECTION IS DELIBERATE AND ONE-WAY. A helper that lowers
-    // the RECEIVER and only then discovers it does not know the member (
-    // `tryLowerChannelAndDomainCall`'s `isSender` arm does exactly this) leaves
-    // a footprint and is therefore read as "handled". That costs a MISSED
-    // detection, never a false reject — which is the only direction a codegen
-    // gate may err in, since the false reject is what fails a build on correct
-    // code.
+    // insert point — and `emittedSideEffectSince` answers the question against
+    // it (see there for why "any instruction" is the WRONG test, and for the
+    // one-way failure direction every caller depends on).
     struct IrFootprint {
         llvm::BasicBlock* bb = nullptr;
         const llvm::Instruction* prev = nullptr;
-        bool operator==(const IrFootprint& o) const {
-            return bb == o.bb && prev == o.prev;
-        }
-        bool operator!=(const IrFootprint& o) const { return !(*this == o); }
     };
     IrFootprint irFootprint() {
         IrFootprint f;
@@ -12133,6 +12122,51 @@ private:
             if (ip != f.bb->begin()) f.prev = &*std::prev(ip);
         }
         return f;
+    }
+
+    // fix #2966 (v0.240): "has anything been emitted since `since` that DOES
+    // SOMETHING?" — the discriminator itself.
+    //
+    // ⚠ "ANY instruction" is NOT the right test, and that was MEASURED rather
+    // than reasoned about. `r.TotallyBogusMember(1, 2);` on a `Random` reaches
+    // the end-of-chain fallthrough with one instruction emitted since entry:
+    //
+    //     %3 = load ptr, ptr %0, align 8        ; the receiver `r`
+    //
+    // — left behind by an arm that lowered the RECEIVER and only then found it
+    // did not know the member. Under an any-instruction test that load reads as
+    // "an arm handled this", and the whole true-positive population disappears.
+    // `llvm::Instruction::mayHaveSideEffects()` is LLVM's own name for the
+    // distinction and separates them exactly: a non-volatile load, a GEP, a
+    // cast, arithmetic — all false; a `store`, a `call`, anything that writes
+    // memory — true. Lowering a call means DOING something.
+    //
+    // EVERY UNCERTAIN ANSWER IS `true` ("assume an arm handled it"), and that
+    // is the one-way failure direction the callers depend on: a missed
+    // detection costs a silent zero (the status quo ante), while a false
+    // "nothing lowered this" fails the build on correct code. So: a new basic
+    // block entered ⇒ true; the snapshot point not found by walking back ⇒
+    // true; the walk exceeding its budget ⇒ true.
+    //
+    // The walk is backwards from the CURRENT insert point precisely so it never
+    // dereferences `since.prev` — an arm is free to have erased it, and this
+    // only ever compares its address.
+    bool emittedSideEffectSince(const IrFootprint& since) {
+        llvm::BasicBlock* bb = builder_.GetInsertBlock();
+        if (!bb || bb != since.bb) return true;  // a new block: real work
+        llvm::BasicBlock::iterator ip = builder_.GetInsertPoint();
+        unsigned budget = 512;
+        while (ip != bb->begin()) {
+            --ip;
+            const llvm::Instruction* i = &*ip;
+            if (i == since.prev) return false;  // reached the snapshot
+            if (i->mayHaveSideEffects()) return true;
+            if (--budget == 0) return true;  // give up conservatively
+        }
+        // The top of the block was reached without meeting the snapshot point:
+        // either the snapshot WAS the top (nothing side-effecting found — a
+        // definite "no"), or the block was rewritten underneath us (unknown).
+        return since.prev != nullptr;
     }
 
     // fix #2963: set by `lowerCall` (the wrapper) on EVERY return — true exactly

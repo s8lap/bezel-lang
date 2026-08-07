@@ -85,10 +85,15 @@ const char* kChainRepro =
 
 BEZEL_TEST(builtin_member_chain_2976,
            nonexistent_hop_before_a_real_member_is_rejected_stdlib_6_5) {
+    // #2966 (v0.240) moved WHERE this fires without changing WHETHER it does:
+    // the general call-site gate now reports it before the local-declaration
+    // consumer gets to, so the clause after the family's shared opening names
+    // the CAUSE ("no dispatch arm emitted any code") instead of the consumer.
+    // The opening, the hop attribution and the rejection are unchanged.
     BEZEL_EXPECT_TRUE(hasError(
         kChainRepro,
-        "`Event` on built-in type `EventSource` produced no value, so it "
-        "cannot initialize this local"));
+        "`Event` on built-in type `EventSource` produced no value, and no "
+        "dispatch arm emitted any code for this call"));
 }
 
 BEZEL_TEST(builtin_member_chain_2976,
@@ -142,7 +147,8 @@ BEZEL_TEST(builtin_member_chain_2976,
         "end Main; end C;";
     BEZEL_EXPECT_TRUE(hasError(program,
                                "`NextInt` on built-in type `Random` produced "
-                               "no value, so it cannot initialize this local"));
+                               "no value, and no dispatch arm emitted any code "
+                               "for this call"));  // #2966's site — see above
     auto r = runAot(program);
     for (const auto& d : r.diagnostics.diagnostics())
         BEZEL_EXPECT_TRUE(d.message.find("the failing hop is") ==

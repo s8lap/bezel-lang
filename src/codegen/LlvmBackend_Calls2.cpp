@@ -3352,10 +3352,10 @@ llvm::Value* Emitter::explicitDisposeOwnedReceiverSlot(
 llvm::Value* Emitter::lowerCall(const ast::CallExpr& call) {
     const IrFootprint before = irFootprint();
     llvm::Value* v = lowerCallDispatch(call);
-    // A value came back ⇒ nothing was degraded. No value AND no IR emitted ⇒
-    // nothing lowered this. No value BUT IR emitted ⇒ an arm lowered it and the
-    // result is unit.
-    lastCallHandledWithoutValue_ = !v && irFootprint() != before;
+    // A value came back ⇒ nothing was degraded. No value and nothing emitted
+    // that DOES anything ⇒ nothing lowered this. No value but real work emitted
+    // ⇒ an arm lowered it and the result is unit.
+    lastCallHandledWithoutValue_ = !v && emittedSideEffectSince(before);
     return v;
 }
 
@@ -3363,6 +3363,12 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     if (!call.callee) return nullptr;
     // Pre-create out var slots so lvalueAddr can find them in all paths.
     ensureOutVarSlots(call);
+    // fix #2966 (v0.240): the same observation `lowerCall`'s wrapper makes,
+    // taken here so the END-OF-CHAIN FALLTHROUGH (the last statement of the
+    // `if (!ms)` dispatch, far below) can ask it directly rather than infer
+    // "nothing lowered this" from a nullptr that also means "lowered, unit".
+    // See that site for what it is spent on.
+    const IrFootprint dispatchEntry = irFootprint();
     // per §24.3/§24.5: event method calls — `<event>.Subscribe(h)` (returns an
     // owned Subscription), `.Add`/`.Remove` (the += / -= desugaring targets),
     // and `.Raise(payload)` / `.Raise()`. Checked first so the event member
@@ -7084,6 +7090,112 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         // with the repro rather than folded in here, where it
                         // would make #2922's fix reject programs that have
                         // nothing to do with #2922.
+                        //
+                        // fix #2966 (stdlib closed surfaces; language spec
+                        // §3/#605, v0.240): THE POSITION-INDEPENDENT FORM OF
+                        // #2935, which #2963 is what makes safe.
+                        //
+                        // #2935 rejects a nonexistent member on a built-in
+                        // receiver at the two positions where a value is
+                        // DEMANDED — a local declaration, and `return expr;`
+                        // (§21.7). It had to buy soundness that way because
+                        // `lowerCall`'s nullptr meant both "nothing lowered
+                        // this" and "an arm lowered it and the result is unit",
+                        // and only a value demand could tell them apart from
+                        // outside. That left the QUIETEST form uncovered — a
+                        // BARE STATEMENT, which is exactly how a side-effecting
+                        // method is written:
+                        //
+                        //   using var r := new Random();
+                        //   r.TotallyBogusMember(1, 2);   // accepted, ZERO
+                        //                                 // diagnostics
+                        //
+                        // Not even #2434's warning fires there: no local slot
+                        // is degraded, so nothing reports anything.
+                        //
+                        // #2963 replaced the value demand with the fact this
+                        // site actually needs. `dispatchEntry` is the builder
+                        // position on entry to this function; nothing
+                        // SIDE-EFFECTING emitted since means NO ARM DID
+                        // ANYTHING — "declined", not "lowered as unit". `Send`
+                        // and `Spawn`, the shapes a value-blind version of this
+                        // gate false-rejected, emit `bz_channel_sender_send` /
+                        // `bz_domain_spawn` and are excluded by construction
+                        // rather than by a list.
+                        //
+                        // ⚠ "any instruction emitted" was tried FIRST and is
+                        // measurably wrong: this exact repro arrives here with
+                        // `%3 = load ptr, ptr %0` already emitted — the receiver
+                        // `r`, lowered by an arm that only THEN discovered it
+                        // did not know the member — so an any-instruction test
+                        // silently loses the whole true-positive population.
+                        // See `emittedSideEffectSince`.
+                        //
+                        // The rest of the property is #2935's, unchanged and
+                        // through the SAME predicate rather than a copy of it
+                        // (#2924's four-way-mirror finding): the receiver is a
+                        // `builtinTypeArity` built-in with no user `TypeDecl`,
+                        // and SEMA never typed the call either. That last
+                        // conjunct is what keeps #2167's bound `Drain()` view —
+                        // real, implemented, and deliberately valueless — out.
+                        //
+                        // ⚠ THIS GATE PRE-EMPTS #2935's TWO, and the message
+                        // change that follows is deliberate rather than
+                        // incidental. #2935's sites name the CONSUMER ("so it
+                        // cannot initialize this local" / "cannot supply this
+                        // return value") because the consumer was the only
+                        // thing they could be sure of; this site fires from the
+                        // call itself, at every position, so a consumer clause
+                        // would be false two-thirds of the time. It keeps the
+                        // family's opening verbatim — "`M` on built-in type
+                        // `R` produced no value" — and replaces the consumer
+                        // clause with the CAUSE, which is now known exactly.
+                        //
+                        // #2935's sites stay live and stay tested: they still
+                        // own the OTHER half of their population, where an arm
+                        // DID emit code and simply produced no value
+                        // (`var x := sender.Send(42);` — real, implemented,
+                        // valueless, and illegal in a value-demanding
+                        // position). This gate cannot see that shape and must
+                        // not: it is the one #2963 exists to tell apart.
+                        //
+                        // What the message may CLAIM is also narrower here, and
+                        // it says so. At #2935's sites "produced no value" left
+                        // open that a documented member yields nothing; here
+                        // nothing was emitted at all, so that reading is
+                        // excluded and the two remaining ones — misspelling, or
+                        // documented-but-unimplemented (#2457) — are the whole
+                        // set.
+                        std::string ftMember, ftApplied;
+                        const std::string ftRecv =
+                            !emittedSideEffectSince(dispatchEntry)
+                                ? builtinReceiverOfMemberCall(&call, &ftMember,
+                                                              &ftApplied)
+                                : std::string();
+                        if (!ftRecv.empty()) {
+                            // #2874's rule: locate the diagnostic on EVERY
+                            // path — a body re-lowered from a RECONSTRUCTED AST
+                            // carries no spans and renders as a useless
+                            // `file:0:0`.
+                            SourceLocation at = call.span.begin;
+                            if (at.line == 0) at = ma->span.begin;
+                            if (at.line == 0 && ma->target)
+                                at = ma->target->span.begin;
+                            ctx_.diagnostics().report(
+                                Severity::Error, at,
+                                "`" + ftMember + "` on built-in type `" +
+                                ftRecv +
+                                "` produced no value, and no dispatch arm "
+                                "emitted any code for this call. `" + ftRecv +
+                                "` has no user declaration, so its member "
+                                "surface is exactly what the standard library "
+                                "documents for it: either `" + ftMember +
+                                "` is not on that surface (a misspelling), or "
+                                "it is documented but not implemented by this "
+                                "compiler (#2457)" +
+                                builtinMemberChainNote(ftMember, ftApplied));
+                            return nullptr;
+                        }
                     }
                     // Shape 1: receiver is a concrete type whose declared
                     // member set is known to the type system (Named +
