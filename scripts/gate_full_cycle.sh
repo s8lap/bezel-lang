@@ -85,7 +85,17 @@ run_until_trustworthy() {
       return "$rc"
     fi
     if grep -q 'shard crash / undercount' "$log"; then
-      say "$mode_desc attempt $i: rc=0 but UNDERCOUNT banner present — NOT trusted, retrying"
+      # PRESERVE THE EVIDENCE (#3001). Every attempt writes to the same $log, so
+      # before this loop each distrusted attempt was OVERWRITTEN by the next one
+      # and only the final (green) run survived. That made the undercount
+      # undiagnosable: the banner's own numbers — reported `ran` vs the registry
+      # total, which shard dropped, whether a completion summary was missing at
+      # all — live in the attempt's log and nowhere else. The 2026-08-07
+      # close-out undercounted three times in a row and left nothing to look at.
+      # Keep the canonical path pointing at the LAST attempt (callers grep it),
+      # and copy each distrusted one aside.
+      cp -f "$log" "${log%.log}.attempt${i}.log" 2>/dev/null || true
+      say "$mode_desc attempt $i: rc=0 but UNDERCOUNT banner present — NOT trusted, retrying (log kept: ${log%.log}.attempt${i}.log)"
       sleep 60; continue
     fi
     say "$mode_desc attempt $i: TRUSTWORTHY GREEN (rc=0, no undercount) — $log"
