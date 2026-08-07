@@ -80,6 +80,15 @@ run_until_trustworthy() {
       say "$mode_desc attempt $i: preflight refused (builders active) — waiting"
       sleep 45; continue
     fi
+    # rc==3 (#3002): the sharded pass was TRUNCATED — fewer gtests ran than the
+    # registry says exist. That is not a verdict about the tree, so it is a
+    # retry, not a REAL FAILURE. Keep the log: this is the one shape that used
+    # to be laundered into `== GATE PASS ==` by flake arbitration.
+    if [ "$rc" -eq 3 ]; then
+      cp -f "$log" "${log%.log}.attempt${i}.log" 2>/dev/null || true
+      say "$mode_desc attempt $i: COVERAGE SHORT — $(grep -oE '[0-9]+ of [0-9]+ gtests ran' "$log" | tail -1) — retrying (log kept: ${log%.log}.attempt${i}.log)"
+      sleep 60; continue
+    fi
     if [ "$rc" -ne 0 ]; then
       say "$mode_desc attempt $i: REAL FAILURE rc=$rc — see $log"
       return "$rc"

@@ -477,9 +477,25 @@ fi
 # deadlines and the canary is the fail-fast layer, so a generous cold value costs
 # nothing on a healthy tree and is what stops a store under eviction pressure
 # from killing shards and printing an undercount.
+#
+# ⚠ THE PLAIN WARM CEILING IS 900s, NOT 300s (#3000 follow-on, measured
+# 2026-08-07). 300s was never a tuned value — it was `run_parallel.sh`'s
+# hardcoded fallback, which the plain oracle fell through to because #2100's
+# cold logic was ASan-only. #2918 hoisted the cold logic to both oracles, but
+# `cache_n` was reading through a symlink without -L and returned 0
+# unconditionally, so BOTH oracles always predicted COLD and the warm branch
+# here was unreachable dead code. #3000 fixed the -L; the very first gate to
+# reach this branch (f60c1cb, plain attempt 1) was killed at 300s — 14
+# timeout-victim suites, 5156 of 16482 tests. So the warm path had never in fact
+# been exercised on this box, and 300s does not fit it: that run's whole-suite
+# wall was 358s, and the cold uncached close-out at 410ed6e was 314s.
+#
+# 900s matches the ASan warm ceiling, sits ~2.5x above the observed whole-suite
+# wall, and still fails fast on a genuine hang. The coverage floor below is the
+# real backstop; this value only decides how long a wedged shard is tolerated.
 sto="$GATE_EXPLICIT_STO"
 if [ -z "$sto" ]; then
-  if [ "$ASAN" -eq 1 ]; then sto=900; else sto=300; fi
+  sto=900
   [ "$GATE_COLD" -eq 1 ] && sto=1800
 fi
 SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
@@ -671,6 +687,56 @@ fi
 # mistake this for a full-suite validation.
 if [ "${rc:-0}" -ne 0 ] && [ "${COV_GTESTS:-0}" -eq 0 ]; then
   echo "== gate: WARNING — accepted via flake arbitration with NO completed gtest total (whole-suite timeout shape): only the arbitrated suspect suites were validated in THIS run =="
+fi
+
+# fix #3002: COVERAGE FLOOR — count what ran, compare it to WHAT EXISTS.
+#
+# The warning above fires only on COV_GTESTS == 0, i.e. it recognises TOTAL
+# coverage loss and is blind to PARTIAL loss — "total is not zero, therefore the
+# run was complete". Measured on 2026-08-07 (f60c1cb, plain attempt 1): the
+# sharded pass reported 5156 of 16482 (31%), every crashed shard was a timeout
+# victim, flake arbitration cleared them all (a suite killed at the ceiling
+# ALWAYS passes when re-run alone — its process was terminated, it never
+# failed), and gate.sh printed `== GATE PASS ==` with rc=0 and no warning at
+# all. 11,326 tests never ran and the gate said pass.
+#
+# No refinement of the banner or the warning can fix that, because the only
+# thing that distinguishes a complete run from a truncated one is the number
+# that SHOULD have run — which the gate never asked for. So ask. The registry
+# is authoritative and cheap: BEZEL_TEST_ENUMERATE=1 lists what a process WOULD
+# run without running it (~30ms per binary), and test_binaries.txt is a
+# configure-time manifest whose partition of tests/**/*.cpp is enforced by two
+# FATAL_ERROR invariants — so this sum is exactly the whole suite, by
+# construction, and cannot drift as areas are added.
+#
+# This subsumes the undercount heuristics rather than joining them: they infer
+# truncation from symptoms (a crashed shard, a missing summary, a zero total);
+# this measures it.
+GATE_EXPECTED_GTESTS=0
+if [ -r build/tests/test_binaries.txt ]; then
+  while read -r _g bin _n; do
+    [ -x "$bin" ] || continue
+    n=$(BEZEL_TEST_ENUMERATE=1 "$bin" 2>/dev/null | wc -l)
+    GATE_EXPECTED_GTESTS=$(( GATE_EXPECTED_GTESTS + n ))
+  done < build/tests/test_binaries.txt
+fi
+if [ "$GATE_EXPECTED_GTESTS" -gt 0 ]; then
+  if [ "${COV_GTESTS:-0}" -lt "$GATE_EXPECTED_GTESTS" ]; then
+    echo "## GATE FAILURE: COVERAGE SHORT — ${COV_GTESTS:-0} of $GATE_EXPECTED_GTESTS gtests ran ($(( ${COV_GTESTS:-0} * 100 / GATE_EXPECTED_GTESTS ))%)"
+    echo "##   The registry says $GATE_EXPECTED_GTESTS tests exist; this run reported ${COV_GTESTS:-0}."
+    echo "##   A pass over a truncated run is not a pass, however the missing shards were arbitrated."
+    # Exit 3 = NO TRUSTWORTHY VERDICT (retry), not 1 = REAL FAILURE. A short run
+    # says nothing about the tree either way, and truncation is usually
+    # transient (contention, a wedged shard). gate_full_cycle.sh retries on 3;
+    # a direct caller sees the banner and a nonzero exit, which is the point —
+    # what must never happen again is `== GATE PASS ==` over 31% coverage.
+    FAILED_PHASE="coverage short: ${COV_GTESTS:-0} of $GATE_EXPECTED_GTESTS gtests ran"
+    echo "== GATE FAIL: $FAILED_PHASE =="
+    exit 3
+  fi
+  echo "== gate: coverage floor OK — ${COV_GTESTS} of $GATE_EXPECTED_GTESTS gtests (registry-complete) =="
+else
+  echo "== gate: WARNING — could not read the test registry; coverage floor NOT enforced this run =="
 fi
 
 # Record the cache identity this pass populated the bincache for, so the NEXT
