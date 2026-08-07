@@ -26929,11 +26929,36 @@ llvm::GlobalVariable* Emitter::ensureUnitBoxVtable() {
         builder_.CreateRet(lowerStringLiteral("\"()\"", false));
     }
 
+    // The vtable global is created HERE, before the thunks, and its initializer
+    // is filled in at the end. `bz$uniteq` below needs to name it, and creating
+    // it up front is the same device #2906 used in `specializedVtableFor` for
+    // the same reason (a body that must refer to the vtable it will occupy).
+    auto* vtTy = llvm::ArrayType::get(ptrTy(), kVirtualMethodsBase);
+    auto* vtGV = new llvm::GlobalVariable(
+        *module_, vtTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage, /*Initializer=*/nullptr,
+        "bvt$unitbox");
+
     // --- Equals: "is `other` also a boxed unit" ---------------------------
-    // The guard is the SAME descriptor comparison the inline-array box uses, so
-    // a boxed unit is equal to every other boxed unit and to nothing else — in
-    // particular not to a boxed `int` or a class instance, whose vtable[0] is a
-    // different global.
+    // A boxed unit is equal to every other boxed unit and to nothing else — in
+    // particular not to a boxed `int` or a class instance, whose vtable is a
+    // different global. `boxUnitValue` mints a FRESH box per site (calloc), so
+    // pointer identity would be wrong; the test has to be on the vtable.
+    //
+    // ⚠ fix (gate 2, ASan): this compares `other`'s word 0 against `bvt$unitbox`
+    // with ONE load. It previously loaded word 0 as a vtable and then
+    // DEREFERENCED THAT to read `vtable[0]`'s descriptor — a
+    // `global-buffer-overflow in bz$uniteq` under ASan, invisible to the plain
+    // oracle, caught only because #2633's dual-oracle rule makes both run.
+    //
+    // `Equals(other: Object?)` admits ANY Object, and not every Object has a
+    // vtable at word 0: for a `%bz.string` (and the vtable-less builtins #2921
+    // and #2923 are about) word 0 is DATA. Loading it is safe — every heap
+    // object has a first word — but dereferencing it reads wherever that datum
+    // points, which for an interned literal is a small global, hence the
+    // overflow. Comparing the loaded word against a known global instead is
+    // exactly as discriminating (a unit box's word 0 IS this global) and needs
+    // no second dereference. Same defect class as #2921/#2923, one member over.
     llvm::Function* eqFn;
     {
         auto* fnTy = llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
@@ -26950,12 +26975,11 @@ llvm::GlobalVariable* Emitter::ensureUnitBoxVtable() {
             builder_.CreateICmpEQ(other, nullP), endBB, notNullBB);
 
         builder_.SetInsertPoint(notNullBB);
+        // ONE load: `other`'s first word. No second dereference — see above.
         llvm::Value* otherVtbl =
             builder_.CreateLoad(ptrTy(), other, "uniteq.ovtbl");
-        llvm::Value* otherDesc =
-            builder_.CreateLoad(ptrTy(), otherVtbl, "uniteq.odesc");
         llvm::Value* same = builder_.CreateICmpEQ(
-            otherDesc, llvm::ConstantExpr::getPointerCast(desc, ptrTy()));
+            otherVtbl, llvm::ConstantExpr::getPointerCast(vtGV, ptrTy()));
         builder_.CreateBr(endBB);
 
         builder_.SetInsertPoint(endBB);
@@ -27003,11 +27027,7 @@ llvm::GlobalVariable* Emitter::ensureUnitBoxVtable() {
     vtElems[kToStringSlot]    = toStrFn;
     vtElems[kEqualsSlot]      = eqFn;
     vtElems[kGetHashCodeSlot] = hashFn;
-    auto* vtTy = llvm::ArrayType::get(ptrTy(), kVirtualMethodsBase);
-    auto* vtGV = new llvm::GlobalVariable(
-        *module_, vtTy, /*isConstant=*/true,
-        llvm::GlobalValue::InternalLinkage,
-        llvm::ConstantArray::get(vtTy, vtElems), "bvt$unitbox");
+    vtGV->setInitializer(llvm::ConstantArray::get(vtTy, vtElems));
     allVtables_.push_back(vtGV);  // §8.6 #417: bz_obj_is_string discriminator
     unitBoxVtable_ = vtGV;
     return vtGV;
