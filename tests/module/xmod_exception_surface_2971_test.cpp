@@ -39,7 +39,7 @@
 // BASE MESSAGES ARE LITERALS ON PURPOSE, as in the #2950 sibling: nothing
 // releases a user exception subclass's inherited Message (#2951), and the
 // CauseChain snapshot a subclass's `base(msg, cause)` builds is not reclaimed
-// either (filed alongside this fix). These cells are about the member SURFACE,
+// either (#2989, measured by this lane). These cells are about the member SURFACE,
 // not lifetime, so they run without sanitizers and stay independent of both.
 
 #include <cstdio>

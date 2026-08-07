@@ -3107,6 +3107,23 @@ void Resolver::checkHidingAndOverride() {
         // incidental name==token coincidence. This is what keeps §25.2's
         // inherited-operator candidate set duplicate-free within one chain.
         std::unordered_map<std::string_view, MethodSymbol*> baseOperators;
+        // fix #2984 (§12.2 / §31.4 / §12.1, v0.240): the frontier below is
+        // seeded from `t->baseTypes`, and a BUILT-IN exception base is never in
+        // that collection — it has no `TypeSymbol` at all. So the inherited-
+        // member set this check walks was EMPTY for every class deriving from
+        // one, and §12.2 — "Declaring a member in a derived class with the same
+        // name as ANY inherited member visible at the derived class's
+        // declaration site is a compile error" — was simply not enforced
+        // against the §31.4 surface. That is the SILENT direction of the same
+        // absence #2983 hit loudly: a positive check keyed on a collection that
+        // never held the population fails by ACCEPTING.
+        //
+        // `sema::builtinExceptionBaseOf` is the ONE walk that answers whether
+        // there is such a base (#2950), and `builtinExceptionSurfaceMemberOf`
+        // the ONE statement of what it declares (#2971); the reject below asks
+        // both, so it can never block a name the resolver would not have
+        // resolved, nor miss one it would.
+        std::string_view builtinExcBase = builtinExceptionBaseOf(t);
         std::vector<TypeSymbol*> frontier;
         for (TypeSymbol* b : t->baseTypes) {
             if (b && b->kind == ast::TypeDeclKind::Class) {
@@ -3165,7 +3182,12 @@ void Resolver::checkHidingAndOverride() {
                 }
             }
         }
-        if (baseMembers.empty() && baseOperators.empty()) continue;
+        // fix #2984: a class whose ONLY base is a built-in exception has both
+        // maps empty, so this early-out used to skip its derived-member loop
+        // entirely — the reject below would never have been reached.
+        if (baseMembers.empty() && baseOperators.empty() &&
+            builtinExcBase.empty())
+            continue;
         for (Symbol* m : t->members) {
             if (dynamic_cast<ConstructorSymbol*>(m) ||
                 dynamic_cast<DestructorSymbol*>(m)) {
@@ -3207,7 +3229,56 @@ void Resolver::checkHidingAndOverride() {
             auto* ms = dynamic_cast<MemberSymbol*>(m);
             if (!ms || ms->name.empty()) continue;
             auto it = baseMembers.find(ms->name);
-            if (it == baseMembers.end()) continue;
+            if (it == baseMembers.end()) {
+                // fix #2984 (§12.2 / §31.4, v0.240): no USER ancestor declares
+                // this name — but a BUILT-IN exception ancestor may, and it
+                // contributed nothing to `baseMembers` above. §31.4 declares
+                // every one of these `public readonly property`, and §12.2's
+                // blocked-name set says "`public` and `protected` base members
+                // always block"; none is `virtual`, so no `override` escape
+                // exists and the declaration has no legal form.
+                //
+                // MEASURED on 0dac23f, why this matters and why the accepted
+                // program is worse than it looks: `class ExOwn: Exception` with
+                // its own `public property Message: string => _m;` and
+                // `base("header")` compiled with ZERO diagnostics, and the SAME
+                // OBJECT then answered `Message` two different ways —
+                //     this.Message  ->  shadow   (the declared property)
+                //     p.Message     ->  header   (the inherited §31.4 slot)
+                // — both through the subclass's own type. The object carries
+                // the §31.4 header (`classStruct` inserts it for any class
+                // `builtinExceptionBaseOf` accepts), so it really does have two
+                // `Message`s, which is precisely the hazard §12.2 exists to
+                // reject.
+                //
+                // Checked only after `baseMembers` misses, so a user ancestor
+                // that (illegally) declares the same name reports once, on that
+                // ancestor's own declaration, rather than twice down the chain.
+                std::string_view excOwner;
+                if (!builtinExcBase.empty() &&
+                    builtinExceptionSurfaceMemberOf(builtinExcBase, ms->name,
+                                                    &excOwner) !=
+                        BuiltinExcMember::None) {
+                    // The message names the built-in that DECLARES the member,
+                    // not the class's own base — §31.4 declares `StackTrace` on
+                    // `Exception` and `ParamName` on `ArgumentException`, so a
+                    // class under `ArgumentOutOfRangeException` inherits them
+                    // from different levels. Naming the base for both would
+                    // state something false about the user's hierarchy, which
+                    // is the #2983 defect in miniature; the walk that finds the
+                    // member reports where it came from.
+                    ctx_.diagnostics().report(
+                        Severity::Error, ms->declLoc,
+                        std::string("member `") + std::string(ms->name) +
+                        "` hides the inherited `" + std::string(ms->name) +
+                        "` declared by the built-in `" +
+                        std::string(excOwner) +
+                        "` (\xC2\xA7""31.4); hiding is forbidden — that member "
+                        "is not `virtual`, so `override` is not available "
+                        "either; choose a different name (\xC2\xA7""12.2)");
+                }
+                continue;
+            }
             const std::vector<MemberSymbol*>& bases = it->second;
             // Pick the base overload this member matches. For an overloaded
             // method, match by SIGNATURE so a derived override of one overload

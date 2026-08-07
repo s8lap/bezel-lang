@@ -525,21 +525,26 @@ std::string_view builtinExceptionBaseOf(const TypeSymbol* t) {
 // ArgumentException descendant to `kBuiltinExceptionHierarchy`. The walk cannot
 // drift: adding an edge to that table is enough.
 BuiltinExcMember builtinExceptionSurfaceMemberOf(std::string_view builtinBase,
-                                                 std::string_view member) {
+                                                 std::string_view member,
+                                                 std::string_view* owner) {
     if (builtinBase.empty() || member.empty()) return BuiltinExcMember::None;
     // Bound the walk exactly as builtinExceptionBaseOf does: the table is
     // acyclic by construction, but a malformed edit must not spin.
     unsigned guard = 0;
     for (std::string_view cur = builtinBase;
          !cur.empty() && guard < 64u; ++guard) {
+        auto found = [&](BuiltinExcMember k) {
+            if (owner) *owner = cur;
+            return k;
+        };
         // §31.4 `public class ArgumentException: Exception … ParamName: string?`
         if (cur == "ArgumentException" && member == "ParamName")
-            return BuiltinExcMember::ParamName;
+            return found(BuiltinExcMember::ParamName);
         // §31.4 `public class Exception … Message / StackTrace / CauseChain`
         if (cur == "Exception") {
-            if (member == "Message")    return BuiltinExcMember::Message;
-            if (member == "StackTrace") return BuiltinExcMember::StackTrace;
-            if (member == "CauseChain") return BuiltinExcMember::CauseChain;
+            if (member == "Message")    return found(BuiltinExcMember::Message);
+            if (member == "StackTrace") return found(BuiltinExcMember::StackTrace);
+            if (member == "CauseChain") return found(BuiltinExcMember::CauseChain);
         }
         cur = common::builtinExceptionParentOf(cur);
     }

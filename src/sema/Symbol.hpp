@@ -235,8 +235,17 @@ enum class BuiltinExcMember {
     ParamName,   // ArgumentException.ParamName : string?
 };
 
+// `owner`, when non-null, receives the name of the built-in that DECLARES the
+// member — which is not always `builtinBase`. §31.4 declares `StackTrace` on
+// `Exception` and `ParamName` on `ArgumentException`, so a class whose base is
+// `ArgumentOutOfRangeException` inherits the two from different levels. A
+// diagnostic that named `builtinBase` for both would state something false
+// about the user's own hierarchy — the #2983 defect in miniature — so the walk
+// that FINDS the member is also the thing that reports where it came from.
+// Left untouched when the answer is None.
 BuiltinExcMember builtinExceptionSurfaceMemberOf(std::string_view builtinBase,
-                                                 std::string_view member);
+                                                 std::string_view member,
+                                                 std::string_view* owner = nullptr);
 
 // Convenience over the pair above: the §31.4 surface member `member` names on
 // `t`, or None when `t` derives from no built-in exception at all.

@@ -62,9 +62,11 @@
 // the lexically enclosing type, which IS the type of `this`; so "sema resolved
 // this access as the inherited Message" is that property, already decided by
 // the same predicate, and the two cannot diverge. It is observable in codegen
-// as: the access is typed `string` and carries no member symbol. A subclass
-// that declares its OWN `Message` resolves to that member's symbol and is
-// excluded — pinned below. Keying on sema's resolution rather than re-deriving
+// as: the access is typed `string` and carries no member symbol. A class that
+// declares its OWN `Message` resolves to that member's symbol and is excluded
+// — pinned below on a plain class. (It was pinned on an exception SUBCLASS too
+// until #2984 made that declaration a §12.2 hiding error; that cell now pins
+// the reject, and says why in place.) Keying on sema's resolution rather than re-deriving
 // the enclosing type in codegen is what makes this total over frames: an
 // earlier draft recovered the enclosing type by reverse-looking `currentFn_` in
 // the emitters' memo caches (as `currentReceiverRecordType` / `choiceTypeOf`
@@ -72,11 +74,14 @@
 // accessor body re-points `currentThis_` while `currentFn_` still belongs to
 // the enclosing method.
 //
-// Mechanical verification: with `src/` reverted to 618c0c8 and these tests
-// kept, 12 of the 16 cases below FAIL and 4 pass — the 4 being the bare-
-// spelling control, the from-outside control, and the two own-`Message`
-// negatives, i.e. exactly the cases that do not read the inherited slot
-// through `this` / `base`.
+// Mechanical verification (at the time of #2972): with `src/` reverted to
+// 618c0c8 and these tests kept, 12 of the 16 cases below FAILED and 4 passed —
+// the 4 being the bare-spelling control, the from-outside control, and the two
+// own-`Message` negatives, i.e. exactly the cases that do not read the
+// inherited slot through `this` / `base`. (One of those four, the exception-
+// subclass own-`Message` negative, has since been rewritten: #2984 made that
+// declaration a §12.2 hiding error, so the cell pins the reject. See it for
+// why the old expectation was never safe to keep.)
 
 #include <string>
 
@@ -340,8 +345,28 @@ BEZEL_TEST(codegen_this_exception_message_2972, own_message_member_wins_on_plain
         "end Main; end C;", "plain=own"));
 }
 
-BEZEL_TEST(codegen_this_exception_message_2972, own_message_member_wins_on_exception_subclass_spec_11_3) {
-    BEZEL_EXPECT_TRUE(prints(
+// THIS CELL'S PREMISE EXPIRED, and it expired LOUDLY — which is why it is
+// rewritten here rather than deleted. It used to pin that a subclass declaring
+// its own `Message` reads that member and not the §31.4 header
+// (`shadow=shadow`), on the strength of #2984's own note that "#2972's fix
+// declines this case correctly". #2984 then established what the note itself
+// said was missing: §12.2's no-hiding rule, which the declaration violates —
+// "Declaring a member in a derived class with the same name as any inherited
+// member visible at the derived class's declaration site is a compile error",
+// and §31.4 declares `Message` `public readonly property` on `Exception`, which
+// "always block[s]". So the PROGRAM is illegal; the behaviour it pinned is
+// unreachable, not wrong.
+//
+// The half of the gate this cell existed for is still pinned, twice over: by
+// `own_message_member_wins_on_plain_class_spec_11_3` above (a class with no
+// exception ancestor keeps its own `Message` — that program stays legal
+// forever), and by the §12.2 reject below, which is what now stands between the
+// header and a same-named declaration. #2984's measurement is the reason the
+// old expectation was never safe to keep: the accepted program answered
+// `Message` two DIFFERENT ways on one object — `this.Message` -> "shadow", the
+// declared property; `p.Message` -> "header", the inherited slot.
+BEZEL_TEST(codegen_this_exception_message_2972, own_message_member_on_exception_subclass_is_a_12_2_error) {
+    auto r = bezel::test::runAot(
         "module M; "
         "class ExOwn: Exception "
         "  private _m: string := \"shadow\"; "
@@ -352,7 +377,16 @@ BEZEL_TEST(codegen_this_exception_message_2972, own_message_member_wins_on_excep
         "  using var p := new ExOwn(); "
         "  Console.WriteLine(\"shadow=\" + p.Read()); "
         "  return 0; "
-        "end Main; end C;", "shadow=shadow"));
+        "end Main; end C;");
+    BEZEL_EXPECT_FALSE(r.ran);
+    bool sawHiding = false;
+    for (const auto& d : r.diagnostics.diagnostics())
+        if (d.severity == bezel::Severity::Error &&
+            d.message.find("hides the inherited `Message`") !=
+                std::string::npos &&
+            d.message.find("12.2") != std::string::npos)
+            sawHiding = true;
+    BEZEL_EXPECT_TRUE(sawHiding);
 }
 
 // ---------------------------------------------------------------------------

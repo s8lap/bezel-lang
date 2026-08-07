@@ -4139,10 +4139,12 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
             // That arm is observable here as: the access is typed `string` and
             // carries NO member symbol. A class that declares its own `Message`
             // member instead resolves to that member's FieldSymbol /
-            // PropertySymbol and is excluded (verified: a subclass declaring
-            // `public property Message: string` reads its own property, not the
-            // header). A class with no `Message` at all is rejected by sema
-            // before codegen runs.
+            // PropertySymbol and is excluded. A class with no `Message` at all
+            // is rejected by sema before codegen runs. (#2984 has since made
+            // such a declaration a §12.2 hiding error when the class DOES
+            // derive from a built-in exception, so that exclusion is now
+            // reachable only on a class that does not — which is exactly the
+            // case it must still get right.)
             //
             // Re-deriving the enclosing type in codegen was written first and
             // ABANDONED, because there is no premise-free way to do it: the
