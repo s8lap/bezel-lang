@@ -1020,6 +1020,29 @@ private:
                          SourceLocation loc, const std::string& what,
                          const ast::Expr* fromExpr = nullptr);
 
+    // §5.1 "Constant narrowing" (#2925) — the ONE definition of the rule, for
+    // every §5.1 conversion site. Verbatim (v0.240):
+    //
+    //   "**Constant narrowing.** An expression of integer type that is a
+    //    **compile-time constant** ([§17.14]) implicitly converts to any
+    //    integer type whose range contains its value: `var b: byte := 50;`,
+    //    `Set(level: byte)` called as `Set(3)`, and enum constants of the
+    //    underlying type ([§10.2]) are all well-typed by this rule. A constant
+    //    whose value does not fit the target's range is a **compile error** at
+    //    the conversion site — never a silent truncation. The rule applies to
+    //    constants only; a run-time `int` value still requires the explicit
+    //    `byte(x)` narrowing of [§5.2]. Collection-literal element typing
+    //    ([§15.4]) and default-argument typing use this same rule."
+    //
+    // Re-types `fromExpr` to `to` when the rule applies and returns the new
+    // source type; returns `from` unchanged otherwise (an out-of-range constant
+    // and a non-constant both fall through to checkAssignable's §5.1
+    // rejection — never a silent truncation). Called from checkAssignable
+    // itself so the POPULATION is "every §5.1 conversion site", not a
+    // hand-maintained list of statement kinds.
+    TypeRef* narrowIntConstantToTarget(const ast::Expr* fromExpr,
+                                       TypeRef* from, TypeRef* to);
+
     // Slice S18: a condition must be `bool` (§21.2 if, §21.3 while,
     // §20 if-expression). Only flags when the condition has a resolved
     // primitive type that is not bool — conditions whose type isn't yet

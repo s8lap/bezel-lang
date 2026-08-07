@@ -7861,7 +7861,9 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                 if (const sema::TypeRef* declRet =
                         ctx_.resolvedType(*currentReturnTypeNode_))
                     v = coerceReturnToNullableValue(
-                        v, declRet, isUnsignedTargetExpr(*ci.exprBody));
+                        v, declRet, isUnsignedTargetExpr(*ci.exprBody),
+                        /*sourceIsNullableRef=*/false,
+                        ci.exprBody);  // #2925: the constant-narrowing gate
             }
             // §5.1 (#1778): a numeric arrow-body result narrower than the
             // declared return type is implicitly WIDENED (`=> 42` for a `long`
@@ -7869,12 +7871,16 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
             // The ReturnStmt path (LlvmBackend_Stmts.cpp ~line 1383) applies the
             // same coercion; the arrow path emitted the bare narrow value as the
             // `ret` operand (e.g. `ret i32` into an `i64` function) — malformed
-            // IR that fails the verifier for VALID code. coerceNumericToType is a
-            // no-op for ptr/struct returns and for an already-matching width, so
-            // the nullable-value case coerced just above is unaffected.
+            // IR that fails the verifier for VALID code. A no-op for ptr/struct
+            // returns and for an already-matching width, so the nullable-value
+            // case coerced just above is unaffected.
+            // fix #2925: `coerceInitializerToSlot` for §5.1's OTHER direction —
+            // `method B(): byte => 77;` and `=> K` (a `const` identifier that
+            // loads its i32 slot) are well-typed under §5.1 "Constant
+            // narrowing" and must `ret i8`. See the ReturnStmt site.
             if (v && ci.exprBody && !fn->getReturnType()->isVoidTy())
-                v = coerceNumericToType(v, fn->getReturnType(),
-                                        isUnsignedTargetExpr(*ci.exprBody));
+                v = coerceExprValueToSlot(v, fn->getReturnType(), ci.exprBody,
+                                          isUnsignedTargetExpr(*ci.exprBody));
             // #2491 (twin of #2434): arrow-body (`=> expr`) return expression
             // failed to lower — emitReturn's `v ? v : null` fallback would
             // silently substitute a zero/null return. See the ReturnStmt site

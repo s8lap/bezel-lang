@@ -3995,10 +3995,16 @@ private:
     // just a ConstantPointerNull) as the {i8 0, T 0} null constant. See the
     // definition's comment for the soundness argument (sema admits a reference-
     // nullable value into a value-nullable slot ONLY when provably null).
+    // #2925: `srcExpr` — the expression that produced `v`, when the caller has
+    // it. It carries §5.1's "Constant narrowing" into the tagged payload (the
+    // rules compose as `S → T → T?`, §5.1 "Nullable conversions"), through the
+    // SAME sema-types-it-at-the-slot gate `coerceExprValueToSlot` applies.
+    // Omitting it declines to narrow, which is the pre-#2925 behaviour.
     llvm::Value* coerceReturnToNullableValue(llvm::Value* v,
                                              const sema::TypeRef* declRet,
                                              bool srcUnsigned = false,
-                                             bool sourceIsNullableRef = false);
+                                             bool sourceIsNullableRef = false,
+                                             const ast::Expr* srcExpr = nullptr);
 
     // §11.2 / §23.4 (#2437/#2442, v0.235): the indexer PropertySymbol on `ts`
     // — or an inherited base class — whose FULL parameter list (arity AND
@@ -11109,6 +11115,46 @@ private:
     // not understand.
     llvm::Value* coerceInitializerToSlot(llvm::Value* v, llvm::Type* slotTy,
                                          bool srcUnsigned);
+
+    // fix #2903 (§7.2): the WIDTH a value must arrive at to reach `slotTy` —
+    // the PAYLOAD of a tagged `{i8 hasValue; T}` nullable value slot (the
+    // caller does the wrap), and `slotTy` itself for everything else. Factored
+    // out of `coerceInitializerToSlot` by #2925 so its gated sibling below
+    // asks the same question rather than re-deriving it.
+    llvm::Type* slotPayloadTy(llvm::Type* slotTy);
+
+    // fix #2925 (§5.1 "Constant narrowing", v0.240) — the CALL-ARGUMENT and
+    // RETURN form of the same rule, and the reason it is NOT simply
+    // `coerceInitializerToSlot`.
+    //
+    // At a field initializer the slot type IS the declared type: sema has
+    // checked assignability against it (#2926), so #2903 may match the slot's
+    // width unconditionally. At a call argument or a `return` the target LLVM
+    // type is NOT always the declared type — an IMPORTED GENERIC METHOD's
+    // compiled template is an i32 PLACEHOLDER (#1943 / #428), and treating that
+    // placeholder as authority silently TRUNCATES a genuine argument:
+    //
+    //   var y: long := 99;  Lib.Util.Count<long>(y)
+    //
+    // MEASURED: with an unconditional narrow this compiled, linked and RAN
+    // (returning 7) with the i64 truncated to i32 — the #1943 fail-closed
+    // diagnostic never fired, turning a loud, located compile error into a
+    // silent wrong value across a module boundary. Strictly worse than the
+    // defect #2925 set out to fix.
+    //
+    // So codegen may only ever REPAIR A WIDTH ITS OWN LOWERING FAILED TO
+    // HONOUR, never invent a conversion: narrowing is admitted exactly when
+    // SEMA ALREADY TYPES `e` AT THE SLOT'S PAYLOAD WIDTH. That is the case
+    // §5.1's constant narrowing creates — sema re-typed the constant, but a
+    // `const K := 3` identifier still loads its declared i32 slot and `1 + 2`
+    // still folds at i32 — and it is exactly NOT the case for the placeholder,
+    // where sema types `y` as `long` while the slot is the i32 template.
+    // Widening is unconditional and unchanged (§5.1's table, #408/#421/#746).
+    // A null `e`, an unresolved type, or a non-primitive sema type all decline
+    // to narrow, which is the pre-#2925 behaviour (a loud verifier/#1943
+    // failure) — the safe direction.
+    llvm::Value* coerceExprValueToSlot(llvm::Value* v, llvm::Type* slotTy,
+                                       const ast::Expr* e, bool srcUnsigned);
     // §6.4: decimal arithmetic for compound-assign / increment (sweep #6).
     llvm::Value* emitDecimalArith(const std::string& op, llvm::Value* lhs,
                                   llvm::Value* rhs);

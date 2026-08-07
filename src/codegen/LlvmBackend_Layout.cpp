@@ -2187,24 +2187,29 @@ llvm::StructType* Emitter::nullableValueStructTy(const sema::TypeRef* rt) {
 
 // fix #2903 / §5.1 / §7.2 / §23.1 / §9.2: see the declaration comment in
 // LlvmBackend_impl.hpp for why this exists and what it is the one definition of.
+// fix #2903 / §7.2 (factored out by #2925): the width a value must arrive at to
+// reach `slotTy`. A nullable VALUE slot is the tagged `{i8 hasValue; T}` struct
+// and the value is the bare payload `T`, so the width to match is T's. The
+// shape test is the EXACT one #2888 established — a nullable value type is a
+// LITERAL two-element struct whose element 0 is the i8 tag, while every class,
+// record and choice is a NAMED struct — but with the payload left unrestricted,
+// unlike `nullableValuePayloadTy`, which narrows to the scalars `emitCompoundOp`
+// can operate on: a nullable RECORD / Guid payload is an aggregate this must
+// still recognize (so it does not target the whole tagged struct) and then pass
+// through untouched.
+llvm::Type* Emitter::slotPayloadTy(llvm::Type* slotTy) {
+    if (auto* st = llvm::dyn_cast<llvm::StructType>(slotTy))
+        if (st->isLiteral() && st->getNumElements() == 2 &&
+            st->getElementType(0) == nullablePrimHasValTy())
+            return st->getElementType(1);
+    return slotTy;
+}
+
 llvm::Value* Emitter::coerceInitializerToSlot(llvm::Value* v,
                                               llvm::Type* slotTy,
                                               bool srcUnsigned) {
     if (!v || !slotTy) return v;
-    // §7.2: a nullable VALUE slot is the tagged `{i8 hasValue; T}` struct and
-    // the initializer is the bare payload `T`, so the width to match is T's.
-    // The shape test is the EXACT one #2888 established — a nullable value type
-    // is a LITERAL two-element struct whose element 0 is the i8 tag, while every
-    // class, record and choice is a NAMED struct — but with the payload left
-    // unrestricted, unlike `nullableValuePayloadTy`, which narrows to the
-    // scalars `emitCompoundOp` can operate on: a nullable RECORD / Guid payload
-    // is an aggregate this function must still recognize (so it does not target
-    // the whole tagged struct) and then pass through untouched.
-    llvm::Type* want = slotTy;
-    if (auto* st = llvm::dyn_cast<llvm::StructType>(slotTy))
-        if (st->isLiteral() && st->getNumElements() == 2 &&
-            st->getElementType(0) == nullablePrimHasValTy())
-            want = st->getElementType(1);
+    llvm::Type* want = slotPayloadTy(slotTy);
     if (v->getType() == want) return v;
     // §5.1's WIDENING direction (int→long, int→double, float→double, int→decimal).
     llvm::Value* w = coerceNumericToType(v, want, srcUnsigned);
@@ -2220,12 +2225,43 @@ llvm::Value* Emitter::coerceInitializerToSlot(llvm::Value* v,
     return v;  // no §5.1 conversion applies — leave the value as is.
 }
 
+// fix #2925 (§5.1 "Constant narrowing" at a CALL ARGUMENT / `return`, v0.240) —
+// see the declaration comment in LlvmBackend_impl.hpp for why this is NOT
+// `coerceInitializerToSlot` and what the placeholder truncation was.
+llvm::Value* Emitter::coerceExprValueToSlot(llvm::Value* v, llvm::Type* slotTy,
+                                            const ast::Expr* e,
+                                            bool srcUnsigned) {
+    if (!v || !slotTy) return v;
+    llvm::Type* want = slotPayloadTy(slotTy);
+    if (v->getType() == want) return v;
+    // §5.1's WIDENING direction is unconditional and unchanged — the target
+    // type is only ever a widening's *destination*, never its authority over
+    // what the value IS (issues #408 / #421 / #410 / #746 / #1778).
+    llvm::Value* w = coerceNumericToType(v, want, srcUnsigned);
+    if (w->getType() == want) return w;
+    // §5.1's "Constant narrowing" direction. THE GATE: only when sema already
+    // types the producing expression AT this width, so codegen is repairing a
+    // width its own lowering failed to honour (a re-typed `const K := 3` still
+    // loads its declared i32 slot; `1 + 2` still folds at i32) rather than
+    // performing a conversion of its own. Without the gate, an IMPORTED GENERIC
+    // METHOD's i32 PLACEHOLDER parameter (#1943 / #428) looked like a narrower
+    // slot and `Count<long>(y)` had its i64 silently truncated to fit it —
+    // MEASURED compiling, linking and running (returning 7) instead of raising
+    // #1943's fail-closed diagnostic.
+    if (!e) return w;
+    const sema::TypeRef* st = ctx_.exprType(*e);
+    if (!st || st->kind != sema::TypeRef::Kind::Primitive) return w;
+    if (lowerPrimitive(st->primitive) != want) return w;
+    return coerceInitializerToSlot(v, want, srcUnsigned);
+}
+
 
 // fix #568 / §14.1 / §7.1: see the declaration comment in LlvmBackend_impl.hpp.
 llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
                                                   const sema::TypeRef* declRet,
                                                   bool srcUnsigned,
-                                                  bool sourceIsNullableRef) {
+                                                  bool sourceIsNullableRef,
+                                                  const ast::Expr* srcExpr) {
     if (!v || !declRet) return v;
     // Resolve the EFFECTIVE nullable value type. A bare nullable type-parameter
     // (`T?`) resolves through the active monomorphization to its concrete value
@@ -2272,9 +2308,21 @@ llvm::Value* Emitter::coerceReturnToNullableValue(llvm::Value* v,
     // needs SIToFP. Without this the bare narrower value fell through unwrapped
     // and emitReturn then `ret`'d it against the `{i8, T}` struct return type
     // (IR-verify failure). Mirrors the local-decl fix (#842).
+    // fix #2925 (§5.1 "Constant narrowing" composed with "Nullable
+    // conversions", v0.240): `coerceExprValueToSlot` rather than
+    // `coerceNumericToType`, which is the WIDENING direction only. §5.1: "The
+    // two rules compose through at most one `?` on each side ([§7.10]: `?` is
+    // idempotent): `S` converts to `T?` via `S → T → T?`" — so `return K;`
+    // from a `byte?`-returning method (a `const` identifier that loads its i32
+    // slot) must reach the tagged payload as an i8 before the wrap. `slotTy`
+    // is already the unwrapped payload, so no further tagged retarget occurs.
+    // The narrowing carries the same sema-types-it-at-the-slot GATE as every
+    // other value-reaching-a-slot site (see coerceExprValueToSlot): a caller
+    // that passes no `srcExpr` keeps the widening-only, pre-#2925 behaviour.
     if ((v->getType()->isIntegerTy() || v->getType()->isFloatingPointTy()) &&
         v->getType() != slotTy) {
-        llvm::Value* inner = coerceNumericToType(v, slotTy, srcUnsigned);
+        llvm::Value* inner =
+            coerceExprValueToSlot(v, slotTy, srcExpr, srcUnsigned);
         if (inner->getType() == slotTy) return wrapNullableValue(nv, inner);
     }
     // A bare value matching the value slot — or a layout-equal but differently-

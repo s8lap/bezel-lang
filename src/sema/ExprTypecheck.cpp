@@ -2979,6 +2979,79 @@ static std::string spellMoveOnlySource(const TypeRef* t) {
     return "?";
 }
 
+// fix #2925 (§5.1 *Constant narrowing*, v0.240) — see the header for the rule
+// quoted in full. The predicate (`foldIntConstExprTC` + `fitsInIntType`) was
+// already right; what was wrong is the POPULATION it was fed. Three statement
+// kinds re-typed the constant by hand — a LOCAL declaration, an ASSIGNMENT
+// statement (both here) and a RECORD POSITIONAL `new Rec(...)` argument (which
+// carried a third copy of the range table) — and every OTHER §5.1 conversion
+// site simply never consulted the rule, so the constant kept its `int` type
+// and the surrounding check rejected it. MEASURED on 618c0c8:
+//
+//   c.Set(3) / Cfg.SSet(3) / new Cfg(lvl := 3)  "the argument `level` … is not
+//                                    implicitly convertible" — §5.1 names
+//                                    `Set(level: byte)` called as `Set(3)` AS
+//                                    AN EXAMPLE OF THE RULE
+//   return 200;  from `byte`         "the returned value … is not implicitly
+//                                    convertible"
+//   return 200;  from `byte?`        same (§5.1 "Nullable conversions": "`S`
+//                                    converts to `T?` via `S → T → T?`")
+//   method W(level: byte := 3)       admitted by sema, then MALFORMED IR:
+//                                    "Call parameter type does not match
+//                                    function signature! i32 3 / i8"
+//
+// Hoisting the rule into `checkAssignable` — which IS the §5.1 conversion-site
+// check — makes the population "every site that asks the §5.1 question",
+// including the ones nobody has written yet. The three hand-written copies are
+// deleted, so there is one range table and one fold.
+//
+// Deliberately NOT in scope here, filed separately: §22.6 overload resolution
+// asks the same question through `implicitlyConvertible`, which takes TYPES
+// only (no expression) and so cannot see the constant — `Pick(3)` against
+// `Pick(byte)`/`Pick(string)` still reports "no overload … is applicable".
+TypeRef* ExprTC::narrowIntConstantToTarget(const ast::Expr* fromExpr,
+                                           TypeRef* from, TypeRef* to) {
+    if (!fromExpr || !from || !to) return from;
+    // The rule's SOURCE side: "an expression of integer type that is a
+    // compile-time constant". A folded constant is typed plain `int` here (a
+    // suffixed / wide literal already carries its own wider type and needs no
+    // narrowing); a NULLABLE source is not a bare constant and stays out.
+    if (from->kind != TypeRef::Kind::Primitive ||
+        from->primitive != PrimitiveType::Int || from->nullable)
+        return from;
+    if (to->kind != TypeRef::Kind::Primitive) return from;
+    // The rule's TARGET side: "any integer type whose range contains its
+    // value". Only the integer types an `int` does NOT already widen to
+    // (§5.1's table) need the rule; everything else is an ordinary widening.
+    PrimitiveType tgt = to->primitive;
+    const bool narrowerIntTarget =
+        tgt == PrimitiveType::Byte  || tgt == PrimitiveType::SByte ||
+        tgt == PrimitiveType::Short || tgt == PrimitiveType::UShort ||
+        tgt == PrimitiveType::UInt  || tgt == PrimitiveType::ULong;
+    if (!narrowerIntTarget) return from;
+    // Only re-type an expression whose OWN recorded type is the one being
+    // checked. Some callers synthesise `from` (the `this` seed on the
+    // assignment path, a cloned non-nullable probe) — re-typing the expression
+    // to a target it was never measured against would be a silent miscompile.
+    if (ctx_.exprType(*fromExpr) != from) return from;
+    auto cv = foldIntConstExprTC(*fromExpr);
+    // "A constant whose value does not fit the target's range is a compile
+    // error at the conversion site — never a silent truncation", and "the rule
+    // applies to constants only; a run-time `int` value still requires the
+    // explicit `byte(x)` narrowing of §5.2": both fall through unchanged, and
+    // checkAssignable's own §5.1 rejection reports them.
+    if (!cv || !fitsInIntType(*cv, tgt)) return from;
+    // §5.1 "Nullable conversions": "The two rules compose through at most one
+    // `?` on each side (§7.10: `?` is idempotent): `S` converts to `T?` via
+    // `S → T → T?`". Re-typing to `to` itself (nullability included) is what
+    // the local-declaration path has always done — codegen lowers an integer
+    // literal at `lowerPrimitive(primitive)` and ignores `nullable`, so the
+    // value reaches the slot at the PAYLOAD width and the store site supplies
+    // §7.2's wrap (#2903).
+    ctx_.setExprType(const_cast<ast::Expr*>(fromExpr), to);
+    return to;
+}
+
 // Slices T1/T4: assignability check (§5.1, §7, §12 subtyping).
 // Handles two cases and conservatively skips everything else
 // (mixed primitive/named, generics, null, Object target) so it
@@ -2990,6 +3063,9 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
                              SourceLocation loc, const std::string& what,
                              const ast::Expr* fromExpr) {
     if (!from || !to) return;
+    // §5.1 "Constant narrowing" (#2925): applied HERE, once, for every §5.1
+    // conversion site — see narrowIntConstantToTarget above.
+    from = narrowIntConstantToTarget(fromExpr, from, to);
     // fix #2912 (§8.6 *Boxing of inline arrays*, v0.240) — the whole rule:
     //
     //   "Move-only value types — owning inline arrays (`[N owned]T` and
@@ -8479,6 +8555,27 @@ void ExprTC::runMethodBody(
                     "declare the parameter `owned` to receive it, or use a "
                     "trivial-dispose default (§22.5)");
         }
+        // fix #2925 (§5.1 / §22.4, v0.240): a default value is stored into the
+        // parameter's slot when the argument is omitted, so it is a §5.1
+        // conversion site — §5.1 says so in as many words: "Collection-literal
+        // element typing ([§15.4]) and default-argument typing use this same
+        // rule." Nothing checked it. MEASURED on 618c0c8, `method W(level:
+        // byte := 3)` was ADMITTED by sema and then emitted malformed IR
+        // ("Call parameter type does not match function signature! i32 3 /
+        // i8") — the §5.1 constant-narrowing re-type never ran here, so the
+        // literal stayed `int` while the parameter slot was i8. Running the
+        // same checkAssignable every other conversion site runs supplies BOTH
+        // halves: the re-type (narrowIntConstantToTarget) for an in-range
+        // constant, and the §5.1 rejection for everything the rule does not
+        // admit.
+        if (params[i].type) {
+            if (TypeRef* pty = ctx_.resolvedType(*params[i].type))
+                checkAssignable(ctx_.exprType(*params[i].defaultValue), pty,
+                                params[i].defaultValue->span.begin,
+                                std::string("default value of parameter `") +
+                                    std::string(params[i].name) + "`",
+                                params[i].defaultValue.get());
+        }
     }
     forbiddenForwardParams_.clear();
     if (exprBody) {
@@ -9562,45 +9659,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // Slice T1: when an explicit ascription and an
                 // initializer are both present and both primitive,
                 // check primitive assignability (§5.1).
-                // §5.1 special: an integer CONSTANT EXPRESSION assigns to any
-                // integer type that can represent its value — re-type it as the
-                // target type so the assignability check passes. #738: gate on
-                // the initializer actually being a compile-time int constant
-                // (foldIntConst: a literal, arithmetic on literals, or a `const`
-                // reference); a non-constant int value (a variable / call result)
-                // does NOT implicitly narrow and falls through to checkAssignable,
-                // which reports the §5.1 error (`var y: sbyte := someIntVar`).
+                // §5.1 "Constant narrowing" (#738, one definition since
+                // #2925): an integer CONSTANT EXPRESSION assigns to any integer
+                // type that can represent its value. checkAssignable itself
+                // re-types the constant to the target (narrowIntConstantToTarget)
+                // — the same rule now applies at every §5.1 conversion site, so
+                // this arm no longer carries its own copy.
                 if (ld->initializer) {
-                    TypeRef* fromTy = ctx_.exprType(*ld->initializer);
-                    if (fromTy && lsym->declType &&
-                        fromTy->kind == TypeRef::Kind::Primitive &&
-                        lsym->declType->kind == TypeRef::Kind::Primitive &&
-                        fromTy->primitive == PrimitiveType::Int) {
-                        PrimitiveType tgt = lsym->declType->primitive;
-                        bool narrowerIntTarget =
-                            tgt == PrimitiveType::Byte ||
-                            tgt == PrimitiveType::SByte ||
-                            tgt == PrimitiveType::Short ||
-                            tgt == PrimitiveType::UShort ||
-                            tgt == PrimitiveType::UInt ||
-                            tgt == PrimitiveType::ULong;
-                        if (narrowerIntTarget) {
-                            auto cv = foldIntConstExprTC(*ld->initializer);
-                            // #738 / §5.1: a compile-time int constant re-types to
-                            // the narrower target only when its value FITS — an
-                            // out-of-range constant (e.g. `sbyte := 300`) falls
-                            // through to checkAssignable, which reports the §5.1
-                            // error (no silent truncation). A non-constant value
-                            // never folds and is likewise rejected.
-                            if (cv && fitsInIntType(*cv, tgt)) {
-                                ctx_.setExprType(ld->initializer.get(),
-                                                 lsym->declType);
-                                fromTy = lsym->declType;
-                            }
-                        }
-                    }
                     checkAssignable(
-                        fromTy,
+                        ctx_.exprType(*ld->initializer),
                         lsym->declType, ld->initializer->span.begin,
                         std::string("initializer for `") +
                         std::string(ld->name) + "`",
@@ -11046,14 +11113,15 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // assignable (compound ops like `+=` have their own
             // operator semantics and are left to a later slice).
             if (as->op == ":=" && as->target && as->value) {
-                // §5.1 special (mirrors LocalDecl init narrowing above):
-                // an int CONSTANT EXPRESSION on the RHS assigns to a narrower
-                // integer target without a diagnostic — retype it so
-                // checkAssignable sees matching primitive types. This covers
-                // Buffer<byte>[i] := 1, local byte b := 1, etc. #738: gate on the
-                // RHS being a compile-time int constant (foldIntConstExprTC) — a
-                // non-constant int value (`b := someIntVar`) does not implicitly
-                // narrow and is reported by checkAssignable.
+                // §5.1 "Constant narrowing": an int CONSTANT EXPRESSION on the
+                // RHS assigns to a narrower integer target without a
+                // diagnostic — `Buffer<byte>[i] := 1`, `b := 1`, … #738 gated
+                // it on the RHS being a compile-time int constant; a
+                // non-constant int value (`b := someIntVar`) does not
+                // implicitly narrow and is reported by checkAssignable. Since
+                // #2925 the re-type is checkAssignable's own
+                // (narrowIntConstantToTarget), shared with every other §5.1
+                // conversion site.
                 TypeRef* fromTy = ctx_.exprType(*as->value);
                 TypeRef* toTy   = ctx_.exprType(*as->target);
                 // §5.1 / §9 / §22 (#1770): a bare `this` on the RHS is left
@@ -11083,29 +11151,10 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                         }
                     }
                 }
-                if (fromTy && toTy &&
-                    fromTy->kind == TypeRef::Kind::Primitive &&
-                    toTy->kind   == TypeRef::Kind::Primitive &&
-                    fromTy->primitive == PrimitiveType::Int) {
-                    PrimitiveType tgt = toTy->primitive;
-                    bool narrowerIntTarget =
-                        tgt == PrimitiveType::Byte  ||
-                        tgt == PrimitiveType::SByte ||
-                        tgt == PrimitiveType::Short ||
-                        tgt == PrimitiveType::UShort||
-                        tgt == PrimitiveType::UInt  ||
-                        tgt == PrimitiveType::ULong;
-                    if (narrowerIntTarget) {
-                        auto cv = foldIntConstExprTC(*as->value);
-                        // #738 / §5.1: retype only an IN-RANGE int constant; an
-                        // out-of-range constant / a non-constant falls through to
-                        // checkAssignable's §5.1 rejection.
-                        if (cv && fitsInIntType(*cv, tgt)) {
-                            ctx_.setExprType(as->value.get(), toTy);
-                            fromTy = toTy;
-                        }
-                    }
-                }
+                // §5.1 "Constant narrowing" (#738, one definition since
+                // #2925): the re-type lives in checkAssignable
+                // (narrowIntConstantToTarget), which this arm's own copy used
+                // to duplicate.
                 checkAssignable(
                     fromTy,
                     toTy,

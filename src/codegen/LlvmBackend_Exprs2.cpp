@@ -2048,9 +2048,13 @@ llvm::Value* Emitter::lowerLambda(const ast::LambdaExpr& lam) {
                 // struct/already-matching values pass through unchanged), so
                 // this is safe to run unconditionally ahead of the retain
                 // checks below (which only fire on pointer types).
+                // fix #2925: `coerceInitializerToSlot` — §5.1's narrowing
+                // direction as well as its widening one, for the same reason
+                // as the method arrow-body and ReturnStmt sites.
                 if (v->getType() != retTy)
-                    v = coerceNumericToType(v, retTy,
-                                            isUnsignedTargetExpr(*lam.exprBody));
+                    v = coerceExprValueToSlot(
+                        v, retTy, lam.exprBody.get(),
+                        isUnsignedTargetExpr(*lam.exprBody));
                 // #429 (closure CALL-RETURN category) / §28.9 / §27.5: a lambda
                 // with an expression body must also mint +1 for reference-counted
                 // return types, exactly as the block-body path does via

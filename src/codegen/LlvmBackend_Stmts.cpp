@@ -2093,19 +2093,32 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 v = coerceReturnToNullableValue(
                     v, declRet,
                     rs->value && isUnsignedTargetExpr(*rs->value),  // #843
-                    srcNullableRef);
+                    srcNullableRef,
+                    rs->value.get());  // #2925: the constant-narrowing gate
             }
         }
         // §5.1 (#746 R41-H): a numeric return value narrower than the declared
         // return type is implicitly widened (e.g. `return arr[0]` where
         // arr: Array<byte> in an int-returning method, or `return aByte`).
         // Without this the bare i8/i16 was `ret`'d into a wider integer function
-        // (IR-verify failure). coerceNumericToType is a no-op for ptr/struct
-        // returns and for an already-matching width.
+        // (IR-verify failure).
+        // fix #2925 (§5.1 "Constant narrowing", v0.240): `coerceInitializer
+        // ToSlot`, not `coerceNumericToType` — the latter is §5.1's WIDENING
+        // direction only (`srcBits < targetBits`), and §5.1 admits the other
+        // one for a compile-time constant, which sema now re-types at `return`
+        // as at every other conversion site. A LITERAL lowers at the re-typed
+        // width, but `return K;` (a `const` identifier loads its i32 slot) and
+        // `return 40 + 2;` (folded at i32) reached `ret i32` from an i8/i16
+        // function — malformed IR for a program §5.1 makes well-typed.
+        // A no-op for ptr/struct returns and an already-matching width.
+        // GATED on sema already typing `rs->value` at the return width — a
+        // generic body compiled against an i32 placeholder must keep failing
+        // loudly rather than have its wide value truncated to fit.
         if (v && rs->value && currentFn_ &&
             !currentFn_->getReturnType()->isVoidTy())
-            v = coerceNumericToType(v, currentFn_->getReturnType(),
-                                    isUnsignedTargetExpr(*rs->value));
+            v = coerceExprValueToSlot(v, currentFn_->getReturnType(),
+                                      rs->value.get(),
+                                      isUnsignedTargetExpr(*rs->value));
         // §28.3 ownership transfer: if the return expression is a bare
         // `using var` local, exclude it from disposal — ownership moves
         // to the caller.  Without this, the local would be freed before

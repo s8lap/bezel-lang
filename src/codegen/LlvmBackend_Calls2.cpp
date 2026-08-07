@@ -9211,14 +9211,34 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             }
         }
         if (!fnTy || args.size() != fnTy->getNumParams()) return nullptr;
-        // §5.1 / §22.6: widen each argument to its declared parameter type
+        // §5.1 / §22.6: coerce each argument to its declared parameter type
         // when sema admitted an implicit numeric conversion (e.g. an int
         // argument bound to a double parameter). Otherwise the i32 reaches an
         // f64 parameter as raw bits (issue #408 / finding [17]). An unsigned
         // source widens via UIToFP/ZExt (issue #421 / #410).
+        //
+        // fix #2925 (§5.1 "Constant narrowing", v0.240): this was a bare
+        // `coerceNumericToType`, which is §5.1's WIDENING direction ONLY by
+        // construction (`srcBits < targetBits`) — the same one-directional gap
+        // #2903 found at the field-initializer stores and #2927 at the property
+        // setter slot. §5.1 admits the other direction too, and once sema
+        // applies "Constant narrowing" at a call argument the narrowed constant
+        // arrives here at whatever width its own lowering produced: a LITERAL
+        // is emitted at the re-typed width (lowerExpr reads exprType), but a
+        // `const K := 3` identifier loads its i32 slot and `1 + 2` folds at
+        // i32, so `TakeB(K)` / `TakeB(1 + 2)` against `TakeB(b: byte)` emitted
+        // `call i32 @TakeB(i32 %k)` into an i8 parameter — malformed IR.
+        // `coerceExprValueToSlot` narrows ONLY when sema already types the
+        // argument expression at the parameter's width — NOT the ungated
+        // `coerceInitializerToSlot`, whose target-is-authority contract holds
+        // at a field initializer but not here: an imported generic method's
+        // parameter is an i32 PLACEHOLDER (#1943), and treating it as the
+        // parameter's type silently truncated a genuine `long` argument.
         for (std::size_t ai = 0; ai < args.size(); ++ai)
-            args[ai] = coerceNumericToType(args[ai], fnTy->getParamType(ai),
-                                           argUnsigned(ai));
+            args[ai] = coerceExprValueToSlot(
+                args[ai], fnTy->getParamType(ai),
+                (argExprs && ai < argExprs->size()) ? (*argExprs)[ai] : nullptr,
+                argUnsigned(ai));
         llvm::Value* recv = args[0];
         // issue #484 / §14.2: guard against emitting an itable/vtable load from
         // a non-pointer receiver. This happens when the compiled (unspecialized)
@@ -9643,18 +9663,27 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
             }
         }
     }
-    // §5.1 / §22.6: widen each argument to its declared parameter type when
+    // §5.1 / §22.6: coerce each argument to its declared parameter type when
     // sema admitted an implicit numeric conversion (e.g. an int argument bound
     // to a double parameter — also reached by the operator-overload path in
     // lowerBinary). Without this the i32 reaches an f64 parameter as raw bits
     // (issue #408 / finding [17]). Applied after the generic-specialization
     // checks above so it does not perturb their arg/param type comparisons.
+    // fix #2925: `coerceExprValueToSlot` rather than `coerceNumericToType` for
+    // the same reason as the sibling loop above — §5.1's "Constant narrowing"
+    // direction, which the widening-only helper cannot express — and GATED on
+    // sema already typing the argument at the parameter's width, which is what
+    // keeps the #1943 placeholder below from looking like a narrower slot.
+    // (This is the loop the #1943 gate immediately follows, so an ungated
+    // narrow here disarmed it outright.)
     {
         auto* callFnTy = callee->getFunctionType();
         for (std::size_t ai = 0;
              ai < args.size() && ai < callFnTy->getNumParams(); ++ai)
-            args[ai] = coerceNumericToType(args[ai], callFnTy->getParamType(ai),
-                                           argUnsigned(ai));
+            args[ai] = coerceExprValueToSlot(
+                args[ai], callFnTy->getParamType(ai),
+                (argExprs && ai < argExprs->size()) ? (*argExprs)[ai] : nullptr,
+                argUnsigned(ai));
     }
     // #1943 / §14.1 / §2.8.3 / §2.5 (decline-with-reasons, ARGUMENT side; the
     // sibling of the #1937 return-side sema gate): an IMPORTED GENERIC METHOD —
