@@ -426,9 +426,20 @@ done < <(test_binaries)
 # plain entries and 0 ASan entries reads "warm" to both. The count can therefore
 # only ever err toward warm; the per-oracle identity marker is the load-bearing
 # signal and is what actually forces the cold verdict.
+#
+# ⚠ `find -L` IS LOAD-BEARING (#3000). The default cache root is a SYMLINK on
+# this box (/var/tmp/bezel-scratch/aot-bincache -> /mnt/fast/aot-bincache), and
+# `find` does not traverse a symlinked START POINT without -L. Without it this
+# read returned 0 unconditionally — against a store holding 102,299 entries —
+# so `cache_n < 2000` always fired, the gate always predicted COLD, the warm
+# ceilings were unreachable dead code, and the log printed "bincache entries=0"
+# into the one place a human arbitrating a red gate goes looking for evidence.
+# That is the third variant of the category-defect taxonomy: a correct predicate
+# fed by a source that never held the population. The predicate was fine; the
+# `find` never returned the population. Do not drop the -L.
 core_post=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo -1)
 GATE_CACHE_ROOT="${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}"
-cache_n=$(find "$GATE_CACHE_ROOT" -type f 2>/dev/null | wc -l)
+cache_n=$(find -L "$GATE_CACHE_ROOT" -type f 2>/dev/null | wc -l)
 GATE_COLD=0
 { [ "$core_post" != "$CORE_MTIME_PRE" ] || [ "$cache_n" -lt 2000 ]; } && GATE_COLD=1
 # IDENTITY CHECK (2026-07-29). The mtime comparison above only asks "did THIS
