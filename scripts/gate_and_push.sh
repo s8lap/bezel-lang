@@ -86,6 +86,37 @@ else
 fi
 
 if "${GATE_CMD[@]}"; then
+  # fix #3010: THE LAST CHECK BEFORE A PUSH IS THE GATE'S OWN TELEMETRY.
+  #
+  # Both oracles have reported green by here. That is exactly the state in which
+  # the 55 recorded pass-but-truncated gates were pushed: each one's coverage
+  # field contradicted its verdict, in a file nobody read. This is advisory
+  # inside gate.sh (a reporting step must not change a gate's exit code) and
+  # BLOCKING here, which is the only place it can stop something.
+  #
+  # Exit 2 = the log could not be read at all. That is NOT a pass: it means
+  # nothing was checked, and treating "no findings" and "no check" alike is the
+  # #3000 shape.
+  if [ -x scripts/gate_trend.sh ]; then
+    trend_out=$(scripts/gate_trend.sh --last 2>&1); trend_rc=$?
+    printf '%s\n' "$trend_out" | sed 's/^/   trend| /'
+    case "$trend_out" in
+      *"records scanned"*) ;;
+      *) echo "== gate_and_push: REFUSING TO PUSH — gate_trend.sh produced no scan line;" >&2
+         echo "   the telemetry check did not run, which is not the same as passing." >&2
+         exit 1 ;;
+    esac
+    if [ "$trend_rc" -ne 0 ]; then
+      echo "== gate_and_push: REFUSING TO PUSH — the gate's own telemetry contradicts its verdict (see above)." >&2
+      echo "   Both oracles reported green; the recorded numbers say the run was not what it claimed." >&2
+      echo "   This is the check that would have caught 55 pass-but-truncated gates over 24 days." >&2
+      exit 1
+    fi
+  else
+    echo "== gate_and_push: REFUSING TO PUSH — scripts/gate_trend.sh is missing or not executable." >&2
+    exit 1
+  fi
+
   echo "== gate_and_push: GATE PASS -> pushing =="
   if git push; then
     echo "== gate_and_push: PUSHED origin/main now $(git rev-parse --short origin/main) =="

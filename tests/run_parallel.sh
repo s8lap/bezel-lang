@@ -78,7 +78,33 @@ for (( b = 0; b < nbin; b++ )); do
 done
 
 logdir="$(mktemp -d "${TMPDIR:-/tmp}/bezel_shards.XXXXXX")"
-trap 'rm -rf "$logdir"' EXIT
+# fix #3010: RETAIN THE PER-SHARD LOGS WHEN THE RUN WAS NOT CLEAN.
+#
+# This was an unconditional `trap 'rm -rf "$logdir"' EXIT`, so every per-shard
+# log was destroyed on EVERY exit — pass or fail. That is the same defect
+# #3001 just fixed one level up (gate_full_cycle.sh overwrote each distrusted
+# attempt's log), and it has the same consequence: an undercount leaves nothing
+# to look at, so it can never be diagnosed. #3001's open question 7 — "why does
+# the gtests harvest regex fail on 26 passing runs?" — is unanswerable today
+# precisely because these logs were rm -rf'd.
+#
+# Clean run: reap as before, nothing is lost. Non-clean: move the directory
+# aside and say where it went, once.
+_rp_keep() {
+  local rc=$?
+  if [ "$rc" -eq 0 ]; then
+    rm -rf "$logdir"
+  else
+    local keep="${BEZEL_SHARD_LOG_KEEP:-/var/tmp/bezel-scratch/shard-logs}"
+    if mkdir -p "$keep" 2>/dev/null && mv "$logdir" "$keep/$(date +%Y%m%d-%H%M%S)-rc$rc" 2>/dev/null; then
+      echo "run_parallel: exit rc=$rc — per-shard logs KEPT in $keep/ (see #3010)" >&2
+    else
+      rm -rf "$logdir"
+    fi
+  fi
+  return $rc
+}
+trap _rp_keep EXIT
 
 njobs=$(( nbin * conc ))
 echo "Running $nbin test binaries × $conc slices = $njobs shards, $conc at a time (of $ncpu cores)..."

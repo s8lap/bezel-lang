@@ -70,6 +70,30 @@
 set -u
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate: not in a git repo" >&2; exit 2; }
 MODE="${1:-default}"
+# fix #3011: REJECT AN UNRECOGNISED MODE. `MODE` has exactly one semantic use
+# (`[ "$MODE" = "--full" ] && ASAN=1`, below), so before this check ANY other
+# argument ran a PLAIN gate while every log line, the status file, and the
+# telemetry record labelled it whatever was typed. A typo did not fail — it
+# silently ran the weaker oracle under the stronger name.
+#
+# That is not hypothetical. gate-timings.jsonl records six such runs:
+#   --fast x4, --clean-first x2   (both --clean-first runs recorded result=pass)
+# Each displaced a real oracle. `c7404bf` (#2917) made the DUAL-oracle rule
+# structural five commits before this; a mistyped flag defeated it anyway.
+#
+# The allow-list is a POSITIVE list, which is variant 1 of this project's own
+# category-defect taxonomy — it fails LOUD by rejecting a name it should know.
+# That is the correct direction here: a new mode announces itself at the first
+# invocation instead of silently degrading forever. Adding one is a one-word
+# edit; add it to gate_and_push.sh's --single-oracle help too.
+case "$MODE" in
+  default|--quick|--full|--no-asan) ;;
+  *)
+    echo "gate: UNRECOGNISED MODE '$MODE'" >&2
+    echo "  known modes: default | --quick | --no-asan (all plain) | --full (ASan)" >&2
+    echo "  Refusing rather than running a plain gate under a name you did not mean." >&2
+    exit 64 ;;
+esac
 S=/var/tmp/bezel-scratch; mkdir -p "$S"
 DH=scripts/dev_heavy.sh
 
@@ -116,7 +140,12 @@ esac
 # shell assignment, it is a nonexistent program. The leading `env` is therefore
 # load-bearing, and it is seeded here rather than in the ASan branch because as
 # of #2918 the PLAIN pass also contributes a variable (its shard ceiling).
-SHARD_ENV=(env); ARB_ENV=(); SHARD_NOTE=""; SHARD_LABEL="crash/undercount-checked"
+# fix #3010: BEZEL_AOT_CACHE_STATS was set NOWHERE in scripts/ — this project
+# has never had a single AOT cache hit/miss number, so every warm-vs-cold
+# argument in its history (including the ones that shaped the shard ceiling)
+# was inference from wall-clock. Turn it on: the harness prints one
+# `[aot-cache] hits=N misses=M ...` line per process at exit, which is free.
+SHARD_ENV=(env BEZEL_AOT_CACHE_STATS=1); ARB_ENV=(); SHARD_NOTE=""; SHARD_LABEL="crash/undercount-checked"
 # An explicit caller-supplied BEZEL_SHARD_TIMEOUT wins unconditionally, in BOTH
 # oracles (#2918 — this used to be read only in the ASan branch, so an operator
 # exporting it for a plain gate had it silently ignored by this script and only
@@ -134,7 +163,7 @@ if [ "$ASAN" -eq 1 ]; then
   # only the coarse per-shard backstop, and the CANARY is the fail-fast layer,
   # so a generous cold ceiling no longer delays broken-tree detection. A
   # caller's explicit BEZEL_SHARD_TIMEOUT always wins.
-  SHARD_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
+  SHARD_ENV=(env BEZEL_AOT_CACHE_STATS=1 BEZEL_AOT_FORCE_SANITIZE=address)
   ARB_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
   SHARD_NOTE="asan-instrumented"
   SHARD_LABEL="crash/undercount + generated-code ASan"
@@ -210,9 +239,47 @@ emit_json() { # rc result total_s -> append one JSON object; best-effort
     sep=","
   done
   local fp="null"; [ -n "$FAILED_PHASE" ] && fp="\"$FAILED_PHASE\""
-  printf '{"schema":1,"ts":"%s","epoch":%s,"host":"%s","mode":"%s","head":"%s","head_short":"%s","dirty":%s,"result":"%s","failed_phase":%s,"total_s":%s,"gtests":%s,"littests":%s,"shard_count":%s,"shard_reported_s":%s,"arbitration_suspects":%s,"serial_attempts":%s,"serial_total":%s,"asan_shards_reported":%s,"asan_errors":%s,"shard_times":[%s],"phases":[%s]}\n' \
+  # fix #3010: AN UNMEASURED NUMBER EMITS null, NEVER 0.
+  # `"gtests":${COV_GTESTS:-0}` is precisely how 26 records came to say
+  # result=pass with gtests=0: a harvest regex that failed and a suite that
+  # genuinely ran nothing were byte-identical in the log. `null` means "not
+  # measured"; `0` means "measured as zero". Conflating them destroyed the only
+  # evidence that would have distinguished them, for 24 days.
+  local j_gtests="null"; [ -n "${COV_GTESTS:-}" ] && [ "${COV_GTESTS:-0}" -gt 0 ] 2>/dev/null && j_gtests="$COV_GTESTS"
+  local j_lit="null";    [ -n "${COV_LITTESTS:-}" ] && [ "${COV_LITTESTS:-0}" -gt 0 ] 2>/dev/null && j_lit="$COV_LITTESTS"
+  local j_exp="null";    [ "${GATE_EXPECTED_GTESTS:-0}" -gt 0 ] 2>/dev/null && j_exp="$GATE_EXPECTED_GTESTS"
+  local j_cachen="null"; [ -n "${cache_n:-}" ] && j_cachen="$cache_n"
+  local j_sto="null";    [ -n "${sto:-}" ] && j_sto="$sto"
+  local j_cold="null";   [ -n "${GATE_COLD:-}" ] && { [ "$GATE_COLD" -eq 1 ] && j_cold=true || j_cold=false; }
+  local j_floor="null";  [ -n "${GATE_FLOOR_OK:-}" ] && { [ "$GATE_FLOOR_OK" -eq 1 ] && j_floor=true || j_floor=false; }
+  local j_aot="null"
+  [ -n "${AOT_HITS:-}${AOT_MISSES:-}" ] && j_aot="{\"hits\":${AOT_HITS:-null},\"misses\":${AOT_MISSES:-null},\"store_failures\":${AOT_STORE_FAILS:-null}}"
+  # merge the two flat maps written at different points in the run (see the
+  # ordering note at the harvest). Union of names, so a binary that was expected
+  # but never reported appears with ran=0 — which is exactly the signature R2
+  # looks for ("a whole area contributed nothing").
+  local j_bins="null" _m=""
+  if [ -n "${GATE_BIN_EXPECTED:-}${GATE_BIN_RAN:-}" ]; then
+    _m=$(# NB: `exp` and `ran` are gawk builtins — using them as -v names is a
+      # fatal awk error, which would have made this merge emit nothing at all.
+      awk -v emap="${GATE_BIN_EXPECTED:-}" -v rmap="${GATE_BIN_RAN:-}" '
+      BEGIN{
+        n=split(emap,E," "); for(i=1;i<=n;i++){ split(E[i],a,":"); if(a[1]!="")e[a[1]]=a[2] }
+        n=split(rmap,R," "); for(i=1;i<=n;i++){ split(R[i],a,":"); if(a[1]!="")r[a[1]]=a[2] }
+        for(k in e) seen[k]=1; for(k in r) seen[k]=1
+        out=""; sep=""
+        for(k in seen){
+          ev=(k in e)?e[k]:"null"; rv=(k in r)?r[k]:0
+          out=out sep "\"" k "\":{\"ran\":" rv ",\"expected\":" ev "}"; sep=","
+        }
+        print out
+      }')
+    [ -n "$_m" ] && j_bins="{$_m}"
+  fi
+  printf '{"schema":2,"ts":"%s","epoch":%s,"host":"%s","mode":"%s","head":"%s","head_short":"%s","dirty":%s,"result":"%s","failed_phase":%s,"total_s":%s,"gtests":%s,"littests":%s,"expected_gtests":%s,"coverage_floor_enforced":%s,"cold":%s,"cache_n":%s,"shard_timeout_s":%s,"aot":%s,"binaries":%s,"shard_count":%s,"shard_reported_s":%s,"arbitration_suspects":%s,"serial_attempts":%s,"serial_total":%s,"asan_shards_reported":%s,"asan_errors":%s,"shard_times":[%s],"phases":[%s]}\n' \
     "$GATE_TS" "${GATE_EPOCH:-0}" "$GATE_HOST" "$MODE" "$GATE_HEAD" "$GATE_HEAD_SHORT" "$GATE_DIRTY" \
-    "$result" "$fp" "$total" "${COV_GTESTS:-0}" "${COV_LITTESTS:-0}" "${SHARD_COUNT:-0}" "${SHARD_REPORTED_S:-0}" \
+    "$result" "$fp" "$total" "$j_gtests" "$j_lit" "$j_exp" "$j_floor" "$j_cold" "$j_cachen" "$j_sto" \
+    "$j_aot" "$j_bins" "${SHARD_COUNT:-0}" "${SHARD_REPORTED_S:-0}" \
     "${ARB_SUSPECTS:-0}" "${SERIAL_ATTEMPTS:-0}" "${SERIAL_TOTAL:-0}" "${ASAN_SHARDS:-0}" "${ASAN_ERRS:-0}" \
     "$SHARD_TIMES" "$phases" >> "$TLOG" 2>/dev/null || return 0
 }
@@ -235,6 +302,21 @@ gate_finish() { # rc -> print aligned summary + append JSON; must NOT change exi
     echo "   machine log: $TLOG"
   } || true
   emit_json "$rc" "$result" "$total" 2>/dev/null || true
+  # fix #3010: READ THE TELEMETRY BACK. Writing it was never the gap — the file
+  # held 465 records over 24 days and had zero readers, with 55 `pass` verdicts
+  # contradicted by their own coverage field sitting in it in plain numbers.
+  # Advisory HERE (gate.sh must not change its own exit code from a reporting
+  # step); gate_and_push.sh treats the same check as BLOCKING before a push,
+  # which is where it can actually stop something.
+  if [ -x scripts/gate_trend.sh ]; then
+    local _tout; _tout=$(scripts/gate_trend.sh --last 2>&1) || true
+    # A checker that silently no-ops is #3000 applied to the fix for #3000, so
+    # the ABSENCE of the scan line is itself reported.
+    case "$_tout" in
+      *"records scanned"*) printf '%s\n' "$_tout" | sed 's/^/   trend| /' ;;
+      *) echo "   trend| WARNING: gate_trend.sh produced no scan line — the check did not run" ;;
+    esac
+  fi
   # Verdict to the canonical status file (see GATE_STATUS_FILE above).
   printf '{"status":"%s","rc":%d,"mode":"%s","head":"%s","total_s":%s,"failed_phase":%s,"finished":"%s"}\n' \
     "$result" "$rc" "$MODE" "$GATE_HEAD_SHORT" "$total" \
@@ -677,6 +759,39 @@ COV_GTESTS=${gtests:-0}; COV_LITTESTS=${littests:-0}
 if [ -n "${gtests:-}" ]; then
   echo "== gate: coverage: ${gtests} gtest + ${littests:-0} lit = $(( gtests + ${littests:-0} )) tests passing =="
 fi
+
+# fix #3010: harvest what the run ALREADY PRINTED and threw away.
+#
+# (a) PER-BINARY counts. run_parallel.sh already prints one
+#     `  <name>   N passed, M failed` line per binary. Merging it with the
+#     registry's per-binary expectation gives the "a whole area contributed
+#     zero" signature directly — 16482 - 11326 = 5156 is not a coincidence,
+#     it is the codegen binary contributing nothing, which no aggregate total
+#     can distinguish from a uniformly short run.
+# (b) AOT CACHE STATS. Never collected before today (see SHARD_ENV above).
+if [ -r "$S/gate_shard.log" ]; then
+  # NOTE ON ORDERING (caught in review, and it is the same defect class as
+  # everything else fixed today): this harvest runs BEFORE the coverage-floor
+  # block that enumerates the registry, so `expected` is not known yet. Recording
+  # RAN and EXPECTED into separate flat maps and merging them in emit_json is the
+  # only correct order — an earlier draft read `expected` here (always empty) and
+  # was then overwritten by the floor block, so the per-binary data would have
+  # been silently absent and R2 would never have fired.
+  GATE_BIN_RAN=""
+  while read -r _bn _bp; do
+    [ -n "$_bn" ] || continue
+    GATE_BIN_RAN="${GATE_BIN_RAN}${_bn}:${_bp:-0} "
+  done < <(grep -aE '^  [a-z_]+ +[0-9]+ passed, [0-9]+ failed' "$S/gate_shard.log" 2>/dev/null \
+             | awk '{print $1, $2}')
+
+  AOT_HITS=$(grep -aoE '\[aot-cache\] hits=[0-9]+' "$S/gate_shard.log" 2>/dev/null \
+               | grep -oE '[0-9]+$' | awk '{t+=$1} END{if(NR)print t}')
+  AOT_MISSES=$(grep -aoE 'misses=[0-9]+' "$S/gate_shard.log" 2>/dev/null \
+               | grep -oE '[0-9]+$' | awk '{t+=$1} END{if(NR)print t}')
+  if [ -n "${AOT_HITS:-}${AOT_MISSES:-}" ]; then
+    echo "== gate: AOT cache: ${AOT_HITS:-?} hits / ${AOT_MISSES:-?} misses =="
+  fi
+fi
 # Whole-suite-timeout acceptance is LOUD (#2100): when the sharded pass exited
 # nonzero and the gate is passing purely because every arbitrated suspect
 # cleared, a zero/absent gtest total means the shards were killed at the
@@ -712,13 +827,56 @@ fi
 # This subsumes the undercount heuristics rather than joining them: they infer
 # truncation from symptoms (a crashed shard, a missing summary, a zero total);
 # this measures it.
+#
+# fix #3011: THE FLOOR'S OWN INPUT WAS THE DEFECT IT WAS WRITTEN TO CATCH.
+# The first version skipped a manifest row with `[ -x "$bin" ] || continue`, so
+# a binary that failed to link, was never built, or was renamed did not fail the
+# gate — it silently LOWERED the bar it was supposed to raise. Miss the codegen
+# binary and `expected` drops from 16,482 to 5,156, which is exactly the number
+# the run that motivated #3002 reported as a pass. The floor would have agreed
+# with it.
+#
+# That is variant 3 of this project's category-defect taxonomy — a correct
+# predicate fed by a source collection that never held the population — sitting
+# inside the fix for a variant-3 defect. So: count the rows, require every row
+# to yield a number, and require the row count to be non-zero. Any gap is a hard
+# failure, never a smaller expectation.
 GATE_EXPECTED_GTESTS=0
+GATE_FLOOR_OK=1
+GATE_BIN_ROWS=0
+GATE_BIN_EXPECTED=""
 if [ -r build/tests/test_binaries.txt ]; then
   while read -r _g bin _n; do
-    [ -x "$bin" ] || continue
+    [ -n "$bin" ] || continue
+    GATE_BIN_ROWS=$(( GATE_BIN_ROWS + 1 ))
+    if [ ! -x "$bin" ]; then
+      echo "## GATE FAILURE: test registry lists '$bin' ($_g) but it is not executable"
+      echo "##   Skipping it would LOWER the coverage floor by however many tests it holds,"
+      echo "##   which is the exact defect #3002 exists to prevent. Refusing to guess."
+      GATE_FLOOR_OK=0
+      continue
+    fi
     n=$(BEZEL_TEST_ENUMERATE=1 "$bin" 2>/dev/null | wc -l)
+    if [ "${n:-0}" -le 0 ]; then
+      echo "## GATE FAILURE: '$bin' ($_g) enumerated 0 tests — the registry read failed"
+      GATE_FLOOR_OK=0
+      continue
+    fi
     GATE_EXPECTED_GTESTS=$(( GATE_EXPECTED_GTESTS + n ))
+    GATE_BIN_EXPECTED="${GATE_BIN_EXPECTED}${_g}:${n} "
   done < build/tests/test_binaries.txt
+else
+  echo "## GATE FAILURE: build/tests/test_binaries.txt is unreadable — cannot establish what SHOULD run"
+  GATE_FLOOR_OK=0
+fi
+if [ "$GATE_BIN_ROWS" -eq 0 ]; then
+  echo "## GATE FAILURE: the test registry lists ZERO binaries"
+  GATE_FLOOR_OK=0
+fi
+if [ "$GATE_FLOOR_OK" -ne 1 ]; then
+  FAILED_PHASE="coverage floor unusable: the registry could not be read completely"
+  echo "== GATE FAIL: $FAILED_PHASE =="
+  exit 3
 fi
 if [ "$GATE_EXPECTED_GTESTS" -gt 0 ]; then
   if [ "${COV_GTESTS:-0}" -lt "$GATE_EXPECTED_GTESTS" ]; then
