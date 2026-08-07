@@ -147,8 +147,28 @@ run_until_trustworthy "$LOGDIR/${TAG}_plain.log" "plain" || exit $?
 # means something else entirely.
 run_until_trustworthy "$LOGDIR/${TAG}_full.log" "full(ASan)" --full || exit $?
 
+# fix #3011: THIS IS A HARD FAILURE, NOT A WARNING.
+#
+# It was `say "WARNING: …"` followed by an unconditional
+# `say "cycle COMPLETE: both oracles trustworthy-green"; exit 0` — so a cycle
+# that ran the PLAIN oracle twice announced dual-oracle green and pushed. The
+# check already existed and already knew; it just had no teeth.
+#
+# The whole point of #2917/#2633 is that plain and ASan are DIFFERENT oracles,
+# neither dominating. A cycle that silently ran one of them twice has not
+# established the thing this script exists to establish, and "both oracles
+# trustworthy-green" is then a false statement in the log that a human will
+# later cite as evidence.
+#
+# gate.sh's mode allow-list (#3011) stops the typo that caused this. This is the
+# belt to that braces: a POSITIVE allow-list missing a name is variant 1 of the
+# category-defect taxonomy, so the downstream evidence check must stand on its
+# own rather than trusting the upstream list to be complete.
 if ! grep -qi 'asan\|sanitize' "$LOGDIR/${TAG}_full.log"; then
-  say "WARNING: the --full log mentions no sanitizer — verify the mode took effect"
+  say "CYCLE FAILURE: the --full log mentions no sanitizer — the ASan oracle did NOT run."
+  say "  Refusing to report dual-oracle green for a cycle that ran one oracle twice."
+  say "  Log: $LOGDIR/${TAG}_full.log"
+  exit 1
 fi
 
 say "cycle COMPLETE: both oracles trustworthy-green"
