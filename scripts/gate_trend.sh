@@ -75,14 +75,28 @@ path, limit, only_last = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 
 recs = []
 malformed = 0
+last_line_bad = False
 for line in open(path, errors="replace"):
     line = line.strip()
     if not line:
         continue
     try:
         recs.append(json.loads(line))
+        last_line_bad = False
     except Exception:
         malformed += 1
+        last_line_bad = True
+
+# If the NEWEST line is unparseable, --last would silently fall back to judging
+# an OLDER record — quietly answering a question about a different gate, and
+# (given the historical log) very likely firing R1 on a run from weeks ago. That
+# is the failure mode this whole script exists to stop, so it is loud instead.
+if last_line_bad:
+    print(f"trend: {len(recs)} records scanned, 0 rules evaluated")
+    print("trend: FAIL — the NEWEST record is malformed JSON. The gate that just ran "
+          "did not record a readable result, so there is nothing to judge. "
+          "(Refusing to silently grade an older record instead.)")
+    sys.exit(1)
 
 if limit > 0:
     recs = recs[-limit:]
