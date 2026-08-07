@@ -1393,13 +1393,25 @@ inline void storeToCache(const std::string& exePath,
     if (ec) {
         ec.clear();
         fs::copy_file(exePath, tmp, fs::copy_options::overwrite_existing, ec);
-        if (ec) return;
+        // fix #3003: REMOVE THE TEMP ON FAILURE. This was a bare `return`, so
+        // every failed store leaked its .tmp file. Measured 2026-08-08: 9,160
+        // orphans in the store, 9,158 of them zero-byte — 7,661 inside a single
+        // hour, which was one ASan gate pass. Each of 17 PIDs produced a
+        // CONTIGUOUS run of temp counters, i.e. each process stored ~1,700-2,500
+        // entries successfully and then failed EVERY store until it exited,
+        // silently. Combined with the GC skipping .tmp names below, those bytes
+        // were invisible to the cap.
+        if (ec) { std::error_code e2; fs::remove(tmp, e2); return; }
     }
     fs::permissions(tmp, kExePerms, fs::perm_options::replace, ec);
     ec.clear();
     fs::rename(tmp, cachePath, ec);  // atomic install (same filesystem)
     if (ec) { std::error_code e2; fs::remove(tmp, e2); }  // clean the temp
 }
+
+// Orphan-temp age floor for the GC below (#3003). The compile+link deadline is
+// 120s, so an hour is far past any in-flight store and cannot race a live one.
+inline constexpr auto kTempOrphanAge = std::chrono::hours(1);
 
 // Size-bounded GC, run ONCE per process under a non-blocking flock so only one
 // shard sweeps (losers skip; GC is a coarse safety valve, not per-run-critical).
@@ -1440,10 +1452,31 @@ inline void maybeGcCache() {
             std::error_code e2;
             if (!it->is_regular_file(e2) || e2) continue;
             const std::string name = it->path().filename().string();
-            if (name == ".gc.lock" || name.rfind(".tmp.", 0) == 0) continue;
+            if (name == ".gc.lock") continue;
             std::uintmax_t sz = fs::file_size(it->path(), e2); if (e2) continue;
             fs::file_time_type mt = fs::last_write_time(it->path(), e2);
             if (e2) continue;
+            // fix #3003: COUNT AND REAP ORPHANED TEMPS.
+            //
+            // `.tmp.` names were skipped for BOTH counting and deletion, so the
+            // cap bounded only the countable subset — and the uncountable subset
+            // is precisely the one that grows when stores start failing. That
+            // makes BEZEL_AOT_CACHE_MAX_GB not an enforceable ceiling at all.
+            //
+            // A temp older than kTempOrphanAge cannot belong to a live store:
+            // the whole compile+link has a 120s deadline, so an hour is orders
+            // of magnitude past any in-flight write, and a concurrent storer's
+            // fresh temp is never touched.
+            if (name.rfind(".tmp.", 0) == 0) {
+                const auto age = fs::file_time_type::clock::now() - mt;
+                if (age > kTempOrphanAge) {
+                    std::error_code e3;
+                    fs::remove(it->path(), e3);   // reclaim; not added to `ents`
+                    continue;
+                }
+                total += sz;   // young temp: counts against the cap, not reaped
+                continue;
+            }
             total += sz;
             ents.push_back({it->path().string(), sz, mt});
         }
