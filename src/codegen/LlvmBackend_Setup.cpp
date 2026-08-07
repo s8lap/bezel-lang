@@ -11251,6 +11251,40 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     // plain BORROW — same contract as the unchanged
                     // wrapArrayAsIEnumerable call below.
                     v = wrapStackAsIEnumerator(v, declTR);
+                // fix #2975 manifestation 3 (§28.3 / §28.9 / §29.2, v0.240):
+                // an UNBOUND `new` of an array-family collection widened at
+                // this decl site. `wrapArrayAsIEnumerable` builds a BORROWING
+                // enumerator whose slot-1 Dispose is `free(self)` — the
+                // wrapper frame only — which is right when the source has its
+                // own owner, and a LEAK when it does not: the `new` here is
+                // bound to no other name, so nothing else ever frees the
+                // backing. MEASURED on 618c0c8: 200 iterations of `using var
+                // e: IEnumerable<int> := new Array<int>(2);` leaked 11200
+                // bytes in 400 allocations under LSan, while the SAME loop at
+                // an `IList<int>`/`ICollection<int>`/`IReadOnlyList<int>` head
+                // — which take no wrap and keep the array-backed protocol —
+                // was clean. Use the OWNING enumerator instead: its slot-1
+                // Dispose frees the backing AND the frame, exactly once, which
+                // is the same treatment #2299 already gave the RETURN coercion
+                // (wrapAsIEnumerableForTarget's `srcOwnedByCallee` arm) for
+                // this identical shape. The two coercion sites duplicate this
+                // dispatch independently (see #2486's note directly above), so
+                // the local-decl site had to be fixed here as well.
+                //
+                // Gated on the initializer being a `new` EXPRESSION, not on
+                // the wider "callee-owned producer" predicate the return site
+                // uses: at a local-decl site a producer-init IDENTIFIER (`var
+                // a := new Array<int>(2); var e: IEnumerable<int> := a;`) is
+                // still owned by `a`, which disposes it — taking ownership
+                // here would double-free. A `new` at this site is bound to no
+                // other name by construction. It is also EMPTY by construction
+                // (a collection constructor argument is a capacity, not
+                // contents), which is why the owning wrapper's `bz_array_free
+                // (arr, null)` element-disposer-less free is complete here: a
+                // temporary that no name can reach can have had nothing added
+                // to it.
+                else if (dynamic_cast<const ast::NewExpr*>(init) != nullptr)
+                    v = wrapOwnedArrayAsIEnumerable(v, declTR);
                 else
                     v = wrapArrayAsIEnumerable(v, declTR);
             } else if (initIsDictSet) {
