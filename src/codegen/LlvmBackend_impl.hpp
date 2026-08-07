@@ -9251,6 +9251,19 @@ private:
     static std::string builtinMemberChainNote(const std::string& member,
                                               const std::string& appliedMember);
 
+    // fix #2974 (language spec §11.7/§12.5, stdlib §6.8, v0.240): the `new`
+    // twin of `builtinReceiverOfMemberCall` — is `e` a `new` on a registry
+    // built-in (no user `TypeDecl`)? Returns that name, else empty. Callers use
+    // it where a VALUE IS DEMANDED and lowering produced none; unlike the twin
+    // it needs no "sema was ignorant too" conjunct, because sema types every
+    // `new T(…)` and no construction is unit-valued. See the definition.
+    std::string unconstructedBuiltinNewName(const ast::Expr* e);
+
+    // fix #2974: the two sites' shared diagnostic text. `siteClause` completes
+    // "…produced no value, so it cannot <siteClause>".
+    static std::string unconstructedBuiltinNewNote(const std::string& n,
+                                                   const char* siteClause);
+
     // #2182 / §28.3: consume lastLambdaCapturedCells_ — for each freshly-boxed
     // capture cell of a cellFreeEligible_ local (populated by lowerLambda),
     // register a boxedCellFree (or boxedCellFreeDeferred / inline-array-cell

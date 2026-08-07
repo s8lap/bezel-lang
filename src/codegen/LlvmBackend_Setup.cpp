@@ -10900,6 +10900,104 @@ std::string Emitter::builtinReceiverOfMemberCall(const ast::Expr* e,
 }
 
 
+// fix #2974 (language spec §11.7 "Static classes" / §12.5; stdlib §6.8,
+// v0.240): the `new` twin of `builtinReceiverOfMemberCall`. Is `e` a `new` on a
+// name the `builtinTypeArity` registry resolves without any user `TypeDecl`?
+// Returns that name when it is, an empty string otherwise. Callers use it where
+// a VALUE IS DEMANDED and lowering produced none.
+//
+// ⚠ IT DELIBERATELY LACKS ITS TWIN'S "SEMA WAS IGNORANT TOO" CONJUNCT, and that
+// is a difference in the language rather than a relaxation. #2935 needs that
+// conjunct because `lowerCallExpr` returns nullptr both for "nothing lowered
+// this" and for "an arm lowered it and the result is unit" — a real,
+// unit-returning member can legitimately produce no value. NO SUCH AMBIGUITY
+// EXISTS FOR `new`: sema types every `new T(…)` as `T` (so the conjunct would
+// reject everything, not filter anything), and there is no unit-valued
+// construction, so "produced no value at a value-demanding site" is
+// unambiguously a failure. Measured population on this base: `Domain`, `Path`,
+// `File`, `Directory`, `Debug`, `BitConverter`, `Encoding` and `Linq` — eight,
+// against the one #2974 reports.
+//
+// A user type that merely SHARES a built-in's name is excluded exactly as in
+// the twin: it carries a real `decl`, or (imported) a non-empty `moduleName`.
+// A `new T()` on a generic type PARAMETER is excluded because `T` is not a
+// registry name — its own no-value shape is #2477's, diagnosed there.
+std::string Emitter::unconstructedBuiltinNewName(const ast::Expr* e) {
+    auto* ne = dynamic_cast<const ast::NewExpr*>(e);
+    if (!ne) return {};
+    // Resolved exactly as `lowerNew` resolves it: the explicit `ne->type` when
+    // present, else the inferred target-typed `new(...)` shorthand's own
+    // recorded exprType (§17.7, #979).
+    const sema::TypeRef* rt = ne->type
+        ? ctx_.resolvedType(*ne->type)
+        : ctx_.exprType(*ne);
+    if (!rt || rt->kind != sema::TypeRef::Kind::Named) return {};
+    const sema::TypeSymbol* rd = rt->declaration;
+    if (rd && (rd->decl || !rd->moduleName.empty())) return {};  // user type
+    std::string n = rd ? std::string(rd->name) : std::string(rt->headName());
+    if (n.empty() || !sema::isBuiltinTypeName(n)) return {};
+    // ⚠ A VALUE-SHAPED BUILT-IN IS EXEMPT, and this conjunct was forced by
+    // MEASUREMENT, not by review. Re-running a 34-spelling `new <builtin>(…)`
+    // grid on the fixed compiler showed the gate also newly rejecting
+    // `new Guid()`, `new IntPtr()`, `new ExceptionInfo()` and
+    // `new ReadOnlyStringSpan()`. Measured on the PARENT compiler,
+    //
+    //     var g := new Guid(); Console.WriteLine(g.ToString());
+    //
+    // prints `00000000-0000-0000-0000-000000000000` — exactly the documented
+    // `Guid.Empty`. It is not a degraded null at all: for a value-shaped
+    // built-in the substituted all-zero pattern IS `default(T)` (§17.11), and
+    // §14.2 states outright that "`new T()` for a value substitution is
+    // equivalent to `default(T)`". Rejecting that would have broken a program
+    // that works and returns the right answer. Whether `new Guid()` is legal
+    // Bezel at an ordinary (non-generic) site is a question the spec does not
+    // settle, and CLAUDE.md rule 1 says an unclear spec is an ISSUE, not an
+    // interpretation quietly committed to in codegen. Filed separately.
+    //
+    // The test is the EXISTING registry split rather than a new list:
+    // `kNonHeapReservedBuiltins` (common/BuiltinRegistry.cpp) is already the
+    // authority for "a reserved built-in whose representation is not a heap
+    // pointer" — the temporal/identity value records, the span shapes,
+    // `ExceptionInfo`, `JsonOptions`, the FFI value types — and it is
+    // snapshot-pinned. What remains gated is exactly the pointer-shaped half,
+    // where "produced no value" IS a null reference: a value the language has
+    // no legal way to produce for a non-nullable reference type, and the one
+    // #2922 MEASURED faulting at address 0x8.
+    //
+    // All eight members of #2974's population — `Domain`, `Path`, `File`,
+    // `Directory`, `Debug`, `BitConverter`, `Encoding`, `Linq` — are in NEITHER
+    // registry table (`lowerTypeRef`'s Named case has no arm for them), so they
+    // are not value-shaped and stay rejected, as do `Subscription`,
+    // `CancellationToken`, `Task` and `Type`.
+    if (common::isReservedBuiltinTypeName(n) &&
+        !common::isHeapPointerReferenceBuiltin(n))
+        return {};
+    return n;
+}
+
+
+// fix #2974: the shared text of the two value-demanding `new` diagnostics.
+// It offers THREE readings and asserts none of them, because the population is
+// not uniform: `Domain`/`Path`/`File`/`Directory`/`Debug`/`BitConverter` are
+// `public static class` (§11.7), `Encoding` is `public abstract class` (§12.5),
+// `Linq` is not a declared stdlib type at all, and a built-in like `Lock` or
+// `SemaphoreToken` is a real class obtained only from a factory. Saying "static"
+// would be false for most of them — the #2935 re-wording lesson, applied before
+// it had to be paid for a second time.
+std::string Emitter::unconstructedBuiltinNewNote(const std::string& n,
+                                                 const char* siteClause) {
+    return "`new " + n + "(\xE2\x80\xA6)` produced no value, so it cannot " +
+           siteClause + ". `" + n + "` has no user declaration, so its "
+           "CONSTRUCTOR surface is exactly what the standard library documents "
+           "for it: either `" + n + "` may not be instantiated at all (`new` on "
+           "a static class is a compile error \xE2\x80\x94 language spec "
+           "\xC2\xA7""11.7 \xE2\x80\x94 as it is on an abstract class, "
+           "\xC2\xA7""12.5, and several built-ins are obtained only from a "
+           "factory), or this argument list matches no documented constructor "
+           "(#2974)";
+}
+
+
 // fix #2976 (stdlib §6.5, v0.240): the parenthetical the two value-demanding
 // diagnostics append when the failing hop was NOT the call's own callee — see
 // builtinReceiverOfMemberCall. A reader who is told only "`Event` … produced no
@@ -11811,6 +11909,16 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
             unitInitializer ? std::string()
                             : builtinReceiverOfMemberCall(init, &initMember,
                                                           &initAppliedMember);
+        // fix #2974 (§11.7/§12.5, stdlib §6.8, v0.240): (b)'s `new` sibling —
+        // the initializer is a construction of a BUILT-IN that produced
+        // nothing. Same site, same "a local declaration demands a value" half
+        // of the property; see unconstructedBuiltinNewName for why it needs no
+        // sema conjunct. Tested after (b) only because the two are structurally
+        // disjoint (a CallExpr is not a NewExpr), so the order cannot matter.
+        const std::string builtinNewName =
+            (unitInitializer || !builtinRecvName.empty())
+                ? std::string()
+                : unconstructedBuiltinNewName(init);
         if (unitInitializer) {
             // (a) — nothing to report.
         } else if (!builtinRecvName.empty() &&
@@ -11826,6 +11934,12 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 "(#2935 \xE2\x80\x94 if it is documented and should yield a "
                 "value, it is unimplemented, #2457)" +
                 builtinMemberChainNote(initMember, initAppliedMember));
+        } else if (!builtinNewName.empty() &&
+                   !ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Error, init->span.begin,
+                unconstructedBuiltinNewNote(builtinNewName,
+                                            "initialize this local"));
         } else if (init && !ctx_.diagnostics().hasErrors()) {
             ctx_.diagnostics().report(
                 Severity::Warning, init->span.begin,

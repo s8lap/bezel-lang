@@ -1680,6 +1680,15 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 ? builtinReceiverOfMemberCall(rs->value.get(), &retMember,
                                               &retAppliedMember)
                 : std::string();
+        // fix #2974 (§11.7/§12.5, stdlib §6.8, v0.240): the `new` sibling, at
+        // the same §21.7-protected `return expr;` site the member-call gate
+        // covers — `return new Domain("d");` demands a value exactly as a local
+        // declaration does. Disjoint from the member-call gate by construction
+        // (a CallExpr is not a NewExpr), so the order is immaterial.
+        const std::string retBuiltinNew =
+            (rs->value && !v && !unitReturnValue && retBuiltinRecv.empty())
+                ? unconstructedBuiltinNewName(rs->value.get())
+                : std::string();
         if (unitReturnValue) {
             // (a) — nothing to report.
         } else if (!retBuiltinRecv.empty() &&
@@ -1695,6 +1704,12 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 "(#2935 \xE2\x80\x94 if it is documented and should yield a "
                 "value, it is unimplemented, #2457)" +
                 builtinMemberChainNote(retMember, retAppliedMember));
+        } else if (!retBuiltinNew.empty() &&
+                   !ctx_.diagnostics().hasErrors()) {
+            ctx_.diagnostics().report(
+                Severity::Error, rs->value->span.begin,
+                unconstructedBuiltinNewNote(retBuiltinNew,
+                                            "supply this return value"));
         } else if (rs->value && !v && !ctx_.diagnostics().hasErrors()) {
             ctx_.diagnostics().report(
                 Severity::Warning, rs->value->span.begin,

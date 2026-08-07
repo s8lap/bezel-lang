@@ -4283,18 +4283,44 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                 return builder_.CreateCall(
                     openFn, {pathData, pathLen, mode, access}, "fs.open");
             }
-            // per §6.8 / #652: new Domain(name: string) — allocate a named
-            // domain instance backed by a bz_domain_t with a stored name field.
-            // bz_domain_alloc(name_str_p) → bz_domain_t* (refs=1 for `using var`).
-            if (colName == "Domain") {
-                llvm::Value* nameArg = llvm::ConstantPointerNull::get(ptrTy());
-                if (!ne.args.empty() && ne.args[0].value) {
-                    llvm::Value* v = lowerExpr(*ne.args[0].value);
-                    if (v) nameArg = v;
-                }
-                auto* allocFn = declareC("bz_domain_alloc", ptrTy(), {ptrTy()});
-                return builder_.CreateCall(allocFn, {nameArg}, "dom.alloc");
-            }
+            // fix #2974 (language spec §11.7 "Static classes", stdlib §6.8,
+            // v0.240): THE `new Domain(name: string)` ARM IS DELETED HERE.
+            //
+            // It emitted `bz_domain_alloc` for a construction the standard
+            // library does not declare. stdlib §6.8 is `public static class
+            // Domain` with twelve `Spawn` overloads and NO constructor and NO
+            // `Name`; §11.7 is verbatim "A static class may not be instantiated:
+            // `new` on a static class is a compile error", and adds "Because a
+            // static class cannot be instantiated, it does not implement
+            // `IDisposable`" — so `using var d := new Domain(…)` was doubly
+            // ill-formed. The arm's own runtime comment records how it got here:
+            // "stdlib §6.8 documents Domain as a static-class for Domain.Spawn.
+            // The probe suite exercises `new Domain("test")` and `d.Name` as an
+            // instance-creation path…". A probe wanted a capability, the
+            // compiler grew it undeclared, and four tests pinned it under a
+            // `// §6.8` citation for a section that declares none of it.
+            //
+            // WHY DELETION IS THE FIX AND A GUARD IS NOT. #2974 read the
+            // acceptance as a missing check ("does this built-in name denote an
+            // instantiable class?"). It was not a gap: with the arm present,
+            // `new Domain("d")` PRODUCED A VALUE and so looked exactly like a
+            // working construction to every downstream check — which is why it
+            // ran, and why it leaked 714 bytes a call (nothing releases a
+            // built-in the auto-drop chain has no arm for). With the arm gone it
+            // produces no value like every other non-constructible built-in, and
+            // the ONE property in `lowerLocalDecl`/the return site
+            // (`unconstructedBuiltinNewName`) rejects it together with the seven
+            // others that were already silently degrading — `Path`, `File`,
+            // `Directory`, `Debug`, `BitConverter`, `Encoding`, `Linq`. One
+            // property, not a `Domain` special case.
+            //
+            // §6.8's REAL surface — `Domain.Spawn` — is a static call on the
+            // identifier and lives in LlvmBackend_Calls3.cpp; it is untouched.
+            // The `.Name` getter (LlvmBackend_Exprs.cpp) and the `Domain` arm of
+            // the explicit `Dispose()` chain (LlvmBackend_Calls2.cpp) survive
+            // this change unreachable-from-`new`, together with the runtime trio
+            // behind them; removing those is a wider change than this fix and is
+            // filed separately.
             // §2.5: new DateTime(year, month, day) or
             //        new DateTime(year, month, day, hour, minute, second) or
             //        new DateTime(year, month, day, hour, minute, second, ms).
