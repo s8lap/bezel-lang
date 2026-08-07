@@ -140,12 +140,24 @@ esac
 # shell assignment, it is a nonexistent program. The leading `env` is therefore
 # load-bearing, and it is seeded here rather than in the ASan branch because as
 # of #2918 the PLAIN pass also contributes a variable (its shard ceiling).
-# fix #3010: BEZEL_AOT_CACHE_STATS was set NOWHERE in scripts/ — this project
-# has never had a single AOT cache hit/miss number, so every warm-vs-cold
-# argument in its history (including the ones that shaped the shard ceiling)
-# was inference from wall-clock. Turn it on: the harness prints one
-# `[aot-cache] hits=N misses=M ...` line per process at exit, which is free.
-SHARD_ENV=(env BEZEL_AOT_CACHE_STATS=1); ARB_ENV=(); SHARD_NOTE=""; SHARD_LABEL="crash/undercount-checked"
+# ⚠ BEZEL_AOT_CACHE_STATS IS DELIBERATELY *NOT* SET HERE — see #3012.
+#
+# It was set here in the first draft of #3010, to get the AOT hit/miss numbers
+# this project has never had. The gate caught the consequence immediately: the
+# harness prints its `[aot-cache] …` line from an atexit hook that RACES the
+# shard's own summary printer, and on sema shard 6 it landed mid-line:
+#
+#     102 passed[aot-cache] hits=5 misses=2 (71% hit) …
+#     , 0 failed (shard 6/16), 1630 total
+#
+# run_parallel.sh matches `^[0-9]+ passed, [0-9]+ failed`, so a completed shard
+# (rc=0, 102 real tests) was counted as 102 unaccounted and the whole gate failed.
+# Enabling the measurement corrupted the thing being measured.
+#
+# The fix is to route the stats to their own file rather than into the stream the
+# summary is parsed from (#3012, code change). Until then this stays off: an
+# unmeasured number is a known gap, a corrupted count is a wrong answer.
+SHARD_ENV=(env); ARB_ENV=(); SHARD_NOTE=""; SHARD_LABEL="crash/undercount-checked"
 # An explicit caller-supplied BEZEL_SHARD_TIMEOUT wins unconditionally, in BOTH
 # oracles (#2918 — this used to be read only in the ASan branch, so an operator
 # exporting it for a plain gate had it silently ignored by this script and only
@@ -163,7 +175,7 @@ if [ "$ASAN" -eq 1 ]; then
   # only the coarse per-shard backstop, and the CANARY is the fail-fast layer,
   # so a generous cold ceiling no longer delays broken-tree detection. A
   # caller's explicit BEZEL_SHARD_TIMEOUT always wins.
-  SHARD_ENV=(env BEZEL_AOT_CACHE_STATS=1 BEZEL_AOT_FORCE_SANITIZE=address)
+  SHARD_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)   # see #3012 note above
   ARB_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
   SHARD_NOTE="asan-instrumented"
   SHARD_LABEL="crash/undercount + generated-code ASan"

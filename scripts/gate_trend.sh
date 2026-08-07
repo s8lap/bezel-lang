@@ -196,8 +196,13 @@ for i in judge:
     # that is 0/null WHILE ITS PHASE RAN is a measurement that did not happen,
     # and must never be silently indistinguishable from a real zero.
     phases = {p.get("name"): p for p in (r.get("phases") or [])}
+    # Scope R4 to a PASSING gate. A gate that failed early (e.g. the sharded
+    # pass exited nonzero) legitimately never reaches the coverage harvest, so
+    # `gtests` is unmeasured for a good reason. Firing there would make every
+    # real failure carry a second, spurious finding — and a rule that cries wolf
+    # on failures is a rule people learn to skip past.
     sh = phases.get("shard")
-    if sh and sh.get("status") == "ran" and (sh.get("s") or 0) > 30:
+    if result == "pass" and sh and sh.get("status") == "ran" and (sh.get("s") or 0) > 30:
         if not gtests:
             findings.append(("FAIL", RULES[3], i,
                 f"{ts(r)} {hd(r)}: shard phase ran {sh.get('s')}s but gtests is "
