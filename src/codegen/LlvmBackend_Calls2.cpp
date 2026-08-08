@@ -7907,11 +7907,30 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                         newSubst[pname] = lowerTypeRef(argSema);
                         newSema[pname] = argSema;
                     }
-                    // Check if any resolved arg is still i32 (unresolved generic
-                    // fallback). If so, try the localGenericSubst_ for the receiver.
+                    // Check if any resolved arg is an UNRESOLVED placeholder and
+                    // try the localGenericSubst_ for the receiver if so.
+                    // fix #3020 (#2192 order-dependence): the old check was
+                    // `ty == i32()` on the LLVM type, but lowerTypeRef returns
+                    // i32 for BOTH a genuine `int` argument AND the bare-type-
+                    // parameter fallback — so a concrete `int` arg falsely fired
+                    // the fallback, overwriting newSubst from a potentially-stale
+                    // localGenericSubst_ WITHOUT updating newSema. That desynced
+                    // the two maps (different key names), corrupting the
+                    // buildSpecializedMethodFn cache key into an empty-idKey
+                    // collision that made the transitive-generic specialization
+                    // reuse a wrong (placeholder) body — an order-dependence the
+                    // unordered methodFns_ iteration happened to satisfy but a
+                    // deterministic (name-sorted) emission exposed. The SEMA type
+                    // distinguishes the two: a bare type-parameter placeholder is
+                    // a Named TypeRef with no declaration and no generic args,
+                    // while a genuine Primitive (int) has kind == Primitive.
                     bool hasUnresolved = false;
-                    for (auto& [name, ty] : newSubst)
-                        if (ty == i32()) { hasUnresolved = true; break; }
+                    for (auto& [name, semaTy] : newSema)
+                        if (!semaTy ||
+                            (semaTy->kind == sema::TypeRef::Kind::Named &&
+                             !semaTy->declaration &&
+                             semaTy->genericArgs.empty()))
+                        { hasUnresolved = true; break; }
                     if (hasUnresolved) {
                         // Try looking up the local's stored substitution.
                         sema::Symbol* recvSym = ctx_.exprSymbol(*recvExpr);

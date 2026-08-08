@@ -11,6 +11,7 @@
 // anonymous-namespace placement gave, while allowing the definitions to live
 // in separately-compiled units.
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -419,11 +420,34 @@ public:
         // that ensurePropertyAccessorFn — invoked from declareVtables (Pass D)
         // and emitExportedPropertySetters — sees a populated boxStorageFields_
         // for the auto-setter body's box-ARC branch (fix #2500).
-        for (auto& [sym, fn] : methodFns_) {
-            emitFunctionBody(sym, fn);
+        // fix #3020 (#1608): methodFns_/ctorFns_/disposerFns_ are POINTER-KEYED
+        // unordered_maps. A pointer-keyed map's bucket order varies with the key
+        // address, which varies across processes/forks (different heap layout
+        // under ASLR), so emitting these bodies in iteration order made the
+        // rodata global order — and therefore the GNU build-id — vary run to run.
+        // Sort by the LLVM function name (a stable, deterministic string), the
+        // established precedent of accessorSpecTagFor (LlvmBackend_Setup.cpp:5883,
+        // "an iteration-order-dependent key would make [output] vary run to run").
+        {
+            std::vector<std::pair<sema::MethodSymbol*, llvm::Function*>> sorted(
+                methodFns_.begin(), methodFns_.end());
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const auto& a, const auto& b) {
+                          return a.second->getName() < b.second->getName();
+                      });
+            for (auto& [sym, fn] : sorted) {
+                emitFunctionBody(sym, fn);
+            }
         }
         emittingGenericTemplateBody_ = false;  // #817: don't leak into ctors/etc.
-        for (auto& [sym, fn] : ctorFns_) {
+        {
+            std::vector<std::pair<sema::ConstructorSymbol*, llvm::Function*>>
+                sorted(ctorFns_.begin(), ctorFns_.end());
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const auto& a, const auto& b) {
+                          return a.second->getName() < b.second->getName();
+                      });
+            for (auto& [sym, fn] : sorted) {
             // §2.5 / §14 (issue #328 item 1, fix #711): an IMPORTED class's
             // ctorFns_ entry is an EXTERNAL declaration — the DEFINING module
             // owns `bz$<Type>$ctor` and emitted its body there. Skip it, exactly
@@ -438,15 +462,24 @@ public:
             // active), never a call to the unspecialized template symbol.
             if (ctx_.isImported(sym)) continue;
             emitConstructorBody(sym, fn);
+            }
         }
         for (auto& e : staticCtors_) {
             emitStaticConstructorBody(e.cs, e.type, e.fn);
         }
-        for (auto& [ts, fn] : disposerFns_) {
-            // §2.5 (issue #328 item 1): an IMPORTED class's disposerFns_ entry is
-            // an EXTERNAL declaration (the exporter holds the body); skip it.
-            if (ctx_.isImported(ts)) continue;
-            emitDisposerBody(ts, fn);
+        {
+            std::vector<std::pair<const sema::TypeSymbol*, llvm::Function*>>
+                sorted(disposerFns_.begin(), disposerFns_.end());
+            std::sort(sorted.begin(), sorted.end(),
+                      [](const auto& a, const auto& b) {
+                          return a.second->getName() < b.second->getName();
+                      });
+            for (auto& [ts, fn] : sorted) {
+                // §2.5 (issue #328 item 1): an IMPORTED class's disposerFns_ entry is
+                // an EXTERNAL declaration (the exporter holds the body); skip it.
+                if (ctx_.isImported(ts)) continue;
+                emitDisposerBody(ts, fn);
+            }
         }
         // §2.5 / §22.8 (issue #328 item 2+3): emit the exported
         // `bz$<Type>$init` body for every public non-generic class declared in

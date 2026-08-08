@@ -76,10 +76,28 @@ const char kSourceB[] =
     "module M; class C public static method Main(): int return 1; end Main; "
     "end C;";
 // A program returning a DISTINCTIVE non-zero value, so an equivalence check
-// between two builds of it (both must exit 42) is non-trivial.
+// between two builds of it (both must exit 42) is non-trivial.  It declares
+// multiple enums and classes with methods/constructors so the pointer-keyed
+// emission maps (methodFns_/ctorFns_/disposerFns_/supersOf) have enough entries
+// for their iteration order to affect the .rodata layout — the exact hazard
+// fix #3020 made deterministic (name-sorted emission).  A regression that
+// restores unordered iteration would make two forked compiles of this source
+// diverge by a few .rodata bytes (an enum-name / descriptor reorder), which the
+// byte-equality assertion below catches.
 const char kSourceDistinct[] =
-    "module M; class C public static method Main(): int return 42; end Main; "
-    "end C;";
+    "module M; "
+    "enum FileAccess Read, Write; end FileAccess; "
+    "enum FileMode Append, Truncate; end FileMode; "
+    "enum FileShare None, Read; end FileShare; "
+    "class A public tag: int; "
+    "  public constructor(t: int) tag := t; end constructor; "
+    "  public method probe(o: Object): int => (if o is A then 1 else 0); "
+    "end A; "
+    "class B public tag: int; "
+    "  public constructor(t: int) tag := t; end constructor; "
+    "  public method probe(o: Object): int => (if o is B then 1 else 0); "
+    "end B; "
+    "public class C public static method Main(): int => 42; end C;";
 
 // A stand-in for the auto-imported stdlib prelude. The real text comes from
 // Driver::preludeSourceFingerprint; these tests only need two distinguishable
@@ -466,42 +484,30 @@ BEZEL_TEST(aot_cache_key, link_cache_is_reached_and_preserves_behaviour) {
     BEZEL_EXPECT_EQ(st.linkHits.load(), l0 + 1);  // and its LINK was served
 }
 
-// The split path must be OBSERVATIONALLY EXACT: compiling+linking in ONE driver
+// The split path must be BYTE-FOR-BYTE EXACT: compiling+linking in ONE driver
 // call (what bezelc ships, and what the harness does when the cache is off) and
-// compiling then linking as TWO calls (what the cache does) must produce
-// executables that BEHAVE identically. This is what lets the cache be an
-// optimisation rather than a second, weaker oracle: a cache HIT serves a binary
-// the real compile would have produced.
+// compiling then linking as TWO calls (what the cache does) must produce the
+// SAME executable. This is what lets the cache be an optimisation rather than a
+// second, weaker oracle: a cache HIT serves a binary the real compile would have
+// produced.
 //
-// WHY THIS IS NOT A BYTE-EQUALITY ASSERTION (#1608). The original form asserted
-// hCombined == hSplit (byte-for-byte executables). That flaked ~15% of co-resident
-// ASan shard runs, and the cause is NOT in-process state pollution (the #1608
-// fork-isolation already contains crashes): the compiler emits its rodata globals
-// (enum/type-name strings, type descriptors, box vtables) in an order determined
-// by POINTER-KEYED std::unordered_map iteration — methodFns_ / ctorFns_ /
-// disposerFns_ (keyed on MethodSymbol*/ConstructorSymbol*/TypeSymbol*) and the
-// supersOf descriptor maps (keyed on TypeSymbol*). A pointer-keyed map's bucket
-// order varies with the key-pointer VALUE, which varies with the forked child's
-// inherited heap layout; two forked compiles of the SAME source therefore emit
-// their globals in different orders, the objects diverge by a few bytes (measured:
-// an enum-name string-pool swap, e.g. "FileMode"/"FileAccess" laid out in either
-// order), the linked executables get distinct GNU build-ids, and the byte-equality
-// assertion flakes. run_parallel's "died on" attribution names the LAST [ RUN ]
-// line in the shard (an internal_degrade / builtin_registry_snapshot case that
-// runs AFTER this one and passes [ OK ]), so the flake was long misread as a
-// crash in that later, innocent test. A naive fix — sorting the emission loops by
-// mangled name — was tried and BREAKS is_transitive_generic_2192: the codegen has
-// a latent body-emission ORDER-DEPENDENCE for generic `is`-descriptor chains that
-// the unordered iteration happens to satisfy, so determinism needs a codegen lane
-// of its own (the fork-isolation cannot make two forked compiles byte-identical
-// when the compiler itself is heap-layout-dependent). The cache's actual soundness
-// requirement — a HIT serves a binary the real compile would have produced — is
-// therefore verified OBSERVATIONALLY: both builds must produce executables that
-// RUN and exit with the SAME, correct result. The byte divergence is semantically
-// inert (a rodata string/descriptor REORDER), so observationally-equivalent is
-// correct today; a future deterministic compiler can restore a byte-equality pin.
-// The compiler non-determinism is tracked as #3020. // per #1608
-BEZEL_TEST(aot_cache_key, split_build_produces_an_equivalent_executable) {
+// FORK-ISOLATED + DETERMINISTIC COMPILER (#1608 / #3020). Both builds compile
+// the SAME source in separate forked children. The byte-equality assertion
+// (hCombined == hSplit) was temporarily relaxed to observational equivalence
+// (#1608 narrow) because the compiler emitted its rodata globals in POINTER-KEYED
+// unordered_map iteration order — methodFns_ / ctorFns_ / disposerFns_ and the
+// supersOf descriptor maps — whose bucket order varies with the forked child's
+// inherited heap layout, making two forked compiles diverge by a few .rodata
+// bytes (~15% flake). Fix #3020 made the emission DETERMINISTIC by name-sorting
+// those maps' iteration (precedent: accessorSpecTagFor), plus fixed a latent
+// order-dependence in the buildSpecializedMethodFn cache key that the name-sort
+// exposed (a hasUnresolved check on the LLVM i32 type misclassified a genuine
+// `int` arg as a placeholder fallback, desyncing genericSubst_ from
+// genericSubstSemaTy_ and corrupting the specialization cache into an empty-idKey
+// collision — the #2192 transitive-generic break). With both fixes the compiler
+// is deterministic across processes/forks and the byte-equality pin is restored.
+// // per #1608 / #3020
+BEZEL_TEST(aot_cache_key, split_build_matches_the_combined_build_byte_for_byte) {
     const std::string dir = bezel::test::aot_detail::makeWorkDir();
     BEZEL_EXPECT_TRUE(!dir.empty());
     if (dir.empty()) return;
@@ -541,11 +547,22 @@ BEZEL_TEST(aot_cache_key, split_build_produces_an_equivalent_executable) {
         built("linkExecutableObject(split)",
               bezel::test::aot_detail::forkedLink(obj, split, opts, ccErr)));
 
-    // OBSERVATIONAL equivalence (#1608): both executables must RUN and exit with
-    // the SAME, correct result. A divergence here would mean the cache's split
-    // path served a binary the shipping combined path would NOT have produced —
-    // the false-green class this file exists to prevent. (See the header comment
-    // for why byte-equality is not asserted.)
+    // #3020: BYTE-FOR-BYTE equality. Two forked compiles of the same source must
+    // now produce identical executables — the compiler's rodata emission is
+    // deterministic (name-sorted), so the inherited-heap-layout divergence that
+    // used to reorder a few globals is gone. A regression here means either the
+    // name-sort was reverted or a new pointer-keyed emission map was added
+    // without sorting.
+    std::array<uint8_t, 32> hCombined{}, hSplit{};
+    BEZEL_EXPECT_TRUE(sha256File(combined, hCombined));
+    BEZEL_EXPECT_TRUE(sha256File(split, hSplit));
+    if (hCombined != hSplit) {
+        std::cout << "    BYTE DIVERGENCE: combined and split executables differ\n";
+    }
+    BEZEL_EXPECT_EQ(hCombined, hSplit);
+
+    // Defense in depth: both must also RUN and exit 42 (the observational check
+    // the #1608 narrow kept as the sole assertion — kept now as a second gate).
     auto exitCodeOf = [&](const std::string& exe,
                           const std::string& tag) -> int {
         const std::string out = dir + "/" + tag + ".out";
@@ -596,13 +613,12 @@ BEZEL_TEST(aot_cache_key, split_build_produces_an_equivalent_executable) {
 //
 // SCOPE of this pin (#3020). It pins BACK-TO-BACK fork determinism: the three
 // forks here run in quick succession, so each child inherits near-identical
-// parent state and the emitted objects match. It does NOT reproduce the
-// residual #1608 flake — two forks SEPARATED by other forked work (the
-// split_build shape) still diverge ~15% of co-resident runs, because the
-// compiler's rodata emission order is pointer-keyed-unordered-map-dependent and
-// the parent heap shifts between non-back-to-back forks. That residual is a
-// compiler non-determinism (#3020), not an isolation regression; this pin is a
-// narrow canary that catches the in-process-compile class, not the deeper one. // per #1608/#3020
+// parent state and the emitted objects match. The deeper non-back-to-back fork
+// case (two forks SEPARATED by other work, the split_build shape) is now ALSO
+// pinned byte-for-byte by split_build_matches_the_combined_build_byte_for_byte
+// above, since fix #3020 made the compiler's rodata emission deterministic
+// (name-sorted). This test remains a narrow canary for the in-process-compile
+// class. // per #1608/#3020
 BEZEL_TEST(aot_cache_key, recompiling_same_source_is_deterministic_1608) {
     const std::string dir = bezel::test::aot_detail::makeWorkDir();
     BEZEL_EXPECT_TRUE(!dir.empty());

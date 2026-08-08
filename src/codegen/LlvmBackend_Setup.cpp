@@ -3923,7 +3923,20 @@ void Emitter::declareVtables() {
     // #596 / §21 / §31 / §12: after user-type supers, also append the builtin
     // ancestor descriptors (builtinDesc_) so emitIsA finds them when testing
     // `e is Exception` or dispatching a `catch var e: Exception` arm.
-    for (auto& [ts, supers] : supersOf) {
+    // fix #3020 (#1608): supersOf is a POINTER-KEYED unordered_map; iterate in
+    // NAME order so the descriptor globals are emitted deterministically across
+    // processes/forks (pointer-keyed bucket order varies with heap layout). The
+    // fill is per-ts independent, so reordering cannot affect content — only the
+    // .rodata global creation order.
+    std::vector<const sema::TypeSymbol*> supersKeys;
+    supersKeys.reserve(supersOf.size());
+    for (auto& [k, v] : supersOf) supersKeys.push_back(k);
+    std::sort(supersKeys.begin(), supersKeys.end(),
+              [](const sema::TypeSymbol* a, const sema::TypeSymbol* b) {
+                  return a->name < b->name;
+              });
+    for (const sema::TypeSymbol* ts : supersKeys) {
+        auto& supers = supersOf[ts];
         std::vector<llvm::Constant*> elems;
         for (const sema::TypeSymbol* s : supers) {
             auto it = descArray_.find(s);
@@ -25242,7 +25255,18 @@ void Emitter::setupBoxDescriptors() {
     // Pass B: fill each descriptor with [self + transitive bases, null]. A base
     // that is itself a record/enum is in descArray_ from Pass A; an interface
     // base is in descArray_ from declareVtables.
-    for (auto& [ts, supers] : supersOf) {
+    // fix #3020 (#1608): iterate supersOf in NAME order (pointer-keyed map —
+    // see declareVtables Pass C for the determinism rationale). Reuse the same
+    // sorted key vector for Pass C below.
+    std::vector<const sema::TypeSymbol*> boxSupersKeys;
+    boxSupersKeys.reserve(supersOf.size());
+    for (auto& [k, v] : supersOf) boxSupersKeys.push_back(k);
+    std::sort(boxSupersKeys.begin(), boxSupersKeys.end(),
+              [](const sema::TypeSymbol* a, const sema::TypeSymbol* b) {
+                  return a->name < b->name;
+              });
+    for (const sema::TypeSymbol* ts : boxSupersKeys) {
+        auto& supers = supersOf[ts];
         std::vector<llvm::Constant*> elems;
         for (const sema::TypeSymbol* s : supers) {
             auto it = descArray_.find(s);
@@ -25285,7 +25309,8 @@ void Emitter::setupBoxDescriptors() {
     // { vtable*, i64 rc, record-bytes } (#422); the record bytes start TWO
     // words in. Each itable entry is a small thunk that advances `this` past
     // both words then tail-calls the real method.
-    for (auto& [ts, supers] : supersOf) {
+    for (const sema::TypeSymbol* ts : boxSupersKeys) {
+        auto& supers = supersOf[ts];
         std::unordered_set<const sema::TypeSymbol*> superSet(supers.begin(),
                                                              supers.end());
 
