@@ -11019,6 +11019,118 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
                                                      isToString, isGetHashCode,
                                                      isEquals);
             }
+            // fix #2982 (§7.5 / §8.3 / §9.6, v0.240): the REFERENCE-typed
+            // sibling of the value-type block above — `q?.GetHashCode()` /
+            // `q?.Equals(x)` / `q?.ToString()` on a nullable CLASS / Object /
+            // interface receiver with NO override (a class WITH an override
+            // resolved `ms` above and never reaches here). The `.` form
+            // dispatches the universal Object surface through
+            // lowerObjectGetHashCode / lowerObjectEquals / lowerObjectToString
+            // (the §9.6 vtable[kSlot] / string-content dispatch); that dispatch
+            // never runs for `?.` because `ms` is null here (no override → no
+            // MethodSymbol), so the access fell through to the `!ms` bail below
+            // and returned nullptr — silently dropping the whole enclosing
+            // statement (no diagnostic at any severity, exit 0). MEASURED on
+            // 0bddcb7: `Console.WriteLine(w?.GetHashCode())` on a NON-NULL
+            // `Widget?` printed nothing at all; the `start`/`end` markers
+            // printed around the gap. `?.Equals(...)` and `?.ToString()`
+            // dropped identically. (An override-bearing class printed correctly:
+            // `o?.GetHashCode()` on a class overriding GetHashCode resolved `ms`
+            // and travelled the normal emitMethodCall path — that is the
+            // pre-empt proving this block targets exactly the no-override gap.)
+            //
+            // Route `?.` through the SAME object-surface dispatch the `.` form
+            // uses — lowerObjectGetHashCode / lowerObjectEquals /
+            // lowerObjectToString are the one fact the compiler already
+            // computes that decides "this is the universal Object surface,
+            // dispatch the vtable slot" — with a §7.5 null-receiver
+            // short-circuit FIRST. A null receiver yields the §7.5 null result
+            // (the call is skipped entirely), NOT the helpers' own null-receiver
+            // default (0 / reference-identity): those internal null branches are
+            // dead on the non-null path, but the dispatch must not even run when
+            // the receiver is null, per §7.5 ("if any segment of a chain is
+            // null, the remainder is not evaluated" — the Equals argument is
+            // lowered INSIDE callBB for the same reason). The §7.5 lift mirrors
+            // lowerNullCondValueSemCall above: ToString → a reference result
+            // (string ptr, null when the receiver is null); GetHashCode → i32 /
+            // Equals → i1, wrapped into the tagged {i8 hasValue; T} struct.
+            else if (recvTy0) {
+                bool ncoIsObj = recvTy0->kind == sema::TypeRef::Kind::Primitive &&
+                                recvTy0->primitive == sema::PrimitiveType::Object;
+                bool ncoIsIface =
+                    recvTy0->kind == sema::TypeRef::Kind::Named &&
+                    recvTy0->declaration &&
+                    recvTy0->declaration->kind == ast::TypeDeclKind::Interface;
+                bool ncoIsClass =
+                    recvTy0->kind == sema::TypeRef::Kind::Named &&
+                    recvTy0->declaration &&
+                    recvTy0->declaration->kind == ast::TypeDeclKind::Class;
+                if (ncoIsObj || ncoIsIface || ncoIsClass) {
+                    llvm::Value* recv = lowerExpr(*nm.target);
+                    if (recv && recv->getType()->isPointerTy()) {
+                        // §7.5 null-receiver short-circuit (a nullable class /
+                        // Object / interface receiver is a pointer; null is the
+                        // null pointer).
+                        auto* ncoEntryBB = builder_.GetInsertBlock();
+                        auto* ncoCallBB = llvm::BasicBlock::Create(
+                            llvm_, "ncobj.do", currentFn_);
+                        auto* ncoEndBB = llvm::BasicBlock::Create(
+                            llvm_, "ncobj.end", currentFn_);
+                        llvm::Value* ncoIsNull = builder_.CreateICmpEQ(
+                            recv, llvm::ConstantPointerNull::get(ptrTy()));
+                        builder_.CreateCondBr(ncoIsNull, ncoEndBB, ncoCallBB);
+                        builder_.SetInsertPoint(ncoCallBB);
+                        // Dispatch through the SAME helper the `.` form uses
+                        // for the universal Object surface on a class / Object /
+                        // interface receiver with no override.
+                        llvm::Value* ncoRes = nullptr;
+                        if (isToString) {
+                            ncoRes = lowerObjectToString(recv);
+                        } else if (isGetHashCode) {
+                            ncoRes = lowerObjectGetHashCode(recv);
+                        } else {
+                            // §7.5: the argument is part of the call (the
+                            // remainder after the receiver), so it is lowered
+                            // HERE — inside callBB — and never evaluated when
+                            // the receiver is null.
+                            llvm::Value* ncoOther =
+                                lowerExpr(*call.args[0].value);
+                            if (ncoOther)
+                                ncoRes = lowerObjectEquals(recv, ncoOther);
+                        }
+                        if (!ncoRes) return nullptr;
+                        bool ncoRef = ncoRes->getType()->isPointerTy();
+                        llvm::Type* ncoWrapTy = ncoRef
+                            ? static_cast<llvm::Type*>(ptrTy())
+                            : static_cast<llvm::Type*>(llvm::StructType::get(
+                                  llvm_, {nullablePrimHasValTy(),
+                                          ncoRes->getType()}));
+                        llvm::Value* ncoCallVal = ncoRes;
+                        if (!ncoRef) {
+                            ncoCallVal = builder_.CreateInsertValue(
+                                llvm::UndefValue::get(ncoWrapTy),
+                                llvm::ConstantInt::get(
+                                    nullablePrimHasValTy(), 1),
+                                {0u});
+                            ncoCallVal = builder_.CreateInsertValue(
+                                ncoCallVal, ncoRes, {1u});
+                        }
+                        auto* ncoCallEnd = builder_.GetInsertBlock();
+                        builder_.CreateBr(ncoEndBB);
+                        builder_.SetInsertPoint(ncoEndBB);
+                        auto* ncoPhi = builder_.CreatePHI(ncoWrapTy, 2);
+                        ncoPhi->addIncoming(
+                            ncoRef ? static_cast<llvm::Value*>(
+                                         llvm::ConstantPointerNull::get(ptrTy()))
+                                   : static_cast<llvm::Value*>(
+                                         llvm::ConstantAggregateZero::get(
+                                             ncoWrapTy)),
+                            ncoEntryBB);
+                        ncoPhi->addIncoming(ncoCallVal, ncoCallEnd);
+                        return ncoPhi;
+                    }
+                }
+            }
         }
     }
     if (!ms || isStaticMethod(ms) || !nm.target) return nullptr;
