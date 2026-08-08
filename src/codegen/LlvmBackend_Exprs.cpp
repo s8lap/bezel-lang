@@ -1994,6 +1994,190 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 return ncPhi;
             }
         }
+        // fix #3015 (§7.5 / §23.2 / §23.3, v0.240): `q?.P` on a nullable class
+        // receiver, where P is a NON-VIRTUAL computed property getter —
+        // expression-bodied `=> expr` (§23.2) or block-form `get => do … end;`
+        // (§23.3). The `.` form evaluates the getter body (computedGetterOf /
+        // blockGetterOf in the MemberAccessExpr arm below); that arm never runs
+        // for `?.` (a NullCondMemberExpr is a distinct AST node), so the access
+        // reached FINDING [3] below, `storageMemberOf` returned null (a computed
+        // property carries NO storage FieldSymbol — only an auto-property does),
+        // and the `!ms` guard returned nullptr — silently dropping the whole
+        // enclosing statement (no diagnostic at any severity, exit 0). MEASURED
+        // on f386fda: `Console.WriteLine("p=" + (q?.Computed ?? "<null>"))` on a
+        // NON-NULL receiver printed nothing at all; the `start`/`end` markers
+        // printed around the gap.
+        //
+        // Route `?.` through the SAME getter evaluation the `.` form uses —
+        // computedGetterOf / blockGetterOf are the one fact the compiler already
+        // computes that decides "this is a computed getter, call the body" — with
+        // a null-receiver short-circuit first per §7.5 (the always-nullable
+        // result is null when the receiver is null, else the getter value lifted
+        // to nullable). VIRTUAL / INTERFACE properties are GATED OUT: they
+        // dispatch dynamically through propGetSlot_ / ifacePropertyGetIndex_ (the
+        // `.` form's lowerVirtualPropertyGet runs first and returns before the
+        // computed-getter path), and a static inline of the declaring getter
+        // would miscompile an override. The virtual-property-through-`?.` case is
+        // tracked separately (the vtable dispatch needs a null short-circuit
+        // before the slot load, a related but distinct lowering).
+        //
+        // The getter evaluation (generic substitution, `this` binding, result
+        // wrap/box) mirrors the qualified MemberAccessExpr getter paths verbatim;
+        // the §7.5 lift mirrors FINDING [3] below for a storage member.
+        if (auto* ncPropSym =
+                dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e))) {
+            if (!ncPropSym->isIndexer) {
+                bool ncIsVirtual = propGetSlot_.count(ncPropSym) > 0 ||
+                    ifacePropertyGetIndex_.count(ncPropSym) > 0;
+                const ast::Expr* ncGetter = nullptr;
+                const ast::PropertyAccessor* ncBlockAcc = nullptr;
+                if (!ncIsVirtual) {
+                    ncGetter = computedGetterOf(ctx_.exprSymbol(e));
+                    ncBlockAcc = blockGetterOf(ctx_.exprSymbol(e));
+                }
+                if (ncGetter || ncBlockAcc) {
+                    llvm::Value* obj = lowerExpr(*nm->target);
+                    if (!obj || !obj->getType()->isPointerTy()) return nullptr;
+                    auto* ncEntryBB = builder_.GetInsertBlock();
+                    auto* ncAccessBB = llvm::BasicBlock::Create(
+                        llvm_, "ncprop.access", currentFn_);
+                    auto* ncEndBB = llvm::BasicBlock::Create(
+                        llvm_, "ncprop.end", currentFn_);
+                    llvm::Value* ncIsNull = builder_.CreateICmpEQ(
+                        obj, llvm::ConstantPointerNull::get(ptrTy()));
+                    builder_.CreateCondBr(ncIsNull, ncEndBB, ncAccessBB);
+                    builder_.SetInsertPoint(ncAccessBB);
+                    // Evaluate the getter on the (now known non-null) receiver.
+                    auto* ncPd = dynamic_cast<const ast::PropertyDecl*>(
+                        ncPropSym->decl);
+                    const sema::TypeRef* ncDeclTy =
+                        ncPd ? ctx_.resolvedType(*ncPd->type) : nullptr;
+                    llvm::Value* ncRaw = nullptr;
+                    if (ncGetter) {
+                        // §23.2 expression-bodied getter: inline the body with
+                        // this = obj. The generic-substitution setup mirrors the
+                        // `.` form's qualified-getter path so a generic class's
+                        // `T`-typed field read inside the body resolves against
+                        // the receiver's concrete type args.
+                        auto ncSavedSubst = genericSubst_;
+                        auto ncSavedSemaTy = genericSubstSemaTy_;
+                        if (ncPropSym->parent && ncPropSym->parent->decl) {
+                            const sema::TypeRef* ncRecvTy =
+                                ctx_.exprType(*nm->target);
+                            if (ncRecvTy &&
+                                ncRecvTy->kind == sema::TypeRef::Kind::Named &&
+                                ncRecvTy->declaration == ncPropSym->parent &&
+                                !ncRecvTy->genericArgs.empty()) {
+                                auto* ncTd = dynamic_cast<const ast::TypeDecl*>(
+                                    ncPropSym->parent->decl);
+                                if (ncTd && ncTd->genericParams.size() ==
+                                            ncRecvTy->genericArgs.size()) {
+                                    std::unordered_map<std::string_view,
+                                                       llvm::Type*> ncSubst;
+                                    std::unordered_map<std::string_view,
+                                        const sema::TypeRef*> ncSema;
+                                    for (std::size_t ncGi = 0;
+                                         ncGi < ncTd->genericParams.size();
+                                         ++ncGi) {
+                                        ncSubst[ncTd->genericParams[ncGi].name] =
+                                            lowerTypeRef(
+                                                ncRecvTy->genericArgs[ncGi]);
+                                        ncSema[ncTd->genericParams[ncGi].name] =
+                                            resolveTypeParamRef(
+                                                ncRecvTy->genericArgs[ncGi]);
+                                    }
+                                    bool ncHasUnresolved = false;
+                                    for (auto& [n, ty] : ncSubst)
+                                        if (ty == i32()) {
+                                            ncHasUnresolved = true; break;
+                                        }
+                                    if (ncHasUnresolved) {
+                                        sema::Symbol* ncRecvSym =
+                                            ctx_.exprSymbol(*nm->target);
+                                        const ast::Node* ncDecl = nullptr;
+                                        if (auto* ncLoc =
+                                                dynamic_cast<sema::LocalSymbol*>(
+                                                    ncRecvSym))
+                                            ncDecl = ncLoc->decl;
+                                        if (ncDecl) {
+                                            auto ncLit =
+                                                localGenericSubst_.find(ncDecl);
+                                            if (ncLit !=
+                                                localGenericSubst_.end())
+                                                ncSubst = ncLit->second;
+                                        }
+                                    }
+                                    genericSubst_ = std::move(ncSubst);
+                                    genericSubstSemaTy_ = std::move(ncSema);
+                                }
+                            }
+                        }
+                        llvm::Value* ncSavedThis = currentThis_;
+                        currentThis_ = obj;
+                        ncRaw = lowerExpr(*ncGetter);
+                        // §23.2/§23.3 (#1168/#2761): wrap/box the body result to
+                        // the property's DECLARED type (not the §7.5-lifted
+                        // nullable result) — a `T?`-declared body yielding bare
+                        // `T` wraps here, an Object-typed value-type body boxes.
+                        ncRaw = wrapNullableGetterResult(ncDeclTy, ncRaw);
+                        ncRaw = boxForTarget(ncRaw, ncDeclTy, ncGetter);
+                        currentThis_ = ncSavedThis;
+                        genericSubst_ = std::move(ncSavedSubst);
+                        genericSubstSemaTy_ = std::move(ncSavedSemaTy);
+                    } else {
+                        // §23.3 block-form getter: call the standalone getter
+                        // function (ncPd is non-null — blockGetterOf returns
+                        // null for an imported property with no PropertyDecl).
+                        llvm::Function* ncGetterFn =
+                            ensurePropertyBlockGetter(ncPd, ncBlockAcc);
+                        ncRaw = builder_.CreateCall(
+                            ncGetterFn->getFunctionType(), ncGetterFn, {obj});
+                        emitPendingCheck();  // §31.1/§31.2: throw propagation
+                    }
+                    // Lift the getter result to the §7.5 (always-nullable)
+                    // result — the same logic FINDING [3] uses for a storage
+                    // member: a reference result is a pointer (null when the
+                    // receiver is null); a value result wraps into the tagged
+                    // {i8 hasValue; T} struct; a result already nullable passes
+                    // through with the receiver's edge.
+                    const sema::TypeRef* ncResultTy = ctx_.exprType(e);
+                    bool ncRef = ncRaw->getType()->isPointerTy();
+                    bool ncNullableMem = !ncRef && ncResultTy &&
+                        isNullableValueTy(ncResultTy) &&
+                        ncRaw->getType() == nullableValueStructTy(ncResultTy);
+                    llvm::Type* ncResTy = ncRef
+                        ? static_cast<llvm::Type*>(ptrTy())
+                        : (ncNullableMem
+                               ? ncRaw->getType()
+                               : static_cast<llvm::Type*>(llvm::StructType::get(
+                                     llvm_,
+                                     {nullablePrimHasValTy(), ncRaw->getType()})));
+                    llvm::Value* ncAccessVal;
+                    if (ncRef || ncNullableMem) {
+                        ncAccessVal = ncRaw;
+                    } else {
+                        ncAccessVal = builder_.CreateInsertValue(
+                            llvm::UndefValue::get(ncResTy),
+                            llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                            {0u});
+                        ncAccessVal =
+                            builder_.CreateInsertValue(ncAccessVal, ncRaw, {1u});
+                    }
+                    auto* ncAccessEnd = builder_.GetInsertBlock();
+                    builder_.CreateBr(ncEndBB);
+                    builder_.SetInsertPoint(ncEndBB);
+                    llvm::Value* ncNullVal = ncRef
+                        ? static_cast<llvm::Value*>(
+                              llvm::ConstantPointerNull::get(ptrTy()))
+                        : static_cast<llvm::Value*>(
+                              llvm::ConstantAggregateZero::get(ncResTy));
+                    auto* ncPhi = builder_.CreatePHI(ncResTy, 2);
+                    ncPhi->addIncoming(ncNullVal, ncEntryBB);
+                    ncPhi->addIncoming(ncAccessVal, ncAccessEnd);
+                    return ncPhi;
+                }
+            }
+        }
         // §7.5 / FINDING [3]: the receiver is a class/string reference, so a null
         // receiver is the null pointer. Resolve the accessed member to either a
         // storage field (class receiver) or the `Length` intrinsic (string
