@@ -2178,6 +2178,154 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 }
             }
         }
+        // fix #3016 (§7.5 / §12.1 / §13 / §23, v0.240): the VIRTUAL / INTERFACE
+        // case that #3015 (above) deliberately gated out — `q?.VProp` where
+        // VProp is a virtual (§12.1) or interface (§13) property getter. The `.`
+        // form dispatches dynamically through lowerVirtualPropertyGet (the
+        // vtable/itable slot); that path never runs for `?.` (a
+        // NullCondMemberExpr is a distinct AST node), so the access reached
+        // FINDING [3] below, `storageMemberOf` returned null (a virtual property
+        // carries NO storage FieldSymbol), and the `!ms` guard dropped the
+        // statement — MEASURED on d2a3d3e:
+        // `Console.WriteLine("p=" + (q?.VProp ?? "<null>"))` on a NON-NULL
+        // receiver printed nothing at all (start/end around the gap), exit 0.
+        //
+        // Route `?.` through the SAME vtable/itable slot dispatch the `.` form
+        // uses, with a §7.5 null-receiver short-circuit FIRST (loading the slot
+        // from a null receiver is the crash). The slot load + call mirror
+        // lowerVirtualPropertyGet's core dispatch verbatim — crucially the
+        // dispatch goes through the RUNTIME type's vtable, so an OVERRIDDEN
+        // getter runs (the reason #3015 gated this out: a static inline of the
+        // declaring getter body would miscompile the override). The §7.5 lift
+        // mirrors #3015's block above.
+        if (auto* ncVirtSym =
+                dynamic_cast<sema::PropertySymbol*>(ctx_.exprSymbol(e))) {
+            if (!ncVirtSym->isIndexer) {
+                bool ncVIsIface = ncVirtSym->parent &&
+                    ncVirtSym->parent->kind == ast::TypeDeclKind::Interface;
+                auto ncVGetIt = propGetSlot_.find(ncVirtSym);
+                auto ncVIfGetIt = ifacePropertyGetIndex_.find(ncVirtSym);
+                if ((!ncVIsIface && ncVGetIt != propGetSlot_.end()) ||
+                    (ncVIsIface && ncVIfGetIt != ifacePropertyGetIndex_.end())) {
+                    // For an interface property, verify the itable descriptor
+                    // exists (mirrors lowerVirtualPropertyGet). A missing
+                    // descriptor cannot dispatch — fall through to the next arm
+                    // rather than crash mid-block.
+                    if (!ncVIsIface || descArray_.find(ncVirtSym->parent) !=
+                                           descArray_.end()) {
+                        // Derive the getter's return type (mirrors
+                        // lowerVirtualPropertyGet). pd is null for an IMPORTED
+                        // property; the type rides importedMemberType.
+                        auto* ncVpd = dynamic_cast<const ast::PropertyDecl*>(
+                            ncVirtSym->decl);
+                        llvm::Type* ncVValTy = nullptr;
+                        if (ncVpd) {
+                            ncVValTy = lowerType(ncVpd->type.get());
+                        } else if (sema::TypeRef* tr =
+                                       ctx_.importedMemberType(ncVirtSym)) {
+                            ncVValTy = lowerTypeRef(tr);
+                        }
+                        if (!ncVValTy) ncVValTy = i32();
+                        llvm::Value* obj = lowerExpr(*nm->target);
+                        if (!obj || !obj->getType()->isPointerTy()) return nullptr;
+                        auto* ncVEntryBB = builder_.GetInsertBlock();
+                        auto* ncVAccessBB = llvm::BasicBlock::Create(
+                            llvm_, "ncvprop.access", currentFn_);
+                        auto* ncVEndBB = llvm::BasicBlock::Create(
+                            llvm_, "ncvprop.end", currentFn_);
+                        llvm::Value* ncVIsNull = builder_.CreateICmpEQ(
+                            obj, llvm::ConstantPointerNull::get(ptrTy()));
+                        builder_.CreateCondBr(ncVIsNull, ncVEndBB, ncVAccessBB);
+                        builder_.SetInsertPoint(ncVAccessBB);
+                        // Dispatch through the vtable/itable slot — SAME logic
+                        // as lowerVirtualPropertyGet's core dispatch.
+                        auto* ncVFnTy = llvm::FunctionType::get(
+                            ncVValTy, {ptrTy()}, false);
+                        llvm::Value* ncVFnPtr = nullptr;
+                        if (ncVIsIface) {
+                            // §13 itable dispatch.
+                            llvm::Value* ncVVptr =
+                                builder_.CreateLoad(ptrTy(), obj);
+                            auto* ncVLookupFn = declareC(
+                                "bz_itable_lookup", ptrTy(),
+                                {ptrTy(), ptrTy()});
+                            llvm::Value* ncVItmapPtr = builder_.CreateLoad(
+                                ptrTy(),
+                                builder_.CreateGEP(
+                                    ptrTy(), ncVVptr,
+                                    {builder_.getInt32(1)}));
+                            llvm::Value* ncVItab = builder_.CreateCall(
+                                llvm::FunctionType::get(
+                                    ptrTy(), {ptrTy(), ptrTy()}, false),
+                                ncVLookupFn,
+                                {ncVItmapPtr,
+                                 descArray_.find(ncVirtSym->parent)->second},
+                                "ncvitab");
+                            ncVFnPtr = builder_.CreateLoad(
+                                ptrTy(),
+                                builder_.CreateGEP(
+                                    ptrTy(), ncVItab,
+                                    {builder_.getInt32(ncVIfGetIt->second)}),
+                                "ncvpget");
+                        } else {
+                            // §12.1 class virtual dispatch: vt[slot].
+                            llvm::Value* ncVVptr =
+                                builder_.CreateLoad(ptrTy(), obj);
+                            llvm::Value* ncVSlotPtr = builder_.CreateGEP(
+                                ptrTy(), ncVVptr,
+                                {builder_.getInt32(ncVGetIt->second)});
+                            ncVFnPtr = builder_.CreateLoad(ptrTy(), ncVSlotPtr);
+                        }
+                        llvm::Value* ncVRaw =
+                            builder_.CreateCall(ncVFnTy, ncVFnPtr, {obj});
+                        emitPendingCheck();  // §31.1/§31.2: throw propagation
+                        // Lift the getter result to the §7.5 (always-nullable)
+                        // result — SAME logic as #3015's block above and FINDING
+                        // [3] below: a reference result is a pointer (null when
+                        // the receiver is null); a value result wraps into the
+                        // tagged {i8 hasValue; T} struct; a result already
+                        // nullable passes through with the receiver's edge.
+                        const sema::TypeRef* ncVResultTy = ctx_.exprType(e);
+                        bool ncVRef = ncVRaw->getType()->isPointerTy();
+                        bool ncVNullableMem = !ncVRef && ncVResultTy &&
+                            isNullableValueTy(ncVResultTy) &&
+                            ncVRaw->getType() ==
+                                nullableValueStructTy(ncVResultTy);
+                        llvm::Type* ncVResTy = ncVRef
+                            ? static_cast<llvm::Type*>(ptrTy())
+                            : (ncVNullableMem
+                                   ? ncVRaw->getType()
+                                   : static_cast<llvm::Type*>(
+                                         llvm::StructType::get(llvm_,
+                                             {nullablePrimHasValTy(),
+                                              ncVRaw->getType()})));
+                        llvm::Value* ncVAccessVal;
+                        if (ncVRef || ncVNullableMem) {
+                            ncVAccessVal = ncVRaw;
+                        } else {
+                            ncVAccessVal = builder_.CreateInsertValue(
+                                llvm::UndefValue::get(ncVResTy),
+                                llvm::ConstantInt::get(nullablePrimHasValTy(), 1),
+                                {0u});
+                            ncVAccessVal = builder_.CreateInsertValue(
+                                ncVAccessVal, ncVRaw, {1u});
+                        }
+                        auto* ncVAccessEnd = builder_.GetInsertBlock();
+                        builder_.CreateBr(ncVEndBB);
+                        builder_.SetInsertPoint(ncVEndBB);
+                        llvm::Value* ncVNullVal = ncVRef
+                            ? static_cast<llvm::Value*>(
+                                  llvm::ConstantPointerNull::get(ptrTy()))
+                            : static_cast<llvm::Value*>(
+                                  llvm::ConstantAggregateZero::get(ncVResTy));
+                        auto* ncVPhi = builder_.CreatePHI(ncVResTy, 2);
+                        ncVPhi->addIncoming(ncVNullVal, ncVEntryBB);
+                        ncVPhi->addIncoming(ncVAccessVal, ncVAccessEnd);
+                        return ncVPhi;
+                    }
+                }
+            }
+        }
         // §7.5 / FINDING [3]: the receiver is a class/string reference, so a null
         // receiver is the null pointer. Resolve the accessed member to either a
         // storage field (class receiver) or the `Length` intrinsic (string
