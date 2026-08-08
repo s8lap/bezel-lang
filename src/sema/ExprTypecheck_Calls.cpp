@@ -8804,30 +8804,37 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 "#2393)");
             return;
         }
-        // §8.1/§8.3/§8.5 (#1075): an inherited Object value-semantics method
-        // (`ToString`/`GetHashCode`/`Equals`) on a VALUE-type/enum/record
-        // receiver has no MethodSymbol, so the member-access value-method typing
-        // (keyed on a plain `.`) never ran and the call is left untyped — codegen
-        // then zero-inits the `T?` result (= null) or crashes a string compare.
-        // Set the raw return type here (ToString→string, GetHashCode→int,
-        // Equals→bool) so the lift below makes it nullable, matching the codegen
-        // null-conditional value-method lowering.
+        // §8.1/§8.3/§8.5 (#1075, #2964): an Object value-semantics method
+        // (`ToString`/`GetHashCode`/`Equals`) with no resolved MethodSymbol — on
+        // a VALUE-type/enum/record receiver (#1075) OR a CLASS/Object/interface
+        // receiver (#2964) — has no member-access typing here: the plain-`.`
+        // value-method last-resort further above is keyed on `MemberAccessExpr`
+        // and a `?.` callee is a `NullCondMemberExpr`, so it never ran and the
+        // call is left untyped. On a class/Object/interface receiver the #2982
+        // LOWERING now dispatches the call (it runs and produces a value), but
+        // the RESULT carried no sema type, so an INLINE `??` on the value-typed
+        // results (GetHashCode→{i8,i32}, Equals→{i8,i1}) — which needs the sema
+        // type for lowerCoalesce to see the nullable-value struct and extract
+        // hasValue/payload — instead took the #1045 "non-pointer, non-nullable"
+        // fall-through and returned the RAW {i8,T} struct: `?.GetHashCode() ?? -1`
+        // printed the hasValue byte (1), not the hash; `?.Equals(o) ?? false`
+        // crashed the IR verifier (`trunc { i8, i1 } to i1`). Set the raw return
+        // type here (ToString→string, GetHashCode→int, Equals→bool) so the lift
+        // below makes it nullable, matching the codegen null-conditional
+        // object/value-method lowering. No receiver-kind list: the `!exprType(ce)`
+        // guard makes this a LAST RESORT (a receiver WITH an override resolved a
+        // MethodSymbol and was already typed above), and whether this compiler
+        // can LOWER the call on a given receiver is #2922's question, not sema's
+        // — the same argument the plain-`.` last-resort above uses for having no
+        // list (a list would be the list-shaped mistake #2922 was filed to
+        // remove).
         if (!ctx_.exprType(ce) && ncm->target) {
-            const TypeRef* rt = ctx_.exprType(*ncm->target);
-            const TypeSymbol* rd = rt ? rt->declaration : nullptr;
-            bool valuePrim = rt && rt->kind == TypeRef::Kind::Primitive &&
-                rt->primitive != PrimitiveType::String &&
-                rt->primitive != PrimitiveType::Object;
-            bool valueNamed = rd && (rd->kind == ast::TypeDeclKind::Record ||
-                                     rd->kind == ast::TypeDeclKind::Enum);
-            if (valuePrim || valueNamed) {
-                if (ncm->member == "ToString" && ce.args.empty())
-                    ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::String));
-                else if (ncm->member == "GetHashCode" && ce.args.empty())
-                    ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::Int));
-                else if (ncm->member == "Equals" && ce.args.size() == 1)
-                    ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::Bool));
-            }
+            if (ncm->member == "ToString" && ce.args.empty())
+                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::String));
+            else if (ncm->member == "GetHashCode" && ce.args.empty())
+                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::Int));
+            else if (ncm->member == "Equals" && ce.args.size() == 1)
+                ctx_.setExprType(&ce, ctx_.primitiveTypeRef(PrimitiveType::Bool));
         }
         if (auto* ct = ctx_.exprType(ce)) {
             if (!ct->nullable && ct->kind != TypeRef::Kind::Unit) {
