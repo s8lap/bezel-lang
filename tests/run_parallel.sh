@@ -141,7 +141,13 @@ for (( b = 0; b < nbin; b++ )); do
         # appended to its log, surfaced below) — observation only.
         (
             _s=$(awk '{print $1; exit}' /proc/uptime 2>/dev/null || date +%s)
+            # per #3012 Phase 2a: opt each shard into the structured JSON
+            # summary. test_main.cpp writes it ALONGSIDE the (unchanged) legacy
+            # stderr line; the agreement check below compares the two. The path
+            # lives in $logdir so it shares the run's lifetime (reaped on a
+            # clean exit, kept with the logs on a failure).
             TMPDIR="$shard_tmp" BEZEL_SHARD_COUNT="$conc" BEZEL_SHARD_INDEX="$i" \
+                BEZEL_SHARD_SUMMARY="$logdir/summary.${names[$b]}.$i.json" \
                 timeout -k 10 "${BEZEL_SHARD_TIMEOUT:-300}" "${bins[$b]}" \
                 > "$logdir/shard.${names[$b]}.$i.log" 2>&1
             _rc=$?
@@ -336,6 +342,19 @@ subset_note=""
 [[ "$subset_mode" -eq 1 ]] && subset_note="  [SUBSET: $global_selected selected of $registry_all registered]"
 echo "TOTAL: $total_pass passed, $total_fail failed  (across $njobs shards, $((end - start))s)$subset_note"
 echo "============================================================"
+
+# ── per #3012 Phase 2b: JSON-vs-legacy agreement (OBSERVATION-ONLY) ──────────
+# Each shard ALSO wrote a structured JSON summary (BEZEL_SHARD_SUMMARY, Phase
+# 2a). scripts/gate/summary.py pairs each JSON with its legacy stderr line and
+# reports any divergence. This NEVER affects this script's exit status: the
+# legacy accounting above (TOTAL:/summary_ok/count_ok) remains authoritative
+# until Phase 2c switches the reader — and only after N gates prove agreement.
+# `|| true`: a python absence or a helper crash must never change the verdict.
+if [[ -x "$(command -v python3 || true)" ]]; then
+    python3 "$repo_root/scripts/gate/summary.py" check "$logdir" || true
+else
+    echo "shard-summary agreement: SKIPPED (python3 not found)" >&2
+fi
 
 if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 || "$subset_empty" -eq 1 ]]; then
     exit 1

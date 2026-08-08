@@ -9,6 +9,11 @@ historical `gate-timings.jsonl`.
 
 Phase 0 (this package + `io.py`) lands no logic that a gate consumes yet; it is
 the scaffold every later phase composes on.
+
+Phase 2 (`summary.py`, #3012) reads the per-shard JSON summaries the C++
+harness emits (BEZEL_SHARD_SUMMARY) and compares them against the legacy
+stderr summary line — observation-only equivalence data for the eventual
+reader switch (Phase 2c).
 """
 
-__all__ = ["io"]
+__all__ = ["io", "summary"]
