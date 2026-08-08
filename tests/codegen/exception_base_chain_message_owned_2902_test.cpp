@@ -99,22 +99,23 @@
 // a use-after-free (an ASan abort, which flips `r.ran` to false) was exactly
 // what must not come back. This header said that when #2950 and the residual
 // (#2951) landed, every lenient cell should be promoted to `runAotChecked`.
-// Both have landed, and every cell IS now promoted — with ONE exception, which
-// was measured rather than assumed:
+// Both landed, and as of #2989 every cell IS promoted — including the one that
+// stayed lenient the longest:
 //
-//   `message_and_cause_overload_sibling_branch_undisturbed_31_4` STAYS lenient.
-//   It uses §31.4's `(message, cause)` overload, whose CauseChain SNAPSHOT is
-//   still not reclaimed for a user subclass — #2951 closed the Message/ParamName
-//   half, not the CauseChain half (`bz_exc_reclaim_causechain` gates on the
-//   object's vtable being one of the BUILT-IN exception vtables, and a user
-//   subclass's is not, so the call emitted at the reclaim site returns early).
-//   Measured on the landed fix, this exact program: `2231 byte(s) leaked in 80
-//   allocation(s)`, with `bz_exc_causechain_link -> bz_array_alloc_count_n` in
-//   the trace. Promoting it would have made this file fail for a defect it does
-//   not pin. It is promoted the day that half lands — and the presence of a
-//   still-lenient cell here is the reminder that it has not.
+//   `message_and_cause_overload_sibling_branch_undisturbed_31_4` is now under
+//   `runAotChecked`. It uses §31.4's `(message, cause)` overload, whose
+//   CauseChain SNAPSHOT was not reclaimed for a user subclass — #2951 closed
+//   the Message/ParamName half, not the CauseChain half
+//   (`bz_exc_reclaim_causechain` gated on the object's vtable being one of the
+//   BUILT-IN exception vtables, and a user subclass's is not, so the call
+//   emitted at the reclaim site returned early). Measured before #2989, this
+//   exact program: `2231 byte(s) leaked in 80 allocation(s)`, with
+//   `bz_exc_causechain_link -> bz_array_alloc_count_n` in the trace. #2989
+//   widened that gate to recognise a user subclass via its type-descriptor
+//   chain (the same authority `o is Exception` uses), so the snapshot is now
+//   reclaimed and this cell runs under the full LSan net.
 //
-// Everything else now asserts exactly-once, in both directions, so a fix that
+// Everything now asserts exactly-once, in both directions, so a fix that
 // introduced either a leak or an over-release is caught here.
 //
 // EVIDENCE DISCIPLINE. Every message/paramName is built at RUNTIME
@@ -341,17 +342,21 @@ BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
     BEZEL_EXPECT_EQ(run(r), 0);
 }
 
-// #2902 / §31.4 — the SIBLING branch of the one the fix edits. `emitChainCall`
-// discriminates `base(msg, X)` on X's static type: a `string` X is
-// `ArgumentException`'s paramName (the slot the fix now retains), anything else
-// is §31.4's `(message, cause)` overload, whose cause is "borrow[ed] ... for the
-// duration of the call" and snapshotted into `CauseChain`. The fix sits inside
-// the `argIsString` arm, so this pins that the else-arm still routes and still
-// renders — a mis-edit that retained the *cause* operand, or that collapsed the
-// discrimination, changes this total.
+// #2902 / §31.4 / #2989 — the SIBLING branch of the one the fix edits.
+// `emitChainCall` discriminates `base(msg, X)` on X's static type: a `string` X
+// is `ArgumentException`'s paramName (the slot the fix now retains), anything
+// else is §31.4's `(message, cause)` overload, whose cause is "borrow[ed] ... for
+// the duration of the call" and snapshotted into `CauseChain`. The fix sits
+// inside the `argIsString` arm, so this pins that the else-arm still routes and
+// still renders — a mis-edit that retained the *cause* operand, or that
+// collapsed the discrimination, changes this total. This cell was the LAST
+// `runAotCheckedLenient` one in this file — its §31.4 CauseChain snapshot leaked
+// for a user subclass until #2989 widened `bz_exc_reclaim_causechain`'s gate; it
+// now runs under the full LSan net and is the leak oracle for that fix
+// (FAILS-without via the LSan report, PASSES-with).
 BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
            message_and_cause_overload_sibling_branch_undisturbed_31_4) {
-    auto r = runAotCheckedLenient(
+    auto r = runAotChecked(
         "module App; "
         "class SubEx7: Exception "
         "  public constructor(m: string, c: Exception) base(m, c); "
@@ -445,4 +450,49 @@ BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
         "end Main; end C;");
     BEZEL_EXPECT_EQ(run(r), 0);
     BEZEL_EXPECT_EQ(out(r), std::string("191\nliteral\n"));
+}
+
+// #2989 / §31.4 / §28.9 — the issue's OWN shape, isolated from throw/catch. A
+// user exception subclass that chains `base(msg, cause)` builds a §31.4
+// CauseChain snapshot ("the `(message, cause)` constructor borrows `cause` … and
+// copies … into the new exception's `CauseChain`"). On a directly-constructed
+// (using-var) instance the snapshot was leaked: `bz_exc_reclaim_causechain`
+// gated on the built-in exception VTABLE table, and a user subclass's vt$<C> is
+// not in it, so the reclaim returned early. #2989 widened the gate to walk the
+// type-descriptor chain (the same authority `o is Exception` uses), so the
+// snapshot is reclaimed at the terminal site. This cell is the leak oracle:
+// loop-amplified 20x, CauseChain.Count re-read into the total, and under the
+// FULL runAotChecked LSan net — FAILS-without (LSan reports the snapshot leak,
+// flipping ran to false), PASSES-with. Measured pre-fix: ~111 B / 4 allocs per
+// iteration (the Array<ExceptionInfo> + its element block + the retained cause
+// strings). The built-in `(msg, cause)` path was already leak-clean and is the
+// control that localized the defect (it is the path this fix shares, not a
+// second derivation).
+BEZEL_TEST(codegen_exception_base_chain_message_owned_2902,
+           user_subclass_causechain_snapshot_reclaimed_31_4_2989) {
+    auto r = runAotChecked(
+        "module App; "
+        "class ChainSub: Exception "
+        "  public constructor(m: string, c: Exception) base(m, c); "
+        "  end constructor; "
+        "end ChainSub; "
+        "class C public static method Main(): int "
+        "  var t: int := 0; "
+        "  var i: int := 0; "
+        "  while i < 20 do "
+        "    i := i + 1; "
+        "    using var root := new Exception(\"root\" + i.ToString()); "
+        "    using var s := new ChainSub(\"wrap\" + i.ToString(), root); "
+        "    var asBase: Exception := s; "
+        "    var churn: string := \"c\" + i.ToString(); "
+        "    t := t + asBase.CauseChain.Count + asBase.Message.Length "
+        "           + churn.Length; "
+        "  end while; "
+        // Measured total t=182 (20 CauseChain.Count + 111 "wrap"+i message bytes
+        // + 51 "c"+i churn bytes); recomputed from values the leaked block held,
+        // so a degraded/null read fails loudly rather than passing on exit 0.
+        "  if t <> 182 then return 1; end if; "
+        "  return 0; "
+        "end Main; end C;");
+    BEZEL_EXPECT_EQ(run(r), 0);
 }

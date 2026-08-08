@@ -294,9 +294,12 @@ void Emitter::emitDisposerCore(const sema::TypeSymbol* ts, llvm::Function* fn) {
         // CauseChain@24 is deliberately NOT released here — see the #811/#1389
         // reasoning on `bz$exDisposeMsg`: it is reclaimed at the terminal
         // `emitDisposeAndReclaim` site, which runs exactly once per object,
-        // rather than in a disposer that can be re-dispatched. (That reclaim is
-        // itself a no-op for a user subclass's vtable; tracked as this issue's
-        // second half, and NOT addressed here.)
+        // rather than in a disposer that can be re-dispatched. (That reclaim
+        // now ALSO covers a user subclass: #2989 widened
+        // `bz_exc_reclaim_causechain`'s gate to walk the type-descriptor chain,
+        // so a user subclass's vt$<C> is recognized via its btd$Exception
+        // ancestor — the same authority `o is Exception` uses — not just the
+        // built-in vtable-identity table.)
         //
         // Inherits the pre-existing corner noted above: a destructor that
         // returns early leaves `terminated` set and skips this block entirely,
@@ -1605,6 +1608,14 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
     // built-in-exception vtable table bz_unhandled_exception gates on (only a
     // built-in exception type installs bz$exDisposeMsg / carries the
     // CauseChain slot at BZ_EXC_CAUSE_OFFSET); a no-op for every other class.
+    // The third argument is the built-in exception DESCRIPTOR table: a USER
+    // subclass of a built-in exception (§31.4) carries the same header but its
+    // vtable is vt$<C>, absent from the vtable table — issue #2989/#2979. The
+    // runtime then walks obj's type-descriptor chain (vtable[0] = td$<C>, the
+    // same null-terminated ancestor array emitIsA uses for `o is Exception`)
+    // and reclaims iff a built-in exception descriptor is among the ancestors,
+    // which is the one fact the compiler already computes (hasBuiltinExceptionBase
+    // / builtinChainOf in setupBuiltinExceptions). See bezel_runtime_itable.cpp.
     //
     // Scope: this covers every reclaim that funnels through this function —
     // catch-arm dispose, using-var / owned-field scope-end dispose, and a
@@ -1619,8 +1630,8 @@ void Emitter::emitDisposeAndReclaim(llvm::Value* obj) {
     // follow-up (see the issue tracker) rather than fixed silently here.
     builder_.CreateCall(
         declareC("bz_exc_reclaim_causechain", llvm::Type::getVoidTy(llvm_),
-                 {ptrTy(), ptrTy()}),
-        {obj, builtinExcVtableTablePtr()});
+                 {ptrTy(), ptrTy(), ptrTy()}),
+        {obj, builtinExcVtableTablePtr(), builtinExcDescTablePtr()});
     // §28.2 v0.134 / issue #601: in checked disposal mode the block is
     // quarantined (not freed) after disposal so that the per-instance disposed
     // flag at slot 1 (or 2) remains readable when a subsequent member-entry

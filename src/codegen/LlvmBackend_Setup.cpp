@@ -26834,6 +26834,33 @@ llvm::Value* Emitter::builtinExcVtableTablePtr() {
     return excVtableTableGV_;
 }
 
+// §31.4/#2989/#2979: the null-terminated table of built-in exception TYPE
+// DESCRIPTORS (btd$<name>), parallel to builtinExcVtableTablePtr's vtable
+// table and over the same name set (builtinVtable_'s keys). The runtime's
+// bz_exc_reclaim_causechain walks a USER exception subclass's descriptor chain
+// (vtable[0] = td$<C>) against this table to recognize it as header-bearing
+// when its vt$<C> vtable is absent from the vtable table — the same ancestor
+// list setupBuiltinExceptions appends (builtinChainOf) and emitIsA walks for
+// `o is Exception`. btd$<name> is LinkOnceODR (one canonical address per type
+// across modules), so descriptor-POINTER equality is stable cross-module.
+llvm::Value* Emitter::builtinExcDescTablePtr() {
+    if (excDescTableGV_) return excDescTableGV_;
+    std::vector<llvm::Constant*> entries;
+    for (const auto& [name, gv] : builtinVtable_) {
+        auto it = builtinDesc_.find(name);
+        if (it != builtinDesc_.end())
+            entries.push_back(llvm::ConstantExpr::getPointerCast(it->second,
+                                                                 ptrTy()));
+    }
+    entries.push_back(llvm::ConstantPointerNull::get(ptrTy()));  // terminator
+    auto* arrTy = llvm::ArrayType::get(ptrTy(), entries.size());
+    excDescTableGV_ = new llvm::GlobalVariable(
+        *module_, arrTy, /*isConstant=*/true,
+        llvm::GlobalValue::InternalLinkage,
+        llvm::ConstantArray::get(arrTy, entries), "bz$exc$desc$table");
+    return excDescTableGV_;
+}
+
 
 // §4.16 / §8.6 (#970): synthesize (or return cached) the box vtable for a span
 // boxed into IReadOnlySpan<T>. `elemTy` is the concrete LLVM element type

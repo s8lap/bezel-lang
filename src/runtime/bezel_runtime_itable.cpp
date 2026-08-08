@@ -100,19 +100,52 @@ extern "C" void* bz_exc_causechain_link(void* causeTypeName, void* causeMessage,
 // on some path, so freeing it there raced that read. The reclaim site is
 // different: ownership discipline runs it EXACTLY ONCE per object, strictly
 // after every live borrow/read has concluded, so it cannot race an in-flight
-// read. `excVtableTable` is the same null-terminated built-in-exception
-// vtable table bz_unhandled_exception gates on — a no-op for a non-built-in
-// (or user-subclass) object, which either has no CauseChain slot or does not
-// share this vtable/disposer. Not wired into the pure-runtime
-// vtable-Dispose-then-free reclaim sites that bypass codegen
-// (bz_dispose_class_obj, bz_domain_spawn's DomainFaultedException wrap) —
-// tracked as a follow-up, see the issue tracker.
-extern "C" void bz_exc_reclaim_causechain(void* obj, void** excVtableTable) {
-    if (!obj || !excVtableTable) return;
+// read.
+//
+// WHAT CARRIES THE SLOT. `excVtableTable` is the same null-terminated
+// built-in-exception vtable table bz_unhandled_exception gates on: a directly
+// constructed built-in exception's vtable is one of these. A USER subclass of
+// a built-in exception (§31.4) carries the SAME §31.4 header (its layout
+// mirrors Message@8/InnerException@16/CauseChain@24/ParamName@32 via
+// hasBuiltinExceptionBase in classStruct), but its vtable is vt$<C>, which is
+// NOT in excVtableTable — so the vtable-identity gate alone skipped it and its
+// CauseChain leaked (issue #2989/#2979). The compiler already records that
+// header-bearing fact in the type's descriptor chain: vtable[0] is td$<C>, a
+// null-terminated array of the type and every ancestor, and setupBuiltinExceptions
+// appends the built-in exception ancestor descriptors (btd$Exception, …) for
+// exactly these classes — the SAME chain emitIsA walks for `o is Exception`.
+// `excDescTable` is that built-in exception descriptor set; when the vtable is
+// not a direct built-in, walk obj's descriptor chain and reclaim iff some
+// ancestor is a built-in exception descriptor. This is the one authority the
+// language already uses for the type test, not a second derivation; the
+// offset-24 read stays gated behind it. Reading vtable[0] here is safe because
+// emitDynamicDispose (run immediately above this call, LlvmBackend_Disposal.cpp)
+// already dispatched vtable[2], i.e. obj[0] is a CG35-itable vtable whose [0]
+// is its td$ descriptor — true of every class/box that reaches this site.
+// Not wired into the pure-runtime vtable-Dispose-then-free reclaim sites that
+// bypass codegen (bz_dispose_class_obj, bz_domain_spawn's DomainFaultedException
+// wrap) — tracked as a follow-up, see the issue tracker.
+extern "C" void bz_exc_reclaim_causechain(void* obj, void** excVtableTable,
+                                          void** excDescTable) {
+    if (!obj) return;
     void* vtable; memcpy(&vtable, obj, sizeof(void*));
     bool builtinExc = false;
-    for (void** p = excVtableTable; *p; ++p)
-        if (*p == vtable) { builtinExc = true; break; }
+    if (excVtableTable)
+        for (void** p = excVtableTable; *p; ++p)
+            if (*p == vtable) { builtinExc = true; break; }
+    if (!builtinExc && excDescTable) {
+        // §31.4/#2989: obj's vtable is vt$<C> (a user subclass) or a non-class
+        // object. vtable[0] is td$<C>, a null-terminated ancestor-descriptor
+        // array; reclaim iff a built-in exception descriptor is among them.
+        void* desc; memcpy(&desc, vtable, sizeof(void*));
+        if (desc) {
+            for (void** d = (void**)desc; *d; ++d) {
+                for (void** p = excDescTable; *p; ++p)
+                    if (*d == *p) { builtinExc = true; break; }
+                if (builtinExc) break;
+            }
+        }
+    }
     if (!builtinExc) return;
     void* chain;
     memcpy(&chain, (uint8_t*)obj + BZ_EXC_CAUSE_OFFSET, sizeof(void*));

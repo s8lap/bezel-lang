@@ -2069,6 +2069,10 @@ private:
     // reported by type name only, never by an out-of-bounds field read.
     llvm::GlobalVariable* excVtableTableGV_ = nullptr;
     llvm::Value* builtinExcVtableTablePtr();
+    // §31.4/#2989/#2979: parallel built-in exception DESCRIPTOR table
+    // (btd$<name>) for bz_exc_reclaim_causechain's user-subclass path.
+    llvm::GlobalVariable* excDescTableGV_ = nullptr;
+    llvm::Value* builtinExcDescTablePtr();
     // #481 / §12.1 / §12.5 / §23: a virtual vtable slot is either a virtual
     // METHOD or a virtual PROPERTY accessor (getter or setter). A `virtual`/
     // `abstract`/`override` property's get (and set, when present) each occupy
