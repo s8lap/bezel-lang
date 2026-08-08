@@ -286,18 +286,36 @@ BEZEL_TEST(aot_cache_key, relinking_the_same_object_is_reproducible) {
         os << kSourceA;
     }
 
-    Driver driver;
-    const std::string obj = dir + "/prog.o";
     CodegenOptions opts;
-    const bool compiled =
-        driver.compileExecutableObject(src, obj, /*deps=*/{}, opts).success;
-    BEZEL_EXPECT_TRUE(compiled);
-    if (!compiled) return;
-
+    const std::string obj = dir + "/prog.o";
     const std::string exe1 = dir + "/prog1";
     const std::string exe2 = dir + "/prog2";
-    BEZEL_EXPECT_TRUE(driver.linkExecutableObject(obj, exe1, /*deps=*/{}, opts));
-    BEZEL_EXPECT_TRUE(driver.linkExecutableObject(obj, exe2, /*deps=*/{}, opts));
+    const std::string ccErr = dir + "/cc.err";
+    // Fork-isolate each driver step. Every OTHER AOT test in the suite forks its
+    // compile because the front-end has a live crash history (see
+    // aot_crash_isolation_test.cpp — "without the fork, the SIGSEGV would abort
+    // the whole bezel_tests binary, taking down every other test in the shard").
+    // These two end-to-end cache-key tests were the lone paths that ran the
+    // Driver in-process, so an in-process compile fault here could kill a shard;
+    // for the split_build sibling it was also the #1608 flake source. Forking
+    // each step in its own child removes that path. // per #1608
+    auto run = [](const char* what,
+                  const bezel::test::aot_detail::CompileStatus& cc) -> bool {
+        if (cc.outcome != bezel::test::aot_detail::CompileOutcome::Ok)
+            std::cout << "    " << what << " did not succeed: " << cc.diag << "\n";
+        return cc.outcome == bezel::test::aot_detail::CompileOutcome::Ok;
+    };
+    const bool compiled =
+        run("compileExecutableObject",
+            bezel::test::aot_detail::forkedCompileObject(src, obj, opts, ccErr));
+    BEZEL_EXPECT_TRUE(compiled);
+    if (!compiled) return;
+    BEZEL_EXPECT_TRUE(run("linkExecutableObject(exe1)",
+                          bezel::test::aot_detail::forkedLink(
+                              obj, exe1, opts, ccErr)));
+    BEZEL_EXPECT_TRUE(run("linkExecutableObject(exe2)",
+                          bezel::test::aot_detail::forkedLink(
+                              obj, exe2, opts, ccErr)));
 
     Digest h1{}, h2{};
     BEZEL_EXPECT_TRUE(sha256File(exe1, h1));
@@ -353,6 +371,22 @@ BEZEL_TEST(aot_cache_key, link_cache_is_reached_and_preserves_behaviour) {
 // compiling then linking as TWO calls (what the cache does) must produce the
 // same executable. This is what lets the cache be an optimisation rather than a
 // second, weaker oracle.
+//
+// FORK-ISOLATED, NOT IN-PROCESS (#1608). Both builds compile the SAME source, so
+// byte-for-byte equivalence is the property under test — but two SEQUENTIAL
+// in-process compiles do NOT see the same state: the first mutates process-
+// global compiler state (LLVM context / maps) that the second then reads, and
+// co-resident tests (the runtime_* stress tests, round-robin'd into the same
+// shard) dirty the initial state further. The two emitted objects then diverge
+// by a few bytes, the linked executables get distinct build-ids, and the
+// equality assertion flakes (~15% of shard runs under the gate; the gate log
+// showed hCombined != hSplit at this line). run_parallel's "died on" attribution
+// names the LAST [ RUN ] line in the shard — a builtin_registry_snapshot case
+// that runs AFTER this one — so the flake was long misread as a registry-
+// pollution crash; the registry is constexpr-immutable and the snapshot tests
+// all passed (the gate log confirms [ OK ] on each). Forking each compile in its
+// own child makes both builds start from the SAME parent state, which is the
+// only sound basis for the byte-equality claim. // per #1608
 BEZEL_TEST(aot_cache_key, split_build_matches_the_combined_build_byte_for_byte) {
     const std::string dir = bezel::test::aot_detail::makeWorkDir();
     BEZEL_EXPECT_TRUE(!dir.empty());
@@ -365,23 +399,31 @@ BEZEL_TEST(aot_cache_key, split_build_matches_the_combined_build_byte_for_byte) 
         os << kSourceA;
     }
 
-    Driver driver;
     CodegenOptions opts;
+    const std::string ccErr = dir + "/cc.err";
+    auto run = [](const char* what,
+                  const bezel::test::aot_detail::CompileStatus& cc) -> bool {
+        if (cc.outcome != bezel::test::aot_detail::CompileOutcome::Ok)
+            std::cout << "    " << what << " did not succeed: " << cc.diag << "\n";
+        return cc.outcome == bezel::test::aot_detail::CompileOutcome::Ok;
+    };
 
     const std::string combined = dir + "/combined";
-    const bool builtCombined =
-        driver.compileFile(src, combined, /*deps=*/{}, opts).success;
-    BEZEL_EXPECT_TRUE(builtCombined);
-    if (!builtCombined) return;
+    BEZEL_EXPECT_TRUE(run("compileFile(combined)",
+                          bezel::test::aot_detail::forkedCompile(
+                              src, combined, opts, ccErr)));
     // compileFile must clean up after itself — a left-behind object would be a
-    // stray artifact in every bezelc invocation.
+    // stray artifact in every bezelc invocation. The forked child removes it
+    // before _Exit, so it is gone by the time the parent resumes.
     BEZEL_EXPECT_TRUE(!fs::exists(combined + ".o"));
 
     const std::string obj = dir + "/split.o";
     const std::string split = dir + "/split";
     const bool builtSplit =
-        driver.compileExecutableObject(src, obj, /*deps=*/{}, opts).success &&
-        driver.linkExecutableObject(obj, split, /*deps=*/{}, opts);
+        run("compileExecutableObject(split.o)",
+            bezel::test::aot_detail::forkedCompileObject(src, obj, opts, ccErr)) &&
+        run("linkExecutableObject(split)",
+            bezel::test::aot_detail::forkedLink(obj, split, opts, ccErr));
     BEZEL_EXPECT_TRUE(builtSplit);
     if (!builtSplit) return;
 
@@ -390,4 +432,71 @@ BEZEL_TEST(aot_cache_key, split_build_matches_the_combined_build_byte_for_byte) 
     BEZEL_EXPECT_TRUE(sha256File(split, hSplit));
     // If this fails the cache is a DIFFERENT oracle from the shipping path.
     BEZEL_EXPECT_TRUE(hCombined == hSplit);
+}
+
+// ---------------------------------------------------------------------------
+// #1608 regression pin — recompiling the same source is DETERMINISTIC.
+// ---------------------------------------------------------------------------
+// This looks like a tautology ("obviously the same source compiles to the same
+// object"). It is NOT, and #1608 was the proof. The flake it pins was real and
+// gate-burning: when two compiles of the same source ran IN-PROCESS (the old
+// split_build shape), the first mutated process-global compiler state (LLVM
+// context / name-to-pointer maps) that the second then read; co-resident
+// runtime_* stress tests (round-robin'd into the same shard) dirtied the
+// initial state further; the two emitted objects diverged by a few bytes; the
+// linked executables got distinct GNU build-ids; and a content-equality
+// assertion flaked on ~15% of gate shard runs. run_parallel's crash attribution
+// names the LAST [ RUN ] line in the shard, so the failure was long misread as a
+// builtin_registry_snapshot "crash" (those tests are pure constexpr reads and
+// always passed — the gate log confirms [ OK ] on each).
+//
+// The fix was to fork-isolate each compile (forkedCompileObject) so every
+// compile starts from the SAME parent state — the only sound basis for a byte-
+// equality claim across recompiles. This test pins that property directly and
+// narrowly: three independent forked compiles of one source must be byte-for-
+// byte identical objects, every time, regardless of what prior co-resident
+// tests left in the process. If this ever flakes or fails, the #1608 isolation
+// has regressed — either an in-process compile path crept back in, or the
+// compiler grew a new state-dependent non-determinism. Either is a shard-killer
+// under the gate's parallel sharded run. // per #1608
+BEZEL_TEST(aot_cache_key, recompiling_same_source_is_deterministic_1608) {
+    const std::string dir = bezel::test::aot_detail::makeWorkDir();
+    BEZEL_EXPECT_TRUE(!dir.empty());
+    if (dir.empty()) return;
+    bezel::test::aot_detail::WorkDir cleanup{dir};
+
+    const std::string src = dir + "/prog.bzl";
+    {
+        std::ofstream os(src, std::ios::binary);
+        os << kSourceA;
+    }
+    CodegenOptions opts;
+    const std::string ccErr = dir + "/cc.err";
+
+    // Each call forks a fresh child from the (compile-unchanged) parent, so all
+    // three compiles start from identical process state. An IN-PROCESS recompile
+    // here would reproduce the #1608 flake (the second/third object would read
+    // state the first mutated); the forked path cannot.
+    auto hashOfForkedCompile = [&](const std::string& objPath,
+                                   Digest& out) -> bool {
+        const auto cc = bezel::test::aot_detail::forkedCompileObject(
+            src, objPath, opts, ccErr);
+        if (cc.outcome != bezel::test::aot_detail::CompileOutcome::Ok) {
+            std::cout << "    forkedCompileObject did not succeed: " << cc.diag
+                      << "\n";
+            return false;
+        }
+        return sha256File(objPath, out);
+    };
+
+    Digest h1{}, h2{}, h3{};
+    BEZEL_EXPECT_TRUE(hashOfForkedCompile(dir + "/a.o", h1));
+    BEZEL_EXPECT_TRUE(hashOfForkedCompile(dir + "/b.o", h2));
+    BEZEL_EXPECT_TRUE(hashOfForkedCompile(dir + "/c.o", h3));
+    // The load-bearing pin: every forked compile of the same source is the same
+    // object. (Three pairwise checks, not one, so a two-way coincidence is not
+    // mistaken for determinism.)
+    BEZEL_EXPECT_TRUE(h1 == h2);
+    BEZEL_EXPECT_TRUE(h2 == h3);
+    BEZEL_EXPECT_TRUE(h1 == h3);
 }
