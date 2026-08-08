@@ -15629,97 +15629,22 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // exempt this access from the "no member" reject below.
             return;
         }
-        // #2517 (§9.2, §35.7): the §9.2 record use-site gate and §35.7 choice
-        // use-site gate for direct `.Equals(...)` / `.GetHashCode()` calls fire
-        // HERE, BEFORE the null-decl (`!targetType->decl`) builtin-class branch
-        // below. Before this fix, both gates lived nested inside the
-        // `else if (Record || Enum || Choice)` branch below — which is reached
-        // only when `targetType->decl != nullptr` (a local AST TypeDecl).
-        // IMPORTED records and choices have `decl == nullptr` (the loader's
-        // reconstructTypeSymbol never sets it, §11.3/issue #501), so they took
-        // the `if (!decl)` branch — intended for builtin classes (Console,
-        // Math, Guid, …) — fell through with no match, then past the "no
-        // member" reject (which exempts Equals/GetHashCode as universal
-        // members, §8.1), and compiled silently: a §9.2 / §35.7 use-site
-        // diagnostic bypass (the structural twin of #2374's `astNode`-gated
-        // defect). Hoisting these gates out of the `else if` branch makes
-        // them fire for BOTH null-decl (imported) and non-null-decl (local)
-        // records/choices, exactly as #2483's `=`/`<>` gate already does
-        // (ExprTypecheck_Exprs.cpp). En and ToString / GetType are NOT
-        // affected — the §8.5/§9.1 default ToString remains for every record,
-        // and GetType is universal.
-        const auto& gateMember = ma.member;
-        if (gateMember == "Equals" || gateMember == "GetHashCode") {
-            if (targetType->kind == ast::TypeDeclKind::Record) {
-                // §9.2 (v0.156)/§9.3 (v0.158, #1383): a direct
-                // `.Equals(...)`/`.GetHashCode()` on a body / combined-form
-                // record that is not auto-equality-bearing and declares no
-                // explicit `=`/`<>` overloads is a compile error. The
-                // `positional` flag uses `hasPositionalFields` first (covers
-                // imported records per #501), then falls back to the local
-                // `ast::TypeDecl` for any record that has one.
-                bool positional = targetType->hasPositionalFields;
-                if (!positional)
-                    if (auto* td =
-                            dynamic_cast<const ast::TypeDecl*>(targetType->decl))
-                        positional = td->hasPositionalFields;
-                bool isEq = positional
-                                ? isPositionalRecordEqualityBearing(
-                                      targetType, ctx_)
-                                : isAutoEqualityBearingBodyRecord(
-                                      targetType, ctx_);
-                if (!isEq && !recordHasUserDeclaredEquality(targetType)) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, ma.span.begin,
-                        "`." + std::string(gateMember) +
-                        "` is not available on record `" +
-                        std::string(targetType->name) +
-                        "`: it is not auto-equality-bearing (§9.2/§9.3). Declare"
-                        " `=` and `<>` overloads (with `Equals`/`GetHashCode`),"
-                        " or simplify the record to an auto-equality-bearing"
-                        " form.");
-                }
-            } else if (targetType->kind == ast::TypeDeclKind::Choice) {
-                // §35.7 (v0.200, #2045; v0.226, #2110): a choice rejects direct
-                // `.Equals(...)`/`.GetHashCode()` at the call site when it is
-                // NOT auto-equality-bearing — any borrow-bearing or owning
-                // choice, AND any value-like choice whose case payload fails
-                // the §9.2 admissible-component rule. Mirrors the record gate
-                // above (and `=`/`<>`, isEqualityBearing §3.6, `where T:
-                // hashable` §14.2, checkHashContainerKeys — same predicate).
-                sema::TypeRef rt;
-                rt.kind = sema::TypeRef::Kind::Named;
-                rt.declaration = targetType;
-                if (!isAutoEqualityBearingChoice(targetType, ctx_, &rt)) {
-                    auto verdict = common::classifyChoiceType(&rt, ctx_);
-                    std::string reason;
-                    if (verdict &&
-                        *verdict != common::ChoiceClassification::ValueLike) {
-                        reason =
-                            std::string("it is not auto-equality-bearing "
-                                        "(§35.7) — the choice is ") +
-                            (*verdict == common::ChoiceClassification::Owning
-                                 ? "owning"
-                                 : "borrow-bearing") +
-                            ", and a non-value-like choice carries no "
-                            "value equality";
-                    } else {
-                        reason =
-                            "it is not auto-equality-bearing (§35.7): the "
-                            "choice is value-like but a case payload is not "
-                            "an admissible equality component (§9.2)";
-                    }
-                    ctx_.diagnostics().report(
-                        Severity::Error, ma.span.begin,
-                        "`." + std::string(gateMember) +
-                        "` is not available on choice `" +
-                        std::string(targetType->name) + "`: " + reason +
-                        ". Declare `=` and `<>` overloads (with "
-                        "`Equals`/`GetHashCode`), or restructure the choice "
-                        "payload to an admissible component type.");
-                }
-            }
-        }
+        // #2517 / #3019 (§9.2, §35.7): the §9.2 record use-site gate and §35.7
+        // choice use-site gate for direct `.Equals(...)` / `.GetHashCode()`
+        // calls fire HERE, BEFORE the null-decl (`!targetType->decl`)
+        // builtin-class branch below, via the shared checkEqualityMemberUseSite
+        // helper. #2517 hoisted this out of the `else if (Record || …)`
+        // branch (reached only when `targetType->decl != nullptr`): IMPORTED
+        // records/choices have `decl == nullptr` (the loader never sets it,
+        // §11.3/#501), so they took the builtin-class branch, fell past the
+        // "no member" reject (which exempts Equals/GetHashCode as universal
+        // §8.1 members), and compiled silently. #3019 routes the `?.` form
+        // through the SAME helper (called from resolveNullCondMember) so
+        // `r?.Equals(...)` / `r?.GetHashCode()` on a non-bearing record/choice
+        // is rejected at the call site instead of crashing codegen. ToString /
+        // GetType are NOT affected — the §8.5/§9.1 default ToString remains for
+        // every record, and GetType is universal.
+        checkEqualityMemberUseSite(targetType, ma.member, ma.span.begin);
         // §2.3: built-in class TypeSymbols (Console, Math, Convert, …)
         // have null `decl` and empty members. Assign return types for
         // their known methods so callers can infer the call result type.
@@ -16628,6 +16553,94 @@ TypeRef* ExprTC::builtinValueMemberType(const TypeRef* recvTy,
     return nullptr;
 }
 
+// #3019 (§9.2/§9.3/§35.7): the use-site gate shared by the `.` form
+// (resolveMemberAccess) and the `?.` form (resolveNullCondMember) for a direct
+// `.Equals(...)`/`.GetHashCode()` (or `?.Equals(...)`/`?.GetHashCode()`) call
+// on a record/choice that is not auto-equality-bearing and declares no user
+// `=`/`<>` overloads. Extracted from resolveMemberAccess (#2517 hoisted it out
+// of the null-decl branch) so both access forms enforce the ONE check — the
+// one fact the compiler already computes for "is this record/choice auto-
+// equality-bearing" (isPositionalRecordEqualityBearing /
+// isAutoEqualityBearingBodyRecord / recordHasUserDeclaredEquality /
+// isAutoEqualityBearingChoice — the SAME predicates isEqualityBearing, the
+// `where T: hashable` §14.2 check, and checkHashContainerKeys use). No-op when
+// `targetType` is null or not a record/choice (a class/Object/interface
+// receiver uses the universal §9.6 Object surface, so `?.Equals`/`?.GetHashCode`
+// is valid there — #2982/#2964). §7.5: a null-conditional access evaluates the
+// member normally when the receiver is non-null, so the member must be
+// AVAILABLE; the gate is on availability, not on the receiver's nullness.
+void ExprTC::checkEqualityMemberUseSite(TypeSymbol* targetType,
+                                        std::string_view member,
+                                        SourceLocation loc) {
+    if (!targetType) return;
+    if (member != "Equals" && member != "GetHashCode") return;
+    if (targetType->kind == ast::TypeDeclKind::Record) {
+        // §9.2 (v0.156)/§9.3 (v0.158, #1383): a direct `.Equals(...)`/
+        // `.GetHashCode()` on a body / combined-form record that is not
+        // auto-equality-bearing and declares no explicit `=`/`<>` overloads is
+        // a compile error. The `positional` flag uses `hasPositionalFields`
+        // first (covers imported records per #501), then falls back to the
+        // local `ast::TypeDecl` for any record that has one.
+        bool positional = targetType->hasPositionalFields;
+        if (!positional)
+            if (auto* td = dynamic_cast<const ast::TypeDecl*>(targetType->decl))
+                positional = td->hasPositionalFields;
+        bool isEq = positional
+                        ? isPositionalRecordEqualityBearing(targetType, ctx_)
+                        : isAutoEqualityBearingBodyRecord(targetType, ctx_);
+        if (!isEq && !recordHasUserDeclaredEquality(targetType)) {
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "`." + std::string(member) +
+                "` is not available on record `" +
+                std::string(targetType->name) +
+                "`: it is not auto-equality-bearing (§9.2/§9.3). Declare"
+                " `=` and `<>` overloads (with `Equals`/`GetHashCode`),"
+                " or simplify the record to an auto-equality-bearing"
+                " form.");
+        }
+    } else if (targetType->kind == ast::TypeDeclKind::Choice) {
+        // §35.7 (v0.200, #2045; v0.226, #2110): a choice rejects direct
+        // `.Equals(...)`/`.GetHashCode()` at the call site when it is NOT
+        // auto-equality-bearing — any borrow-bearing or owning choice, AND any
+        // value-like choice whose case payload fails the §9.2 admissible-
+        // component rule. Mirrors the record gate above (and `=`/`<>`,
+        // isEqualityBearing §3.6, `where T: hashable` §14.2,
+        // checkHashContainerKeys — same predicate).
+        sema::TypeRef rt;
+        rt.kind = sema::TypeRef::Kind::Named;
+        rt.declaration = targetType;
+        if (!isAutoEqualityBearingChoice(targetType, ctx_, &rt)) {
+            auto verdict = common::classifyChoiceType(&rt, ctx_);
+            std::string reason;
+            if (verdict &&
+                *verdict != common::ChoiceClassification::ValueLike) {
+                reason =
+                    std::string("it is not auto-equality-bearing "
+                                "(§35.7) — the choice is ") +
+                    (*verdict == common::ChoiceClassification::Owning
+                         ? "owning"
+                         : "borrow-bearing") +
+                    ", and a non-value-like choice carries no "
+                    "value equality";
+            } else {
+                reason =
+                    "it is not auto-equality-bearing (§35.7): the "
+                    "choice is value-like but a case payload is not "
+                    "an admissible equality component (§9.2)";
+            }
+            ctx_.diagnostics().report(
+                Severity::Error, loc,
+                "`." + std::string(member) +
+                "` is not available on choice `" +
+                std::string(targetType->name) + "`: " + reason +
+                ". Declare `=` and `<>` overloads (with "
+                "`Equals`/`GetHashCode`), or restructure the choice "
+                "payload to an admissible component type.");
+        }
+    }
+}
+
 // §7.5 null-conditional member access `x?.M`. Resolves the member on
 // the target's (non-nullable) type exactly like `.`, but the result
 // type is ALWAYS nullable (the access yields null when the target is
@@ -16672,7 +16685,41 @@ void ExprTC::resolveNullCondMember(const ast::NullCondMemberExpr& nm) {
             }
         }
     }
-    if (!member) return;
+    if (!member) {
+        // #3019 (§9.2/§9.3/§35.7): the `?.` form of a direct Equals/GetHashCode
+        // call is the SAME use-site violation as the `.` form — route it
+        // through the shared checkEqualityMemberUseSite gate (the one fact the
+        // compiler already computes for "is this record/choice auto-equality-
+        // bearing") so a `r?.Equals(...)` / `r?.GetHashCode()` on a
+        // non-auto-equality-bearing record/choice is rejected at the call site,
+        // not silently compiled into a codegen crash (IR verification: "Basic
+        // Block ... does not have a terminator"). The `.` form applies this
+        // gate in resolveMemberAccess; before #3019 the `?.` form (a
+        // NullCondMemberExpr, resolved HERE) missed it — the use-site-check
+        // twin of the `?.` sema/lowering gaps #2982/#2964 just landed.
+        if (nm.member == "Equals" || nm.member == "GetHashCode") {
+            TypeSymbol* gateType = targetType;
+            // A nullable VALUE-type receiver (record?/choice?) may leave
+            // memberTargetType null (see the comment above: the receiver is a
+            // Named record/choice, not a class TypeSymbol) — unwrap the
+            // nullable from the receiver's own declared type so the gate sees
+            // the underlying record/choice (a Named TypeRef's `declaration` is
+            // the base type regardless of the nullable flag, per §7.5).
+            if (!gateType && nm.target) {
+                const TypeRef* rt = ctx_.exprType(*nm.target);
+                if (rt && rt->kind == TypeRef::Kind::Named)
+                    gateType = rt->declaration;
+            }
+            // The parser does not set a NullCondMemberExpr's own span, so fall
+            // back to the receiver's span when the callee span is degenerate
+            // (line/column 0) — the #1307 degenerate-callee-span pattern the
+            // extension lookup above also uses.
+            SourceLocation loc = nm.span.begin;
+            if (loc.line == 0 && nm.target) loc = nm.target->span.begin;
+            checkEqualityMemberUseSite(gateType, nm.member, loc);
+        }
+        return;
+    }
     // §13.1 (issue #432): full visibility check — delegates to the shared
     // checkMemberVisibility helper (same four-level rule as resolveMemberAccess).
     if (auto* msym = dynamic_cast<MemberSymbol*>(member)) {

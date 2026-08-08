@@ -1999,6 +1999,22 @@ private:
     // expression's type, so member access chains (`a?.b?.c`) resolve.
     void resolveNullCondMember(const ast::NullCondMemberExpr& nm);
 
+    // #3019 (§9.2/§9.3/§35.7): the use-site gate for a direct
+    // `.Equals(...)`/`.GetHashCode()` (or `?.Equals(...)`/`?.GetHashCode()`)
+    // call on a record/choice that is not auto-equality-bearing and declares
+    // no user `=`/`<>` overloads. Shared by the `.` path
+    // (resolveMemberAccess) and the `?.` path (resolveNullCondMember) so the
+    // two forms enforce the SAME check: §7.5 evaluates the member normally
+    // when the receiver is non-null, so a `?.Equals` on a non-bearing record
+    // is the same use-site violation as the `.` form (the gate is on the
+    // member's availability, not the receiver's nullness). `targetType` is the
+    // receiver's underlying record/choice TypeSymbol (nullable wrapper already
+    // unwrapped by the caller); no-op when targetType is null or not a
+    // record/choice. `member` is "Equals"/"GetHashCode"; `loc` is the use site.
+    void checkEqualityMemberUseSite(TypeSymbol* targetType,
+                                    std::string_view member,
+                                    SourceLocation loc);
+
     // §7.5 / #751: result type of a builtin (string/primitive) RECEIVER's
     // property-like value member (e.g. `string.Length`, `string.IsAscii`) for
     // the null-conditional `x?.M` path. resolveMemberAccess types these via a
