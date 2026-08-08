@@ -95,9 +95,11 @@ BEZEL_TEST(aot_cache_durability, store_to_cache_routes_through_durable_rename) {
     const std::string cachePath = cacheSub + "/hashed-entry";
 
     const std::uint64_t fsyncs0 = aot::cacheStats().storeFsyncs.load();
+    const std::uint64_t fails0 = aot::cacheStats().storeFailures.load();
     aot::storeToCache(exe, cachePath);
-    // A successful install fsyncs (mechanism pin).
+    // A successful install fsyncs (mechanism) and records no failure.
     BEZEL_EXPECT_TRUE(aot::cacheStats().storeFsyncs.load() > fsyncs0);
+    BEZEL_EXPECT_EQ(aot::cacheStats().storeFailures.load(), fails0);
 
     // The installed entry holds the exe's bytes whole.
     BEZEL_EXPECT_TRUE(fs::exists(cachePath, ec));

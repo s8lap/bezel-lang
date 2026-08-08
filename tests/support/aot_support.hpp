@@ -1314,9 +1314,14 @@ struct CacheStats {
     std::atomic<std::uint64_t> exeKeyHits{0};  // KE: whole build skipped
     std::atomic<std::uint64_t> objHits{0};     // K1: front-end skipped
     std::atomic<std::uint64_t> linkHits{0};    // K2: link skipped after a compile
-    // per #3009: proves the durability fsync actually ran on the install path —
-    // the regression test pins the mechanism.
+    // per #3014: a silently-failing store is the #3003 defect class (each of 17
+    // PIDs stored ~1,700-2,500 entries then failed every store until exit, with
+    // NO telemetry of it). Counting failures + the last errno makes that class
+    // visible in the stats sink. storeFsyncs (#3009) proves the durability fsync
+    // actually ran on the install path — the regression test pins the mechanism.
+    std::atomic<std::uint64_t> storeFailures{0};
     std::atomic<std::uint64_t> storeFsyncs{0};
+    std::atomic<int> lastStoreErrno{0};
 };
 inline CacheStats& cacheStats() {
     // Leaked on purpose: the BEZEL_AOT_CACHE_STATS atexit hook reads these
@@ -1333,14 +1338,28 @@ inline bool cacheStatsEnabled() {
     return v;
 }
 
+// per #3014: the AOT cache stats' OWN sink. When set, the [aot-cache] line goes
+// to this file atomically (see emitCacheStatsNow) INSTEAD OF stderr. Read fresh
+// (not static-cached) so a test can setenv and observe it in a forked child; it
+// is consulted only at stats-emit time (once per process), so the cost is
+// negligible. This is the structural #3012 fix: with the env set the [aot-cache]
+// line NEVER touches the shard's stderr/summary stream, so the atexit hook
+// cannot race the shard's own summary printer mid-line and corrupt the
+// "N passed, M failed" parse (#3012).
+inline std::string cacheStatsFile() {
+    const char* e = std::getenv("BEZEL_AOT_CACHE_STATS_FILE");
+    return (e && *e) ? std::string(e) : std::string{};
+}
+
 // per #3009: fsync the temp file's DATA, then atomically rename it into place,
 // then best-effort fsync the target directory so the rename itself is durable.
-// Returns the rename's error_code (empty on success); on rename failure the temp
-// is removed. The data fsync is the load-bearing half: without it, a crash
+// Returns the rename's error_code (empty on success); on rename failure the
+// temp is removed. The data fsync is the load-bearing half: without it, a crash
 // between the byte copy and the rename could leave a partial/truncated cache
 // entry that a later lookup mistakes for whole (#3009 — latent: zero truncated
-// entries in 53,703, but a cheap durability fix). storeFsyncs is the mechanism
-// pin the #3009 regression test asserts against.
+// entries in 53,703, but a cheap durability fix). Shared by storeToCache (cache
+// install) and the BEZEL_AOT_CACHE_STATS_FILE sink (#3014). storeFsyncs is the
+// mechanism pin the #3009 regression test asserts against.
 inline std::error_code durableRename(const std::string& tmp,
                                      const std::string& dst) {
     if (int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0) {
@@ -1361,25 +1380,82 @@ inline std::error_code durableRename(const std::string& tmp,
     return {};
 }
 
-// Register (once) an atexit hook that prints the hits/misses line at shard exit
-// when BEZEL_AOT_CACHE_STATS=1. Default off → normal runs print nothing.
+// per #3014: atomically write `content` to `path` (temp in the same dir, then
+// durableRename — fsync + atomic rename + dir fsync, reusing the #3009 helper).
+// A concurrent reader never sees a partial line. Best-effort: on any failure no
+// file is left, which the reader treats as "no stats for this shard" rather than
+// a truncated line.
+inline void atomicWriteStats(const std::string& path,
+                             const std::string& content) {
+    std::error_code ec;
+    const std::string dir = fs::path(path).parent_path().string();
+    if (!dir.empty()) fs::create_directories(dir, ec);
+    static std::atomic<std::uint64_t> ctr{0};
+    const std::string tmp =
+        path + ".tmp." + std::to_string(::getpid()) + "." +
+        std::to_string(ctr.fetch_add(1, std::memory_order_relaxed));
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) { std::error_code e2; fs::remove(tmp, e2); return; }
+        f.write(content.data(), static_cast<std::streamsize>(content.size()));
+        if (!f) { std::error_code e2; fs::remove(tmp, e2); return; }
+        f.close();
+        if (!f) { std::error_code e2; fs::remove(tmp, e2); return; }
+    }
+    durableRename(tmp, path);  // fsync + atomic rename + dir fsync
+}
+
+// per #3014: emit the [aot-cache] stats line NOW to the selected sink:
+//   1. BEZEL_AOT_CACHE_STATS_FILE set -> atomic file write (the #3012 fix: keeps
+//      the line OFF the shard's stderr/summary stream).
+//   2. else BEZEL_AOT_CACHE_STATS=1 -> legacy stderr print (byte-identical to
+//      the pre-#3014 atexit hook when the new env is unset).
+//   3. else -> nothing.
+// Factored out of the atexit hook so the sink selection is observable in a
+// forked child without depending on process teardown (the regression test calls
+// this directly with stderr captured to prove no [aot-cache] lands on it).
+inline void emitCacheStatsNow() {
+    auto& s = cacheStats();
+    const unsigned long long h = s.hits.load(std::memory_order_relaxed);
+    const unsigned long long m = s.misses.load(std::memory_order_relaxed);
+    const unsigned long long eh = s.exeKeyHits.load(std::memory_order_relaxed);
+    const unsigned long long oh = s.objHits.load(std::memory_order_relaxed);
+    const unsigned long long lh = s.linkHits.load(std::memory_order_relaxed);
+    const unsigned long long sf = s.storeFailures.load(std::memory_order_relaxed);
+    const unsigned long long fy = s.storeFsyncs.load(std::memory_order_relaxed);
+    const int lse = s.lastStoreErrno.load(std::memory_order_relaxed);
+    char buf[640];
+    const int n = std::snprintf(buf, sizeof(buf),
+        "[aot-cache] hits=%llu misses=%llu (%.0f%% hit) "
+        "exe-key-hits=%llu obj-hits=%llu link-hits=%llu "
+        "store_failures=%llu store_fsyncs=%llu store_errno=%d dir=%s\n",
+        h, m, (h + m) ? 100.0 * h / (h + m) : 0.0, eh, oh, lh, sf, fy, lse,
+        cacheDir().c_str());
+    if (n < 0) return;
+    // Clamp to the bytes snprintf actually wrote (it returns the would-be size,
+    // which can exceed the buffer on truncation).
+    const std::size_t len = static_cast<std::size_t>(
+        n < static_cast<int>(sizeof(buf)) ? n
+                                          : static_cast<int>(sizeof(buf)) - 1);
+    const std::string statsFile = cacheStatsFile();
+    if (!statsFile.empty()) {
+        atomicWriteStats(statsFile, std::string(buf, len));
+        return;
+    }
+    if (cacheStatsEnabled()) std::fwrite(buf, 1, len, stderr);
+}
+
+// Register (once) an atexit hook that emits the stats line at shard exit when a
+// sink is opted into (BEZEL_AOT_CACHE_STATS_FILE or BEZEL_AOT_CACHE_STATS=1).
+// Default off → normal runs print nothing. The hook calls emitCacheStatsNow, so
+// the file sink (#3014) keeps the line OFF stderr — the #3012 race is fixed.
 inline void ensureStatsAtExit() {
     static const bool once = [] {
-        if (cacheStatsEnabled()) {
-            std::atexit([] {
-                auto& s = cacheStats();
-                unsigned long long h = s.hits.load(std::memory_order_relaxed);
-                unsigned long long m = s.misses.load(std::memory_order_relaxed);
-                unsigned long long eh =
-                    s.exeKeyHits.load(std::memory_order_relaxed);
-                unsigned long long oh = s.objHits.load(std::memory_order_relaxed);
-                unsigned long long lh = s.linkHits.load(std::memory_order_relaxed);
-                std::fprintf(stderr,
-                    "[aot-cache] hits=%llu misses=%llu (%.0f%% hit) "
-                    "exe-key-hits=%llu obj-hits=%llu link-hits=%llu dir=%s\n",
-                    h, m, (h + m) ? 100.0 * h / (h + m) : 0.0, eh, oh, lh,
-                    cacheDir().c_str());
-            });
+        // Whether to register is decided once at first compile; the file env is
+        // RE-READ by emitCacheStatsNow at exit, so a late setenv still routes to
+        // the file. Register if EITHER sink could fire.
+        if (cacheStatsEnabled() || !cacheStatsFile().empty()) {
+            std::atexit(emitCacheStatsNow);
         }
         return true;
     }();
@@ -1432,7 +1508,17 @@ inline void storeToCache(const std::string& exePath,
         // entries successfully and then failed EVERY store until it exited,
         // silently. Combined with the GC skipping .tmp names below, those bytes
         // were invisible to the cap.
-        if (ec) { std::error_code e2; fs::remove(tmp, e2); return; }
+        if (ec) {
+            // per #3014: count every store failure and capture the errno. The
+            // #3003 orphan storm was exactly this path failing silently for
+            // thousands of stores per shard; the counter makes it visible in
+            // the stats sink instead of detectable only by du.
+            cacheStats().storeFailures.fetch_add(1, std::memory_order_relaxed);
+            cacheStats().lastStoreErrno.store(
+                static_cast<int>(ec.value()), std::memory_order_relaxed);
+            std::error_code e2; fs::remove(tmp, e2);
+            return;
+        }
     }
     fs::permissions(tmp, kExePerms, fs::perm_options::replace, ec);
     ec.clear();
@@ -1440,7 +1526,14 @@ inline void storeToCache(const std::string& exePath,
     // (and best-effort fsyncs the cache dir) so a crash between the copy and the
     // rename-in-cache-dir cannot leave a partial/truncated entry serving a
     // future hit.
-    (void)durableRename(tmp, cachePath);
+    const std::error_code rec = durableRename(tmp, cachePath);
+    if (rec) {
+        // per #3014: the rename itself failed — count it too (durableRename has
+        // already removed the temp).
+        cacheStats().storeFailures.fetch_add(1, std::memory_order_relaxed);
+        cacheStats().lastStoreErrno.store(
+            static_cast<int>(rec.value()), std::memory_order_relaxed);
+    }
 }
 
 // Orphan-temp age floor for the GC below (#3003). The compile+link deadline is
