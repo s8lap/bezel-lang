@@ -1314,6 +1314,9 @@ struct CacheStats {
     std::atomic<std::uint64_t> exeKeyHits{0};  // KE: whole build skipped
     std::atomic<std::uint64_t> objHits{0};     // K1: front-end skipped
     std::atomic<std::uint64_t> linkHits{0};    // K2: link skipped after a compile
+    // per #3009: proves the durability fsync actually ran on the install path —
+    // the regression test pins the mechanism.
+    std::atomic<std::uint64_t> storeFsyncs{0};
 };
 inline CacheStats& cacheStats() {
     // Leaked on purpose: the BEZEL_AOT_CACHE_STATS atexit hook reads these
@@ -1328,6 +1331,34 @@ inline bool cacheStatsEnabled() {
         return e && std::string(e) == "1";
     }();
     return v;
+}
+
+// per #3009: fsync the temp file's DATA, then atomically rename it into place,
+// then best-effort fsync the target directory so the rename itself is durable.
+// Returns the rename's error_code (empty on success); on rename failure the temp
+// is removed. The data fsync is the load-bearing half: without it, a crash
+// between the byte copy and the rename could leave a partial/truncated cache
+// entry that a later lookup mistakes for whole (#3009 — latent: zero truncated
+// entries in 53,703, but a cheap durability fix). storeFsyncs is the mechanism
+// pin the #3009 regression test asserts against.
+inline std::error_code durableRename(const std::string& tmp,
+                                     const std::string& dst) {
+    if (int fd = ::open(tmp.c_str(), O_RDONLY | O_CLOEXEC); fd >= 0) {
+        while (::fsync(fd) != 0 && errno == EINTR) {}
+        ::close(fd);
+        cacheStats().storeFsyncs.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::error_code ec;
+    fs::rename(tmp, dst, ec);  // atomic install (same filesystem)
+    if (ec) { std::error_code e2; fs::remove(tmp, e2); return ec; }
+    // Best-effort directory fsync (some filesystems refuse; harmless — the data
+    // fsync above is what prevents a truncated entry).
+    if (int dfd = ::open(fs::path(dst).parent_path().string().c_str(),
+                         O_RDONLY | O_DIRECTORY | O_CLOEXEC); dfd >= 0) {
+        while (::fsync(dfd) != 0 && errno == EINTR) {}
+        ::close(dfd);
+    }
+    return {};
 }
 
 // Register (once) an atexit hook that prints the hits/misses line at shard exit
@@ -1405,8 +1436,11 @@ inline void storeToCache(const std::string& exePath,
     }
     fs::permissions(tmp, kExePerms, fs::perm_options::replace, ec);
     ec.clear();
-    fs::rename(tmp, cachePath, ec);  // atomic install (same filesystem)
-    if (ec) { std::error_code e2; fs::remove(tmp, e2); }  // clean the temp
+    // per #3009: durableRename fsyncs the temp's data before the atomic rename
+    // (and best-effort fsyncs the cache dir) so a crash between the copy and the
+    // rename-in-cache-dir cannot leave a partial/truncated entry serving a
+    // future hit.
+    (void)durableRename(tmp, cachePath);
 }
 
 // Orphan-temp age floor for the GC below (#3003). The compile+link deadline is
