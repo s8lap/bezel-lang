@@ -1082,6 +1082,43 @@ void checkOneMember(SemaContext& ctx, MemberSymbol& member) {
     }
 }
 
+// §22.16 (v0.240, #2941 interim): a class `invariant(E);` member is parsed,
+// purity-tagged, and carried in the artifact interface (§2.8.2), but is NOT
+// evaluated at the construction-exit / public-entry / public-exit boundaries
+// this section fixes — full invariant enforcement is contracts feature
+// build-out (the §22.16 / #2053 area) and is out of scope for this interim.
+// `checkInvariantExpr` above is unreached dead code (an `InvariantDecl` never
+// becomes a MemberSymbol, so `checkOneMember` never reaches it), which means
+// the predicate was never name-resolved, type-checked, OR evaluated: an
+// invariant naming an unresolved identifier, one typed non-bool, or one
+// calling a mutating method were ALL silently accepted — the compiler claimed
+// to enforce something it does not. The safe, loud half: emit a located Error
+// at every SOURCE-defined invariant so a programmer cannot be silently misled
+// into believing the predicate is enforced. An Error (not a Warning) makes the
+// false promise structurally impossible: a warning that still compiles leaves
+// the program running under an unenforced invariant — precisely the silent
+// failure this issue is about — and mirrors issue #2942's loud rejection of
+// the unimplemented `result`/`old` clause operands. Imported classes are
+// excluded (td == nullptr): their invariant records are declaration facts in
+// the artifact interface, not something this compilation re-evaluates, and
+// rejecting them would break every importer of a pre-built library.
+static void diagnoseUnevaluatedInvariants(SemaContext& ctx,
+                                          const TypeSymbol& t) {
+    const auto* td = dynamic_cast<const ast::TypeDecl*>(t.decl);
+    if (!td) return;  // imported type: no AST in this compilation
+    for (const auto& member : td->members) {
+        const auto* inv =
+            dynamic_cast<const ast::InvariantDecl*>(member.get());
+        if (!inv) continue;
+        ctx.diagnostics().report(
+            Severity::Error, inv->loc,
+            "`invariant` member is parsed but not evaluated in this compiler "
+            "revision (§22.16): class invariants are not checked at "
+            "construction exit or public boundaries, so this predicate is "
+            "unenforced");
+    }
+}
+
 }  // namespace
 
 bool checkPureBodies(const ast::SourceFile& src, SemaContext& ctx) {
@@ -1095,6 +1132,11 @@ bool checkPureBodies(const ast::SourceFile& src, SemaContext& ctx) {
         if (auto* t = dynamic_cast<TypeSymbol*>(child)) types.push_back(t);
     }
     for (TypeSymbol* t : types) {
+        // §22.16 (v0.240, #2941 interim): diagnose every source-defined
+        // invariant member BEFORE the member-purity walk, so an invariant
+        // diagnostic is reported ahead of any body diagnostic (matching the
+        // clause-before-body ordering at the checkOneMember call site).
+        diagnoseUnevaluatedInvariants(ctx, *t);
         for (Symbol* m : t->members) {
             auto* mem = dynamic_cast<MemberSymbol*>(m);
             if (!mem) continue;
@@ -1102,6 +1144,7 @@ bool checkPureBodies(const ast::SourceFile& src, SemaContext& ctx) {
             // Recurse into nested types' members.
             if (auto* nt = dynamic_cast<NestedTypeSymbol*>(m)) {
                 if (nt->type) {
+                    diagnoseUnevaluatedInvariants(ctx, *nt->type);
                     for (Symbol* nm : nt->type->members) {
                         auto* nmem = dynamic_cast<MemberSymbol*>(nm);
                         if (nmem) checkOneMember(ctx, *nmem);
