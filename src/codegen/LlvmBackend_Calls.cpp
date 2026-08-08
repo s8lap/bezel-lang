@@ -425,7 +425,9 @@ int64_t Emitter::collectionElemSize(const sema::TypeRef* collTy) {
 // §6.1 / §30.8: extract the builtin type name from a Named TypeRef with no
 // user TypeDecl.  Two shapes are possible:
 //   a) !rt->declaration: the name lives in rt->headName().
-//   b) rt->declaration is a builtinClassSym (null decl): name = declaration->name.
+//   b) rt->declaration is a builtinClassSym (null decl AND empty moduleName, so
+//      an imported user class — same null-decl shape, but a populated moduleName
+//      — is NOT mistaken for one; see #2997): name = declaration->name.
 // Returns an empty string_view if the TypeRef is not in either shape.
 std::string_view Emitter::builtinTypeName(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return {};
@@ -444,8 +446,24 @@ std::string_view Emitter::builtinTypeName(const sema::TypeRef* rt) {
         if (!rt->importedName.empty()) return rt->importedName;
         return {};
     }
-    // builtinClassSym — non-null declaration, null decl (no user TypeDecl).
-    if (!rt->declaration->decl) return rt->declaration->name;
+    // builtinClassSym — non-null declaration, null decl (no user TypeDecl), AND
+    // no originating module. fix #2997 (spec §11.3 / §28.3, v0.240): an IMPORTED
+    // user class is shaped EXACTLY like a builtinClassSym here — declaration
+    // non-null, decl null (there is no ast::TypeDecl for another module's
+    // source) — so `!decl` alone is not "built-in". §11.3 reserves no names, so
+    // a dependency module is free to export a class called `Stopwatch` and an
+    // importer's `using var s := new Stopwatch();` is a legal program with no
+    // built-in in it. The fact that tells them apart is one the compiler already
+    // computes: the module loader (ModuleLoader.cpp loadMetadataPass1) populates
+    // TypeSymbol::moduleName from the dependency's metadata for EVERY imported
+    // type, while a synthetic builtinClassSym (SemaContext::builtinClassSym)
+    // leaves it empty. That empty/non-empty split — not `!decl` — is what
+    // identifies a real built-in, and answering it in this one chokepoint fixes
+    // every probe routed through builtinTypeName (the five residual arms of
+    // registerUsingDisposal: Stopwatch / FileStream / CancellationTokenSource /
+    // Random / Atomic) at once.
+    if (!rt->declaration->decl && rt->declaration->moduleName.empty())
+        return rt->declaration->name;
     return {};
 }
 
