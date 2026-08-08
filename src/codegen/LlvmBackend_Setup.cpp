@@ -26075,9 +26075,13 @@ llvm::Constant* Emitter::boxDefaultHashCodeThunk() {
 // for a boxed RECORD or boxed ENUM. `this` is the box pointer (the receiver);
 // `other` is the Object? argument. The thunk:
 //   1. Returns false if `other` is null.
-//   2. Loads `other`'s vtable[0] (its type descriptor) and compares it to the
-//      known descriptor for `ts`. A mismatch returns false (different type or
-//      a non-box class object in the other slot).
+//   2. Compares `other`'s word 0 (its vtable pointer) against `self`'s word 0
+//      — ONE load each, no second dereference (fix #2980, the bz$uniteq
+//      defect class). A mismatch returns false (different type or a non-box
+//      object in the other slot). For a generic record each instantiation
+//      mints its own vtable (specializedBoxVtableFor), so #1939 leg 2's
+//      invariant — same-instantiation boxes match, siblings do not — holds
+//      under vtable identity exactly as it did under descriptor identity.
 //   3. Loads both payloads (two words past the box header, BZ_BOX layout) and
 //      runs emitStructEquality (record) or an integer ICmpEQ (enum), mirroring
 //      the statically-typed §8.3 value-equality path.
@@ -26110,23 +26114,31 @@ llvm::Function* Emitter::boxRecordEqualsThunkCore(const sema::TypeSymbol* ts,
         builder_.CreateCondBr(
             builder_.CreateICmpEQ(other, nullP), endBB, notNullBB);
 
-        // other is non-null: load its vtable[0] (the type descriptor pointer).
+        // other is non-null: compare word 0 of `other` against word 0 of
+        // `self` — ONE load each, no second dereference.
+        // ⚠ fix #2980 (spec §8.3, the bz$uniteq defect class): pre-fix this
+        // loaded word 0 of `other` as a vtable and then DEREFERENCED IT to
+        // read vtable[0] (the descriptor) — a global-buffer-overflow under
+        // ASan when `other` is a `%bz.string` (whose word 0 is the char-data
+        // pointer, not a vtable), invisible to the plain oracle. `Equals` per
+        // §8.3 dispatches through `lowerObjectEquals`, which sends a NON-string,
+        // non-null `other` of ANY Object kind here, so a `%bz.string` operand
+        // reaches this thunk (confirmed via IR: `bz$boxeq$<T>` is the indirect
+        // callee at the vtable Equals slot). Comparing the loaded vtable
+        // pointers is exactly as discriminating as comparing the loaded
+        // descriptors they point to: a box's word 0 IS its vtable, and the
+        // vtable uniquely identifies the type (for a generic record each
+        // instantiation mints its own vtable via specializedBoxVtableFor, so
+        // #1939 leg 2's invariant — same-instantiation boxes match, sibling
+        // instantiations do not — holds under vtable identity exactly as it
+        // did under descriptor identity). Same one-load fix bz$uniteq already
+        // took (it compared against a static global because the unit type has
+        // no instantiations; `self`'s own word 0 is the general form).
         builder_.SetInsertPoint(notNullBB);
         llvm::Value* otherVtbl = builder_.CreateLoad(ptrTy(), other, "beq.ovtbl");
-        llvm::Value* otherDesc = builder_.CreateLoad(ptrTy(), otherVtbl, "beq.odesc");
-        // #1939 leg 2 (§9.1/§12.9): compare against SELF's own loaded
-        // descriptor, not the static shared `descArray_[ts]`. A constructed
-        // generic record box carries a per-monomorphization slot-0 chain
-        // (specializedBoxVtableFor, cached per instantiation), so
-        // same-instantiation boxes compare equal-typed and SIBLING
-        // instantiations do not — pre-#1939 the shared descriptor gate
-        // erased-matched siblings and then compared bytes of MISMATCHED
-        // layouts. For a non-generic record/enum both loads yield the shared
-        // descriptor: behavior unchanged.
         llvm::Value* selfVtbl = builder_.CreateLoad(ptrTy(), self, "beq.svtbl");
-        llvm::Value* myDesc = builder_.CreateLoad(ptrTy(), selfVtbl, "beq.sdesc");
         builder_.CreateCondBr(
-            builder_.CreateICmpEQ(otherDesc, myDesc), checkBB, endBB);
+            builder_.CreateICmpEQ(otherVtbl, selfVtbl), checkBB, endBB);
 
         // Types match: load both payloads (offset 2 words) and compare.
         builder_.SetInsertPoint(checkBB);
@@ -26275,8 +26287,9 @@ llvm::Constant* Emitter::boxRecordHashThunkFor(
 
 // §9.1 / §9.6 (#961): per-primitive structural Equals thunk `i1(ptr this, ptr other)`
 // for a boxed PRIMITIVE (int, bool, char, …). Guards `other` is a box of the
-// same primitive (same vtable[0] descriptor), then loads both scalar payloads
-// and compares by value (ICmpEQ for integers, FCmpOEQ for floats).
+// same primitive (same vtable pointer — fix #2980, the bz$uniteq one-load
+// device, no second dereference), then loads both scalar payloads and compares
+// by value (ICmpEQ for integers, FCmpOEQ for floats).
 llvm::Constant* Emitter::primBoxEqualsThunk(sema::PrimitiveType prim,
                                             const char* nm) {
     auto it = primBoxEqualsFns_.find(nm);
@@ -26302,14 +26315,24 @@ llvm::Constant* Emitter::primBoxEqualsThunk(sema::PrimitiveType prim,
         builder_.CreateCondBr(
             builder_.CreateICmpEQ(other, nullP), endBB, notNullBB);
 
-        // Load other's vtable[0] and compare with this primitive's descriptor.
+        // ONE load each: compare word 0 of `other` against word 0 of `self`.
+        // ⚠ fix #2980 (spec §8.3, the bz$uniteq defect class): pre-fix this
+        // loaded word 0 of `other` as a vtable and then DEREFERENCED IT to
+        // read vtable[0] (the descriptor) — a global-buffer-overflow under ASan
+        // when `other` is a `%bz.string` (whose word 0 is the char-data pointer,
+        // not a vtable). `Equals` per §8.3 dispatches through lowerObjectEquals,
+        // which sends a non-string, non-null `other` of ANY Object kind here,
+        // so a `%bz.string` operand reaches this thunk (confirmed via IR:
+        // `bz$primeq$int` is the indirect callee at the vtable Equals slot).
+        // Comparing the loaded vtable pointers is exactly as discriminating as
+        // comparing the descriptors: `self`'s word 0 IS this primitive's box
+        // vtable, and a matching `other` carries the same vtable. Same one-load
+        // fix bz$uniteq already took.
         builder_.SetInsertPoint(notNullBB);
         llvm::Value* otherVtbl = builder_.CreateLoad(ptrTy(), other, "peq.ovtbl");
-        llvm::Value* otherDesc = builder_.CreateLoad(ptrTy(), otherVtbl, "peq.odesc");
-        llvm::Value* myDesc = llvm::ConstantExpr::getPointerCast(
-            primBoxDesc_.at(nm), ptrTy());
+        llvm::Value* selfVtbl = builder_.CreateLoad(ptrTy(), self, "peq.svtbl");
         builder_.CreateCondBr(
-            builder_.CreateICmpEQ(otherDesc, myDesc), checkBB, endBB);
+            builder_.CreateICmpEQ(otherVtbl, selfVtbl), checkBB, endBB);
 
         // Same primitive type: load both payloads and compare.
         builder_.SetInsertPoint(checkBB);
@@ -27342,13 +27365,24 @@ llvm::GlobalVariable* Emitter::ensureInlineArrayBoxVtable(
             builder_.CreateICmpEQ(other, nullP), endBB, notNullBB);
 
         builder_.SetInsertPoint(notNullBB);
+        // ⚠ fix #2980 (spec §8.3, the bz$uniteq defect class): ONE load each —
+        // compare word 0 of `other` against word 0 of `self`. Pre-fix this
+        // loaded word 0 of `other` as a vtable and then DEREFERENCED IT to
+        // read vtable[0] (the descriptor) — a global-buffer-overflow under ASan
+        // when `other` is a `%bz.string` (whose word 0 is the char-data pointer,
+        // not a vtable). `Equals` per §8.3 dispatches through lowerObjectEquals,
+        // which sends a non-string, non-null `other` of ANY Object kind here
+        // (confirmed via IR: `bz$iaeq$_3_int` is the indirect callee at the
+        // vtable Equals slot). Comparing the loaded vtable pointers is exactly
+        // as discriminating as comparing the descriptors: `self`'s word 0 IS
+        // this inline-array type's box vtable, and a matching `other` carries
+        // the same vtable. Same one-load fix bz$uniteq already took.
         llvm::Value* otherVtbl =
             builder_.CreateLoad(ptrTy(), other, "iaeq.ovtbl");
-        llvm::Value* otherDesc =
-            builder_.CreateLoad(ptrTy(), otherVtbl, "iaeq.odesc");
-        llvm::Value* myDesc = llvm::ConstantExpr::getPointerCast(desc, ptrTy());
+        llvm::Value* selfVtbl =
+            builder_.CreateLoad(ptrTy(), self, "iaeq.svtbl");
         builder_.CreateCondBr(
-            builder_.CreateICmpEQ(otherDesc, myDesc), checkBB, endBB);
+            builder_.CreateICmpEQ(otherVtbl, selfVtbl), checkBB, endBB);
 
         builder_.SetInsertPoint(checkBB);
         llvm::Value* selfPay = builder_.CreateGEP(
