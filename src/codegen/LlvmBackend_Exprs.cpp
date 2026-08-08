@@ -1899,6 +1899,101 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 return res;
             }
         }
+        // fix #2990 (§31.4 / §12.1 / §7.5, v0.240): `q?.M` on a nullable
+        // exception-typed receiver, where M is one of the four §31.4 header
+        // members (Message / StackTrace / CauseChain / ParamName). These carry
+        // NO storage FieldSymbol — the `.` form reads them through the
+        // byte-offset header GEPs in the MemberAccessExpr arm below (the
+        // `ma->member == "Message"` handler at CG22+ and the
+        // `isInheritedExcSurfaceAccess` block for the other three). That arm
+        // never runs for a `?.` access: a NullCondMemberExpr is a distinct AST
+        // node, so the access reached this storage-field path,
+        // `storageMemberOf` returned null, and the `!ms` guard at FINDING [3]
+        // returned nullptr — silently dropping the whole enclosing statement
+        // (no diagnostic at any severity, exit 0). MEASURED on 8eab3f8: the
+        // middle `Console.WriteLine(q?.Message ?? …)` line printed nothing at
+        // all for a non-null receiver carrying `Message = "zz"`.
+        //
+        // Route the `?.` form through the SAME header reads, gated by the SAME
+        // receiver-type predicates the `.` form uses (`isBuiltinExceptionTypeRef`
+        // / `hasBuiltinExceptionBase`) — the one fact sema already computes that
+        // decides how the access lowers — with a null-receiver short-circuit
+        // first per §7.5 (the result is always nullable, and a null receiver
+        // yields null). The `exprSymbol == nullptr` gate mirrors
+        // `isInheritedExcSurfaceAccess`: a subclass that DECLARES its own member
+        // of the same name resolves to a Symbol and is excluded, so this never
+        // shadows a declared property with a header read. (`this?.M` is not a
+        // concern: `this` is non-nullable, so `?.` on it is rejected upstream.)
+        //
+        // All four §31.4 members are reference-typed (string / Array<Exception
+        // Info>), so the §7.5 (always-nullable) result is a pointer that is null
+        // when the receiver is null and the header value otherwise — the same
+        // null-pointer-as-null representation FINDING [3] uses for a
+        // reference-typed storage member.
+        if (nm->member == "Message" || nm->member == "StackTrace" ||
+            nm->member == "CauseChain" || nm->member == "ParamName") {
+            const sema::TypeRef* ncRtt = ctx_.exprType(*nm->target);
+            bool ncExcReceiver = false;
+            if (ncRtt && ncRtt->kind == sema::TypeRef::Kind::Named &&
+                ctx_.exprSymbol(e) == nullptr) {
+                if (isBuiltinExceptionTypeRef(ncRtt))
+                    ncExcReceiver = true;
+                else if (ncRtt->declaration &&
+                         hasBuiltinExceptionBase(ncRtt->declaration))
+                    ncExcReceiver = true;
+            }
+            if (ncExcReceiver) {
+                llvm::Value* excObj = lowerExpr(*nm->target);
+                if (!excObj || !excObj->getType()->isPointerTy()) return nullptr;
+                auto* ncEntryBB = builder_.GetInsertBlock();
+                auto* ncAccessBB = llvm::BasicBlock::Create(
+                    llvm_, "ncexc.access", currentFn_);
+                auto* ncEndBB = llvm::BasicBlock::Create(
+                    llvm_, "ncexc.end", currentFn_);
+                llvm::Value* ncIsNull = builder_.CreateICmpEQ(
+                    excObj, llvm::ConstantPointerNull::get(ptrTy()));
+                builder_.CreateCondBr(ncIsNull, ncEndBB, ncAccessBB);
+                builder_.SetInsertPoint(ncAccessBB);
+                // The header GEPs mirror the MemberAccessExpr arm below
+                // (classStruct inserts all four slots at the SAME byte offsets
+                // in a user subclass — Message@8, CauseChain@24, ParamName@32).
+                auto* i8Ty = llvm::Type::getInt8Ty(llvm_);
+                llvm::Value* ncAccessVal = nullptr;
+                if (nm->member == "StackTrace") {
+                    // §31.4 `StackTrace: string` — "" stub (no debug info yet),
+                    // matching the `.` form. The receiver was loaded for the
+                    // null check above; its bytes are not read.
+                    ncAccessVal = lowerStringLiteral("\"\"", false);
+                } else {
+                    int64_t ncOff = nm->member == "Message"    ? kExcMsgOffset
+                                  : nm->member == "CauseChain" ? kExcCauseOffset
+                                  : /*ParamName*/              kExcParamOffset;
+                    llvm::Value* ncSlot = builder_.CreateGEP(
+                        i8Ty, excObj, builder_.getInt64(ncOff));
+                    llvm::Value* ncPtr =
+                        builder_.CreateLoad(ptrTy(), ncSlot);
+                    if (nm->member == "Message") {
+                        // §31.4: null message (no `message` given) → "" per the
+                        // `.` form's contract.
+                        auto* ncMsgNull = builder_.CreateICmpEQ(
+                            ncPtr, llvm::ConstantPointerNull::get(ptrTy()));
+                        ncAccessVal = builder_.CreateSelect(
+                            ncMsgNull, lowerStringLiteral("\"\"", false),
+                            ncPtr);
+                    } else {
+                        ncAccessVal = ncPtr;
+                    }
+                }
+                auto* ncAccessEnd = builder_.GetInsertBlock();
+                builder_.CreateBr(ncEndBB);
+                builder_.SetInsertPoint(ncEndBB);
+                auto* ncPhi = builder_.CreatePHI(ptrTy(), 2);
+                ncPhi->addIncoming(
+                    llvm::ConstantPointerNull::get(ptrTy()), ncEntryBB);
+                ncPhi->addIncoming(ncAccessVal, ncAccessEnd);
+                return ncPhi;
+            }
+        }
         // §7.5 / FINDING [3]: the receiver is a class/string reference, so a null
         // receiver is the null pointer. Resolve the accessed member to either a
         // storage field (class receiver) or the `Length` intrinsic (string
