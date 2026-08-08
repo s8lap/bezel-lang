@@ -69,7 +69,63 @@
 #                            (default 50 — the full pass then does the work anyway)
 set -u
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate: not in a git repo" >&2; exit 2; }
+# Scratch dir + verdict file path are set up BEFORE any preflight exit can fire,
+# so the verdict writer (gate_write_verdict, below) has a path on every exit path
+# (Phase 3, #3002). $S was previously set after the mode/builder preflights, so
+# early exits (exit 64/2 below) could not write a verdict — now they can.
+S=/var/tmp/bezel-scratch; mkdir -p "$S"
+GATE_VERDICT_FILE="${GATE_VERDICT_FILE:-$S/gate-verdict.json}"
 MODE="${1:-default}"
+
+# ---------------------------------------------------------------------------
+# gate_write_verdict — the authoritative verdict file writer (Phase 3, #3002).
+#
+# THE EXIT-CODE-TRAP CLASS: a backgrounded `gate_and_push.sh > log; echo EXIT=$?`
+# reports the WRAPPER's exit, not the gate's. The gate's real verdict is smeared
+# across ($?, banner greps, a status file) and they can disagree (#3002: rc=0
+# over 31% coverage; #2633: rc=0 under an undercount banner). This writes ONE
+# authoritative gate-verdict.json on EVERY exit, atomically, that Phase 3c
+# consumers will read instead of $?/greps.
+#
+# PHASE 3 IS ADDITIVE: the write lands here, but NO consumer switches yet. The
+# existing $?/banner/status-file outputs are UNCHANGED (back-compat). The file
+# is observation-only until N gates prove it matches the gate's outcome.
+#
+# Best-effort: the `|| true` ensures a verdict-write hiccup NEVER changes the
+# gate's exit code (the file is not load-bearing until Phase 3c switches a
+# consumer to read it). per #3002 / the exit-code-trap.
+# ---------------------------------------------------------------------------
+gate_write_verdict() { # rc [total_s] — write gate-verdict.json; best-effort, never changes exit
+  local rc="$1" total="${2:-0}"
+  # Detect truncation: the "## GATE FAILURE: shard crash / undercount" banner
+  # from run_parallel.sh:306 (Plan-A invariant 1.19: gate_full_cycle distrusts
+  # rc=0+undercount-banner and retries) OR a coverage short (rc==3, #3002). The
+  # truncated flag only turns an rc==0 pass into POISONED, but is recorded in
+  # integrity for all exit codes so a consumer sees the full picture.
+  local trunc=0 ubanner=0
+  if [ -r "$S/gate_shard.log" ] && grep -q 'shard crash / undercount' "$S/gate_shard.log" 2>/dev/null; then
+    trunc=1; ubanner=1
+  fi
+  [ "$rc" -eq 3 ] && trunc=1
+  local oracle="plain"; [ "${ASAN:-0}" = "1" ] && oracle="asan"
+  local -a vargs=(--path "$GATE_VERDICT_FILE" --rc "$rc"
+    --head "${GATE_HEAD:-}" --mode "${MODE:-}" --oracle "$oracle"
+    --started-epoch "${GATE_EPOCH:-0}" --total-s "$total")
+  local _fp="${FAILED_PHASE:-}"; [ -n "$_fp" ] && vargs+=(--failed-phase "$_fp")
+  [ "$trunc" -eq 1 ] && vargs+=(--truncated)
+  [ "$ubanner" -eq 1 ] && vargs+=(--undercount-banner)
+  [ "${SHARD_COUNT:-0}" -gt 0 ] 2>/dev/null && vargs+=(--shard-count "$SHARD_COUNT")
+  [ "${SHARD_REPORTED_S:-0}" -gt 0 ] 2>/dev/null && vargs+=(--shard-reported-s "$SHARD_REPORTED_S")
+  # Coverage: pass only when the variable is SET (measured). Unset → omitted →
+  # None in the JSON, per #3010 (an unmeasured number emits null, never 0, so a
+  # harvest failure and a genuine zero stay distinguishable).
+  [ -n "${COV_GTESTS+x}" ] && vargs+=(--coverage-gtests "$COV_GTESTS")
+  [ -n "${COV_LITTESTS+x}" ] && vargs+=(--coverage-littests "$COV_LITTESTS")
+  [ -n "${GATE_EXPECTED_GTESTS+x}" ] && vargs+=(--expected-gtests "$GATE_EXPECTED_GTESTS")
+  [ -n "${ASAN_ERRS+x}" ] && vargs+=(--asan-errors "$ASAN_ERRS")
+  [ -n "${ARB_SUSPECTS+x}" ] && vargs+=(--arbitration-suspects "$ARB_SUSPECTS")
+  PYTHONPATH=scripts python3 -m gate.verdict write "${vargs[@]}" 2>/dev/null || true
+}
 # fix #3011: REJECT AN UNRECOGNISED MODE. `MODE` has exactly one semantic use
 # (`[ "$MODE" = "--full" ] && ASAN=1`, below), so before this check ANY other
 # argument ran a PLAIN gate while every log line, the status file, and the
@@ -92,9 +148,9 @@ case "$MODE" in
     echo "gate: UNRECOGNISED MODE '$MODE'" >&2
     echo "  known modes: default | --quick | --no-asan (all plain) | --full (ASan)" >&2
     echo "  Refusing rather than running a plain gate under a name you did not mean." >&2
+    gate_write_verdict 64 0
     exit 64 ;;
 esac
-S=/var/tmp/bezel-scratch; mkdir -p "$S"
 DH=scripts/dev_heavy.sh
 
 # Zero-builders preflight (cold-cache flake defense): a --full gate run
@@ -110,6 +166,7 @@ BUILDERS='cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests(_[a-z]+)?'
 if [ -z "${GATE_SKIP_BUILDER_CHECK:-}" ] && pgrep -x "$BUILDERS" >/dev/null 2>&1; then
   echo "GATE ABORT: heavy build/test process(es) already active — gating now risks the cold-cache flake (zero-builders rule). Stop them, or set GATE_SKIP_BUILDER_CHECK=1:" >&2
   pgrep -ax "$BUILDERS" >&2 || true
+  gate_write_verdict 2 0
   exit 2
 fi
 
@@ -335,6 +392,12 @@ gate_finish() { # rc -> print aligned summary + append JSON; must NOT change exi
     "$([ -n "$FAILED_PHASE" ] && printf '"%s"' "$FAILED_PHASE" || echo null)" \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo '')" \
     > "${GATE_STATUS_FILE:-$S/gate-status.json}" 2>/dev/null || true
+  # Phase 3 (#3002): write the AUTHORITATIVE verdict file — ONE atomically-
+  # written gate-verdict.json that Phase 3c consumers will read instead of
+  # $?/banner greps. ADDITIVE: no consumer reads it yet (observation-only
+  # prove-out); the existing $?/banner/status-file outputs above are unchanged.
+  # Best-effort `|| true`: a verdict-write hiccup must never change the exit code.
+  gate_write_verdict "$rc" "$total"
 }
 
 fail() { FAILED_PHASE="$1"; echo "== GATE FAIL: $1 =="; exit 1; }

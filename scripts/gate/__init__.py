@@ -14,6 +14,11 @@ Phase 2 (`summary.py`, #3012) reads the per-shard JSON summaries the C++
 harness emits (BEZEL_SHARD_SUMMARY) and compares them against the legacy
 stderr summary line — observation-only equivalence data for the eventual
 reader switch (Phase 2c).
+
+Phase 3 (`verdict.py`, #3002) writes an authoritative `gate-verdict.json` on
+every gate exit — ONE atomically-written file that fixes the exit-code-trap
+class (a backgrounded wrapper's `$?` is not the gate's). ADDITIVE: no consumer
+reads it yet (Phase 3c switches the readers after a prove-out).
 """
 
-__all__ = ["io", "summary"]
+__all__ = ["io", "summary", "verdict"]
