@@ -1,8 +1,16 @@
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
+#include <string>
+#include <unistd.h>
+
+#include <fcntl.h>
+
 #include <fstream>
 #include <iostream>
-#include <string>
 #include <unordered_set>
 
 #include "test_harness.hpp"
@@ -43,6 +51,13 @@
 //                                 per-shard partitions have no overlap and no
 //                                 gap (concatenate every binary's enumeration
 //                                 and compare against the whole registry).
+//   BEZEL_SHARD_SUMMARY=<path>  — ALSO write a structured JSON shard summary to
+//                                 <path> (#3012 Phase 2a; additive, off by
+//                                 default). The legacy summary line above is
+//                                 unchanged and stays authoritative; the JSON
+//                                 is the foundation for the gate reading
+//                                 structured data (#3012 Phase 2c). Off when
+//                                 unset → behaviour is byte-identical to before.
 //
 // Sharding lets a parallel driver (tests/run_parallel.sh) launch n copies of
 // this binary across cores; each test process is self-contained (its own LLVM
@@ -51,7 +66,95 @@
 // The loop here mirrors bezel::test::runAll() so the shard variant lives in this
 // single TU — editing it does not recompile the test translation units that
 // include the harness header.
-int main() {
+
+// ── per #3012 Phase 2a: structured shard-summary (additive, off by default) ──
+// When BEZEL_SHARD_SUMMARY=<path> is set, main() ALSO writes a JSON object
+// there (the fields run_parallel.sh greps out of the legacy line below). The
+// legacy "N passed, M failed (shard i/n), T total" stderr line is UNCHANGED and
+// remains the gate's authoritative source; the JSON is the foundation for
+// Phase 2c (switch the gate's reader once N gates prove agreement). Off unless
+// the env is set, so the default build is byte-identical to before.
+
+// Minimal JSON string escape — the only string field is the binary path
+// (argv[0]). Escapes the characters that would break the document; printable
+// ASCII paths pass through unchanged.
+static std::string jsonEscape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:   out += c; break;
+        }
+    }
+    return out;
+}
+
+// Atomically install `content` at `path`: write a temp in the SAME directory
+// (so the rename is one-filesystem), fsync the temp's data, then rename it into
+// place (atomic on POSIX). Mirrors scripts/gate/io.py's atomic_json_write and
+// aot_support.hpp's durableRename/atomicWriteStats — the #3000/#3003/#3009
+// invariant: a reader either sees the whole new document or the prior state,
+// never a partial write. Best-effort on any I/O failure (no file left).
+static void atomicWriteShardSummary(const std::string& path,
+                                    const std::string& content) {
+    const std::size_t slash = path.find_last_of('/');
+    const std::string dir = (slash == std::string::npos)
+                                ? std::string(".") : path.substr(0, slash);
+    const std::string base = (slash == std::string::npos)
+                                 ? path : path.substr(slash + 1);
+    // Unique temp name per process + per call (a process can emit at most once,
+    // but the counter keeps two writers in the same dir from colliding).
+    static std::atomic<unsigned long long> ctr{0};
+    const std::string tmp = dir + "/" + base + ".tmp." +
+                            std::to_string(::getpid()) + "." +
+                            std::to_string(
+                                ctr.fetch_add(1, std::memory_order_relaxed));
+    const int fd = ::open(tmp.c_str(),
+                          O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    bool ok = true;
+    std::size_t off = 0;
+    while (off < content.size()) {
+        const ssize_t n = ::write(fd, content.data() + off,
+                                  content.size() - off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ok = false;
+            break;
+        }
+        off += static_cast<std::size_t>(n);
+    }
+    if (ok) {
+        // Durability: fsync the temp's DATA before the rename so a crash between
+        // the byte copy and the rename cannot install a truncated document
+        // (#3009 — the load-bearing half of durableRename).
+        while (::fsync(fd) != 0 && errno == EINTR) {}
+    }
+    ::close(fd);
+    if (!ok) { ::unlink(tmp.c_str()); return; }
+    if (::rename(tmp.c_str(), path.c_str()) != 0) {
+        ::unlink(tmp.c_str());
+        return;
+    }
+    // Best-effort directory fsync (some filesystems refuse; harmless — the data
+    // fsync above is what prevents a truncated entry).
+    const int dfd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dfd >= 0) {
+        while (::fsync(dfd) != 0 && errno == EINTR) {}
+        ::close(dfd);
+    }
+}
+
+int main(int argc, char** argv) {
+    // Wall-clock start for the structured summary's elapsed_s field (#3012
+    // Phase 2a). Captured before any test work so it reflects the whole shard.
+    const auto t0 = std::chrono::steady_clock::now();
+
     const char* filterEnv = std::getenv("BEZEL_TEST_FILTER");
     const std::string filter = filterEnv ? filterEnv : "";
 
@@ -168,5 +271,52 @@ int main() {
     if (sharded)
         std::cout << " (shard " << shardIndex << "/" << shardCount << ")";
     std::cout << ", " << ::bezel::test::registry().size() << " total\n";
+
+    // per #3012 Phase 2a: ALSO emit a structured JSON shard summary to the path
+    // named by BEZEL_SHARD_SUMMARY (off unless set). The legacy summary line
+    // above is UNCHANGED and remains the gate's authoritative source; this JSON
+    // is the foundation for Phase 2c (switch the reader once N gates prove
+    // agreement, observation-only until then). Atomic (temp + fsync + rename)
+    // so run_parallel's agreement check never reads a partial document.
+    const char* sumEnv = std::getenv("BEZEL_SHARD_SUMMARY");
+    if (sumEnv && *sumEnv) {
+        const int rc = (failed == 0) ? 0 : 1;
+        const double elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+        const char* bin = (argc > 0 && argv[0]) ? argv[0] : "";
+        // Mirrors forceSanitizeAddress (#1822): generated-code ASan is forced
+        // when BEZEL_AOT_FORCE_SANITIZE is address/asan/1 (the --full oracle).
+        const char* asanEnv = std::getenv("BEZEL_AOT_FORCE_SANITIZE");
+        const bool asan = asanEnv && *asanEnv &&
+                          (std::string(asanEnv) == "address" ||
+                           std::string(asanEnv) == "asan" ||
+                           std::string(asanEnv) == "1");
+        char elapsedBuf[32];
+        std::snprintf(elapsedBuf, sizeof(elapsedBuf), "%.3f", elapsed);
+        std::string json = "{\"schema\":\"bezel.shard-summary.v1\",";
+        json += "\"binary\":\"";
+        json += jsonEscape(bin);
+        json += "\",\"shard_index\":";
+        json += std::to_string(shardIndex);
+        json += ",\"shard_count\":";
+        json += std::to_string(shardCount);
+        json += ",\"passed\":";
+        json += std::to_string(passed);
+        json += ",\"failed\":";
+        json += std::to_string(failed);
+        json += ",\"total\":";
+        json += std::to_string(::bezel::test::registry().size());
+        json += ",\"selected\":";
+        json += std::to_string(selected);
+        json += ",\"asan_mode\":";
+        json += asan ? "true" : "false";
+        json += ",\"rc\":";
+        json += std::to_string(rc);
+        json += ",\"elapsed_s\":";
+        json += elapsedBuf;
+        json += "}\n";
+        atomicWriteShardSummary(std::string(sumEnv), json);
+    }
+
     return failed == 0 ? 0 : 1;
 }
