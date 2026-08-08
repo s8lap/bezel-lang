@@ -170,6 +170,14 @@ const Entry kWarningDegrades[] = {
      "it still substitutes when it fires is unchanged: a null pointer on the "
      "§3/#605 permissive surface"},
 
+    {"src/codegen/LlvmBackend_Setup.cpp", "#2992",
+     Disposition::WrongValue,
+     "the end-of-chain guard emits the note and substitutes NOTHING — it falls "
+     "through with the local's real value intact (registerUsingDisposal returns "
+     "with no store altered). The harm it flags is a missing disposal arm, a "
+     "bounded recoverable LEAK, never a zero/null read into a pointer slot; it "
+     "is a compiler-bug alarm, not a value-substituting degrade"},
+
     {"src/codegen/LlvmBackend_Stmts.cpp", "#2491",
      Disposition::UnsafePointer,
      "the ReturnStmt face, which carries the family's full rationale: same "

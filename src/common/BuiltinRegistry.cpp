@@ -336,6 +336,64 @@ bool isVtableLessBuiltinClassName(std::string_view n) {
            !contains(kBuiltinInterfaceHeads, n);
 }
 
+// fix #2992 (§28.3 / §28.9 / §28.10, v0.240): the built-in type heads whose
+// `using var` carries a REAL §28.10 disposal obligation — the set the §28.10
+// vacuity lint (rhsIsDisposableClassType Path 2) uses to decide a `using var`
+// is NOT vacuous, and that the codegen auto-drop chain
+// (registerUsingDisposal) consults at its end-of-chain guard to make a silent
+// fallthrough loud. See the header for why this is the shared authority.
+//
+// This is the EXACT population that lived inline in rhsIsDisposableClassType's
+// Path 2 (Ownership.cpp ~5046) pre-#2992 — lifted verbatim, not reconciled
+// with codegen's broader chain-claimed set. The two DISAGREE on 13 names (the
+// borrowing collections Array/Stack/Queue/Set/SortedSet/Dictionary/
+// SortedDictionary/LinkedList, plus Stopwatch, Random, Atomic, AtomicInteger,
+// Buffer): every one is claimed by the chain but absent here, so a factory-
+// call `using var x := MakeArr()` over `Array<T>` fires a false-positive
+// vacuity warning (measured 2026-08-09 on d2a3d3e). Reconciling them requires
+// a design decision about whether borrowing collections belong in the LINT's
+// disposable set — #2695 deliberately excluded them so the lint fires on a
+// bound-then-pinned alias whose `const` remedy compiles (the lint's coherence
+// invariant). That decision is filed separately; the table here matches the
+// lint's current table so the lift is behaviour-preserving.
+// per §28.3 / §28.9 / §28.10, fix #2992
+constexpr std::array<std::string_view, 41> kDisposableBuiltinHeadNames = {
+    // stdlib §3.1 / spec §28.9 (#2190): StringBuilder owns its heap parts array.
+    "StringBuilder",
+    // §2.15 concrete serializers/deserializers (#2073 rework 3b).
+    "BinarySerializer", "BinaryDeserializer",
+    "JsonSerializer", "JsonDeserializer",
+    // §32.6 / stdlib §10: CString/WString/RawBytes carry a free() obligation.
+    "CString", "WString", "RawBytes",
+    // stdlib §7.2 (#645): FileStream — flush + close on dispose.
+    "FileStream",
+    // §29.1/§29.2: the iteration-protocol sentinel family (#2385/#2451).
+    "IEnumerable", "IEnumerator",
+    "IOwningEnumerable", "IOwningEnumerator",
+    "IAsyncEnumerable", "IAsyncEnumerator",
+    "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
+    // §30.15 channels; §24.3 events; §2.11 subscription.
+    "Channel", "ChannelSender",
+    "EventSource", "AsyncEventSource",
+    "Subscription",
+    // §6.10 nursery; §6.1 cancellation.
+    "TaskScope", "CancellationTokenSource",
+    // §6.2/§6.3 sync primitives.
+    "Mutex", "Lock", "Semaphore", "SemaphoreToken",
+    // §30 tasks; §28.13 Shared/Weak.
+    "OwningTask", "Task", "Shared", "Weak",
+    // §28.11 owning collections (the borrowing variants are intentionally
+    // absent — see the header comment and #2695).
+    "OwningArray", "OwningDictionary", "OwningSet", "OwningStack",
+    "OwningQueue", "OwningLinkedList", "OwningBuffer",
+    // §6.6 task-completion sources.
+    "TaskCompletionSource", "OwningTaskCompletionSource",
+};
+
+bool isDisposableBuiltinHeadName(std::string_view head) {
+    return contains(kDisposableBuiltinHeadNames, head);
+}  // per §28.3 / §28.9 / §28.10, fix #2992
+
 std::string_view builtinExceptionParentOf(std::string_view name) {
     for (const auto& edge : kBuiltinExceptionHierarchy)
         if (edge.name == name) return edge.parent;

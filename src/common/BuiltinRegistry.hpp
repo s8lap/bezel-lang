@@ -174,6 +174,26 @@ bool isReservedBuiltinTypeName(std::string_view n);
 // jump. // per §8.1 / §8.5 / §28.2 / §28.9
 bool isVtableLessBuiltinClassName(std::string_view n);
 
+// fix #2992 (§28.3 / §28.9, v0.240): is `head` a reserved built-in type whose
+// `using var` carries a REAL §28.10 disposal obligation? This is the SHARED
+// authority that previously lived as a private table inside
+// `MethodOwnership::rhsIsDisposableClassType`'s Path 2 (the §28.10 vacuity-lint
+// gate, Ownership.cpp ~5046). Both the lint and the codegen auto-drop chain's
+// end-of-chain guard (registerUsingDisposal, LlvmBackend_Setup.cpp) now consult
+// this table, so a built-in in this set that no disposal arm claims becomes a
+// compiler-detected hole rather than a silent leak.
+//
+// The table is lifted VERBATIM from the lint's pre-#2992 Path 2 — it is NOT
+// reconciled with codegen's broader chain-claimed set. The two DISAGREE on 13
+// names (the borrowing collections, Stopwatch, Random, Atomic/AtomicInteger,
+// Buffer): every one is chain-claimed but absent here. This produces a false-
+// positive vacuity warning on factory-call forms of those types (measured
+// 2026-08-09 on d2a3d3e). Reconciling requires a design decision — #2695
+// deliberately excluded the borrowing collections from this set so the lint
+// fires on a bound-then-pinned alias whose `const` remedy compiles — filed
+// separately. // per §28.3 / §28.9 / §28.10, fix #2992
+bool isDisposableBuiltinHeadName(std::string_view head);
+
 // §31.4 / #1621: given a built-in exception type's simple name, return the
 // name of its DIRECT parent in the built-in exception hierarchy (e.g.
 // "FileNotFoundException" -> "IOException"), or an empty string_view if

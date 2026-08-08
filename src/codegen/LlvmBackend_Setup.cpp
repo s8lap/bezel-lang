@@ -13990,6 +13990,75 @@ void Emitter::registerUsingDisposal(const ast::LocalDecl* ld) {
         disposeStack_.back().push_back(d);
         return;
     }
+
+    // fix #2992 (§28.3 / §28.9, v0.240): END-OF-CHAIN GUARD. Every arm above
+    // tried and none claimed this `using var` local. If the local's type is a
+    // built-in CLASS that owns heap (a vtable-less builtin that is NOT a value
+    // type), the chain has a HOLE — a built-in that owns heap but no arm
+    // releases it. Pre-#2992 this fell through in SILENCE (no release, no
+    // diagnostic) — the structural defect behind #2921 (Random) and #2973
+    // (Atomic), found twice. The guard makes the NEXT omission loud rather than
+    // the next leak silent: an `internal:` note, the codebase's degrade-site
+    // convention (#2434/#2491), not a hard error (a bounded leak is recoverable;
+    // aborting the compile is not — the same trade recorded on #2874/#2823).
+    //
+    // The population is BROADER than the §28.10 vacuity lint's disposable table
+    // (common::isDisposableBuiltinHeadName, 41 names): the lint's table is
+    // narrower by design (#2695 deliberately excluded the borrowing collections
+    // so the lint fires on a bound-then-pinned alias whose `const` remedy
+    // compiles). The guard uses the DERIVED predicate
+    // common::isVtableLessBuiltinClassName (all reserved built-in classes minus
+    // interface heads) and subtracts the known VALUE types (which carry no
+    // disposal obligation, §28.9). The subtraction fails SAFE: a new value type
+    // forgotten here triggers a false `internal:` note (a bounded alarm), never
+    // a silent leak — the same trade isVtableLessBuiltinClassName itself makes.
+    // per §28.3 / §28.9, fix #2992
+    {
+        std::string_view headName;
+        const sema::TypeRef* headTy = nullptr;
+        if (ld->type) {
+            headTy = ctx_.resolvedType(*ld->type);
+            headName = builtinTypeName(headTy);
+        }
+        if (headName.empty() && ld->initializer) {
+            if (auto* ne =
+                    dynamic_cast<const ast::NewExpr*>(ld->initializer.get()))
+                headName = newExprBuiltinHead(ne);
+            if (headName.empty()) {
+                headTy = ctx_.exprType(*ld->initializer);
+                headName = builtinTypeName(headTy);
+            }
+        }
+        if (!headName.empty() &&
+            common::isVtableLessBuiltinClassName(headName)) {
+            // Exclude value types — they carry no disposal obligation (§28.9).
+            // Path A: builtinClassSym sets isValueBuiltin (DateTime, TimeSpan,
+            // Guid, CancellationToken, Range, DateOnly, TimeOnly).
+            if (headTy && headTy->declaration &&
+                headTy->declaration->isValueBuiltin)
+                return;
+            // Path B: declaration-less value builtins — check the head name.
+            // A small, stable set (the §2.5 / §9.8 / §32.7 value types). These
+            // never own heap; a `using var` of one is vacuous (the §28.10 lint
+            // fires, not this guard).
+            if (headName == "Guid" || headName == "DateTime" ||
+                headName == "TimeSpan" || headName == "DateOnly" ||
+                headName == "TimeOnly" || headName == "Range" ||
+                headName == "CancellationToken" || headName == "JsonOptions" ||
+                headName == "IntPtr" || headName == "UIntPtr" ||
+                headName == "ArraySpan" || headName == "ReadOnlyArraySpan" ||
+                headName == "Span" || headName == "ReadOnlySpan" ||
+                headName == "ReadOnlyStringSpan" ||
+                headName == "ExceptionInfo" || headName == "LinkedListNode")
+                return;
+            ctx_.diagnostics().report(
+                Severity::Warning, ld->span.begin,
+                std::string("internal: `using var` of disposable built-in `") +
+                    std::string(headName) +
+                    "` has no disposal arm — the value leaks at scope end "
+                    "(§28.3 / §28.9); this is a compiler bug — #2992");
+        }
+    }
 }
 
 

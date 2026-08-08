@@ -395,3 +395,60 @@ BEZEL_TEST(builtin_registry_snapshot, contract_violation_exception_registered_sp
     BEZEL_EXPECT_EQ(builtinExceptionParentOf("IndexOutOfRangeException"),
                     std::string_view("Exception"));
 }
+
+// fix #2992 (§28.3 / §28.9 / §28.10, v0.240): the disposable-builtin-head set
+// — the table the §28.10 vacuity lint (rhsIsDisposableClassType Path 2) and the
+// codegen auto-drop chain's end-of-chain guard (registerUsingDisposal) now
+// SHARE. Pinning the exact membership here means a change to either site's
+// behaviour is caught mechanically: adding a name to the table without a
+// chain arm (or vice versa) is the defect class #2992 makes loud.
+BEZEL_TEST(builtin_registry_snapshot, disposable_builtin_head_name_set_spec_28_3_28_9) {
+    // IN: every name in kDisposableBuiltinHeadNames — the lint's pre-#2992 Path 2
+    // population, lifted verbatim. A `using var` of any of these is the canonical
+    // §28.10 pattern (not vacuous), and the auto-drop chain MUST claim each one.
+    for (std::string_view n : {
+        "StringBuilder",
+        "BinarySerializer", "BinaryDeserializer",
+        "JsonSerializer", "JsonDeserializer",
+        "CString", "WString", "RawBytes",
+        "FileStream",
+        "IEnumerable", "IEnumerator",
+        "IOwningEnumerable", "IOwningEnumerator",
+        "IAsyncEnumerable", "IAsyncEnumerator",
+        "IOwningAsyncEnumerable", "IOwningAsyncEnumerator",
+        "Channel", "ChannelSender",
+        "EventSource", "AsyncEventSource",
+        "Subscription",
+        "TaskScope", "CancellationTokenSource",
+        "Mutex", "Lock", "Semaphore", "SemaphoreToken",
+        "OwningTask", "Task", "Shared", "Weak",
+        "OwningArray", "OwningDictionary", "OwningSet", "OwningStack",
+        "OwningQueue", "OwningLinkedList", "OwningBuffer",
+        "TaskCompletionSource", "OwningTaskCompletionSource",
+    })
+        BEZEL_EXPECT_TRUE(isDisposableBuiltinHeadName(n));
+
+    // OUT: value builtins with no disposal obligation — a `using var` of these
+    // IS vacuous (§28.9), so the lint fires (correctly) and the chain registers
+    // nothing (there is nothing to release).
+    for (std::string_view n : {
+        "Guid", "DateTime", "TimeSpan", "DateOnly", "TimeOnly",
+        "Range", "CancellationToken", "JsonOptions",
+        "IntPtr", "UIntPtr",
+    })
+        BEZEL_EXPECT_FALSE(isDisposableBuiltinHeadName(n));
+
+    // OUT (measured disagreement, filed separately): the borrowing collections
+    // and four vtable-less builtins ARE chain-claimed (they own heap) but are
+    // intentionally NOT in this table — #2695 excluded the borrowing collections
+    // so the lint fires on a bound-then-pinned alias whose `const` remedy
+    // compiles. The four vtable-less builtins (Random/Atomic/AtomicInteger/
+    // Stopwatch/Buffer) share the same gap on factory-call forms. Pinning them
+    // OUT here documents the disagreement; reconciling it is a separate decision.
+    for (std::string_view n : {
+        "Array", "Stack", "Queue", "Set", "SortedSet",
+        "Dictionary", "SortedDictionary", "LinkedList",
+        "Random", "Atomic", "AtomicInteger", "Stopwatch", "Buffer",
+    })
+        BEZEL_EXPECT_FALSE(isDisposableBuiltinHeadName(n));
+}

@@ -5043,72 +5043,21 @@ bool MethodOwnership::rhsIsDisposableClassType(const sema::TypeRef* rt) {
         }
         return false;
     }
-    // Path 2: built-in named type with no user TypeDecl. Match on the head
-    // name against the stdlib's runtime-disposal contract surface.
+    // Path 2: built-in named type with no user TypeDecl. Consult the SHARED
+    // authority — common::isDisposableBuiltinHeadName — that the codegen auto-
+    // drop chain (registerUsingDisposal, LlvmBackend_Setup.cpp) also consults at
+    // its end-of-chain guard. fix #2992 (§28.3 / §28.9 / §28.10, v0.240): this
+    // was a private hand-list that DISAGREED with codegen's per-arm enumeration
+    // — 13 names (the borrowing collections Array/Stack/Queue/Set/SortedSet/
+    // Dictionary/SortedDictionary/LinkedList, plus Stopwatch, Random, Atomic,
+    // AtomicInteger, Buffer) were claimed by the chain but absent here, so a
+    // factory-call `using var x := MakeArr()` over `Array<T>` fired the vacuous-
+    // pin warning on a real disposal (measured). The two now consult one table;
+    // the rationale for each name's disposal obligation lives in the shared
+    // table's own comments. // per §28.3 / §28.9 / §28.10, fix #2992
     if (!rt->astNode || !rt->astNode->name || rt->astNode->name->parts.empty())
         return false;
-    std::string_view head = rt->headName();
-    // stdlib §3.1 / spec §28.9 (#2190): StringBuilder owns its heap parts
-    // array and a +1 reference to every appended string. Codegen's dedicated
-    // path releases those parts, so this built-in carries a real disposal
-    // obligation rather than the borrowing collections' no-op Dispose.
-    if (head == "StringBuilder") return true;
-    // §2.15 concrete serializers/deserializers: each explicitly implements
-    // IDisposable and owns parser or output-buffer state (the §2.15 spec
-    // example uses `using var s := new JsonSerializer();`), so a `using var`
-    // over `new BinarySerializer()` / `new JsonDeserializer()` is the
-    // canonical pattern — not vacuous. Added per §28.10 / §28.11 in #2073
-    // (rework 3b).
-    if (head == "BinarySerializer" || head == "BinaryDeserializer" ||
-        head == "JsonSerializer"   || head == "JsonDeserializer")
-        return true;
-    // #1718 / §32.6 / stdlib §10: a CString/WString/RawBytes from an owned-
-    // returning EXTERN or static From/FromBytes factory carries a real free()
-    // disposal obligation (§32.6: "a `using var` discharges it"). The classifier
-    // would otherwise lump them with value-typed/runtime-managed types and fire
-    // the §28.10 vacuous-pin warning — even though codegen's isFfiBuf branch
-    // (registerUsingDisposal, LlvmBackend_Setup) registers the free(). Recognize
-    // them here so the lint does not fight the disposal.
-    if (head == "CString" || head == "WString" || head == "RawBytes")
-        return true;
-    // stdlib §7.2 (#645): FileStream declares `destructor;` outright — "flushes
-    // buffered writes and closes the OS file handle" — and §7.2's own prose
-    // makes `using var` the canonical spelling ("the `using var` idiom
-    // guarantees this on every exit edge, including exceptions"). Without this
-    // arm the §28.10 lint would call that idiom vacuous.
-    if (head == "FileStream") return true;
-    // #2385/#2451 / §29.1, §29.2, stdlib §4.12/§4.13: the iteration-protocol
-    // sentinel family. `GetEnumerator()`/`GetOwningEnumerator()`/
-    // `GetAsyncEnumerator()`/`GetOwningAsyncEnumerator()` return an `owned`
-    // enumerator/enumerable — §29.1: "the caller takes ownership of the
-    // enumerator and must dispose it", unconditionally, independent of the
-    // callee's implementation shape (compiler-generated iterator, hand-
-    // written user class, or an Array<T>/user-class value wrapped into the
-    // interface by codegen's wrapUserClassAsIEnumerable). A `using var`/
-    // `await using var` bound to one of these eight names is exactly the
-    // canonical §28.10 pattern, mirrored by registerUsingDisposal's own
-    // isSyncIterEnum / isAsyncIterEnum head-name sets (LlvmBackend_Setup.cpp)
-    // — never a no-op. Without this arm, isBorrowableType's null-declaration
-    // fallthrough (these are declaration-less builtins, TypeResolution_
-    // Names.cpp) left every one of them in the "no disposal obligation"
-    // bucket, misfiring the vacuous-pin warning on a real disposal.
-    if (head == "IEnumerable" || head == "IEnumerator" ||
-        head == "IOwningEnumerable" || head == "IOwningEnumerator" ||
-        head == "IAsyncEnumerable" || head == "IAsyncEnumerator" ||
-        head == "IOwningAsyncEnumerable" || head == "IOwningAsyncEnumerator")
-        return true;
-    return head == "Channel" || head == "ChannelSender" ||
-           head == "EventSource" || head == "AsyncEventSource" ||
-           head == "Subscription" || head == "TaskScope" ||
-           head == "CancellationTokenSource" || head == "Mutex" ||
-           head == "Semaphore" || head == "SemaphoreToken" || head == "Lock" ||
-           head == "OwningTask" || head == "Task" ||
-           head == "Shared" || head == "Weak" ||
-           head == "OwningArray" || head == "OwningDictionary" ||
-           head == "OwningSet" || head == "OwningStack" ||
-           head == "OwningQueue" || head == "OwningLinkedList" ||
-           head == "OwningBuffer" ||
-           head == "TaskCompletionSource" || head == "OwningTaskCompletionSource";
+    return common::isDisposableBuiltinHeadName(rt->headName());
 }
 
 void MethodOwnership::handleAssignment(const ast::AssignmentStmt& as) {
