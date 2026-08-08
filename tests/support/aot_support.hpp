@@ -900,10 +900,14 @@ inline CompileStatus forkedLink(const std::string& objectPath,
 //       could hand a future, really-rebuilt bezel_tests a stale hit. The
 //       identity then falls back to /proc/self/exe (the k1 behaviour):
 //       conservative, never stale. Same fallback when the macro is undefined
-//       or the archive unreadable. Known gaps, UNCHANGED from k1: neither key
-//       hashes the external clang/ld toolchain nor the dynamically-linked
-//       libLLVM.so — a system toolchain update should be paired with a cache
-//       wipe (gc_scratch.sh reaps the dir anyway).
+//       or the archive unreadable. Known gaps: the external clang/ld toolchain
+//       and the dynamically-linked libLLVM.so are now folded in via the
+//       `toolchain` identity (per #3006), so a system toolchain update
+//       auto-invalidates the cache instead of needing a manual wipe. Residual:
+//       the system libs the link resolves (libc/libm/libpthread/libstdc++) are
+//       still untracked — a glibc/libstdc++-only update (no clang/ld/libLLVM
+//       change) is not detected; pair such an update with a cache wipe
+//       (gc_scratch.sh reaps the dir anyway).
 //   (b) RUNTIME-LIBRARY IDENTITY — libbezel_runtime.a (BEZEL_RUNTIME_LIB_PATH),
 //       what the driver's link actually consumes. Under k2 this is LOAD-BEARING
 //       (the runtime is whole-archived into bezel_tests, not into core.a, so
@@ -997,21 +1001,127 @@ inline bool sha256File(const std::string& path, std::array<uint8_t, 32>& out) {
     return true;
 }
 
+// per #3006: the EXTERNAL toolchain identity — clang/ld (the link driver and
+// linker the driver shells out to via std::system) and libLLVM.so (the
+// dynamically-linked codegen backend the IN-PROCESS compiler calls). These are
+// inputs to the build that the archive identities do NOT cover: a Fedora clang /
+// binutils / llvm-libs update swaps the on-disk tools the cached products were
+// produced with, but leaves libbezel_core.a / libbezel_runtime.a byte-identical
+// (core.a is only rebuilt if ccache misses on the new headers — and a same-soname
+// llvm-libs update can change libLLVM.so WITHOUT touching the devel headers,
+// so core.a is served stale and the in-process codegen silently changes). The
+// documented gap (aot_support.hpp KEY comment, and the K2 comment below) is now
+// closed by folding this digest into every key (see BuildIdentity).
+//
+// CHEAP: two popen subprocesses (clang --version, ld --version) + one
+// /proc/self/maps read + one stat, ONCE per process (cached in buildIdentity's
+// static). clang --version and ld --version each return in a few ms; the maps
+// read is a single open. This never dominates even a cold build.
+//
+// FAIL CLOSED. clang is the one tool the link cannot proceed without (the
+// driver's recipe is literally "clang …"), so an unidentified clang ⇒ no sound
+// toolchain identity ⇒ the cache disables itself for the process (returns ""),
+// exactly like the existing unreadable-archive behaviour — never mint an
+// under-keyed entry. ld and libLLVM are BEST-EFFORT: ld adds the binutils signal
+// (a separate package from clang), and libLLVM is OPTIONAL because a STATIC-LLVM
+// build folds the backend into core.a (already keyed) — no libLLVM line in
+// /proc/self/maps means the backend is not a separate .so, so its absence is
+// sound rather than a gap.
+inline bool toolchainIdentityFrom(std::string_view clangVer,
+                                  std::string_view ldVer,
+                                  std::string_view llvmInfo,
+                                  std::array<uint8_t, 32>& out) {
+    if (clangVer.empty()) return false;  // clang unidentified → fail CLOSED
+    llvm::SHA256 h;
+    static const char kSep[] = "\0";  // NUL keeps adjacent fields unambiguous
+    h.update(llvm::StringRef(clangVer.data(), clangVer.size()));
+    h.update(llvm::StringRef(kSep, 1));
+    if (!ldVer.empty()) {
+        h.update(llvm::StringRef(ldVer.data(), ldVer.size()));
+        h.update(llvm::StringRef(kSep, 1));
+    }
+    if (!llvmInfo.empty()) {
+        h.update(llvm::StringRef(llvmInfo.data(), llvmInfo.size()));
+        h.update(llvm::StringRef(kSep, 1));
+    }
+    out = h.final();
+    return true;
+}
+
+// The live toolchain strings, gathered once. clang/ld via popen (the shell PATH
+// is exactly what Driver's std::system link resolves, so this is the same clang
+// whose output the cache would serve). libLLVM via /proc/self/maps: the first
+// mapping whose path names libLLVM is the shared backend the compiler actually
+// loaded; its size + mtime (NUL-joined onto the path) is stable across relinks
+// of bezel_tests (the system .so is untouched by a compiler rebuild) but moves
+// on a dnf update that replaces the .so (new mtime/size) — the exact signal
+// #3006 wants.
+inline bool computeToolchainIdentity(std::array<uint8_t, 32>& out) {
+    auto capture = [](const char* cmd) -> std::string {
+        std::string result;
+        // popen goes through the shell, matching Driver::linkExecutableObject's
+        // std::system — so it resolves the same PATH clang/ld the link uses.
+        if (FILE* p = ::popen(cmd, "r")) {
+            char buf[256];
+            while (fgets(buf, sizeof(buf), p)) result += buf;
+            ::pclose(p);
+        }
+        return result;
+    };
+    const std::string clangVer = capture("clang --version 2>&1");
+    const std::string ldVer = capture("ld --version 2>&1");
+    // libLLVM: the COMPILER's codegen backend. The path comes from the process's
+    // own memory map, so it is the actually-loaded .so (not a build-time guess).
+    // A static-LLVM build has no such line → llvmInfo empty → sound (backend is
+    // inside core.a, already keyed).
+    std::string llvmInfo;
+    {
+        std::ifstream maps("/proc/self/maps");
+        std::string line;
+        while (std::getline(maps, line)) {
+            // The maps path is the last whitespace-delimited token on the line.
+            if (line.find("libLLVM") == std::string::npos) continue;
+            auto sp = line.find_last_of(" \t");
+            if (sp == std::string::npos) break;
+            const std::string path = line.substr(sp + 1);
+            if (path.empty() || path[0] != '/') break;
+            std::error_code ec;
+            const auto sz = fs::file_size(path, ec);
+            if (ec) break;
+            const auto mt = fs::last_write_time(path, ec);
+            if (ec) break;
+            llvmInfo = path;
+            llvmInfo += '|';
+            llvmInfo += std::to_string(sz);
+            llvmInfo += '|';
+            llvmInfo += std::to_string(mt.time_since_epoch().count());
+            break;  // the first libLLVM mapping is the backend
+        }
+    }
+    return toolchainIdentityFrom(clangVer, ldVer, llvmInfo, out);
+}
+
 // The per-process build identity, computed ONCE (hashing the ~100 MB core
 // archive or the test binary is a few hundred ms; amortized over the whole
 // shard it is negligible).
 //
 // `compiler` and `runtime` are kept SEPARATE — that separation is what lets the
 // two-level cache key each build half on its own inputs (see the "k3" comment
-// below). `combined` is their SHA-256 in that order, i.e. byte-for-byte the
-// pre-split k2 identity, so every already-stored exe entry keyed under it stays
-// valid across this change.
+// below). `combined` folds compiler ‖ runtime ‖ toolchain into the KE identity.
+// (Pre-#3006 `combined` was SHA-256(compiler ‖ runtime) only — the k2 identity.
+// Folding in toolchain deliberately shifts EVERY exe key: entries stored before
+// the toolchain was tracked were built under an UNTRACKED external clang/ld/
+// libLLVM, so they cannot be proven sound against the current toolchain and are
+// orphaned — never hit — rather than risked. The schema tag stays "k2;": a
+// different hash (toolchain now in the input) is a different key with no
+// collision, so no tag bump is needed; the orphans fall to the size GC.)
 struct BuildIdentity {
     bool usable = false;        // false => no sound identity; cache disabled
     bool splitUsable = false;   // false => the two-level (k3) path is unsound here
-    std::array<uint8_t, 32> compiler{};  // core.a (guarded) or /proc/self/exe
-    std::array<uint8_t, 32> runtime{};   // libbezel_runtime.a; valid iff splitUsable
-    std::array<uint8_t, 32> combined{};  // SHA-256(compiler ‖ runtime) — the k2 key
+    std::array<uint8_t, 32> compiler{};   // core.a (guarded) or /proc/self/exe
+    std::array<uint8_t, 32> runtime{};    // libbezel_runtime.a; valid iff splitUsable
+    std::array<uint8_t, 32> toolchain{};  // per #3006: clang/ld/libLLVM; required
+    std::array<uint8_t, 32> combined{};   // SHA-256(compiler ‖ runtime ‖ toolchain)
 };
 
 inline const BuildIdentity& buildIdentity() {
@@ -1081,6 +1191,28 @@ inline const BuildIdentity& buildIdentity() {
             if (!sha256File("/proc/self/exe", exeHash)) return out;  // unusable
             out->compiler = exeHash;
         }
+        // per #3006: the EXTERNAL toolchain (clang/ld/libLLVM). clang is
+        // REQUIRED — the link shells out to it, so no clang identity means no
+        // sound toolchain identity, and the cache disables itself for the
+        // process (fail CLOSED) rather than serve products from an untracked
+        // toolchain. This mirrors the existing fail-closed on an unreadable
+        // runtime archive: never mint an under-keyed entry.
+        //
+        // FORK-SAFE — why #3006 is split_build-safe alongside #1608. This whole
+        // lambda runs in the PARENT: the static above is initialised on the
+        // first cache lookup, which happens in cachedCompile BEFORE
+        // forkedDriverStep forks, so every compile/link child INHERITS the
+        // already-computed identity and never recomputes it (no popen, no
+        // /proc/self/maps read inside a child). split_build's two forked builds
+        // therefore see the SAME toolchain digest, and the digest is a pure KEY
+        // input that never reaches emitted bytes. The earlier #3006 lane broke
+        // split_build only because its base (04b5279) predates #1608 and ran
+        // the compiles IN-PROCESS, where this gather's popen state churn
+        // amplified #1608's in-process-compile non-determinism; #1608's
+        // fork-isolation removed that mechanism entirely. // per #3006 / #1608
+        std::array<uint8_t, 32> tcHash;
+        if (!computeToolchainIdentity(tcHash)) return out;  // unusable — fail CLOSED
+        out->toolchain = tcHash;
         h.update(llvm::ArrayRef<uint8_t>(out->compiler.data(),
                                          out->compiler.size()));
         if (haveRuntime) {
@@ -1088,6 +1220,10 @@ inline const BuildIdentity& buildIdentity() {
             out->runtime = rtHash;
             h.update(llvm::ArrayRef<uint8_t>(rtHash.data(), rtHash.size()));
         }
+        // Fold the toolchain into `combined` so the KE (whole-exe) key carries
+        // it; K1/K2 fold it in via their own composers (the emitted object
+        // depends on the libLLVM backend, the link on clang/ld).
+        h.update(llvm::ArrayRef<uint8_t>(tcHash.data(), tcHash.size()));
         out->combined = h.final();
         out->usable = true;
         // The two-level split is only sound when the runtime archive the link
@@ -1103,10 +1239,10 @@ inline const BuildIdentity& buildIdentity() {
     return *id;
 }
 
-// SHA-256(compiler-identity ‖ runtime-library-identity) — the k2 exe key's
-// identity component. Returns nullptr if no identity input can be hashed: with
-// no sound compiler identity the cache DISABLES itself rather than risk a stale
-// hit.
+// SHA-256(compiler ‖ runtime ‖ toolchain) — the k2 exe key's identity
+// component (per #3006 the toolchain — clang/ld/libLLVM — is folded in).
+// Returns nullptr if no identity input can be hashed: with no sound compiler
+// identity the cache DISABLES itself rather than risk a stale hit.
 inline const std::array<uint8_t, 32>* combinedIdentity() {
     const BuildIdentity& id = buildIdentity();
     return id.usable ? &id.combined : nullptr;
@@ -1116,7 +1252,11 @@ inline const std::array<uint8_t, 32>* combinedIdentity() {
 // emitted object or the link line. The schema tag is bumped if the key
 // composition ever changes, so old entries fall out cleanly — "k1;"→"k2;" with
 // the core-archive identity refinement (#2100): a k1 entry (exe-hash identity)
-// must never be served under a k2 key or vice versa.
+// must never be served under a k2 key or vice versa. #3006 folds the external
+// toolchain into every key WITHOUT a tag bump: the toolchain digest is a new
+// hash INPUT, so every key's SHA-256 shifts and pre-#3006 entries (built under
+// an untracked toolchain) are orphaned — never hit, no collision — and GC'd,
+// which is the property a bump would buy. See BuildIdentity for the rationale.
 inline std::string modeString(const codegen::CodegenOptions& opts) {
     std::string s = "k2;";
     s += "sa=";  s += opts.sanitizeAddress ? '1' : '0';
@@ -1199,10 +1339,13 @@ inline std::string computeCacheKey(std::string_view source,
 // the link depends on, and is derived from the same function that runs the
 // link, so it cannot drift.
 //
-// WHAT K2 STILL DOES NOT COVER, unchanged from k2: the external clang/ld
-// toolchain and the system libraries it links (libc/libm/libpthread/libstdc++,
-// the ASan runtime). A toolchain update should be paired with a cache wipe —
-// exactly the pre-existing caveat, no new gap.
+// WHAT K2 STILL DOES NOT COVER: the system libraries the link resolves
+// (libc/libm/libpthread/libstdc++) are unhashed — a glibc/libstdc++-only
+// update (no clang/ld/libLLVM change) is not detected. The external clang/ld
+// toolchain and the ASan runtime (part of the clang/compiler-rt package) ARE
+// now covered via the `toolchain` identity folded in per #3006, so a clang or
+// binutils update invalidates cached executables automatically. The system-lib
+// residual is unchanged from k2; pair such an update with a cache wipe.
 
 // The codegen-mode component of K1: every CodegenOptions bit that alters the
 // EMITTED OBJECT. All three do (sanitizeAddress adds the AddressSanitizer pass,
@@ -1247,7 +1390,8 @@ inline const std::string& linkRecipeSignature(bool sanitizeAddress) {
 inline std::string composeObjectKey(const std::array<uint8_t, 32>& compilerId,
                                     const std::string& codegenMode,
                                     std::string_view preludeText,
-                                    std::string_view source) {
+                                    std::string_view source,
+                                    const std::array<uint8_t, 32>& toolchainId) {
     llvm::SHA256 h;
     h.update(llvm::ArrayRef<uint8_t>(compilerId.data(), compilerId.size()));
     h.update(llvm::StringRef(codegenMode.data(), codegenMode.size()));
@@ -1256,6 +1400,13 @@ inline std::string composeObjectKey(const std::array<uint8_t, 32>& compilerId,
     h.update(llvm::StringRef(plen.data(), plen.size()));
     h.update(llvm::StringRef(preludeText.data(), preludeText.size()));
     h.update(llvm::StringRef(source.data(), source.size()));
+    // per #3006: the in-process codegen calls into libLLVM.so, so the emitted
+    // object depends on the toolchain backend. A same-soname llvm-libs update
+    // can swap that .so without rebuilding core.a (whose hash `compilerId`
+    // covers), so without this component a stale object would be served and
+    // then linked into a stale executable — the false-green this key exists to
+    // prevent.
+    h.update(llvm::ArrayRef<uint8_t>(toolchainId.data(), toolchainId.size()));
     return toHex(h.final());
 }
 
@@ -1270,13 +1421,21 @@ inline const std::string& preludeFingerprint() {
 // distinct from an object key even if every other byte coincided.
 inline std::string composeLinkKey(const std::array<uint8_t, 32>& objectHash,
                                   const std::array<uint8_t, 32>& runtimeId,
-                                  const std::string& recipe) {
+                                  const std::string& recipe,
+                                  const std::array<uint8_t, 32>& toolchainId) {
     llvm::SHA256 h;
     static const char kTag[] = "k3l;";
     h.update(llvm::StringRef(kTag, sizeof(kTag) - 1));
     h.update(llvm::ArrayRef<uint8_t>(objectHash.data(), objectHash.size()));
     h.update(llvm::ArrayRef<uint8_t>(runtimeId.data(), runtimeId.size()));
     h.update(llvm::StringRef(recipe.data(), recipe.size()));
+    // per #3006: the link runs `clang …` (Driver::linkExecutableObject shells
+    // out via std::system), so the linked bytes depend on the external clang/ld
+    // and the system libs they resolve. The recipe signature spells the flags
+    // verbatim but NOT clang's/ld's VERSION, so two toolchain builds producing
+    // the same recipe string could otherwise collide. Folding the toolchain
+    // identity in closes that.
+    h.update(llvm::ArrayRef<uint8_t>(toolchainId.data(), toolchainId.size()));
     return toHex(h.final());
 }
 
@@ -1288,7 +1447,7 @@ inline std::string computeObjectKey(std::string_view source,
     const BuildIdentity& id = buildIdentity();
     if (!id.usable || !id.splitUsable) return {};
     return composeObjectKey(id.compiler, codegenModeString(opts),
-                            preludeFingerprint(), source);
+                            preludeFingerprint(), source, id.toolchain);
 }
 
 // K2: the LINK key — the object's CONTENT hash ‖ runtime identity ‖ recipe.
@@ -1303,7 +1462,7 @@ inline std::string computeLinkKey(const std::array<uint8_t, 32>& objectHash,
     const BuildIdentity& id = buildIdentity();
     if (!id.usable || !id.splitUsable) return {};
     return composeLinkKey(objectHash, id.runtime,
-                          linkRecipeSignature(opts.sanitizeAddress));
+                          linkRecipeSignature(opts.sanitizeAddress), id.toolchain);
 }
 
 // Per-process hit/miss counters (a hit is served from the cache; a miss ran the

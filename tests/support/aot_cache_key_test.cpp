@@ -50,6 +50,7 @@ using bezel::codegen::CodegenOptions;
 using bezel::test::aot_detail::composeLinkKey;
 using bezel::test::aot_detail::composeObjectKey;
 using bezel::test::aot_detail::sha256File;
+using bezel::test::aot_detail::toolchainIdentityFrom;
 
 using Digest = std::array<std::uint8_t, 32>;
 
@@ -61,6 +62,12 @@ Digest ident(std::uint8_t seed) {
         d[i] = static_cast<std::uint8_t>(seed + i);
     return d;
 }
+
+// A stand-in toolchain identity (per #3006): the external clang/ld/libLLVM the
+// cache key now folds in. Held CONSTANT in the existing object/link tests (so
+// their compiler/source/mode/runtime/recipe assertions are unchanged) and
+// VARIED in the new toolchain tests below.
+const Digest kToolchain = ident(5);
 
 const char kSourceA[] =
     "module M; class C public static method Main(): int return 0; end Main; "
@@ -104,14 +111,14 @@ std::string checkedMode() {
 // single most important property in the file: it is what makes "the suite
 // validated THIS compiler" true.
 BEZEL_TEST(aot_cache_key, object_key_moves_when_the_compiler_moves) {
-    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA) !=
-                      composeObjectKey(ident(2), plainMode(), kPrelude, kSourceA));
+    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+                      composeObjectKey(ident(2), plainMode(), kPrelude, kSourceA, kToolchain));
 }
 
 // A different program must never serve another program's object.
 BEZEL_TEST(aot_cache_key, object_key_moves_when_the_source_moves) {
-    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA) !=
-                      composeObjectKey(ident(1), plainMode(), kPrelude, kSourceB));
+    BEZEL_EXPECT_TRUE(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+                      composeObjectKey(ident(1), plainMode(), kPrelude, kSourceB, kToolchain));
 }
 
 // Every CodegenOptions bit alters the emitted object, so each must key apart.
@@ -120,9 +127,9 @@ BEZEL_TEST(aot_cache_key, object_key_moves_when_the_source_moves) {
 // net, and would report clean because nothing was watching.
 BEZEL_TEST(aot_cache_key, object_key_separates_every_codegen_mode) {
     const std::set<std::string> keys{
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA),
-        composeObjectKey(ident(1), asanMode(), kPrelude, kSourceA),
-        composeObjectKey(ident(1), checkedMode(), kPrelude, kSourceA),
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain),
+        composeObjectKey(ident(1), asanMode(), kPrelude, kSourceA, kToolchain),
+        composeObjectKey(ident(1), checkedMode(), kPrelude, kSourceA, kToolchain),
     };
     BEZEL_EXPECT_EQ(keys.size(), static_cast<std::size_t>(3));
 }
@@ -136,11 +143,11 @@ BEZEL_TEST(aot_cache_key, object_key_separates_every_codegen_mode) {
 // structural form of the claim; this pins that the LINK key does move with the
 // runtime, so the two halves genuinely separate rather than both being blind.
 BEZEL_TEST(aot_cache_key, object_key_is_independent_of_runtime_and_recipe) {
-    BEZEL_EXPECT_EQ(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA),
-                    composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA));
+    BEZEL_EXPECT_EQ(composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain),
+                    composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain));
     const std::string recipe = Driver::linkRecipeSignature(false);
-    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), recipe) !=
-                      composeLinkKey(ident(9), ident(2), recipe));
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), recipe, kToolchain) !=
+                      composeLinkKey(ident(9), ident(2), recipe, kToolchain));
 }
 
 // The auto-imported stdlib PRELUDE (§2.20 Result<T,E>, §7.1/§7.2 System.IO
@@ -157,8 +164,8 @@ BEZEL_TEST(aot_cache_key, object_key_is_independent_of_runtime_and_recipe) {
 // removed, so the property cannot regress unnoticed.
 BEZEL_TEST(aot_cache_key, object_key_moves_when_the_stdlib_prelude_moves) {
     BEZEL_EXPECT_TRUE(
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA) !=
-        composeObjectKey(ident(1), plainMode(), kPreludeChanged, kSourceA));
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+        composeObjectKey(ident(1), plainMode(), kPreludeChanged, kSourceA, kToolchain));
 }
 
 // …and the key the harness actually mints must use the DRIVER's prelude text,
@@ -182,8 +189,96 @@ BEZEL_TEST(aot_cache_key, live_object_key_uses_the_drivers_prelude_text) {
     if (!live.empty()) {  // empty only where the split is unusable
         BEZEL_EXPECT_EQ(live, composeObjectKey(
                                   bezel::test::aot_detail::buildIdentity().compiler,
-                                  plainMode(), driverPrelude, kSourceA));
+                                  plainMode(), driverPrelude, kSourceA,
+                                  bezel::test::aot_detail::buildIdentity().toolchain));
     }
+}
+
+// ---------------------------------------------------------------------------
+// TOOLCHAIN identity (per #3006): the external clang/ld/libLLVM. Before #3006
+// neither key hashed the toolchain, so a Fedora clang/binutils/llvm-libs update
+// left ~16,830 stored products servable against a recipe that no longer matched
+// the toolchain that produced them. The toolchain digest is now folded into the
+// OBJECT key (the emitted object depends on the libLLVM backend), the LINK key
+// (the link runs clang/ld), and the whole-exe KE key. These pin all three.
+//
+// The composer is fed SYNTHETIC toolchain digests (ident(N)), mirroring how the
+// tests above vary the compiler identity — the pure function makes the toolchain
+// swappable without a real system update. The fail-closed property is pinned on
+// toolchainIdentityFrom directly (the function the live gatherer feeds).
+// ---------------------------------------------------------------------------
+
+// A toolchain update (new clang/ld/libLLVM) MUST invalidate every cached object:
+// the in-process codegen calls into libLLVM.so, so a backend change can emit
+// different bytes for the same source. Without this the split would serve a
+// stale object and link it into a stale executable — the false-green this whole
+// file exists to prevent. (#3006.)
+BEZEL_TEST(aot_cache_key, object_key_moves_when_the_toolchain_moves) {
+    BEZEL_EXPECT_TRUE(
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, ident(5)) !=
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, ident(6)));
+}
+
+// The same holds for the LINK product: a clang/ld update can link different
+// bytes from the same object, so the link key must carry the toolchain too.
+BEZEL_TEST(aot_cache_key, link_key_moves_when_the_toolchain_moves) {
+    const std::string recipe = Driver::linkRecipeSignature(false);
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), recipe, ident(5)) !=
+                      composeLinkKey(ident(9), ident(1), recipe, ident(6)));
+}
+
+// Stability is the other half: a no-op rebuild (the COMMON case — every test
+// iteration) MUST NOT move the key. The toolchain identity is stable across
+// relinks of bezel_tests (the system clang/ld/libLLVM are untouched by a
+// compiler rebuild), so two identical inputs reproduce the same key. If this
+// failed, the cache would never warm and the fix would be useless.
+BEZEL_TEST(aot_cache_key, toolchain_key_is_stable_across_rebuilds) {
+    BEZEL_EXPECT_EQ(
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, ident(5)),
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, ident(5)));
+    const std::string recipe = Driver::linkRecipeSignature(false);
+    BEZEL_EXPECT_EQ(composeLinkKey(ident(9), ident(1), recipe, ident(5)),
+                    composeLinkKey(ident(9), ident(1), recipe, ident(5)));
+}
+
+// FAIL CLOSED (Plan-A invariant 1.21/1.22). clang is the one tool the link
+// cannot proceed without, so an unidentified clang ⇒ no sound toolchain
+// identity ⇒ the cache disables itself for the process (returns no digest)
+// rather than mint an under-keyed entry a pre-update toolchain could later
+// stale-hit. Mirrors the existing fail-closed on an unreadable runtime archive.
+// ld and libLLVM are BEST-EFFORT (optional) — their absence does NOT fail.
+BEZEL_TEST(aot_cache_key, toolchain_identity_fails_closed_when_clang_is_absent) {
+    Digest d{};
+    // clang unidentified (empty version string) ⇒ fail CLOSED.
+    BEZEL_EXPECT_TRUE(!toolchainIdentityFrom("", "ld 2.43", "/usr/lib64/libLLVM.so|99|1234", d));
+    // clang present ⇒ succeeds even with ld/libLLVM absent (best-effort).
+    BEZEL_EXPECT_TRUE(toolchainIdentityFrom("clang 19", "", "", d));
+    // And the identity is DETERMINISTIC: same inputs ⇒ same digest (so two
+    // processes on the same toolchain agree, and a stable key follows).
+    Digest d2{};
+    BEZEL_EXPECT_TRUE(toolchainIdentityFrom("clang 19", "", "", d2));
+    BEZEL_EXPECT_TRUE(d == d2);
+    // A different clang version ⇒ a different digest (so the key moves).
+    Digest d3{};
+    BEZEL_EXPECT_TRUE(toolchainIdentityFrom("clang 20", "", "", d3));
+    BEZEL_EXPECT_TRUE(d != d3);
+}
+
+// The LIVE toolchain identity is computable in this environment (clang is on
+// PATH for the link to work at all) and feeds the real keys. This is the
+// end-to-end wiring check: the live build identity carries a non-zero
+// toolchain digest, so computeObjectKey/computeLinkKey (which pass it through)
+// actually depend on it.
+BEZEL_TEST(aot_cache_key, live_identity_carries_a_toolchain_component) {
+    const auto& id = bezel::test::aot_detail::buildIdentity();
+    if (!id.usable) return;  // split unusable in this configuration — nothing to pin
+    // clang is required for the cache to be usable at all (fail closed), so a
+    // usable identity implies a non-zero toolchain digest: the live keys really
+    // do carry the external toolchain, not just the compiler/runtime archives.
+    bool anyNonZero = false;
+    for (std::size_t i = 0; i < id.toolchain.size(); ++i)
+        if (id.toolchain[i]) { anyNonZero = true; break; }
+    BEZEL_EXPECT_TRUE(anyNonZero);
 }
 
 // ---------------------------------------------------------------------------
@@ -195,15 +290,15 @@ BEZEL_TEST(aot_cache_key, live_object_key_uses_the_drivers_prelude_text) {
 // containing the OLD runtime and report that the new one works.
 BEZEL_TEST(aot_cache_key, link_key_moves_when_the_runtime_moves) {
     const std::string recipe = Driver::linkRecipeSignature(false);
-    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), recipe) !=
-                      composeLinkKey(ident(9), ident(2), recipe));
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), recipe, kToolchain) !=
+                      composeLinkKey(ident(9), ident(2), recipe, kToolchain));
 }
 
 // Different generated code must never be served the same executable.
 BEZEL_TEST(aot_cache_key, link_key_moves_when_the_object_moves) {
     const std::string recipe = Driver::linkRecipeSignature(false);
-    BEZEL_EXPECT_TRUE(composeLinkKey(ident(8), ident(1), recipe) !=
-                      composeLinkKey(ident(9), ident(1), recipe));
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(8), ident(1), recipe, kToolchain) !=
+                      composeLinkKey(ident(9), ident(1), recipe, kToolchain));
 }
 
 // The link key deliberately does NOT contain the compiler identity — that is
@@ -215,8 +310,8 @@ BEZEL_TEST(aot_cache_key, link_key_moves_when_the_object_moves) {
 BEZEL_TEST(aot_cache_key, link_key_moves_when_the_recipe_moves) {
     const std::string real = Driver::linkRecipeSignature(false);
     const std::string edited = real + " -lsomethingnew";
-    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), real) !=
-                      composeLinkKey(ident(9), ident(1), edited));
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), real, kToolchain) !=
+                      composeLinkKey(ident(9), ident(1), edited, kToolchain));
 }
 
 // ASan and plain products must be distinct entries. They are separated TWICE
@@ -229,8 +324,8 @@ BEZEL_TEST(aot_cache_key, link_recipe_separates_asan_from_plain) {
     BEZEL_EXPECT_TRUE(plain != asan);
     BEZEL_EXPECT_TRUE(asan.find("-fsanitize=address") != std::string::npos);
     BEZEL_EXPECT_TRUE(plain.find("-fsanitize=address") == std::string::npos);
-    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), plain) !=
-                      composeLinkKey(ident(9), ident(1), asan));
+    BEZEL_EXPECT_TRUE(composeLinkKey(ident(9), ident(1), plain, kToolchain) !=
+                      composeLinkKey(ident(9), ident(1), asan, kToolchain));
 }
 
 // The recipe fingerprint must abstract the per-invocation paths (or no two
@@ -262,8 +357,8 @@ BEZEL_TEST(aot_cache_key, object_and_link_keys_never_collide) {
     // Feed both composers the most similar inputs available and require the
     // outputs to differ; the "k3l;" tag on the link key guarantees it.
     BEZEL_EXPECT_TRUE(
-        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA) !=
-        composeLinkKey(ident(1), ident(1), Driver::linkRecipeSignature(false)));
+        composeObjectKey(ident(1), plainMode(), kPrelude, kSourceA, kToolchain) !=
+        composeLinkKey(ident(1), ident(1), Driver::linkRecipeSignature(false), kToolchain));
 }
 
 // ---------------------------------------------------------------------------
