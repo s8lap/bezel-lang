@@ -2807,33 +2807,9 @@ namespace {
 // span. // per §9.7, §4.14, §4.15
 bool isBuiltinSpanTypeRef(const sema::TypeRef* rt) {
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
-    std::string_view n;
-    if (!rt->declaration) {
-        n = rt->headName();
-    } else if (!rt->declaration->decl) {
-        // fix #3022 (spec §11.3, v0.240): the `declaration->decl == null`
-        // shape is a builtinClassSym (no user TypeDecl) AND has an empty
-        // `moduleName` (SymbolCollection populates moduleName on every
-        // real local TypeSymbol; ModuleLoader does the same for
-        // imported ones — see TypeSymbol::moduleName and #2995/#2997).
-        // An IMPORTED user class named `Span`/`ReadOnlySpan`/`ArraySpan`/
-        // `ReadOnlyArraySpan` reaches this branch with a null `decl`
-        // (no source AST) AND a populated `moduleName`; the previous
-        // gate (`!declaration->decl` only) admitted it as a borrow-
-        // bearing span, classifying a user record with such a field as
-        // §9.7 borrow-bearing when the user's own `Span` is plainly not.
-        // Add the `moduleName.empty()` discriminator — same shape
-        // #2997 uses for the codegen chain and #2995 uses for the
-        // TaskScope front-end predicate. A user-declared `Span` (local
-        // OR imported) now falls through and the caller treats it as
-        // the ordinary user type it is.
-        if (!rt->declaration->moduleName.empty()) return false;
-        n = rt->declaration->name;
-    } else {
-        // declaration with a non-null decl = a LOCAL user class; the
-        // §9.7 record-field walk handles it on its user-Record recurse.
-        return false;
-    }
+    const std::string_view n =
+        rt->declaration ? std::string_view(rt->declaration->name)
+                        : rt->headName();
     return n == "Span" || n == "ReadOnlySpan" ||
            n == "ArraySpan" || n == "ReadOnlyArraySpan";
 }

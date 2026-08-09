@@ -2809,16 +2809,6 @@ bool ExprTC::primitiveBoxesIntoBuiltinIface(PrimitiveType fromPrim,
         to->declaration->kind != ast::TypeDeclKind::Interface ||
         to->genericArgs.size() != 1 || !to->genericArgs[0])
         return false;
-    // fix #3022 (spec §11.3, v0.240): a USER interface named IComparable /
-    // IEquatable must NOT trigger the §8.6 primitive-boxing predicate — the
-    // boxing lowering (§22.6 / §5.1) is built-in specific, and a user
-    // interface with that name is a perfectly ordinary user contract.
-    // `declaration->moduleName.empty()` is the discriminator the rest of the
-    // front-end adopted after #2995/#2997: a builtinClassSym leaves it empty,
-    // SymbolCollection (local) and ModuleLoader (imported) populate it on
-    // every real TypeSymbol. The Boolean guard below is unchanged — §9.4
-    // applies to the builtin ONLY and the gate now does the same.
-    if (!to->declaration->moduleName.empty()) return false;
     bool isCmp = to->declaration->name == "IComparable";
     bool isEq  = to->declaration->name == "IEquatable";
     if (!isCmp && !isEq) return false;
@@ -3342,13 +3332,7 @@ void ExprTC::checkAssignable(TypeRef* from, TypeRef* to,
     if (from->kind == TypeRef::Kind::Named && !from->declaration &&
         to->kind   == TypeRef::Kind::Named &&  to->declaration &&
         to->declaration->kind == ast::TypeDeclKind::Interface &&
-        to->declaration->name == "IReadOnlySpan" &&
-        // fix #3022 (§11.3, v0.240): only the §4.16 BUILTIN interface has
-        // moduleName.empty() — SymbolCollection (local) and ModuleLoader
-        // (imported) populate moduleName on every real TypeSymbol. Without
-        // this gate a user interface named IReadOnlySpan is wrongly admitted
-        // as the §4.16 target.
-        to->declaration->moduleName.empty()) {
+        to->declaration->name == "IReadOnlySpan") {
         std::string_view fromN = namedTypeSimpleName(from);
         if (fromN == "ArraySpan" || fromN == "ReadOnlyArraySpan" ||
             fromN == "Span"      || fromN == "ReadOnlySpan") {

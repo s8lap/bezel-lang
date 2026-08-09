@@ -149,14 +149,7 @@ bool ExprTC::implicitlyConvertible(const TypeRef* from, const TypeRef* to) {
     if (from->kind == TypeRef::Kind::Named && !from->declaration &&
         to->kind   == TypeRef::Kind::Named &&  to->declaration &&
         to->declaration->kind == ast::TypeDeclKind::Interface &&
-        to->declaration->name == "IReadOnlySpan" &&
-        // fix #3022 (§11.3, v0.240): only the §4.16 BUILTIN interface has
-        // moduleName.empty() — SymbolCollection (local) and ModuleLoader
-        // (imported) populate moduleName on every real TypeSymbol. Without
-        // this gate a user interface named IReadOnlySpan would be admitted
-        // as the §4.16 target and codegen would box a span through a
-        // non-existent vtable.
-        to->declaration->moduleName.empty()) {
+        to->declaration->name == "IReadOnlySpan") {
         // Inline name extraction (callsNamedTypeSimpleName is defined later).
         std::string_view fromN;
         if (from->astNode && from->astNode->name &&
@@ -3523,16 +3516,7 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 !recvTy->astNode->name->parts.empty())
                                 spanHead = recvTy->headName();
                         } else if (!recvTy->declaration->decl ||
-                                   // fix #3022 (§11.3, v0.240): gate the
-                                   // IReadOnlySpan builtinClassSym match on
-                                   // moduleName.empty() so a USER interface
-                                   // named IReadOnlySpan (local or imported)
-                                   // does not get the §4.16 span-receiver
-                                   // typing — SymbolCollection and
-                                   // ModuleLoader populate moduleName on
-                                   // every real TypeSymbol.
-                                   (recvTy->declaration->name == "IReadOnlySpan" &&
-                                    recvTy->declaration->moduleName.empty())) {
+                                   recvTy->declaration->name == "IReadOnlySpan") {
                             spanHead = recvTy->declaration->name;
                         }
                     }
@@ -3883,14 +3867,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // result was otherwise left null → the downstream operator saw an
                 // untyped receiver). Range's own members (Contains/GetEnumerator)
                 // resolve through their dedicated handlers and are unaffected.
-                // fix #3022 (§11.3, v0.240): the `Range` head must be the §5 builtin
-                    // Range<T>, not a user class named Range — gate on
-                    // moduleName.empty() (the discriminator the rest of
-                    // the front-end adopted after #2995/#2997).
-                    bool isRangeLinqRecv =
+                bool isRangeLinqRecv =
                     recvTy && recvTy->kind == TypeRef::Kind::Named &&
                     recvTy->declaration && recvTy->declaration->name == "Range" &&
-                    recvTy->declaration->moduleName.empty() &&
                     !recvTy->genericArgs.empty();
                 // stdlib §5 (#755): an `IGrouping<TKey, T>` receiver. `IGrouping :
                 // IEnumerable<T>` (stdlib §5:3076), so the whole §5 operator and
@@ -4209,17 +4188,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // codegen and `.Length`/`.Get` paths recognize); GetString → string;
                 // Name → string. Only Utf8 reaches here (the other singletons are
                 // rejected at member access).
-                // fix #3022 (§11.3, v0.240): the Encoding head must be the stdlib §3.2
-                // builtin, not a user class named Encoding — gate on
-                // moduleName.empty() (the discriminator the rest of the
-                // front-end adopted after #2995/#2997). Without the gate
-                // a user class named `Encoding` reaches stdlib §3.2's
-                // specific member-typing arm and codegen tries to box
-                // `Encoding.Utf8` as a built-in singleton.
                 if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
                     recvTy->declaration &&
-                    recvTy->declaration->name == "Encoding" &&
-                    recvTy->declaration->moduleName.empty()) {
+                    recvTy->declaration->name == "Encoding") {
                     if (m == "GetBytes" && ce.args.size() <= 1) {
                         // fix #526 / stdlib §3.2: 1-arg GetBytes(s: string)
                         // returns owned Array<byte>. Use makeConcreteCollectionResult
@@ -6661,124 +6632,6 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     unit->kind = TypeRef::Kind::Unit;
                     ctx_.setExprType(&ce, unit);
                 }
-                // fix #3021 (§11.7 / §22.6, v0.240): per-static-class
-                // closed-surface guard. The per-instance-type closed-surface
-                // arms further below (lines 6914-7775) reject unknown members
-                // with a "no member `M` on `T`; documented surface: ..." Error
-                // diagnostic; the equivalent pattern is missing for static
-                // classes, so a bogus call like `File.TotallyBogusMember(1, 2)`
-                // compiles with no Error (only the §2434 internal warning from
-                // the local-decl zero-init fallback) and exits 0 with `v = 0`.
-                // Mirror the per-instance-type arms: when the receiver is a
-                // static-class identifier in this revision's documented
-                // surface and the member is not in that surface, emit the
-                // diagnostic. The earlier arms above already stamp `exprType`
-                // for the documented members they handle — known void members
-                // (Debug.Assert/WriteLine, File.Write* family, Domain.Dispose
-                // analogues) intentionally leave `exprType` null, and the
-                // membership check below is name-only, so the diagnostic does
-                // NOT fire for them. Excluded from this list: `Encoding`
-                // (abstract, has its own §3.2 singleton-property reject at
-                // line 12208), `BitConverter` (already rejected via the
-                // `rejectBuiltinStatic()` helper at line 15810), and `Linq`
-                // (a module name with no static class surface — `Linq.X` is
-                // a name-lookup failure, not a member-call failure).
-                //
-                // Scope of `colName` coverage: the colName lambda at line
-                // 3380 falls back to the IdentifierExpr head for a
-                // declaration-less built-in (per its "Builtin class
-                // identifiers (File, Directory, etc.) are given a symbol but
-                // no TypeRef; fall back to reading the identifier name"
-                // comment), so `File.TotallyBogusMember(1, 2)` has colName
-                // == "File" and reaches this block. The brief's reported
-                // population — File, Directory, Path, Debug, Domain — is
-                // enumerated below; a later lane can extend it for the
-                // remaining static-class names (Task, Stopwatch,
-                // CancellationTokenSource — same shape, same defect family,
-                // tracked separately to keep this commit tight).
-                {
-                    struct StaticSurface {
-                        std::string_view colName;
-                        std::initializer_list<std::string_view> members;
-                        std::string_view surface;
-                        std::string_view stdlibSection;
-                    };
-                    static const StaticSurface kStaticSurfaces[] = {
-                        // §7.3 File — 12 static methods (4 async, 8 sync).
-                        {"File",
-                         {"ReadAllText", "ReadAllTextAsync", "WriteAllText",
-                          "WriteAllTextAsync", "ReadAllBytes", "WriteAllBytes",
-                          "ReadAllLines", "WriteAllLines", "Exists", "Delete",
-                          "Copy", "Move"},
-                         "ReadAllText(path), ReadAllBytes(path), "
-                         "ReadAllLines(path), "
-                         "ReadAllTextAsync(path, token := CancellationToken.None), "
-                         "WriteAllText(path, contents), WriteAllBytes(path, "
-                         "Array<byte>|ReadOnlySpan<byte>), "
-                         "WriteAllLines(path, IEnumerable<string>), "
-                         "WriteAllTextAsync(path, contents, "
-                         "token := CancellationToken.None), "
-                         "Exists(path), Delete(path), Copy(source, dest, "
-                         "overwrite), Move(source, dest)",
-                         "7.3"},
-                        // §7.4 Directory — 5 method names (Delete is two
-                        // arities; one entry covers both).
-                        {"Directory",
-                         {"Exists", "CreateDirectory", "Delete", "GetFiles",
-                          "GetDirectories"},
-                         "Exists(path), CreateDirectory(path), Delete(path), "
-                         "Delete(path, recursive), GetFiles(path), "
-                         "GetDirectories(path)",
-                         "7.4"},
-                        // §7.4 Path — 6 methods, all returning string.
-                        {"Path",
-                         {"Combine", "GetFileName", "GetExtension",
-                          "GetFileNameWithoutExtension", "GetDirectoryName",
-                          "GetFullPath"},
-                         "Combine(a, b), GetFileName(path), GetExtension(path), "
-                         "GetFileNameWithoutExtension(path), "
-                         "GetDirectoryName(path), GetFullPath(path)",
-                         "7.4"},
-                        // §8.2 Debug — 3 static methods (Assert has two
-                        // arities), all unit-returning.
-                        {"Debug",
-                         {"Assert", "WriteLine"},
-                         "Assert(condition), Assert(condition, message), "
-                         "WriteLine(message)",
-                         "8.2"},
-                        // §6.8 Domain — Spawn with many overloads
-                        // (sync/async, generic/non-generic, with/without
-                        // args/result). One entry covers the whole family.
-                        {"Domain",
-                         {"Spawn"},
-                         "Spawn(entry), Spawn<A>(entry, owned A), "
-                         "Spawn<A>(entry, A), Spawn<R>(entry) -> "
-                         "owned OwningTask<R>|owned Task<R>, plus the async "
-                         "entry variants and the with-args/with-result "
-                         "overloads (stdlib §6.8)",
-                         "6.8"},
-                    };
-                    for (const auto& s : kStaticSurfaces) {
-                        if (colName != s.colName) continue;
-                        bool known = false;
-                        for (auto km : s.members) {
-                            if (m == km) { known = true; break; }
-                        }
-                        if (!known) {
-                            ctx_.diagnostics().report(
-                                Severity::Error, ce.span.begin,
-                                std::string("no member `") + std::string(m) +
-                                "` on `" + std::string(s.colName) +
-                                "`; documented surface: " +
-                                std::string(s.surface) + " (stdlib §" +
-                                std::string(s.stdlibSection) + ")");
-                        }
-                        // Only one StaticSurface row matches per receiver —
-                        // stop scanning after the match (the loop above
-                        // already skips rows whose colName doesn't match).
-                        break;
-                    }
-                }
                 // §2.5: DateTime instance method return types.
                 // The receiver's TypeRef uses builtinClassSym (non-null declaration,
                 // null decl) so colName is empty; check via declaration->name directly.
@@ -8099,20 +7952,11 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // rejected here with a §3.6-derived-type-properties rule-2
                     // diagnostic naming the classification, the deciding payload,
                     // and the owning-match remedy (§35.5).
-                    // fix #3022 (§11.3, v0.240): the Result choice must be the stdlib §35.2
-                    // builtin, not a user choice named Result — gate on
-                    // moduleName.empty() (the discriminator the rest of
-                    // the front-end adopted after #2995/#2997). Without
-                    // the gate a user choice named `Result` reaches
-                    // stdlib §35.2's specific combinator-typing arm and
-                    // codegen routes the call to the result-specific
-                    // lowering on a non-result value.
                     if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
                             recvTy->declaration &&
                             recvTy->declaration->kind ==
                                 ast::TypeDeclKind::Choice &&
                             recvTy->declaration->name == "Result" &&
-                            recvTy->declaration->moduleName.empty() &&
                             recvTy->genericArgs.size() == 2 &&
                             (m == "Map" || m == "MapError" ||
                              m == "AndThen" || m == "UnwrapOr")) {
@@ -8170,18 +8014,12 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // probe: if fnTy->funcReturn is a Named Result
                             // choice with two generic args, treat its first
                             // arg as U; otherwise treat the funcReturn as U.
-                            // fix #3022 (§11.3, v0.240): the nested `Result<U, E>` lambda-return
-                            // type in `AndThen` must be the stdlib §35.2
-                            // builtin choice — gate on moduleName.empty()
-                            // so a user choice named `Result` is not
-                            // unwrapped to steal its first generic arg.
                             if (m == "AndThen" &&
                                 uArg && uArg->kind == TypeRef::Kind::Named &&
                                 uArg->declaration &&
                                 uArg->declaration->kind ==
                                     ast::TypeDeclKind::Choice &&
                                 uArg->declaration->name == "Result" &&
-                                uArg->declaration->moduleName.empty() &&
                                 uArg->genericArgs.size() == 2) {
                                 uArg = uArg->genericArgs[0];
                             }
@@ -12385,17 +12223,9 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // miscompile (a null receiver → crash). A clear compile error is the
         // sound outcome until a real singleton object is modeled.
         if (auto* tt = ctx_.exprType(*ma.target)) {
-            // fix #3022 (§11.3, v0.240): `targetIsEncoding` must NOT match
-            // a USER class named Encoding — gate on moduleName.empty()
-            // (the discriminator the rest of the front-end adopted after
-            // #2995/#2997). Without it a user class named `Encoding`
-            // trips the stdlib §3.2 "Encoding is usable only as the
-            // immediate receiver" diagnostic on a program that contains
-            // no §3.2 built-in.
             bool targetIsEncoding =
                 tt->kind == TypeRef::Kind::Named && tt->declaration &&
-                tt->declaration->name == "Encoding" &&
-                tt->declaration->moduleName.empty();
+                tt->declaration->name == "Encoding";
             bool targetIsDirectSingleton = false;
             if (auto* inner =
                     dynamic_cast<const ast::MemberAccessExpr*>(ma.target.get())) {
@@ -13078,24 +12908,8 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // correctly via strlen / bz_wstrlen), and giving it a type changes
             // what the §5.1 no-implicit-conversion rule sees at every existing
             // use site. Measured, not inferred, and filed rather than folded in.
-            // fix #3022 (§11.3, v0.240): gate the RawBytes-specific `.Length` typing
-            // on moduleName.empty() so a USER class named RawBytes does
-            // not get the builtin pointer-length typing — the FFI
-            // pointer-length lowering is built-in specific. The Pointer
-            // leg above uses `common::isFfiBufferBuiltinName` (which
-            // already has its own user-type exclusion, see comment); this
-            // is the matching leg for the §10.3 RawBytes-only spelling
-            // the comment block above describes. NOTE: the test for
-            // user class `class RawBytes { … }` with a method `Length`
-            // (e.g. an int-returning `Length()`) was previously typed
-            // int by this branch and so silently short-circuited the
-            // real method dispatch; the gate restores the §11.3
-            // "no member `Length`" rejection for a user class while
-            // leaving the FFI builtin path unchanged.
             if (tt && tt->kind == TypeRef::Kind::Named && tt->declaration &&
-                tt->declaration->name == "RawBytes" &&
-                tt->declaration->moduleName.empty() &&
-                ma.member == "Length") {
+                tt->declaration->name == "RawBytes" && ma.member == "Length") {
                 ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                 return;
             }
