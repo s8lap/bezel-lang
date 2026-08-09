@@ -4455,10 +4455,39 @@ llvm::Function* Emitter::ensurePropertyBlockGetter(const ast::PropertyDecl* pd,
     accessorReturnTypeNode_ = pd->type.get();
     accessorReturnTypeFn_   = fn;
 
+    // fix #2944 (§12.1 / §14.1 / §23, v0.240): a BLOCK-bodied property
+    // GETTER (and the indexer twin at line ~5188) built as the shared/erased
+    // TEMPLATE (tag 0 — `declareVtables` Pass D's first emission) lowers its
+    // body's `return v;` through `emitReturn` with no active substitution, so
+    // the value carries the i32 ERASED PLACEHOLDER for a T-typed field while
+    // the function's declared RETURN TYPE comes from `lowerType(pd->type)` —
+    // which respects the OVERRIDE's concrete `Item: string` -> ptr.
+    // `emitReturn`'s `emittingGenericTemplateBody_` guard (#817,
+    // LlvmBackend_Setup.cpp ~10818) would substitute a type-correct `ret
+    // null`, but it is gated on a flag set only by `emitFunctionBody` for
+    // METHOD templates — this getter's body is emitted INSIDE the property
+    // builder, never via `emitFunctionBody`. Mirror the expression-getter
+    // fix above and the method's own template coercion: temporarily arm the
+    // flag for the duration of the TEMPLATE body only (tag > 0 → spec body,
+    // which lowers under the active substitution and reads fields at the
+    // concrete widths, so the coercion would mask a real bug there). The
+    // template is dead at runtime when the layout moves (condition (d) of
+    // #2928 installs the spec body in the per-instantiation slot) — only the
+    // IR has to verify. Safe to arm even for a non-generic template body:
+    // emitReturn's coercion is a no-op when the value's type already matches
+    // the return type, and the OTHER consumers of the flag pair it with
+    // `templateGenericParamNames_` (populated only by `emitFunctionBody`),
+    // which is empty here so they no-op.
+    bool savedEmittingGenericTemplateBody = emittingGenericTemplateBody_;
+    if (accessorSpecTagNow() == 0)
+        emittingGenericTemplateBody_ = true;
+
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
     if (!builder_.GetInsertBlock()->getTerminator())
         emitImplicitReturn(fn);
+
+    emittingGenericTemplateBody_ = savedEmittingGenericTemplateBody;
 
     // --- Restore state ---
     currentFn_          = savedFn;
@@ -4845,6 +4874,32 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                         "internal: return-value expression failed to lower to a "
                         "value (degraded to a zero/null return value) — #2491");
                 }
+                // fix #2944 (§12.1 / §14.1 / §23, v0.240): an EXPRESSION-bodied
+                // property GETTER built as the shared/erased TEMPLATE (tag 0 —
+                // `declareVtables` Pass D's first emission, before any per-
+                // instantiation tag is installed) lowers its body without an
+                // active substitution, so the lowered value of an expression
+                // that reaches a `T`-typed field is the i32 ERASED PLACEHOLDER.
+                // The function's declared RETURN TYPE was built from
+                // `lowerType(pd->type)` — which respects the OVERRIDE's concrete
+                // annotation (e.g. `Item: string` -> ptr) — so the body's
+                // `ret i32` inside a `ptr`-returning function fails IR
+                // verification: "Function return type does not match operand
+                // type of return inst!". The METHOD twin (emitReturn,
+                // LlvmBackend_Setup.cpp ~10818) handles this case by
+                // substituting a type-correct `ret null` whenever
+                // `emittingGenericTemplateBody_` is true; this site bypasses
+                // emitReturn and was missing the guard, so the same shape on
+                // the PROPERTY face was a hard abort. Mirror the method twin:
+                // a type-correct zero/null keeps the template IR-valid (the
+                // template is dead at runtime — the per-instantiation vtable
+                // installed by `specializedVtableFor` condition (d) replaces
+                // this body when the layout moves) without masking a real
+                // return-coercion bug in a non-generic or live-specialization
+                // body, both of which reach this site with `accessorSpecTag_`
+                // non-zero and matching `genericSubst_`.
+                if (v && v->getType() != valTy && accessorSpecTagNow() == 0)
+                    v = llvm::Constant::getNullValue(valTy);
                 builder_.CreateRet(v ? v
                                      : llvm::Constant::getNullValue(valTy));
             }
@@ -4860,9 +4915,25 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
             // returns void and has no return-representation contract.
             accessorReturnTypeNode_ = pd->type.get();
             accessorReturnTypeFn_   = fn;
+            // fix #2944 (§12.1 / §14.1 / §23, v0.240): a BLOCK-bodied property
+            // GETTER built as the shared/erased TEMPLATE (tag 0) lowers its
+            // body's `return v;` through `emitReturn` with no active
+            // substitution, so the value carries the i32 ERASED PLACEHOLDER for
+            // a T-typed field while the function's declared RETURN TYPE comes
+            // from the OVERRIDE's concrete annotation (`Item: string` -> ptr).
+            // `emitReturn`'s `emittingGenericTemplateBody_` guard would coerce
+            // the mismatched return to a type-correct `ret null`, but the flag
+            // is set only by `emitFunctionBody` for METHOD templates — this
+            // getter's body is emitted INSIDE `ensurePropertyAccessorFn`,
+            // never via `emitFunctionBody`. Mirror the method's own template
+            // coercion and the `ensurePropertyBlockGetter` fix above.
+            bool savedEmittingGenericTemplateBody = emittingGenericTemplateBody_;
+            if (accessorSpecTagNow() == 0)
+                emittingGenericTemplateBody_ = true;
             lowerScopedBlock(blockGet->stmts);
             if (!builder_.GetInsertBlock()->getTerminator())
                 emitImplicitReturn(fn);
+            emittingGenericTemplateBody_ = savedEmittingGenericTemplateBody;
         }
     } else {
         // --- Setter body: bind the implicit `value` param (anchored on pd). ---
@@ -5162,10 +5233,39 @@ llvm::Function* Emitter::ensureIndexerBlockGetter(
     accessorReturnTypeNode_ = pd->type.get();
     accessorReturnTypeFn_   = fn;
 
+    // fix #2944 (§12.1 / §14.1 / §23, v0.240): a BLOCK-bodied property
+    // GETTER (and the indexer twin at line ~5188) built as the shared/erased
+    // TEMPLATE (tag 0 — `declareVtables` Pass D's first emission) lowers its
+    // body's `return v;` through `emitReturn` with no active substitution, so
+    // the value carries the i32 ERASED PLACEHOLDER for a T-typed field while
+    // the function's declared RETURN TYPE comes from `lowerType(pd->type)` —
+    // which respects the OVERRIDE's concrete `Item: string` -> ptr.
+    // `emitReturn`'s `emittingGenericTemplateBody_` guard (#817,
+    // LlvmBackend_Setup.cpp ~10818) would substitute a type-correct `ret
+    // null`, but it is gated on a flag set only by `emitFunctionBody` for
+    // METHOD templates — this getter's body is emitted INSIDE the property
+    // builder, never via `emitFunctionBody`. Mirror the expression-getter
+    // fix above and the method's own template coercion: temporarily arm the
+    // flag for the duration of the TEMPLATE body only (tag > 0 → spec body,
+    // which lowers under the active substitution and reads fields at the
+    // concrete widths, so the coercion would mask a real bug there). The
+    // template is dead at runtime when the layout moves (condition (d) of
+    // #2928 installs the spec body in the per-instantiation slot) — only the
+    // IR has to verify. Safe to arm even for a non-generic template body:
+    // emitReturn's coercion is a no-op when the value's type already matches
+    // the return type, and the OTHER consumers of the flag pair it with
+    // `templateGenericParamNames_` (populated only by `emitFunctionBody`),
+    // which is empty here so they no-op.
+    bool savedEmittingGenericTemplateBody = emittingGenericTemplateBody_;
+    if (accessorSpecTagNow() == 0)
+        emittingGenericTemplateBody_ = true;
+
     // --- Emit body ---
     lowerScopedBlock(acc->stmts);
     if (!builder_.GetInsertBlock()->getTerminator())
         emitImplicitReturn(fn);
+
+    emittingGenericTemplateBody_ = savedEmittingGenericTemplateBody;
 
     // --- Restore state ---
     currentFn_          = savedFn;
