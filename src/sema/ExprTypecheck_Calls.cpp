@@ -6661,6 +6661,124 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     unit->kind = TypeRef::Kind::Unit;
                     ctx_.setExprType(&ce, unit);
                 }
+                // fix #3021 (§11.7 / §22.6, v0.240): per-static-class
+                // closed-surface guard. The per-instance-type closed-surface
+                // arms further below (lines 6914-7775) reject unknown members
+                // with a "no member `M` on `T`; documented surface: ..." Error
+                // diagnostic; the equivalent pattern is missing for static
+                // classes, so a bogus call like `File.TotallyBogusMember(1, 2)`
+                // compiles with no Error (only the §2434 internal warning from
+                // the local-decl zero-init fallback) and exits 0 with `v = 0`.
+                // Mirror the per-instance-type arms: when the receiver is a
+                // static-class identifier in this revision's documented
+                // surface and the member is not in that surface, emit the
+                // diagnostic. The earlier arms above already stamp `exprType`
+                // for the documented members they handle — known void members
+                // (Debug.Assert/WriteLine, File.Write* family, Domain.Dispose
+                // analogues) intentionally leave `exprType` null, and the
+                // membership check below is name-only, so the diagnostic does
+                // NOT fire for them. Excluded from this list: `Encoding`
+                // (abstract, has its own §3.2 singleton-property reject at
+                // line 12208), `BitConverter` (already rejected via the
+                // `rejectBuiltinStatic()` helper at line 15810), and `Linq`
+                // (a module name with no static class surface — `Linq.X` is
+                // a name-lookup failure, not a member-call failure).
+                //
+                // Scope of `colName` coverage: the colName lambda at line
+                // 3380 falls back to the IdentifierExpr head for a
+                // declaration-less built-in (per its "Builtin class
+                // identifiers (File, Directory, etc.) are given a symbol but
+                // no TypeRef; fall back to reading the identifier name"
+                // comment), so `File.TotallyBogusMember(1, 2)` has colName
+                // == "File" and reaches this block. The brief's reported
+                // population — File, Directory, Path, Debug, Domain — is
+                // enumerated below; a later lane can extend it for the
+                // remaining static-class names (Task, Stopwatch,
+                // CancellationTokenSource — same shape, same defect family,
+                // tracked separately to keep this commit tight).
+                {
+                    struct StaticSurface {
+                        std::string_view colName;
+                        std::initializer_list<std::string_view> members;
+                        std::string_view surface;
+                        std::string_view stdlibSection;
+                    };
+                    static const StaticSurface kStaticSurfaces[] = {
+                        // §7.3 File — 12 static methods (4 async, 8 sync).
+                        {"File",
+                         {"ReadAllText", "ReadAllTextAsync", "WriteAllText",
+                          "WriteAllTextAsync", "ReadAllBytes", "WriteAllBytes",
+                          "ReadAllLines", "WriteAllLines", "Exists", "Delete",
+                          "Copy", "Move"},
+                         "ReadAllText(path), ReadAllBytes(path), "
+                         "ReadAllLines(path), "
+                         "ReadAllTextAsync(path, token := CancellationToken.None), "
+                         "WriteAllText(path, contents), WriteAllBytes(path, "
+                         "Array<byte>|ReadOnlySpan<byte>), "
+                         "WriteAllLines(path, IEnumerable<string>), "
+                         "WriteAllTextAsync(path, contents, "
+                         "token := CancellationToken.None), "
+                         "Exists(path), Delete(path), Copy(source, dest, "
+                         "overwrite), Move(source, dest)",
+                         "7.3"},
+                        // §7.4 Directory — 5 method names (Delete is two
+                        // arities; one entry covers both).
+                        {"Directory",
+                         {"Exists", "CreateDirectory", "Delete", "GetFiles",
+                          "GetDirectories"},
+                         "Exists(path), CreateDirectory(path), Delete(path), "
+                         "Delete(path, recursive), GetFiles(path), "
+                         "GetDirectories(path)",
+                         "7.4"},
+                        // §7.4 Path — 6 methods, all returning string.
+                        {"Path",
+                         {"Combine", "GetFileName", "GetExtension",
+                          "GetFileNameWithoutExtension", "GetDirectoryName",
+                          "GetFullPath"},
+                         "Combine(a, b), GetFileName(path), GetExtension(path), "
+                         "GetFileNameWithoutExtension(path), "
+                         "GetDirectoryName(path), GetFullPath(path)",
+                         "7.4"},
+                        // §8.2 Debug — 3 static methods (Assert has two
+                        // arities), all unit-returning.
+                        {"Debug",
+                         {"Assert", "WriteLine"},
+                         "Assert(condition), Assert(condition, message), "
+                         "WriteLine(message)",
+                         "8.2"},
+                        // §6.8 Domain — Spawn with many overloads
+                        // (sync/async, generic/non-generic, with/without
+                        // args/result). One entry covers the whole family.
+                        {"Domain",
+                         {"Spawn"},
+                         "Spawn(entry), Spawn<A>(entry, owned A), "
+                         "Spawn<A>(entry, A), Spawn<R>(entry) -> "
+                         "owned OwningTask<R>|owned Task<R>, plus the async "
+                         "entry variants and the with-args/with-result "
+                         "overloads (stdlib §6.8)",
+                         "6.8"},
+                    };
+                    for (const auto& s : kStaticSurfaces) {
+                        if (colName != s.colName) continue;
+                        bool known = false;
+                        for (auto km : s.members) {
+                            if (m == km) { known = true; break; }
+                        }
+                        if (!known) {
+                            ctx_.diagnostics().report(
+                                Severity::Error, ce.span.begin,
+                                std::string("no member `") + std::string(m) +
+                                "` on `" + std::string(s.colName) +
+                                "`; documented surface: " +
+                                std::string(s.surface) + " (stdlib §" +
+                                std::string(s.stdlibSection) + ")");
+                        }
+                        // Only one StaticSurface row matches per receiver —
+                        // stop scanning after the match (the loop above
+                        // already skips rows whose colName doesn't match).
+                        break;
+                    }
+                }
                 // §2.5: DateTime instance method return types.
                 // The receiver's TypeRef uses builtinClassSym (non-null declaration,
                 // null decl) so colName is empty; check via declaration->name directly.
