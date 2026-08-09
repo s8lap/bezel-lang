@@ -105,18 +105,48 @@ if "${GATE_CMD[@]}"; then
   # so fall back to $? (back-compat). Exit 1 = verdict present but NOT a
   # trustworthy pass — the exit and the verdict DISAGREE, which must never be
   # silently pushed on.
+  #
+  # Wave 3 (#3010): the conservative-non-accept reconciliation now lives in
+  # gate.cycle.cross_check. At the push boundary the decision is binary
+  # (accept=push / bail=refuse): legacy_decision is accept ($?=0 here — the gate
+  # succeeded), verdict_decision is accept iff the verdict is a trustworthy pass
+  # (read exit 0), bail iff present-not-pass (read exit 1), absent iff
+  # missing/stale (read exit 2 -> fallback to legacy accept). cross_check returns
+  # accept on agreement / bail on disagreement (never accept on disagreement —
+  # the policy that stopped the 55-truncated-gates class). The legacy 3-way read
+  # branch below is the dual-consume CROSS-CHECK (asserted to agree with
+  # cross_check); keep it for 1 landing gate, then retire.
   _head="$(git rev-parse HEAD 2>/dev/null || echo '')"
-  if PYTHONPATH=scripts python3 -m gate.verdict read --path "$GATE_VERDICT" \
-       --expect-head "$_head" 2>/dev/null; then
-    : # verdict agrees: trustworthy pass.
+  _v_out="$(PYTHONPATH=scripts python3 -m gate.verdict read --path "$GATE_VERDICT" \
+       --expect-head "$_head" 2>/dev/null)"; _vrc=$?
+  case "$_vrc" in
+    0) _vdec=accept ;;        # verdict is pass+trustworthy
+    1) _vdec=bail ;;          # present but not a trustworthy pass -> refuse
+    *) _vdec="" ;;            # missing/stale -> fallback to $? (accept)
+  esac
+  # The push decision via gate.cycle: cross-check the verdict decision against
+  # the legacy ($?=0 -> accept). Empty _vdec -> cross_check returns the legacy
+  # (accept) — the fallback. bail -> refuse to push.
+  _push_dec="$(PYTHONPATH=scripts python3 -m gate.cycle cross-check \
+      --verdict-decision "${_vdec}" --legacy-decision accept 2>/dev/null)"
+  if [ "$_push_dec" = accept ]; then
+    : # verdict agrees (or absent) -> push.
   else
-    _vrc=$?
     if [ "$_vrc" -eq 2 ]; then
       echo "== gate_and_push: note — no usable cycle verdict at $GATE_VERDICT (writer best-effort) — relying on \$? =="
+      # DUAL-CONSUME: cross_check said accept for a missing verdict (fallback);
+      # if it said otherwise, the Python port diverged from the legacy branch.
+      [ "$_push_dec" != accept ] && \
+        echo "== gate_and_push: DUAL-CONSUME DISAGREEMENT — missing verdict but cross_check said '$_push_dec' (expected accept/fallback) — see test_cycle.CrossCheckTest ==" >&2
     else
       echo "== gate_and_push: REFUSING TO PUSH — the gate exited 0 but the verdict file is NOT a trustworthy pass ==" >&2
       echo "   The exit code and the verdict disagree (per the exit-code-trap, this is exactly the class that pushed 55 truncated gates)." >&2
       echo "   Verdict: $GATE_VERDICT — inspect before trusting either source." >&2
+      # DUAL-CONSUME: cross_check must have said bail for a present-not-pass
+      # verdict against an accept legacy. If it said accept, the Python port is
+      # wrong (it would push on the disagreement the whole policy exists to stop).
+      [ "$_push_dec" != bail ] && \
+        echo "== gate_and_push: DUAL-CONSUME DISAGREEMENT — present-not-pass verdict but cross_check said '$_push_dec' (expected bail) — see test_cycle.CrossCheckTest ==" >&2
       exit 1
     fi
   fi

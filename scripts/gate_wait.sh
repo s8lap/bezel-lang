@@ -76,27 +76,67 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
 # the log greps are the belt-and-braces fallback when the verdict is missing or
 # stale. On disagreement (verdict says pass but log says fail), take the
 # CONSERVATIVE fail — never report pass on a disagreement.
+#
+# Wave 3 (#3010): the conservative-non-accept reconciliation now lives in
+# gate.cycle.cross_check. The verdict decision (accept iff read exit 0, bail iff
+# present-not-pass, absent iff missing/stale) is cross-checked against the
+# log-marker decision (bail on FAIL markers, accept on PASS/PUSHED markers, absent
+# on neither). cross_check returns accept only when no dissent is present: on a
+# disagreement it never accepts (the policy that stopped the 55-truncated-gates
+# class); when one side is absent it defers to the other; when both are absent it
+# bails (could-not-classify). The original 3-branch ladder is computed below as
+# _legacy_exit and asserted equal (dual-consume 0-disagreement); keep for 1
+# landing gate, then retire.
 _v_args=(--path "$GATE_VERDICT")
 [ -n "$EXPECT_HEAD" ] && _v_args+=(--expect-head "$EXPECT_HEAD")
-if PYTHONPATH="$_GATE_SCRIPTS" python3 -m gate.verdict read "${_v_args[@]}" 2>/dev/null; then
-  # Verdict says trustworthy pass. Cross-check the log has no FAIL markers.
-  if grep -qE '== GATE FAIL|GATE FAILED -> NOT pushing' "$LOG" 2>/dev/null; then
-    echo "gate_wait: VERDICT CROSS-CHECK DISAGREEMENT — verdict says pass but log has FAIL markers in $LOG" >&2
-    exit 1
-  fi
-  exit 0
-else
-  _v_rc=$?
-  if [ "$_v_rc" -eq 1 ]; then
-    # Verdict present but NOT a trustworthy pass (fail/retry/refused/poisoned).
-    exit 1
-  fi
-  # rc==2: verdict missing/stale/unparseable — fall back to log markers.
-  if grep -qE '== GATE FAIL|GATE FAILED -> NOT pushing' "$LOG" 2>/dev/null; then
-    exit 1
-  elif grep -qE '== GATE PASS|PUSHED origin/main now' "$LOG" 2>/dev/null; then
-    exit 0
-  fi
-  echo "gate_wait: reached a terminal marker but could not classify pass/fail — inspect $LOG"
-  exit 1
+PYTHONPATH="$_GATE_SCRIPTS" python3 -m gate.verdict read "${_v_args[@]}" 2>/dev/null; _v_rc=$?
+
+# Verdict decision from the read-CLI exit (0 pass+trustworthy / 1 present-not-pass / 2 missing).
+case "$_v_rc" in
+  0) _vdec=accept ;;
+  1) _vdec=bail ;;
+  *) _vdec="" ;;
+esac
+# Log-marker decision: bail on FAIL, accept on PASS/PUSHED, else absent ("").
+_ldec=""
+if grep -qE '== GATE FAIL|GATE FAILED -> NOT pushing' "$LOG" 2>/dev/null; then
+  _ldec=bail
+elif grep -qE '== GATE PASS|PUSHED origin/main now' "$LOG" 2>/dev/null; then
+  _ldec=accept
 fi
+
+# The reconciled decision via gate.cycle (primary). accept -> exit 0, else exit 1.
+_gw_dec="$(PYTHONPATH="$_GATE_SCRIPTS" python3 -m gate.cycle cross-check \
+    --verdict-decision "${_vdec}" --legacy-decision "${_ldec}" 2>/dev/null)"
+_py_exit=0; [ "$_gw_dec" = accept ] || _py_exit=1
+
+# Legacy 3-branch ladder (faithful original, :79-102) as the dual-consume
+# CROSS-CHECK. Computes the same pass/fail from the raw read exit + log greps.
+_has_fail=0; grep -qE '== GATE FAIL|GATE FAILED -> NOT pushing' "$LOG" 2>/dev/null && _has_fail=1
+_has_pass=0; grep -qE '== GATE PASS|PUSHED origin/main now' "$LOG" 2>/dev/null && _has_pass=1
+_legacy_exit=1
+if [ "$_v_rc" -eq 0 ]; then
+  [ "$_has_fail" -eq 1 ] && _legacy_exit=1 || _legacy_exit=0
+elif [ "$_v_rc" -eq 1 ]; then
+  _legacy_exit=1
+else  # _v_rc == 2: verdict missing -> log decides; neither marker -> could-not-classify
+  [ "$_has_pass" -eq 1 ] && _legacy_exit=0 || _legacy_exit=1
+fi
+
+# DUAL-CONSUME 0-disagreement assertion: the Python cross_check and the legacy
+# ladder must agree on pass/fail. A divergence means the Python port is wrong.
+if [ "$_py_exit" -ne "$_legacy_exit" ]; then
+  echo "gate_wait: DUAL-CONSUME DISAGREEMENT — cross_check exit=$_py_exit but legacy ladder exit=$_legacy_exit (v_rc=$_v_rc vdec='${_vdec:-none}' ldec='${_ldec:-none}') in $LOG" >&2
+  echo "  The Python port and the legacy ladder disagree; see test_cycle.CrossCheckTest." >&2
+fi
+# Surface the GATE's own internal disagreement (the case cross_check escalated
+# on): verdict says pass but the log carries FAIL markers. This is the operator-
+# facing diagnostic the original inline classifier printed; cross_check IS the
+# reconciliation, but the message tells the operator WHY a pass became a fail.
+if [ "$_v_rc" -eq 0 ] && [ "$_has_fail" -eq 1 ]; then
+  echo "gate_wait: VERDICT CROSS-CHECK DISAGREEMENT — verdict says pass but log has FAIL markers in $LOG" >&2
+fi
+if [ "$_legacy_exit" -ne 0 ] && [ "$_v_rc" -eq 2 ] && [ "$_has_pass" -eq 0 ] && [ "$_has_fail" -eq 0 ]; then
+  echo "gate_wait: reached a terminal marker but could not classify pass/fail — inspect $LOG"
+fi
+exit "$_legacy_exit"

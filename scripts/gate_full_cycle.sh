@@ -74,6 +74,13 @@ say() { echo "[gate_full_cycle $(date '+%H:%M:%S')] $*" | tee -a "$CYCLE_LOG"; }
 # #3002). per the exit-code-trap: in THIS foreground call $? is the gate's own
 # exit (no pipeline/backgrounding), so it is reliable HERE — the trap bites the
 # EXTERNAL observer (gate_and_push/gate_wait), not this inner loop.
+#
+# Wave 3 (#3010): the canonical port of this logic now lives in
+# gate.cycle.legacy_decision; this bash function stays as the dual-consume
+# CROSS-CHECK (it and the Python module are proven byte-identical over every
+# reachable rc x undercount by test_cycle.ZeroDisagreementProofTest). The
+# 0-disagreement assertion below screams loudly if they ever diverge on a real
+# gate. Keep for 1 landing gate, then retire (the Python module is the authority).
 _legacy_rc_decision() { # rc log -> echoes accept|retry|bail
   case "$1" in
     0)  if grep -q 'shard crash / undercount' "$2" 2>/dev/null; then echo retry; else echo accept; fi ;;
@@ -133,26 +140,46 @@ run_until_trustworthy() {
     v_rc=$?
 
     # Map the verdict to a decision (empty = verdict absent -> fallback below).
-    case "$v_verdict" in
-      pass)     dec=accept ;;
-      refused)  dec=retry ;;
-      retry)    dec=retry ;;
-      poisoned) dec=retry ;;
-      fail)     dec=bail ;;
-      *)        dec="" ;;
-    esac
+    # Wave 3 (#3010): the canonical verdict->decision mapping + the trustworthy
+    # defense-in-depth now live in gate.cycle.classify (the inline `case` is
+    # retired). classify prints accept/retry/bail (or empty for an absent
+    # verdict); the v_rc trusted-pass predicate feeds the defense-in-depth cell
+    # (pass + trustworthy=false -> retry, never accept — the #3002 belt).
+    dec="$(PYTHONPATH=scripts python3 -m gate.cycle classify \
+            --verdict "$v_verdict" $([ "$v_rc" -eq 0 ] || echo --not-trustworthy) 2>/dev/null)"
 
     # CROSS-CHECK (dual-consume): compute the legacy $?/grep decision and verify
     # the verdict agrees. Disagreement means a bug in the verdict write or a race
     # on the verdict file — scream LOUDLY and take the CONSERVATIVE non-accept
     # decision. per the exit-code-trap: a false accept is the worst outcome (55
     # pass-but-truncated gates over 24 days).
+    #
+    # Wave 3 (#3010): the reconciliation itself now lives in
+    # gate.cycle.cross_check (conservative-non-accept-on-disagreement). The
+    # legacy decision is the dual-consume CROSS-CHECK input; cross_check returns
+    # the settled decision (agree -> that; disagree + either-accept -> bail;
+    # disagree retry/bail -> verdict wins). Pinned over the full 3x3 grid by
+    # test_cycle.CrossCheckTest. _legacy_rc_decision stays as the cross-check
+    # source (proven byte-identical to gate.cycle.legacy_decision by
+    # test_cycle.ZeroDisagreementProofTest).
     old_dec="$(_legacy_rc_decision "$rc" "$log")"
-    if [ -n "$dec" ] && [ "$dec" != "$old_dec" ]; then
-      say "VERDICT CROSS-CHECK DISAGREEMENT: verdict=$v_verdict->$dec but \$?=$rc/grep->$old_dec (attempt $i)"
-      say "  The verdict and legacy logic disagree — taking the conservative (non-accept) decision."
-      if [ "$dec" = accept ] || [ "$old_dec" = accept ]; then
-        dec=bail
+    if [ -n "$dec" ]; then
+      # Dual-consume: also compute the legacy decision via gate.cycle and assert
+      # it matches the bash _legacy_rc_decision. _legacy_rc_decision takes the log
+      # and greps the undercount banner itself; the Python port takes the resolved
+      # boolean, so harvest it once here.
+      _uc=0; grep -q 'shard crash / undercount' "$log" 2>/dev/null && _uc=1
+      _py_legacy="$(PYTHONPATH=scripts python3 -m gate.cycle legacy-decision \
+                     --rc "$rc" $([ "$_uc" -eq 1 ] && echo --undercount) 2>/dev/null)"
+      if [ -n "$_py_legacy" ] && [ "$_py_legacy" != "$old_dec" ]; then
+        say "DUAL-CONSUME DISAGREEMENT (legacy): bash _legacy_rc_decision='$old_dec' but gate.cycle.legacy-decision='$_py_legacy' (rc=$rc) — the Python port diverged from the bash; see test_cycle.ZeroDisagreementProofTest"
+      fi
+      if [ "$dec" != "$old_dec" ]; then
+        _cc="$(PYTHONPATH=scripts python3 -m gate.cycle cross-check \
+                --verdict-decision "$dec" --legacy-decision "$old_dec" 2>/dev/null)"
+        say "VERDICT CROSS-CHECK DISAGREEMENT: verdict=$v_verdict->$dec but \$?=$rc/grep->$old_dec (attempt $i) — cross_check -> ${_cc:-n/a}"
+        say "  The verdict and legacy logic disagree — taking the conservative (non-accept) decision."
+        dec="${_cc:-bail}"
       fi
     fi
     # FALLBACK: verdict missing/unparseable — use the legacy $?/grep decision.
@@ -252,20 +279,54 @@ run_until_trustworthy "$LOGDIR/${TAG}_full.log" "full(ASan)" --full || exit $?
 # oracle=asan. The log grep stays AUTHORITATIVE: it checks OBSERVED evidence
 # (sanitizer output in the log), while the verdict's oracle is the INTENDED mode
 # — the grep catches a mode that silently degraded even if the verdict says asan.
+#
+# Wave 3 (#3010): the consolidated ASan-ran evidence check now lives in
+# gate.cycle.assert_asan_ran (OBSERVED log grep + INTENDED verdict oracle). This
+# call IS the check; the inline grep below is the dual-consume CROSS-CHECK
+# (proven byte-identical over every evidence combination by
+# test_cycle.AssertAsanRanTest). The two MUST agree — disagreement means the
+# Python port diverged from the bash, and the conservative outcome is to treat
+# the cycle as NOT dual-oracle green. Keep the inline grep for 1 landing gate,
+# then retire it (gate.cycle is the authority).
 _fvf=$(ls -1 "$LOGDIR/${TAG}_full.attempt"*.verdict.json 2>/dev/null | sort -V | tail -1)
-if [ -n "$_fvf" ]; then
-  _ora="$(PYTHONPATH=scripts python3 -m gate.verdict read --path "$_fvf" --field oracle 2>/dev/null)"
-  if [ "$_ora" != asan ]; then
-    say "CYCLE FAILURE: the --full verdict says oracle='${_ora:-n/a}' (expected asan) — $_fvf"
-    say "  Refusing to report dual-oracle green — the ASan oracle's verdict does not confirm it ran."
-    exit 1
-  fi
+_asan_args=(--log-path "$LOGDIR/${TAG}_full.log")
+[ -n "$_fvf" ] && _asan_args+=(--verdict-path "$_fvf")
+# Run the check once, capturing the exit + the stderr reason (the reason goes to
+# stderr; stdout is empty on failure). `if ! var=$(...)` negates the command's
+# exit while still capturing its output. The single invocation avoids the
+# wasteful double-call the original draft had.
+if ! _a_reason="$(PYTHONPATH=scripts python3 -m gate.cycle assert-asan-ran "${_asan_args[@]}" 2>&1 1>/dev/null)"; then
+  say "CYCLE FAILURE: ASan-ran evidence check FAILED — ${_a_reason#cycle: }"
+  say "  Refusing to report dual-oracle green for a cycle that ran one oracle twice."
+  say "  Log: $LOGDIR/${TAG}_full.log"
+  exit 1
 fi
+# DUAL-CONSUME CROSS-CHECK: the inline grep must agree with gate.cycle. The grep
+# is the OBSERVED-evidence authority (it caught the original silent-degradation
+# defect); gate.cycle wraps it. If they disagree, the Python port is wrong.
 if ! grep -qi 'asan\|sanitize' "$LOGDIR/${TAG}_full.log"; then
+  if [ -n "$_fvf" ]; then
+    say "DUAL-CONSUME DISAGREEMENT (asan-ran): gate.cycle assert-asan-ran passed but the inline log grep found no 'asan|sanitize' — the Python port is wrong; see test_cycle.AssertAsanRanTest"
+  fi
   say "CYCLE FAILURE: the --full log mentions no sanitizer — the ASan oracle did NOT run."
   say "  Refusing to report dual-oracle green for a cycle that ran one oracle twice."
   say "  Log: $LOGDIR/${TAG}_full.log"
   exit 1
+fi
+# Legacy verdict-oracle cross-check (the INTENDED-mode half). gate.cycle
+# assert-asan-ran already gates on this (it reads the same verdict's oracle field
+# when --verdict-path is passed), so reaching here means it passed — this block is
+# the dual-consume belt for that half, kept for 1 landing gate, then retired. It
+# would only fire if assert-asan-ran and the direct read disagree (a Python-port
+# bug); in that case it still refuses dual-oracle green, the conservative outcome.
+if [ -n "$_fvf" ]; then
+  _ora="$(PYTHONPATH=scripts python3 -m gate.verdict read --path "$_fvf" --field oracle 2>/dev/null)"
+  if [ "$_ora" != asan ]; then
+    say "DUAL-CONSUME DISAGREEMENT (asan-ran): gate.cycle assert-asan-ran passed but the verdict oracle='${_ora:-n/a}' (expected asan) — $_fvf"
+    say "CYCLE FAILURE: the --full verdict says oracle='${_ora:-n/a}' (expected asan)"
+    say "  Refusing to report dual-oracle green — the ASan oracle's verdict does not confirm it ran."
+    exit 1
+  fi
 fi
 
 # Conformance phase: the spec-example sweep (tests/conformance). This is a

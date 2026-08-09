@@ -44,6 +44,18 @@ byte-identical to the old bash over a controlled dual-run (8 cases, every
 null-vs-0 branch, zero diff); gate.sh now calls `python3 -m gate.telemetry
 emit`. The schema:2 field set/order and the null-vs-0 distinction are pinned
 by test_telemetry.py (the blocking gate.trend R1-R5 depend on them).
+
+Wave 3 (`cycle.py`, #3010) consolidates the recurring verdict-classification
+pattern (read a verdict/signal -> classify accept/retry/bail ->
+conservative-on-disagreement) that was inlined across FOUR runner-script sites
+(gate_full_cycle's run_until_trustworthy + ASan-ran check, gate_and_push's
+verdict-before-push, gate_wait's classifier). classify maps a verdict value to
+a Decision; cross_check reconciles two derivations WITHOUT EVER accepting on
+disagreement (the false-accept-prevention that stopped the
+55-truncated-gates-over-24-days class); assert_asan_ran is the ASan-evidence
+check. The four sites dual-consume (legacy bash + gate.cycle), assert
+0-disagreement, then switch to the Python. Pinned by test_cycle.py's truth
+tables (classify 5x2, cross_check 3x3) + the 0-disagreement proof.
 """
 
-__all__ = ["io", "summary", "verdict", "coverage", "arbitration", "telemetry"]
+__all__ = ["io", "summary", "verdict", "coverage", "arbitration", "telemetry", "cycle"]
