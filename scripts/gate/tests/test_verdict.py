@@ -667,7 +667,7 @@ class DetectTruncationTest(unittest.TestCase):
     def test_banner_literal_constant(self):
         # Pinned: the wording run_parallel.sh emits, verbatim. A drift here is
         # the silent-undetected-truncation defect (the grep re-implementation
-        # the Wave-3 migration consolidated into ONE owner).
+        # the Wave-3 migration consolidated into ONE authority).
         self.assertEqual(verdict.UNDERCOUNT_BANNER, "shard crash / undercount")
 
 

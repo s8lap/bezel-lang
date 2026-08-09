@@ -246,7 +246,7 @@ def detect_truncation(shard_log, rc):
     This is the detection gate.sh's gate_write_verdict used to perform in bash
     (`grep -q 'shard crash / undercount' "$S/gate_shard.log"` plus the rc==3
     coverage-short signal), now owned by Python per the #3010 Wave 3 migration.
-    The banner grep becomes an `in` check on the log content — one owner for the
+    The banner grep becomes an `in` check on the log content — one authority for the
     wording instead of a fragile bash re-implementation of run_parallel's banner.
 
     `undercount_banner` is the specific marker (the literal was present in a
@@ -359,7 +359,7 @@ def _main_write_from_state(argv):
 
       (a) reads the shard log ITSELF and computes truncation — the banner grep
           is now `detect_truncation`'s `in` check (no process spawn, no regex),
-          one owner for run_parallel's banner wording instead of a bash
+          one authority for run_parallel's banner wording instead of a bash
           re-implementation;
       (b) builds the verdict object from kwargs, normalizing empty coverage
           fields to None via `_optional_int` (the set-vs-unset conditionality is

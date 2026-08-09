@@ -1,6 +1,6 @@
 """scripts/gate/ — Python home for the gate/test-infra logic (#3010).
 
-The gate/test-infra is ~3,555 lines of bash; the owner signed off on migrating
+The gate/test-infra is ~3,555 lines of bash; migrating
 the LOGIC-heavy parts to Python (stdlib only — `unittest`, no pytest, no new
 deps). This package is the migration target. It is built up phase by phase with
 an emit-alongside -> prove-equivalence -> switch methodology: nothing switches

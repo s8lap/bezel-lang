@@ -101,7 +101,7 @@ gate_write_verdict() { # rc [total_s] — write gate-verdict.json; best-effort, 
   # per the exit-code-trap / #3010 Wave 3: the truncation banner grep AND the 12
   # conditional `[ -n "${X+x}" ]` arg guards moved INTO verdict.py's
   # write_from_state. Python reads the shard log itself (the "shard crash /
-  # undercount" banner grep is now an `in` check — ONE owner for run_parallel's
+  # undercount" banner grep is now an `in` check — ONE authority for run_parallel's
   # wording, not a bash re-implementation) and computes truncated/undercount;
   # the conditional guards collapse to `${VAR:-}` defaults + Python's empty->
   # None normalization (an unmeasured number still emits null, never 0, #3010).
@@ -490,22 +490,6 @@ rec_ran build "$prc"
 if ! _gate_bins=$(PYTHONPATH=scripts python3 -m gate.manifest verify --path build/tests/test_binaries.txt); then
   fail "build reported success but a test binary is missing or not executable (manifest verify failed — see module stderr above)"
 fi
-# --- dual-run assertion (TEMPORARY: remove after the landing gate proves it) ---
-# The OLD bash `cut -f2` listing must produce the SAME paths in the SAME order
-# as the module's verified output. Fatal on drift: a divergence is a port defect
-# in the manifest read (#3010). Both read top-to-bottom; on a well-formed
-# manifest with all binaries built they are byte-identical. (The hard-fail on a
-# missing/non-executable binary is pinned by test_manifest.py's VerifyBinaries
-# test class; this assertion pins the path LISTING equivalence.)
-_bash_bins=$(cut -f2 build/tests/test_binaries.txt 2>/dev/null)
-if [ "$_bash_bins" != "$_gate_bins" ]; then
-  echo "## GATE FAILURE: manifest PYTHON/BASH DRIFT — binary path lists differ" >&2
-  echo "##   gate.manifest verify produced a different path list than the proven" >&2
-  echo "##   \`cut -f2\`; a divergence is a port defect in the manifest read (#3010)." >&2
-  FAILED_PHASE="manifest python/bash drift: binary path lists differ"
-  exit 3
-fi
-# --- end dual-run assertion ---
 while IFS= read -r _b; do
   [ -n "$_b" ] || continue
   echo "   binary: $(basename "$_b")  $(ls -la --time-style=+%H:%M:%S "$_b" | awk '{print $6}')"
