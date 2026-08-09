@@ -3534,6 +3534,62 @@ bool MethodOwnership::constInitializerRejected(const ast::Expr& e) {
     // accepted-and-leaking one. // per §28.3, §15.6, §21.1, #2749
     if (auto* ix = dynamic_cast<const ast::IndexExpr*>(&e))
         if (common::isBuiltinArrayRangeSliceIndex(*ix, ctx_)) return true;
+    // fix #3017 (§28.3 / §28.9 / §28.10, v0.240): a STATIC CallExpr returning
+    // a chain-claimed built-in absent from the §28.10 lint's
+    // `kDisposableBuiltinHeadNames` table — the 13 borrowing collections and
+    // vtable-less builtins (Array/Stack/Queue/Set/SortedSet/Dictionary/
+    // SortedDictionary/LinkedList/Random/Atomic/AtomicInteger/Stopwatch/
+    // Buffer, see `common::isChainClaimedBuiltinHeadName`). producerState
+    // returns Borrowed for these because the result's declaration is null
+    // (builtin, no MethodSymbol to find a `returnOwned` flag on — the
+    // `md->returnOwned` arm of producerState reads null) and
+    // `staticFactoryReturnsFreshOwned` requires a non-null declaration on the
+    // RESULT side (OwnershipFacts.cpp:567 `!resultTy->declaration` → returns
+    // false). So the lint's outer guard `!constInitializerRejected` was not
+    // satisfied and a factory-call `using var x := C.Make()` over one of the
+    // 13 names fired the vacuous-pin warning on a REAL §28.10 disposal
+    // obligation (the chain reclaims each — measured in #2992's authority-
+    // differential analysis).
+    //
+    // The alias form (`var src := new Array<int>(); using var p := src;`) is
+    // PRESERVED: the IdentifierExpr RHS bypasses every CallExpr disjunct
+    // here, AND `rhsIsDisposableClassType` Path 2 still returns false for
+    // the 13 heads (they are deliberately absent from
+    // `kDisposableBuiltinHeadNames` by #2695's coherence invariant), so the
+    // lint still fires on the alias case with its existing message.
+    //
+    // Gated to STATIC methods to mirror §28.3's structural-source rule: an
+    // instance method has a borrow source (the receiver) and may legitimately
+    // return a borrow of receiver state — a `using var x := obj.GetArr()`
+    // over an instance getter returning a borrowed field would be wrongly
+    // accepted by an unguarded disjunct (a use-after-free at the receiver's
+    // scope end). A static method has no receiver, so a return is either a
+    // fresh `new T()` or a fresh built-in materializer, and the chain will
+    // reclaim it. `calleeMethodDecl` returns null for a callee through a
+    // value/function or an imported method; those fall through and the lint
+    // still fires, matching today's behaviour.
+    //
+    // Mirrors `rhsIsDisposableClassType` Path 2's own shape: declaration-less
+    // (builtin), single-part name, head is in the predicate's set. The
+    // declaration-less gate keeps a user class that happens to share one of
+    // the 13 names out of the disjunct (its declaration is non-null and the
+    // chain's arms would not reclaim it). // per §28.3, §28.9, §28.10, #3017
+    if (auto* ce = dynamic_cast<const ast::CallExpr*>(&e)) {
+        if (const ast::MethodDecl* md = common::calleeMethodDecl(*ce, ctx_)) {
+            bool calleeIsStatic = false;
+            for (std::string_view mod : md->modifiers)
+                if (mod == "static") { calleeIsStatic = true; break; }
+            if (calleeIsStatic) {
+                if (const sema::TypeRef* rt = ctx_.exprType(e)) {
+                    if (rt->kind == sema::TypeRef::Kind::Named &&
+                        !rt->declaration && rt->astNode && rt->astNode->name &&
+                        !rt->astNode->name->parts.empty() &&
+                        common::isChainClaimedBuiltinHeadName(rt->headName()))
+                        return true;
+                }
+            }
+        }
+    }
     return false;
 }
 

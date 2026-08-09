@@ -394,6 +394,53 @@ bool isDisposableBuiltinHeadName(std::string_view head) {
     return contains(kDisposableBuiltinHeadNames, head);
 }  // per §28.3 / §28.9 / §28.10, fix #2992
 
+// fix #3017 (§28.3 / §28.9 / §28.10, v0.240): the 13 built-in class heads
+// the codegen auto-drop chain (registerUsingDisposal) claims disposal for but
+// that are DELIBERATELY ABSENT from `kDisposableBuiltinHeadNames` above —
+// the §28.10 vacuity-lint's table. Each name carries a real disposal
+// obligation (§28.9 trivial-dispose reclaim for the borrowing collections;
+// specific runtime frees for the vtable-less builtins), so a factory-call
+// `using var x := C.Make()` over one is the CORRECT canonical pattern, not
+// vacuous. The alias form (`var src := new T(); using var p := src;`) is NOT
+// affected by this table: the lint's `rhsIsDisposableClassType` Path 2 still
+// returns false for these heads, and the IdentifierExpr RHS bypasses every
+// CallExpr disjunct in `constInitializerRejected`.
+//
+// Population measured 2026-08-09 on d2a3d3e (#2992's authority-differential
+// analysis): every name here has a dedicated disposal arm in
+// `registerUsingDisposal` and is absent from `kDisposableBuiltinHeadNames`.
+//
+// **Borrowing collections** (§4, §28.11 trivial-dispose):
+//   - Array, Stack, Queue, Set, SortedSet, Dictionary, SortedDictionary,
+//     LinkedList — each reclaimed by the chain's collection-family arms
+//     (array-backed, dictionary-backed, linked-list). #2695 deliberately
+//     excluded the borrowing collections from `kDisposableBuiltinHeadNames`
+//     so the lint fires on a bound-then-pinned alias — that decision is
+//     preserved (see `kDisposableBuiltinHeadNames`'s own header comment).
+//
+// **Vtable-less builtins** (§6.4 / §3 / §8.1 / §10.1):
+//   - Random — fix #2921; `bz_random_free` (stdlib §3 trivial-dispose).
+//   - Atomic, AtomicInteger — fix #2973; `bz_atomic_dispose`.
+//   - Stopwatch — §8.1 (#2025); `bz_stopwatch_free`.
+//   - Buffer — #545; element-buffer free.
+//
+// Adding a new name here is a soundness-adjacent change: the chain must
+// have an arm that reclaims it, or it stays a leak (the end-of-chain guard
+// in `registerUsingDisposal` catches future omissions of any vtable-less
+// builtin, #2992). The lint's two predicates (`isDisposableBuiltinHeadName`
+// and `isChainClaimedBuiltinHeadName`) are EXPLICITLY disjoint — the former
+// is the lint's narrow table, the latter is the factory-call-form closure
+// for the gap #2695 created.  // per §28.3 / §28.9 / §28.10, fix #3017
+constexpr std::array<std::string_view, 13> kChainClaimedBuiltinHeadNames = {
+    "Array", "Stack", "Queue", "Set", "SortedSet",
+    "Dictionary", "SortedDictionary", "LinkedList",
+    "Random", "Atomic", "AtomicInteger", "Stopwatch", "Buffer",
+};
+
+bool isChainClaimedBuiltinHeadName(std::string_view head) {
+    return contains(kChainClaimedBuiltinHeadNames, head);
+}  // per §28.3 / §28.9 / §28.10, fix #3017
+
 std::string_view builtinExceptionParentOf(std::string_view name) {
     for (const auto& edge : kBuiltinExceptionHierarchy)
         if (edge.name == name) return edge.parent;

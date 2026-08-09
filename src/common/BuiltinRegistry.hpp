@@ -194,6 +194,25 @@ bool isVtableLessBuiltinClassName(std::string_view n);
 // separately. // per §28.3 / §28.9 / §28.10, fix #2992
 bool isDisposableBuiltinHeadName(std::string_view head);
 
+// fix #3017 (§28.3 / §28.9 / §28.10, v0.240): the 13 built-in class heads
+// the codegen auto-drop chain (registerUsingDisposal, LlvmBackend_Setup.cpp)
+// claims disposal for but that are DELIBERATELY ABSENT from
+// `isDisposableBuiltinHeadName` — the §28.10 vacuity-lint table — because
+// #2695's coherence invariant (the lint must fire on a bound-then-pinned
+// alias whose `const` remedy compiles) requires the borrowing collections to
+// stay out. For factory-call forms (`using var x := C.Make()`) the result IS
+// a fresh owned value, so the lint must NOT fire — the chain DOES reclaim it.
+// The alias form (`using var p := src;` over a local) keeps the current
+// behaviour because rhsIsDisposableClassType still returns false on these
+// heads and the IdentifierExpr RHS bypasses every CallExpr disjunct.
+//
+// The 13 names: 8 borrowing collections (§4 — §28.11 trivial-dispose; the
+// chain's collection-family arms reclaim the backing) and 5 vtable-less
+// builtins (Random/Atomic/AtomicInteger from fix #2921/#2973, Stopwatch from
+// §8.1, Buffer from #545). See Ownership.cpp's `constInitializerRejected`
+// for the disjunct this predicate closes the gap on.
+bool isChainClaimedBuiltinHeadName(std::string_view head);
+
 // §31.4 / #1621: given a built-in exception type's simple name, return the
 // name of its DIRECT parent in the built-in exception hierarchy (e.g.
 // "FileNotFoundException" -> "IOException"), or an empty string_view if
