@@ -448,8 +448,12 @@ def _main_check(logdir):
         print("shard-summary agreement: {} MISMATCH(es) over {} JSON summaries "
               "(observation-only; legacy path authoritative)".format(
                   len(mismatches), n_json), file=sys.stderr)
-        # Still exit 0: observation-only — never change the gate's verdict.
-        return 0
+        # Exit 1: a mismatch is a real divergence. The OBSERVATION-ONLY nature
+        # of the legacy call site (run_parallel.sh `... || true`) is enforced by
+        # the caller, not here — returning nonzero lets the Phase 2c dual-read
+        # assertion treat a mismatch as a hard failure while the observation
+        # call still swallows it with `|| true`.
+        return 1
     print("shard-summary agreement: 0 mismatches over {} JSON summaries "
           "(observation-only)".format(n_json))
     return 0

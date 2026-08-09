@@ -541,5 +541,66 @@ class RunSummaryRoundTripTest(_Fixture):
             self.assertEqual(obj["schema"], summary.RUN_SCHEMA)
 
 
+class AccountCLITest(_Fixture):
+    """Smoke-test the `account` and `run-summary harvest` CLIs via the exact
+    invocation run_parallel.sh uses (`PYTHONPATH=scripts python3 -m
+    gate.summary ...`). Pins the module-path form (the codebase convention,
+    matching verdict.py/trend.py) so a future `from gate import` addition can't
+    silently break the gate's reader."""
+
+    # PYTHONPATH must point at scripts/ (the parent of gate/) so `gate` is a
+    # package — matching run_parallel's `PYTHONPATH=$repo_root/scripts`.
+    _SCRIPTS_DIR = os.path.join(os.path.dirname(__file__), "..", "..")
+
+    def _run_cli(self, args):
+        import subprocess
+        env = dict(os.environ, PYTHONPATH=os.path.abspath(self._SCRIPTS_DIR))
+        return subprocess.run([sys.executable, "-m", "gate.summary"] + args,
+                              capture_output=True, text=True, env=env)
+
+    def test_account_emits_sourceable_output(self):
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(2):
+                self._shard(d, "codegen", i, 5, 0, 10)
+            out = self._run_cli(["account", d, "--conc", "2", "--", "codegen"])
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("rp_total_pass=10", out.stdout)
+            self.assertIn("rp_integrity_ok=1", out.stdout)
+            self.assertIn("rp_bin_names=('codegen')", out.stdout)
+
+    def test_account_writes_run_summary_and_harvest_reads_it(self):
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(2):
+                self._shard(d, "codegen", i, 5, 0, 10)
+            run_path = os.path.join(d, "run.json")
+            out = self._run_cli(
+                ["account", d, "--conc", "2", "--run-summary", run_path,
+                 "--", "codegen"])
+            self.assertEqual(out.returncode, 0, out.stderr)
+            # harvest reads back what account wrote (the gate.sh bridge).
+            hout = self._run_cli(["run-summary", "harvest", run_path])
+            self.assertIn("rp_run_present=1", hout.stdout)
+            self.assertIn("rp_run_gtests=10", hout.stdout)
+
+    def test_check_cli_exits_nonzero_on_mismatch(self):
+        # The dual-read assertion relies on check exiting 1 on mismatch.
+        with tempfile.TemporaryDirectory() as d:
+            self._shard(d, "codegen", 0, 5, 0, 10)  # legacy says 5
+            _write_json(d, "codegen", 0, {  # JSON says 4 -> mismatch
+                "schema": summary.SCHEMA, "binary": "b", "shard_index": 0,
+                "shard_count": 2, "passed": 4, "failed": 0, "total": 10,
+                "selected": 10, "asan_mode": False, "rc": 0, "elapsed_s": 1.0})
+            out = self._run_cli(["check", d])
+            self.assertEqual(out.returncode, 1)
+            self.assertIn("MISMATCH", out.stdout + out.stderr)
+
+    def test_check_cli_exits_zero_on_agreement(self):
+        with tempfile.TemporaryDirectory() as d:
+            for i in range(2):
+                self._shard(d, "codegen", i, 5, 0, 10)
+            out = self._run_cli(["check", d])
+            self.assertEqual(out.returncode, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

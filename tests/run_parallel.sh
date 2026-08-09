@@ -162,112 +162,106 @@ for (( b = 0; b < nbin; b++ )); do
 done
 wait
 
-# ── per-binary integrity accounting ─────────────────────────────────────────
+# ── per-binary integrity accounting (Phase 2c: reads structured JSON) ────────
 # Every check the single-binary runner made is made here PER BINARY, because
-# each binary has its own registry and its own expected total. A missing rc file
-# is itself a crash (the subshell died before recording one).
+# each binary has its own registry and its own expected total. A missing rc
+# file is itself a crash (the subshell died before recording one).
 #
-# Each shard prints "P passed, F failed[, S filtered][, N selected] (shard i/n),
-# T total". T is that binary's whole registry size (identical across its
-# shards) — capture it as the EXPECTED count so a shard that dies mid-run (its
-# passed count missing) is detected as an undercount rather than passing
-# silently.
+# Each shard writes a structured JSON summary (BEZEL_SHARD_SUMMARY, Phase 2a)
+# ALONGSIDE its legacy "N passed, ... T total" stderr line. scripts/gate/
+# summary.py `account` reads those JSONs + the rc.<name>.<i> files and produces
+# the accounting the legacy per-shard grep used to (run_parallel pre-Phase-2c):
+# grand totals, per-binary ran/expected, and the integrity flags + defect lists
+# that drive this script's exit and the GATE FAILURE banner below.
 #
-# summaries_seen ALSO records, EXPLICITLY, how many shards printed a completion
-# summary at all. A shard that exits 0 yet never printed a summary — e.g. a path
-# that abort()s or exit()s the harness mid-loop — drops its whole slice while
-# evading detection: crashed_shards misses it (exit 0), and the ran!=expected
-# undercount check can only catch it when SOME OTHER shard of the same binary
-# established that binary's expected total. This direct "every shard must
-# complete" check closes that window unconditionally, and is the safety basis
-# for the shard-authoritative gate (scripts/gate.sh, #1861) having no serial
-# backstop. It is purely additive: a healthy run prints nothing new below.
-total_pass=0
-total_fail=0
-shard_rc=0
-count_ok=1
-summary_ok=1
-subset_mode=0
-global_selected=0
-crashed_shards=()
-missing_summary_shards=()
-undercount_bins=()
-declare -a bin_pass bin_fail bin_expected bin_registry bin_what
-for (( b = 0; b < nbin; b++ )); do
-    name="${names[$b]}"
-    b_pass=0; b_fail=0; b_registry=0; b_selected=0; b_summaries=0; b_subset=0
-    for (( i = 0; i < conc; i++ )); do
-        log="$logdir/shard.$name.$i.log"
-        rcf="$logdir/rc.$name.$i"
-        rc="$(cat "$rcf" 2>/dev/null)"
-        if [[ "${rc:-1}" -ne 0 ]]; then
-            echo "shard $name/$i exited nonzero (crash or test failure)" >&2
-            shard_rc=1
-            crashed_shards+=("$name/$i")
-        fi
-        line="$(grep -a -E '^[0-9]+ passed, [0-9]+ failed' "$log" 2>/dev/null | tail -1)"
-        if [[ -n "$line" ]]; then
-            b_summaries=$(( b_summaries + 1 ))
-        else
-            missing_summary_shards+=("$name/$i")
-        fi
-        p="$(sed -E 's/^([0-9]+) passed.*/\1/' <<<"$line")"
-        f="$(sed -E 's/^[0-9]+ passed, ([0-9]+) failed.*/\1/' <<<"$line")"
-        t="$(sed -E 's/.*, ([0-9]+) total.*/\1/' <<<"$line")"
-        b_pass=$(( b_pass + ${p:-0} ))
-        b_fail=$(( b_fail + ${f:-0} ))
-        [[ "${t:-0}" -gt "$b_registry" ]] && b_registry="$t"
-        # Subset marker (#2100): a BEZEL_TEST_LIST run reports ", N selected".
-        # Like the registry total, the selected count is identical across a
-        # binary's shards (each re-walks the whole registry with the same list)
-        # — max is the harvest.
-        if [[ "$line" == *" selected"* ]]; then
-            subset_mode=1; b_subset=1
-            s="$(grep -oE '[0-9]+ selected' <<<"$line" | grep -oE '^[0-9]+')"
-            [[ "${s:-0}" -gt "$b_selected" ]] && b_selected="$s"
-        fi
-    done
-    # Subset accounting (#2100): under BEZEL_TEST_LIST the drop-detection
-    # contract is "every SELECTED test ran" — the registry total would
-    # mechanically false-fail any subset.
-    if [[ "$b_subset" -eq 1 ]]; then
-        b_expected="$b_selected"; bin_what[$b]="selected"
-        global_selected=$(( global_selected + b_selected ))
-    else
-        b_expected="$b_registry"; bin_what[$b]="registered"
-    fi
-    b_ran=$(( b_pass + b_fail ))
-    if [[ "$b_expected" -gt 0 && "$b_ran" -ne "$b_expected" ]]; then
-        count_ok=0
-        undercount_bins+=("$name: ran $b_ran of $b_expected ${bin_what[$b]}")
-    fi
-    # EVERY shard must have printed a completion summary. A shard missing one
-    # validated NONE of its slice, so a "0 failed" aggregate is not trustworthy
-    # regardless of exit code — stricter than the undercount check (which needs
-    # another shard of the SAME binary to have established the expected total)
-    # and never lets a dropped slice pass green.
-    [[ "$b_summaries" -ne "$conc" ]] && summary_ok=0
-    bin_pass[$b]=$b_pass; bin_fail[$b]=$b_fail
-    bin_expected[$b]=$b_expected; bin_registry[$b]=$b_registry
-    total_pass=$(( total_pass + b_pass ))
-    total_fail=$(( total_fail + b_fail ))
-done
-ran=$(( total_pass + total_fail ))
-expected_all=0
-registry_all=0
-for (( b = 0; b < nbin; b++ )); do
-    expected_all=$(( expected_all + bin_expected[b] ))
-    registry_all=$(( registry_all + bin_registry[b] ))
-done
-
-# An EMPTY selection is never a pass: a subset run that selected 0 tests
-# validated nothing, so it fails loudly instead of reading "0 failed". This is
-# GLOBAL — a single binary selecting 0 is normal (it holds none of the listed
-# tests); only "no binary selected anything" is the empty-list bug.
-subset_empty=0
-if [[ "$subset_mode" -eq 1 && "$global_selected" -eq 0 ]]; then
-    subset_empty=1
+# Crash detection reads the rc FILE, not the JSON `rc` field: test_main.cpp
+# writes the JSON just before `return` (test_main.cpp:281-318), so a shard
+# killed mid-run (segfault / timeout) never reaches the write. The rc file is
+# the only signal that catches a kill. summary_ok demands EVERY shard wrote a
+# JSON summary — a shard that exits 0 yet wrote none validated NONE of its
+# slice, so a "0 failed" aggregate is not trustworthy regardless of exit code;
+# that is the safety basis for the shard-authoritative gate (scripts/gate.sh,
+# #1861) having no serial backstop.
+#
+# DUAL-READ (the "rewriting the engine while flying" rule, per #3012): the
+# legacy stderr line is still dual-emitted, and summary.check_agreement pairs
+# each JSON with its legacy line PER SHARD. Per-shard agreement TRANSITIVELY
+# guarantees the accounting sums agree (0 per-shard mismatch => identical
+# totals/flags — passed/failed/total/selected and presence are all compared per
+# shard, so summing them can't diverge). So a 0-mismatch assertion here IS the
+# equivalence proof. A mismatch is a #3012-style stream/parse divergence — fail
+# LOUD rather than read ambiguous data. Once N gates prove 0-mismatch the
+# assertion + the legacy dual-emit are removed (the ratchet this lands).
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "run_parallel: python3 not found — Phase 2c accounting requires it (see #3012)" >&2
+    exit 1
 fi
+_account_subset=0
+[[ -n "${BEZEL_TEST_LIST:-}" ]] && _account_subset=1
+# Build the argv as an array so a BEZEL_RUN_SUMMARY path with spaces survives
+# intact (the gate sets BEZEL_RUN_SUMMARY=$S/gate_run_summary.json so its
+# harvest can read the merged result instead of grepping this script's stdout —
+# the per-shard JSONs live in $logdir and are reaped on a clean exit).
+_account_args=(gate.summary account "$logdir" --conc "$conc")
+[[ "$_account_subset" -eq 1 ]] && _account_args+=(--subset)
+[[ -n "${BEZEL_RUN_SUMMARY:-}" ]] && _account_args+=(--run-summary "$BEZEL_RUN_SUMMARY")
+_account_args+=(-- "${names[@]}")
+if ! _rp_out=$(PYTHONPATH="$repo_root/scripts" python3 -m "${_account_args[@]}" 2>"$logdir/account.err"); then
+    echo "run_parallel: summary.py account failed — see $logdir/account.err" >&2
+    cat "$logdir/account.err" >&2
+    exit 1
+fi
+eval "$_rp_out"
+
+# Dual-read assertion: 0 per-shard JSON/legacy mismatch => the structured
+# accounting equals the legacy grep accounting on every field. check exits
+# nonzero on any mismatch; on success it prints the human-readable agreement
+# line (relayed below for the log).
+if ! _agr=$(PYTHONPATH="$repo_root/scripts" python3 -m gate.summary check "$logdir" 2>&1); then
+    echo "############################################################"
+    echo "## GATE FAILURE: shard-summary MISMATCH — structured JSON != legacy line"
+    echo "##   The Phase 2c reader disagrees with the legacy grep; the result is"
+    echo "##   NOT trustworthy. Per-shard agreement details:"
+    echo "$_agr" >&2
+    echo "############################################################"
+    exit 1
+fi
+echo "$_agr"
+
+# Map the sourceable rp_* output onto the variables the banner/table/exit below
+# consume. Kept identical to the pre-Phase-2c names so the reporting surface
+# (banner literal, TOTAL line, per-binary table) is byte-for-byte unchanged —
+# the switch is in the READER, not the reporting (gate_full_cycle.sh:96 greps
+# the banner; gate.sh:831/785 greps the TOTAL/shard-timing lines).
+total_pass=$rp_total_pass
+total_fail=$rp_total_fail
+shard_rc=$(( 1 - rp_shard_rc_ok ))   # shard_rc=1 iff a crash occurred
+count_ok=$rp_count_ok
+summary_ok=$rp_summary_ok
+subset_mode=$rp_subset_mode
+global_selected=$rp_global_selected
+ran=$rp_ran
+expected_all=$rp_expected_all
+registry_all=$rp_registry_all
+crashed_shards=("${rp_crashed_shards[@]}")
+missing_summary_shards=("${rp_missing_summary_shards[@]}")
+undercount_bins=("${rp_undercount_bins[@]}")
+declare -a bin_pass bin_fail bin_expected bin_registry
+bin_pass=("${rp_bin_pass[@]}")
+bin_fail=("${rp_bin_fail[@]}")
+bin_expected=("${rp_bin_expected[@]}")
+bin_registry=("${rp_bin_registry[@]}")
+# An EMPTY selection is never a pass (#2100): a subset run that selected 0
+# tests validated nothing. GLOBAL — a single binary selecting 0 is normal (it
+# holds none of the listed tests); only "no binary selected anything" is the
+# empty-list bug.
+subset_empty=$rp_subset_empty
+
+# Preserve the per-shard crash notice on stderr (no external consumer greps it,
+# but it surfaces a crash immediately, ahead of the banner below).
+for _cs in "${crashed_shards[@]:-}"; do
+    [[ -n "$_cs" ]] && echo "shard $_cs exited nonzero (crash or test failure)" >&2
+done
 
 end=$(date +%s)
 
@@ -343,18 +337,10 @@ subset_note=""
 echo "TOTAL: $total_pass passed, $total_fail failed  (across $njobs shards, $((end - start))s)$subset_note"
 echo "============================================================"
 
-# ── per #3012 Phase 2b: JSON-vs-legacy agreement (OBSERVATION-ONLY) ──────────
-# Each shard ALSO wrote a structured JSON summary (BEZEL_SHARD_SUMMARY, Phase
-# 2a). scripts/gate/summary.py pairs each JSON with its legacy stderr line and
-# reports any divergence. This NEVER affects this script's exit status: the
-# legacy accounting above (TOTAL:/summary_ok/count_ok) remains authoritative
-# until Phase 2c switches the reader — and only after N gates prove agreement.
-# `|| true`: a python absence or a helper crash must never change the verdict.
-if [[ -x "$(command -v python3 || true)" ]]; then
-    python3 "$repo_root/scripts/gate/summary.py" check "$logdir" || true
-else
-    echo "shard-summary agreement: SKIPPED (python3 not found)" >&2
-fi
+# Per-shard JSON/legacy agreement was ASSERTED in the accounting block above
+# (a mismatch fails the run loud). The legacy stderr line is still dual-emitted
+# by test_main.cpp as the fallback the assertion compares against; removing
+# that dual-emit + the legacy line is the post-N-gates ratchet (per #3012).
 
 if [[ "$shard_rc" -ne 0 || "$total_fail" -ne 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 || "$subset_empty" -eq 1 ]]; then
     exit 1
