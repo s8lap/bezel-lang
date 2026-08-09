@@ -10453,6 +10453,48 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 }
             }
         }
+        // §15.1 / §23.5 (#2940, v0.240): the inline-array-typed-PROPERTY twin
+        // of the two checks above. The target is `<propertyAccess>[i] := v`
+        // (an `IndexExpr` whose `target` is a `MemberAccessExpr` to a
+        // `PropertySymbol`); the property's declared type is an inline array
+        // (`[N]T`, §15.1), which is itself a value type (§3.1), so a property
+        // GET returns a COPY of the inline array and `arr[i] := v` modifies
+        // an element of that discarded copy. This is the same shape a
+        // record-typed property's field write raises above: the property
+        // accessor is bypassed entirely — the setter never fires — and the
+        // field-level emission in `lvalueAddr`'s inline-array branch
+        // (`src/codegen/LlvmBackend_Layout.cpp:126`) recurses into
+        // `lvalueAddr(*ix->target, arrSlotTy)`, which returns null for a
+        // property target (no backing slot of its own), and the caller's
+        // `if (!addr2) return false;` silently drops the write
+        // (`LlvmBackend_Stmts.cpp:374`). Reject it. A heap-collection indexer
+        // SETTER (`obj.A[i] := v` where `A: Array<T> | OwningArray<T>`) is a
+        // class-typed PROPERTY, so the property get yields a REFERENCE and
+        // the indexer setter is invoked via `lowerIndexerSet` / the property
+        // accessor pair — that path stays accepted. Only the inline-array
+        // value-typed-PROPERTY shape is broken.
+        if (auto* ix =
+                dynamic_cast<const ast::IndexExpr*>(as->target.get())) {
+            if (auto* innerMa =
+                    dynamic_cast<const ast::MemberAccessExpr*>(ix->target.get())) {
+                auto* ps =
+                    dynamic_cast<PropertySymbol*>(ctx_.exprSymbol(*innerMa));
+                if (ps && !ps->isIndexer) {
+                    TypeRef* rt = ctx_.exprType(*innerMa);
+                    if (rt && rt->kind == TypeRef::Kind::InlineArray) {
+                        ctx_.diagnostics().report(
+                            Severity::Error, as->target->span.begin,
+                            "assigning to an element of an inline-array-typed "
+                            "property result modifies a discarded copy — the "
+                            "property get returns the array by value (§15.1), "
+                            "so the element write is lost and the setter is "
+                            "bypassed; bind a local, mutate it, then assign "
+                            "the whole array back through the property setter "
+                            "(§23.5 / §15.1, #2940)");
+                    }
+                }
+            }
+        }
         // §6.5: a compound bitwise/shift assignment (`&= |= ^= <<= >>=`) carries
         // the same operand-type restriction as the binary bitwise operators — it
         // is not valid on a `bool` / `char` / floating-point target. Compound
