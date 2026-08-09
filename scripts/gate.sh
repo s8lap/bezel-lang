@@ -69,6 +69,11 @@
 #                            (default 50 — the full pass then does the work anyway)
 set -u
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate: not in a git repo" >&2; exit 2; }
+
+# Make scripts/ importable as the `gate` package so `python3 -m gate.serialize`
+# resolves from any cwd. Honor an operator's pre-set PYTHONPATH by appending
+# rather than overwriting.
+export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}scripts"
 # Scratch dir + verdict file path are set up BEFORE any preflight exit can fire,
 # so the verdict writer (gate_write_verdict, below) has a path on every exit path
 # (Phase 3, #3002). $S was previously set after the mode/builder preflights, so
@@ -170,21 +175,18 @@ BUILDERS='cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests(_[a-z]+)?'
 # driver scripts is a sibling. If ANY matched builder has NO gate ancestor, the
 # original "builders active" message fires (an actual orphan producer build IS
 # active and a concurrent gate still risks the cold-cache flake).
-_is_gate_ancestor() { # $1 = pid  -> echoes "yes" iff any ancestor's comm is a gate driver
-  local pid="$1" pp cur=0
-  while [ "$cur" -lt 32 ]; do
-    [ -r "/proc/$pid/comm" ] || return 1
-    local comm; comm=$(cat "/proc/$pid/comm" 2>/dev/null) || return 1
-    case "$comm" in
-      gate_and_push.sh|gate_full_cycle.sh|gate.sh|tests/run_parallel.sh|run_parallel.sh|dev_heavy.sh)
-        echo "yes"; return 0 ;;
-    esac
-    pp=$(awk '/^PPid:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null) || return 1
-    [ -n "$pp" ] && [ "$pp" -gt 0 ] 2>/dev/null || return 1
-    [ "$pp" = "$pid" ] && return 1
-    pid="$pp"; cur=$((cur+1))
-  done
-  return 1
+#
+# The /proc walk itself now lives in scripts/gate/serialize.py
+# (`is_gate_sibling`, post-run infra migration; pinned by
+# test_gate_serialization.py's SiblingDetectionTest). This wrapper is a thin
+# shell adapter so the gate.sh call sites read identically to the bash
+# implementation: returns 0 on yes, 1 on no. The verdict is captured first
+# (the helper exits 1 on "no" — using `|| return 1` would short-circuit the
+# assignment), then matched against "yes" via `[ ... ]`.
+_is_gate_ancestor() { # $1 = pid  -> returns 0 iff any ancestor's comm is a gate driver
+  local pid="$1" _verdict
+  _verdict=$(PYTHONPATH=scripts python3 -m gate.serialize is-sibling --pid "$pid" 2>/dev/null)
+  [ "$_verdict" = yes ]
 }
 if [ -z "${GATE_SKIP_BUILDER_CHECK:-}" ] && pgrep -x "$BUILDERS" >/dev/null 2>&1; then
   # Separate sibling-only from mixed (sibling + non-sibling) matches. Mixed

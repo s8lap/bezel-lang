@@ -39,6 +39,11 @@
 set -u
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate_and_push: not in a git repo" >&2; exit 2; }
 
+# Make scripts/ importable as the `gate` package so `python3 -m gate.serialize`
+# resolves from any cwd. Honor an operator's pre-set PYTHONPATH (e.g. a CI
+# harness that pins one) by appending rather than overwriting.
+export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}scripts"
+
 # gate-infra preflight-lockfile lane: acquire an exclusive flock on the gate's
 # lockfile so two concurrent `gate_and_push.sh` invocations cannot both run.
 # Without this, the preflight sees the OTHER gate's `cmake`/`run_parallel.sh`
@@ -50,20 +55,31 @@ cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate_and_push: not 
 # Bypass with GATE_SKIP_LOCK=1 (e.g. for a deliberately-overlapping diagnosis
 # run); on a held lock, print a clear single-line message and exit 0 so the
 # caller sees a clean "another gate is running" abort, not a phantom failure.
+#
+# The flock + sibling detection logic now lives in scripts/gate/serialize.py
+# (post-run infra migration, see test_gate_serialization.py). This script is
+# a thin wrapper: spawn the helper in a coproc so the lock is held for THIS
+# script's lifetime, read the ACQUIRED/REFUSED verdict from the coproc's
+# stdout, and kill the helper on EXIT (the kernel auto-releases the flock on
+# process death — see serialize.py: `test_lockfile_released_on_subprocess_exit`).
 mkdir -p /var/tmp/bezel-scratch 2>/dev/null || true
 GATE_LOCK="/var/tmp/bezel-scratch/gate.lock"
 if [ -z "${GATE_SKIP_LOCK:-}" ]; then
-  # Open FD 9 on the lockfile; flock on FD 9; the FD is inherited by the
-  # gate's child processes and released atomically when this bash exits.
-  exec 9>"$GATE_LOCK" 2>/dev/null || {
-    echo "gate_and_push: cannot open lockfile $GATE_LOCK (continuing without it)" >&2
-    exec 9>/dev/null  # harmless fallback; flock below will still work on /dev/null
-  }
-  if ! flock -n 9; then
-    # Another gate holds the lock. Surface the holder's pid if we can read it
-    # from /proc/locks; otherwise just print the path. Exit 0 — the caller
-    # (CI, a waiter) sees a clean "another gate is running" rather than a
-    # gate failure, and the active gate keeps its lock undisturbed.
+  # coproc: the helper's stdin/stdout are COPROC[1]/COPROC[0]; COPROC_PID is
+  # the helper's PID. We read one line (ACQUIRED or REFUSED) and either
+  # register a cleanup trap (ACQUIRED — the daemon keeps the lock alive
+  # for this script) or print the refused-message and exit 0 (REFUSED —
+  # the daemon already exited; we just need to wait+reap).
+  coproc python3 -m gate.serialize acquire --path "$GATE_LOCK" --hold
+  _gate_serialize_pid=$COPROC_PID
+  IFS= read -r _gate_serialize_verdict <&${COPROC[0]} || _gate_serialize_verdict=""
+  if [ "$_gate_serialize_verdict" != "ACQUIRED" ]; then
+    # REFUSED (or read failed — treat as refused; the helper will reap itself).
+    # Surface the holder's pid if we can read it from /proc/locks; otherwise
+    # just print the path. Exit 0 — the caller (CI, a waiter) sees a clean
+    # "another gate is running" rather than a gate failure, and the active
+    # gate keeps its lock undisturbed.
+    wait "$_gate_serialize_pid" 2>/dev/null || true
     _holder=""
     if command -v fuser >/dev/null 2>&1; then
       _holder=$(fuser "$GATE_LOCK" 2>/dev/null | tr -d ' ' || true)
@@ -77,6 +93,10 @@ if [ -z "${GATE_SKIP_LOCK:-}" ]; then
     fi
     exit 0
   fi
+  # ACQUIRED — register cleanup so the daemon dies (and the kernel releases
+  # the flock) when this bash script exits. SIGTERM is caught by the helper's
+  # signal handler (clean release); SIGKILL is the unconditional fallback.
+  trap 'kill "$_gate_serialize_pid" 2>/dev/null || true; wait "$_gate_serialize_pid" 2>/dev/null || true' EXIT
 fi
 
 # The authoritative verdict file path (matches gate.sh:77 / gate_full_cycle.sh).
