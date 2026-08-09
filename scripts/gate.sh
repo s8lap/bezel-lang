@@ -463,20 +463,6 @@ gate_arbitrate() { # $1 = sharded-run log  →  returns 0|1|2; sets ARB_LAST_SUS
   ARB_LAST_SUSPECTS=$(printf '%s\n' "$_out" | sed -n 's/^@arb:suspects=//p' | head -1); ARB_LAST_SUSPECTS=${ARB_LAST_SUSPECTS:-0}
   # Echo the FLAKY/REAL/cap detail lines (the @arb: line is orchestrator-only).
   printf '%s\n' "$_out" | grep -v '^@arb:'
-  # --- dual-run assertion (TEMPORARY: remove after the landing gate proves it) ---
-  # The OLD bash greps' unique-suspect count: crashed + failed, minus blank,
-  # minus <none> (a shard killed at startup is not an arbitrable suspect).
-  _crashed=$(grep 'died on:' "$log" | sed -E 's/.*died on: //')
-  _failed=$(grep -E '^\[ FAIL' "$log" | sed -E 's/^\[ FAIL \] //' | awk '{print $1}')
-  _bash_suspects=$(printf '%s\n%s\n' "$_crashed" "$_failed" | grep -v '^$' | grep -vx '<none>' | sort -u | grep -c . || true)
-  if [ "$_bash_suspects" -ne "$ARB_LAST_SUSPECTS" ]; then
-    echo "## GATE FAILURE: arbitration PYTHON/BASH DRIFT — suspects(bash=$_bash_suspects py=$ARB_LAST_SUSPECTS)" >&2
-    echo "##   gate.arbitration parsed a different suspect set than the proven bash;" >&2
-    echo "##   a re-run over a divergent suspect set is untrustworthy (#2100)." >&2
-    FAILED_PHASE="arbitration python/bash drift: suspects(bash=$_bash_suspects py=$ARB_LAST_SUSPECTS)"
-    exit 3
-  fi
-  # --- end dual-run assertion ---
   return "$_verdict"
 }
 
@@ -590,35 +576,6 @@ eval "$(PYTHONPATH=scripts python3 -m gate.cold evaluate \
 GATE_COLD=$cold
 # A caller's explicit BEZEL_SHARD_TIMEOUT always wins (see GATE_EXPLICIT_STO).
 sto="$GATE_EXPLICIT_STO"; [ -z "$sto" ] && sto=$ceiling
-# --- dual-run assertion (TEMPORARY: remove after the landing gate proves it) ---
-# Recompute the cold/identity signals the OLD bash way and assert the Python
-# modules agree. Fatal on drift: a disagreement is a real port defect, and the
-# gate must not proceed on an unproven value (#3010 — the gate stays
-# trustworthy; the old bash is authority until the Python is proven, and if they
-# DISAGREE neither is trusted — exit 3 = retry, never a silent pass).
-_bash_cache_n=$(find -L "$GATE_CACHE_ROOT" -type f 2>/dev/null | wc -l)
-_bash_id=$(cat build/libbezel_core.a build/libbezel_runtime.a 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1)
-_bash_recorded=$(cat "$GATE_CACHE_ID_FILE" 2>/dev/null || echo none)
-_bash_cold=0
-{ [ "$core_post" != "$CORE_MTIME_PRE" ] || [ "$_bash_cache_n" -lt 2000 ] || { [ -n "$_bash_id" ] && [ "$_bash_id" != "$_bash_recorded" ]; }; } && _bash_cold=1
-_p5_drift=""
-[ "$_bash_cache_n" -ne "$cache_n" ] && _p5_drift="${_p5_drift}cache_n(bash=$_bash_cache_n py=$cache_n) "
-[ "$_bash_cold" -ne "$GATE_COLD" ] && _p5_drift="${_p5_drift}cold(bash=$_bash_cold py=$GATE_COLD) "
-# The identity hashes agree whenever BOTH archives exist (the build phase
-# guarantees this); they diverge only in the both-missing case, where bash's
-# `sha256sum` of empty input yields e3b0c44… while the module fails CLOSED ("").
-# Assert the digest only when the module produced one — i.e. both archives read.
-if [ -n "$GATE_CACHE_ID" ] && [ "$_bash_id" != "$GATE_CACHE_ID" ]; then
-  _p5_drift="${_p5_drift}identity(bash=$_bash_id py=$GATE_CACHE_ID) "
-fi
-if [ -n "$_p5_drift" ]; then
-  echo "## GATE FAILURE: Phase-5 PYTHON/BASH DRIFT — $_p5_drift" >&2
-  echo "##   gate.identity/gate.cold disagree with the proven bash; refusing to" >&2
-  echo "##   proceed on an unproven cold/identity value (retry once fixed)." >&2
-  FAILED_PHASE="phase-5 python/bash drift: $_p5_drift"
-  exit 3
-fi
-# --- end dual-run assertion ---
 SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
 core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebuilt"
 cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
@@ -932,36 +889,6 @@ printf '%s\n' "$_cov_out" | grep -v '^@cov:'
 GATE_EXPECTED_GTESTS=$(printf '%s\n' "$_cov_out" | sed -n 's/^@cov:expected=//p' | head -1); GATE_EXPECTED_GTESTS=${GATE_EXPECTED_GTESTS:-0}
 GATE_FLOOR_OK=$(printf '%s\n' "$_cov_out" | sed -n 's/^@cov:floor_ok=//p' | head -1); GATE_FLOOR_OK=${GATE_FLOOR_OK:-0}
 GATE_BIN_EXPECTED=$(printf '%s\n' "$_cov_out" | sed -n 's/^@cov:bin_expected=//p' | head -1)
-# --- dual-run assertion (TEMPORARY: remove after the landing gate proves it) ---
-# Re-enumerate the registry the OLD bash way and assert the module agrees on the
-# decision-critical values: the expected total and the floor usability. Fatal on
-# drift. The bash re-enumerate is itself the #3011 authority (a missing binary ⇒
-# hard-fail), so a divergence here is exactly the defect this floor catches.
-_bash_exp=0; _bash_floor_ok=1; _bash_rows=0
-if [ -r build/tests/test_binaries.txt ]; then
-  while read -r _g _bin _n; do
-    [ -n "$_bin" ] || continue
-    _bash_rows=$(( _bash_rows + 1 ))
-    if [ ! -x "$_bin" ]; then _bash_floor_ok=0; continue; fi
-    _en=$(BEZEL_TEST_ENUMERATE=1 "$_bin" 2>/dev/null | wc -l)
-    [ "${_en:-0}" -le 0 ] && { _bash_floor_ok=0; continue; }
-    _bash_exp=$(( _bash_exp + _en ))
-  done < build/tests/test_binaries.txt
-else
-  _bash_floor_ok=0
-fi
-[ "$_bash_rows" -eq 0 ] && _bash_floor_ok=0
-_cov_drift=""
-[ "$_bash_exp" -ne "$GATE_EXPECTED_GTESTS" ] && _cov_drift="${_cov_drift}expected(bash=$_bash_exp py=$GATE_EXPECTED_GTESTS) "
-[ "$_bash_floor_ok" -ne "$GATE_FLOOR_OK" ] && _cov_drift="${_cov_drift}floor_ok(bash=$_bash_floor_ok py=$GATE_FLOOR_OK) "
-if [ -n "$_cov_drift" ]; then
-  echo "## GATE FAILURE: coverage-floor PYTHON/BASH DRIFT — $_cov_drift" >&2
-  echo "##   gate.coverage disagrees with the proven bash; refusing to proceed on" >&2
-  echo "##   an unproven floor (#3011 — a missing binary must never lower it)." >&2
-  FAILED_PHASE="coverage-floor python/bash drift: $_cov_drift"
-  exit 3
-fi
-# --- end dual-run assertion ---
 # The verdict: the module's exit code IS the decision. Exit 3 = coverage short
 # OR registry-unusable (both retry, neither is a pass — what must never happen
 # again is `== GATE PASS ==` over 31% coverage, #3002). FAILED_PHASE drives the
