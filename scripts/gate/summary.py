@@ -488,6 +488,49 @@ def extract_crash_culprit(logdir, shard_id):
     return _RUN_CULPRIT_RE.sub('', last.rstrip('\n'), count=1)
 
 
+# `[ FAIL ] <test>` — the line a test that RAN and failed prints, mirrored from
+# arbitration.py's `_FAIL_LINE_RE` and the gtest output convention. Per #1608
+# Appendix and #3018: the "died on: <last RUN>" attribution in the banner is
+# documented as a MISATTRIBUTION (the last [ RUN ] line may be an innocent
+# bystander at a timeout; the actual failing test is signaled by `[ FAIL ]`).
+# The arbitration layer already arbitrates [FAIL] suites first (un-capped),
+# but the *banner* showed only the last [ RUN ] — leaving the actual failing
+# test invisible to whoever reads the GATE FAILURE block. Cross-check the log
+# for [FAIL] lines so the banner names the real culprit alongside the
+# (preserved) last-[RUN] attribution.
+_FAIL_LINE_RE = re.compile(r"^\[ FAIL \]\s*(\S+)")
+
+
+def extract_log_failures(logdir, shard_id):
+    """The list of `[ FAIL ] <test>` test names from a crashed shard's log.
+
+    The test name is the first whitespace-delimited token after the `] `
+    marker (faithful to gtest's emission and arbitration.py's `_FAIL_LINE_RE`).
+    Returns [] when the log is missing or carries no [ FAIL ] line — distinct
+    from the "no crash" case (which never calls this).
+
+    Per #1608/#3018: when a shard crashes, the last [ RUN ] line is the
+    `died on:` attribution the banner reports, but the *actual* failing test
+    is the one whose `[ FAIL ]` line appeared before the crash. The banner
+    now shows both side-by-side so a reader sees the real culprit without
+    having to re-run the shard.
+    """
+    name, sep, _idx = shard_id.partition('/')
+    if not sep:
+        return []
+    path = os.path.join(logdir, 'shard.{}.{}.log'.format(name, _idx))
+    out = []
+    try:
+        with open(path, errors='replace') as f:
+            for line in f:
+                m = _FAIL_LINE_RE.match(line)
+                if m:
+                    out.append(m.group(1))
+    except OSError:
+        return []
+    return out
+
+
 def format_phantom_warning(listed, selected):
     """The phantom-name warning line (#2100), or '' if no warning.
 
@@ -507,17 +550,31 @@ def format_phantom_warning(listed, selected):
 
 
 def format_failure_banner(ran, expected, nbin, undercount_bins, subset_empty,
-                          missing_summary_shards, njobs, crashed_culprits):
+                          missing_summary_shards, njobs, crashed_culprits,
+                          crashed_log_failures=None):
     """The GATE FAILURE banner, byte-identical to run_parallel.sh:298-317, or
     '' when integrity is ok.
 
     `crashed_culprits` is an ordered list of (shard_id, culprit) pairs (culprit
     from extract_crash_culprit; '' if none). The 'shard crash / undercount'
     literal is LOAD-BEARING (gate_full_cycle.sh:79 + gate.sh:106 grep it). per
-    #1608: the culprit is the last [ RUN ] line. Returns '' when no integrity
-    defect is present — the bash `if` guard maps exactly (any crashed shard, any
-    undercount bin, any missing-summary shard, or subset-empty; count_ok==0 and
-    summary_ok==0 are equivalent to those lists being non-empty, see account()).
+    #1608: the culprit is the last [ RUN ] line.
+
+    `crashed_log_failures` (optional, #3018) is a parallel ordered list of
+    (shard_id, [fail_name, ...]) pairs from `extract_log_failures`. When a
+    shard_id appears in BOTH lists with a non-empty failure list, the banner
+    appends an "actual FAIL: <list>" line after the "died on" line, so the
+    reader sees the real culprit (the test that ran and failed) alongside the
+    preserved last-[RUN] attribution. When no failure markers were observed
+    (the shard died at a timeout before any [FAIL] could print, or the
+    failure was a clean signal-killed process), only the "died on" line is
+    emitted — the new line is conditional, so the existing banner is
+    byte-identical for the common no-FAIL case.
+
+    Returns '' when no integrity defect is present — the bash `if` guard maps
+    exactly (any crashed shard, any undercount bin, any missing-summary shard,
+    or subset-empty; count_ok==0 and summary_ok==0 are equivalent to those
+    lists being non-empty, see account()).
     """
     has_defect = bool(crashed_culprits or undercount_bins
                       or missing_summary_shards or subset_empty)
@@ -539,9 +596,25 @@ def format_failure_banner(ran, expected, nbin, undercount_bins, subset_empty,
                      "(slice not validated): shard(s) %s"
                      % (len(missing_summary_shards), njobs,
                         " ".join(missing_summary_shards)))
+    # Index failures by shard_id for the cross-check below. Default to {} when
+    # the caller didn't pass the new list — the banner stays byte-identical.
+    failures_by_id = {}
+    if crashed_log_failures:
+        for sid, fs in crashed_log_failures:
+            if fs:
+                failures_by_id[sid] = fs
     for shard_id, culprit in crashed_culprits:
         lines.append("##   shard %s exited nonzero — died on: %s"
                      % (shard_id, culprit or "<none>"))
+        # Per #3018: surface the actual [FAIL] lines (the test that ran and
+        # FAILED) alongside the (preserved) last-[RUN] attribution. The
+        # "last [RUN]" attribution is documented as a misattribution (#1608),
+        # so the FAIL list is the real culprit. Distinct line so existing
+        # grep/scraper consumers of the "died on:" line are unaffected.
+        if shard_id in failures_by_id:
+            fails = failures_by_id[shard_id]
+            lines.append("##   shard %s actual FAIL: %s"
+                         % (shard_id, " ".join(fails)))
     lines.append("############################################################")
     return "\n".join(lines)
 
@@ -616,7 +689,12 @@ def _main_format_failure(argv):
     --njobs N [--undercount a b ...] [--missing-summary x y ...]
     [--crashed a/0 b/1 ...] --logdir PATH` — print the GATE FAILURE banner (or
     nothing). The culprit extraction (grep RUN | tail -1 | sed) is done HERE
-    from the shard logs, so run_parallel no longer carries that fiddly shell."""
+    from the shard logs, so run_parallel no longer carries that fiddly shell.
+
+    Per #3018: for each crashed shard, also cross-check the log for [FAIL]
+    lines via `extract_log_failures` and include them in the banner as
+    "actual FAIL:" so the reader sees the real failing test alongside the
+    (preserved) last-[RUN] attribution."""
     import argparse
     p = argparse.ArgumentParser(prog="summary.py format-failure", add_help=True)
     p.add_argument("--ran", type=int, required=True)
@@ -637,10 +715,15 @@ def _main_format_failure(argv):
     args = p.parse_args(argv)
     crashed_culprits = [(s, extract_crash_culprit(args.logdir, s))
                         for s in args.crashed]
+    # Per #3018: cross-check the log for [FAIL] lines so the banner names the
+    # real culprit alongside the preserved last-[RUN] attribution. Parallel list
+    # to crashed_culprits (same shard_ids, in the same order).
+    crashed_log_failures = [(s, extract_log_failures(args.logdir, s))
+                            for s in args.crashed]
     text = format_failure_banner(
         args.ran, args.expected, args.nbin, args.undercount,
         bool(args.subset_empty), args.missing_summary, args.njobs,
-        crashed_culprits)
+        crashed_culprits, crashed_log_failures)
     if text:
         sys.stdout.write(text + "\n")
     return 0

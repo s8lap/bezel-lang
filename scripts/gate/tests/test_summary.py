@@ -643,6 +643,59 @@ class ExtractCrashCulpritTest(unittest.TestCase):
             self.assertEqual(summary.extract_crash_culprit(d, "nodash"), "")
 
 
+class ExtractLogFailuresTest(unittest.TestCase):
+    r"""extract_log_failures mirrors arbitration.py's `_FAIL_LINE_RE` — `[ FAIL
+    ] <test>` first-token test names from a shard log. Per #1608/#3018: the
+    `died on:` attribution is the last [ RUN ] line (a misattribution); the
+    actual failing test is signaled by [ FAIL ]. Surfaced in the banner so
+    readers see the real culprit."""
+
+    def test_returns_all_fail_lines_in_order(self):
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "sema", 5,
+                       "[ RUN  ] sema_zero_one_reject_1424.a\n"
+                       "[  OK  ] sema_zero_one_reject_1424.a\n"
+                       "[ RUN  ] sema_other.actual_failure\n"
+                       "[ FAIL ] sema_other.actual_failure\n"
+                       "[ RUN  ] sema_zero_one_reject_1424.b\n")
+            self.assertEqual(
+                summary.extract_log_failures(d, "sema/5"),
+                ["sema_other.actual_failure"])
+
+    def test_no_fail_lines_returns_empty(self):
+        # The common case — a shard dies after its last [ RUN ] but before any
+        # [ FAIL ] gets printed (the "clean signal-killed" path). The banner
+        # suppresses the new line entirely.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "sema", 5,
+                       "[ RUN  ] sema_zero_one_reject_1424.a\n"
+                       "[  OK  ] sema_zero_one_reject_1424.a\n"
+                       "[ RUN  ] sema_zero_one_reject_1424.b\n")
+            self.assertEqual(summary.extract_log_failures(d, "sema/5"), [])
+
+    def test_missing_log_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(summary.extract_log_failures(d, "sema/5"), [])
+
+    def test_malformed_shard_id_returns_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(summary.extract_log_failures(d, "nodash"), [])
+
+    def test_multiple_fail_lines_all_preserved(self):
+        # A shard that surfaces multiple failing tests (the misattribution
+        # case: the real culprit is the LAST [FAIL], the others are earlier
+        # observed failures). Preserve order so the LAST [FAIL] is naturally
+        # the last entry — the most recent culprit is the most diagnostic.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "sema", 5,
+                       "[ FAIL ] sema_a.first\n"
+                       "[ FAIL ] sema_b.second\n"
+                       "[ FAIL ] sema_c.third\n")
+            self.assertEqual(
+                summary.extract_log_failures(d, "sema/5"),
+                ["sema_a.first", "sema_b.second", "sema_c.third"])
+
+
 class FormatPhantomWarningTest(unittest.TestCase):
     """format_phantom_warning mirrors run_parallel.sh:283-289 (#2100). The
     'WARNING: only' literal is LOAD-BEARING — gate.sh:637 and agent_check.sh:266
@@ -766,6 +819,42 @@ class FormatFailureBannerTest(unittest.TestCase):
             subset_empty=False, missing_summary_shards=[], njobs=1,
             crashed_culprits=[("x/0", "")])
         self.assertIn("shard crash / undercount", out)
+
+    def test_crashed_with_actual_failures_appends_actual_fail_line(self):
+        # Per #3018: when a shard log carries [FAIL] lines, the banner names
+        # the real culprit (the test that ran and FAILED) alongside the
+        # preserved last-[RUN] attribution. The new line is conditional and
+        # byte-identical for the common no-FAIL case (#3018 byte-stability pin).
+        out = summary.format_failure_banner(
+            ran=8, expected=10, nbin=1, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=[], njobs=2,
+            crashed_culprits=[("sema/5", "sema_zero_one_reject_1424.last_one")],
+            crashed_log_failures=[("sema/5", ["sema_other.actual_failure"])])
+        self.assertIn("died on: sema_zero_one_reject_1424.last_one", out)
+        self.assertIn("actual FAIL: sema_other.actual_failure", out)
+
+    def test_crashed_without_failures_omits_actual_fail_line(self):
+        # No [FAIL] lines in the log -> the new line is suppressed entirely.
+        # The banner stays byte-identical to the pre-#3018 output for this
+        # case (the common "clean signal-killed" path).
+        out = summary.format_failure_banner(
+            ran=8, expected=10, nbin=1, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=[], njobs=2,
+            crashed_culprits=[("sema/5", "sema_zero_one_reject_1424.last_one")],
+            crashed_log_failures=[("sema/5", [])])
+        self.assertIn("died on: sema_zero_one_reject_1424.last_one", out)
+        self.assertNotIn("actual FAIL:", out)
+
+    def test_crashed_log_failures_none_default_omits_actual_fail_line(self):
+        # The new parameter defaults to None (back-compat for any caller that
+        # doesn't pass it). The new line MUST be suppressed in that case —
+        # the pre-#3018 banner is byte-identical for the default invocation.
+        out = summary.format_failure_banner(
+            ran=8, expected=10, nbin=1, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=[], njobs=2,
+            crashed_culprits=[("sema/5", "sema_zero_one_reject_1424.last_one")])
+        self.assertIn("died on: sema_zero_one_reject_1424.last_one", out)
+        self.assertNotIn("actual FAIL:", out)
 
 
 class FormatCLITest(unittest.TestCase):
