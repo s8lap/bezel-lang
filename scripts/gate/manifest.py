@@ -32,6 +32,9 @@ from the sources must not silently shrink the suite.
 Stdlib only (no pytest). See test_manifest.py for the read + partition pins.
 """
 
+import argparse
+import sys
+
 
 class Binary:
     """One row of build/tests/test_binaries.txt: a per-area test binary.
@@ -156,3 +159,33 @@ def partition_is_complete(manifest, tests_glob, num_shared_entry=1):
         total += b.num_sources
     glob_n = len(tests_glob)
     return total == glob_n - num_shared_entry
+
+
+# ---------------------------------------------------------------------------
+# CLI — gate.sh / run_parallel.sh / agent_check.sh call
+# `python3 -m gate.manifest binaries ...` to enumerate the binary paths the way
+# the old `cut -f2 build/tests/test_binaries.txt` did (Wave 2 retires that
+# hand-parse). read_manifest's strict validation replaces the silent skip the
+# loose bash cut performed, so a malformed row now fails loudly instead of
+# dropping a binary from the runner's accounting.
+# ---------------------------------------------------------------------------
+
+def _main_binaries(argv):
+    """`binaries [--path P]` → one binary path per line."""
+    p = argparse.ArgumentParser(prog="manifest.py binaries")
+    p.add_argument("--path", default="build/tests/test_binaries.txt")
+    args = p.parse_args(argv)
+    for b in read_manifest(args.path):
+        print(b.path)
+    return 0
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[1] == "binaries":
+        return _main_binaries(argv[2:])
+    sys.stderr.write("usage: manifest.py binaries [--path PATH]\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

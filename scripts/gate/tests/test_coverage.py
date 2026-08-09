@@ -205,5 +205,108 @@ class CheckCoverageFloorTest(unittest.TestCase):
         self.assertEqual(v.exit_code, coverage.EXIT_RETRY)
 
 
+def _fake_binary(dirpath, name, ntests):
+    """A hermetic stand-in for a gtest binary: prints `ntests` test-name lines
+    when run (the BEZEL_TEST_ENUMERATE protocol prints one suite.name per line).
+    The real `_default_enumerate_runner` execs this and counts the newlines."""
+    p = os.path.join(dirpath, name)
+    with open(p, "w") as f:
+        f.write("#!/bin/sh\n")
+        for i in range(ntests):
+            f.write("echo Suite%d.test%d\n" % (i % 3, i))
+    os.chmod(p, 0o755)
+    return p
+
+
+class CLITest(unittest.TestCase):
+    """`python3 -m gate.coverage check` — the Wave-2 gate.sh bridge (#3010).
+
+    The EXIT CODE is the decision (0 ok / 3 retry); stdout carries the banner
+    plus `@cov:` machine lines. Pins: exit 0 on a complete run, exit 3 on a
+    coverage-short AND on a registry-unusable shape, and that the @cov machine
+    lines carry the values the orchestrator harvests for telemetry.
+    """
+
+    _SCRIPTS_DIR = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", ".."))
+
+    def _run_cli(self, args):
+        import subprocess
+        env = dict(os.environ, PYTHONPATH=self._SCRIPTS_DIR)
+        return subprocess.run(
+            [sys.executable, "-m", "gate.coverage"] + args,
+            capture_output=True, text=True, env=env)
+
+    def _machine(self, out):
+        """Parse the `@cov:k=v` lines the orchestrator harvests."""
+        m = {}
+        for line in out.splitlines():
+            if line.startswith("@cov:"):
+                k, v = line[len("@cov:"):].split("=", 1)
+                m[k] = v
+        return m
+
+    def test_check_ok_exits_zero_and_emits_floor_ok(self):
+        with tempfile.TemporaryDirectory() as d:
+            b1 = _fake_binary(d, "codegen", 5)
+            b2 = _fake_binary(d, "sema", 3)
+            mp = _write_manifest(d, [_row("codegen", b1, 99),
+                                     _row("sema", b2, 88)])
+            r = self._run_cli(["check", "--ran", "8", "--manifest", mp])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            m = self._machine(r.stdout)
+            self.assertEqual(m["exit"], "0")
+            self.assertEqual(m["floor_ok"], "1")
+            self.assertEqual(m["expected"], "8")
+            self.assertIn("codegen:5", m["bin_expected"])
+            self.assertIn("sema:3", m["bin_expected"])
+
+    def test_check_ran_superset_of_expected_is_ok(self):
+        # A re-run that picks up a few extra tests is NOT a defect (== too strict).
+        with tempfile.TemporaryDirectory() as d:
+            b1 = _fake_binary(d, "codegen", 5)
+            mp = _write_manifest(d, [_row("codegen", b1, 99)])
+            r = self._run_cli(["check", "--ran", "6", "--manifest", mp])
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_check_coverage_short_exits_three(self):
+        with tempfile.TemporaryDirectory() as d:
+            b1 = _fake_binary(d, "codegen", 500)
+            mp = _write_manifest(d, [_row("codegen", b1, 99)])
+            r = self._run_cli(["check", "--ran", "100", "--manifest", mp])
+            self.assertEqual(r.returncode, 3, r.stdout)
+            m = self._machine(r.stdout)
+            self.assertEqual(m["exit"], "3")
+            self.assertEqual(m["floor_ok"], "0")
+            self.assertIn("COVERAGE SHORT", r.stdout)
+
+    def test_check_missing_binary_hard_fails_exit_three(self):
+        # #3011: a non-executable registry binary is a HARD fail, never a
+        # silently-lowered expectation. The CLI inherits the default
+        # is_executable, so a path that was never made executable triggers it.
+        with tempfile.TemporaryDirectory() as d:
+            b1 = _fake_binary(d, "codegen", 5)
+            missing = os.path.join(d, "never-built")
+            mp = _write_manifest(d, [_row("codegen", b1, 99),
+                                     _row("sema", missing, 88)])
+            r = self._run_cli(["check", "--ran", "9999", "--manifest", mp])
+            self.assertEqual(r.returncode, 3, r.stdout)
+            m = self._machine(r.stdout)
+            self.assertEqual(m["floor_ok"], "0")
+            self.assertIn("not executable", r.stdout)
+
+    def test_check_zero_rows_hard_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "test_binaries.txt")
+            open(mp, "w").close()
+            r = self._run_cli(["check", "--ran", "0", "--manifest", mp])
+            self.assertEqual(r.returncode, 3, r.stdout)
+            self.assertIn("ZERO binaries", r.stdout)
+
+    def test_no_subcommand_exits_2(self):
+        r = self._run_cli([])
+        self.assertEqual(r.returncode, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -42,8 +42,10 @@ forces the cold verdict.
 Stdlib only (no pytest). See test_cold.py for the truth-table + find-L pins.
 """
 
+import argparse
 import collections
 import subprocess
+import sys
 
 # The cold/warm ceilings, in seconds, for BOTH oracles. per #2918 /
 # gate.sh:629-662 (cold=1800, warm=900).
@@ -124,3 +126,41 @@ def evaluate(identity_changed, cache_root, marker_changed):
     n = count_cache(cache_root)
     cold = is_cold(identity_changed, n, marker_changed)
     return ColdResult(cache_n=n, cold=cold, ceiling=ceiling(cold))
+
+
+# ---------------------------------------------------------------------------
+# CLI — gate.sh calls `python3 -m gate.cold evaluate ...` (Wave 2). Prints
+# shell-sourceable `cache_n`/`cold`/`ceiling` lines that gate.sh evals; these
+# are the three values the old bash derived inline (#2100 / #2918 / #3000).
+# ---------------------------------------------------------------------------
+
+def _main_evaluate(argv):
+    """`evaluate --cache-root P [--identity-changed 0/1] [--marker-changed 0/1]`.
+
+    Prints cache_n / cold / ceiling (shell-sourceable). The two changed-flags
+    are 0/1 ints (bool(args.x)) so gate.sh can pass `[ "$x" = ... ]` results
+    without quoting. An explicit caller BEZEL_SHARD_TIMEOUT is still resolved
+    BY THE CALLER (this returns the ceiling the caller either uses or overrides).
+    """
+    p = argparse.ArgumentParser(prog="cold.py evaluate")
+    p.add_argument("--cache-root", required=True)
+    p.add_argument("--identity-changed", type=int, default=0)
+    p.add_argument("--marker-changed", type=int, default=0)
+    args = p.parse_args(argv)
+    r = evaluate(bool(args.identity_changed), args.cache_root,
+                 bool(args.marker_changed))
+    print("cache_n=%d" % r.cache_n)
+    print("cold=%d" % (1 if r.cold else 0))
+    print("ceiling=%d" % r.ceiling)
+    return 0
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[1] == "evaluate":
+        return _main_evaluate(argv[2:])
+    sys.stderr.write("usage: cold.py evaluate --cache-root PATH ...\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

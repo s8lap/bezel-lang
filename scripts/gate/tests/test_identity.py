@@ -262,5 +262,79 @@ class MarkerReadWriteTest(unittest.TestCase):
         identity.write_marker("/proc/this/cannot/exist/.gate-identity", "x" * 64)
 
 
+class CLITest(unittest.TestCase):
+    """`python3 -m gate.identity <sub>` — the Wave-2 gate.sh bridge (#3010)."""
+
+    _SCRIPTS_DIR = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", ".."))
+
+    def _run_cli(self, args):
+        import subprocess
+        env = dict(os.environ, PYTHONPATH=self._SCRIPTS_DIR)
+        return subprocess.run(
+            [sys.executable, "-m", "gate.identity"] + args,
+            capture_output=True, text=True, env=env)
+
+    def test_compute_prints_digest_matching_function(self):
+        with tempfile.TemporaryDirectory() as d:
+            core = os.path.join(d, "libbezel_core.a")
+            rt = os.path.join(d, "libbezel_runtime.a")
+            with open(core, "wb") as f:
+                f.write(b"core-bytes")
+            with open(rt, "wb") as f:
+                f.write(b"runtime-bytes")
+            r = self._run_cli(["compute", "--core", core, "--runtime", rt])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(),
+                             identity.compute_identity(core, rt))
+            self.assertEqual(r.stdout.strip(), _sha256_concat(core, rt))
+
+    def test_compute_blank_when_archive_missing(self):
+        with tempfile.TemporaryDirectory() as d:
+            core = os.path.join(d, "libbezel_core.a")
+            with open(core, "wb") as f:
+                f.write(b"x")
+            # runtime missing ⇒ blank line (gate.sh swallows to "" via $()).
+            r = self._run_cli(
+                ["compute", "--core", core, "--runtime", d + "/missing.a"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "")
+
+    def test_marker_filename_is_per_oracle_and_joined_to_root(self):
+        for oracle, basename in [("plain", identity.MARKER_PLAIN),
+                                 ("asan", identity.MARKER_ASAN)]:
+            r = self._run_cli(
+                ["marker-filename", "--cache-root", "/cache/root", "--oracle",
+                 oracle])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(),
+                             os.path.join("/cache/root", basename))
+        # plain is the default branch.
+        r = self._run_cli(
+            ["marker-filename", "--cache-root", "/c", "--oracle", "plain"])
+        self.assertIn(identity.MARKER_PLAIN, r.stdout)
+
+    def test_read_write_marker_round_trip_via_cli(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, ".gate-identity")
+            self.assertEqual(self._run_cli(
+                ["write-marker", "--path", p, "--identity", "abc123"]).returncode,
+                             0)
+            r = self._run_cli(["read-marker", "--path", p])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "abc123")
+
+    def test_read_marker_blank_when_absent(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = self._run_cli(["read-marker", "--path", d + "/nope"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), "")
+
+    def test_no_subcommand_exits_2(self):
+        r = self._run_cli([])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("usage", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -47,9 +47,11 @@ into _parse_summary here.
 Stdlib only (no pytest). See test_arbitration.py for the load-bearing pins.
 """
 
+import argparse
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 
 # The two gtest summary shapes the harvest must read. Faithful to gate.sh:451
@@ -291,3 +293,94 @@ def arbitrate(log_text, run_suite, *, sample_cap=DEFAULT_SAMPLE_CAP):
     # here (the empty-suspects return-2 was handled above).
     result.verdict = ARB_REAL if real else ARB_FLAKY
     return result
+
+
+# ---------------------------------------------------------------------------
+# CLI — gate.sh calls these as `python3 -m gate.arbitration <sub> ...` (Wave 2).
+#
+#   arbitrate  the full re-run: reads the shard log, re-runs each suspect's
+#              suite across the per-area binaries (arb_run_suite), and exits
+#              with the 0/1/2 verdict contract. This is the authoritative path.
+#
+#   suspects   a CHEAP dual-run probe: drives arbitrate() with a RECORDING stub
+#              that captures the sample order WITHOUT running anything, so the
+#              orchestrator can assert the suspect SELECTION (invariant 2:
+#              [FAIL]-never-sampled + the crash-suite cap) matches the old bash
+#              greps — without doubling the re-run cost. The full re-run stays
+#              Python-authoritative, proven by the unit tests (the 5 invariants
+#              pinned in test_arbitration.py).
+# ---------------------------------------------------------------------------
+
+def _read_log(path):
+    with open(path, errors="replace") as f:
+        return f.read()
+
+
+def _main_arbitrate(argv):
+    """`arbitrate --log P [--manifest P] [--sample-cap N] [--asan]` → exit 0|1|2.
+
+    --asan forces BEZEL_AOT_FORCE_SANITIZE=address on every re-run (invariant 5:
+    an ASan-only failure must reproduce rather than be cleared as flaky).
+    """
+    p = argparse.ArgumentParser(prog="arbitration.py arbitrate")
+    p.add_argument("--log", required=True)
+    p.add_argument("--manifest", default="build/tests/test_binaries.txt")
+    p.add_argument("--sample-cap", type=int, default=DEFAULT_SAMPLE_CAP)
+    p.add_argument("--asan", action="store_true")
+    args = p.parse_args(argv)
+    from gate import manifest  # local import keeps the core arbitrate() decoupled
+    bins = [b.path for b in manifest.read_manifest(args.manifest)]
+    log_text = _read_log(args.log)
+    arb_env = {"BEZEL_AOT_FORCE_SANITIZE": "address"} if args.asan else None
+
+    def run_suite(suite):
+        return arb_run_suite(suite, bins, arb_env=arb_env)
+
+    result = arbitrate(log_text, run_suite, sample_cap=args.sample_cap)
+    for m in result.messages:
+        print(m)
+    print("@arb:suspects=%d" % result.last_suspects)
+    return result.verdict
+
+
+def _main_suspects(argv):
+    """`suspects --log P [--sample-cap N]` → print the suspect plan, exit 0.
+
+    Drives arbitrate() with a recording stub (every suite "passes"), so the
+    `sampled` list is EXACTLY the set of suites arbitrate chose to re-run, in
+    order, with the cap already applied. gate.sh asserts this equals the old
+    bash greps' selection — a cheap proof of invariant 2 on every gate that
+    reaches arbitration, with no re-runs.
+    """
+    p = argparse.ArgumentParser(prog="arbitration.py suspects")
+    p.add_argument("--log", required=True)
+    p.add_argument("--sample-cap", type=int, default=DEFAULT_SAMPLE_CAP)
+    args = p.parse_args(argv)
+    log_text = _read_log(args.log)
+    sampled = []
+
+    def record(suite):
+        sampled.append(suite)
+        return True  # "passes" so arbitrate advances; we observe order/cap only
+
+    result = arbitrate(log_text, record, sample_cap=args.sample_cap)
+    cap_fired = any("capped arbitration" in m for m in result.messages)
+    print("@arb:fail_suites=%s" % " ".join(result.fail_suites))
+    print("@arb:crash_suites_all=%s" % " ".join(result.crash_suites))
+    print("@arb:cap_fired=%d" % (1 if cap_fired else 0))
+    print("@arb:sampled=%s" % " ".join(sampled))
+    print("@arb:last_suspects=%d" % result.last_suspects)
+    return 0
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[1] == "arbitrate":
+        return _main_arbitrate(argv[2:])
+    if len(argv) >= 2 and argv[1] == "suspects":
+        return _main_suspects(argv[2:])
+    sys.stderr.write("usage: arbitration.py {arbitrate|suspects} ...\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

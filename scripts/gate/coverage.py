@@ -38,9 +38,11 @@ Stdlib only (no pytest). See test_coverage.py for the load-bearing pins:
   - ran >= expected => ok (a superset is fine: == is too strict)
 """
 
+import argparse
 import os
 import pathlib
 import subprocess
+import sys
 from dataclasses import dataclass, field
 
 # per #3002: a run that reports fewer gtests than the registry says exist is a
@@ -300,3 +302,58 @@ def check_coverage_floor(ran, per_binary_ran, manifest_path,
     return floor_ok(
         ran, enum.total_expected, per_binary_ran, enum.per_binary_expected,
         usable=enum.usable, errors=enum.errors)
+
+
+# ---------------------------------------------------------------------------
+# CLI — gate.sh calls `python3 -m gate.coverage check ...` (Wave 2). The EXIT
+# CODE is the decision (0 ok / 3 retry — gate.sh's exit-3 retry contract, same
+# as the old inline block). stdout carries the human banner (echoed verbatim
+# into the gate log) followed by `@cov:` machine lines the orchestrator
+# harvests for telemetry (expected / floor_ok / the per-binary-expected map).
+# ---------------------------------------------------------------------------
+
+def _parse_per_binary_ran(s):
+    """Parse a "name:count name:count" map (the GATE_BIN_RAN format)."""
+    out = {}
+    for tok in (s or "").split():
+        if ":" in tok:
+            k, v = tok.split(":", 1)
+            try:
+                out[k] = int(v)
+            except ValueError:
+                pass
+    return out
+
+
+def _main_check(argv):
+    """`check --ran N --manifest PATH [--per-binary-ran MAP]` → exit 0|3."""
+    p = argparse.ArgumentParser(prog="coverage.py check")
+    p.add_argument("--ran", type=int, required=True)
+    p.add_argument("--manifest", required=True)
+    p.add_argument("--per-binary-ran", default="",
+                   help="the ran map in GATE_BIN_RAN form 'name:count ...'")
+    args = p.parse_args(argv)
+    pbr = _parse_per_binary_ran(args.per_binary_ran)
+    v = check_coverage_floor(args.ran, pbr, args.manifest)
+    if v.message:
+        print(v.message)
+    # Machine lines (gate.sh strips these from the echoed banner). Group names
+    # are CMake identifiers (alnum + _) and counts are ints, so the space-
+    # separated name:count map needs no quoting for the awk merge downstream.
+    print("@cov:exit=%d" % v.exit_code)
+    print("@cov:expected=%d" % v.expected)
+    print("@cov:floor_ok=%d" % (1 if v.ok else 0))
+    print("@cov:bin_expected=%s" % " ".join(
+        "%s:%d" % (k, c) for k, c in sorted(v.per_binary_expected.items())))
+    return v.exit_code
+
+
+def main(argv):
+    if len(argv) >= 2 and argv[1] == "check":
+        return _main_check(argv[2:])
+    sys.stderr.write("usage: coverage.py check --ran N --manifest PATH\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

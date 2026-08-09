@@ -224,5 +224,85 @@ class EvaluateTest(unittest.TestCase):
             self.assertEqual(r.ceiling, 1800)
 
 
+class CLITest(unittest.TestCase):
+    """`python3 -m gate.cold evaluate` — the Wave-2 gate.sh bridge (#3010).
+
+    Pins the shell-sourceable stdout contract gate.sh evals: cache_n / cold /
+    ceiling, each on its own line, with cold as 0/1 (bash-testable).
+    """
+
+    _SCRIPTS_DIR = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", ".."))
+
+    def _run_cli(self, args):
+        env = dict(os.environ, PYTHONPATH=self._SCRIPTS_DIR)
+        return subprocess.run(
+            [sys.executable, "-m", "gate.cold"] + args,
+            capture_output=True, text=True, env=env)
+
+    def _eval_sourceable(self, out):
+        """Parse the `k=v` stdout lines the way gate.sh's eval would."""
+        env = {}
+        for line in out.stdout.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                env[k] = v
+        return env
+
+    def test_warm_store_emits_sourceable_triple(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "c")
+            os.makedirs(cache)
+            for i in range(cold.COLD_CACHE_THRESHOLD + 5):
+                open(os.path.join(cache, "e%d" % i), "wb").close()
+            r = self._run_cli(["evaluate", "--cache-root", cache,
+                               "--identity-changed", "0", "--marker-changed", "0"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            env = self._eval_sourceable(r)
+            self.assertEqual(env["cold"], "0")
+            self.assertEqual(env["ceiling"], "900")
+
+    def test_identity_changed_forces_cold(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "c")
+            os.makedirs(cache)
+            for i in range(cold.COLD_CACHE_THRESHOLD + 5):
+                open(os.path.join(cache, "e%d" % i), "wb").close()
+            r = self._run_cli(["evaluate", "--cache-root", cache,
+                               "--identity-changed", "1", "--marker-changed", "0"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            env = self._eval_sourceable(r)
+            self.assertEqual(env["cold"], "1")
+            self.assertEqual(env["ceiling"], "1800")
+
+    def test_marker_changed_forces_cold_even_warm_count(self):
+        # The load-bearing #2100 case: a full-looking store under a STALE key.
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "c")
+            os.makedirs(cache)
+            for i in range(5000):
+                open(os.path.join(cache, "e%d" % i), "wb").close()
+            r = self._run_cli(["evaluate", "--cache-root", cache,
+                               "--identity-changed", "0", "--marker-changed", "1"])
+            env = self._eval_sourceable(r)
+            self.assertEqual(env["cold"], "1")
+            self.assertEqual(env["ceiling"], "1800")
+
+    def test_cache_n_reports_find_l_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = os.path.join(d, "c")
+            os.makedirs(cache)
+            for i in range(3):
+                open(os.path.join(cache, "e%d" % i), "wb").close()
+            r = self._run_cli(["evaluate", "--cache-root", cache,
+                               "--identity-changed", "0", "--marker-changed", "0"])
+            env = self._eval_sourceable(r)
+            self.assertEqual(env["cache_n"], "3")
+
+    def test_no_subcommand_exits_2(self):
+        r = self._run_cli([])
+        self.assertEqual(r.returncode, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

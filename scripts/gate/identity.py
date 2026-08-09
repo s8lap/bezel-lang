@@ -36,8 +36,11 @@ Stdlib only (no pytest). See test_identity.py for the load-bearing pins:
   - the sa= bit parity against aot_support.hpp:1121-1122 / :1262
 """
 
+import argparse
 import hashlib
+import os
 import pathlib
+import sys
 
 # The per-oracle marker filenames. per #2918 (Plan-A 1.14): plain and ASan are
 # disjoint populations in ONE store, so the marker — the only oracle-
@@ -122,3 +125,76 @@ def write_marker(path, identity):
         p.write_text(identity + "\n")
     except OSError:
         pass  # best-effort — per gate.sh:988 `2>/dev/null`
+
+
+# ---------------------------------------------------------------------------
+# CLI — gate.sh calls these as `python3 -m gate.identity <sub> ...` (Wave 2).
+# Each subcommand is a thin wrapper over the pure functions above; stdout is the
+# value gate.sh consumes via $(). The empty-string-when-unavailable contract is
+# preserved: compute/read-marker print a blank line (command substitution strips
+# the trailing newline ⇒ "" in bash), matching the old `2>/dev/null || echo none`
+# swallow the marker comparison degrades to "changed" (cold). per #2918 / #3010.
+# ---------------------------------------------------------------------------
+
+def _main_compute(argv):
+    """`compute --core A --runtime B` → SHA-256(A ‖ B) hex digest (or blank)."""
+    p = argparse.ArgumentParser(prog="identity.py compute")
+    p.add_argument("--core", required=True)
+    p.add_argument("--runtime", required=True)
+    args = p.parse_args(argv)
+    print(compute_identity(args.core, args.runtime))
+    return 0
+
+
+def _main_marker_filename(argv):
+    """`marker-filename --cache-root P --oracle {plain,asan}` → full marker path.
+
+    Joins the cache root with the per-oracle marker basename. per #2918 the
+    marker MUST be per-oracle; the oracle choice is the load-bearing input.
+    """
+    p = argparse.ArgumentParser(prog="identity.py marker-filename")
+    p.add_argument("--cache-root", required=True)
+    p.add_argument("--oracle", default="plain", choices=["plain", "asan"])
+    args = p.parse_args(argv)
+    print(os.path.join(args.cache_root, marker_filename(args.oracle)))
+    return 0
+
+
+def _main_read_marker(argv):
+    """`read-marker --path P` → the recorded identity (blank if absent)."""
+    p = argparse.ArgumentParser(prog="identity.py read-marker")
+    p.add_argument("--path", required=True)
+    args = p.parse_args(argv)
+    print(read_marker(args.path))
+    return 0
+
+
+def _main_write_marker(argv):
+    """`write-marker --path P --identity ID` → record ID (no-op if ID blank)."""
+    p = argparse.ArgumentParser(prog="identity.py write-marker")
+    p.add_argument("--path", required=True)
+    p.add_argument("--identity", default="")
+    args = p.parse_args(argv)
+    write_marker(args.path, args.identity)
+    return 0
+
+
+def main(argv):
+    if len(argv) >= 2:
+        cmd, rest = argv[1], argv[2:]
+        if cmd == "compute":
+            return _main_compute(rest)
+        if cmd == "marker-filename":
+            return _main_marker_filename(rest)
+        if cmd == "read-marker":
+            return _main_read_marker(rest)
+        if cmd == "write-marker":
+            return _main_write_marker(rest)
+    sys.stderr.write(
+        "usage: identity.py {compute|marker-filename|read-marker|"
+        "write-marker} ...\n")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

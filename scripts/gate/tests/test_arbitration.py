@@ -23,6 +23,7 @@ binary is built (stdlib only, hermetic).
 
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -287,6 +288,109 @@ class ArbitrateInvariantsTest(unittest.TestCase):
         self.assertEqual(res.last_suspects, 3)
         self.assertEqual(res.fail_suites, ["Same"])   # both FAILs are suite Same
         self.assertEqual(res.crash_suites, ["Other"])  # Other.C is a crash victim
+
+
+class CLITest(unittest.TestCase):
+    """`python3 -m gate.arbitration {arbitrate|suspects}` — Wave-2 bridge (#3010).
+
+    The `suspects` subcommand is the cheap dual-run probe (records the sample
+    order WITHOUT re-running). The `arbitrate` subcommand is only reachable on
+    the exit-2 (no-suspects) path without real binaries — its re-run logic is
+    pinned by the function tests above; here we pin its CLI contract.
+    """
+
+    _SCRIPTS_DIR = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", ".."))
+
+    def _run_cli(self, args):
+        import subprocess
+        env = dict(os.environ, PYTHONPATH=self._SCRIPTS_DIR)
+        return subprocess.run(
+            [sys.executable, "-m", "gate.arbitration"] + args,
+            capture_output=True, text=True, env=env)
+
+    def _write_manifest(self, d):
+        mp = os.path.join(d, "test_binaries.txt")
+        with open(mp, "w") as f:
+            f.write("codegen\t%s/b1\t10\n" % d)
+        return mp
+
+    def _machine(self, out):
+        m = {}
+        for line in out.splitlines():
+            if line.startswith("@arb:"):
+                k, v = line[len("@arb:"):].split("=", 1)
+                m[k] = v
+        return m
+
+    def test_suspects_orders_fail_suites_before_crash_and_caps_crash(self):
+        # invariant 2: every [FAIL] suite is arbitrated IN FULL; only the crash
+        # (timeout-victim) tail is capped. The recording stub observes the order.
+        # The crash victims span DISTINCT suites (Crash0..Crash11) so the cap,
+        # which counts crash SUITES (deduped, like the bash `sort -u`), fires.
+        log = "\n".join([
+            _fail_line("OwnBranch.A"),
+            _fail_line("OwnBranch.B"),
+        ] + [_died_line("Crash%d.x" % i) for i in range(12)]) + "\n"
+        with tempfile.TemporaryDirectory() as d:
+            lf = os.path.join(d, "shard.log")
+            with open(lf, "w") as f:
+                f.write(log)
+            r = self._run_cli(
+                ["suspects", "--log", lf, "--sample-cap", "8"])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            m = self._machine(r.stdout)
+            self.assertEqual(m["fail_suites"], "OwnBranch")
+            self.assertEqual(m["cap_fired"], "1")
+            sampled = m["sampled"].split()
+            # OwnBranch first, then crash suites up to the cap (8).
+            self.assertEqual(sampled[0], "OwnBranch")
+            self.assertEqual(len(sampled), 1 + 8)
+
+    def test_suspects_strips_none_and_reports_untrustworthy_when_empty(self):
+        # <none> is stripped (invariant 3); an all-<none> log has no arbitrable
+        # suspect ⇒ the caller treats the result as untrustworthy (last_suspects=0).
+        log = _died_line("<none>") + "\n"
+        with tempfile.TemporaryDirectory() as d:
+            lf = os.path.join(d, "shard.log")
+            with open(lf, "w") as f:
+                f.write(log)
+            r = self._run_cli(["suspects", "--log", lf])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            m = self._machine(r.stdout)
+            self.assertEqual(m["last_suspects"], "0")
+            self.assertEqual(m["fail_suites"], "")
+            self.assertEqual(m["sampled"], "")
+
+    def test_suspects_no_cap_when_crash_count_under_limit(self):
+        # Crash victims in the SAME suite dedupe to ONE crash suite (matching the
+        # bash `sort -u` on the suite-stripped name), so 2 crashes < cap ⇒ no cap.
+        log = "\n".join([_fail_line("F.X"), _died_line("C.a"), _died_line("C.b")])
+        with tempfile.TemporaryDirectory() as d:
+            lf = os.path.join(d, "shard.log")
+            with open(lf, "w") as f:
+                f.write(log)
+            r = self._run_cli(["suspects", "--log", lf, "--sample-cap", "8"])
+            m = self._machine(r.stdout)
+            self.assertEqual(m["cap_fired"], "0")
+            self.assertEqual(m["sampled"], "F C")
+
+    def test_arbitrate_no_suspects_exits_two(self):
+        # A clean log (nonzero exit but no crash/FAIL marker) ⇒ exit 2
+        # (untrustworthy). arbitrate returns before re-running anything, so a
+        # real binary is not needed (only a valid manifest).
+        with tempfile.TemporaryDirectory() as d:
+            mp = self._write_manifest(d)
+            lf = os.path.join(d, "shard.log")
+            with open(lf, "w") as f:
+                f.write("## GATE FAILURE: shard crash / undercount\n")
+            r = self._run_cli(["arbitrate", "--log", lf, "--manifest", mp])
+            self.assertEqual(r.returncode, 2, r.stdout)
+            self.assertIn("@arb:suspects=0", r.stdout)
+
+    def test_no_subcommand_exits_2(self):
+        r = self._run_cli([])
+        self.assertEqual(r.returncode, 2)
 
 
 if __name__ == "__main__":

@@ -228,5 +228,64 @@ class PartitionIsCompleteTest(unittest.TestCase):
                                                       num_shared_entry=0))
 
 
+class CLITest(unittest.TestCase):
+    """`python3 -m gate.manifest binaries` — the Wave-2 gate.sh bridge (#3010).
+
+    Replaces the old `cut -f2 build/tests/test_binaries.txt` hand-parse. Pins
+    that the CLI prints one path per line and that a malformed manifest fails
+    loudly (the loose cut used to silently skip a bad row).
+    """
+
+    _SCRIPTS_DIR = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", ".."))
+
+    def _run_cli(self, args):
+        import subprocess
+        env = dict(os.environ, PYTHONPATH=self._SCRIPTS_DIR)
+        return subprocess.run(
+            [sys.executable, "-m", "gate.manifest"] + args,
+            capture_output=True, text=True, env=env)
+
+    def test_binaries_prints_paths_one_per_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "test_binaries.txt")
+            with open(mp, "w") as f:
+                f.write("codegen\t/build/b1\t42\n")
+                f.write("sema\t/build/b2\t17\n")
+            r = self._run_cli(["binaries", "--path", mp])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.splitlines(), ["/build/b1", "/build/b2"])
+
+    def test_binaries_skips_blank_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "test_binaries.txt")
+            with open(mp, "w") as f:
+                f.write("\ncodegen\t/build/b1\t42\n\n")
+            r = self._run_cli(["binaries", "--path", mp])
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.splitlines(), ["/build/b1"])
+
+    def test_binaries_fails_loudly_on_malformed_row(self):
+        # The loose `cut -f2` would silently print a partial field; read_manifest
+        # raises (a manifest a consumer cannot trust is FATAL, #3000 shape).
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "test_binaries.txt")
+            with open(mp, "w") as f:
+                f.write("garbage row with no tabs\n")
+            r = self._run_cli(["binaries", "--path", mp])
+            self.assertNotEqual(r.returncode, 0)
+
+    def test_binaries_fails_on_empty_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "test_binaries.txt")
+            open(mp, "w").close()
+            r = self._run_cli(["binaries", "--path", mp])
+            self.assertNotEqual(r.returncode, 0)
+
+    def test_no_subcommand_exits_2(self):
+        r = self._run_cli([])
+        self.assertEqual(r.returncode, 2)
+
+
 if __name__ == "__main__":
     unittest.main()
