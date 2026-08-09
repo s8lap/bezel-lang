@@ -776,6 +776,12 @@ fi
 
 echo "== gate[6/6]: sharded suite ($SHARD_LABEL) — the authoritative oracle =="
 PHASE_T0=$(now)
+# per #3012 Phase 2c: name a merged run-summary path for the MAIN shard run
+# only (not the canary above — its summary would otherwise clobber this one).
+# run_parallel writes it; the harvest below reads it instead of grepping the
+# printed TOTAL / per-binary lines. $S is /var/tmp/bezel-scratch (line 76).
+GATE_RUN_SUMMARY="$S/gate_run_summary.json"
+SHARD_ENV+=(BEZEL_RUN_SUMMARY="$GATE_RUN_SUMMARY")
 "$DH" suite "${SHARD_ENV[@]}" tests/run_parallel.sh ${GATE_SHARDS:-} >"$S/gate_shard.log" 2>&1; rc=$?
 # When ASan is on (--full), the shard phase's recorded duration INCLUDES the
 # ASan compile+run (SHARD_NOTE marks it), so the ASan cost is captured in the
@@ -828,7 +834,26 @@ fi
 # Combined coverage: the gtest behavior track and the lit diagnostic track are
 # separate runners, so neither alone reports the real total. Sum them here (this
 # is the one place that ran both). Best-effort — never fails the gate.
-gtests=$(grep -oE 'TOTAL: [0-9]+ passed' "$S/gate_shard.log" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
+#
+# per #3012 Phase 2c: prefer the structured run-summary run_parallel wrote
+# (BEZEL_RUN_SUMMARY) over grepping the printed TOTAL line — the JSON is the
+# authoritative accounting. The grand total (gtests) and the per-binary ran map
+# (GATE_BIN_RAN, further below) both consume one harvest. Fall back to the
+# legacy grep when the run-summary is absent (python3 missing, or an older
+# run_parallel) so the gate stays sound — the grep is the retained fallback
+# assertion until N gates prove the JSON path, then it is removed.
+GATE_RUN_HARVEST=""; GATE_RUN_PRESENT=0
+if [ -n "${GATE_RUN_SUMMARY:-}" ] && command -v python3 >/dev/null 2>&1; then
+  GATE_RUN_HARVEST=$(PYTHONPATH=scripts python3 -m gate.summary run-summary harvest "$GATE_RUN_SUMMARY" 2>/dev/null || true)
+  if printf '%s\n' "$GATE_RUN_HARVEST" | grep -q '^rp_run_present=1$'; then
+    eval "$GATE_RUN_HARVEST"; GATE_RUN_PRESENT=1
+  fi
+fi
+if [ "$GATE_RUN_PRESENT" -eq 1 ]; then
+  gtests=$rp_run_gtests
+else
+  gtests=$(grep -oE 'TOTAL: [0-9]+ passed' "$S/gate_shard.log" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
+fi
 littests=$(grep -oE 'Passed: *[0-9]+' "$S/gate_lit.log" 2>/dev/null | grep -oE '[0-9]+' | tail -1)
 COV_GTESTS=${gtests:-0}; COV_LITTESTS=${littests:-0}
 if [ -n "${gtests:-}" ]; then
@@ -837,12 +862,12 @@ fi
 
 # fix #3010: harvest what the run ALREADY PRINTED and threw away.
 #
-# (a) PER-BINARY counts. run_parallel.sh already prints one
-#     `  <name>   N passed, M failed` line per binary. Merging it with the
-#     registry's per-binary expectation gives the "a whole area contributed
-#     zero" signature directly — 16482 - 11326 = 5156 is not a coincidence,
-#     it is the codegen binary contributing nothing, which no aggregate total
-#     can distinguish from a uniformly short run.
+# (a) PER-BINARY counts. run_parallel.sh writes one structured per-binary row
+#     into the run-summary (Phase 2c; the legacy `  <name> N passed` line is the
+#     fallback). Merging it with the registry's per-binary expectation gives the
+#     "a whole area contributed zero" signature directly — 16482 - 11326 = 5156
+#     is not a coincidence, it is the codegen binary contributing nothing, which
+#     no aggregate total can distinguish from a uniformly short run.
 # (b) AOT CACHE STATS. Never collected before today (see SHARD_ENV above).
 if [ -r "$S/gate_shard.log" ]; then
   # NOTE ON ORDERING (caught in review, and it is the same defect class as
@@ -853,11 +878,18 @@ if [ -r "$S/gate_shard.log" ]; then
   # was then overwritten by the floor block, so the per-binary data would have
   # been silently absent and R2 would never have fired.
   GATE_BIN_RAN=""
-  while read -r _bn _bp; do
-    [ -n "$_bn" ] || continue
-    GATE_BIN_RAN="${GATE_BIN_RAN}${_bn}:${_bp:-0} "
-  done < <(grep -aE '^  [a-z_]+ +[0-9]+ passed, [0-9]+ failed' "$S/gate_shard.log" 2>/dev/null \
-             | awk '{print $1, $2}')
+  if [ "$GATE_RUN_PRESENT" -eq 1 ] && [ -n "${rp_run_bin_ran:-}" ]; then
+    # Phase 2c: the run-summary's per-binary map is already in the
+    # "name:passed " format GATE_BIN_RAN uses (and the awk merge at emit_json
+    # consumes); adopt it verbatim with the trailing space the merge expects.
+    GATE_BIN_RAN="${rp_run_bin_ran} "
+  else
+    while read -r _bn _bp; do
+      [ -n "$_bn" ] || continue
+      GATE_BIN_RAN="${GATE_BIN_RAN}${_bn}:${_bp:-0} "
+    done < <(grep -aE '^  [a-z_]+ +[0-9]+ passed, [0-9]+ failed' "$S/gate_shard.log" 2>/dev/null \
+               | awk '{print $1, $2}')
+  fi
 
   AOT_HITS=$(grep -aoE '\[aot-cache\] hits=[0-9]+' "$S/gate_shard.log" 2>/dev/null \
                | grep -oE '[0-9]+$' | awk '{t+=$1} END{if(NR)print t}')
