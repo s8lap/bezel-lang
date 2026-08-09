@@ -1038,6 +1038,14 @@ private:
         // UAF) and it runs once per exit (no double-free). `slot` holds the box
         // pointer; the class/collection/dict fields are unused.
         bool boxRelease = false;
+        // fix #2960 / §8.6 / §28.9: for a reassignable Object/interface local,
+        // `boxReleaseState` is an entry-block i1 alloca tracking whether the
+        // slot's CURRENT pointer is a box. The initializer and each plain `:=`
+        // update it from the stored expression's static producer kind. Scope-end
+        // disposal consults the flag before bz_box_release, so a class instance
+        // coerced to Object/interface is never mistaken for a box. Null for the
+        // legacy unconditional form (kept as a defensive fallback).
+        llvm::AllocaInst* boxReleaseState = nullptr;
         // fix #1747 / §28.9 / §9.7 / §28.3: a plain `var` RECORD local (value
         // type) bound from a RECORD-RETURNING CALL (`var p := Mk()`) whose
         // declared type owns at least one `string` field, and which the
@@ -3010,13 +3018,14 @@ private:
         builder_.CreateCall(fn, {b});
     }
 
-    // #422 / §8.6 / §28.9: emit a call to bz_box_release(b) — decrements the box
-    // wrapper's rc and, at zero, frees the wrapper (no-op on null). The boxed
-    // value is a value-type leaf (no owned sub-objects), so this frees ONLY the
-    // wrapper. Emitted ONLY for a `var` Object/interface local codegen itself
-    // boxed (a boxable-value initializer) and proved non-escaping — never for a
-    // class instance coerced to Object (which keeps its bare pointer and never
-    // becomes a box). Used at scope-end release of such a local.
+    // #422 / #2960 / §8.6 / §28.9: emit a call to bz_box_release(b) —
+    // decrements the box wrapper's rc and, at zero, frees the wrapper (no-op on
+    // null). The boxed value is a value-type leaf, so this frees ONLY the
+    // wrapper. Emitted only when placement proves the current pointer is a box:
+    // for an initializer-only local that proof is its +1 producer; for a
+    // reassignable local it is the #2960 state bit updated at every known store.
+    // A class instance coerced to Object/interface records false and never reaches
+    // this helper.
     void emitBoxRelease(llvm::Value* b) {
         if (!b) return;
         auto* fn = declareC("bz_box_release",
@@ -9974,19 +9983,25 @@ private:
     // eligibility.
     bool isPlusOneClosureProducer(const ast::Expr* init) const;
 
-    // #422 / §8.6 / §28.9: the set of `var` Object/interface LocalDecl nodes
-    // PROVABLY eligible for scope-end bz_box_release — declared with an
-    // Object/interface type, initialized once by a codegen-internal +1 BOX
-    // producer (an initializer whose static type is a boxable VALUE type, so
-    // boxValue itself allocated the wrapper), and never escaping their scope (a
-    // conservative whole-body walk found every use is a non-consuming read —
-    // `is`/`as`/`= null`). Computed once per body by collectBoxReleaseEligible
-    // and consulted in lowerLocalDecl. Membership is the ONLY thing that arms a
-    // release; absence ⇒ the box leaks (the pre-existing, safe behavior). A class
-    // instance coerced to Object has a REFERENCE initializer (not a boxable
-    // value), so it is never a producer here — it is never released by this path,
-    // which is what keeps the class-instance model uncorrupted.
+    // #422 / #2960 / §8.6 / §28.9: the set of `var` Object/interface
+    // LocalDecl nodes PROVABLY eligible for managed box release. A candidate
+    // either starts with a known +1 box or receives one through plain `:=`, and
+    // a conservative whole-body walk proves that the local never escapes and
+    // every assignment source is statically classifiable as fresh-box or
+    // definitely-non-box. lowerLocalDecl registers a slot state bit; each `:=`
+    // releases the displaced pointer only when that bit says BOX, then updates
+    // it from the new source. Scope exit does the same conditional release.
+    // Unknown Object/interface copies and all escaping locals remain unmanaged
+    // (the safe leak direction). A class coerced to Object/interface sets the bit
+    // false, so bz_box_release is never handed a class pointer.
     std::unordered_set<const void*> boxReleaseEligible_;
+    // fix #2960: subset of boxReleaseEligible_ that has at least one managed
+    // plain assignment and therefore needs the per-slot state bit. Initializer-
+    // only locals retain the pre-existing unconditional disposal exactly. A
+    // suspend-live state-machine local is not admitted here yet because the
+    // sidecar bit has no reserved frame field; that shape remains conservatively
+    // leaked rather than reading an uninitialized bit after resume.
+    std::unordered_set<const void*> boxReassignedLocals_;
     // The function for which boxReleaseEligible_ was computed (mirrors
     // stringReleaseEligibleFn_): a lambda/thunk body lowered mid-function
     // inherits no eligibility, so its boxed-value locals just leak (never
@@ -10104,19 +10119,18 @@ private:
     // Compute cellFreeEligible_ for a block body (see the .cpp).
     void collectCellFreeEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
-    // True if local `ld` is a codegen-internal +1 box producer: its declared
-    // type is Object or an interface AND its initializer's static type is a
-    // boxable VALUE type (record/enum/primitive/nullable value). boxForTarget
-    // then allocates a fresh rc=1 box wrapper that codegen fully controls — so
-    // binding the result to the local CONSUMES that single reference. A reference
-    // initializer (a class instance coerced to Object — the #399 path) is NOT a
-    // box producer: boxForTarget is a no-op and no wrapper exists.
-    // Also true when the initializer is a call to a method in boxReturnMethods_
-    // (a locally-compiled method whose body always returns boxable value sources —
-    // see isUserMethodBoxReturnCall): such a call's return value was produced by
-    // boxForTarget at the callee's return site and is a fresh rc=1 box. Used to
-    // gate release eligibility. (Not const: it consults the boxable-value
-    // predicates, which are non-const Emitter members.)
+    // fix #2960 / §8.6 / §28.9: classify an expression stored into a managed
+    // Object/interface local: +1 means boxForTarget creates (or a local
+    // box-return method hands back) a fresh box; 0 means a statically non-box
+    // reference/value such as a class or string; -1 means Object/interface
+    // provenance is unknown and must remain conservatively unmanaged. This ONE
+    // discriminator feeds both the pre-pass and AssignmentStmt emission.
+    int boxLocalAssignmentSourceKind(const ast::Expr* valueExpr);
+
+    // True if local `ld` starts with a known +1 box producer. Reassignment-
+    // capable locals use the same source classifier above plus a runtime i1
+    // state bit, so class and box values may safely occupy the slot on different
+    // control-flow paths.
     bool isPlusOneBoxProducer(const ast::LocalDecl* ld);
 
     // #429 (box RETURN category) / §8.6 / §28.9: true when `init` is a call

@@ -939,6 +939,59 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!handled)
                     handled = lowerOwnedTaskFieldStore(*as->target, addr, rhs);
                 if (!handled) {
+                    // fix #2960 / §8.6 / §28.9 (v0.240): drop-on-overwrite
+                    // for a managed Object/interface LOCAL. The pre-pass admits
+                    // only non-escaping locals whose stores have statically known
+                    // fresh-box vs definitely-non-box provenance. lowerLocalDecl
+                    // registered an i1 state bit beside the slot; if it says the
+                    // displaced pointer is a box, release that box now (RHS has
+                    // already fully evaluated and been boxed), before overwriting.
+                    // A class/string/null source records false after the store, so
+                    // neither this site nor scope exit can hand its pointer to
+                    // bz_box_release. An unknown source defensively suppresses the
+                    // old release and clears the bit (safe leak) even though the
+                    // pre-pass normally excludes it.
+                    llvm::AllocaInst* boxState = nullptr;
+                    if (llvm::AllocaInst* local = localSlot(*as->target)) {
+                        for (auto scopeIt = disposeStack_.rbegin();
+                             scopeIt != disposeStack_.rend() && !boxState;
+                             ++scopeIt) {
+                            for (auto dispIt = scopeIt->rbegin();
+                                 dispIt != scopeIt->rend(); ++dispIt) {
+                                if (dispIt->slot == local && dispIt->boxRelease) {
+                                    boxState = dispIt->boxReleaseState;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (boxState) {
+                        // Smear the state init to the assignment block in
+                        // case the local was declared with a non-box initializer.
+                        // lowerLocalDecl already stored the starting value into
+                        // the state bit; nothing to do here on that front. The
+                        // state is entry-block relative, so the assignment's
+                        // basic block inherits the store.
+                    }
+                    int newBoxKind = boxState
+                        ? boxLocalAssignmentSourceKind(as->value.get())
+                        : -1;
+                    if (boxState && newBoxKind >= 0) {
+                        llvm::Value* oldIsBox = builder_.CreateLoad(
+                            llvm::Type::getInt1Ty(llvm_), boxState,
+                            "box.reassign.old.armed");
+                        auto* releaseBB = llvm::BasicBlock::Create(
+                            llvm_, "box.reassign.release", currentFn_);
+                        auto* contBB = llvm::BasicBlock::Create(
+                            llvm_, "box.reassign.store", currentFn_);
+                        builder_.CreateCondBr(oldIsBox, releaseBB, contBB);
+                        builder_.SetInsertPoint(releaseBB);
+                        llvm::Value* oldBox = builder_.CreateLoad(
+                            ptrTy(), addr, "box.reassign.old");
+                        emitBoxRelease(oldBox);
+                        builder_.CreateBr(contBB);
+                        builder_.SetInsertPoint(contBB);
+                    }
                     // §28.7 (#1054): reassigning an owned class local must dispose
                     // the displaced old value before overwriting (the class analog
                     // of the string/closure/box/owned-collection field-store helpers
@@ -953,6 +1006,9 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     // the struct, not its value element).
                     rhs = unwrapNarrowedNullable(rhs, elemTy);
                     llvm::StoreInst* si = builder_.CreateStore(rhs, addr);
+                    if (boxState)
+                        builder_.CreateStore(
+                            builder_.getInt1(newBoxKind > 0), boxState);
                     // §22.12 rule 2 store atomicity (v0.181, #1556): a store into
                     // a static REFERENCE field is a single pointer-word write the
                     // runtime performs atomically — no torn reference is ever

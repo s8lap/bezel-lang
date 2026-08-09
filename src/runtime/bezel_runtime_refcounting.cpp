@@ -387,15 +387,15 @@ extern "C" void bz_closure_release(void* c) {
 //
 // SAFETY — never handed a class instance. A class instance coerced to `Object`
 // (the #399 reference path) keeps its bare pointer: boxValue is NOT invoked, no
-// box wrapper exists, and codegen never marks such a local box-release-eligible
-// (its initializer has a REFERENCE static type, not a boxable value type). So
-// bz_box_release is only ever called on a genuine box cell. It does NOT inspect
-// the vtable or attempt to tell a box from a class instance at runtime — the
-// box-vs-class distinction is resolved at the codegen producer site (the static
-// type of the initializer), exactly as bz_string_release / bz_closure_release
-// are only emitted for locals codegen knows hold a producer's +1 reference. A
-// class instance's bytes ({ vtable, i8 disposed-flag@1, fields }) are therefore
-// never read as an rc and never freed here.
+// box wrapper exists, and codegen's placement discriminator records the slot as
+// non-box. For an initializer-only local that discriminator is the initializer's
+// static producer kind; for a reassignable local (#2960) it is an i1 state bit
+// updated from every statically-classifiable store. So bz_box_release is only
+// ever called on a genuine box cell. It does NOT inspect the vtable or attempt to
+// tell a box from a class instance at runtime — the box-vs-class distinction is
+// resolved at the codegen producer/store site. A class instance's bytes
+// ({ vtable, i8 disposed-flag@1, fields }) are therefore never read as an rc and
+// never freed here.
 //
 // §28.9 / #439: the count is ATOMIC now that async lands — a boxed value may be
 // captured into an async frame and released on a different thread than the one

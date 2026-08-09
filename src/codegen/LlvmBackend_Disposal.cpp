@@ -3793,20 +3793,37 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind,
             builder_.CreateCall(gfree, {g});
             continue;
         }
-        // #422 / §8.6 / §28.9: a provably-non-escaping `var` Object/interface
-        // local holding a BOXED VALUE. Release its single (producer) reference at
-        // scope end — on BOTH the normal and unwind exit (the reference dies
-        // either way; a given exit goes one way only, so this runs exactly once
-        // per scope exit). The local was proven non-escaping, so nothing else
-        // holds the box pointer: bz_box_release frees the box wrapper exactly
-        // once (no UAF, no double-free). The boxed value is a value-type leaf, so
-        // only the wrapper is freed. This is NEVER a class instance (a class
-        // coerced to Object is not a box producer, so it is never registered
-        // here) — the class-instance ownership/disposal path is untouched.
-        // bz_box_release is null-safe (a null T? boxes to a null Object).
+        // #422 / #2960 / §8.6 / §28.9: a provably-non-escaping `var`
+        // Object/interface local whose box-vs-class contents are tracked by the
+        // placement layer. Reassignable slots carry `boxReleaseState`: release
+        // only when the CURRENT value came from a known box producer. A class,
+        // string, closure, null, or other definitely-non-box source stores false,
+        // so its overlapping pointer representation never reaches bz_box_release.
+        // Unknown Object/interface provenance and escaping locals never receive
+        // this Disposal entry (safe leak direction). The null state fallback is
+        // the pre-#2960 unconditional form, retained defensively.
         if (it->boxRelease) {
-            llvm::Value* b = builder_.CreateLoad(ptrTy(), it->slot, "box.rel");
+            if (!it->boxReleaseState) {
+                llvm::Value* b =
+                    builder_.CreateLoad(ptrTy(), it->slot, "box.rel");
+                emitBoxRelease(b);
+                continue;
+            }
+            llvm::Value* armed = builder_.CreateLoad(
+                llvm::Type::getInt1Ty(llvm_), it->boxReleaseState,
+                "box.rel.armed");
+            auto* releaseBB = llvm::BasicBlock::Create(
+                llvm_, "box.rel.do", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(
+                llvm_, "box.rel.cont", currentFn_);
+            builder_.CreateCondBr(armed, releaseBB, contBB);
+            builder_.SetInsertPoint(releaseBB);
+            llvm::Value* b =
+                builder_.CreateLoad(ptrTy(), it->slot, "box.rel");
             emitBoxRelease(b);
+            builder_.CreateStore(builder_.getFalse(), it->boxReleaseState);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
             continue;
         }
         // fix #1747 / §28.9 / §9.7 / §28.3: a plain `var` RECORD local bound

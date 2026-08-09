@@ -7616,6 +7616,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     // #422 / §8.6 / §28.9: which `var` Object/interface locals holding a boxed
     // VALUE may be released at scope end (mirrors stringReleaseEligible_).
     boxReleaseEligible_.clear();
+    boxReassignedLocals_.clear();  // fix #2960
     // fix #1747 / §28.9 / §9.7 / §28.3: which plain `var` RECORD locals bound
     // from a record-returning CALL (`var p := Mk()`) may have their string
     // fields released at scope end (mirrors stringReleaseEligible_;
@@ -12106,25 +12107,32 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
         // next lowerLocalDecl in this scope does not reprocess stale cells.
         lastLambdaCapturedCells_.clear();
     }
-    // #422 / §8.6 / §28.9: if this `var` Object/interface local was proven
-    // non-escaping and initialized by a codegen +1 BOX producer (a boxable-value
-    // initializer that boxForTarget wrapped), register a scope-end bz_box_release
-    // of its single producer reference. The slot holds exactly that one reference
-    // (the box `v` just stored, at rc=1); no other reference exists (proven by
-    // the escape walk), so releasing it at scope end frees the box wrapper
-    // exactly once — no UAF, no double-free. The boxed value is a value-type leaf
-    // (no owned sub-objects), so only the wrapper is freed. CRITICALLY, this NEVER
-    // fires on a class instance coerced to Object: such a local's initializer has
-    // a reference static type, so isPlusOneBoxProducer is false and it is never in
-    // boxReleaseEligible_ — the class instance keeps its own ownership/disposal
-    // path untouched. Gated on currentFn_ matching the analyzed function (a
-    // lambda/thunk body lowered mid-function is not analyzed → its boxed locals
-    // just leak, never double-freed).
-    if (v && currentFn_ == boxReleaseEligibleFn_ &&
+    // #422 / #2960 / §8.6 / §28.9: register managed box state for a
+    // non-escaping Object/interface local that starts with, or later receives,
+    // a known fresh box. The state bit describes the slot's CURRENT contents:
+    // true for a box producer, false for a class/string/null reference. Plain
+    // `:=` updates it after releasing a displaced box; scope exit consults it
+    // before releasing the final value. This is the cardinal box-vs-class
+    // discriminator: the pointer representations overlap, but a class source
+    // stores false and therefore never reaches bz_box_release. An escaping or
+    // unknown-Object-copy local is absent from boxReleaseEligible_ and remains
+    // conservatively unmanaged.
+    if (currentFn_ == boxReleaseEligibleFn_ &&
         boxReleaseEligible_.count(static_cast<const void*>(declNode)) &&
         !disposeStack_.empty()) {
+        bool reassigned = boxReassignedLocals_.count(
+            static_cast<const void*>(declNode)) != 0;
+        llvm::AllocaInst* state = nullptr;
+        if (reassigned) {
+            state = entryAlloca(llvm::Type::getInt1Ty(llvm_));
+            bool startsBoxed = false;
+            if (auto* ld = dynamic_cast<const ast::LocalDecl*>(declNode))
+                startsBoxed = isPlusOneBoxProducer(ld);
+            builder_.CreateStore(builder_.getInt1(startsBoxed), state);
+        }
         Disposal d{slot, nullptr};
         d.boxRelease = true;
+        d.boxReleaseState = state;
         disposeStack_.back().push_back(d);
     }
     // #1003 / stdlib §5 / §28: if this `var` borrowing-`Array<T>` local was bound
@@ -21633,64 +21641,39 @@ void Emitter::collectSafeViewAliases(
 }
 
 
-// #422 / #429 (box RETURN) / §8.6 / §28.9: is local `ld` a codegen-internal
-// +1 box producer? It is when the declared target type is Object or an
-// interface AND either:
-//   (a) the initializer's static type is a boxable VALUE type
-//       (record/enum/primitive) or a nullable value type — i.e. exactly the
-//       cases boxForTarget/boxValue allocate a fresh rc=1 box wrapper for; OR
-//   (b) the initializer is a call to a locally-compiled method in
-//       boxReturnMethods_ (a method that ALWAYS returns a boxable value and
-//       therefore ALWAYS triggers boxForTarget at its callee return site),
-//       so the caller receives a fresh rc=1 box from the callee.
-// A class instance coerced to Object (the #399 path) has a REFERENCE
-// initializer (class/interface/string/Object) for which boxForTarget is a
-// no-op — NOT a producer, never released, so the class model is untouched.
-// An INFERRED local (no `: Type`) is not a producer either: without a declared
-// Object/interface target boxForTarget never boxes (the local takes the value
-// type directly). Mirrors the boxForTarget gate in lowerLocalDecl exactly.
+// fix #2960 / §8.6 / §28.9 (v0.240): classify a source that is about to be
+// stored in an Object/interface local. The result is deliberately tri-state:
+//   +1 — a fresh rc=1 box producer (boxable source or local box-return call),
+//    0 — definitely not a box (class/string/closure/null/etc.),
+//   -1 — Object/interface provenance could already be either box or class.
+// Unknown provenance stays conservatively unmanaged; a leak is safer than
+// handing a class instance to bz_box_release. This one predicate is shared by
+// collectBoxReleaseEligible and the AssignmentStmt store path so their box-vs-
+// class decisions cannot drift.
+int Emitter::boxLocalAssignmentSourceKind(const ast::Expr* valueExpr) {
+    if (!valueExpr) return -1;
+    const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+    if (!srcTy) return -1;
+    if (isBoxableValueType(srcTy) || isNullableValueTy(srcTy) ||
+        isUserMethodBoxReturnCall(valueExpr))
+        return 1;
+    if (isObjectOrInterfaceTarget(srcTy)) return -1;
+    return 0;
+}
+
+
+// #422 / #429 (box RETURN) / §8.6 / §28.9: is local `ld` initialized by a
+// known +1 box producer? The target must be Object/interface, and the shared
+// #2960 source classifier must say the initializer is fresh-box. A class
+// instance coerced to Object/interface is classified definitely-non-box; an
+// Object/interface-valued copy is unknown and remains conservatively unmanaged.
 bool Emitter::isPlusOneBoxProducer(const ast::LocalDecl* ld) {
-    // fix #2304 / §8.6 / §28.9: an INFERRED Object local (`var x := MakeBox(7);`
-    // — no `: Object` annotation) is also a +1 box producer when its initializer
-    // is a box-return method call. The DECLARED-TARGET gate above short-circuits
-    // on inferred locals (ld->type is null), so case (b) below never fires for
-    // them and the local leaks (the box the callee minted) at scope end (a
-    // 24-byte Direct leak per iteration — the half of the #2060 fix the call-
-    // result form was missing). The inferred type IS Object/interface (sema
-    // promotes the call's return type into the local), so it passes
-    // isObjectOrInterfaceTarget's criteria; we use srcTy (the initializer's
-    // static type) AS the target type when no declared target exists. Built-in
-    // string methods (`Equals`/`ToString`/etc), lambda captures, and every
-    // other +1 producer path are unchanged: they always go through
-    // isPlusOneStringProducer (not isPlusOneBoxProducer). Crucially,
-    // isPlusOneStringProducer's `var o: Object := ToString()` / `var o: Object
-    // := Caller()` paths are already covered by case (a)/(b); the NEW case here
-    // is purely the INFERRED-LOCAL FALLBACK for case (b) — it admits the call
-    // when srcTy is Object/interface (case b's two-test pair already accepts
-    // the DECLARED variant). Recognized by the SAME shapes the declared case
-    // keys on (MemberSymbol binding, isImported check, boxReturnMethods_
-    // membership, operator exclusion) so a cross-module call (whose callee
-    // does NOT run THIS module's boxForTarget) is still rejected: the
-    // inferred-target fallback walks the same call-resolution / method-set
-    // paths as the declared variant, no new surface.
     if (!ld || !ld->initializer) return false;
-    bool inferredTarget = !ld->type;
-    if (!inferredTarget && !ld->type) return false;
-    const sema::TypeRef* declTy = inferredTarget
-        ? nullptr
-        : ctx_.resolvedType(*ld->type);
-    const sema::TypeRef* srcTy = ctx_.exprType(*ld->initializer);
-    if (!srcTy) return false;
-    // For an inferred local, the declared type IS srcTy (sema promotes the
-    // call's return type into the local). Treating srcTy as the target lets
-    // case (b) admit the call when srcTy is Object/interface — the same
-    // shape isUserMethodBoxReturnCall already validates.
-    if (!isObjectOrInterfaceTarget(inferredTarget ? srcTy : declTy)) return false;
-    // Case (a): the initializer itself is a boxable value source.
-    if (isBoxableValueType(srcTy) || isNullableValueTy(srcTy)) return true;
-    // Case (b): a call to a box-return method (always returns a fresh box).
-    if (isUserMethodBoxReturnCall(ld->initializer.get())) return true;
-    return false;
+    const sema::TypeRef* targetTy = ld->type
+        ? ctx_.resolvedType(*ld->type)
+        : ctx_.exprType(*ld->initializer);
+    if (!isObjectOrInterfaceTarget(targetTy)) return false;
+    return boxLocalAssignmentSourceKind(ld->initializer.get()) == 1;
 }
 
 namespace {
@@ -21700,22 +21683,26 @@ namespace {
 // to release at scope end ONLY if no other reference to the wrapper can exist.
 // A boxed Object's only NON-CONSUMING reads are: the operand of `is`/`is not`,
 // the operand of `as` (which copies the payload bytes — it never retains the box
-// pointer), and a `= null` / `<> null` comparison. EVERY other position — a call
-// argument, a METHOD/PROPERTY receiver (an interface/Object method call could
-// stash the receiver), an assignment/return/throw/yield/discard operand, a
-// binding to another local, a `new`/`with`/collection element, a lambda capture,
-// a `move`, a `for ... in` iterable, a reassignment of the local — is treated as
-// an ESCAPE. The walk is an OVER-approximation of escape: any construct it does
-// not explicitly recognize as a safe read leaves the local escaped (→ no release
-// → leak, the safe direction). Note this is STRICTER than the string walker:
-// a string method receiver is a safe read (strings are immutable leaves the
-// runtime owns), but a boxed-Object method receiver is treated as an escape,
-// because `o.SomeMethod()` dispatches through the box and the callee could
-// retain the receiver. Only a local that NEVER escapes is released at scope end.
+// pointer), and a `= null` / `<> null` comparison. A direct method-call
+// receiver is also a call-bounded borrow (#2060). EVERY other position — a call
+// argument, a stored method/property reference, an assignment/return/throw/yield/
+// discard operand, a binding to another local, a `new`/`with`/collection element,
+// a lambda capture, a `move`, or a `for ... in` iterable — is treated as an
+// ESCAPE. A plain reassignment OF the local is the #2960 exception: when its RHS
+// is fresh-box or definitely-non-box, the state-bit overwrite path manages it;
+// unknown Object/interface provenance and compound/??= assignment still escape.
+// The walk is an OVER-approximation: any unrecognized construct leaves the local
+// escaped (→ leak, the safe direction). Only a local that NEVER escapes is
+// released at overwrite or scope end.
 struct BoxEscapeWalker {
     const sema::SemaContext& ctx;
     const void* target;   // the LocalDecl node we are testing
+    // fix #2960: shared Emitter classifier, returning +1 box / 0 non-box /
+    // -1 unknown. Unknown assignment provenance makes the local ineligible.
+    std::function<int(const ast::Expr*)> assignmentSourceKind;
     bool escaped = false;
+    bool sawManagedAssignment = false;
+    bool sawBoxAssignment = false;
     // FINDING [1] / §28.9 / §28.3: true while walking inside a lambda body. A
     // captured boxed-Object local read inside a lambda is held by the lambda's
     // env, which outlives the producing scope, so it must be an ESCAPE even in
@@ -21988,9 +21975,26 @@ struct BoxEscapeWalker {
             expr(ts->value.get(), /*safeRead=*/false); return;
         }
         if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
-            // Reassigning the local itself is an escape (overwrite handling is
-            // out of this increment); the RHS escapes.
-            if (isTargetIdent(as->target.get())) { escaped = true; return; }
+            // fix #2960 / §8.6 / §28.9: a plain `:=` overwrite of the
+            // tracked local is manageable when the RHS is statically known to
+            // be either a fresh box or definitely non-box. First walk the RHS:
+            // a read that forwards the old box (call/store/capture) still makes
+            // the local escape. Then apply the shared source classifier. An
+            // Object/interface-valued RHS has unknown box-vs-class provenance,
+            // so it remains an escape (safe leak); compound/??= stores are not
+            // implemented by the state-bit path and remain escapes too.
+            if (isTargetIdent(as->target.get())) {
+                if (as->op != ":=") { escaped = true; return; }
+                expr(as->value.get(), /*safeRead=*/false);
+                if (escaped) return;
+                int kind = assignmentSourceKind
+                    ? assignmentSourceKind(as->value.get())
+                    : -1;
+                if (kind < 0) { escaped = true; return; }
+                sawManagedAssignment = true;
+                if (kind > 0) sawBoxAssignment = true;
+                return;
+            }
             expr(as->target.get(), /*safeRead=*/false);
             expr(as->value.get(), /*safeRead=*/false);
             return;
@@ -22057,17 +22061,23 @@ struct BoxEscapeWalker {
 void Emitter::collectBoxReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     boxReleaseEligible_.clear();
-    // Find every `var` (non-using) Object/interface LocalDecl whose initializer
-    // is a codegen-internal +1 box producer, then run the escape walk for each.
-    // A decl survives as eligible iff the walk proves it never escapes. (`using
-    // var` is excluded defensively, mirroring the string/closure paths; boxed
-    // value types never carry a disposal obligation so they never appear in a
-    // meaningful `using var`.)
+    boxReassignedLocals_.clear();  // fix #2960
+    // fix #2960 / §8.6 / §28.9: consider every non-using Object/interface
+    // LocalDecl, not only one whose INITIALIZER is a box. A string/class/null
+    // initializer may be followed by `p := <value>`; the assignment then mints
+    // the first box the slot owns and needs a later release. The escape walker
+    // admits only plain assignments whose source is statically fresh-box or
+    // definitely-non-box and records whether at least one box assignment exists.
+    // A candidate is armed only when it starts boxed OR receives a box, and all
+    // uses stay non-escaping.
     std::vector<const ast::LocalDecl*> candidates;
     std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
         if (!s) return;
         if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
-            if (!ld->isUsing && isPlusOneBoxProducer(ld))
+            const sema::TypeRef* targetTy = ld->type
+                ? ctx_.resolvedType(*ld->type)
+                : (ld->initializer ? ctx_.exprType(*ld->initializer) : nullptr);
+            if (!ld->isUsing && isObjectOrInterfaceTarget(targetTy))
                 candidates.push_back(ld);
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
@@ -22093,10 +22103,25 @@ void Emitter::collectBoxReleaseEligible(
     for (auto& s : body) scan(s.get());
 
     for (const ast::LocalDecl* ld : candidates) {
-        BoxEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        BoxEscapeWalker w{
+            ctx_, static_cast<const void*>(ld),
+            [this](const ast::Expr* value) {
+                return boxLocalAssignmentSourceKind(value);
+            }};
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
-        if (!w.escaped)
-            boxReleaseEligible_.insert(static_cast<const void*>(ld));
+        bool hasManagedBox =
+            isPlusOneBoxProducer(ld) || w.sawBoxAssignment;
+        if (w.escaped || !hasManagedBox) continue;
+        // A sidecar alloca cannot survive an async/iterator suspension unless
+        // it has its own frame field. Do not arm reassignment management for a
+        // local that the state-machine analysis says is suspend-live; preserving
+        // the old conservative leak is sound, while an uninitialized resumed
+        // state bit could false-release a class pointer. Initializer-only box
+        // locals keep their pre-existing unconditional release.
+        if (w.sawManagedAssignment && smLocalFields_.count(ld)) continue;
+        boxReleaseEligible_.insert(static_cast<const void*>(ld));
+        if (w.sawManagedAssignment)
+            boxReassignedLocals_.insert(static_cast<const void*>(ld));
     }
 }
 
