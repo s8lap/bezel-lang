@@ -583,5 +583,358 @@ class CliReadTest(unittest.TestCase):
             self.assertEqual(r.returncode, 0)
 
 
+class DetectTruncationTest(unittest.TestCase):
+    """detect_truncation owns the banner grep that lived in gate.sh (#3010 W3).
+
+    Pins: (a) the literal banner in a readable log -> undercount_banner=True;
+    (b) rc==3 -> truncated even with no banner; (c) a missing/unreadable shard
+    log -> no banner seen (mirrors bash's `[ -r ... ] &&` readability guard);
+    (d) the composite `truncated` = undercount_banner OR rc==3.
+    """
+
+    def test_clean_log_rc0_is_not_truncated(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "shard.log")
+            with open(log, "w") as f:
+                f.write("## GATE PASS — all shards reported\n")
+            trunc, ubanner = verdict.detect_truncation(log, 0)
+        self.assertFalse(trunc)
+        self.assertFalse(ubanner)
+
+    def test_banner_in_log_sets_undercount_banner(self):
+        # The exact run_parallel.sh:300 wording — detect_truncation must spot the
+        # "shard crash / undercount" substring (not the full banner line).
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "shard.log")
+            with open(log, "w") as f:
+                f.write("...\n## GATE FAILURE: shard crash / undercount — "
+                        "result is NOT trustworthy\n...\n")
+            trunc, ubanner = verdict.detect_truncation(log, 0)
+        self.assertTrue(ubanner)
+        # rc=0 + banner -> POISONED: truncated must be True so verdict_from_rc
+        # flips the pass to poisoned (#3002 shape).
+        self.assertTrue(trunc)
+
+    def test_rc3_is_truncated_even_without_banner(self):
+        # The coverage-short signal (rc==3) sets truncated independently of the
+        # banner — gate_full_cycle retries on exit 3 (#3002).
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "shard.log")
+            with open(log, "w") as f:
+                f.write("clean log, no banner\n")
+            trunc, ubanner = verdict.detect_truncation(log, 3)
+        self.assertTrue(trunc)
+        self.assertFalse(ubanner)  # the banner itself was absent
+
+    def test_missing_log_is_not_truncated(self):
+        # No shard log (early preflight exit) -> no banner -> not truncated
+        # (mirrors bash `[ -r "$S/gate_shard.log" ] && grep ...`).
+        trunc, ubanner = verdict.detect_truncation("/nonexistent/shard.log", 0)
+        self.assertFalse(trunc)
+        self.assertFalse(ubanner)
+
+    def test_none_log_is_not_truncated(self):
+        trunc, ubanner = verdict.detect_truncation(None, 0)
+        self.assertFalse(trunc)
+        self.assertFalse(ubanner)
+
+    def test_unreadable_log_is_not_truncated(self):
+        # A path that exists but cannot be opened -> no banner seen (the OSError
+        # is swallowed, matching grep's 2>/dev/null).
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "noperm.log")
+            with open(log, "w") as f:
+                f.write("## GATE FAILURE: shard crash / undercount\n")
+            os.chmod(log, 0o000)
+            try:
+                trunc, ubanner = verdict.detect_truncation(log, 0)
+                # If running as root, chmod 0o000 is bypassed — skip the assert.
+                if os.geteuid() != 0:
+                    self.assertFalse(trunc)
+                    self.assertFalse(ubanner)
+            finally:
+                os.chmod(log, 0o600)
+
+    def test_rc3_with_banner_keeps_both_signals(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "shard.log")
+            with open(log, "w") as f:
+                f.write("shard crash / undercount\n")
+            trunc, ubanner = verdict.detect_truncation(log, 3)
+        self.assertTrue(trunc)
+        self.assertTrue(ubanner)
+
+    def test_banner_literal_constant(self):
+        # Pinned: the wording run_parallel.sh emits, verbatim. A drift here is
+        # the silent-undetected-truncation defect (the grep re-implementation
+        # the Wave-3 migration consolidated into ONE owner).
+        self.assertEqual(verdict.UNDERCOUNT_BANNER, "shard crash / undercount")
+
+
+class OptionalIntTest(unittest.TestCase):
+    """_optional_int is the move that collapses the 12 conditional arg guards:
+    gate.sh passes ${VAR:-} unconditionally and Python owns set-vs-unset.
+    """
+
+    def test_empty_is_none(self):
+        # Unset (-> "") emits null, never 0 (per #3010).
+        self.assertIsNone(verdict._optional_int(""))
+        self.assertIsNone(verdict._optional_int(None))
+
+    def test_zero_is_zero(self):
+        # A SET 0 stays 0 — distinguishable from unmeasured (null).
+        self.assertEqual(verdict._optional_int("0"), 0)
+
+    def test_count_is_int(self):
+        self.assertEqual(verdict._optional_int("16482"), 16482)
+
+
+class CliWriteFromStateTest(unittest.TestCase):
+    """Smoke test the write_from_state CLI gate.sh now calls (Wave 3)."""
+
+    def _run_cli(self, args):
+        scripts_dir = os.path.join(os.path.dirname(__file__), "..", "..")
+        env = dict(os.environ, PYTHONPATH=scripts_dir)
+        r = subprocess.run(
+            [sys.executable, "-m", "gate.verdict", "write_from_state"] + args,
+            capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0,
+                         "CLI failed: {} {}".format(r.stdout, r.stderr))
+        return r
+
+    def test_minimal_pass(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "gv.json")
+            log = os.path.join(d, "shard.log")
+            with open(log, "w") as f:
+                f.write("clean\n")
+            self._run_cli(["--path", p, "--rc", "0", "--shard-log", log])
+            got = verdict.read_verdict(p)
+        self.assertEqual(got["verdict"], "pass")
+        self.assertTrue(got["trustworthy"])
+        self.assertFalse(got["integrity"]["truncated"])
+
+    def test_poisoned_via_shard_log_banner(self):
+        # The truncation detection moved INTO Python: write_from_state reads the
+        # shard log itself, so a banner in the log flips rc=0 to poisoned WITHOUT
+        # the caller passing --truncated/--undercount-banner.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "gv.json")
+            log = os.path.join(d, "shard.log")
+            with open(log, "w") as f:
+                f.write("## GATE FAILURE: shard crash / undercount\n")
+            self._run_cli(["--path", p, "--rc", "0", "--shard-log", log])
+            got = verdict.read_verdict(p)
+        self.assertEqual(got["verdict"], "poisoned")
+        self.assertTrue(got["integrity"]["truncated"])
+        self.assertTrue(got["integrity"]["undercount_banner"])
+
+    def test_unmeasured_coverage_is_null(self):
+        # The #3010 pin preserved through the migration: an empty coverage field
+        # (gate.sh's ${COV_GTESTS:-} on an early exit) emits null, never 0.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "gv.json")
+            self._run_cli(["--path", p, "--rc", "2", "--coverage-gtests", ""])
+            got = verdict.read_verdict(p)
+        self.assertIsNone(got["evidence"]["coverage"]["gtests"])
+
+    def test_measured_zero_coverage_is_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "gv.json")
+            self._run_cli(["--path", p, "--rc", "0", "--coverage-gtests", "0"])
+            got = verdict.read_verdict(p)
+        self.assertEqual(got["evidence"]["coverage"]["gtests"], 0)
+
+    def test_mode_full_via_equals_form(self):
+        # MODE can be '--full'; the caller uses --mode=VALUE so argparse does not
+        # mistake the value for an unknown flag (the #3010 comment preserved).
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "gv.json")
+            self._run_cli(["--path", p, "--rc", "0", "--mode=--full",
+                           "--oracle", "asan"])
+            got = verdict.read_verdict(p)
+        self.assertEqual(got["mode"], "--full")
+        self.assertEqual(got["oracle"], "asan")
+
+
+class DualRunWriteFromStateTest(unittest.TestCase):
+    """The dual-run equivalence pin (#3010 Wave 3): the verdict file written by
+    the new `write_from_state` (Python owns truncation detection + arg assembly)
+    MUST equal the file the old `write` + bash arg-assembly produced, over every
+    reachable gate state. This is the load-bearing proof that the migration
+    changed WHERE the logic lives without changing WHAT it computes.
+
+    The old path is reproduced faithfully (_old_assemble — a Python copy of
+    gate.sh's pre-Wave-3 gate_write_verdict: the bash banner grep + the 12
+    conditional `[ -n "${X+x}" ]` / `[ "${X:-0}" -gt 0 ]` guards, feeding the
+    unchanged low-level `write` subcommand). Both paths run as real CLIs on the
+    same state; the two JSON files must be equal.
+    """
+
+    @staticmethod
+    def _oracle(state):
+        return "asan" if state.get("ASAN") == "1" else "plain"
+
+    @staticmethod
+    def _old_assemble(state, path):
+        """Faithful replica of gate.sh's pre-Wave-3 gate_write_verdict arg
+        assembly (the truncation grep + 12 conditional guards). Returns argv for
+        `gate.verdict write`. The dual-run oracle."""
+        rc = state["rc"]
+        shard_log = state.get("shard_log")
+        # bash: `if [ -r "$S/gate_shard.log" ] && grep -q '...'; then trunc=1; ubanner=1; fi`
+        trunc = 0
+        ubanner = 0
+        if shard_log and os.path.isfile(shard_log):
+            try:
+                with open(shard_log, errors="replace") as f:
+                    if "shard crash / undercount" in f.read():
+                        trunc = 1
+                        ubanner = 1
+            except OSError:
+                pass
+        # bash: `[ "$rc" -eq 3 ] && trunc=1`
+        if rc == 3:
+            trunc = 1
+        args = ["--path", path, "--rc", str(rc),
+                "--head", state.get("GATE_HEAD", "") or "",
+                "--mode=" + (state.get("MODE", "") or ""),
+                "--oracle", DualRunWriteFromStateTest._oracle(state),
+                "--started-epoch", str(state.get("GATE_EPOCH", 0) or 0),
+                "--total-s", str(state.get("total", 0) or 0)]
+        # bash: `local _fp="${FAILED_PHASE:-}"; [ -n "$_fp" ] && vargs+=(...)`
+        if state.get("FAILED_PHASE"):
+            args += ["--failed-phase", state["FAILED_PHASE"]]
+        if trunc:
+            args += ["--truncated"]
+        if ubanner:
+            args += ["--undercount-banner"]
+        # bash: `[ "${SHARD_COUNT:-0}" -gt 0 ] 2>/dev/null && vargs+=(...)`
+        sc = state.get("SHARD_COUNT") or 0
+        if sc > 0:
+            args += ["--shard-count", str(sc)]
+        sr = state.get("SHARD_REPORTED_S") or 0
+        if sr > 0:
+            args += ["--shard-reported-s", str(sr)]
+        # bash: `[ -n "${X+x}" ] && vargs+=(...)` — pass iff SET (not None).
+        for flag, key in (("--coverage-gtests", "COV_GTESTS"),
+                          ("--coverage-littests", "COV_LITTESTS"),
+                          ("--expected-gtests", "GATE_EXPECTED_GTESTS"),
+                          ("--asan-errors", "ASAN_ERRS"),
+                          ("--arbitration-suspects", "ARB_SUSPECTS")):
+            v = state.get(key)
+            if v is not None:
+                args += [flag, str(v)]
+        return args
+
+    @staticmethod
+    def _new_assemble(state, path):
+        """The new write_from_state argv — gate.sh's post-Wave-3 call: all
+        fields passed unconditionally with ${VAR:-} defaults; Python owns the
+        truncation detection (via --shard-log) and set-vs-unset normalization
+        (empty coverage -> null)."""
+        s = lambda k, default="": state.get(k, default) or default
+        cov = lambda k: ("" if state.get(k) is None else str(state.get(k)))
+        return ["--path", path, "--rc", str(state["rc"]),
+                "--shard-log", state.get("shard_log") or "",
+                "--head", s("GATE_HEAD"),
+                "--mode=" + s("MODE"),
+                "--oracle", DualRunWriteFromStateTest._oracle(state),
+                "--started-epoch", str(state.get("GATE_EPOCH", 0) or 0),
+                "--total-s", str(state.get("total", 0) or 0),
+                "--failed-phase", s("FAILED_PHASE"),
+                "--shard-count", str(state.get("SHARD_COUNT") or 0),
+                "--shard-reported-s", str(state.get("SHARD_REPORTED_S") or 0),
+                "--coverage-gtests", cov("COV_GTESTS"),
+                "--coverage-littests", cov("COV_LITTESTS"),
+                "--expected-gtests", cov("GATE_EXPECTED_GTESTS"),
+                "--asan-errors", cov("ASAN_ERRS"),
+                "--arbitration-suspects", cov("ARB_SUSPECTS")]
+
+    def _run_module(self, subcmd, args):
+        scripts_dir = os.path.join(os.path.dirname(__file__), "..", "..")
+        env = dict(os.environ, PYTHONPATH=scripts_dir)
+        r = subprocess.run(
+            [sys.executable, "-m", "gate.verdict", subcmd] + args,
+            capture_output=True, text=True, env=env)
+        self.assertEqual(r.returncode, 0,
+                         "{} failed: {} {}".format(subcmd, r.stdout, r.stderr))
+
+    def _states(self, shard_dir):
+        """A matrix of reachable gate states (the exit-code taxonomy 0/1/2/3/64
+        x banner-present/absent/early x coverage measured/unmeasured x plain/
+        asan). Each exercises a distinct branch of the old arg-assembly."""
+        clean = os.path.join(shard_dir, "clean.log")
+        with open(clean, "w") as f:
+            f.write("## GATE PASS — 16 shards, all summaries present\n")
+        banner = os.path.join(shard_dir, "banner.log")
+        with open(banner, "w") as f:
+            f.write("...\n## GATE FAILURE: shard crash / undercount — x\n")
+        return [
+            # rc=0 clean pass, full harvest (the happy path).
+            {"rc": 0, "shard_log": clean, "GATE_HEAD": "abc123",
+             "MODE": "default", "GATE_EPOCH": 1234, "total": 120,
+             "FAILED_PHASE": None, "SHARD_COUNT": 16, "SHARD_REPORTED_S": 400,
+             "COV_GTESTS": 16482, "COV_LITTESTS": 2103,
+             "GATE_EXPECTED_GTESTS": 16482, "ASAN_ERRS": 0, "ARB_SUSPECTS": 0,
+             "ASAN": "0"},
+            # rc=0 + undercount banner -> POISONED (the #3002 shape).
+            {"rc": 0, "shard_log": banner, "GATE_HEAD": "abc123",
+             "MODE": "default", "total": 90, "SHARD_COUNT": 16,
+             "COV_GTESTS": 4000, "GATE_EXPECTED_GTESTS": 16482, "ASAN": "0"},
+            # rc=1 real failure with a failed phase + asan errors + arb suspects.
+            {"rc": 1, "shard_log": clean, "FAILED_PHASE": "build",
+             "MODE": "--full", "ASAN": "1", "SHARD_COUNT": 8,
+             "COV_GTESTS": 0, "COV_LITTESTS": 0, "GATE_EXPECTED_GTESTS": 16482,
+             "ASAN_ERRS": 3, "ARB_SUSPECTS": 2},
+            # rc=2 preflight refused — EARLY exit: harvest vars UNSET (None),
+            # no shard log. Coverage must be null, never 0 (#3010).
+            {"rc": 2, "shard_log": None, "GATE_HEAD": None, "MODE": "default",
+             "FAILED_PHASE": None, "SHARD_COUNT": None, "COV_GTESTS": None,
+             "COV_LITTESTS": None, "GATE_EXPECTED_GTESTS": None,
+             "ASAN_ERRS": None, "ARB_SUSPECTS": None, "ASAN": "0"},
+            # rc=3 coverage short (#3002) — truncated via rc, FAILED_PHASE set.
+            {"rc": 3, "shard_log": clean, "FAILED_PHASE": "coverage floor",
+             "MODE": "default", "SHARD_COUNT": 16, "COV_GTESTS": 5000,
+             "GATE_EXPECTED_GTESTS": 16482, "ASAN": "0"},
+            # rc=64 unrecognized mode — EARLY exit (harvest unset), MODE=default.
+            {"rc": 64, "shard_log": None, "MODE": "default", "ASAN": "0"},
+            # rc=0 pass with coverage explicitly measured as 0 (the 0-vs-null
+            # boundary: SET 0 must stay 0, not collapse to null).
+            {"rc": 0, "shard_log": clean, "MODE": "default", "SHARD_COUNT": 0,
+             "COV_GTESTS": 0, "COV_LITTESTS": 0, "GATE_EXPECTED_GTESTS": 16482,
+             "ASAN": "0"},
+            # rc=0 asan pass, mode=--full, GATE_HEAD unset (early-ish).
+            {"rc": 0, "shard_log": clean, "MODE": "--full", "ASAN": "1",
+             "COV_GTESTS": 16482, "GATE_EXPECTED_GTESTS": 16482,
+             "ASAN_ERRS": 0},
+        ]
+
+    def test_new_verdict_equals_old_over_all_reachable_states(self):
+        """For every state in the matrix, the verdict file from write_from_state
+        equals the file from the old write + bash arg-assembly. This is the
+        dual-run proof the Wave-3 migration requires: same verdict, same
+        trustworthy, same truncated, same oracle, same evidence/integrity."""
+        with tempfile.TemporaryDirectory() as d:
+            shard_dir = os.path.join(d, "shards")
+            os.makedirs(shard_dir)
+            for i, state in enumerate(self._states(shard_dir)):
+                old_p = os.path.join(d, "old{}.json".format(i))
+                new_p = os.path.join(d, "new{}.json".format(i))
+                self._run_module("write", self._old_assemble(state, old_p))
+                self._run_module("write_from_state",
+                                 self._new_assemble(state, new_p))
+                old = verdict.read_verdict(old_p)
+                new = verdict.read_verdict(new_p)
+                self.assertIsNotNone(old, "old path wrote nothing for state {}".format(i))
+                self.assertIsNotNone(new, "new path wrote nothing for state {}".format(i))
+                self.assertEqual(old, new,
+                    "state #{} (rc={}): new write_from_state verdict differs "
+                    "from old write verdict.\nOLD: {}\nNEW: {}".format(
+                        i, state["rc"],
+                        json.dumps(old, sort_keys=True),
+                        json.dumps(new, sort_keys=True)))
+
+
 if __name__ == "__main__":
     unittest.main()

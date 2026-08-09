@@ -97,40 +97,31 @@ MODE="${1:-default}"
 # ---------------------------------------------------------------------------
 gate_write_verdict() { # rc [total_s] — write gate-verdict.json; best-effort, never changes exit
   local rc="$1" total="${2:-0}"
-  # Detect truncation: the "## GATE FAILURE: shard crash / undercount" banner
-  # from run_parallel.sh:306 (Plan-A invariant 1.19: gate_full_cycle distrusts
-  # rc=0+undercount-banner and retries) OR a coverage short (rc==3, #3002). The
-  # truncated flag only turns an rc==0 pass into POISONED, but is recorded in
-  # integrity for all exit codes so a consumer sees the full picture.
-  local trunc=0 ubanner=0
-  if [ -r "$S/gate_shard.log" ] && grep -q 'shard crash / undercount' "$S/gate_shard.log" 2>/dev/null; then
-    trunc=1; ubanner=1
-  fi
-  [ "$rc" -eq 3 ] && trunc=1
   local oracle="plain"; [ "${ASAN:-0}" = "1" ] && oracle="asan"
-  # per the exit-code-trap / #3002: --mode uses the `=` form because MODE can be
-  # `--full`/`--quick`/`--no-asan`, and a bare `--mode --full` makes argparse
-  # treat `--full` as an unknown FLAG (exit 2), silently skipping the verdict
-  # write (the `|| true` below swallows it). That left the ASan oracle's verdict
-  # unwritten for the entire Phase 3-additive window — the exact gap Phase 3c
-  # closes by making the verdict load-bearing.
-  local -a vargs=(--path "$GATE_VERDICT_FILE" --rc "$rc"
-    --head "${GATE_HEAD:-}" --mode="${MODE:-}" --oracle "$oracle"
-    --started-epoch "${GATE_EPOCH:-0}" --total-s "$total")
-  local _fp="${FAILED_PHASE:-}"; [ -n "$_fp" ] && vargs+=(--failed-phase "$_fp")
-  [ "$trunc" -eq 1 ] && vargs+=(--truncated)
-  [ "$ubanner" -eq 1 ] && vargs+=(--undercount-banner)
-  [ "${SHARD_COUNT:-0}" -gt 0 ] 2>/dev/null && vargs+=(--shard-count "$SHARD_COUNT")
-  [ "${SHARD_REPORTED_S:-0}" -gt 0 ] 2>/dev/null && vargs+=(--shard-reported-s "$SHARD_REPORTED_S")
-  # Coverage: pass only when the variable is SET (measured). Unset → omitted →
-  # None in the JSON, per #3010 (an unmeasured number emits null, never 0, so a
-  # harvest failure and a genuine zero stay distinguishable).
-  [ -n "${COV_GTESTS+x}" ] && vargs+=(--coverage-gtests "$COV_GTESTS")
-  [ -n "${COV_LITTESTS+x}" ] && vargs+=(--coverage-littests "$COV_LITTESTS")
-  [ -n "${GATE_EXPECTED_GTESTS+x}" ] && vargs+=(--expected-gtests "$GATE_EXPECTED_GTESTS")
-  [ -n "${ASAN_ERRS+x}" ] && vargs+=(--asan-errors "$ASAN_ERRS")
-  [ -n "${ARB_SUSPECTS+x}" ] && vargs+=(--arbitration-suspects "$ARB_SUSPECTS")
-  PYTHONPATH=scripts python3 -m gate.verdict write "${vargs[@]}" 2>/dev/null || true
+  # per the exit-code-trap / #3010 Wave 3: the truncation banner grep AND the 12
+  # conditional `[ -n "${X+x}" ]` arg guards moved INTO verdict.py's
+  # write_from_state. Python reads the shard log itself (the "shard crash /
+  # undercount" banner grep is now an `in` check — ONE owner for run_parallel's
+  # wording, not a bash re-implementation) and computes truncated/undercount;
+  # the conditional guards collapse to `${VAR:-}` defaults + Python's empty->
+  # None normalization (an unmeasured number still emits null, never 0, #3010).
+  # Best-effort `|| true` preserved: a verdict-write hiccup NEVER changes the
+  # gate's exit code. Dual-run equivalence (new verdict == old verdict) is pinned
+  # by DualRunWriteFromStateTest over a matrix of reachable gate states.
+  # --mode uses the `=` form because MODE can be `--full`/`--quick`/`--no-asan`,
+  # and a bare `--mode --full` makes argparse treat `--full` as an unknown FLAG
+  # (exit 2), silently skipping the verdict write (the `|| true` swallows it).
+  PYTHONPATH=scripts python3 -m gate.verdict write_from_state \
+    --path "$GATE_VERDICT_FILE" --rc "$rc" \
+    --shard-log "$S/gate_shard.log" \
+    --head "${GATE_HEAD:-}" --mode="${MODE:-}" --oracle "$oracle" \
+    --started-epoch "${GATE_EPOCH:-0}" --total-s "$total" \
+    --failed-phase "${FAILED_PHASE:-}" \
+    --shard-count "${SHARD_COUNT:-0}" --shard-reported-s "${SHARD_REPORTED_S:-0}" \
+    --coverage-gtests "${COV_GTESTS:-}" --coverage-littests "${COV_LITTESTS:-}" \
+    --expected-gtests "${GATE_EXPECTED_GTESTS:-}" \
+    --asan-errors "${ASAN_ERRS:-}" --arbitration-suspects "${ARB_SUSPECTS:-}" \
+    2>/dev/null || true
 }
 # fix #3011: REJECT AN UNRECOGNISED MODE. `MODE` has exactly one semantic use
 # (`[ "$MODE" = "--full" ] && ASAN=1`, below), so before this check ANY other

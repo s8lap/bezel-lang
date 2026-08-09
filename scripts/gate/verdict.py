@@ -229,6 +229,49 @@ def read_verdict(path):
     return obj
 
 
+# The truncation marker run_parallel.sh emits on a shard crash / undercount
+# (run_parallel.sh:300 — "## GATE FAILURE: shard crash / undercount — result is
+# NOT trustworthy"). Kept as a literal so the detection is grep-equivalent but
+# does not spawn a process or interpret regex metachars. Three callers used to
+# grep this exact wording independently (gate.sh's gate_write_verdict,
+# gate_full_cycle.sh's _legacy_rc_decision, and the bash dual-run assertion);
+# per #3010 Wave 3 verdict.py now OWNS it so the wording lives in one place —
+# the module that already owns the trustworthy=False-iff-pass+truncated pin.
+UNDERCOUNT_BANNER = "shard crash / undercount"
+
+
+def detect_truncation(shard_log, rc):
+    """Read the shard log + the exit code; return (truncated, undercount_banner).
+
+    This is the detection gate.sh's gate_write_verdict used to perform in bash
+    (`grep -q 'shard crash / undercount' "$S/gate_shard.log"` plus the rc==3
+    coverage-short signal), now owned by Python per the #3010 Wave 3 migration.
+    The banner grep becomes an `in` check on the log content — one owner for the
+    wording instead of a fragile bash re-implementation of run_parallel's banner.
+
+    `undercount_banner` is the specific marker (the literal was present in a
+    readable shard log). `truncated` is the composite integrity flag
+    (undercount_banner OR the rc==3 coverage short, #3002). The composite only
+    turns an rc==0 PASS into POISONED (verdict_from_rc), but is recorded in the
+    integrity block for ALL exit codes so a consumer sees the full picture.
+
+    A missing/unreadable shard log means no banner was seen — undercount_banner
+    stays False (mirrors bash's `[ -r "$S/gate_shard.log" ] &&` readability
+    guard). per the exit-code-trap / #3001: rc==0 over an undercount banner is
+    POISONED, and rc==3 (coverage short) is RETRY.
+    """
+    undercount_banner = False
+    if shard_log:
+        try:
+            with open(shard_log, errors="replace") as f:
+                content = f.read()
+        except OSError:
+            content = ""
+        undercount_banner = UNDERCOUNT_BANNER in content
+    truncated = undercount_banner or (rc == 3)
+    return truncated, undercount_banner
+
+
 # ---------------------------------------------------------------------------
 # CLI — gate.sh calls this to write the verdict on every exit.
 #
@@ -283,6 +326,107 @@ def _main_write(argv):
         expected_gtests=args.expected_gtests,
         asan_errors=args.asan_errors,
         arbitration_suspects=args.arbitration_suspects,
+    )
+    write_verdict(args.path, obj)
+    return 0
+
+
+def _optional_int(s):
+    """Parse a CLI value as int, treating empty/None as 'unset' (-> None).
+
+    Mirrors the bash `[ -n "${VAR+x}" ]` conditional guards gate.sh's old
+    gate_write_verdict used for the harvested coverage/asan/arbitration fields:
+    a field the caller did not measure (unset -> "") emits None in the JSON,
+    NEVER 0, so a harvest failure and a genuine zero stay distinguishable
+    (per #3010). A set field carries its integer value.
+
+    This is the move that collapses the 12 conditional arg guards: gate.sh now
+    passes `${VAR:-}` unconditionally and Python owns the set-vs-unset decision,
+    instead of bash branching per field.
+    """
+    if s is None or s == "":
+        return None
+    return int(s)
+
+
+def _main_write_from_state(argv):
+    """`write_from_state` subcommand — gate.sh's entry point (#3010 Wave 3).
+
+    Migrates gate.sh's gate_write_verdict (the truncation banner grep + the 12
+    conditional `[ -n "${X+x}" ]` arg guards) INTO Python. The caller passes the
+    RAW gate state (rc, the shard-log path, and the harvested fields with
+    `${VAR:-}` defaults); this subcommand:
+
+      (a) reads the shard log ITSELF and computes truncation — the banner grep
+          is now `detect_truncation`'s `in` check (no process spawn, no regex),
+          one owner for run_parallel's banner wording instead of a bash
+          re-implementation;
+      (b) builds the verdict object from kwargs, normalizing empty coverage
+          fields to None via `_optional_int` (the set-vs-unset conditionality is
+          now Python's, not bash's per-field `[ -n ]` branch).
+
+    The 12 conditional guards collapse to: always pass the flag, let the default
+    + `_optional_int` handle 'unset'. Best-effort remains the caller's `|| true`
+    (preserved verbatim) — a verdict-write hiccup never changes the gate's exit
+    code. Dual-run equivalence with the old `write` + bash arg-assembly path is
+    pinned by DualRunWriteFromStateTest over a matrix of reachable gate states.
+    """
+    p = argparse.ArgumentParser(
+        prog="verdict.py write_from_state",
+        description="Write gate-verdict.json from raw gate state, computing "
+                    "truncation from the shard log (#3010 Wave 3).",
+    )
+    p.add_argument("--path", required=True,
+                   help="output path (gate.sh uses $GATE_VERDICT_FILE)")
+    p.add_argument("--rc", type=int, required=True,
+                   help="gate.sh exit code (0/1/2/3/64)")
+    p.add_argument("--shard-log", default=None,
+                   help="shard log path; read for the undercount banner "
+                        "(missing/unreadable => no banner seen)")
+    p.add_argument("--head", default="", help="git HEAD sha")
+    p.add_argument("--mode", default="",
+                   help="gate mode (default/--full/--quick/--no-asan). "
+                        "Caller uses the --mode=VALUE form so a '--full' value "
+                        "is not mistaken for an unknown flag (#3010 comment).")
+    p.add_argument("--oracle", default="", help="oracle (plain/asan)")
+    p.add_argument("--started-epoch", type=int, default=0, help="gate start epoch seconds")
+    p.add_argument("--total-s", type=float, default=0.0, help="total gate wall seconds")
+    p.add_argument("--failed-phase", default=None,
+                   help="which phase failed (empty => None)")
+    p.add_argument("--shard-count", type=int, default=0, help="number of shards")
+    p.add_argument("--shard-reported-s", type=int, default=0, help="shard aggregate wall seconds")
+    p.add_argument("--coverage-gtests", default="",
+                   help="gtest count that ran (empty => unmeasured => null)")
+    p.add_argument("--coverage-littests", default="",
+                   help="lit count that ran (empty => unmeasured => null)")
+    p.add_argument("--expected-gtests", default="",
+                   help="registry-expected gtest count (empty => unmeasured => null)")
+    p.add_argument("--asan-errors", default="",
+                   help="ASan report count (empty => unmeasured => null)")
+    p.add_argument("--arbitration-suspects", default="",
+                   help="arbitration suspect count (empty => unmeasured => null)")
+    args = p.parse_args(argv)
+
+    truncated, undercount_banner = detect_truncation(args.shard_log, args.rc)
+    failed_phase = args.failed_phase if args.failed_phase else None
+
+    obj = build_verdict_obj(
+        rc=args.rc,
+        truncated=truncated,
+        head=args.head,
+        mode=args.mode,
+        oracle=args.oracle,
+        started_epoch=args.started_epoch,
+        total_s=args.total_s,
+        failed_phase=failed_phase,
+        undercount_banner=undercount_banner,
+        shard_count=args.shard_count,
+        shard_reported_s=args.shard_reported_s,
+        coverage_gtests=_optional_int(args.coverage_gtests),
+        coverage_littests=_optional_int(args.coverage_littests),
+        expected_gtests=_optional_int(args.expected_gtests),
+        asan_errors=_optional_int(args.asan_errors),
+        arbitration_suspects=_optional_int(args.arbitration_suspects),
     )
     write_verdict(args.path, obj)
     return 0
@@ -384,9 +528,12 @@ def _main_read(argv):
 def main(argv):
     if len(argv) >= 2 and argv[1] == "write":
         return _main_write(argv[2:])
+    if len(argv) >= 2 and argv[1] == "write_from_state":
+        return _main_write_from_state(argv[2:])
     if len(argv) >= 2 and argv[1] == "read":
         return _main_read(argv[2:])
-    sys.stderr.write("usage: verdict.py {write|read} --path PATH [options]\n")
+    sys.stderr.write(
+        "usage: verdict.py {write|write_from_state|read} --path PATH [options]\n")
     return 2
 
 
