@@ -108,8 +108,14 @@ gate_write_verdict() { # rc [total_s] — write gate-verdict.json; best-effort, 
   fi
   [ "$rc" -eq 3 ] && trunc=1
   local oracle="plain"; [ "${ASAN:-0}" = "1" ] && oracle="asan"
+  # per the exit-code-trap / #3002: --mode uses the `=` form because MODE can be
+  # `--full`/`--quick`/`--no-asan`, and a bare `--mode --full` makes argparse
+  # treat `--full` as an unknown FLAG (exit 2), silently skipping the verdict
+  # write (the `|| true` below swallows it). That left the ASan oracle's verdict
+  # unwritten for the entire Phase 3-additive window — the exact gap Phase 3c
+  # closes by making the verdict load-bearing.
   local -a vargs=(--path "$GATE_VERDICT_FILE" --rc "$rc"
-    --head "${GATE_HEAD:-}" --mode "${MODE:-}" --oracle "$oracle"
+    --head "${GATE_HEAD:-}" --mode="${MODE:-}" --oracle "$oracle"
     --started-epoch "${GATE_EPOCH:-0}" --total-s "$total")
   local _fp="${FAILED_PHASE:-}"; [ -n "$_fp" ] && vargs+=(--failed-phase "$_fp")
   [ "$trunc" -eq 1 ] && vargs+=(--truncated)
