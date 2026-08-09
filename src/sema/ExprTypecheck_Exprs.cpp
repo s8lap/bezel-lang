@@ -2070,6 +2070,230 @@ void ExprTC::visitExpr(const ast::Expr& e) {
                     // exactly as the single-indexer path always did).
                     if (!ps) ps = arityOnly;
                     if (ps && ps->isIndexer) {
+                        // fix #2955 (§23.4 / §13 / §14.1 / §2.8.3 rule 4,
+                        // v0.240): an INDEXER whose INDEX PARAMETER is typed
+                        // by the RECEIVER DECLARATION's own generic
+                        // parameter (e.g. `interface I<T> { property [i: T]:
+                        // int }` reached as `r[i]` over `r: I<string>`) has no
+                        // working lower path in the current ABI — the
+                        // exported cross-module stub is keyed by the open
+                        // type and erases `T -> i32`, while the call-site
+                        // argument is the concrete-substituted type (a `ptr`
+                        // for `string`), so the emitted indirect call carries
+                        // the wrong `i32 (ptr, i32)` signature for an `i32
+                        // (ptr, ptr)` argument and aborts at LLVM IR
+                        // verification with no located diagnostic. The named-
+                        // property twin is #2944 (return type) and the
+                        // property-side twin is #2928; this is the INDEX
+                        // PARAMETER form of the family.
+                        //
+                        // MEASURED (issue's own repro, two-module
+                        // `bezelc -c lib.bzl` then `bezelc --import lib.o
+                        // app.bzl`):
+                        //   * `r["k"]` on `var r: IAtU5<string> := g` →
+                        //     `Call parameter type does not match function
+                        //     signature! ptr @.bz.str.50` (raw verifier
+                        //     abort, no source location, exit non-zero).
+                        //   * the SAME shape reached DIRECTLY through the
+                        //     implementing class (`g["k"]` on `var g :=
+                        //     new GArrU5<string>()`) → byte-identical
+                        //     verifier abort, because the imported-stub
+                        //     dispatch goes through the same `bz$<Class>$
+                        //     idxget$<arity>` symbol whose signature is the
+                        //     same erasure.
+                        //
+                        // Decline with a sourced diagnostic, in the style of
+                        // #2884 (the property twin) and #2832 / #1943's
+                        // imported-generic shapes — and exactly as
+                        // `accessorAbiFits` (LlvmBackend_Setup.cpp, added in
+                        // #2946) refuses to install an itable slot whose ABI
+                        // doesn't fit the per-instantiation substitution
+                        // here refuses to TYPE an indexer access whose
+                        // declared ABI can't be made to fit the substitution
+                        // at the call site. The Driver gates codegen on
+                        // `!diagnostics.hasErrors()` (Driver.cpp's `if
+                        // (!objectPath.empty() && !diagnostics.hasErrors())`
+                        // before emitModule), so once this diagnostic fires
+                        // codegen is skipped and the verifier never sees the
+                        // broken module. The full fix is importer-side
+                        // accessor monomorphization per instantiation, the
+                        // way `methodBodyText` / `ctorBodyText` already
+                        // carry method/ctor bodies across the artifact
+                        // boundary (#428 family).
+                        //
+                        // GATED: only the shape the issue's own diagnosis
+                        // names, and only on the dispatch paths the ABI
+                        // mismatch actually breaks. The receiver must be a
+                        // generic Interface (any interface — local or
+                        // imported — because the itable slot is filled
+                        // with a function whose ABI is fixed at the erasure)
+                        // OR an IMPORTED generic Class/Record (because the
+                        // cross-module stub `bz$<Class>$idxget$<arity>` is
+                        // the same erasure and there is no per-instantiation
+                        // re-emission). The LOCAL generic Class/Record case
+                        // is OUT OF GATE — codegen inlines the body into
+                        // the caller (the `getterExpr` / `getterBlock`
+                        // paths in `lowerIndexerGet`/`-Set`), and the body
+                        // runs in the caller's substitution context, so a
+                        // body that doesn't touch the index parameter
+                        // works at runtime even when the indexer's
+                        // declared parameter type is the generic param.
+                        // PROBED: `GCtrl4<string>` accessed directly as
+                        // `g["k"]` (local generic class) returns the
+                        // correct 42, no verifier abort — the body is
+                        // `_w + 2`, never reads `i`. The same indexer
+                        // reached through a generic INTERFACE
+                        // (`r["k"]` on `var r: ICtrl3<string>`) DOES abort
+                        // the verifier — same root cause, but the dispatch
+                        // is itable-mediated.
+                        //
+                        // Receiver's index parameter type must additionally
+                        // be a bare TypeRef::Kind::Named whose `headName`
+                        // matches one of those generic params' names — a
+                        // Name-only reference, not a declaration-resolved
+                        // one (mirrors `interfaceIndexerElementType`'s
+                        // predicate shape). Out-of-gate shapes:
+                        //   * a NON-generic receiver — no substitution to
+                        //     erase, the stub ABI IS the call ABI.
+                        //   * an indexer parameter typed by a
+                        //     declaration-resolved class/record (e.g. `[i:
+                        //     SomeNamedClass]`) — `lowerType` lowers it to
+                        //     the same `ptr` the call site passes.
+                        //   * a builtin collection (Array<T>, dictionary,
+                        //     string, span/buffer) — has no PropertySymbol
+                        //     here and was already a builtin path; the issue
+                        //     is specific to a USER-declared indexer.
+                        //   * a `base`-rooted indexer — gated separately
+                        //     (#2832's `rejectImportedVirtualBaseIndexer` in
+                        //     codegen; this decline would also fire on it,
+                        //     which is correct — the same family).
+                        if (tt && tt->kind == TypeRef::Kind::Named &&
+                            tt->declaration &&
+                            !tt->declaration->genericParams.empty() &&
+                            (tt->declaration->kind ==
+                                 ast::TypeDeclKind::Interface ||
+                             ctx_.isImported(tt->declaration))) {
+                            // Map generic-param NAME → its positional index in
+                            // the receiver declaration's genericParams list,
+                            // so the per-parameter substitution check below
+                            // can walk `tt->genericArgs` in the same order.
+                            std::unordered_map<std::string_view, std::size_t>
+                                gpIndex;
+                            for (std::size_t gi = 0;
+                                 gi < tt->declaration->genericParams.size();
+                                 ++gi) {
+                                if (auto* gp =
+                                        dynamic_cast<const GenericParamSymbol*>(
+                                            tt->declaration->genericParams[gi]))
+                                    gpIndex[gp->name] = gi;
+                            }
+                            auto paramIsBareReceiverTypeParam =
+                                [&](const TypeRef* pty) -> bool {
+                                if (!pty || pty->kind != TypeRef::Kind::Named)
+                                    return false;
+                                if (pty->declaration) return false;
+                                std::string_view hn = pty->headName();
+                                if (hn.empty()) return false;
+                                return gpIndex.count(hn) != 0;
+                            };
+                            // For an index parameter typed by a generic
+                            // param of the receiver, the substitution MOVES
+                            // the index parameter's ABI iff the substituted
+                            // arg's lowered LLVM type is not the i32
+                            // erasure placeholder. The only TypeRef that
+                            // lowers to i32 is the int primitive — every
+                            // other kind (any other primitive, any named
+                            // type, any nested generic) lowers to a
+                            // different type and would abort the verifier on
+                            // the call. This is the same population the
+                            // call-site ABI (`gFnTy`/`sFnTy` in
+                            // `lowerIndexerGet`/`-Set`,
+                            // LlvmBackend_Assign.cpp) needs to match;
+                            // checking it here keeps the decline to the
+                            // shape that ACTUALLY breaks, instead of
+                            // catching the T=int case (where the
+                            // substitution is the same `i32` erasure and
+                            // the call type matches the argument type —
+                            // measured to compile clean and run clean).
+                            auto substitutedArgMovesAbi =
+                                [&](const TypeRef* pty) -> bool {
+                                if (!pty || pty->kind != TypeRef::Kind::Named)
+                                    return true;  // unknown / non-named:
+                                                  // be conservative
+                                if (pty->declaration) return true;
+                                std::string_view hn = pty->headName();
+                                auto it = gpIndex.find(hn);
+                                if (it == gpIndex.end()) return true;
+                                const std::size_t gi = it->second;
+                                if (gi >= tt->genericArgs.size()) return true;
+                                const TypeRef* arg = tt->genericArgs[gi];
+                                if (!arg) return true;
+                                // The ONLY shape that does NOT move the ABI:
+                                // the int primitive. Every other kind
+                                // (string, bool, byte, char, any Named
+                                // declaration, any nested generic, any
+                                // non-int primitive) lowers to a different
+                                // LLVM type.
+                                if (arg->kind == TypeRef::Kind::Primitive &&
+                                    arg->primitive == PrimitiveType::Int)
+                                    return false;
+                                return true;
+                            };
+                            bool paramHitsGenericParam = false;
+                            if (auto* pd2 =
+                                    dynamic_cast<const ast::PropertyDecl*>(
+                                        ps->decl)) {
+                                for (const auto& p : pd2->indexerParams) {
+                                    if (p.type) {
+                                        const TypeRef* pt =
+                                            ctx_.resolvedType(*p.type);
+                                        if (paramIsBareReceiverTypeParam(pt) &&
+                                            substitutedArgMovesAbi(pt)) {
+                                            paramHitsGenericParam = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (!paramHitsGenericParam) {
+                                for (const Symbol* pSym :
+                                     ps->indexerParams) {
+                                    if (auto* prm =
+                                            dynamic_cast<const ParameterSymbol*>(
+                                                pSym)) {
+                                        if (paramIsBareReceiverTypeParam(
+                                                prm->resolvedDeclType) &&
+                                            substitutedArgMovesAbi(
+                                                prm->resolvedDeclType)) {
+                                            paramHitsGenericParam = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            if (paramHitsGenericParam) {
+                                auto loc = e.span.begin;
+                                ctx_.diagnostics().report(
+                                    Severity::Error, loc,
+                                    "indexer `" + std::string(ps->name) +
+                                    "` on the generic type `" +
+                                    std::string(tt->declaration->name) +
+                                    "` is not yet monomorphized "
+                                    "(\xC2\xA7""23.4 / \xC2\xA7""14.1 / "
+                                    "\xC2\xA7""2.8.3 rule 4 / #2955): a "
+                                    "generic type's indexer accessors are "
+                                    "not exported per instantiation, so an "
+                                    "index parameter typed by a type "
+                                    "parameter of the receiver's "
+                                    "declaration has no correct target — "
+                                    "it aborts LLVM IR verification with "
+                                    "an `i32 (ptr, …)` call against a "
+                                    "substituted `ptr` argument. Access a "
+                                    "field directly, or route through a "
+                                    "method, until importer-side indexer "
+                                    "monomorphization lands");
+                            }
+                        }
                         auto* pd = dynamic_cast<const ast::PropertyDecl*>(
                             ps->decl);
                         TypeRef* rt = nullptr;
