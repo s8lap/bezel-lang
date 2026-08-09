@@ -4,7 +4,7 @@
 // Warning is gated on `lowerExpr` FAILING to lower the RHS — a successful
 // assignment whose RHS lowers correctly (the overwhelmingly common case:
 // plain value, owned, string, nullable, method-call result, indexer-set
-// operand) must stay COMPLETELY SILENT. A regression that dropped the `!rhs`
+// operand, and a real `??=` RHS) must stay COMPLETELY SILENT. A regression that dropped the `!rhs`
 // check (firing on EVERY assignment) would turn this clean-compile control
 // red — pinning it here catches that shape of regression directly, the same
 // way the sibling test pins the case that SHOULD warn.
@@ -20,12 +20,13 @@
 //   * `local := owned obj`                  — owned class RHS (transfer)
 //   * `local := nullable`                   — nullable RHS to a nullable
 //   * `arr[i] := v`                         — indexer-set assignment
+//   * `nullable ??= v`                      — null-coalescing assignment
 //   * `local := local + 1`                  — binary-op RHS
 //   * `local := M(7)`                       — call-result RHS
-// All must lower real values and produce NO #2961 diagnostic.
+// All must lower real values and produce NO #2961 or #3025 diagnostic.
 //
 // Clean-compile ACCEPT control: bezelc -c must exit zero and emit no
-// internal: / #2961 diagnostics.
+// internal: / #2961 / #3025 diagnostics.
 //
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
@@ -46,18 +47,20 @@ class C
     var s: string := "x";
     var own: Inner := new Inner(3);
     var n: int? := 5;
+    var coalesced: int? := null;
     using var holder: Holder := new Holder();
     local := 7;
     s := "hi";
     own := new Inner(7);
     n := 5;
     arr[0] := 42;
+    coalesced ??= 11;
     holder.fieldA := 9;
     holder.fieldB := local + 1;
     local := C.Mk();
     local := C.Idx(arr, 0);
     _ := own;
-    return local + holder.fieldA + holder.fieldB;
+    return local + holder.fieldA + holder.fieldB + (coalesced ?? 0);
   end Main;
 end C;
 
@@ -65,3 +68,4 @@ end C;
 // NODIAG-NOT: warning
 // NODIAG-NOT: internal:
 // NODIAG-NOT: #2961
+// NODIAG-NOT: #3025

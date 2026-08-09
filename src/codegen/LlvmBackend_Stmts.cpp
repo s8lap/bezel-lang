@@ -334,7 +334,20 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (auto* ix = dynamic_cast<const ast::IndexExpr*>(
                         as->target.get())) {
                     llvm::Value* rhsOnce = lowerExpr(*as->value);
-                    if (!rhsOnce) return false;
+                    // fix #3025 (§28.9/§28.3, v0.240): this dedicated
+                    // indexer-setter arm precedes #2961's generic assignment
+                    // fallback, so its null RHS still returned silently. Keep
+                    // the existing preserve-the-slot degradation, but make it
+                    // observable with the same guarded Warning posture.
+                    if (!rhsOnce) {
+                        if (!ctx_.diagnostics().hasErrors())
+                            ctx_.diagnostics().report(
+                                Severity::Warning, as->value->span.begin,
+                                "internal: indexer-setter RHS expression failed "
+                                "to lower (degraded — target retains its previous "
+                                "value) — #3025");
+                        return false;
+                    }
                     // fix #2540: pass `as->value.get()` so the interface-
                     // dispatch branch in lowerIndexerSet can gate its paired
                     // call-site retain on the RHS being a tracked string
@@ -748,6 +761,16 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 // RHS evaluated here ONLY (the LHS was null) — short-circuit.
                 rhs = lowerExpr(*as->value);
                 if (!rhs) {
+                    // fix #3025 (§28.9/§28.3, v0.240): the RHS is lowered only
+                    // in §6.6's null branch, but a null lowering result used to
+                    // branch around the store silently. Preserve the target and
+                    // make that degradation observable, matching #2961.
+                    if (!ctx_.diagnostics().hasErrors())
+                        ctx_.diagnostics().report(
+                            Severity::Warning, as->value->span.begin,
+                            "internal: ??= short-circuit RHS expression failed "
+                            "to lower (degraded — target retains its previous "
+                            "value) — #3025");
                     builder_.CreateBr(endBB);
                     builder_.SetInsertPoint(endBB);
                     return false;

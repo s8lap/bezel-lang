@@ -96,7 +96,7 @@ struct Entry {
     const char* reason;
 };
 
-// The fourteen WARNING-severity `internal:` degrades as of v0.240, each with the
+// The sixteen WARNING-severity `internal:` degrades as of v0.240, each with the
 // judgement #2924 asks for.  Ordered by file, then by the tag.
 const Entry kWarningDegrades[] = {
     {"src/codegen/LlvmBackend_Assign.cpp", "#2833",
@@ -201,12 +201,28 @@ const Entry kWarningDegrades[] = {
      "shape as the localSlot arm above. The retained value is whatever was "
      "stored there before; no null-pointer substitution, no UAF. The hazard "
      "is a stale field/indexer slot — bounded, observable, and now diagnosed."},
+
+    {"src/codegen/LlvmBackend_Stmts.cpp", "#3025",
+     Disposition::WrongValue,
+     "the dedicated indexer-setter arm returns before invoking any setter or "
+     "store when its RHS has no lowered value. The slot keeps its previous, "
+     "already-valid value; the site neither manufactures nor substitutes a "
+     "pointer. This is the dedicated-arm residual outside #2961."},
+
+    {"src/codegen/LlvmBackend_Stmts.cpp", "#3025",
+     Disposition::WrongValue,
+     "the `??=` null-branch arm evaluates the RHS, then branches around the "
+     "store when no value was lowered. The nullable target keeps its previous "
+     "null value; nullable member access still requires narrowing or the "
+     "checked `!` unwrap. No raw pointer is substituted — the bounded harm is "
+     "that the coalescing assignment failed to establish a value."},
 };
 
-// How many of the fourteen can hand a user a memory-unsafe binary. Pinned as
+// How many of the sixteen can hand a user a memory-unsafe binary. Pinned as
 // its own number so that changing a disposition is a deliberate edit in two
-// places. The two #2961 entries are WrongValue (no null pointer is produced),
-// so this count is unchanged at 9 from the twelve-degrade population.
+// places. The two #2961 and two #3025 entries are WrongValue (no null pointer
+// is substituted), so this count is unchanged at 9 from the twelve-degrade
+// population.
 constexpr std::size_t kUnsafePointerCount = 9;
 
 // Locate the repo root from this translation unit's own path:
@@ -322,7 +338,7 @@ BEZEL_TEST(internal_degrade_disposition_snapshot_2924,
     const std::vector<Site> sites = scanSrcTree(root);
     // The scan must find the population at all — a zero here means the walk or
     // the needle broke, not that the tree became clean.
-    BEZEL_EXPECT_TRUE(sites.size() > 20);
+    BEZEL_EXPECT_TRUE(sites.size() > 22);
 
     std::vector<const Site*> warnings;
     for (const Site& s : sites) {
