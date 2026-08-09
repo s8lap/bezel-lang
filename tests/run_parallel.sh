@@ -272,49 +272,110 @@ if [[ -n "$fail_lines" ]]; then
     echo "$fail_lines"
 fi
 
-# Phantom-name warning (#2100). A listed name matching NO registered test is a
-# silently-dropped test (typo, rename, or a selector parse artifact). It is
-# computed HERE, not in the binary, because with the suite split across binaries
-# no single binary can tell a phantom name from a name that lives in a sibling
-# binary — each would warn about every test it does not own. Only meaningful
-# with no substring filter: under list+filter composition, selected < listed is
-# the filter working, not phantom names. The gate and agent_check tripwires grep
-# for the 'WARNING: only' text, which is preserved verbatim.
-if [[ "$subset_mode" -eq 1 && -z "${BEZEL_TEST_FILTER:-}" && -r "${BEZEL_TEST_LIST:-}" ]]; then
-    # Count DISTINCT names, matching the binary's own set semantics — a list
-    # with a repeated line must not read as a phantom.
-    listed="$(sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//' "$BEZEL_TEST_LIST" 2>/dev/null | grep . | sort -u | grep -c .)"
-    if [[ "$global_selected" -lt "${listed:-0}" ]]; then
-        echo "bezel_tests: WARNING: only $global_selected of $listed listed tests matched the registry (BEZEL_TEST_LIST has phantom/renamed names)"
-    fi
-fi
+# Phantom-name warning + GATE FAILURE banner (#2100, #1861) — migrated to
+# gate.summary: the fiddly culprit-extraction grep + the distinct-names warning
+# are clearer and testable in Python. The OLD bash formatters are recomputed
+# ALONGSIDE and asserted byte-identical: the 'shard crash / undercount' +
+# 'WARNING: only' literals are LOAD-BEARING — gate_full_cycle.sh:79, gate.sh
+# :106/637, agent_check.sh:266 grep them, so any drift would silently break
+# those tripwires. Fail LOUD on a difference; the bash oracle is removed once
+# the landing gate proves byte-identity (per #3010 dual-run methodology).
+# per #2100 (the distinct-names rule) and #1608 (the last-[ RUN ]-line culprit
+# is a MISATTRIBUTION, but documented behavior consumers expect — preserved).
 
-# GATE INTEGRITY: a crashed shard (uncaught exception -> runtime exit(70), or a
-# segfault) kills the host process and silently drops its remaining tests. Detect
-# it three ways — a nonzero shard exit, a PER-BINARY count that falls short of
-# that binary's total, and a shard that printed no summary — and fail LOUDLY,
-# naming the crashed shard and the last test it ran (the crash culprit). Without
-# this the summary reads "0 failed" on an undercount.
-if [[ "${#crashed_shards[@]}" -gt 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 || "$subset_empty" -eq 1 ]]; then
-    echo "############################################################"
-    echo "## GATE FAILURE: shard crash / undercount — result is NOT trustworthy"
-    echo "##   ran $ran of $expected_all expected tests ($(( expected_all - ran )) unaccounted) across $nbin binaries"
-    for u in "${undercount_bins[@]:-}"; do
-        [[ -n "$u" ]] && echo "##   UNDERCOUNT $u"
-    done
-    if [[ "$subset_empty" -eq 1 ]]; then
-        echo "##   SUBSET run selected 0 tests in EVERY binary (empty/unmatched BEZEL_TEST_LIST) — nothing was validated"
-    fi
-    if [[ "$summary_ok" -eq 0 ]]; then
-        echo "##   ${#missing_summary_shards[@]} of $njobs shards printed NO completion summary (slice not validated): shard(s) ${missing_summary_shards[*]}"
-    fi
-    for s in "${crashed_shards[@]:-}"; do
-        [[ -n "$s" ]] || continue
-        last="$(grep -a -E '^\[ RUN' "$logdir/shard.${s%/*}.${s#*/}.log" 2>/dev/null | tail -1 | sed -E 's/^\[ RUN  \] //')"
-        echo "##   shard $s exited nonzero — died on: ${last:-<none>}"
-    done
-    echo "############################################################"
+# Distinct listed-name count + the Python formatter are GATED identically to the
+# bash oracle below (subset mode, no filter, readable list) so the two formatters
+# share the exact same scope — the diff then proves the FORMATTING matches.
+# sort -u so a repeated list line does not read as a phantom, matching the
+# binary's own set semantics.
+listed=0
+_rp_py_phantom=""
+if [[ "$subset_mode" -eq 1 && -z "${BEZEL_TEST_FILTER:-}" && -r "${BEZEL_TEST_LIST:-}" ]]; then
+    listed="$(sed -E 's/[[:space:]]+$//; s/^[[:space:]]+//' "$BEZEL_TEST_LIST" 2>/dev/null | grep . | sort -u | grep -c .)"
+    # Phantom-name warning (#2100): a listed name matching NO registered test is
+    # a silently-dropped test. Computed HERE, not in the binary — with the suite
+    # split across binaries no single binary can tell a phantom from a name in a
+    # sibling binary. Only meaningful with no substring filter: under list+filter
+    # composition, selected < listed is the filter working, not phantom names.
+    _rp_py_phantom="$(PYTHONPATH="$repo_root/scripts" python3 -m gate.summary format-phantom --listed "$listed" --selected "$global_selected")"
 fi
+# OLD bash formatter (dual-run oracle — the exact pre-migration emission).
+_rp_phantom_bash() {
+    if [[ "$subset_mode" -eq 1 && -z "${BEZEL_TEST_FILTER:-}" && -r "${BEZEL_TEST_LIST:-}" ]]; then
+        if [[ "$global_selected" -lt "${listed:-0}" ]]; then
+            echo "bezel_tests: WARNING: only $global_selected of $listed listed tests matched the registry (BEZEL_TEST_LIST has phantom/renamed names)"
+        fi
+    fi
+}
+_rp_bash_phantom="$(_rp_phantom_bash)"
+if [[ "$_rp_py_phantom" != "$_rp_bash_phantom" ]]; then
+    {
+        echo "############################################################"
+        echo "## GATE FAILURE: phantom-warning PYTHON/BASH DRIFT"
+        echo "##   gate.summary disagrees with the proven bash formatter; the"
+        echo "##   'WARNING: only' literal is grepped by gate.sh/agent_check."
+        echo "##   py={$_rp_py_phantom} bash={$_rp_bash_phantom}"
+        echo "############################################################"
+    } >&2
+    exit 1
+fi
+[[ -n "$_rp_py_phantom" ]] && printf '%s\n' "$_rp_py_phantom"
+
+# GATE INTEGRITY (#1861): a crashed shard (segfault / uncaught exit(70)) silently
+# drops its remaining tests. Detect three ways — nonzero shard exit, a per-binary
+# count short of its total, a shard that printed no summary — and fail LOUDLY,
+# naming the crashed shard and the last test it ran. The culprit extraction
+# (grep RUN | tail -1 | sed) now lives in summary.py; this call is the authority.
+_rp_py_failure="$(PYTHONPATH="$repo_root/scripts" python3 -m gate.summary format-failure \
+    --ran "$ran" --expected "$expected_all" --nbin "$nbin" \
+    --subset-empty "$subset_empty" --njobs "$njobs" \
+    --undercount "${undercount_bins[@]}" \
+    --missing-summary "${missing_summary_shards[@]}" \
+    --crashed "${crashed_shards[@]}" \
+    --logdir "$logdir")"
+# OLD bash formatter (dual-run oracle — the exact pre-migration emission).
+_rp_failure_bash() {
+    if [[ "${#crashed_shards[@]}" -gt 0 || "$count_ok" -eq 0 || "$summary_ok" -eq 0 || "$subset_empty" -eq 1 ]]; then
+        echo "############################################################"
+        echo "## GATE FAILURE: shard crash / undercount — result is NOT trustworthy"
+        echo "##   ran $ran of $expected_all expected tests ($(( expected_all - ran )) unaccounted) across $nbin binaries"
+        local u
+        for u in "${undercount_bins[@]:-}"; do
+            [[ -n "$u" ]] && echo "##   UNDERCOUNT $u"
+        done
+        if [[ "$subset_empty" -eq 1 ]]; then
+            echo "##   SUBSET run selected 0 tests in EVERY binary (empty/unmatched BEZEL_TEST_LIST) — nothing was validated"
+        fi
+        if [[ "$summary_ok" -eq 0 ]]; then
+            echo "##   ${#missing_summary_shards[@]} of $njobs shards printed NO completion summary (slice not validated): shard(s) ${missing_summary_shards[*]}"
+        fi
+        local s last
+        for s in "${crashed_shards[@]:-}"; do
+            [[ -n "$s" ]] || continue
+            last="$(grep -a -E '^\[ RUN' "$logdir/shard.${s%/*}.${s#*/}.log" 2>/dev/null | tail -1 | sed -E 's/^\[ RUN  \] //')"
+            echo "##   shard $s exited nonzero — died on: ${last:-<none>}"
+        done
+        echo "############################################################"
+    fi
+}
+_rp_bash_failure="$(_rp_failure_bash)"
+if [[ "$_rp_py_failure" != "$_rp_bash_failure" ]]; then
+    {
+        echo "############################################################"
+        echo "## GATE FAILURE: banner PYTHON/BASH DRIFT"
+        echo "##   gate.summary disagrees with the proven bash formatter; the"
+        echo "##   'shard crash / undercount' literal is grepped by"
+        echo "##   gate_full_cycle.sh/gate.sh — a divergent banner would"
+        echo "##   silently break those tripwires."
+        echo "##   --- py ---"
+        printf '%s\n' "$_rp_py_failure"
+        echo "##   --- bash ---"
+        printf '%s\n' "$_rp_bash_failure"
+        echo "############################################################"
+    } >&2
+    exit 1
+fi
+[[ -n "$_rp_py_failure" ]] && printf '%s\n' "$_rp_py_failure"
 
 # Per-shard wall times (observation only — lets the gate's timing log spot shard
 # imbalance). Harvested from each shard's SHARD_ELAPSED marker before cleanup.

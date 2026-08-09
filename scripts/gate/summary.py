@@ -438,6 +438,114 @@ def harvest_run_summary(path):
     return int(obj.get("total_pass", 0)), ran
 
 
+# ---------------------------------------------------------------------------
+# Phase 6: the GATE FAILURE banner + phantom-name warning formatters.
+#
+# run_parallel.sh:275-317 (the integrity-failure banner + the phantom-name
+# warning) becomes `python3 -m gate.summary format-failure` / `format-phantom`
+# calls. Both return the EXACT text the bash emits — the literals are contracts:
+# 'shard crash / undercount' is grepped by gate_full_cycle.sh:79 (retry/accept)
+# and gate.sh:106 (verdict-truncation detection); 'WARNING: only' is grepped by
+# gate.sh:637 and agent_check.sh:266. per #2100 (the phantom-name distinct-names
+# rule has a real bug history — clearer + testable in Python) and #1608 (the
+# last-[ RUN ]-line culprit is a MISATTRIBUTION, but it is the documented
+# behavior consumers expect — preserved verbatim).
+
+# `grep -E '^\[ RUN'` — the crashed-shard log line that names the last test the
+# shard started (test_main.cpp:238 prints "[ RUN  ] suite.name").
+_RUN_PREFIX_RE = re.compile(r'^\[ RUN')
+# `sed -E 's/^\[ RUN  \] //'` — strip the gtest "[ RUN  ] " marker (two spaces
+# before the bracket, matching test_main.cpp's exact emission).
+_RUN_CULPRIT_RE = re.compile(r'^\[ RUN  \] ')
+
+
+def extract_crash_culprit(logdir, shard_id):
+    """The last [ RUN ] test name from a crashed shard's log, or '' if none.
+
+    Mirrors run_parallel.sh:313 — `grep -aE '^\\[ RUN' <log> | tail -1 |
+    sed -E 's/^\\[ RUN  \\] //'` — byte-for-byte. per #1608: the last-run test
+    need not be the crash culprit (a crash may surface one test late), but this
+    MISATTRIBUTION is the documented behavior consumers expect, so it is
+    preserved. Returns '' (which the banner renders as '<none>') when the shard
+    log is missing or holds no [ RUN ] line — the shard died at startup."""
+    name, sep, _idx = shard_id.partition('/')
+    if not sep:
+        return ''
+    path = os.path.join(logdir, 'shard.{}.{}.log'.format(name, _idx))
+    last = None
+    try:
+        with open(path, errors='replace') as f:  # -a: treat as text
+            for line in f:
+                if _RUN_PREFIX_RE.match(line):  # grep -E '^\[ RUN'
+                    last = line
+    except OSError:
+        return ''  # mirrors `2>/dev/null` — a missing log reads as <none>
+    if last is None:  # grep found nothing => tail -1 empty
+        return ''
+    # sed -E 's/^\[ RUN  \] //' — strip the marker if present (count=1: anchored
+    # at start, so this only fires when the prefix matches, else leaves the line
+    # unchanged, exactly like sed substitution semantics).
+    return _RUN_CULPRIT_RE.sub('', last.rstrip('\n'), count=1)
+
+
+def format_phantom_warning(listed, selected):
+    """The phantom-name warning line (#2100), or '' if no warning.
+
+    Mirrors run_parallel.sh:283-289: a BEZEL_TEST_LIST name matching NO
+    registered test is a silently-dropped test (typo, rename, or a selector
+    parse artifact). The warning text ('WARNING: only') is LOAD-BEARING —
+    gate.sh:637 and agent_check.sh:266 grep it, so the literal is preserved
+    verbatim. `listed` is the count of DISTINCT names in BEZEL_TEST_LIST (the
+    caller computes it: sed/sort -u/grep -c — a repeated list line must not read
+    as a phantom, matching the binary's own set semantics). Returns '' when every
+    listed name matched (selected >= listed)."""
+    if selected < listed:
+        return ("bezel_tests: WARNING: only %d of %d listed tests matched the "
+                "registry (BEZEL_TEST_LIST has phantom/renamed names)"
+                % (selected, listed))
+    return ""
+
+
+def format_failure_banner(ran, expected, nbin, undercount_bins, subset_empty,
+                          missing_summary_shards, njobs, crashed_culprits):
+    """The GATE FAILURE banner, byte-identical to run_parallel.sh:298-317, or
+    '' when integrity is ok.
+
+    `crashed_culprits` is an ordered list of (shard_id, culprit) pairs (culprit
+    from extract_crash_culprit; '' if none). The 'shard crash / undercount'
+    literal is LOAD-BEARING (gate_full_cycle.sh:79 + gate.sh:106 grep it). per
+    #1608: the culprit is the last [ RUN ] line. Returns '' when no integrity
+    defect is present — the bash `if` guard maps exactly (any crashed shard, any
+    undercount bin, any missing-summary shard, or subset-empty; count_ok==0 and
+    summary_ok==0 are equivalent to those lists being non-empty, see account()).
+    """
+    has_defect = bool(crashed_culprits or undercount_bins
+                      or missing_summary_shards or subset_empty)
+    if not has_defect:
+        return ""
+    lines = [
+        "############################################################",
+        "## GATE FAILURE: shard crash / undercount — result is NOT trustworthy",
+        ("##   ran %d of %d expected tests (%d unaccounted) across %d binaries"
+         % (ran, expected, expected - ran, nbin)),
+    ]
+    for u in undercount_bins:
+        lines.append("##   UNDERCOUNT %s" % u)
+    if subset_empty:
+        lines.append("##   SUBSET run selected 0 tests in EVERY binary "
+                     "(empty/unmatched BEZEL_TEST_LIST) — nothing was validated")
+    if missing_summary_shards:
+        lines.append("##   %d of %d shards printed NO completion summary "
+                     "(slice not validated): shard(s) %s"
+                     % (len(missing_summary_shards), njobs,
+                        " ".join(missing_summary_shards)))
+    for shard_id, culprit in crashed_culprits:
+        lines.append("##   shard %s exited nonzero — died on: %s"
+                     % (shard_id, culprit or "<none>"))
+    lines.append("############################################################")
+    return "\n".join(lines)
+
+
 def _main_check(logdir):
     mismatches = check_agreement(logdir)
     n_json = len(read_shard_summaries(logdir))
@@ -486,6 +594,58 @@ def _main_account(argv):
     return 0
 
 
+def _main_format_phantom(argv):
+    """`summary.py format-phantom --listed N --selected M` — print the
+    phantom-name warning line (or nothing). The gating (subset mode, no filter,
+    readable list) stays in run_parallel; this is the pure formatter (#2100)."""
+    import argparse
+    p = argparse.ArgumentParser(prog="summary.py format-phantom", add_help=True)
+    p.add_argument("--listed", type=int, required=True,
+                   help="distinct name count in BEZEL_TEST_LIST (caller-computed)")
+    p.add_argument("--selected", type=int, required=True,
+                   help="global selected count (run_parallel's global_selected)")
+    args = p.parse_args(argv)
+    text = format_phantom_warning(args.listed, args.selected)
+    if text:
+        sys.stdout.write(text + "\n")
+    return 0
+
+
+def _main_format_failure(argv):
+    """`summary.py format-failure --ran N --expected M --nbin N [--subset-empty 1]
+    --njobs N [--undercount a b ...] [--missing-summary x y ...]
+    [--crashed a/0 b/1 ...] --logdir PATH` — print the GATE FAILURE banner (or
+    nothing). The culprit extraction (grep RUN | tail -1 | sed) is done HERE
+    from the shard logs, so run_parallel no longer carries that fiddly shell."""
+    import argparse
+    p = argparse.ArgumentParser(prog="summary.py format-failure", add_help=True)
+    p.add_argument("--ran", type=int, required=True)
+    p.add_argument("--expected", type=int, required=True,
+                   help="expected_all (run_parallel's expected_all)")
+    p.add_argument("--nbin", type=int, required=True, help="binary count")
+    p.add_argument("--subset-empty", type=int, default=0,
+                   help="1 iff a SUBSET run selected 0 in every binary")
+    p.add_argument("--njobs", type=int, required=True, help="total shard count")
+    p.add_argument("--undercount", nargs="*", default=[],
+                   help="per-binary undercount bin strings")
+    p.add_argument("--missing-summary", nargs="*", default=[],
+                   help="shard IDs (name/idx) that printed no summary")
+    p.add_argument("--crashed", nargs="*", default=[],
+                   help="shard IDs (name/idx) that exited nonzero")
+    p.add_argument("--logdir", required=True,
+                   help="run_parallel shard logdir (shard.<name>.<i>.log)")
+    args = p.parse_args(argv)
+    crashed_culprits = [(s, extract_crash_culprit(args.logdir, s))
+                        for s in args.crashed]
+    text = format_failure_banner(
+        args.ran, args.expected, args.nbin, args.undercount,
+        bool(args.subset_empty), args.missing_summary, args.njobs,
+        crashed_culprits)
+    if text:
+        sys.stdout.write(text + "\n")
+    return 0
+
+
 def _main_run_summary(argv):
     """`summary.py run-summary harvest <path>` — read a BEZEL_RUN_SUMMARY and
     print shell-sourceable rp_run_* assignments for gate.sh. Emits
@@ -517,12 +677,17 @@ def main(argv):
         return _main_check(argv[2])
     if len(argv) >= 2 and argv[1] == "account":
         return _main_account(argv[2:])
+    if len(argv) >= 2 and argv[1] == "format-phantom":
+        return _main_format_phantom(argv[2:])
+    if len(argv) >= 2 and argv[1] == "format-failure":
+        return _main_format_failure(argv[2:])
     if len(argv) >= 2 and argv[1] == "run-summary":
         if len(argv) < 3:
             print("usage: summary.py run-summary harvest <path>", file=sys.stderr)
             return 2
         return _main_run_summary(argv[2:])
-    print("usage: summary.py {check|account|run-summary} ...", file=sys.stderr)
+    print("usage: summary.py {check|account|format-phantom|format-failure|"
+          "run-summary} ...", file=sys.stderr)
     return 2
 
 

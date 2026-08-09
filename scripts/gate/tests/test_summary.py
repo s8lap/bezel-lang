@@ -602,5 +602,223 @@ class AccountCLITest(_Fixture):
             self.assertEqual(out.returncode, 0)
 
 
+class ExtractCrashCulpritTest(unittest.TestCase):
+    r"""extract_crash_culprit mirrors run_parallel.sh:313 — `grep -aE '^\[ RUN'
+    <log> | tail -1 | sed -E 's/^\[ RUN  \] //'`. per #1608: the last-run test
+    is a MISATTRIBUTION for the crash culprit, but it is the documented behavior
+    consumers expect, so it is preserved byte-for-byte."""
+
+    def test_returns_last_run_test_name(self):
+        # tail -1: the LAST [ RUN ] line wins, not the first.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0,
+                       "[ RUN  ] First.test\n[  OK  ] First.test\n"
+                       "[ RUN  ] Second.test\n")
+            self.assertEqual(summary.extract_crash_culprit(d, "codegen/0"),
+                             "Second.test")
+
+    def test_missing_log_returns_empty(self):
+        # `2>/dev/null` — a missing shard log reads as <none> (empty culprit).
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(summary.extract_crash_culprit(d, "codegen/9"), "")
+
+    def test_no_run_line_returns_empty(self):
+        # grep found nothing => tail -1 empty => <none>.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0, "12 passed, 0 failed, 40 total\n")
+            self.assertEqual(summary.extract_crash_culprit(d, "codegen/0"), "")
+
+    def test_strips_exact_run_marker(self):
+        # The marker is "[ RUN  ] " (two spaces before the bracket — the exact
+        # emission of test_main.cpp:238); the test name follows verbatim.
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "sema", 1, "[ RUN  ] SuiteA.qux\n")
+            self.assertEqual(summary.extract_crash_culprit(d, "sema/1"),
+                             "SuiteA.qux")
+
+    def test_malformed_shard_id_returns_empty(self):
+        # partition('/') finds no '/' — a defensive guard (run_parallel always
+        # passes name/idx, but the function must not crash on bad input).
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(summary.extract_crash_culprit(d, "nodash"), "")
+
+
+class FormatPhantomWarningTest(unittest.TestCase):
+    """format_phantom_warning mirrors run_parallel.sh:283-289 (#2100). The
+    'WARNING: only' literal is LOAD-BEARING — gate.sh:637 and agent_check.sh:266
+    grep it, so the exact text is pinned."""
+
+    def test_warns_when_selected_below_listed(self):
+        self.assertEqual(
+            summary.format_phantom_warning(listed=10, selected=7),
+            "bezel_tests: WARNING: only 7 of 10 listed tests matched the "
+            "registry (BEZEL_TEST_LIST has phantom/renamed names)")
+
+    def test_no_warning_when_selected_equals_listed(self):
+        self.assertEqual(summary.format_phantom_warning(listed=8, selected=8), "")
+
+    def test_no_warning_when_selected_above_listed(self):
+        self.assertEqual(summary.format_phantom_warning(listed=5, selected=9), "")
+
+    def test_no_warning_when_listed_zero(self):
+        # An empty/unset list cannot have phantom names; selected(>=0) < 0 is
+        # never true, matching bash's `${listed:-0}` default.
+        self.assertEqual(summary.format_phantom_warning(listed=0, selected=0), "")
+
+    def test_literal_is_preserved_verbatim(self):
+        # The exact bytes gate.sh/agent_check grep for — the contract.
+        out = summary.format_phantom_warning(listed=3, selected=1)
+        self.assertTrue(out.startswith("bezel_tests: WARNING: only 1 of 3"))
+        self.assertIn("BEZEL_TEST_LIST has phantom/renamed names", out)
+
+
+class FormatFailureBannerTest(unittest.TestCase):
+    """format_failure_banner mirrors run_parallel.sh:298-317. The 'shard crash
+    / undercount' literal is LOAD-BEARING — gate_full_cycle.sh:79 (retry/accept)
+    and gate.sh:106 (verdict-truncation detection) grep it; the em-dashes are
+    pinned byte-for-byte."""
+
+    def test_no_defect_returns_empty(self):
+        self.assertEqual(summary.format_failure_banner(
+            ran=10, expected=10, nbin=2, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=[], njobs=4,
+            crashed_culprits=[]), "")
+
+    def test_crashed_only_with_culprit(self):
+        out = summary.format_failure_banner(
+            ran=8, expected=10, nbin=1, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=[], njobs=2,
+            crashed_culprits=[("codegen/0", "SuiteA.qux")])
+        self.assertEqual(out, "\n".join([
+            "############################################################",
+            "## GATE FAILURE: shard crash / undercount — result is NOT trustworthy",
+            "##   ran 8 of 10 expected tests (2 unaccounted) across 1 binaries",
+            "##   shard codegen/0 exited nonzero — died on: SuiteA.qux",
+            "############################################################"]))
+
+    def test_crashed_with_empty_culprit_renders_none(self):
+        # ${last:-<none>} — an empty culprit (shard died at startup) => <none>.
+        out = summary.format_failure_banner(
+            ran=0, expected=5, nbin=1, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=[], njobs=1,
+            crashed_culprits=[("codegen/0", "")])
+        self.assertIn("died on: <none>", out)
+
+    def test_undercount_bins_each_get_a_line(self):
+        out = summary.format_failure_banner(
+            ran=3, expected=8, nbin=2,
+            undercount_bins=["codegen: ran 1 of 3 registered",
+                             "sema: ran 2 of 5 registered"],
+            subset_empty=False, missing_summary_shards=[], njobs=4,
+            crashed_culprits=[])
+        self.assertIn("##   UNDERCOUNT codegen: ran 1 of 3 registered", out)
+        self.assertIn("##   UNDERCOUNT sema: ran 2 of 5 registered", out)
+        # unaccounted = expected - ran = 5
+        self.assertIn("ran 3 of 8 expected tests (5 unaccounted) across 2 binaries",
+                      out)
+
+    def test_subset_empty_line(self):
+        out = summary.format_failure_banner(
+            ran=0, expected=0, nbin=2, undercount_bins=[],
+            subset_empty=True, missing_summary_shards=[], njobs=4,
+            crashed_culprits=[])
+        self.assertIn("##   SUBSET run selected 0 tests in EVERY binary "
+                      "(empty/unmatched BEZEL_TEST_LIST) — nothing was validated",
+                      out)
+
+    def test_missing_summary_line_with_count_and_list(self):
+        # "N of M shards ... shard(s) a b" — count + space-joined list.
+        out = summary.format_failure_banner(
+            ran=4, expected=4, nbin=2, undercount_bins=[],
+            subset_empty=False,
+            missing_summary_shards=["sema/1", "codegen/0"], njobs=4,
+            crashed_culprits=[])
+        self.assertIn("##   2 of 4 shards printed NO completion summary "
+                      "(slice not validated): shard(s) sema/1 codegen/0", out)
+
+    def test_all_defects_combined_byte_identity_pin(self):
+        # The full banner — a snapshot pin (judgement, not behaviour): the
+        # literal lines, the em-dashes, and the ordering are all contracts.
+        out = summary.format_failure_banner(
+            ran=3, expected=10, nbin=2,
+            undercount_bins=["codegen: ran 1 of 3 registered"],
+            subset_empty=True,
+            missing_summary_shards=["sema/1"], njobs=4,
+            crashed_culprits=[("codegen/0", "Last.Run"),
+                              ("frontend/1", "")])
+        self.assertEqual(out, "\n".join([
+            "############################################################",
+            "## GATE FAILURE: shard crash / undercount — result is NOT trustworthy",
+            "##   ran 3 of 10 expected tests (7 unaccounted) across 2 binaries",
+            "##   UNDERCOUNT codegen: ran 1 of 3 registered",
+            "##   SUBSET run selected 0 tests in EVERY binary "
+            "(empty/unmatched BEZEL_TEST_LIST) — nothing was validated",
+            "##   1 of 4 shards printed NO completion summary "
+            "(slice not validated): shard(s) sema/1",
+            "##   shard codegen/0 exited nonzero — died on: Last.Run",
+            "##   shard frontend/1 exited nonzero — died on: <none>",
+            "############################################################"]))
+
+    def test_load_bearing_literal_preserved(self):
+        # gate_full_cycle.sh:79 + gate.sh:106 grep 'shard crash / undercount'.
+        out = summary.format_failure_banner(
+            ran=0, expected=1, nbin=1, undercount_bins=[],
+            subset_empty=False, missing_summary_shards=[], njobs=1,
+            crashed_culprits=[("x/0", "")])
+        self.assertIn("shard crash / undercount", out)
+
+
+class FormatCLITest(unittest.TestCase):
+    """The format-phantom / format-failure CLIs that run_parallel calls."""
+
+    def _run_cli(self, args):
+        import subprocess
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.path.join(os.path.dirname(__file__),
+                                         "..", "..")
+        out = subprocess.run([sys.executable, "-m", "gate.summary"] + args,
+                             capture_output=True, text=True, env=env,
+                             cwd=os.path.join(os.path.dirname(__file__),
+                                              "..", ".."))
+        return out
+
+    def test_format_phantom_cli_emits_warning(self):
+        out = self._run_cli(["format-phantom", "--listed", "10",
+                             "--selected", "7"])
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout,
+                         "bezel_tests: WARNING: only 7 of 10 listed tests "
+                         "matched the registry (BEZEL_TEST_LIST has phantom/"
+                         "renamed names)\n")
+
+    def test_format_phantom_cli_emits_nothing_when_no_warning(self):
+        out = self._run_cli(["format-phantom", "--listed", "5",
+                             "--selected", "5"])
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, "")
+
+    def test_format_failure_cli_with_culprit_extraction(self):
+        # The CLI does the culprit extraction from the shard log itself
+        # (run_parallel no longer carries the grep|tail|sed).
+        with tempfile.TemporaryDirectory() as d:
+            _write_log(d, "codegen", 0,
+                       "[ RUN  ] First.test\n[ RUN  ] Second.test\n")
+            out = self._run_cli(
+                ["format-failure", "--ran", "8", "--expected", "10",
+                 "--nbin", "1", "--njobs", "2", "--crashed", "codegen/0",
+                 "--logdir", d])
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("shard crash / undercount", out.stdout)
+            self.assertIn("died on: Second.test", out.stdout)
+
+    def test_format_failure_cli_no_defect_emits_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = self._run_cli(
+                ["format-failure", "--ran", "10", "--expected", "10",
+                 "--nbin", "2", "--njobs", "4", "--logdir", d])
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main()
