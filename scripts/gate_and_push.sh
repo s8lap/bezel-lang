@@ -39,6 +39,12 @@
 set -u
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate_and_push: not in a git repo" >&2; exit 2; }
 
+# The authoritative verdict file path (matches gate.sh:77 / gate_full_cycle.sh).
+# Phase 3c (per the exit-code-trap): the gate writes its outcome here on every
+# exit; this consumer cross-checks it against $? before pushing.
+S=/var/tmp/bezel-scratch
+GATE_VERDICT="${GATE_VERDICT_FILE:-$S/gate-verdict.json}"
+
 CYCLE_ARGS=()
 SINGLE_MODE=""
 while [ $# -gt 0 ]; do
@@ -86,6 +92,35 @@ else
 fi
 
 if "${GATE_CMD[@]}"; then
+  # Phase 3c (per the exit-code-trap): cross-check the gate's exit against the
+  # AUTHORITATIVE verdict file. $? is reliable HERE (a foreground command — no
+  # pipeline/backgrounding), but the verdict is the structured source an EXTERNAL
+  # observer (the coordinator, gate_wait.sh) will rely on across the
+  # backgrounding boundary that bit it 4x. Assert they agree so the verdict
+  # never silently contradicts the exit code a push is about to trust.
+  #
+  # --expect-head rejects a STALE verdict from a previous gate on the same shared
+  # path (#3000 shape: a reader that proceeds on a document not its own). Exit 2
+  # from the read CLI = missing/unparseable/stale — the writer is best-effort,
+  # so fall back to $? (back-compat). Exit 1 = verdict present but NOT a
+  # trustworthy pass — the exit and the verdict DISAGREE, which must never be
+  # silently pushed on.
+  _head="$(git rev-parse HEAD 2>/dev/null || echo '')"
+  if PYTHONPATH=scripts python3 -m gate.verdict read --path "$GATE_VERDICT" \
+       --expect-head "$_head" 2>/dev/null; then
+    : # verdict agrees: trustworthy pass.
+  else
+    _vrc=$?
+    if [ "$_vrc" -eq 2 ]; then
+      echo "== gate_and_push: note — no usable cycle verdict at $GATE_VERDICT (writer best-effort) — relying on \$? =="
+    else
+      echo "== gate_and_push: REFUSING TO PUSH — the gate exited 0 but the verdict file is NOT a trustworthy pass ==" >&2
+      echo "   The exit code and the verdict disagree (per the exit-code-trap, this is exactly the class that pushed 55 truncated gates)." >&2
+      echo "   Verdict: $GATE_VERDICT — inspect before trusting either source." >&2
+      exit 1
+    fi
+  fi
+
   # fix #3010: THE LAST CHECK BEFORE A PUSH IS THE GATE'S OWN TELEMETRY.
   #
   # Both oracles have reported green by here. That is exactly the state in which

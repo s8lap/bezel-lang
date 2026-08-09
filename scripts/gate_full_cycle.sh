@@ -40,6 +40,14 @@ set -u
 REPO=/home/stepan/w/code/bezel-lang
 cd "$REPO" || exit 1
 
+# Scratch dir + cycle-verdict path (matches gate.sh:76-77). The cycle writes its
+# OWN verdict here (Phase 3c, per the exit-code-trap) so downstream consumers
+# (gate_and_push.sh, gate_wait.sh) read the CYCLE outcome — not a per-attempt
+# gate.sh verdict, which lives at a per-run path inside run_until_trustworthy
+# (set via GATE_VERDICT_FILE, honored at gate.sh:77).
+S=/var/tmp/bezel-scratch; mkdir -p "$S"
+CYCLE_VERDICT_FILE="${GATE_VERDICT_FILE:-$S/gate-verdict.json}"
+
 LOGDIR=/var/tmp/bezel-scratch/gate-cycle
 TAG=""
 MAX_ATTEMPTS=40
@@ -60,55 +68,129 @@ CYCLE_LOG="$LOGDIR/${TAG}_cycle.log"
 
 say() { echo "[gate_full_cycle $(date '+%H:%M:%S')] $*" | tee -a "$CYCLE_LOG"; }
 
-# Run one gate mode until it produces a TRUSTWORTHY result, i.e. rc==0 AND no
-# undercount banner. rc==2 is gate.sh's "preflight refused: builders active" —
-# that is a retry, not a failure. Any other non-zero rc is a REAL failure and is
-# returned immediately: retrying a red gate just hides the regression.
+# _legacy_rc_decision — the decision the ORIGINAL $?/banner-grep logic makes.
+# Kept as the CROSS-CHECK assertion (Phase 3c dual-consume) and the FALLBACK when
+# the verdict file is missing (back-compat; the writer is best-effort, per
+# #3002). per the exit-code-trap: in THIS foreground call $? is the gate's own
+# exit (no pipeline/backgrounding), so it is reliable HERE — the trap bites the
+# EXTERNAL observer (gate_and_push/gate_wait), not this inner loop.
+_legacy_rc_decision() { # rc log -> echoes accept|retry|bail
+  case "$1" in
+    0)  if grep -q 'shard crash / undercount' "$2" 2>/dev/null; then echo retry; else echo accept; fi ;;
+    2|3) echo retry ;;
+    *)  echo bail ;;
+  esac
+}
+
+# write_cycle_verdict — write the cycle-level authoritative verdict (Phase 3c,
+# per the exit-code-trap). Called from the EXIT trap on EVERY cycle exit so a
+# downstream consumer (gate_and_push.sh, gate_wait.sh) reads the CYCLE outcome
+# from one file instead of the cycle's $? — which is reliable in-process but not
+# across the backgrounding boundary that bit the coordinator 4x. Best-effort
+# (`|| true`): a verdict-write hiccup must never change the exit code.
+write_cycle_verdict() { # rc
+  local rc="$1"
+  local head; head="$(git rev-parse HEAD 2>/dev/null || echo '')"
+  PYTHONPATH=scripts python3 -m gate.verdict write --path "$CYCLE_VERDICT_FILE" \
+    --rc "$rc" --head="$head" --mode=cycle --oracle=dual 2>/dev/null || true
+}
+trap 'rc=$?; write_cycle_verdict "$rc" || true; exit $rc' EXIT
+
+# Run one gate mode until it produces a TRUSTWORTHY result. Phase 3c (per the
+# exit-code-trap): the decision now comes from the AUTHORITATIVE gate-verdict.json
+# that gate.sh writes on every exit, not from $?/banner greps. The verdict
+# materializes the rc==0+undercount distrust as a POISONED verdict (#3001), so
+# this consumer checks one structured field instead of re-implementing the
+# distrust grep. $?/grep is kept as a CROSS-CHECK assertion (dual-consume): the
+# verdict and the legacy logic are derived from the same signals inside gate.sh,
+# so disagreement means a bug or a race — scream LOUDLY and take the conservative
+# (non-accept) decision. A missing verdict falls back to the legacy $?/grep.
+#
+# Decision mapping (verdict -> cycle action):
+#   pass (+trustworthy) -> accept   rc==0, no undercount
+#   refused             -> retry    rc==2: preflight, builders active (transient)
+#   retry               -> retry    rc==3: coverage short (#3002)
+#   poisoned            -> retry    rc==0 + undercount distrust (#3001)
+#   fail                -> bail     rc==1: real regression
 run_until_trustworthy() {
   local log="$1"; shift
   local mode_desc="${1:-plain}"; shift || true
-  local i rc
+  local i rc v_verdict v_rc dec old_dec reason
   for i in $(seq 1 "$MAX_ATTEMPTS"); do
     # BEZEL_GATE_CYCLE=1 tells gate.sh that a DUAL-oracle run is driving it, so
     # it suppresses its "this is one oracle, not an acceptance verdict" note
-    # (#2917). The note exists for direct single-mode callers; inside the cycle
-    # it would be false — both oracles are being run and this wrapper applies
-    # the real acceptance condition.
-    BEZEL_NO_GC=1 BEZEL_GATE_CYCLE=1 scripts/gate.sh "$@" > "$log" 2>&1
+    # (#2917). GATE_VERDICT_FILE points THIS gate's verdict at a PER-ATTEMPT path
+    # (the default is a SHARED file every gate overwrites — gate.sh:277), so the
+    # consumer reads its OWN gate's verdict, not a stale/concurrent one.
+    local vf="${log%.log}.attempt${i}.verdict.json"
+    BEZEL_NO_GC=1 BEZEL_GATE_CYCLE=1 GATE_VERDICT_FILE="$vf" \
+      scripts/gate.sh "$@" > "$log" 2>&1
     rc=$?
-    if [ "$rc" -eq 2 ]; then
-      say "$mode_desc attempt $i: preflight refused (builders active) — waiting"
-      sleep 45; continue
+
+    # Read the verdict (exit 0 iff trustworthy pass; 1 iff present-not-pass;
+    # 2 iff missing/unparseable — consumer falls back to $?).
+    v_verdict="$(PYTHONPATH=scripts python3 -m gate.verdict read --path "$vf" --field verdict 2>/dev/null)"
+    v_rc=$?
+
+    # Map the verdict to a decision (empty = verdict absent -> fallback below).
+    case "$v_verdict" in
+      pass)     dec=accept ;;
+      refused)  dec=retry ;;
+      retry)    dec=retry ;;
+      poisoned) dec=retry ;;
+      fail)     dec=bail ;;
+      *)        dec="" ;;
+    esac
+
+    # CROSS-CHECK (dual-consume): compute the legacy $?/grep decision and verify
+    # the verdict agrees. Disagreement means a bug in the verdict write or a race
+    # on the verdict file — scream LOUDLY and take the CONSERVATIVE non-accept
+    # decision. per the exit-code-trap: a false accept is the worst outcome (55
+    # pass-but-truncated gates over 24 days).
+    old_dec="$(_legacy_rc_decision "$rc" "$log")"
+    if [ -n "$dec" ] && [ "$dec" != "$old_dec" ]; then
+      say "VERDICT CROSS-CHECK DISAGREEMENT: verdict=$v_verdict->$dec but \$?=$rc/grep->$old_dec (attempt $i)"
+      say "  The verdict and legacy logic disagree — taking the conservative (non-accept) decision."
+      if [ "$dec" = accept ] || [ "$old_dec" = accept ]; then
+        dec=bail
+      fi
     fi
-    # rc==3 (#3002): the sharded pass was TRUNCATED — fewer gtests ran than the
-    # registry says exist. That is not a verdict about the tree, so it is a
-    # retry, not a REAL FAILURE. Keep the log: this is the one shape that used
-    # to be laundered into `== GATE PASS ==` by flake arbitration.
-    if [ "$rc" -eq 3 ]; then
-      cp -f "$log" "${log%.log}.attempt${i}.log" 2>/dev/null || true
-      say "$mode_desc attempt $i: COVERAGE SHORT — $(grep -oE '[0-9]+ of [0-9]+ gtests ran' "$log" | tail -1) — retrying (log kept: ${log%.log}.attempt${i}.log)"
-      sleep 60; continue
-    fi
-    if [ "$rc" -ne 0 ]; then
-      say "$mode_desc attempt $i: REAL FAILURE rc=$rc — see $log"
-      return "$rc"
-    fi
-    if grep -q 'shard crash / undercount' "$log"; then
-      # PRESERVE THE EVIDENCE (#3001). Every attempt writes to the same $log, so
-      # before this loop each distrusted attempt was OVERWRITTEN by the next one
-      # and only the final (green) run survived. That made the undercount
-      # undiagnosable: the banner's own numbers — reported `ran` vs the registry
-      # total, which shard dropped, whether a completion summary was missing at
-      # all — live in the attempt's log and nowhere else. The 2026-08-07
-      # close-out undercounted three times in a row and left nothing to look at.
-      # Keep the canonical path pointing at the LAST attempt (callers grep it),
-      # and copy each distrusted one aside.
-      cp -f "$log" "${log%.log}.attempt${i}.log" 2>/dev/null || true
-      say "$mode_desc attempt $i: rc=0 but UNDERCOUNT banner present — NOT trusted, retrying (log kept: ${log%.log}.attempt${i}.log)"
-      sleep 60; continue
-    fi
-    say "$mode_desc attempt $i: TRUSTWORTHY GREEN (rc=0, no undercount) — $log"
-    return 0
+    # FALLBACK: verdict missing/unparseable — use the legacy $?/grep decision.
+    [ -z "$dec" ] && dec="$old_dec"
+
+    # Act on the decision, preserving the per-case messages + evidence (#3001).
+    case "$dec" in
+      retry)
+        # Determine the reason (verdict value, or rc in fallback mode) to keep
+        # the original specific messages + sleep durations.
+        reason="$v_verdict"
+        [ -z "$reason" ] && case "$rc" in 2) reason=refused;; 3) reason=retry;; *) reason=poisoned;; esac
+        if [ "$reason" = refused ]; then
+          say "$mode_desc attempt $i: preflight refused (builders active) — waiting"
+          sleep 45; continue
+        fi
+        # PRESERVE THE EVIDENCE (#3001). Every attempt writes to the same $log,
+        # so each distrusted attempt was OVERWRITTEN by the next and only the
+        # final (green) run survived — making an undercount undiagnosable: the
+        # banner's own numbers (reported `ran` vs the registry total, which shard
+        # dropped, whether a completion summary was missing) live in the
+        # attempt's log and nowhere else. The 2026-08-07 close-out undercounted
+        # three times in a row and left nothing to look at. Keep the canonical
+        # path at the LAST attempt (callers grep it) and copy each aside.
+        cp -f "$log" "${log%.log}.attempt${i}.log" 2>/dev/null || true
+        if [ "$reason" = retry ]; then
+          say "$mode_desc attempt $i: COVERAGE SHORT — $(grep -oE '[0-9]+ of [0-9]+ gtests ran' "$log" | tail -1) — retrying (log kept: ${log%.log}.attempt${i}.log)"
+        else
+          say "$mode_desc attempt $i: rc=$rc UNDERCOUNT banner present (verdict=$reason) — NOT trusted, retrying (log kept: ${log%.log}.attempt${i}.log)"
+        fi
+        sleep 60; continue ;;
+      bail)
+        say "$mode_desc attempt $i: REAL FAILURE rc=$rc verdict=${v_verdict:-n/a} — see $log"
+        return "$rc" ;;
+      accept)
+        say "$mode_desc attempt $i: TRUSTWORTHY GREEN (verdict=${v_verdict:-pass}, rc=$rc) — $log"
+        return 0 ;;
+    esac
   done
   say "$mode_desc: no trustworthy run in $MAX_ATTEMPTS attempts — giving up"
   return 99
@@ -164,6 +246,21 @@ run_until_trustworthy "$LOGDIR/${TAG}_full.log" "full(ASan)" --full || exit $?
 # belt to that braces: a POSITIVE allow-list missing a name is variant 1 of the
 # category-defect taxonomy, so the downstream evidence check must stand on its
 # own rather than trusting the upstream list to be complete.
+#
+# Phase 3c partial: the verdict carries an `oracle` field (gate.sh sets it from
+# ASAN=1 when MODE=--full). Cross-check the last --full pass's verdict says
+# oracle=asan. The log grep stays AUTHORITATIVE: it checks OBSERVED evidence
+# (sanitizer output in the log), while the verdict's oracle is the INTENDED mode
+# — the grep catches a mode that silently degraded even if the verdict says asan.
+_fvf=$(ls -1 "$LOGDIR/${TAG}_full.attempt"*.verdict.json 2>/dev/null | sort -V | tail -1)
+if [ -n "$_fvf" ]; then
+  _ora="$(PYTHONPATH=scripts python3 -m gate.verdict read --path "$_fvf" --field oracle 2>/dev/null)"
+  if [ "$_ora" != asan ]; then
+    say "CYCLE FAILURE: the --full verdict says oracle='${_ora:-n/a}' (expected asan) — $_fvf"
+    say "  Refusing to report dual-oracle green — the ASan oracle's verdict does not confirm it ran."
+    exit 1
+  fi
+fi
 if ! grep -qi 'asan\|sanitize' "$LOGDIR/${TAG}_full.log"; then
   say "CYCLE FAILURE: the --full log mentions no sanitizer — the ASan oracle did NOT run."
   say "  Refusing to report dual-oracle green for a cycle that ran one oracle twice."

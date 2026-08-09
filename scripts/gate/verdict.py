@@ -1,4 +1,4 @@
-"""verdict.py — the authoritative gate verdict file (Phase 3-additive, #3002).
+"""verdict.py — the authoritative gate verdict file (Phase 3, #3002).
 
 THE EXIT-CODE-TRAP CLASS (bit the coordinator 4x this run): a backgrounded
 `gate_and_push.sh > log; echo EXIT=$?` reports the WRAPPER's exit (the
@@ -12,19 +12,23 @@ $?, banner greps, a status file) and they can disagree:
     pipeline read the wrapper's exit, not the gate's, four times.
 
 This module writes ONE authoritative gate-verdict.json on every gate exit,
-atomically, that Phase 3c consumers will read instead of $?/greps.
+atomically, that Phase 3c consumers read instead of $?/greps.
 
-PHASE 3 IS ADDITIVE: the write lands here, but NO consumer switches yet (the
-existing $?/banner/status-file outputs are unchanged — back-compat). The file
-is observation-only until N gates prove it matches the gate's actual outcome,
-then Phase 3c switches the readers (gate_full_cycle, gate_and_push, gate_wait,
-dev agents).
+PHASE 3c (consumers switched): gate_full_cycle.sh's run_until_trustworthy now
+decides from the verdict (verdict==pass && trustworthy -> accept; refused/retry/
+poisoned -> retry; fail -> bail), with the legacy $?/grep as a cross-check
+assertion and fallback. gate_and_push.sh cross-checks the verdict before a push.
+gate_wait.sh classifies from the verdict with log-grep fallback. The legacy
+$?/banner/status-file outputs are UNCHANGED (back-compat) — the verdict is
+primary, they are the belt-and-braces.
 
 Stdlib only (no pytest). Comments cite issues (#3002, the exit-code-trap, etc).
 See test_verdict.py for the load-bearing pins:
   - trustworthy=False iff pass+truncated (#3002 shape)
   - the verdict enum covers every gate.sh exit path (fail/retry/refused/poisoned/pass)
   - the file is valid JSON + present after a simulated mid-exit crash (atomic rename)
+  - dual-consume equivalence: verdict decision == legacy $?/grep decision on all
+    reachable gate states (the 0-disagreement proof)
 """
 
 import argparse
@@ -284,11 +288,105 @@ def _main_write(argv):
     return 0
 
 
+def _main_read(argv):
+    """`read` subcommand — the consumer-side entry point (Phase 3c, #3002).
+
+    THE EXIT-CODE-TRAP, RECIPROCAL: gate.sh writes the verdict on every exit so
+    a consumer does not have to trust $?/banner greps. This is how a consumer
+    READS it back. The exit code is the canonical green-oracle question —
+    "is this a trustworthy pass?" — so a consumer can:
+
+        if PYTHONPATH=scripts python3 -m gate.verdict read --path "$VF"; then
+            # verdict == pass && trustworthy -> accept
+        fi
+
+    Exit codes:
+      0  verdict is pass AND trustworthy (a green gate you can act on).
+      1  verdict is present but NOT a trustworthy pass (fail/retry/refused/
+         poisoned — the consumer maps these to retry/bail per its own policy).
+      2  verdict file missing, unparseable, stale (head mismatch), or the
+         requested field is absent. The consumer FALLS BACK to $?/greps
+         (back-compat; the verdict writer is best-effort, never load-bearing
+         on its own — per #3002's additive-then-switch discipline).
+
+    `--field NAME` prints a single top-level field (verdict/trustworthy/head/
+    mode/oracle/...) to stdout for diagnostic display; it does NOT change the
+    exit code (which is always the pass-and-trustworthy predicate). This lets a
+    consumer fetch the verdict value for a retry/bail branch while still using
+    the exit code for the accept check.
+
+    `--expect-head SHA` refuses (exit 2) if the verdict's head != SHA. This is
+    the disambiguation a poller uses to reject a STALE or CONCURRENT gate's
+    verdict on the shared default path (#3000 shape: a reader that proceeds on
+    a document not its own is the defect).
+    """
+    p = argparse.ArgumentParser(
+        prog="verdict.py read",
+        description="Read an authoritative gate-verdict.json (Phase 3c, #3002). "
+                    "Exit 0 iff verdict==pass && trustworthy; 1 iff present but "
+                    "not a trustworthy pass; 2 iff missing/unparseable/stale.",
+    )
+    p.add_argument("--path", required=True, help="verdict file path to read")
+    p.add_argument("--field", default=None,
+                   help="print a single top-level field (verdict/trustworthy/"
+                        "head/mode/oracle/...) to stdout; exit code is unchanged")
+    p.add_argument("--expect-head", default=None,
+                   help="refuse (exit 2) if the verdict head != this sha "
+                        "(disambiguates a stale/concurrent gate's verdict)")
+    args = p.parse_args(argv)
+
+    obj = read_verdict(args.path)
+    if obj is None:
+        # Missing or unparseable — consumer falls back to the legacy $?/grep
+        # path (back-compat; the verdict writer is best-effort, per #3002).
+        return 2
+
+    if args.expect_head is not None:
+        head = obj.get("head", "")
+        if head != args.expect_head:
+            # Stale: another gate's verdict, or a back-to-back run overwrote the
+            # shared path. Refuse rather than acting on the wrong gate's outcome
+            # (the #3000 shape: a reader that proceeds on a document it does not
+            # own is the defect).
+            sys.stderr.write(
+                "verdict read: head mismatch (got {!r}, expected {!r}) — refusing "
+                "a stale/concurrent verdict at {}\n".format(
+                    head[:12], args.expect_head[:12], args.path))
+            return 2
+
+    if args.field is not None:
+        if args.field not in obj:
+            sys.stderr.write(
+                "verdict read: no such field {!r} in {}\n".format(
+                    args.field, args.path))
+            return 2
+        val = obj[args.field]
+        # Booleans print as JSON lowercases (true/false), not Python title-case,
+        # so a shell consumer can test [ "$val" = true ].
+        if isinstance(val, bool):
+            print("true" if val else "false")
+        elif val is None:
+            print("null")
+        else:
+            print(val)
+
+    # The exit code is always the trustworthy-pass predicate, regardless of
+    # --field (the field is for display; the exit code is the decision). per the
+    # exit-code-trap: "exit 0 is not an oracle" — and a non-pass verdict is
+    # honestly non-zero here.
+    v = obj.get("verdict")
+    tw = obj.get("trustworthy")
+    if v == Verdict.PASS.value and tw is True:
+        return 0
+    return 1
+
+
 def main(argv):
     if len(argv) >= 2 and argv[1] == "write":
         return _main_write(argv[2:])
-    # No subcommand: a future Phase 3c consumer will add a `read` subcommand.
-    sys.stderr.write("usage: verdict.py write --path PATH --rc RC [options]\n")
+    if len(argv) >= 2 and argv[1] == "read":
+        return _main_read(argv[2:])
+    sys.stderr.write("usage: verdict.py {write|read} --path PATH [options]\n")
     return 2
 
 

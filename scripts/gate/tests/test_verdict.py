@@ -122,6 +122,88 @@ class TrustworthyTest(unittest.TestCase):
                         v.value, trunc, result, not expected_false))
 
 
+class DualConsumeEquivalenceTest(unittest.TestCase):
+    """The 0-disagreement proof (Phase 3c): for every REACHABLE gate state, the
+    verdict-based decision and the legacy $?/banner-grep decision AGREE.
+
+    The legacy logic (gate_full_cycle.sh's original run_until_trustworthy,
+    now preserved as _legacy_rc_decision) maps:
+        rc==2                -> retry   (preflight refused)
+        rc==3                -> retry   (coverage short)
+        rc!=0 (not 2/3)      -> bail    (real failure)
+        rc==0 + undercount   -> retry   (distrust, #3001)
+        rc==0, clean         -> accept
+
+    The verdict-based decision maps the Verdict enum to the same three actions:
+        pass (+trustworthy)  -> accept
+        refused/retry/poisoned -> retry
+        fail                 -> bail
+
+    They are derived from the SAME signals inside gate.sh (rc + undercount
+    banner), so they must agree on every reachable state. The ONLY divergence is
+    rc==64 (bad-mode preflight refusal): legacy bails, verdict says refused->retry.
+    That state is UNREACHABLE from the cycle (gate_full_cycle passes only valid
+    modes: "plain"/default and "--full"), and even if it arose, retry is harmless
+    (it retries until exhaustion -> return 99, which is still non-zero, no push).
+    """
+
+    # The legacy $?/grep decision (faithful copy of _legacy_rc_decision).
+    @staticmethod
+    def _legacy_decision(rc, undercount):
+        if rc == 2:
+            return "retry"
+        if rc == 3:
+            return "retry"
+        if rc != 0:
+            return "bail"
+        if undercount:
+            return "retry"
+        return "accept"
+
+    # The verdict-based decision (faithful copy of run_until_trustworthy's case).
+    @staticmethod
+    def _verdict_decision(rc, undercount):
+        truncated = undercount or (rc == 3)
+        v = verdict.verdict_from_rc(rc, truncated)
+        return {
+            verdict.Verdict.PASS.value: "accept",
+            verdict.Verdict.REFUSED.value: "retry",
+            verdict.Verdict.RETRY.value: "retry",
+            verdict.Verdict.POISONED.value: "retry",
+            verdict.Verdict.FAIL.value: "bail",
+        }[v.value]
+
+    def test_agree_on_all_reachable_states(self):
+        """For every (rc, undercount) the cycle can produce, the two decisions
+        agree. The cycle's reachable exit codes are 0, 1, 2, 3 (gate.sh's exit
+        taxonomy: pass/fail/preflight-refused/coverage-short). rc==64 (bad mode)
+        is unreachable — the cycle passes only valid modes."""
+        reachable_rcs = [0, 1, 2, 3]
+        disagreements = []
+        for rc in reachable_rcs:
+            for undercount in (True, False):
+                legacy = self._legacy_decision(rc, undercount)
+                new = self._verdict_decision(rc, undercount)
+                if legacy != new:
+                    disagreements.append(
+                        "rc={}, undercount={}: legacy={} verdict={}".format(
+                            rc, undercount, legacy, new))
+        self.assertEqual(disagreements, [],
+            "verdict/legacy disagreement on reachable states:\n  " +
+            "\n  ".join(disagreements))
+
+    def test_rc64_divergence_is_documented_and_unreachable(self):
+        """rc==64 (bad mode) is the ONLY divergence: legacy bails, verdict retries.
+        This is unreachable from the cycle (valid modes only) and harmless if it
+        ever arises (retry -> exhaustion -> 99, still no push). Pinned so a future
+        change to either mapping notices the divergence immediately."""
+        for undercount in (True, False):
+            legacy = self._legacy_decision(64, undercount)
+            new = self._verdict_decision(64, undercount)
+            self.assertEqual(legacy, "bail")
+            self.assertEqual(new, "retry")
+
+
 class BuildVerdictObjTest(unittest.TestCase):
     """The schema object must carry every Plan-B field with correct types."""
 
@@ -364,6 +446,141 @@ class CliWriteTest(unittest.TestCase):
             [sys.executable, "-m", "gate.verdict"],
             capture_output=True, text=True, env=env)
         self.assertNotEqual(r.returncode, 0)
+
+
+class CliReadTest(unittest.TestCase):
+    """Tests for the `read` subcommand — the consumer-side entry point (Phase
+    3c, #3002). Exit 0 iff pass && trustworthy; 1 iff present-not-pass; 2 iff
+    missing/unparseable/stale/missing-field."""
+
+    def _run_cli(self, args):
+        scripts_dir = os.path.join(os.path.dirname(__file__), "..", "..")
+        env = dict(os.environ, PYTHONPATH=scripts_dir)
+        r = subprocess.run(
+            [sys.executable, "-m", "gate.verdict", "read"] + args,
+            capture_output=True, text=True, env=env)
+        return r
+
+    def _write(self, d, rc=0, **kw):
+        p = os.path.join(d, "gate-verdict.json")
+        obj = verdict.build_verdict_obj(rc=rc, **kw)
+        verdict.write_verdict(p, obj)
+        return p
+
+    def test_pass_exits_zero(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, rc=0)
+            r = self._run_cli(["--path", p])
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+    def test_fail_exits_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, rc=1)
+            r = self._run_cli(["--path", p])
+            self.assertEqual(r.returncode, 1)
+
+    def test_poisoned_exits_one(self):
+        # poisoned is not a trustworthy pass -> exit 1 (consumer maps to retry).
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, rc=0, truncated=True, undercount_banner=True)
+            r = self._run_cli(["--path", p])
+            self.assertEqual(r.returncode, 1)
+
+    def test_retry_exits_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, rc=3)
+            r = self._run_cli(["--path", p])
+            self.assertEqual(r.returncode, 1)
+
+    def test_refused_exits_one(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, rc=2)
+            r = self._run_cli(["--path", p])
+            self.assertEqual(r.returncode, 1)
+
+    def test_missing_file_exits_two(self):
+        # A consumer must fall back to $?/greps when the verdict is absent
+        # (back-compat; the writer is best-effort).
+        r = self._run_cli(["--path", "/nonexistent/verdict-xyz-12345.json"])
+        self.assertEqual(r.returncode, 2)
+
+    def test_garbage_exits_two(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "bad.json")
+            with open(p, "w") as f:
+                f.write("{not json")
+            r = self._run_cli(["--path", p])
+            self.assertEqual(r.returncode, 2)
+
+    def test_field_verdict_prints_value(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, rc=3)
+            r = self._run_cli(["--path", p, "--field", "verdict"])
+            self.assertEqual(r.stdout.strip(), "retry")
+            # exit code is still the pass-predicate, not the field.
+            self.assertEqual(r.returncode, 1)
+
+    def test_field_trustworthy_prints_lowercase(self):
+        # Booleans print as JSON lowercases so a shell test [ "$v" = true ] works.
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, rc=0)
+            r = self._run_cli(["--path", p, "--field", "trustworthy"])
+            self.assertEqual(r.stdout.strip(), "true")
+            self.assertEqual(r.returncode, 0)
+
+    def test_field_does_not_change_exit_code(self):
+        # --field verdict on a pass still exits 0 (the field is display-only).
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, rc=0, head="abc123")
+            r = self._run_cli(["--path", p, "--field", "head"])
+            self.assertEqual(r.stdout.strip(), "abc123")
+            self.assertEqual(r.returncode, 0)
+
+    def test_field_null_prints_null(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, rc=0)  # failed_phase defaults to None
+            r = self._run_cli(["--path", p, "--field", "failed_phase"])
+            self.assertEqual(r.stdout.strip(), "null")
+
+    def test_missing_field_exits_two(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, rc=0)
+            r = self._run_cli(["--path", p, "--field", "nonexistent_field"])
+            self.assertEqual(r.returncode, 2)
+
+    def test_expect_head_match_exits_normally(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, rc=0, head="deadbeef")
+            r = self._run_cli(["--path", p, "--expect-head", "deadbeef"])
+            self.assertEqual(r.returncode, 0)
+
+    def test_expect_head_mismatch_exits_two(self):
+        # The disambiguation a poller uses to reject a stale/concurrent gate's
+        # verdict on the shared default path (#3000 shape).
+        with tempfile.TemporaryDirectory() as d:
+            p = self._write(d, rc=0, head="aaaa1111")
+            r = self._run_cli(["--path", p, "--expect-head", "bbbb2222"])
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("head mismatch", r.stderr)
+
+    def test_read_then_write_round_trips_via_cli(self):
+        # End-to-end: write via CLI, read via CLI — the exact pattern the
+        # consumer scripts use.
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "gv.json")
+            scripts_dir = os.path.join(os.path.dirname(__file__), "..", "..")
+            env = dict(os.environ, PYTHONPATH=scripts_dir)
+            subprocess.run(
+                [sys.executable, "-m", "gate.verdict", "write",
+                 "--path", p, "--rc", "0", "--head", "cafef00d",
+                 "--mode=--full", "--oracle", "asan"],
+                capture_output=True, text=True, env=env, check=True)
+            r = subprocess.run(
+                [sys.executable, "-m", "gate.verdict", "read",
+                 "--path", p, "--field", "oracle", "--expect-head", "cafef00d"],
+                capture_output=True, text=True, env=env)
+            self.assertEqual(r.stdout.strip(), "asan")
+            self.assertEqual(r.returncode, 0)
 
 
 if __name__ == "__main__":
