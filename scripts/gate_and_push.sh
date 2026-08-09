@@ -39,6 +39,46 @@
 set -u
 cd "$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "gate_and_push: not in a git repo" >&2; exit 2; }
 
+# gate-infra preflight-lockfile lane: acquire an exclusive flock on the gate's
+# lockfile so two concurrent `gate_and_push.sh` invocations cannot both run.
+# Without this, the preflight sees the OTHER gate's `cmake`/`run_parallel.sh`
+# children as "builders active" and both gates deadlock: each one waits for
+# builders (siblings) that never go away because the OTHER gate is the source.
+# Acquired BEFORE the argument parse so the lockfile is held even when the
+# caller passes --help (a long-lived watcher's --help probe is also gated, and
+# that's the correct behavior — the active gate owns the lock until it exits).
+# Bypass with GATE_SKIP_LOCK=1 (e.g. for a deliberately-overlapping diagnosis
+# run); on a held lock, print a clear single-line message and exit 0 so the
+# caller sees a clean "another gate is running" abort, not a phantom failure.
+mkdir -p /var/tmp/bezel-scratch 2>/dev/null || true
+GATE_LOCK="/var/tmp/bezel-scratch/gate.lock"
+if [ -z "${GATE_SKIP_LOCK:-}" ]; then
+  # Open FD 9 on the lockfile; flock on FD 9; the FD is inherited by the
+  # gate's child processes and released atomically when this bash exits.
+  exec 9>"$GATE_LOCK" 2>/dev/null || {
+    echo "gate_and_push: cannot open lockfile $GATE_LOCK (continuing without it)" >&2
+    exec 9>/dev/null  # harmless fallback; flock below will still work on /dev/null
+  }
+  if ! flock -n 9; then
+    # Another gate holds the lock. Surface the holder's pid if we can read it
+    # from /proc/locks; otherwise just print the path. Exit 0 — the caller
+    # (CI, a waiter) sees a clean "another gate is running" rather than a
+    # gate failure, and the active gate keeps its lock undisturbed.
+    _holder=""
+    if command -v fuser >/dev/null 2>&1; then
+      _holder=$(fuser "$GATE_LOCK" 2>/dev/null | tr -d ' ' || true)
+    elif [ -r /proc/locks ]; then
+      _holder=$(awk -v lk="$GATE_LOCK" 'index($0, lk){print $5; exit}' /proc/locks 2>/dev/null || true)
+    fi
+    if [ -n "$_holder" ]; then
+      echo "gate_and_push: another gate is running (lock $GATE_LOCK held by pid $_holder); exiting cleanly." >&2
+    else
+      echo "gate_and_push: another gate is running (lock $GATE_LOCK held); exiting cleanly." >&2
+    fi
+    exit 0
+  fi
+fi
+
 # The authoritative verdict file path (matches gate.sh:77 / gate_full_cycle.sh).
 # Phase 3c (per the exit-code-trap): the gate writes its outcome here on every
 # exit; this consumer cross-checks it against $? before pushing.

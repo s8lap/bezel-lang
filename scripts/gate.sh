@@ -160,7 +160,51 @@ DH=scripts/dev_heavy.sh
 # pattern is a regex and -x anchors it to the WHOLE comm, so this still cannot
 # match this bash script.
 BUILDERS='cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests(_[a-z]+)?'
+# Sibling detection for the preflight (gate-infra preflight-lockfile lane):
+# when the ONLY matched builders are processes descended from another gate, do
+# NOT report them as "builders active" — they are this gate's own workers, not
+# a concurrent producer build. A second concurrent `gate_and_push.sh` must NOT
+# be blocked by the first's `cmake`/`run_parallel.sh` children — that deadlock
+# is the bug this whole lane exists to fix. The check uses /proc/<pid>/status
+# to walk ancestors: a process whose ancestor chain includes any of the gate
+# driver scripts is a sibling. If ANY matched builder has NO gate ancestor, the
+# original "builders active" message fires (an actual orphan producer build IS
+# active and a concurrent gate still risks the cold-cache flake).
+_is_gate_ancestor() { # $1 = pid  -> echoes "yes" iff any ancestor's comm is a gate driver
+  local pid="$1" pp cur=0
+  while [ "$cur" -lt 32 ]; do
+    [ -r "/proc/$pid/comm" ] || return 1
+    local comm; comm=$(cat "/proc/$pid/comm" 2>/dev/null) || return 1
+    case "$comm" in
+      gate_and_push.sh|gate_full_cycle.sh|gate.sh|tests/run_parallel.sh|run_parallel.sh|dev_heavy.sh)
+        echo "yes"; return 0 ;;
+    esac
+    pp=$(awk '/^PPid:/{print $2; exit}' "/proc/$pid/status" 2>/dev/null) || return 1
+    [ -n "$pp" ] && [ "$pp" -gt 0 ] 2>/dev/null || return 1
+    [ "$pp" = "$pid" ] && return 1
+    pid="$pp"; cur=$((cur+1))
+  done
+  return 1
+}
 if [ -z "${GATE_SKIP_BUILDER_CHECK:-}" ] && pgrep -x "$BUILDERS" >/dev/null 2>&1; then
+  # Separate sibling-only from mixed (sibling + non-sibling) matches. Mixed
+  # falls through to the original abort message — an orphan producer build IS
+  # active alongside a sibling, so the cold-cache flake risk is unchanged.
+  sibling_only=1; sibling_ppids=""
+  while IFS= read -r _pid; do
+    [ -n "$_pid" ] || continue
+    if _is_gate_ancestor "$_pid" >/dev/null 2>&1; then
+      sibling_ppids="$sibling_ppids $_pid"
+    else
+      sibling_only=0
+    fi
+  done < <(pgrep -x "$BUILDERS" 2>/dev/null)
+  if [ "$sibling_only" -eq 1 ]; then
+    echo "GATE ABORT: another gate is running (matched builders are all gate-and-push siblings; pids:${sibling_ppids}); wait for it to finish, or set GATE_SKIP_BUILDER_CHECK=1." >&2
+    pgrep -ax "$BUILDERS" >&2 || true
+    gate_write_verdict 2 0
+    exit 2
+  fi
   echo "GATE ABORT: heavy build/test process(es) already active — gating now risks the cold-cache flake (zero-builders rule). Stop them, or set GATE_SKIP_BUILDER_CHECK=1:" >&2
   pgrep -ax "$BUILDERS" >&2 || true
   gate_write_verdict 2 0
