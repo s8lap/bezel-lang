@@ -612,6 +612,29 @@ fi
 echo "== gate[4/6]: canary — diff-selected subset (fail-fast only; never acceptance) =="
 CANARY_LIST="$S/gate_canary.list"
 canary_skip() { echo "   (canary skipped: $1)"; rec_skip canary "$1"; }
+# per #3010 Wave 4: the canary DECISION logic (the classify/dispatch) is now
+# gate.canary.decide (#2100). DUAL-RUN: compute the decision BOTH ways (the old
+# bash dispatch below + Python canary.decide) and assert 0 disagreement — the
+# old bash is the authority until proven. A divergence is a migration bug -> fail
+# loudly (never silently trust either side). The SPAWN (the run_parallel
+# invocation at :652) stays bash glue — only the DECISION moved to Python.
+# _c_* track the decide() inputs as the bash chain progresses (initialized to
+# the not-yet-reached defaults: selok=1, arb=-1=not-arbitrated, asan=0).
+_c_selok=1; _c_nsel=0; _c_nuniv=0
+_c_maxpct="${GATE_CANARY_MAX_PCT:-50}"; _c_asan=0; _c_arb=-1
+_canary_dual() { # $1 = the OLD bash dispatch token (run|skip|hard)
+  local _py
+  _py=$(PYTHONPATH=scripts python3 -m gate.canary decide \
+    --nsel "$_c_nsel" --nuniv "$_c_nuniv" --max-pct "$_c_maxpct" \
+    --asan-hits "$_c_asan" --arb-verdict "$_c_arb" \
+    $([ "$_c_selok" -eq 0 ] && echo --no-selector-ok) 2>/dev/null) || _py="ERR"
+  if [ "$1" != "$_py" ]; then
+    echo "   !! CANARY DUAL-RUN DISAGREEMENT: bash=$1 python=$_py" \
+         "(nsel=$_c_nsel nuniv=$_c_nuniv maxpct=$_c_maxpct asan=$_c_asan arb=$_c_arb selok=$_c_selok)" >&2
+    echo "   !! The Python canary.decide diverged from the old bash dispatch — see scripts/gate/tests/test_canary.py" >&2
+    fail "canary dual-run disagreement (bash=$1 python=$_py) — migration bug"
+  fi
+}
 if [ "${GATE_CANARY:-1}" = "0" ]; then
   canary_skip "GATE_CANARY=0"
 else
@@ -619,17 +642,21 @@ else
   cbase="${GATE_CANARY_BASE:-}"
   [ -z "$cbase" ] && cbase="$(git merge-base HEAD origin/main 2>/dev/null || true)"
   if [ -z "$cbase" ]; then
+    _c_selok=0; _canary_dual skip
     canary_skip "no base (origin/main unavailable and no GATE_CANARY_BASE)"
   elif ! python3 scripts/select_tests.py --base "$cbase" -o "$CANARY_LIST" >"$S/gate_canary_select.log" 2>&1; then
     tail -5 "$S/gate_canary_select.log"
+    _c_selok=0; _canary_dual skip
     canary_skip "selector failed (fail-open; see $S/gate_canary_select.log)"
   else
-    nsel=$(grep -c . "$CANARY_LIST" 2>/dev/null); nsel=${nsel:-0}
-    nuniv=$(grep -oE 'universe: [0-9]+' "$S/gate_canary_select.log" | grep -oE '[0-9]+' | tail -1); nuniv=${nuniv:-0}
-    maxpct="${GATE_CANARY_MAX_PCT:-50}"
+    nsel=$(grep -c . "$CANARY_LIST" 2>/dev/null); nsel=${nsel:-0}; _c_nsel="$nsel"
+    nuniv=$(grep -oE 'universe: [0-9]+' "$S/gate_canary_select.log" | grep -oE '[0-9]+' | tail -1); nuniv=${nuniv:-0}; _c_nuniv="$nuniv"
+    maxpct="${GATE_CANARY_MAX_PCT:-50}"; _c_maxpct="$maxpct"
     if [ "$nsel" -eq 0 ]; then
+      _canary_dual skip
       canary_skip "empty selection (no mapped src/test diff vs base)"
     elif [ "$nuniv" -gt 0 ] && [ $(( 100 * nsel / nuniv )) -ge "$maxpct" ]; then
+      _canary_dual skip
       canary_skip "selection $nsel/$nuniv >= ${maxpct}% of suite — full pass covers it"
     else
       echo "   canary: $nsel of $nuniv tests selected (base $(git rev-parse --short "$cbase" 2>/dev/null || echo "$cbase"))"
@@ -641,19 +668,23 @@ else
       # evidence, exactly as in the full pass — fail hard, no arbitration.
       if [ "$ASAN" -eq 1 ]; then
         c_asan=$(grep -cE 'ERROR: (Address|Leak)Sanitizer|aot-asan #1822\] sanitizer fired' "$S/gate_canary.log" 2>/dev/null)
+        _c_asan="${c_asan:-0}"
         if [ "${c_asan:-0}" -gt 0 ]; then
           echo "   -- generated-code ASan fired in the canary ($c_asan report marker(s)) --"
           grep -m3 -A18 -E 'ERROR: (Address|Leak)Sanitizer' "$S/gate_canary.log" | head -60
+          _canary_dual hard
           fail "canary ASan — memory error in a diff-selected test program (see $S/gate_canary.log)"
         fi
       fi
       if [ "$crc" -ne 0 ]; then
         PHASE_T0=$(now)  # canary arbitration is its own (exceptional) phase
-        gate_arbitrate "$S/gate_canary.log"; carb=$?
+        gate_arbitrate "$S/gate_canary.log"; carb=$?; _c_arb="$carb"
         case "$carb" in
-          0) rec_ran canary_arbitration "0" "$ARB_LAST_SUSPECTS suspects, all flaky"
+          0) _canary_dual run
+             rec_ran canary_arbitration "0" "$ARB_LAST_SUSPECTS suspects, all flaky"
              echo "   all canary suspects flaky (pass alone within 5 tries) -> continue to the full pass";;
-          2) # No arbitrable crash/FAIL marker: an INFRA shape — all-phantom
+          2) _canary_dual skip
+             # No arbitrable crash/FAIL marker: an INFRA shape — all-phantom
              # list (subset_empty), a shard dead before any test, an
              # undercount, a launch hiccup. Per the canary contract this is
              # FAIL-OPEN: warn loudly and continue — the authoritative full
@@ -663,9 +694,12 @@ else
              rec_ran canary_arbitration "0" "no crash/FAIL marker — infra shape, fail-open"
              grep -E '## GATE FAILURE|SUBSET' "$S/gate_canary.log" | head -3 || true
              echo "   canary: nonzero exit with NO crash/FAIL marker (infra/selector shape) -> FAIL-OPEN to the full pass (see $S/gate_canary.log)";;
-          *) rec_ran canary_arbitration "1" "$ARB_LAST_SUSPECTS suspects, real"
+          *) _canary_dual hard
+             rec_ran canary_arbitration "1" "$ARB_LAST_SUSPECTS suspects, real"
              fail "canary (diff-selected subset) — regression caught BEFORE the full pass (see $S/gate_canary.log)";;
         esac
+      else
+        _canary_dual run
       fi
     fi
   fi

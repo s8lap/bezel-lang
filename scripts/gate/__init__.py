@@ -58,4 +58,5 @@ check. The four sites dual-consume (legacy bash + gate.cycle), assert
 tables (classify 5x2, cross_check 3x3) + the 0-disagreement proof.
 """
 
-__all__ = ["io", "summary", "verdict", "coverage", "arbitration", "telemetry", "cycle"]
+__all__ = ["io", "summary", "verdict", "coverage", "arbitration", "telemetry",
+           "cycle", "canary"]
