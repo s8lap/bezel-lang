@@ -268,5 +268,35 @@ if ! grep -qi 'asan\|sanitize' "$LOGDIR/${TAG}_full.log"; then
   exit 1
 fi
 
-say "cycle COMPLETE: both oracles trustworthy-green"
+# Conformance phase: the spec-example sweep (tests/conformance). This is a
+# SEPARATE oracle from the gtest suite — it compiles + runs every spec example
+# fragment against the just-built bezelc and checks the manifest expectations.
+# per Plan-A 5.1: until this wiring NO gate ran conformance (grep found zero
+# references in the gate scripts), so a conformance regression could NOT block a
+# push. Wired here, in the ACCEPTANCE cycle (gate_and_push.sh → this script),
+# not in gate.sh: conformance is oracle-independent (it does not run under ASan),
+# so running it in both gate.sh passes would be redundant; one run per cycle is
+# correct and keeps it off the gate.sh critical path other lanes edit
+# concurrently. The runner cages each case itself (MemoryMax/MemorySwapMax=0 +
+# timeout 30, sequential), and its own Plan-A 5.1 guard (PASS>0) fails a run that
+# validated nothing. A conformance FAIL ⇒ cycle FAIL ⇒ no push.
+say "conformance phase: running spec-example sweep"
+if [ ! -x "$REPO/build/bezelc" ]; then
+  say "CYCLE FAILURE: $REPO/build/bezelc not executable — conformance cannot run"
+  exit 1
+fi
+if ! "$REPO/tests/conformance/run_conformance.sh" "$REPO/build/bezelc" \
+      > "$LOGDIR/${TAG}_conformance.log" 2>&1; then
+  say "CYCLE FAILURE: conformance sweep FAILED — see $LOGDIR/${TAG}_conformance.log"
+  tail -15 "$LOGDIR/${TAG}_conformance.log" 2>/dev/null | sed 's/^/  | /' \
+    | tee -a "$CYCLE_LOG" >/dev/null
+  exit 1
+fi
+# Surface the PASS/FAIL/SKIP tally in the cycle log. The healthy green over the
+# current manifest is 100/0 (16 error + 83 fragment + 1 program, 337 skip).
+grep -E '^(PASS|FAIL|SKIP):' "$LOGDIR/${TAG}_conformance.log" \
+  | sed 's/^/  conformance /' | tee -a "$CYCLE_LOG" >/dev/null
+say "conformance phase: GREEN"
+
+say "cycle COMPLETE: both oracles trustworthy-green + conformance green"
 exit 0
