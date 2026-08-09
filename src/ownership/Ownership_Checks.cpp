@@ -10586,10 +10586,34 @@ const std::vector<ast::CallArgument>* scopedArgsOf(const ast::Expr& e) {
 bool MethodOwnership::typeRefIsTaskScope(const sema::TypeRef* rt) const {
     // stdlib §6.10: TaskScope is a compiler-known class. Sema resolves it
     // either to the synthetic builtin TypeSymbol (declaration->name ==
-    // "TaskScope") or to a null-declaration Named ref whose AST name is
-    // "TaskScope" (annotation path).
+    // "TaskScope" AND empty moduleName — see fix #2995 below) or to a
+    // null-declaration Named ref whose AST name is "TaskScope" (annotation
+    // path).
+    //
+    // fix #2995 (spec §11.3 / stdlib §6.10, v0.240): §11.3 reserves no names,
+    // so a local user class named `TaskScope` (or one imported from another
+    // module) reaches the front-end as a Named TypeRef whose declaration
+    // name is "TaskScope" — EXACTLY the same shape the synthetic builtin
+    // TypeSymbol has. Comparing the bare name therefore rejected every
+    // legal program that contained a user TaskScope: `using var s := new
+    // TaskScope()` got the §6.10 "may only be consumed by `await using`"
+    // diagnostic on a type that is not the §6.10 builtin, and rewriting
+    // to `await using` then got the §6.10 "missing await Join" diagnostic.
+    // No spelling admitted the class.
+    //
+    // The discriminator mirrors #2997 (which closes the same shape in
+    // Emitter::builtinTypeName): a synthetic builtinClassSym leaves
+    // TypeSymbol::moduleName empty, while SymbolCollection (local) and
+    // ModuleLoader (imported) populate it. A LOCAL user class's TypeSymbol
+    // ALSO has a real `decl` (so the old `!decl` test excluded it there),
+    // but here the predicate never looked at `decl`; the new shape is
+    // "name == `TaskScope` AND moduleName is empty", which is the same
+    // test #2997 added to builtinTypeName and the one that distinguishes
+    // the builtin from every user class regardless of decl shape.
     if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
-    if (rt->declaration) return rt->declaration->name == "TaskScope";
+    if (rt->declaration)
+        return rt->declaration->name == "TaskScope" &&
+               rt->declaration->moduleName.empty();
     if (rt->astNode && rt->astNode->name && !rt->astNode->name->parts.empty())
         return rt->headName() == "TaskScope";
     return rt->importedName == "TaskScope";
@@ -10597,10 +10621,28 @@ bool MethodOwnership::typeRefIsTaskScope(const sema::TypeRef* rt) const {
 
 bool MethodOwnership::exprTypeIsTaskScope(const ast::Expr& e) const {
     if (typeRefIsTaskScope(ctx_.exprType(e))) return true;
-    // `new TaskScope()` — before sema typing lands on the NewExpr itself.
-    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e))
-        return ne->type && ne->type->name && !ne->type->name->parts.empty() &&
-               ne->type->name->parts[0] == "TaskScope";
+    // `new TaskScope()` — fall back to the NewExpr's own type node only when
+    // the typechecker hasn't recorded an exprType (e.g. a synthetic test
+    // method that calls into the ownership pass before typecheck populated
+    // exprTypes_). The bare AST name is NOT a discriminator — §11.3 reserves
+    // no names, so a user class named `TaskScope` has the same name as the
+    // builtin, and a raw `parts[0] == "TaskScope"` returns true for it. Use
+    // the RESOLVED TypeRef (via typeRefIsTaskScope) whenever the type
+    // resolver has run; only an unresolvable name reaches the raw AST
+    // branch, and an unresolvable name is not the §6.10 builtin. // per
+    // §11.3, fix #2995
+    if (auto* ne = dynamic_cast<const ast::NewExpr*>(&e)) {
+        if (ne->type) {
+            if (auto* rt = ctx_.resolvedType(*ne->type))
+                return typeRefIsTaskScope(rt);
+            return false;
+        }
+        // The `new()` target-typed shorthand: no `ne->type` to resolve. If
+        // exprType is also uninformative (it should be the target type per
+        // §5.4), we cannot tell; the conservative reading is "not the
+        // builtin" — a `new()`-shorthand that the typecheck pass would have
+        // caught reaches here only when the typecheck pass did not run.
+    }
     return false;
 }
 
