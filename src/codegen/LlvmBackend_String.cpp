@@ -2685,6 +2685,104 @@ llvm::Value* Emitter::emitVtablelessBuiltinToString(llvm::Value* val,
 }
 
 
+// fix #2969 (spec §8.5 / §8.1 / §18.5 / §28.9, v0.240): a special case of
+// `emitVtablelessBuiltinToString` — the static type `frt` is a BUILT-IN
+// INTERFACE HEAD (IEnumerable<T>, IList<T>, IDictionary<K,V>, …), but the AST
+// source `src` narrows the runtime value to a vtable-less built-in class.
+//
+// WHY THIS EXISTS (and is not just a call into emitVtablelessBuiltinToString).
+// §2923's fix gates on the STATIC type being a vtable-less built-in CLASS —
+// it deliberately excluded interface heads from the discriminator, because an
+// interface slot may LEGITIMATELY hold a user class declaring that interface
+// (`class MyE: IEnumerable<int>`, `var e: IEnumerable<int> := new MyE();
+// e.Dispose();` compiles and runs on 09ed9ca). Routing an interface slot
+// through `emitVtablelessBuiltinToString` statically would (a) render
+// "IEnumerable" instead of "MyE" for a user class — wrong per §8.5 — and (b)
+// stop disposing user-class instances through vtable[kDisposeSlot], which
+// §2975 has only just made safe.
+//
+// But for the COMMON shaping of an interface-head-typed local — the
+// initializer is a known constructor of a built-in collection, e.g.
+// `var e: IList<int> := new Array<int>(2);` (a direct NewExpr) or
+// `var e: IList<int> := a;` where `a: Array<int>` (an IdentifierExpr whose
+// sema type is the built-in class) — the §2923 premise DOES hold on the
+// runtime value. The renderer just needs the runtime TYPE, which the
+// initializer's static type already names.
+//
+// HOW THE SOURCE-TYPE LOOKUP WORKS. `src` is the interpolation hole's AST
+// expression. For the only shapes this fix admits:
+//   * `IdentifierExpr` — a plain local reference. Its sema symbol is a
+//     `LocalSymbol` whose `decl` is the `LocalDecl`; we read the decl's
+//     initializer's sema type (`ctx_.exprType(*ld->initializer)`). That type
+//     is the source of truth — for `var e: IList<int> := a;` where `a:
+//     Array<int>`, it returns `Array<int>` even though `ld->type` declares
+//     `IList<int>`.
+//   * A NON-`IdentifierExpr` shape (a member access on an object, a method
+//     call returning the interface head, a generic instantiation through a
+//     type parameter) returns nullptr — the §2923 dynamic path remains in
+//     force, which is correct for the user-class arm and DEFERS the
+//     unanalysed built-in case to a future design decision per #2969.
+//
+// SAFETY / WHAT IT DOES NOT DO. It does not modify `lowerObjectToString`, so
+// the user-class arm keeps its correct vtable dispatch. It does not change
+// `bz_obj_is_string`, so the interface-head -> vtable path remains available.
+// The receiver retains NOTHING — the returned string is a `lowerStringLiteral`
+// constant with a SENTINEL rc, the same discharge shape §2923 already relies
+// on. And the §2975 disposal fix (interface slot holding a raw user-class
+// instance routes to the class disposal) is untouched — its predicate is
+// `iterFormatWrappedDecls_`, never reaches the BuiltinInterfaceHead path here.
+//
+// WHAT IT DOES NOT FIX. The two cases the issue body flags as needing a
+// decision: the OBJECT-slot spelling (`var o: Object := e; $"…{o}"`, tracked
+// separately as #2968) and the explicit `.ToString()` call on a built-in
+// interface head (rejected at sema on the parent commit, #2457). Both are
+// logged in the test's header so the boundary is explicit.
+llvm::Value* Emitter::tryBuiltinIfaceHeadRender(llvm::Value* val,
+                                                const sema::TypeRef* frt,
+                                                const ast::Expr* src) {
+    if (!val || !val->getType()->isPointerTy()) return nullptr;
+    if (!frt || frt->kind != sema::TypeRef::Kind::Named || frt->declaration)
+        return nullptr;
+    // §2923 deliberately excluded interface heads from the vtable-less
+    // discriminator; the interface slot may hold a user class. We are the
+    // OTHER arm of the exclusion — we only fire when the AST source
+    // statically narrows the runtime value to a built-in class.
+    std::string_view bn = builtinTypeName(frt);
+    if (bn.empty() || !common::isBuiltinInterfaceHead(bn)) return nullptr;
+    if (!src) return nullptr;
+    // §2923's `common::isVtableLessBuiltinClassName` test asks whether the
+    // RUNTIME TYPE carries no Bezel vtable at word 0 — i.e. is one of the
+    // built-in classes whose runtime value is a plain C struct
+    // (`bz_array_t*`, `bz_dict_t*`, `bz_mutex_t*`, …). Same predicate, same
+    // table, same answer.
+    auto isVtableLess = [this](const sema::TypeRef* rt) -> bool {
+        if (!rt || rt->kind != sema::TypeRef::Kind::Named) return false;
+        std::string_view n = builtinTypeName(rt);
+        if (n.empty()) return false;
+        return common::isVtableLessBuiltinClassName(n);
+    };
+    // Only the IdentifierExpr shape is admitted here — the §2975 prior art
+    // shows the precise AST-and-sema walk this fix mirrors (the §2975
+    // `rawUserClassInBuiltinInterfaceSlot` reads the same `ld->initializer`
+    // source type for the disposal-side decision). A method-call or
+    // member-access source would need a wider analysis and is left for a
+    // future lane once the owner-signed-off direction for #2969 lands.
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(src);
+    if (!id) return nullptr;
+    sema::Symbol* sym = ctx_.exprSymbol(*id);
+    auto* loc = dynamic_cast<sema::LocalSymbol*>(sym);
+    if (!loc || !loc->decl) return nullptr;
+    auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (!ld || !ld->initializer) return nullptr;
+    const sema::TypeRef* srcRt = ctx_.exprType(*ld->initializer);
+    if (!isVtableLess(srcRt)) return nullptr;
+    // The receiver retains NOTHING (the literal has a sentinel rc), so this
+    // is a pure replacement of the broken `lowerObjectToString` call site —
+    // no memory obligation added for the renderer.
+    return emitVtablelessBuiltinToString(val, srcRt);
+}
+
+
 // Format a single field/element value of static type `fieldTy` as a string,
 // recursing for nested records (§9.1) and using each type's own ToString.
 llvm::Value* Emitter::emitValueToString(llvm::Value* val,

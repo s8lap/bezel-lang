@@ -499,7 +499,31 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             // and otherwise dispatches the dynamic ToString.
                             // Previously this fell to `pv = ev`, reading the object
                             // as a bz_string → "".
-                            pv = emitValueToString(ev, rt);
+                            //
+                            // fix #2969 (spec §8.5 / §8.1 / §18.5 / §28.9,
+                            // v0.240): a declaration-less Named type whose head
+                            // is a built-in INTERFACE head
+                            // (`IList<T>`, `IEnumerable<T>`, `IDictionary<K,V>`,
+                            // …) is the OTHER declaration-less-Named inhabitant
+                            // besides the type-parameter one, and it may also be
+                            // a vtable-less built-in class at runtime
+                            // (`var e: IList<int> := new Array<int>(2);`).
+                            // §2923 deliberately declined to handle it because
+                            // the interface slot may also hold a USER class
+                            // declaring the interface; that arm is correct for
+                            // the user class, broken for the built-in collection.
+                            // Ask first whether the AST source statically
+                            // narrows the runtime value to a vtable-less built-in
+                            // class — if yes, render via the §2923 helper and
+                            // skip the broken `emitValueToString` call; if no,
+                            // fall through (correct for user class; deferral per
+                            // #2969 for the unanalysed built-in case).
+                            if (llvm::Value* r = tryBuiltinIfaceHeadRender(
+                                    ev, rt, part.expr.get())) {
+                                pv = r;
+                            } else {
+                                pv = emitValueToString(ev, rt);
+                            }
                         } else {
                             pv = ev;  // string or unknown ptr — use as-is
                         }

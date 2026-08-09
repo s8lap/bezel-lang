@@ -336,6 +336,18 @@ bool isVtableLessBuiltinClassName(std::string_view n) {
            !contains(kBuiltinInterfaceHeads, n);
 }
 
+// fix #2969 (§8.5 / §8.1 / §18.5 / §28.9, v0.240): the reserved built-in
+// INTERFACE heads — exposed as its own predicate so the §2969 codegen routing
+// does not have to re-list the `kBuiltinInterfaceHeads` names. See the header
+// for the contract — split off from `isVtableLessBuiltinClassName` because a
+// user class may legitimately declare `class MyE: IEnumerable<int>`, so the
+// dynamic dispatch on these names must remain reachable even though they are
+// the one reserved-name population that §2923's fix declined to route away
+// from it.
+bool isBuiltinInterfaceHead(std::string_view n) {
+    return contains(kBuiltinInterfaceHeads, n);
+}
+
 // fix #2992 (§28.3 / §28.9 / §28.10, v0.240): the built-in type heads whose
 // `using var` carries a REAL §28.10 disposal obligation — the set the §28.10
 // vacuity lint (rhsIsDisposableClassType Path 2) uses to decide a `using var`

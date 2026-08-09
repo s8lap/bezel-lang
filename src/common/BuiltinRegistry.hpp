@@ -174,6 +174,19 @@ bool isReservedBuiltinTypeName(std::string_view n);
 // jump. // per §8.1 / §8.5 / §28.2 / §28.9
 bool isVtableLessBuiltinClassName(std::string_view n);
 
+// fix #2969 (§8.5 / §8.1 / §18.5 / §28.9, v0.240): is `n` one of the reserved
+// built-in INTERFACE heads? Exposed as its own predicate so the §2969 fix
+// (codegen-side routing of an interface-head-typed interpolation hole through
+// the vtable-less built-in renderer when the AST source statically determines
+// the value is a built-in collection) does not have to re-list the
+// `kBuiltinInterfaceHeads` names. See the header note on
+// `isVtableLessBuiltinClassName` for why these are deliberately split off from
+// that set — the predicate covers the case where a user class may legitimately
+// implement a built-in interface head, which the derived vtable-less
+// predicate excludes by construction.
+// per §8.1 / §8.5 / §18.5 / §28.9
+bool isBuiltinInterfaceHead(std::string_view n);
+
 // fix #2992 (§28.3 / §28.9, v0.240): is `head` a reserved built-in type whose
 // `using var` carries a REAL §28.10 disposal obligation? This is the SHARED
 // authority that previously lived as a private table inside

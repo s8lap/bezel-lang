@@ -375,6 +375,66 @@ BEZEL_TEST(builtin_registry_snapshot, vtable_less_builtin_class_name_set) {
         BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
 }
 
+// --- isBuiltinInterfaceHead (#2969; spec §8.1 / §8.5 / §18.5 / §28.9, v0.240):
+// the COMPLEMENT of `isVtableLessBuiltinClassName` within the reserved-name set
+// — the reserved built-in INTERFACE heads, exposed as a predicate of their own
+// for the §2969 codegen routing (`tryBuiltinIfaceHeadRender`,
+// `LlvmBackend_String.cpp`). Pinned name-for-name so an accidental add/drop
+// is caught mechanically — the predicate is the one table the §2969 routing
+// reads, so any drift between this snapshot and the `kBuiltinInterfaceHeads`
+// array it mirrors is the regression shape.
+BEZEL_TEST(builtin_registry_snapshot, builtin_interface_head_set_8_1) {
+    static constexpr std::array<std::string_view, 21> kInterfaceHeads = {
+        "IEnumerable", "IEnumerator", "IOwningEnumerable", "IOwningEnumerator",
+        "IAsyncEnumerable", "IAsyncEnumerator", "IOwningAsyncEnumerable",
+        "IOwningAsyncEnumerator", "IReadOnlyCollection", "IReadOnlyList",
+        "ICollection", "IList", "IOwningCollection", "IOwningList",
+        "IEvent", "IAsyncEvent", "IGrouping",
+        "ISerializer", "IDeserializer", "ISerializable", "IDeserializable",
+    };
+    for (auto n : kInterfaceHeads) {
+        BEZEL_EXPECT_TRUE(isBuiltinInterfaceHead(n));
+        // Every name is also reserved — the §2969 routing only fires on the
+        // declaration-less-Named-shape subset, and that subset IS the reserved
+        // name set. This guards against a future "interface head that's not
+        // reserved" silently bypassing the discriminator.
+        BEZEL_EXPECT_TRUE(isReservedBuiltinTypeName(n));
+        // Every name is EXCLUDED from `isVtableLessBuiltinClassName` — the
+        // whole content of the §2923/§2975 split. The complement predicate
+        // here exists precisely because the vtable-less set excludes these;
+        // pinning it makes the symmetry mechanical.
+        BEZEL_EXPECT_FALSE(isVtableLessBuiltinClassName(n));
+    }
+    // (c) OUT: a generic type-PARAMETER spelling and a user type name — the
+    // other inhabitants of the declaration-less Named shape.
+    for (std::string_view n : {"T", "U", "TKey", "MyClass", "Stopwatch2",
+                               "stringbuilder", ""})
+        BEZEL_EXPECT_FALSE(isBuiltinInterfaceHead(n));
+    // (d) OUT: every reserved built-in CLASS — they belong to the vtable-less
+    // half of the split, NOT the interface-head half. Listing them here is
+    // the more thorough end of the symmetry pin (above we checked every
+    // interface head against this predicate; here we walk the other way).
+    for (std::string_view n : {"Array", "OwningArray", "Dictionary",
+                               "OwningDictionary", "SortedDictionary",
+                               "SortedSet", "Stack", "Queue", "Set",
+                               "LinkedList", "LinkedListNode",
+                               "StringBuilder", "Random", "Stopwatch",
+                               "FileStream", "Task", "OwningTask",
+                               "Subscription", "CancellationToken",
+                               "CancellationTokenSource", "TaskScope",
+                               "Shared", "Weak", "Channel", "ChannelSender",
+                               "EventSource", "AsyncEventSource",
+                               "Mutex", "Lock", "Semaphore", "SemaphoreToken",
+                               "TaskCompletionSource",
+                               "OwningTaskCompletionSource",
+                               "Atomic", "AtomicInteger", "Buffer",
+                               "OwningBuffer", "BinarySerializer",
+                               "BinaryDeserializer", "JsonSerializer",
+                               "JsonDeserializer", "CString", "WString",
+                               "RawBytes"})
+        BEZEL_EXPECT_FALSE(isBuiltinInterfaceHead(n));
+}
+
 // --- §22.16 (v0.203, #2053): ContractViolationException registration ---
 // Per spec §22.16 "Failure semantics and the enforcement modes",
 // ContractViolationException joins the built-in hierarchy DERIVING DIRECTLY

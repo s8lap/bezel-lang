@@ -6153,6 +6153,27 @@ private:
     llvm::Value* emitVtablelessBuiltinToString(llvm::Value* val,
                                                const sema::TypeRef* rt);
 
+    // fix #2969 (spec §8.5 / §8.1 / §18.5 / §28.9, v0.240): for an interpolation
+    // hole whose STATIC type `frt` is a built-in INTERFACE HEAD
+    // (common::isBuiltinInterfaceHead), the §2923 fix DELIBERATELY left the
+    // receiver on `lowerObjectToString`'s dynamic path (an interface slot may
+    // hold a user class declaring the interface — those MUST keep dispatching
+    // through vtable[kToStringSlot]). When the AST source of `frt` statically
+    // narrows the runtime value to a vtable-less built-in class
+    // (e.g. `var e: IList<int> := new Array<int>(2);` — the local's initializer
+    // is `new Array<int>(2)`, whose type is the built-in class `Array<int>`),
+    // we route the value through `emitVtablelessBuiltinToString` with that
+    // concrete class type, which is the §2923 renderer the runtime value's
+    // shape already satisfies. Returns nullptr when the static type is not a
+    // built-in interface head OR the AST source does not statically determine
+    // the runtime type as a vtable-less built-in class — in either case the
+    // caller falls through to its existing dispatch (correct for the user-
+    // class arm; incomplete for the unanalysed built-in case, which #2969
+    // records as a deferred hole pending an owner-signed-off direction).
+    llvm::Value* tryBuiltinIfaceHeadRender(llvm::Value* val,
+                                           const sema::TypeRef* frt,
+                                           const ast::Expr* src);
+
     // §9.6 (#946/#947/#948): emit (once) an Equals thunk `i1(ptr this, ptr other)`
     // for a CLASS — the user `Equals(Object?)` override if present (walking the
     // class chain), else the §8.3 reference-identity default (`this == other`).
