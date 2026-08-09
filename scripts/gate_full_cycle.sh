@@ -234,17 +234,85 @@ say "cycle start at $(git rev-parse --short HEAD) — logs in $LOGDIR"
 # lane's time before a binary mtime check settled it.
 #
 # gate.sh rebuilds before it tests, so this preflight is about the state we
-# ENTER in: if the tree already carries a stale binary, say so loudly here
-# rather than trusting the build phase to notice. Advisory, not fatal — the
-# gate's own reconfigure+build is still the mechanism that fixes it; this only
+# ENTER in: if the tree already carries a stale binary that the rebuild
+# phase WILL NOT fix, say so loudly here. Advisory, not fatal — the gate's
+# own reconfigure+build is still the mechanism that fixes it; this only
 # guarantees the condition is never silent.
+#
+# STALE-SUPPRESSION HYGIENE (this run). Every lane commit edits src/ and
+# makes at least one source newer than build/bezelc — so the original
+# "fire whenever any source is newer than bezelc" check fired on EVERY
+# gate, by design, and was noise. The rebuild phase WILL relink bezelc
+# whenever a stale .o file (one where source > .o) gets recompiled, so
+# the warning is REDUNDANT in that case and was correctly suppressing
+# useful signal by being constant.
+#
+# The warning is load-bearing ONLY for the #2426 case, whose structural
+# fingerprint is: some source X is newer than bezelc AND X's .o is ALSO
+# newer than X. That ordering means cmake already rebuilt the .o and
+# thinks the library is up-to-date — it will not touch it again, will
+# not relink bezelc, and a green gate on that state would lie. Fire only
+# when this fingerprint holds; suppress otherwise (the rebuild will fix
+# the staleness, the warning would be redundant).
+#
+# Header-only changes need a slightly different check: a .hpp/.h file has
+# no own .o, but cmake's compiler_depend manifest tracks header→.o deps.
+# If ANY bezelc-related .o (in the libraries that feed bezelc:
+# bezel_core static lib + bezel_runtime static lib + bezelc binary's own
+# main.cpp.o) is newer than the header, cmake processed it — same #2426
+# shape, fire.
+#
+# Only the NEWEST source newer than bezelc is checked: that is the source
+# whose edit drove the staleness, and a single .o>source match is enough
+# to fingerprint the #2426 bug for this run. (Sources older than the
+# newest one are not necessarily up-to-date either, but the rebuild
+# phase walks ALL of them regardless; we only need to detect the case
+# where the rebuild WILL NOT cover the staleness, and any source newer
+# than bezelc whose .o is also newer than it is exactly that case.)
 if [ -x "$REPO/build/bezelc" ]; then
+  fire_stale=0
   newest_src="$(find "$REPO/src" -type f \( -name '*.cpp' -o -name '*.hpp' -o -name '*.h' \) \
                   -newer "$REPO/build/bezelc" -print -quit 2>/dev/null)"
+  # bezelc links THREE object trees (gate_full_cycle.sh:78 — link.txt):
+  # libbezel_core.a, libbezel_runtime.a, and the binary's own main.cpp.o.
+  # The #2426 fingerprint applies to ANY of them — a runtime source newer
+  # than bezelc with its .o ALSO newer than it is exactly the same bug
+  # shape, because cmake believes the library is up-to-date and won't
+  # relink bezelc. All three roots must be searched; missing one would
+  # silently swallow that class of #2426.
+  CORE_OBJ_ROOTS="$REPO/build/CMakeFiles/bezel_core.dir $REPO/build/CMakeFiles/bezel_runtime.dir $REPO/build/CMakeFiles/bezelc.dir"
   if [ -n "$newest_src" ]; then
-    say "STALE: build/bezelc is older than $(basename "$newest_src") — the gate's"
-    say "STALE: build phase must relink it. If a gate ever reports green while"
-    say "STALE: this warning stands, do NOT believe the result (see #2426)."
+    case "$newest_src" in
+      *.cpp)
+        # Source file: its .o mirrors its path under each of the three
+        # object roots above. If ANY candidate .o is newer than the
+        # source, cmake already rebuilt it and the rebuild phase won't
+        # touch it again — #2426 shape.
+        src_rel="${newest_src#$REPO/}"
+        fire_stale=0
+        for root in $CORE_OBJ_ROOTS; do
+          o="$root/$src_rel.o"
+          if [ -f "$o" ] && [ "$o" -nt "$newest_src" ]; then
+            fire_stale=1; break
+          fi
+        done
+        ;;
+      *)
+        # Header: any bezel-related .o newer than the header means cmake
+        # processed it (and was supposed to relink) — #2426 shape.
+        newer_o="$(find $CORE_OBJ_ROOTS -name '*.o' -newer "$newest_src" \
+                       -print -quit 2>/dev/null || true)"
+        [ -n "$newer_o" ] && fire_stale=1
+        ;;
+    esac
+  fi
+  if [ "$fire_stale" -eq 1 ]; then
+    say "STALE: build/bezelc is older than $(basename "$newest_src") AND"
+    say "STALE: its .o (or a dependent one, for headers) IS newer than the"
+    say "STALE: source — cmake already rebuilt it but did not relink bezelc"
+    say "STALE: (the #2426 unreliable-incremental family). The gate's own"
+    say "STALE: rebuild phase may repeat the bug; if a gate reports green"
+    say "STALE: while this warning stands, do NOT believe the result."
   fi
 fi
 
