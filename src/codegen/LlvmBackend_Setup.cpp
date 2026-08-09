@@ -5788,7 +5788,12 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     //
     // Body emission here is safe because #2943 registers `gv` before it; that was
     // not true before.
-    auto objectSlotSpecTarget =
+    // Return a re-lowered body only when this instantiation's object layout
+    // differs from the exporter's erased template and the slot ABI remains
+    // stable. Shared by the fixed Object slots below and, per #2978, the
+    // ordinary virtual-method slots: both need the same two gates (#2943's
+    // reconstructed-body gate and #2906's signature gate).
+    auto layoutSpecializedSlotTarget =
         [&](sema::MethodSymbol* user) -> llvm::Function* {
         if (!user || !user->parent) return nullptr;
         if (!instanceLayoutDiffersFromErasedTemplate(user->parent))
@@ -5796,8 +5801,9 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
         if (!dynamic_cast<const ast::MethodDecl*>(user->decl)) return nullptr;
         auto mit = methodFns_.find(user);
         if (mit == methodFns_.end() || !mit->second) return nullptr;
-        // The thunk calls the target with the slot's own FIXED arguments, so a
-        // specialization whose signature moves cannot go in it.
+        // The slot (or fixed Object-slot thunk) calls the target with its own
+        // fixed arguments, so a specialization whose signature moves cannot go
+        // in it.
         llvm::FunctionType* concFnTy = mit->second->getFunctionType();
         CallableInfo ci;
         if (!callableInfo(user, ci)) return nullptr;
@@ -5809,7 +5815,8 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
             return nullptr;
         return specFn;
     };
-    if (llvm::Function* t3 = objectSlotSpecTarget(classSlotToStringImpl(ts))) {
+    if (llvm::Function* t3 =
+            layoutSpecializedSlotTarget(classSlotToStringImpl(ts))) {
         // The `$specN` suffix is evidence, not cosmetics (#2928's reason): LLVM
         // would otherwise uniquify the InternalLinkage name to
         // `bz$tostr$GTs12.1`, and this family's whole trail is which function
@@ -5825,7 +5832,8 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     }
     // §9.6 (#946/#947/#948): fixed Equals/GetHashCode slots, same as a local
     // class vtable, so an Object-typed receiver of this specialization dispatches.
-    if (llvm::Function* t4 = objectSlotSpecTarget(classSlotEqualsImpl(ts))) {
+    if (llvm::Function* t4 =
+            layoutSpecializedSlotTarget(classSlotEqualsImpl(ts))) {
         auto* thunk = llvm::Function::Create(
             llvm::FunctionType::get(i1(), {ptrTy(), ptrTy()},
                                     /*isVarArg=*/false),
@@ -5836,7 +5844,8 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     } else {
         elems[kEqualsSlot] = classEqualsThunk(ts);
     }
-    if (llvm::Function* t5 = objectSlotSpecTarget(classSlotHashCodeImpl(ts))) {
+    if (llvm::Function* t5 =
+            layoutSpecializedSlotTarget(classSlotHashCodeImpl(ts))) {
         auto* thunk = llvm::Function::Create(
             llvm::FunctionType::get(i32(), {ptrTy()}, /*isVarArg=*/false),
             llvm::Function::InternalLinkage, "bz$hash$" + tsName + suffix,
@@ -5846,14 +5855,23 @@ llvm::GlobalVariable* Emitter::buildImportedGenericVtable(
     } else {
         elems[kGetHashCodeSlot] = classHashCodeThunk(ts);
     }
+    // fix #2978 (§12 / §14.1 / §2.8.3 rule 4, v0.240): an imported
+    // generic's ordinary virtual-method slots had the same erased-body defect
+    // as the fixed Object slots above. `emitVirtualGenericDispatch` usually
+    // bypasses these slots for a layout-moving instantiation, but must abandon
+    // that route when a local generic subclass has type arguments that cannot
+    // be derived from the receiver's static type (#2906). Ordinary vtable
+    // dispatch then reads this slot, so its content must be honest on its own.
     for (std::size_t i = 0;
          i < slots.size() && kVirtualMethodsBase + i < elems.size(); ++i) {
         const VSlot& vs = slots[i];
         if (vs.method) {
             auto mit = methodFns_.find(vs.method);
-            if (mit != methodFns_.end())
-                elems[kVirtualMethodsBase + i] =
-                    llvm::cast<llvm::Constant>(mit->second);
+            if (mit != methodFns_.end()) {
+                llvm::Function* target = layoutSpecializedSlotTarget(vs.method);
+                elems[kVirtualMethodsBase + i] = llvm::cast<llvm::Constant>(
+                    target ? target : mit->second);
+            }
         }
         // A VIRTUAL PROPERTY / INDEXER accessor slot stays NULL, and #2894
         // deliberately does not fill it — measured, not assumed.

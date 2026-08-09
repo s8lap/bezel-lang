@@ -403,4 +403,45 @@ BEZEL_TEST(xmod_imported_generic_layout_moving_2943, two_instantiations_each_get
     if (r == -2) return;
     BEZEL_EXPECT_EQ(r, 42);
 }
+
+// ===========================================================================
+// T8 — issue #2978: an ordinary VIRTUAL METHOD slot in an imported generic's
+// per-instantiation vtable must hold the body re-lowered for that instance.
+//
+// The otherwise-unused local `D2978<U> : G2978<string>` is load-bearing. Its
+// own `U` is not derivable from the static `G2978<string>` receiver type, so
+// `emitVirtualGenericDispatch` must abandon its descriptor-keyed call-site
+// dispatch. The actual receiver remains the imported `G2978<string>` object;
+// the call therefore reads that object's vtable slot directly. Before the fix
+// the slot held the exporter's erased `T -> i32` body, which read `_w` from the
+// old offset and returned 100. The re-lowered body reads the composed offset and
+// returns 121. §12 / §14.1 / §2.8.3 rule 4, v0.240.
+// ===========================================================================
+BEZEL_TEST(xmod_imported_generic_virtual_vtable_slot_2978,
+           undetermined_local_subclass_forces_imported_slot_spec_12) {
+    const char* lib =
+        "module GVirtualLib2978; "
+        "public class G2978<T> "
+        "  public _t: T; "
+        "  public _t2: T; "
+        "  public _w: int := 21; "
+        "  public virtual method V(): int return _w + 100; end V; "
+        "end G2978;";
+    int r = compileImportAndRun2943(
+        lib,
+        "module GVirtualApp2978; import GVirtualLib2978; "
+        "class D2978<U>: G2978<string> "
+        "  public override method V(): int return 7; end V; "
+        "end D2978; "
+        "public class M2978 "
+        "  public static method Main(): int "
+        "    using var g := new G2978<string>(); "
+        "    using var d := new D2978<int>(); "
+        "    var b: G2978<string> := g; "
+        "    return b.V(); "
+        "  end Main; "
+        "end M2978;");
+    if (r == -2) return;
+    BEZEL_EXPECT_EQ(r, 121);
+}
 }  // namespace bezel::module
