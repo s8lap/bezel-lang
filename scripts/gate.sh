@@ -602,65 +602,72 @@ done < <(test_binaries)
 # `find` never returned the population. Do not drop the -L.
 core_post=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo -1)
 GATE_CACHE_ROOT="${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}"
-cache_n=$(find -L "$GATE_CACHE_ROOT" -type f 2>/dev/null | wc -l)
-GATE_COLD=0
-{ [ "$core_post" != "$CORE_MTIME_PRE" ] || [ "$cache_n" -lt 2000 ]; } && GATE_COLD=1
-# IDENTITY CHECK (2026-07-29). The mtime comparison above only asks "did THIS
-# gate's build touch core.a", which is the wrong question. The AOT bincache
-# keys on a hash of libbezel_core.a AND libbezel_runtime.a (the "k2 identity",
-# tests/support/aot_support.hpp), so a RUNTIME-only change invalidates every
-# entry while core.a's mtime is unchanged relative to this build — and a
-# previous gate that timed out leaves the store full of entries under the OLD
-# identity, so the raw count looks warm too. Both signals said "warm" for a
-# fully cold tree on 2026-07-29: gates C and D were given the 900s ceiling for
-# a ~2400s cold run and were killed at it, having completed ~37% of the suite.
-#
-# Record the identity the cache is actually populated FOR, next to the store,
-# and refresh it only after a COMPLETED pass (see the write at the end) so a
-# timed-out gate cannot mark a half-populated store as warm.
-GATE_CACHE_ID=$(cat build/libbezel_core.a build/libbezel_runtime.a 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1)
-if [ "$ASAN" -eq 1 ]; then
-  GATE_CACHE_ID_FILE="$GATE_CACHE_ROOT/.gate-identity-asan"
-else
-  GATE_CACHE_ID_FILE="$GATE_CACHE_ROOT/.gate-identity"
-fi
-gate_id_note="match"
-if [ -n "${GATE_CACHE_ID:-}" ]; then
-  if [ "$GATE_CACHE_ID" != "$(cat "$GATE_CACHE_ID_FILE" 2>/dev/null || echo none)" ]; then
-    GATE_COLD=1; gate_id_note="CHANGED (cache is cold for this tree)"
+# Phase 5 (#3010): the k2 identity, the cold/warm prediction, and the per-oracle
+# marker are now the gate.identity / gate.cold Python modules. Python is
+# AUTHORITATIVE; the bash recompute in the dual-run assertion below is retained
+# for the landing-gate equivalence proof and removed once proven (per #3010's
+# add-then-prove-then-switch discipline). The invariants the modules encode are
+# UNCHANGED — #2100 (the 3-signal cold predicate), #2918 (the per-oracle marker),
+# #3000 (find -L) — see the module docstrings and the block comments above.
+oracle="plain"; [ "$ASAN" -eq 1 ] && oracle="asan"
+GATE_CACHE_ID=$(PYTHONPATH=scripts python3 -m gate.identity compute \
+  --core build/libbezel_core.a --runtime build/libbezel_runtime.a)
+# per #2918: the marker filename MUST be per-oracle (plain/ASan are disjoint
+# populations in one store); marker_filename encodes that branch.
+GATE_CACHE_ID_FILE=$(PYTHONPATH=scripts python3 -m gate.identity marker-filename \
+  --cache-root "$GATE_CACHE_ROOT" --oracle "$oracle")
+_recorded_id=$(PYTHONPATH=scripts python3 -m gate.identity read-marker --path "$GATE_CACHE_ID_FILE")
+identity_changed=0; [ "$core_post" != "$CORE_MTIME_PRE" ] && identity_changed=1
+gate_id_note="match"; marker_changed=0
+if [ -n "$GATE_CACHE_ID" ]; then
+  if [ "$GATE_CACHE_ID" != "$_recorded_id" ]; then
+    marker_changed=1; gate_id_note="CHANGED (cache is cold for this tree)"
   fi
 else
   gate_id_note="unavailable"
 fi
-# Warm ceilings differ because the two oracles cost differently: a warm ASan
-# pass needs 900s, while a warm plain pass is far cheaper (2026-08-06: 96 shards,
-# 336s TOTAL wall, i.e. ~50s of shard time each — 300s is ~6x headroom). The COLD
-# ceiling is the same 1800s for both: it is only a coarse backstop, since a
-# genuine per-test hang is still bounded by the harness's 120s compile / 30s run
-# deadlines and the canary is the fail-fast layer, so a generous cold value costs
-# nothing on a healthy tree and is what stops a store under eviction pressure
-# from killing shards and printing an undercount.
-#
-# ⚠ THE PLAIN WARM CEILING IS 900s, NOT 300s (#3000 follow-on, measured
-# 2026-08-07). 300s was never a tuned value — it was `run_parallel.sh`'s
-# hardcoded fallback, which the plain oracle fell through to because #2100's
-# cold logic was ASan-only. #2918 hoisted the cold logic to both oracles, but
-# `cache_n` was reading through a symlink without -L and returned 0
-# unconditionally, so BOTH oracles always predicted COLD and the warm branch
-# here was unreachable dead code. #3000 fixed the -L; the very first gate to
-# reach this branch (f60c1cb, plain attempt 1) was killed at 300s — 14
-# timeout-victim suites, 5156 of 16482 tests. So the warm path had never in fact
-# been exercised on this box, and 300s does not fit it: that run's whole-suite
-# wall was 358s, and the cold uncached close-out at 410ed6e was 314s.
-#
-# 900s matches the ASan warm ceiling, sits ~2.5x above the observed whole-suite
-# wall, and still fails fast on a genuine hang. The coverage floor below is the
-# real backstop; this value only decides how long a wedged shard is tolerated.
-sto="$GATE_EXPLICIT_STO"
-if [ -z "$sto" ]; then
-  sto=900
-  [ "$GATE_COLD" -eq 1 ] && sto=1800
+# cold.evaluate: count the cache (find -L, #3000), apply the 3-signal predicate
+# (#2100), and pick the ceiling (#2918: cold 1800 / warm 900 for BOTH oracles —
+# the warm 900s is NOT the old 300s fallback; see the ceiling comment above).
+# Prints shell-sourceable cache_n / cold / ceiling. Fail-safe defaults below
+# keep the gate cold if the module is unavailable (python3 is already a hard
+# gate dependency via verdict/summary/trend; this just keeps `set -u` safe).
+cache_n=0 cold=1 ceiling=1800
+eval "$(PYTHONPATH=scripts python3 -m gate.cold evaluate \
+  --cache-root "$GATE_CACHE_ROOT" \
+  --identity-changed "$identity_changed" --marker-changed "$marker_changed" 2>/dev/null)"
+GATE_COLD=$cold
+# A caller's explicit BEZEL_SHARD_TIMEOUT always wins (see GATE_EXPLICIT_STO).
+sto="$GATE_EXPLICIT_STO"; [ -z "$sto" ] && sto=$ceiling
+# --- dual-run assertion (TEMPORARY: remove after the landing gate proves it) ---
+# Recompute the cold/identity signals the OLD bash way and assert the Python
+# modules agree. Fatal on drift: a disagreement is a real port defect, and the
+# gate must not proceed on an unproven value (#3010 — the gate stays
+# trustworthy; the old bash is authority until the Python is proven, and if they
+# DISAGREE neither is trusted — exit 3 = retry, never a silent pass).
+_bash_cache_n=$(find -L "$GATE_CACHE_ROOT" -type f 2>/dev/null | wc -l)
+_bash_id=$(cat build/libbezel_core.a build/libbezel_runtime.a 2>/dev/null | sha256sum 2>/dev/null | cut -d' ' -f1)
+_bash_recorded=$(cat "$GATE_CACHE_ID_FILE" 2>/dev/null || echo none)
+_bash_cold=0
+{ [ "$core_post" != "$CORE_MTIME_PRE" ] || [ "$_bash_cache_n" -lt 2000 ] || { [ -n "$_bash_id" ] && [ "$_bash_id" != "$_bash_recorded" ]; }; } && _bash_cold=1
+_p5_drift=""
+[ "$_bash_cache_n" -ne "$cache_n" ] && _p5_drift="${_p5_drift}cache_n(bash=$_bash_cache_n py=$cache_n) "
+[ "$_bash_cold" -ne "$GATE_COLD" ] && _p5_drift="${_p5_drift}cold(bash=$_bash_cold py=$GATE_COLD) "
+# The identity hashes agree whenever BOTH archives exist (the build phase
+# guarantees this); they diverge only in the both-missing case, where bash's
+# `sha256sum` of empty input yields e3b0c44… while the module fails CLOSED ("").
+# Assert the digest only when the module produced one — i.e. both archives read.
+if [ -n "$GATE_CACHE_ID" ] && [ "$_bash_id" != "$GATE_CACHE_ID" ]; then
+  _p5_drift="${_p5_drift}identity(bash=$_bash_id py=$GATE_CACHE_ID) "
 fi
+if [ -n "$_p5_drift" ]; then
+  echo "## GATE FAILURE: Phase-5 PYTHON/BASH DRIFT — $_p5_drift" >&2
+  echo "##   gate.identity/gate.cold disagree with the proven bash; refusing to" >&2
+  echo "##   proceed on an unproven cold/identity value (retry once fixed)." >&2
+  FAILED_PHASE="phase-5 python/bash drift: $_p5_drift"
+  exit 3
+fi
+# --- end dual-run assertion ---
 SHARD_ENV+=(BEZEL_SHARD_TIMEOUT="$sto")
 core_note="unchanged"; [ "$core_post" != "$CORE_MTIME_PRE" ] && core_note="rebuilt"
 cold_note="warm-predicted"; [ "$GATE_COLD" -eq 1 ] && cold_note="cold-predicted"
@@ -1022,8 +1029,10 @@ fi
 # store warm — re-creating, from the other direction, exactly the mis-prediction
 # this marker exists to prevent.
 if [ "${rc:-1}" -eq 0 ] && [ "${COV_GTESTS:-0}" -gt 0 ] && [ -n "${GATE_CACHE_ID:-}" ] && [ -n "${GATE_CACHE_ID_FILE:-}" ]; then
-  mkdir -p "$(dirname "$GATE_CACHE_ID_FILE")" 2>/dev/null && \
-    printf '%s\n' "$GATE_CACHE_ID" > "$GATE_CACHE_ID_FILE" 2>/dev/null && \
+  # Phase 5 (#3010): write-marker is best-effort (mkdir + write + never raise),
+  # matching the old `2>/dev/null` swallow. A no-op on empty identity.
+  PYTHONPATH=scripts python3 -m gate.identity write-marker \
+    --path "$GATE_CACHE_ID_FILE" --identity "$GATE_CACHE_ID" 2>/dev/null && \
     echo "== gate: recorded AOT cache identity for the next run's warm/cold prediction =="
 fi
 
