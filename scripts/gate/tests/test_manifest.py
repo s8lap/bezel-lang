@@ -287,5 +287,186 @@ class CLITest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
 
 
+class VerifyBinariesTest(unittest.TestCase):
+    """`verify_binaries` — the gate.sh port of `cut -f2` + the per-binary
+    `[ -x ]` loop (#3011). Pins: returns the verified paths in manifest order;
+    HARD-FAILS on the first non-executable binary (never silently lower the
+    bar); propagates read_manifest's ValueError on a malformed/empty manifest.
+    """
+
+    def test_returns_paths_in_manifest_order_when_all_executable(self):
+        # The is_executable seam stands in for the filesystem: all "present".
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "tb.txt")
+            _write(mp,
+                   "codegen\t/build/b1\t42\n"
+                   "sema\t/build/b2\t17\n")
+            paths = manifest.verify_binaries(
+                mp, is_executable=lambda p: True)
+        self.assertEqual(paths, ["/build/b1", "/build/b2"])
+
+    def test_returns_same_paths_as_read_manifest_listing(self):
+        # The dual-run invariant: verify's output == the manifest's path column
+        # (== what `cut -f2` produces). On a well-formed manifest with all
+        # binaries present they are identical.
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "tb.txt")
+            _write(mp,
+                   "codegen\t/build/b1\t42\n"
+                   "ownership\t/build/b2\t9\n"
+                   "support\t/build/b3\t3\n")
+            verified = manifest.verify_binaries(
+                mp, is_executable=lambda p: True)
+            listed = [b.path for b in manifest.read_manifest(mp)]
+        self.assertEqual(verified, listed)
+
+    def test_hard_fails_on_non_executable_binary(self):
+        # per #3011: a binary the manifest lists but that is NOT executable is a
+        # HARD failure — skipping it would silently LOWER the bar.
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "tb.txt")
+            _write(mp,
+                   "codegen\t/build/b1\t42\n"
+                   "sema\t/build/b2\t17\n")
+            with self.assertRaises(manifest.VerifyError):
+                manifest.verify_binaries(
+                    mp, is_executable=lambda p: p != "/build/b2")
+
+    def test_verify_error_names_the_offending_binary_and_group(self):
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "tb.txt")
+            _write(mp, "sema\t/build/missing\t17\n")
+            with self.assertRaises(manifest.VerifyError) as cm:
+                manifest.verify_binaries(
+                    mp, is_executable=lambda p: False)
+        msg = str(cm.exception)
+        self.assertIn("/build/missing", msg)
+        self.assertIn("sema", msg)
+        self.assertIn("#3011", msg)
+
+    def test_fails_on_first_non_executable(self):
+        # The first non-executable binary aborts; a later one is never reached.
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "tb.txt")
+            _write(mp,
+                   "codegen\t/build/b1\t1\n"
+                   "sema\t/build/b2\t2\n"
+                   "support\t/build/b3\t3\n")
+            calls = []
+            def check(p):
+                calls.append(p)
+                return p != "/build/b2"
+            with self.assertRaises(manifest.VerifyError):
+                manifest.verify_binaries(mp, is_executable=check)
+        self.assertNotIn("/build/b3", calls)   # stopped at b2
+
+    def test_propagates_value_error_on_malformed_manifest(self):
+        # read_manifest's strict validation still fires before any FS check.
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "tb.txt")
+            _write(mp, "garbage no tabs\n")
+            with self.assertRaises(ValueError):
+                manifest.verify_binaries(mp, is_executable=lambda p: True)
+
+    def test_propagates_value_error_on_empty_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "tb.txt")
+            _write(mp, "")
+            with self.assertRaises(ValueError):
+                manifest.verify_binaries(mp, is_executable=lambda p: True)
+
+    def test_default_is_executable_checks_real_filesystem(self):
+        # The default seam (no injection) does a real exists + X_OK check,
+        # matching coverage.py:159 and the old bash `[ -x ]`. A file that IS
+        # executable passes; a plain data file fails; a missing path fails.
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, "real_bin")
+            with open(exe, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(exe, 0o755)
+            data = os.path.join(d, "data")
+            open(data, "w").close()
+            mp_ok = os.path.join(d, "ok.txt")
+            _write(mp_ok, "codegen\t%s\t1\n" % exe)
+            self.assertEqual(
+                manifest.verify_binaries(mp_ok), [exe])
+            mp_data = os.path.join(d, "data.txt")
+            _write(mp_data, "codegen\t%s\t1\n" % data)
+            with self.assertRaises(manifest.VerifyError):
+                manifest.verify_binaries(mp_data)
+            mp_missing = os.path.join(d, "missing.txt")
+            _write(mp_missing, "codegen\t%s/nope\t1\n" % d)
+            with self.assertRaises(manifest.VerifyError):
+                manifest.verify_binaries(mp_missing)
+
+
+class VerifyCLITest(unittest.TestCase):
+    """`python3 -m gate.manifest verify` — the gate.sh bridge (#3011).
+
+    Pins that the CLI prints one path per line on success, exits nonzero (with a
+    stderr message) on a missing/non-executable binary, and emits NOTHING to
+    stdout on failure (the gate must fail before iterating a truncated listing).
+    """
+
+    _SCRIPTS_DIR = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..", ".."))
+
+    def _run_cli(self, args):
+        import subprocess
+        env = dict(os.environ, PYTHONPATH=self._SCRIPTS_DIR)
+        return subprocess.run(
+            [sys.executable, "-m", "gate.manifest"] + args,
+            capture_output=True, text=True, env=env)
+
+    def test_verify_prints_paths_one_per_line(self):
+        with tempfile.TemporaryDirectory() as d:
+            exe = os.path.join(d, "real_bin")
+            with open(exe, "w") as f:
+                f.write("#!/bin/sh\n")
+            os.chmod(exe, 0o755)
+            mp = os.path.join(d, "tb.txt")
+            _write(mp,
+                   "codegen\t%s\t42\n" % exe)
+            r = self._run_cli(["verify", "--path", mp])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.splitlines(), [exe])
+
+    def test_verify_exits_nonzero_on_non_executable(self):
+        with tempfile.TemporaryDirectory() as d:
+            data = os.path.join(d, "data")
+            open(data, "w").close()       # not executable
+            mp = os.path.join(d, "tb.txt")
+            _write(mp, "codegen\t%s\t1\n" % data)
+            r = self._run_cli(["verify", "--path", mp])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not executable", r.stderr)
+        self.assertEqual(r.stdout, "")     # nothing on stdout
+
+    def test_verify_exits_nonzero_on_missing_binary(self):
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "tb.txt")
+            _write(mp, "codegen\t%s/nope\t1\n" % d)
+            r = self._run_cli(["verify", "--path", mp])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("missing", r.stderr)
+        self.assertEqual(r.stdout, "")
+
+    def test_verify_exits_nonzero_on_malformed_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "tb.txt")
+            _write(mp, "garbage no tabs\n")
+            r = self._run_cli(["verify", "--path", mp])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
+    def test_verify_exits_nonzero_on_empty_manifest(self):
+        with tempfile.TemporaryDirectory() as d:
+            mp = os.path.join(d, "tb.txt")
+            open(mp, "w").close()
+            r = self._run_cli(["verify", "--path", mp])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(r.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -440,8 +440,10 @@ trap 'rc=$?; gate_finish "$rc" || true; exit $rc' EXIT
 # cold-cache timeouts as mass regressions (the #2205 mis-revert, 2026-07-25).
 # The per-area test binaries, from the CMake-generated manifest
 # (tests/CMakeLists.txt). Every runner reads this same file, so the set of
-# binaries the gate accounts for is exactly the set CMake built.
-test_binaries() { cut -f2 build/tests/test_binaries.txt 2>/dev/null; }
+# binaries the gate accounts for is exactly the set CMake built. The manifest is
+# now read + verified by the gate.manifest module (Wave 3, #3010): the `verify`
+# call after the build phase replaces the old `test_binaries()` (`cut -f2`)
+# reader + the per-binary `[ -x ]` loop.
 
 # Phase 4 (#3010): arbitration is now the gate.arbitration Python module. The
 # module's arbitrate() re-runs each suspect's suite across the per-area binaries
@@ -488,11 +490,35 @@ rec_ran build "$prc"
 # A missing/empty manifest means the gate has no idea what to run — refuse
 # rather than silently sharding a subset of the suite.
 [ -s build/tests/test_binaries.txt ] || fail "build produced no test-binary manifest (build/tests/test_binaries.txt)"
+# per #3011: the manifest module reads the manifest AND verifies every binary
+# is executable, hard-failing on missing/non-executable (the gate's own input
+# was the defect it catches — never silently lower the bar). Replaces the old
+# `cut -f2` + per-binary `[ -x ]` loop. Outputs the verified paths one per line;
+# emits NOTHING to stdout on failure so the loop below never iterates a partial
+# set.
+if ! _gate_bins=$(PYTHONPATH=scripts python3 -m gate.manifest verify --path build/tests/test_binaries.txt); then
+  fail "build reported success but a test binary is missing or not executable (manifest verify failed — see module stderr above)"
+fi
+# --- dual-run assertion (TEMPORARY: remove after the landing gate proves it) ---
+# The OLD bash `cut -f2` listing must produce the SAME paths in the SAME order
+# as the module's verified output. Fatal on drift: a divergence is a port defect
+# in the manifest read (#3010). Both read top-to-bottom; on a well-formed
+# manifest with all binaries built they are byte-identical. (The hard-fail on a
+# missing/non-executable binary is pinned by test_manifest.py's VerifyBinaries
+# test class; this assertion pins the path LISTING equivalence.)
+_bash_bins=$(cut -f2 build/tests/test_binaries.txt 2>/dev/null)
+if [ "$_bash_bins" != "$_gate_bins" ]; then
+  echo "## GATE FAILURE: manifest PYTHON/BASH DRIFT — binary path lists differ" >&2
+  echo "##   gate.manifest verify produced a different path list than the proven" >&2
+  echo "##   \`cut -f2\`; a divergence is a port defect in the manifest read (#3010)." >&2
+  FAILED_PHASE="manifest python/bash drift: binary path lists differ"
+  exit 3
+fi
+# --- end dual-run assertion ---
 while IFS= read -r _b; do
   [ -n "$_b" ] || continue
-  [ -x "$_b" ] || fail "build reported success but test binary $_b is missing"
   echo "   binary: $(basename "$_b")  $(ls -la --time-style=+%H:%M:%S "$_b" | awk '{print $6}')"
-done < <(test_binaries)
+done <<< "$_gate_bins"
 
 # Decide the per-shard ceiling now that coldness is knowable (#2100; see the
 # SHARD_ENV note above). Cold predicate: core.a rebuilt this gate (k2 identity

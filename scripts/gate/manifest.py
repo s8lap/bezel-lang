@@ -2,7 +2,10 @@
 
 Python port of the manifest-reading inline bash in gate.sh / run_parallel.sh /
 agent_check.sh (they `IFS=$'\\t' read -r group path count` the file in several
-places). FOUNDATION ONLY this lane — unit-tested, NOT yet wired into gate.sh.
+places). The `verify` subcommand is WIRED INTO gate.sh (Wave 3): it reads the
+manifest AND checks every listed binary is executable, hard-failing on
+missing/non-executable (#3011 — the gate's own input was the defect it catches).
+The pure `binaries` listing remains for consumers that have not built yet.
 
 THE MANIFEST (tests/CMakeLists.txt:16-17, 242-246): one row per per-area test
 binary, `<group>\\t<abs path>\\t<#sources>`, largest group first. It is the
@@ -33,6 +36,7 @@ Stdlib only (no pytest). See test_manifest.py for the read + partition pins.
 """
 
 import argparse
+import os
 import sys
 
 
@@ -161,13 +165,52 @@ def partition_is_complete(manifest, tests_glob, num_shared_entry=1):
     return total == glob_n - num_shared_entry
 
 
+class VerifyError(Exception):
+    """A manifest binary is missing or not executable (#3011)."""
+
+
+def verify_binaries(path, *, is_executable=None):
+    """Read the manifest and verify every listed binary is executable (#3011).
+
+    The gate.sh port of the old `cut -f2` listing + the per-binary
+    `[ -x "$b" ] || fail` loop. A binary the manifest lists but that is NOT
+    executable (missing, never built, renamed, or its +x lost) is a HARD
+    failure: the old loop hard-failed on exactly this, and skipping the binary
+    would silently LOWER the bar by however many tests it holds (the #3011
+    variant-3 shape — the floor's own input was the defect it catches).
+
+    Returns the binary paths in manifest order on success — the same paths
+    `cut -f2` produces on a well-formed manifest (the dual-run assertion in
+    gate.sh pins this equivalence). Raises VerifyError on the first
+    non-executable binary; read_manifest's ValueError propagates on a
+    malformed/empty manifest. `is_executable` is an injection seam for the unit
+    tests (default: exists + X_OK, matching coverage.py:159 — the same `[ -x ]`
+    semantics the old bash loop used).
+    """
+    if is_executable is None:
+        is_executable = lambda p: os.path.exists(p) and os.access(p, os.X_OK)
+    binaries = read_manifest(path)
+    for b in binaries:
+        if not is_executable(b.path):
+            raise VerifyError(
+                "%s: test binary '%s' (group %s) is missing or not executable "
+                "— build reported success but a per-area binary was not "
+                "produced (#3011: never silently lower the bar)"
+                % (path, b.path, b.group))
+    return [b.path for b in binaries]
+
+
 # ---------------------------------------------------------------------------
 # CLI — gate.sh / run_parallel.sh / agent_check.sh call
 # `python3 -m gate.manifest binaries ...` to enumerate the binary paths the way
-# the old `cut -f2 build/tests/test_binaries.txt` did (Wave 2 retires that
-# hand-parse). read_manifest's strict validation replaces the silent skip the
-# loose bash cut performed, so a malformed row now fails loudly instead of
-# dropping a binary from the runner's accounting.
+# the old `cut -f2 build/tests/test_binaries.txt` did. read_manifest's strict
+# validation replaces the silent skip the loose bash cut performed, so a
+# malformed row now fails loudly instead of dropping a binary from the runner's
+# accounting.
+#
+# `python3 -m gate.manifest verify ...` (Wave 3) ADDS the #3011 executability
+# check on top of the listing — it is the gate.sh replacement for `cut -f2` +
+# the per-binary `[ -x ]` loop, hard-failing on a missing/non-executable binary.
 # ---------------------------------------------------------------------------
 
 def _main_binaries(argv):
@@ -180,10 +223,37 @@ def _main_binaries(argv):
     return 0
 
 
+def _main_verify(argv):
+    """`verify [--path P]` → check each binary is executable; print paths.
+
+    The gate.sh replacement for `cut -f2` + the per-binary `[ -x ]` loop
+    (#3011). Prints the binary paths (one per line, manifest order) on success;
+    exits nonzero with a stderr message if any binary is missing/non-executable
+    (never silently lower the bar) or the manifest is malformed/empty. Emits
+    NOTHING to stdout on failure so a consumer piping the output never sees a
+    partial set — the gate fails before iterating a truncated listing.
+    """
+    p = argparse.ArgumentParser(prog="manifest.py verify")
+    p.add_argument("--path", default="build/tests/test_binaries.txt")
+    args = p.parse_args(argv)
+    try:
+        paths = verify_binaries(args.path)
+    except VerifyError as exc:
+        sys.stderr.write("manifest.py verify: %s\n" % exc)
+        return 1
+    # read_manifest's ValueError (malformed/empty manifest) propagates as a
+    # traceback — still a hard failure (nonzero exit), matching `binaries`.
+    for bpath in paths:
+        print(bpath)
+    return 0
+
+
 def main(argv):
     if len(argv) >= 2 and argv[1] == "binaries":
         return _main_binaries(argv[2:])
-    sys.stderr.write("usage: manifest.py binaries [--path PATH]\n")
+    if len(argv) >= 2 and argv[1] == "verify":
+        return _main_verify(argv[2:])
+    sys.stderr.write("usage: manifest.py {binaries|verify} [--path PATH]\n")
     return 2
 
 
