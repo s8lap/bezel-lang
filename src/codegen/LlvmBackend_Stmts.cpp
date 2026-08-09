@@ -664,7 +664,40 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 localSlot(*as->target) != nullptr) {
                 rhs = lowerExpr(*as->value);
                 rhs = rescueUnitAssignRhs(rhs, *as);
-                if (!rhs) return false;
+                // fix #2961 (§28.9/§28.3, v0.240): the `:=` arms of lowerStmt
+                // bailed silently on a null RHS — no diagnostic of any severity.
+                // The sibling positions already treat this as a reportable
+                // degradation: lowerLocalDecl (#2434, Warning), emitReturn
+                // (#2491, Warning), buildOrderedArgs (#1386, Error). Make the
+                // assignment arm the one member of that family with a signal.
+                //
+                // Severity::Warning, guarded on `!ctx_.diagnostics().hasErrors()`,
+                // mirroring #2434's posture exactly: an Error would false-reject
+                // §3/#605's permissive "unknown member" shape (e.g.
+                // `o: Object; o := o.Anything();`, the local-decl twin
+                // #2434's own corpus check catalogues) — codegen has no concrete
+                // member to dispatch to, so `lowerExpr` returns null for a
+                // sema-legal program, and the `return false;` degrade is what
+                // keeps the target's previous value in place. Driver::compile
+                // ExecutableObject prints every diagnostic regardless of
+                // severity, so a Warning is fully visible on stderr without
+                // failing the build.
+                //
+                // The unit case is already handled by rescueUnitAssignRhs above
+                // (§4.7 / §8.6 "Boxing of the unit value", #2915) — a unit RHS
+                // is rescued to a box (or a no-op for non-Object/interface
+                // targets) before reaching this null check, so the Warning only
+                // fires for non-unit shapes whose lowering actually failed.
+                if (!rhs) {
+                    if (!ctx_.diagnostics().hasErrors())
+                        ctx_.diagnostics().report(
+                            Severity::Warning, as->value->span.begin,
+                            "internal: assignment RHS expression failed to "
+                            "lower to a value for this assignment's target "
+                            "(store dropped — target retains its previous "
+                            "value) — #2961");
+                    return false;
+                }
                 addr = lvalueAddr(*as->target, elemTy);
                 if (!addr) return false;
             } else {
@@ -672,7 +705,21 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                 if (!addr) return false;
                 rhs = lowerExpr(*as->value);
                 rhs = rescueUnitAssignRhs(rhs, *as);
-                if (!rhs) return false;
+                // fix #2961 — same Warning the localSlot arm emits above; the
+                // generic lvalueAddr fallback covers every non-local-slot
+                // assignment shape (field, property, indexer, imported target)
+                // that reached this point without an earlier dedicated arm
+                // having claimed the store.
+                if (!rhs) {
+                    if (!ctx_.diagnostics().hasErrors())
+                        ctx_.diagnostics().report(
+                            Severity::Warning, as->value->span.begin,
+                            "internal: assignment RHS expression failed to "
+                            "lower to a value for this assignment's target "
+                            "(store dropped — target retains its previous "
+                            "value) — #2961");
+                    return false;
+                }
             }
             // §7.7 (#1190): null-coalescing assignment `x ??= e`. Mirror the
             // `??` binary operator's short-circuit (LlvmBackend_Exprs.cpp
