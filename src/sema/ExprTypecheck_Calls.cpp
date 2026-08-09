@@ -6661,6 +6661,113 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     unit->kind = TypeRef::Kind::Unit;
                     ctx_.setExprType(&ce, unit);
                 }
+                // fix #3024 (§11.7 / §22.6, v0.240): per-static-class
+                // closed-surface guard for the three names in this issue
+                // (Task, Stopwatch, CancellationTokenSource). Sibling of
+                // #3021, which covered File/Directory/Path/Debug/Domain and
+                // was reverted at db950a6 because its per-static-class arm
+                // fired for `Path.Deserialize(d)` — a user record Path's
+                // LEGITIMATE static factory — and rejected it (colName
+                // matches "Path" via the IdentifierExpr branch, with no
+                // discriminator on whether the receiver is a user-declared
+                // type). This re-attempt restricts the guard to the three
+                // names #3024 owns AND adds the missing discriminator:
+                // SKIP unless the receiver TypeRef is null — i.e. the call
+                // is on the BUILTIN STATIC CLASS IDENTIFIER (`Task.X(...)`,
+                // `Stopwatch.X(...)`, `CancellationTokenSource.X(...)`),
+                // where the colName lambda's IdentifierExpr fallback fires
+                // (per its "Builtin class identifiers are given a symbol
+                // but no TypeRef" comment).
+                //
+                // The discriminator `recvTy == nullptr` correctly
+                // distinguishes:
+                //   * STATIC calls on a builtin static class identifier —
+                //     recvTy is null (no instance TypeRef), colName from
+                //     the IdentifierExpr fallback. Fire the guard.
+                //   * INSTANCE calls on a builtin instance — recvTy is the
+                //     instance TypeRef (e.g. `new CancellationTokenSource()`
+                //     yields declaration=null + astNode="CTS"; `Stopwatch
+                //     .StartNew()` yields declaration=builtinClassSym,
+                //     astNode=null). DON'T fire the guard — the receiver's
+                //     own per-instance arms at lines 6914-7775 and the
+                //     codegen #605 permissive path handle instance methods,
+                //     and instance methods (cts.Cancel(), sw.Restart(), …)
+                //     are NOT in the static surface and would otherwise be
+                //     wrongly rejected.
+                //   * STATIC calls on a USER class — recvTy is the user
+                //     record's TypeRef (declaration with decl!=nullptr).
+                //     DON'T fire the guard, so `Path.Deserialize(d)` on a
+                //     user record Path (the #3021 regression) is unaffected.
+                //
+                // Membership is name-only (no arity dispatch) and the
+                // surfaces are the documented STATIC methods per stdlib
+                // §6.7/§8.1/§6.1. The block runs AFTER the legitimate
+                // static-class arms above (Task/Stopwatch/CTS already type
+                // their known static members; the guard only fires for
+                // unhandled names).
+                if (recvTy == nullptr) {
+                        struct StaticSurface {
+                            std::string_view colName;
+                            std::initializer_list<std::string_view> members;
+                            std::string_view surface;
+                            std::string_view stdlibSection;
+                        };
+                        static const StaticSurface kStaticSurfaces[] = {
+                            // §6.7 Task — 8 static methods (one entry per
+                            // method name; the four Delay overloads, two
+                            // FromException / two FromCancelled overloads,
+                            // and the two WhenAll overloads share names).
+                            {"Task",
+                             {"FromResult", "FromOwnedResult", "FromException",
+                              "FromCancelled", "Delay", "WhenAll", "WhenAny",
+                              "FireAndForget"},
+                             "FromResult<T>(value), FromOwnedResult<T>(owned "
+                             "value), FromException<T>(owned exc), "
+                             "FromException(owned exc), FromCancelled<T>(), "
+                             "FromCancelled(), Delay(ms), Delay(ms, token), "
+                             "Delay(duration), Delay(duration, token), "
+                             "WhenAll(tasks), WhenAll<T>(tasks), WhenAny(tasks), "
+                             "FireAndForget(owned task)",
+                             "6.7"},
+                            // §8.1 Stopwatch — 1 static factory.
+                            {"Stopwatch",
+                             {"StartNew"},
+                             "StartNew() -> owned Stopwatch",
+                             "8.1"},
+                            // §6.1 CancellationTokenSource — 3 static
+                            // factories. The instance methods (Token,
+                            // IsCancellationRequested, Cancel, CancelAfter)
+                            // are reached via a typed cts receiver, so
+                            // colName is the variable name like `cts`, not
+                            // "CancellationTokenSource" — they don't reach
+                            // this arm.
+                            {"CancellationTokenSource",
+                             {"WithCancelAfter", "CreateLinked",
+                              "CreateLinkedAll"},
+                             "WithCancelAfter(delay), "
+                             "CreateLinked(a, b), CreateLinkedAll(parents)",
+                             "6.1"},
+                        };
+                        for (const auto& s : kStaticSurfaces) {
+                            if (colName != s.colName) continue;
+                            bool known = false;
+                            for (auto km : s.members) {
+                                if (m == km) { known = true; break; }
+                            }
+                            if (!known) {
+                                ctx_.diagnostics().report(
+                                    Severity::Error, ce.span.begin,
+                                    std::string("no member `") + std::string(m) +
+                                    "` on `" + std::string(s.colName) +
+                                    "`; documented surface: " +
+                                    std::string(s.surface) + " (stdlib §" +
+                                    std::string(s.stdlibSection) + ")");
+                            }
+                            // Only one StaticSurface row matches per
+                            // receiver — stop scanning after the match.
+                            break;
+                        }
+                }
                 // §2.5: DateTime instance method return types.
                 // The receiver's TypeRef uses builtinClassSym (non-null declaration,
                 // null decl) so colName is empty; check via declaration->name directly.
