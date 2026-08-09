@@ -308,55 +308,57 @@ rec_skip() { PH_NAME+=("$1"); PH_DUR+=("0.00"); PH_RC+=("0"); PH_STATUS+=("skipp
 emit_json() { # rc result total_s -> append one JSON object; best-effort
   local rc="$1" result="$2" total="$3"
   mkdir -p "$TLOGDIR" 2>/dev/null || return 0
-  local phases="" sep="" i n=${#PH_NAME[@]}
-  for (( i=0; i<n; i++ )); do
-    phases="${phases}${sep}{\"name\":\"${PH_NAME[$i]}\",\"s\":${PH_DUR[$i]},\"rc\":${PH_RC[$i]},\"status\":\"${PH_STATUS[$i]}\",\"note\":\"${PH_NOTE[$i]}\"}"
-    sep=","
-  done
-  local fp="null"; [ -n "$FAILED_PHASE" ] && fp="\"$FAILED_PHASE\""
-  # fix #3010: AN UNMEASURED NUMBER EMITS null, NEVER 0.
-  # `"gtests":${COV_GTESTS:-0}` is precisely how 26 records came to say
-  # result=pass with gtests=0: a harvest regex that failed and a suite that
-  # genuinely ran nothing were byte-identical in the log. `null` means "not
-  # measured"; `0` means "measured as zero". Conflating them destroyed the only
-  # evidence that would have distinguished them, for 24 days.
-  local j_gtests="null"; [ -n "${COV_GTESTS:-}" ] && [ "${COV_GTESTS:-0}" -gt 0 ] 2>/dev/null && j_gtests="$COV_GTESTS"
-  local j_lit="null";    [ -n "${COV_LITTESTS:-}" ] && [ "${COV_LITTESTS:-0}" -gt 0 ] 2>/dev/null && j_lit="$COV_LITTESTS"
-  local j_exp="null";    [ "${GATE_EXPECTED_GTESTS:-0}" -gt 0 ] 2>/dev/null && j_exp="$GATE_EXPECTED_GTESTS"
-  local j_cachen="null"; [ -n "${cache_n:-}" ] && j_cachen="$cache_n"
-  local j_sto="null";    [ -n "${sto:-}" ] && j_sto="$sto"
-  local j_cold="null";   [ -n "${GATE_COLD:-}" ] && { [ "$GATE_COLD" -eq 1 ] && j_cold=true || j_cold=false; }
-  local j_floor="null";  [ -n "${GATE_FLOOR_OK:-}" ] && { [ "$GATE_FLOOR_OK" -eq 1 ] && j_floor=true || j_floor=false; }
-  local j_aot="null"
-  [ -n "${AOT_HITS:-}${AOT_MISSES:-}" ] && j_aot="{\"hits\":${AOT_HITS:-null},\"misses\":${AOT_MISSES:-null},\"store_failures\":${AOT_STORE_FAILS:-null}}"
-  # merge the two flat maps written at different points in the run (see the
-  # ordering note at the harvest). Union of names, so a binary that was expected
-  # but never reported appears with ran=0 — which is exactly the signature R2
-  # looks for ("a whole area contributed nothing").
-  local j_bins="null" _m=""
-  if [ -n "${GATE_BIN_EXPECTED:-}${GATE_BIN_RAN:-}" ]; then
-    _m=$(# NB: `exp` and `ran` are gawk builtins — using them as -v names is a
-      # fatal awk error, which would have made this merge emit nothing at all.
-      awk -v emap="${GATE_BIN_EXPECTED:-}" -v rmap="${GATE_BIN_RAN:-}" '
-      BEGIN{
-        n=split(emap,E," "); for(i=1;i<=n;i++){ split(E[i],a,":"); if(a[1]!="")e[a[1]]=a[2] }
-        n=split(rmap,R," "); for(i=1;i<=n;i++){ split(R[i],a,":"); if(a[1]!="")r[a[1]]=a[2] }
-        for(k in e) seen[k]=1; for(k in r) seen[k]=1
-        out=""; sep=""
-        for(k in seen){
-          ev=(k in e)?e[k]:"null"; rv=(k in r)?r[k]:0
-          out=out sep "\"" k "\":{\"ran\":" rv ",\"expected\":" ev "}"; sep=","
-        }
-        print out
-      }')
-    [ -n "$_m" ] && j_bins="{$_m}"
-  fi
-  printf '{"schema":2,"ts":"%s","epoch":%s,"host":"%s","mode":"%s","head":"%s","head_short":"%s","dirty":%s,"result":"%s","failed_phase":%s,"total_s":%s,"gtests":%s,"littests":%s,"expected_gtests":%s,"coverage_floor_enforced":%s,"cold":%s,"cache_n":%s,"shard_timeout_s":%s,"aot":%s,"binaries":%s,"shard_count":%s,"shard_reported_s":%s,"arbitration_suspects":%s,"serial_attempts":%s,"serial_total":%s,"asan_shards_reported":%s,"asan_errors":%s,"shard_times":[%s],"phases":[%s]}\n' \
-    "$GATE_TS" "${GATE_EPOCH:-0}" "$GATE_HOST" "$MODE" "$GATE_HEAD" "$GATE_HEAD_SHORT" "$GATE_DIRTY" \
-    "$result" "$fp" "$total" "$j_gtests" "$j_lit" "$j_exp" "$j_floor" "$j_cold" "$j_cachen" "$j_sto" \
-    "$j_aot" "$j_bins" "${SHARD_COUNT:-0}" "${SHARD_REPORTED_S:-0}" \
-    "${ARB_SUSPECTS:-0}" "${SERIAL_ATTEMPTS:-0}" "${SERIAL_TOTAL:-0}" "${ASAN_SHARDS:-0}" "${ASAN_ERRS:-0}" \
-    "$SHARD_TIMES" "$phases" >> "$TLOG" 2>/dev/null || return 0
+  # Wave 3 (#3010): the schema:2 record is now built by the gate.telemetry
+  # Python module. The 25-field bash printf, the awk per-binary merge (with its
+  # `exp`/`ran` gawk-builtin-names footgun), and the j_* null-vs-0 conditionals
+  # are all ported there — a dict + json.dumps replaces the printf, a dict
+  # union replaces the awk, and None-vs-0 (trivially correct in Python) replaces
+  # the null-vs-0 rules. Proven byte-identical to the old bash over a controlled
+  # dual-run (8 cases, every null-vs-0 branch, zero raw-byte diff). See
+  # scripts/gate/telemetry.py + scripts/gate/tests/test_telemetry.py.
+  #
+  # fix #3010 (preserved by the module): AN UNMEASURED NUMBER EMITS null, NEVER
+  # 0. A flag OMITTED below means the variable was unset (unmeasured => null);
+  # a flag present with a value means measured. The per-field null-vs-0 RULE
+  # (e.g. gtests null on 0, cache_n 0 on 0) lives in the module — it is the
+  # exact `[ -n "${VAR:-}" ]` conditional the old j_* locals encoded.
+  local _tsv="$S/.gate-phases.$$.tsv" i
+  { for (( i=0; i<${#PH_NAME[@]}; i++ )); do
+      printf '%s\t%s\t%s\t%s\t%s\n' "${PH_NAME[$i]}" "${PH_DUR[$i]}" "${PH_RC[$i]}" "${PH_STATUS[$i]}" "${PH_NOTE[$i]}"
+    done; } > "$_tsv" 2>/dev/null
+  # Always-present scalar fields (identity/context/shard) — `${VAR:-0}` matches
+  # the old printf's unconditional defaults. NB `--mode="$MODE"` uses the `=`
+  # form because MODE can be `--full`/`--quick`/`--no-asan`, and a bare
+  # `--mode --full` makes argparse treat `--full` as an unknown FLAG (exit 2),
+  # silently skipping the record (the `|| true` swallows it) — the same trap
+  # gate_write_verdict documents at the mode flag (see :117-119).
+  local -a a=(
+    --phases-file "$_tsv" --tlog "$TLOG" --result "$result" --total-s "$total"
+    --ts "$GATE_TS" --epoch "${GATE_EPOCH:-0}" --host "$GATE_HOST" --mode="$MODE"
+    --head "$GATE_HEAD" --head-short "$GATE_HEAD_SHORT" --dirty "$GATE_DIRTY"
+    --shard-times "${SHARD_TIMES:-}"
+    --shard-count "${SHARD_COUNT:-0}" --shard-reported-s "${SHARD_REPORTED_S:-0}"
+    --arbitration-suspects "${ARB_SUSPECTS:-0}"
+    --serial-attempts "${SERIAL_ATTEMPTS:-0}" --serial-total "${SERIAL_TOTAL:-0}"
+    --asan-shards-reported "${ASAN_SHARDS:-0}" --asan-errors "${ASAN_ERRS:-0}")
+  # per #3010: conditionally-present fields — OMITTED when unset => null in the
+  # record. cache_n/sto/GATE_COLD are set late (gate.sh:572-578) so are unset on
+  # early-exit paths; COV_*/AOT_*/GATE_BIN_* are set even later by the harvest.
+  [ -n "$FAILED_PHASE" ] && a+=(--failed-phase "$FAILED_PHASE")
+  [ -n "${COV_GTESTS:-}" ] && a+=(--cov-gtests "$COV_GTESTS")
+  [ -n "${COV_LITTESTS:-}" ] && a+=(--cov-littests "$COV_LITTESTS")
+  [ -n "${GATE_EXPECTED_GTESTS:-}" ] && a+=(--expected-gtests "$GATE_EXPECTED_GTESTS")
+  [ -n "${GATE_FLOOR_OK:-}" ] && a+=(--coverage-floor-ok "$GATE_FLOOR_OK")
+  [ -n "${GATE_COLD:-}" ] && a+=(--cold "$GATE_COLD")
+  [ -n "${cache_n:-}" ] && a+=(--cache-n "$cache_n")
+  [ -n "${sto:-}" ] && a+=(--shard-timeout "$sto")
+  [ -n "${AOT_HITS:-}" ] && a+=(--aot-hits "$AOT_HITS")
+  [ -n "${AOT_MISSES:-}" ] && a+=(--aot-misses "$AOT_MISSES")
+  [ -n "${AOT_STORE_FAILS:-}" ] && a+=(--aot-store-fails "$AOT_STORE_FAILS")
+  [ -n "${GATE_BIN_EXPECTED:-}" ] && a+=(--bin-expected "$GATE_BIN_EXPECTED")
+  [ -n "${GATE_BIN_RAN:-}" ] && a+=(--bin-ran "$GATE_BIN_RAN")
+  PYTHONPATH=scripts python3 -m gate.telemetry emit "${a[@]}" > /dev/null 2>&1 || true
+  rm -f "$_tsv" 2>/dev/null || true
 }
 
 gate_finish() { # rc -> print aligned summary + append JSON; must NOT change exit status

@@ -35,6 +35,15 @@ arb_run_suite() and the 2c legacy-grep site at :451 in one move (the
 invariants (ran-nothing-is-not-a-pass, [FAIL]-never-sampled, `<none>`-strip,
 the 0/1/2 return contract never collapsed, ARB_ENV forces ASan) are each
 pinned by test_arbitration.py.
+
+Wave 3 (`telemetry.py`, #3010) ports the schema:2 gate-timings.jsonl record
+builder (gate.sh emit_json). The 25-field bash printf, the awk per-binary
+merge (with its `exp`/`ran` gawk-builtin-names footgun), and the j_* null-vs-0
+conditionals become a dict + json.dumps + dict union + None-vs-0. Proven
+byte-identical to the old bash over a controlled dual-run (8 cases, every
+null-vs-0 branch, zero diff); gate.sh now calls `python3 -m gate.telemetry
+emit`. The schema:2 field set/order and the null-vs-0 distinction are pinned
+by test_telemetry.py (the blocking gate.trend R1-R5 depend on them).
 """
 
-__all__ = ["io", "summary", "verdict", "coverage", "arbitration"]
+__all__ = ["io", "summary", "verdict", "coverage", "arbitration", "telemetry"]
