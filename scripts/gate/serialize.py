@@ -15,7 +15,8 @@ Two responsibilities — both pinned by `scripts/gate/tests/test_gate_serializat
 
   2. `is_gate_sibling(pid) -> bool`
      — walks /proc/<pid>/status' `PPid:` chain up to `_SIBLING_DEPTH_CAP=32`
-     levels; returns True iff any ANCESTOR's `comm` is in `GATE_COMM_NAMES`.
+     levels; returns True iff any ANCESTOR's cmdline (joined NUL-separated
+     argv from /proc/<pid>/cmdline) contains any name in `GATE_COMM_NAMES`.
      The pid itself is NOT checked (only descendants qualify) — this matches
      the `test_self_is_not_sibling_when_invoked_as_gate_script` contract and
      has no production impact: `pgrep -x cmake|cc1plus|...` (the only caller
@@ -24,6 +25,24 @@ Two responsibilities — both pinned by `scripts/gate/tests/test_gate_serializat
      itself too, but that branch is unreachable in production (cmake has
      comm "cmake", not "gate.sh"), so the Python tightening is regression-
      free for the gate's actual call site.
+
+CRITICAL #2 fix (post-run review): the original implementation read
+/proc/<pid>/comm and matched it against GATE_COMM_NAMES. That is silently
+wrong in production — the kernel sets comm from the EXECUTABLE'S BASENAME
+(e.g. "bash" for /usr/bin/bash), NOT from argv[0]. Every script invoked
+under `#!/usr/bin/env bash` therefore has comm="bash" regardless of which
+script is running: the gate driver's comm is "bash", not "gate.sh".
+Sibling detection at the gate layer always returned False, so the
+"builders active" preflight abort always fired against another gate's
+cmake child and the helper never recognized the lock-holding gate. The
+fix reads /proc/<pid>/cmdline (which carries the full argv, including
+the script path like /home/stepan/.../gate_and_push.sh) and matches the
+joined cmdline string against GATE_COMM_NAMES. The bash gate entry points
+themselves — invoked as `#!/usr/bin/env bash …/gate_and_push.sh …` — have
+cmdline = "…/gate_and_push.sh …", so the substring match lands. Pinned
+by `tests/test_gate_serialization.py`'s `test_integration_baseline_bash_not_sibling`,
+`test_integration_argv0_override_is_sibling`, and
+`test_integration_gate_path_in_cmdline_is_sibling`.
 
 The CLI surface (`python3 -m gate.serialize <cmd>`) replaces Lane A's bash
 implementations so the entry points at gate_and_push.sh and gate.sh delegate
@@ -39,10 +58,17 @@ import sys
 import time
 
 
-# Process comm (kernel-truncated argv[0]) names the preflight treats as
-# "this is a gate". MUST match the bash `_is_gate_ancestor` case-list at
-# scripts/gate.sh:179 — drift between this tuple and the bash would
-# silently re-introduce the deadlock class.
+# Names the preflight treats as "this is a gate". Substring-matched
+# against /proc/<pid>/cmdline (see `is_gate_sibling` and `_cmdline_of`
+# below) — drift between this tuple and the bash `_is_gate_ancestor`
+# case-list at scripts/gate.sh:179 would silently re-introduce the
+# deadlock class.
+#
+# Note: these are PATH-LIKE substrings (some include `tests/` or omit
+# it), not kernel comms. /proc/<pid>/cmdline is NUL-separated argv, so
+# for a gate entry point like `/usr/bin/env bash scripts/gate_and_push.sh`,
+# the joined string contains `… scripts/gate_and_push.sh …` and
+# `gate_and_push.sh` matches.
 GATE_COMM_NAMES = (
     "gate_and_push.sh",
     "gate_full_cycle.sh",
@@ -210,9 +236,42 @@ def release_gate_lock(lock) -> None:
     lock.close()
 
 
+def _cmdline_of(pid: int):
+    """Read /proc/<pid>/cmdline. Returns the joined (space-separated)
+    command-line, or `None` on read failure. Strips NULs and trims.
+
+    The cmdline contains the full argv NUL-separated, including the
+    script path like `/home/stepan/.../gate_and_push.sh`. Unlike
+    /proc/<pid>/comm (the kernel-truncated EXECUTABLE basename — set
+    by the kernel from the binary's basename, NOT from argv[0], which
+    is why every script invoked under `#!/usr/bin/env bash` has
+    comm="bash" regardless of which script it runs), cmdline carries
+    argv[0] verbatim. That makes cmdline the load-bearing source for
+    "is this a gate driver" in production. The matched substrings are
+    in `GATE_COMM_NAMES`."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            data = f.read()
+    except (IOError, OSError):
+        return None
+    if not data:
+        return None
+    # cmdline is NUL-separated; replace NULs with spaces so substring
+    # matches land against a path-component. decode with errors="replace"
+    # so a non-UTF8 byte (rare, but legal in argv on Linux) does not
+    # raise — the substring match is byte-as-string and a single
+    # replacement character is harmless.
+    return data.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+
+
 def _comm_of(pid: int):
     """Read /proc/<pid>/comm. Returns the stripped comm string or `None`
-    if the proc entry is missing (process exited) or unreadable (EPERM)."""
+    if the proc entry is missing (process exited) or unreadable (EPERM).
+
+    Retained for tests that need to sanity-check fixture comm values
+    (e.g. `sleep` has comm='sleep'); NOT used by `is_gate_sibling` —
+    sibling detection keys on cmdline because comm is the executable
+    basename and every bash script has comm='bash'."""
     try:
         with open(f"/proc/{pid}/comm", "r") as f:
             return f.read().strip()
@@ -236,7 +295,8 @@ def _ppid_of(pid: int):
 
 def is_gate_sibling(pid: int) -> bool:
     """Return True iff `pid`'s ANCESTOR chain (up to `_SIBLING_DEPTH_CAP=32`
-    levels) includes any process whose comm is in `GATE_COMM_NAMES`.
+    levels) includes any process whose cmdline contains any name in
+    `GATE_COMM_NAMES`.
 
     The pid itself is NOT inspected — only its parents/grand-parents/etc.
     That matches the `test_self_is_not_sibling_when_invoked_as_gate_script`
@@ -244,6 +304,13 @@ def is_gate_sibling(pid: int) -> bool:
     `scripts/gate.sh:194-201` only invokes the predicate on pids returned
     by `pgrep -x cmake|cc1plus|ld|mold|lld|ninja|make|bezel_tests(_[a-z]+)?`,
     so the predicate never sees a gate-named comm in the first place.
+
+    Match shape: substring match against the joined argv (NUL-separated
+    args joined by spaces). This catches the production shape — a bash
+    entry point invoked as `/usr/bin/env bash scripts/gate_and_push.sh …`
+    has cmdline containing the substring `scripts/gate_and_push.sh` —
+    and the test shape (`exec -a gate.sh bash -c 'sleep N'` has cmdline
+    containing `gate.sh` as the first token).
 
     Returns False on:
       * any /proc read failure (transient — the next call after the
@@ -262,8 +329,8 @@ def is_gate_sibling(pid: int) -> bool:
         if ppid == cur:
             # /proc corruption / kernel bug — refuse to loop forever.
             return False
-        comm = _comm_of(ppid)
-        if comm is not None and comm in GATE_COMM_NAMES:
+        cmdline = _cmdline_of(ppid)
+        if cmdline is not None and any(name in cmdline for name in GATE_COMM_NAMES):
             return True
         cur = ppid
     return False
