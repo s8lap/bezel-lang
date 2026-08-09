@@ -68,6 +68,14 @@ import sys
 # serialize() matches and unquotes.
 _TOKEN = "\x01"
 
+# A bare JSON number (the only text RawNumber may carry verbatim, since it is
+# unquoted into the record). Used to validate a TSV `dur` BEFORE wrapping it: a
+# corrupt/non-numeric duration would otherwise be emitted as a bare token where
+# a number is expected, writing a malformed line into gate-timings.jsonl that
+# the next `gate_trend --last` then refuses every push over until hand-edited
+# (the #3010 availability trap). No match => "0.00" fallback.
+_JSON_NUM_RE = re.compile(r"^-?\d+(\.\d+)?([eE][+-]?\d+)?$")
+
 
 class RawNumber:
     """A number whose text is emitted verbatim and unquoted in the JSON line.
@@ -235,8 +243,12 @@ def _build_binaries(bin_expected, bin_ran):
         rv = r.get(name)
         out[name] = {
             # per gate.sh:347: expected is null if absent; ran is 0 if absent.
-            "ran": int(rv) if (rv is not None and rv != "") else 0,
-            "expected": int(ev) if (ev is not None and ev != "") else None,
+            # int() is guarded via _to_int: a non-numeric map value used to
+            # raise here, crashing emit (silently dropping the whole telemetry
+            # record via the caller's `|| true`). Now it degrades to ran=0 /
+            # expected=null like _posint/_optint, #3010.
+            "ran": _to_int(rv, 0),
+            "expected": _to_int(ev, None),
         }
     return out if out else None
 
@@ -405,6 +417,13 @@ def _read_phases_tsv(path):
                     rc_i = int(rc)
                 except ValueError:
                     rc_i = 0
+                # Validate dur is a bare JSON number before wrapping: a corrupt
+                # TSV row (non-numeric dur) would be emitted verbatim as a bare
+                # token, writing a malformed line into gate-timings.jsonl that
+                # the next gate_trend --last refuses every push over until
+                # hand-edited (#3010 availability trap). Fall back to "0.00".
+                if not _JSON_NUM_RE.match(dur):
+                    dur = "0.00"
                 phases.append(
                     Phase(name, RawNumber(dur), rc_i, status, note))
     except OSError:

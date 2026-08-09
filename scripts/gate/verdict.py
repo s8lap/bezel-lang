@@ -485,6 +485,20 @@ def _main_read(argv):
         # path (back-compat; the verdict writer is best-effort, per #3002).
         return 2
 
+    if obj.get("schema") != SCHEMA:
+        # #3000 shape: a reader that proceeds on a document it does not
+        # understand is the defect. Every verdict this module writes carries
+        # `schema: SCHEMA` (build_verdict_obj); a document with a different or
+        # absent schema is not one this reader can interpret, so refuse (rc=2,
+        # same as missing/unparseable -> the consumer falls back) rather than
+        # guess at unknown fields. This is the read-side check the module
+        # docstring promises but did not enforce.
+        sys.stderr.write(
+            "verdict read: schema mismatch (got {!r}, expected {!r}) — refusing "
+            "an unknown verdict document at {}\n".format(
+                obj.get("schema"), SCHEMA, args.path))
+        return 2
+
     if args.expect_head is not None:
         head = obj.get("head", "")
         if head != args.expect_head:

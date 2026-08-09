@@ -139,4 +139,9 @@ fi
 if [ "$_legacy_exit" -ne 0 ] && [ "$_v_rc" -eq 2 ] && [ "$_has_pass" -eq 0 ] && [ "$_has_fail" -eq 0 ]; then
   echo "gate_wait: reached a terminal marker but could not classify pass/fail — inspect $LOG"
 fi
-exit "$_legacy_exit"
+# Exit on the STATED-PRIMARY Python cross_check classification (_py_exit), not
+# the legacy ladder (_legacy_exit). The legacy ladder is the dual-consume
+# CROSS-CHECK asserted equal above; retiring it (per the comment at :88) would
+# otherwise change this script's verdict if the exit followed it. The two are
+# asserted equal on every reachable state, so this is a no-op when they agree.
+exit "$_py_exit"

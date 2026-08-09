@@ -34,6 +34,14 @@ manifest="$repo_root/build/tests/test_binaries.txt"
 ncpu="$(nproc)"
 default_conc=$(( ncpu < 16 ? ncpu : 16 ))
 conc="${1:-$default_conc}"
+# conc must be an integer >= 1: conc=0 launches no shards, writes no summaries,
+# and every accounting check passes vacuously -> exit 0 over NOTHING (the same
+# Plan-A 5.1 "PASS>0" class conformance's guard closes). A non-numeric conc
+# would also misbehave in the arithmetic below.
+if ! [[ "$conc" =~ ^[0-9]+$ ]] || (( conc < 1 )); then
+  echo "error: conc must be an integer >= 1 (got '$conc')" >&2
+  exit 2
+fi
 shift || true
 
 # ── which binaries ──────────────────────────────────────────────────────────

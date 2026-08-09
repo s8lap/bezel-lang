@@ -559,20 +559,19 @@ done <<< "$_gate_bins"
 core_post=$(stat -c %Y build/libbezel_core.a 2>/dev/null || echo -1)
 GATE_CACHE_ROOT="${BEZEL_AOT_CACHE_DIR:-/var/tmp/bezel-scratch/aot-bincache}"
 # Phase 5 (#3010): the k2 identity, the cold/warm prediction, and the per-oracle
-# marker are now the gate.identity / gate.cold Python modules. Python is
-# AUTHORITATIVE; the bash recompute in the dual-run assertion below is retained
-# for the landing-gate equivalence proof and removed once proven (per #3010's
-# add-then-prove-then-switch discipline). The invariants the modules encode are
+# marker are the gate.identity / gate.cold Python modules. Python is
+# AUTHORITATIVE; the dual-run bash recompute that proved equivalence has been
+# removed (the migration is complete). The invariants the modules encode are
 # UNCHANGED — #2100 (the 3-signal cold predicate), #2918 (the per-oracle marker),
 # #3000 (find -L) — see the module docstrings and the block comments above.
 oracle="plain"; [ "$ASAN" -eq 1 ] && oracle="asan"
 GATE_CACHE_ID=$(PYTHONPATH=scripts python3 -m gate.identity compute \
-  --core build/libbezel_core.a --runtime build/libbezel_runtime.a)
+  --core build/libbezel_core.a --runtime build/libbezel_runtime.a 2>/dev/null)
 # per #2918: the marker filename MUST be per-oracle (plain/ASan are disjoint
 # populations in one store); marker_filename encodes that branch.
 GATE_CACHE_ID_FILE=$(PYTHONPATH=scripts python3 -m gate.identity marker-filename \
-  --cache-root "$GATE_CACHE_ROOT" --oracle "$oracle")
-_recorded_id=$(PYTHONPATH=scripts python3 -m gate.identity read-marker --path "$GATE_CACHE_ID_FILE")
+  --cache-root "$GATE_CACHE_ROOT" --oracle "$oracle" 2>/dev/null)
+_recorded_id=$(PYTHONPATH=scripts python3 -m gate.identity read-marker --path "$GATE_CACHE_ID_FILE" 2>/dev/null)
 identity_changed=0; [ "$core_post" != "$CORE_MTIME_PRE" ] && identity_changed=1
 gate_id_note="match"; marker_changed=0
 if [ -n "$GATE_CACHE_ID" ]; then
@@ -888,14 +887,14 @@ fi
 # inside the fix for a variant-3 defect. So: count the rows, require every row
 # to yield a number, and require the row count to be non-zero. Any gap is a hard
 # failure, never a smaller expectation.
-# Phase 4 (#3010): the coverage floor is now the gate.coverage Python module.
+# Phase 4 (#3010): the coverage floor is the gate.coverage Python module.
 # The CLI's EXIT CODE is the decision (0 ok / 3 retry — the same exit-3 retry
 # contract gate_full_cycle.sh relies on). stdout carries the banner (echoed
 # below, excluding the @cov: machine lines) plus machine lines this orchestrator
 # harvests for telemetry + the trap's FAILED_PHASE. Python is AUTHORITATIVE; the
-# bash re-enumerate in the dual-run assertion below is retained for the
-# landing-gate equivalence proof (#3011: a missing/non-executable/empty-
-# enumerate binary is a HARD fail that NEVER lowers the bar).
+# dual-run bash re-enumerate that proved equivalence has been removed (the
+# migration is complete). #3011 invariant: a missing/non-executable/empty-
+# enumerate binary is a HARD fail that NEVER lowers the bar.
 GATE_EXPECTED_GTESTS=0
 GATE_FLOOR_OK=1
 GATE_BIN_EXPECTED=""

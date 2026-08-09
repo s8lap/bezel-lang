@@ -76,23 +76,16 @@ class Decision(enum.Enum):
 Result = namedtuple("Result", ["decision", "reason"])
 
 
-# Log-derived integrity signals a consumer harvests from the gate log. Carried
-# as a namespace so `classify`/`cross_check` stay 2-arg and a new marker is an
-# added field, not a new parameter threaded through every call site. Defaults
-# are the safe (no-evidence) values so a caller with nothing to report passes
-# nothing.
-LogMarkers = namedtuple(
-    "LogMarkers", ["undercount", "fail_markers"], defaults=[False, False])
-# `undercount`      — the "## GATE FAILURE: shard crash / undercount" banner was
-#                     in the shard log (Plan-A invariant 1.19; the legacy grep
-#                     _legacy_rc_decision ran). The signal that turns rc==0 into
-#                     a RETRY rather than an ACCEPT.
-# `fail_markers`    — a terminal '== GATE FAIL' / 'GATE FAILED -> NOT pushing'
-#                     marker was in the gate log (gate_wait.sh's cross-check
-#                     grep). The signal that overrides a verdict-pass.
+# NOTE: classify takes NO log-marker argument. The undercount banner's distrust
+# is already materialized in the POISONED verdict (rc=0 + undercount -> poisoned
+# -> retry), and the FAIL-marker override lives in gate_wait.sh's cross-check +
+# cycle.assert_asan_ran. An earlier draft carried a LogMarkers namespace here
+# that was computed but never read — dead code, removed. The load-bearing
+# undercount signal for the LEGACY decision stays in legacy_decision's own
+# `undercount` parameter (which IS used).
 
 
-def classify(verdict_value, log_markers=None, trustworthy=True):
+def classify(verdict_value, trustworthy=True):
     """Map a verdict VALUE (+ markers + trust) to a Result, or None.
 
     THE VERDICT-PATH DECISION. Faithful port of gate_full_cycle.sh's
@@ -121,11 +114,8 @@ def classify(verdict_value, log_markers=None, trustworthy=True):
     missing/unparseable (the read CLI returned exit 2). `trustworthy` is the
     verdict file's trust flag (default True — by construction verdict=="pass"
     implies trustworthy, since verdict_from_rc only mints PASS for rc0+clean;
-    the flag is the independent safety net). `log_markers` carries the
-    harvested integrity signals (currently advisory for the reason text; the
-    load-bearing distrust is already materialized in the POISONED verdict).
+    the flag is the independent safety net).
     """
-    m = log_markers or LogMarkers()
     if verdict_value == _v.Verdict.PASS.value:
         if trustworthy:
             return Result(Decision.ACCEPT, "pass")
@@ -363,7 +353,7 @@ def _print_result(res, stream=sys.stdout):
 
 
 def _main_classify(argv):
-    """`classify --verdict V [--not-trustworthy] [--undercount]` -> decision word.
+    """`classify --verdict V [--not-trustworthy]` -> decision word.
 
     The verdict-path decision. --verdict is the gate.verdict verdict field value
     (pass/fail/retry/refused/poisoned), or empty for an absent verdict. Prints
@@ -379,13 +369,8 @@ def _main_classify(argv):
     p.add_argument("--not-trustworthy", action="store_true", default=False,
                    help="the verdict's trustworthy flag is False (defense-in-"
                         "depth: pass+untrusted -> retry, never accept)")
-    p.add_argument("--undercount", action="store_true", default=False,
-                   help="the undercount banner was in the log (advisory; the "
-                        "load-bearing distrust is the POISONED verdict)")
     args = p.parse_args(argv)
-    res = classify(args.verdict,
-                   log_markers=LogMarkers(undercount=args.undercount),
-                   trustworthy=not args.not_trustworthy)
+    res = classify(args.verdict, trustworthy=not args.not_trustworthy)
     _print_result(res)
     return 0
 

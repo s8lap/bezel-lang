@@ -152,7 +152,11 @@ def judge(records, only_last=False, malformed=0):
     # never uses information from the future.
     cold_hist = {}
 
-    indices = range(len(records) - 1, len(records)) if only_last else range(len(records))
+    # only_last on an EMPTY log would yield range(-1, 0) -> records[-1] ->
+    # IndexError (a crash, not the exit-2 "nothing checked" the caller expects).
+    # Guard: take the last index only when there IS a last record; otherwise
+    # iterate the (empty) full range and let the scan line report 0 scanned.
+    indices = range(len(records) - 1, len(records)) if (only_last and records) else range(len(records))
 
     for i in indices:
         r = records[i]
@@ -306,8 +310,14 @@ def main(argv):
     while i < len(argv):
         a = argv[i]
         if a == "--log":
+            if i + 1 >= len(argv):
+                sys.stderr.write("gate_trend: --log requires a value\n")
+                return 64
             tlog = argv[i + 1]; i += 2
         elif a == "--limit":
+            if i + 1 >= len(argv):
+                sys.stderr.write("gate_trend: --limit requires a value\n")
+                return 64
             limit = int(argv[i + 1]); i += 2
         elif a == "--last":
             only_last = True; i += 1

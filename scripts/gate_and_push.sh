@@ -134,10 +134,17 @@ if "${GATE_CMD[@]}"; then
   else
     if [ "$_vrc" -eq 2 ]; then
       echo "== gate_and_push: note — no usable cycle verdict at $GATE_VERDICT (writer best-effort) — relying on \$? =="
-      # DUAL-CONSUME: cross_check said accept for a missing verdict (fallback);
-      # if it said otherwise, the Python port diverged from the legacy branch.
-      [ "$_push_dec" != accept ] && \
+      # DUAL-CONSUME: cross_check returns accept for a missing verdict (the
+      # documented fallback). If it returned anything else, the Python port
+      # diverged from the legacy branch — and a non-accept reconciliation must
+      # NEVER push (the conservative-non-accept policy that stopped the
+      # 55-truncated-gates class). Refuse rather than fall through to push on a
+      # disagreement.
+      if [ "$_push_dec" != accept ]; then
         echo "== gate_and_push: DUAL-CONSUME DISAGREEMENT — missing verdict but cross_check said '$_push_dec' (expected accept/fallback) — see test_cycle.CrossCheckTest ==" >&2
+        echo "== gate_and_push: REFUSING TO PUSH — cross_check returned '$_push_dec'; a non-accept reconciliation must never push. ==" >&2
+        exit 1
+      fi
     else
       echo "== gate_and_push: REFUSING TO PUSH — the gate exited 0 but the verdict file is NOT a trustworthy pass ==" >&2
       echo "   The exit code and the verdict disagree (per the exit-code-trap, this is exactly the class that pushed 55 truncated gates)." >&2
