@@ -19,6 +19,13 @@ Phase 3 (`verdict.py`, #3002) writes an authoritative `gate-verdict.json` on
 every gate exit — ONE atomically-written file that fixes the exit-code-trap
 class (a backgrounded wrapper's `$?` is not the gate's). ADDITIVE: no consumer
 reads it yet (Phase 3c switches the readers after a prove-out).
+
+Phase 4a (`coverage.py`, #3002 / #3011) ports the coverage floor as a
+unit-tested Python module. FOUNDATION ONLY: written + standalone-validated,
+NOT yet wired into gate.sh (Wave 2 replaces the bash block at gate.sh:882-973
+with a call here). Preserves the bash invariants (missing-binary=>hard-fail
+#3011, enumerate==0=>hard-fail, zero-rows=>hard-fail, ran>=expected superset
+OK) — pinned by test_coverage.py.
 """
 
-__all__ = ["io", "summary", "verdict"]
+__all__ = ["io", "summary", "verdict", "coverage"]
