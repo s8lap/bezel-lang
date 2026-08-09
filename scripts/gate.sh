@@ -189,7 +189,8 @@ fi
 # fits comfortably. Enable ASan for delicate merges (--full) or on a quiet host
 # (GATE_FAST_ASAN=1); flipping the default here is a one-line change if the
 # cold/contention cost is acceptable. The arbitration re-runs must force ASan too
-# (ARB_ENV) or an ASan-only failure would be falsely cleared as flaky.
+# (gate_arbitrate's --asan flag) or an ASan-only failure would be falsely cleared
+# as flaky.
 ASAN=0
 [ "$MODE" = "--full" ] && ASAN=1
 case "${GATE_FAST_ASAN:-}" in
@@ -220,7 +221,7 @@ esac
 # The fix is to route the stats to their own file rather than into the stream the
 # summary is parsed from (#3012, code change). Until then this stays off: an
 # unmeasured number is a known gap, a corrupted count is a wrong answer.
-SHARD_ENV=(env); ARB_ENV=(); SHARD_NOTE=""; SHARD_LABEL="crash/undercount-checked"
+SHARD_ENV=(env); SHARD_NOTE=""; SHARD_LABEL="crash/undercount-checked"
 # An explicit caller-supplied BEZEL_SHARD_TIMEOUT wins unconditionally, in BOTH
 # oracles (#2918 — this used to be read only in the ASan branch, so an operator
 # exporting it for a plain gate had it silently ignored by this script and only
@@ -239,7 +240,6 @@ if [ "$ASAN" -eq 1 ]; then
   # so a generous cold ceiling no longer delays broken-tree detection. A
   # caller's explicit BEZEL_SHARD_TIMEOUT always wins.
   SHARD_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)   # see #3012 note above
-  ARB_ENV=(env BEZEL_AOT_FORCE_SANITIZE=address)
   SHARD_NOTE="asan-instrumented"
   SHARD_LABEL="crash/undercount + generated-code ASan"
   # 2026-07-17: 16 concurrent ASan shards OOM-kill workers under the dev_heavy
@@ -412,12 +412,16 @@ trap 'rc=$?; gate_finish "$rc" || true; exit $rc' EXIT
 
 # Flake arbitration over a sharded-run log — shared by the canary tier and the
 # authoritative pass (#2100; semantics unchanged from the original inline
-# block, #1861). Collect ALL suspects: shard CRASHES (died on: a program killed
+# block, #1861). Implemented by gate_arbitrate() below, which delegates the
+# re-run + verdict to the gate.arbitration Python module (#3010); the contract
+# and rationale documented here are the invariants that module preserves.
+# Collect ALL suspects: shard CRASHES (died on: a program killed
 # its host) AND assertion FAILs. BOTH can be flaky under sharding — a crash, or
 # a FAIL from test-pollution (a polluter leaves global state; the round-robin
 # lands it with a snapshot/leak test). ARBITRATE uniformly: re-run each
-# suspect's SUITE alone up to 5x (ARB_ENV keeps ASan forced in ASan modes so an
-# ASan-only failure reproduces rather than being falsely cleared as flaky). A
+# suspect's SUITE alone up to 5x (gate_arbitrate's --asan keeps ASan forced in
+# ASan modes so an ASan-only failure reproduces rather than being falsely cleared
+# as flaky). A
 # DETERMINISTIC failure fails all 5; a pollution/timing flake passes at least
 # once — one run isn't enough, it shares the flake rate. Sets ARB_LAST_SUSPECTS
 # for the caller's phase note. Returns:
@@ -437,96 +441,43 @@ trap 'rc=$?; gate_finish "$rc" || true; exit $rc' EXIT
 # binaries the gate accounts for is exactly the set CMake built.
 test_binaries() { cut -f2 build/tests/test_binaries.txt 2>/dev/null; }
 
-# Re-run ONE gtest suite by filter across the per-area binaries. The shard log
-# does not say which binary a suspect came from, and it does not need to: a
-# binary holding none of the suite walks its registry and exits in ~30 ms, so
-# asking all of them costs nothing and cannot pick the wrong one.
+# Phase 4 (#3010): arbitration is now the gate.arbitration Python module. The
+# module's arbitrate() re-runs each suspect's suite across the per-area binaries
+# (its own arb_run_suite — porting subsumes the Phase-2c `^[0-9]+ passed` grep
+# that lived in the old arb_run_suite) and returns the 0/1/2 verdict contract
+# above. ARB_ENV's ASan-forcing (#2100 invariant 5) is the CLI's --asan flag.
 #
-# "Passes alone" requires BOTH every binary exiting 0 AND at least one test
-# actually having run. Without the second half a suspect name that matches
-# NOWHERE (a mapping bug, a rename) would exit 0 having validated nothing and be
-# laundered into a flake-ACCEPT — the exact false-green this gate exists to
-# prevent. ARB_ENV keeps ASan forced in ASan modes so an ASan-only failure
-# reproduces rather than being falsely cleared as flaky.
-arb_run_suite() { # $1 = gtest suite substring
-  local suite="$1" bin out rc n total=0
-  while IFS= read -r bin; do
-    [ -n "$bin" ] || continue
-    out=$(BEZEL_TEST_FILTER="$suite" "${ARB_ENV[@]}" timeout 180 "$bin" 2>&1); rc=$?
-    [ "$rc" -ne 0 ] && return 1
-    n=$(printf '%s\n' "$out" | grep -oE '^[0-9]+ passed, [0-9]+ failed' | tail -1 | awk '{print $1+$3}')
-    total=$(( total + ${n:-0} ))
-  done < <(test_binaries)
-  [ "$total" -gt 0 ]
-}
-
-arbitrate() { # $1 = sharded-run log
-  local log="$1" crashed failed suspects nsus real t suite passed_alone k sampled
-  crashed=$(grep 'died on:' "$log" | sed -E 's/.*died on: //')
-  failed=$(grep -E '^\[ FAIL' "$log" | sed -E 's/^\[ FAIL \] //' | awk '{print $1}')
-  # "died on: <none>" = a shard died before running ANY test (e.g. OOM-kill at
-  # startup). It is NOT an arbitrable suspect: re-running the literal filter
-  # "<none>" matches nothing, "passes", and would launder a dropped whole
-  # slice into a flake-ACCEPT. Strip it so the case degrades to return 2
-  # (marker-absent -> the caller treats the result as untrustworthy). #2100.
-  suspects=$(printf '%s\n%s\n' "$crashed" "$failed" | grep -v '^$' | grep -vx '<none>' | sort -u)
-  ARB_LAST_SUSPECTS=0
-  [ -z "$suspects" ] && return 2
-  nsus=$(printf '%s\n' "$suspects" | grep -c .)
-  ARB_LAST_SUSPECTS=$nsus
-  # Two classes of suspect, and they deserve opposite treatment (2026-07-29):
-  #
-  #   [ FAIL ]   a test that RAN and failed — the actual evidence of a defect.
-  #   died on:   the test a shard happened to be executing when it was killed
-  #              (usually at the timeout ceiling). Almost always innocent.
-  #
-  # The old code merged both, sorted alphabetically, and arbitrated the first 8.
-  # On gate E that sampled 8 of 47 and every one landed in the a*-l* range, so
-  # ELEVEN deterministic ownership failures (own_branch_disposal.*, and friends)
-  # were never re-run and the gate PASSED red. Never sample away a [ FAIL ].
-  #
-  # Dedupe by SUITE first: the re-run below filters by suite substring, so N
-  # failures in one suite are one unit of work — that alone collapsed gate E's
-  # 47 suspects to far fewer, and makes arbitrating every failing suite cheap.
-  # Only the `died on:` victims are sampled, and only after every failing suite
-  # has been checked.
-  local fail_suites crash_suites ncrash
-  fail_suites=$(printf '%s\n' "$failed" | grep -v '^$' | grep -vx '<none>' | sed 's/\..*//' | sort -u)
-  crash_suites=$(printf '%s\n' "$crashed" | grep -v '^$' | grep -vx '<none>' | sed 's/\..*//' | sort -u)
-  # A suite already covered by a [ FAIL ] needs no second arbitration.
-  if [ -n "$fail_suites" ] && [ -n "$crash_suites" ]; then
-    crash_suites=$(comm -13 <(printf '%s\n' "$fail_suites") <(printf '%s\n' "$crash_suites") 2>/dev/null || printf '%s\n' "$crash_suites")
+# DUAL-RUN (cheap): the module's suspect COUNT is asserted to equal the OLD bash
+# greps' count — a live proof of the suspect EXTRACTION (the gate-E false-green
+# class, #2100 — [FAIL]-never-sampled) on every gate that reaches arbitration,
+# without doubling the re-run cost. The full re-run stays Python-authoritative,
+# proven by the unit tests (the 5 invariants pinned in test_arbitration.py); re-
+# running every suspect twice is impractical and the suspect SELECTION is the
+# part most likely to harbour a subtle port bug. The bash greps below ARE the
+# old arbitrate's suspect extraction, inlined as the assertion.
+gate_arbitrate() { # $1 = sharded-run log  →  returns 0|1|2; sets ARB_LAST_SUSPECTS
+  local log="$1" _asan="" _out _verdict _crashed _failed _bash_suspects
+  [ "$ASAN" -eq 1 ] && _asan="--asan"
+  _out=$(PYTHONPATH=scripts python3 -m gate.arbitration arbitrate \
+    --log "$log" --sample-cap "${ARB_SAMPLE:-8}" $_asan 2>&1); _verdict=$?
+  ARB_LAST_SUSPECTS=$(printf '%s\n' "$_out" | sed -n 's/^@arb:suspects=//p' | head -1); ARB_LAST_SUSPECTS=${ARB_LAST_SUSPECTS:-0}
+  # Echo the FLAKY/REAL/cap detail lines (the @arb: line is orchestrator-only).
+  printf '%s\n' "$_out" | grep -v '^@arb:'
+  # --- dual-run assertion (TEMPORARY: remove after the landing gate proves it) ---
+  # The OLD bash greps' unique-suspect count: crashed + failed, minus blank,
+  # minus <none> (a shard killed at startup is not an arbitrable suspect).
+  _crashed=$(grep 'died on:' "$log" | sed -E 's/.*died on: //')
+  _failed=$(grep -E '^\[ FAIL' "$log" | sed -E 's/^\[ FAIL \] //' | awk '{print $1}')
+  _bash_suspects=$(printf '%s\n%s\n' "$_crashed" "$_failed" | grep -v '^$' | grep -vx '<none>' | sort -u | grep -c . || true)
+  if [ "$_bash_suspects" -ne "$ARB_LAST_SUSPECTS" ]; then
+    echo "## GATE FAILURE: arbitration PYTHON/BASH DRIFT — suspects(bash=$_bash_suspects py=$ARB_LAST_SUSPECTS)" >&2
+    echo "##   gate.arbitration parsed a different suspect set than the proven bash;" >&2
+    echo "##   a re-run over a divergent suspect set is untrustworthy (#2100)." >&2
+    FAILED_PHASE="arbitration python/bash drift: suspects(bash=$_bash_suspects py=$ARB_LAST_SUSPECTS)"
+    exit 3
   fi
-  ncrash=$(printf '%s\n' "$crash_suites" | grep -c . || true)
-  suspects=$(printf '%s\n' "$fail_suites" "$crash_suites" | grep -v '^$')
-  real=0; sampled=0
-  while IFS= read -r t; do
-    [ -z "$t" ] && continue
-    # Cap applies ONLY to the timeout-victim suites, which are listed last.
-    if printf '%s\n' "$crash_suites" | grep -qxF -- "$t"; then
-      sampled=$((sampled+1))
-      if [ "$sampled" -gt "${ARB_SAMPLE:-8}" ]; then
-        echo "   (capped arbitration at ${ARB_SAMPLE:-8} of $ncrash timeout-victim suites; every suite with a real [ FAIL ] was arbitrated in full)"
-        break
-      fi
-    fi
-    suite="${t%%.*}"
-    passed_alone=0
-    for k in 1 2 3 4 5; do
-      # The re-run is by SUITE substring, deliberately unrestricted by any
-      # subset list — it may run a few MORE tests than were selected; harmless
-      # extra coverage. See arb_run_suite() above for the per-area-binary
-      # semantics and the "ran nothing is NOT a pass" rule.
-      if arb_run_suite "$suite"; then passed_alone=1; break; fi
-    done
-    if [ "$passed_alone" -eq 1 ]; then
-      echo "   FLAKY: $t — its suite PASSES alone within 5 tries (sharding pollution/timing, not a deterministic failure)"
-    else
-      echo "   REAL: $t — fails alone all 5 tries"; real=1
-    fi
-  done <<< "$suspects"
-  [ "$real" -eq 1 ] && return 1
-  return 0
+  # --- end dual-run assertion ---
+  return "$_verdict"
 }
 
 echo "== gate[1/6]: reconfigure (glob any new test files) =="
@@ -739,7 +690,7 @@ else
       fi
       if [ "$crc" -ne 0 ]; then
         PHASE_T0=$(now)  # canary arbitration is its own (exceptional) phase
-        arbitrate "$S/gate_canary.log"; carb=$?
+        gate_arbitrate "$S/gate_canary.log"; carb=$?
         case "$carb" in
           0) rec_ran canary_arbitration "0" "$ARB_LAST_SUSPECTS suspects, all flaky"
              echo "   all canary suspects flaky (pass alone within 5 tries) -> continue to the full pass";;
@@ -832,7 +783,7 @@ if [ "$rc" -ne 0 ]; then
   # #2100). With serial gone (#1861) THIS is the authoritative re-check: a
   # suspect that passes alone within 5 tries is a sharding flake and the gate
   # continues; a suspect that fails all 5 is a real regression and fails.
-  arbitrate "$S/gate_shard.log"; arb=$?
+  gate_arbitrate "$S/gate_shard.log"; arb=$?
   ARB_SUSPECTS=$ARB_LAST_SUSPECTS
   case "$arb" in
     2) rec_ran shard_arbitration "1" "no crash/FAIL marker"
@@ -961,60 +912,64 @@ fi
 # inside the fix for a variant-3 defect. So: count the rows, require every row
 # to yield a number, and require the row count to be non-zero. Any gap is a hard
 # failure, never a smaller expectation.
+# Phase 4 (#3010): the coverage floor is now the gate.coverage Python module.
+# The CLI's EXIT CODE is the decision (0 ok / 3 retry — the same exit-3 retry
+# contract gate_full_cycle.sh relies on). stdout carries the banner (echoed
+# below, excluding the @cov: machine lines) plus machine lines this orchestrator
+# harvests for telemetry + the trap's FAILED_PHASE. Python is AUTHORITATIVE; the
+# bash re-enumerate in the dual-run assertion below is retained for the
+# landing-gate equivalence proof (#3011: a missing/non-executable/empty-
+# enumerate binary is a HARD fail that NEVER lowers the bar).
 GATE_EXPECTED_GTESTS=0
 GATE_FLOOR_OK=1
-GATE_BIN_ROWS=0
 GATE_BIN_EXPECTED=""
+_cov_out=$(PYTHONPATH=scripts python3 -m gate.coverage check \
+  --ran "${COV_GTESTS:-0}" --manifest build/tests/test_binaries.txt \
+  --per-binary-ran "${GATE_BIN_RAN:-}"); _cov_rc=$?
+# Echo the human banner verbatim (the @cov: machine lines are orchestrator-only).
+printf '%s\n' "$_cov_out" | grep -v '^@cov:'
+# Harvest the machine values emit_json + the trap consume.
+GATE_EXPECTED_GTESTS=$(printf '%s\n' "$_cov_out" | sed -n 's/^@cov:expected=//p' | head -1); GATE_EXPECTED_GTESTS=${GATE_EXPECTED_GTESTS:-0}
+GATE_FLOOR_OK=$(printf '%s\n' "$_cov_out" | sed -n 's/^@cov:floor_ok=//p' | head -1); GATE_FLOOR_OK=${GATE_FLOOR_OK:-0}
+GATE_BIN_EXPECTED=$(printf '%s\n' "$_cov_out" | sed -n 's/^@cov:bin_expected=//p' | head -1)
+# --- dual-run assertion (TEMPORARY: remove after the landing gate proves it) ---
+# Re-enumerate the registry the OLD bash way and assert the module agrees on the
+# decision-critical values: the expected total and the floor usability. Fatal on
+# drift. The bash re-enumerate is itself the #3011 authority (a missing binary ⇒
+# hard-fail), so a divergence here is exactly the defect this floor catches.
+_bash_exp=0; _bash_floor_ok=1; _bash_rows=0
 if [ -r build/tests/test_binaries.txt ]; then
-  while read -r _g bin _n; do
-    [ -n "$bin" ] || continue
-    GATE_BIN_ROWS=$(( GATE_BIN_ROWS + 1 ))
-    if [ ! -x "$bin" ]; then
-      echo "## GATE FAILURE: test registry lists '$bin' ($_g) but it is not executable"
-      echo "##   Skipping it would LOWER the coverage floor by however many tests it holds,"
-      echo "##   which is the exact defect #3002 exists to prevent. Refusing to guess."
-      GATE_FLOOR_OK=0
-      continue
-    fi
-    n=$(BEZEL_TEST_ENUMERATE=1 "$bin" 2>/dev/null | wc -l)
-    if [ "${n:-0}" -le 0 ]; then
-      echo "## GATE FAILURE: '$bin' ($_g) enumerated 0 tests — the registry read failed"
-      GATE_FLOOR_OK=0
-      continue
-    fi
-    GATE_EXPECTED_GTESTS=$(( GATE_EXPECTED_GTESTS + n ))
-    GATE_BIN_EXPECTED="${GATE_BIN_EXPECTED}${_g}:${n} "
+  while read -r _g _bin _n; do
+    [ -n "$_bin" ] || continue
+    _bash_rows=$(( _bash_rows + 1 ))
+    if [ ! -x "$_bin" ]; then _bash_floor_ok=0; continue; fi
+    _en=$(BEZEL_TEST_ENUMERATE=1 "$_bin" 2>/dev/null | wc -l)
+    [ "${_en:-0}" -le 0 ] && { _bash_floor_ok=0; continue; }
+    _bash_exp=$(( _bash_exp + _en ))
   done < build/tests/test_binaries.txt
 else
-  echo "## GATE FAILURE: build/tests/test_binaries.txt is unreadable — cannot establish what SHOULD run"
-  GATE_FLOOR_OK=0
+  _bash_floor_ok=0
 fi
-if [ "$GATE_BIN_ROWS" -eq 0 ]; then
-  echo "## GATE FAILURE: the test registry lists ZERO binaries"
-  GATE_FLOOR_OK=0
-fi
-if [ "$GATE_FLOOR_OK" -ne 1 ]; then
-  FAILED_PHASE="coverage floor unusable: the registry could not be read completely"
-  echo "== GATE FAIL: $FAILED_PHASE =="
+[ "$_bash_rows" -eq 0 ] && _bash_floor_ok=0
+_cov_drift=""
+[ "$_bash_exp" -ne "$GATE_EXPECTED_GTESTS" ] && _cov_drift="${_cov_drift}expected(bash=$_bash_exp py=$GATE_EXPECTED_GTESTS) "
+[ "$_bash_floor_ok" -ne "$GATE_FLOOR_OK" ] && _cov_drift="${_cov_drift}floor_ok(bash=$_bash_floor_ok py=$GATE_FLOOR_OK) "
+if [ -n "$_cov_drift" ]; then
+  echo "## GATE FAILURE: coverage-floor PYTHON/BASH DRIFT — $_cov_drift" >&2
+  echo "##   gate.coverage disagrees with the proven bash; refusing to proceed on" >&2
+  echo "##   an unproven floor (#3011 — a missing binary must never lower it)." >&2
+  FAILED_PHASE="coverage-floor python/bash drift: $_cov_drift"
   exit 3
 fi
-if [ "$GATE_EXPECTED_GTESTS" -gt 0 ]; then
-  if [ "${COV_GTESTS:-0}" -lt "$GATE_EXPECTED_GTESTS" ]; then
-    echo "## GATE FAILURE: COVERAGE SHORT — ${COV_GTESTS:-0} of $GATE_EXPECTED_GTESTS gtests ran ($(( ${COV_GTESTS:-0} * 100 / GATE_EXPECTED_GTESTS ))%)"
-    echo "##   The registry says $GATE_EXPECTED_GTESTS tests exist; this run reported ${COV_GTESTS:-0}."
-    echo "##   A pass over a truncated run is not a pass, however the missing shards were arbitrated."
-    # Exit 3 = NO TRUSTWORTHY VERDICT (retry), not 1 = REAL FAILURE. A short run
-    # says nothing about the tree either way, and truncation is usually
-    # transient (contention, a wedged shard). gate_full_cycle.sh retries on 3;
-    # a direct caller sees the banner and a nonzero exit, which is the point —
-    # what must never happen again is `== GATE PASS ==` over 31% coverage.
-    FAILED_PHASE="coverage short: ${COV_GTESTS:-0} of $GATE_EXPECTED_GTESTS gtests ran"
-    echo "== GATE FAIL: $FAILED_PHASE =="
-    exit 3
-  fi
-  echo "== gate: coverage floor OK — ${COV_GTESTS} of $GATE_EXPECTED_GTESTS gtests (registry-complete) =="
-else
-  echo "== gate: WARNING — could not read the test registry; coverage floor NOT enforced this run =="
+# --- end dual-run assertion ---
+# The verdict: the module's exit code IS the decision. Exit 3 = coverage short
+# OR registry-unusable (both retry, neither is a pass — what must never happen
+# again is `== GATE PASS ==` over 31% coverage, #3002). FAILED_PHASE drives the
+# trap's verdict.json / status file.
+if [ "$_cov_rc" -ne 0 ]; then
+  FAILED_PHASE=$(printf '%s\n' "$_cov_out" | sed -n 's/^@cov:failed_phase=//p' | head -1)
+  FAILED_PHASE=${FAILED_PHASE:-coverage floor}
+  exit "$_cov_rc"
 fi
 
 # Record the cache identity this pass populated the bincache for, so the NEXT

@@ -337,6 +337,12 @@ def _main_check(argv):
     v = check_coverage_floor(args.ran, pbr, args.manifest)
     if v.message:
         print(v.message)
+    # failed_phase: the FAILED_PHASE text for gate.sh's EXIT trap (empty for ok).
+    fp = ""
+    if v.verdict == "registry-unusable":
+        fp = "coverage floor unusable: the registry could not be read completely"
+    elif v.verdict == "coverage-short":
+        fp = "coverage short: {} of {} gtests ran".format(v.ran, v.expected)
     # Machine lines (gate.sh strips these from the echoed banner). Group names
     # are CMake identifiers (alnum + _) and counts are ints, so the space-
     # separated name:count map needs no quoting for the awk merge downstream.
@@ -345,6 +351,7 @@ def _main_check(argv):
     print("@cov:floor_ok=%d" % (1 if v.ok else 0))
     print("@cov:bin_expected=%s" % " ".join(
         "%s:%d" % (k, c) for k, c in sorted(v.per_binary_expected.items())))
+    print("@cov:failed_phase=%s" % fp)
     return v.exit_code
 
 

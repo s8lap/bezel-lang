@@ -279,6 +279,8 @@ class CLITest(unittest.TestCase):
             self.assertEqual(m["exit"], "3")
             self.assertEqual(m["floor_ok"], "0")
             self.assertIn("COVERAGE SHORT", r.stdout)
+            self.assertEqual(m["failed_phase"],
+                             "coverage short: 100 of 500 gtests ran")
 
     def test_check_missing_binary_hard_fails_exit_three(self):
         # #3011: a non-executable registry binary is a HARD fail, never a
