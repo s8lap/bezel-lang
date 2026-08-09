@@ -6308,6 +6308,42 @@ private:
     // boxable value (already a reference) or when no descriptor is available.
     llvm::Value* boxValue(llvm::Value* value, const sema::TypeRef* srcTy);
 
+    // fix #2952 (§8.6 / §28.9 / §28.3, v0.240): a §8.6 box MINTED for an
+    // ARGUMENT position (`Take(rb)` where `Take(v: IArea)`) is a §28.3 unbound
+    // owned temporary whose lifetime ends at the call return — §28.3 discharges
+    // it then, and bz_box_release is null-safe. To avoid double-freeing a box
+    // the callee stored, we walk the CALLEE'S BODY for the parameter (callee
+    // escapes ⇒ leak — the safe direction per #2823/#2874; callee does NOT
+    // escape ⇒ release). The walk tracks the parameter (by ParameterSymbol's
+    // declType AST pointer, unique per param) over the method/constructor body
+    // using ParamEscapeWalker; result cached per (callee Decl, paramIdx) — the
+    // walker is O(N) per first query and O(1) thereafter. Imported callees
+    // have no body ⇒ conservatively leak. Boxed boxes that survive the
+    // release site (returned, stored) are not in this set.
+    //
+    // Populated lazily by isCalleeParamNonEscaping; never invalidated (the AST
+    // does not mutate between the analysis and the call sites).
+    std::unordered_map<const ast::Member*,
+                       std::unordered_set<size_t>> calleeParamNonEscape_;
+
+    // fix #2952: pending releases for argument-position fresh boxes, appended
+    // by buildOrderedArgs and consumed (bz_box_release emitted) by the caller's
+    // post-CreateCall block. Cleared after each call.
+    std::vector<llvm::Value*> pendingArgBoxReleases_;
+
+    // fix #2952: the callee Decl (MethodDecl or ConstructorDecl) for the call
+    // currently being lowered. Set by the call site BEFORE buildOrderedArgs so
+    // the escape analysis can walk the callee's body; cleared after the call.
+    // nullptr for imported (no body available — conservatively leak).
+    const ast::Member* currentCallee_ = nullptr;
+
+    // fix #2952: is the callee's parameter at `paramIdx` provably NON-ESCAPING
+    // the callee body? Returns true only when the walker proves the parameter
+    // is never assigned to a static/instance field, passed to another call,
+    // returned, captured, or stored — the same conservative shape BoxEscapeWalker
+    // uses for the local-binding case. Imported callees ⇒ false.
+    bool isCalleeParamNonEscaping(const ast::Member* callee, size_t paramIdx);
+
     // fix #2865 (§8.6 "Boxing" / §28.9 "Runtime-managed types" / §28.3, v0.240):
     // the LAST box `boxValue` minted, as an SSA value. Written on every mint;
     // read by exactly one consumer — `lowerTypeTest`, which snapshots it to

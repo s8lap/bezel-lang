@@ -7712,9 +7712,17 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
             // eligible for a transferred owned local/param. Ask buildOrderedArgs
             // to null the caller's transferred-owned slots at the call, so the
             // null-guarded unwind disposal is exactly-once across branches.
+            //
+            // fix #2952: install the callee on currentCallee_ so the argument-
+            // position §8.6 box escape analysis inside buildOrderedArgs can
+            // walk `md`'s body. Cleared on every exit below (success, early
+            // bail-out, post-CreateCall release emission).
+            currentCallee_ = md;
             if (!buildOrderedArgs(md->params, call.args, args, &argExprs,
                                   /*nullTransferredOwned=*/true,
                                   &accessorRefArgs)) {
+                currentCallee_ = nullptr;
+                pendingArgBoxReleases_.clear();
                 // Restore before early-return.
                 if (didPrePass) {
                     genericSubst_ = std::move(preSavedSubst);
@@ -9885,6 +9893,18 @@ llvm::Value* Emitter::emitMethodCall(sema::MethodSymbol* ms,
     }
     llvm::Value* r = builder_.CreateCall(callee, args);
     emitPendingCheck();  // CG20: a callee may have thrown
+    // fix #2952 (§8.6 / §28.9 / §28.3, v0.240): §28.3 discharges an unbound
+    // owned temporary at the end of the full expression — for an argument-
+    // position §8.6 box, that is "right after the call returns". Emit the
+    // bz_box_release for each fresh box queued by buildOrderedArgs's callee-
+    // non-escape check. bz_box_release is null-safe (the call's argument list
+    // might never have produced a box, e.g. for a reference source). Then
+    // clear state so the next call starts fresh.
+    for (llvm::Value* b : pendingArgBoxReleases_) {
+        if (b) emitBoxRelease(b);
+    }
+    pendingArgBoxReleases_.clear();
+    currentCallee_ = nullptr;
     return r;
 }
 
@@ -11271,9 +11291,15 @@ llvm::Value* Emitter::lowerNullCondCall(const ast::CallExpr& call,
     // unaffected — only the `ref`/`out` shaping changes.)
     std::vector<AccessorRefArg> accessorRefArgs;
     if (auto* md = dynamic_cast<const ast::MethodDecl*>(ms->decl)) {
+        // fix #2952: install the callee so buildOrderedArgs's argument-position
+        // §8.6 box escape analysis can walk `md`'s body. Cleared on every exit
+        // below (success, early bail-out, post-CreateCall release emission).
+        currentCallee_ = md;
         if (!buildOrderedArgs(md->params, call.args, args, &argExprs,
                               /*nullTransferredOwned=*/true,
                               &accessorRefArgs)) {
+            currentCallee_ = nullptr;
+            pendingArgBoxReleases_.clear();
             // #1302: the call never runs, so no §22.3 write-back is owed —
             // release the pinned receiver/index values.
             emitAccessorRefArgWriteBacks(accessorRefArgs, /*emit=*/false);

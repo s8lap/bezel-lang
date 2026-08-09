@@ -9873,7 +9873,33 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
             // that parameter (which lowers to a descriptor walk through the
             // object's first word) sees a real box rather than the raw value
             // bytes. boxForTarget is a no-op for reference arguments (#399).
+            //
+            // fix #2952 (§8.6 / §28.9 / §28.3, v0.240): the freshly minted box
+            // is a §28.3 unbound owned temporary whose lifetime ends at the
+            // call return — bz_box_release it then, but ONLY when the callee's
+            // body provably does not retain the parameter (§28.3 forbids a
+            // borrowed parameter from being stored into a longer-lived
+            // location, but the compiler's escape analysis conservatively
+            // leaks rather than guessing). The save/clear on lastBoxMint_
+            // isolates this argument from any later boxForTarget on a sibling
+            // argument (or the per-boxable-type rescue on the SAME argument's
+            // own tail — see #2915). The callee Decl flows through
+            // currentCallee_ (set by the call site BEFORE buildOrderedArgs).
+            llvm::Value* savedBoxMint = lastBoxMint_;
+            lastBoxMint_ = nullptr;
             v = boxForTarget(v, formalTy, a.value.get());
+            // fix #2952: if THIS argument just minted a fresh box (lastBoxMint_
+            // is now non-null and IS `v`) AND the callee's parameter is
+            // provably non-escaping (analyzed by isCalleeParamNonEscaping),
+            // queue it for release at the post-call site. A null `v` after
+            // boxForTarget means no box was minted (reference source or null
+            // unit-source rescue), so nothing to release.
+            if (v && lastBoxMint_ && v == lastBoxMint_ &&
+                currentCallee_ != nullptr) {
+                if (isCalleeParamNonEscaping(currentCallee_, idx))
+                    pendingArgBoxReleases_.push_back(v);
+            }
+            lastBoxMint_ = savedBoxMint;
             // §29.2 (#437/#1067/#1068/#552): when an Array<T> / (Owned)LinkedList
             // / user class is passed to a formal `IEnumerable<T>` parameter, wrap
             // it in the vtable-backed enumerator so the callee's vtable dispatch
@@ -10186,6 +10212,302 @@ bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
         nullStateMachineOwnedParamCapture(srcExpr);
     }
     return true;
+}
+
+
+namespace {
+// fix #2952 (§8.6 / §28.9 / §28.3, v0.240): walk a callee's METHOD/CTOR body to
+// determine whether its parameter at a fixed index ESCAPES. The mirror image of
+// BoxEscapeWalker (which tracks a LocalDecl in the CALLER's body) — here we
+// track a ParameterSymbol in the CALLEE'S body, so the "use as call receiver"
+// / "pass to a call" / "assign to a field" rules apply symmetrically:
+//
+//   * `v.GetHashCode()` / `v.Equals(x)` / `v.ToString()` — receiver read; not
+//     an escape (callee borrows; Bezel ownership rules forbid retaining a
+//     borrow into a longer-lived location, and `bz_box_retain` is only emitted
+//     for lambda-capture / class-field-store).
+//   * `v is T` / `v as T` (value target) — descriptor walk / payload copy;
+//     not an escape.
+//   * `v = null` / `v <> null` (with literal null) — read only; not escape.
+//   * Anything else that hands `v` to another call, an assignment target, a
+//     return, a lambda capture, an array index, a collection literal — ESCAPE.
+//
+// The tracked parameter's identity is the `ParameterSymbol::declType` AST
+// pointer (`md->params[i].type.get()`), which is unique per parameter (each
+// parameter carries its own type annotation). Imported callees have no
+// ast::MethodDecl/ConstructorDecl in this module and so never reach the
+// walker — they are conservatively leaked by the caller.
+struct ParamEscapeWalker {
+    const sema::SemaContext& ctx;
+    const ast::Type* paramDeclType;
+    bool escaped = false;
+
+    bool isTarget(const ast::Expr* e) {
+        auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
+        if (!id) return false;
+        auto* sym = ctx.exprSymbol(*id);
+        if (!sym) return false;
+        auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym);
+        return ps && ps->declType == paramDeclType;
+    }
+
+    void expr(const ast::Expr* e, bool safeRead) {
+        if (!e || escaped) return;
+        if (auto* id = dynamic_cast<const ast::IdentifierExpr*>(e)) {
+            if (isTarget(id) && !safeRead) escaped = true;
+            return;
+        }
+        // `v is T` / `v as T` — read only.
+        if (auto* t = dynamic_cast<const ast::TypeTestExpr*>(e)) {
+            expr(t->operand.get(), /*safeRead=*/true);
+            return;
+        }
+        // `v = null` / `v <> null` (literal null): read only.
+        if (auto* b = dynamic_cast<const ast::BinaryExpr*>(e)) {
+            if (b->op == "=" || b->op == "<>") {
+                bool lNull = dynamic_cast<const ast::NullLiteralExpr*>(
+                                 b->left.get()) != nullptr;
+                bool rNull = dynamic_cast<const ast::NullLiteralExpr*>(
+                                 b->right.get()) != nullptr;
+                expr(b->left.get(), /*safeRead=*/rNull);
+                expr(b->right.get(), /*safeRead=*/lNull);
+                return;
+            }
+            expr(b->left.get(), /*safeRead=*/false);
+            expr(b->right.get(), /*safeRead=*/false);
+            return;
+        }
+        // Direct method call with `v` as receiver: receiver read; not escape.
+        if (auto* c = dynamic_cast<const ast::CallExpr*>(e)) {
+            if (auto* mem = dynamic_cast<const ast::MemberAccessExpr*>(
+                    c->callee.get())) {
+                if (isTarget(mem->target.get())) {
+                    // Receiver is the tracked parameter — safe read.
+                    for (auto& a : c->args) expr(a.value.get(), false);
+                    return;
+                }
+                expr(mem->target.get(), false);
+                for (auto& a : c->args) expr(a.value.get(), false);
+                return;
+            }
+            if (auto* mem = dynamic_cast<const ast::NullCondMemberExpr*>(
+                    c->callee.get())) {
+                if (isTarget(mem->target.get())) {
+                    for (auto& a : c->args) expr(a.value.get(), false);
+                    return;
+                }
+                expr(mem->target.get(), false);
+                for (auto& a : c->args) expr(a.value.get(), false);
+                return;
+            }
+            // Generic call — any arg may escape through the callee.
+            for (auto& a : c->args) expr(a.value.get(), false);
+            return;
+        }
+        if (auto* c = dynamic_cast<const ast::NullCondCallExpr*>(e)) {
+            if (auto* mem = dynamic_cast<const ast::MemberAccessExpr*>(
+                    c->callee.get())) {
+                if (isTarget(mem->target.get())) {
+                    for (auto& a : c->args) expr(a.value.get(), false);
+                    return;
+                }
+                expr(mem->target.get(), false);
+                for (auto& a : c->args) expr(a.value.get(), false);
+                return;
+            }
+            for (auto& a : c->args) expr(a.value.get(), false);
+            return;
+        }
+        // `o!` forwards o onward — inherit the parent position.
+        if (auto* p = dynamic_cast<const ast::PostfixBangExpr*>(e)) {
+            expr(p->operand.get(), safeRead);
+            return;
+        }
+        // Conditional: condition reads; branches forward.
+        if (auto* c = dynamic_cast<const ast::ConditionalExpr*>(e)) {
+            expr(c->condition.get(), true);
+            expr(c->thenValue.get(), safeRead);
+            expr(c->elseValue.get(), safeRead);
+            return;
+        }
+        // Everything else conservatively escapes: lambda capture, collection
+        // literal, with, new, throw, interpolation, unary, range.
+        if (auto* lam = dynamic_cast<const ast::LambdaExpr*>(e)) {
+            if (lam->exprBody) expr(lam->exprBody.get(), false);
+            for (auto& s : lam->stmts) stmt(s.get());
+            return;
+        }
+        if (auto* n = dynamic_cast<const ast::NewExpr*>(e)) {
+            for (auto& a : n->args) expr(a.value.get(), false);
+            return;
+        }
+        if (auto* w = dynamic_cast<const ast::WithExpr*>(e)) {
+            expr(w->source.get(), false);
+            for (auto& a : w->assigns) expr(a.value.get(), false);
+            return;
+        }
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(e)) {
+            for (auto& el : cl->elements) expr(el.get(), false);
+            for (auto& k : cl->keys) expr(k.get(), false);
+            return;
+        }
+        if (auto* ix = dynamic_cast<const ast::IndexExpr*>(e)) {
+            expr(ix->target.get(), false);
+            for (auto& ind : ix->indices) expr(ind.value.get(), false);
+            return;
+        }
+        // Conservative: anything else treats the value as escaping.
+        // (This covers UnaryExpr, ThrowExpr, InterpolatedStringExpr,
+        // RangeExpr, CaseExpr — all of them can carry the value into a
+        // longer-lived location or to a position we can't statically prove
+        // safe.)
+        // Recurse conservatively on a few key shapes.
+        if (auto* u = dynamic_cast<const ast::UnaryExpr*>(e)) {
+            expr(u->operand.get(), false);
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::InterpolatedStringExpr*>(e)) {
+            // Interpolation hole — render the value via ToString. Like the
+            // direct method-call case, the callee borrows. Not escape.
+            for (auto& part : is->parts) expr(part.expr.get(), true);
+            return;
+        }
+        if (auto* ce = dynamic_cast<const ast::CaseExpr*>(e)) {
+            expr(ce->scrutinee.get(), false);
+            for (auto& arm : ce->arms) {
+                expr(arm.guard.get(), false);
+                expr(arm.exprBody.get(), false);
+                for (auto& s : arm.stmts) stmt(s.get());
+            }
+            return;
+        }
+    }
+
+    void stmt(const ast::Stmt* s) {
+        if (!s || escaped) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            expr(ld->initializer.get(), false);
+            return;
+        }
+        if (auto* lc = dynamic_cast<const ast::LocalConstDecl*>(s)) {
+            expr(lc->value.get(), false); return;
+        }
+        if (auto* r = dynamic_cast<const ast::ReturnStmt*>(s)) {
+            expr(r->value.get(), false); return;
+        }
+        if (auto* es = dynamic_cast<const ast::ExpressionStmt*>(s)) {
+            expr(es->expr.get(), false); return;
+        }
+        if (auto* ts = dynamic_cast<const ast::ThrowStmt*>(s)) {
+            expr(ts->value.get(), false); return;
+        }
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            // Target reassigned to the tracked param — also a use; treat as
+            // non-safe. We don't separately check the target here; only the
+            // value is what can leak the box.
+            expr(as->target.get(), false);
+            expr(as->value.get(), false);
+            return;
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            expr(is->ifBranch.condition.get(), true);
+            for (auto& b : is->ifBranch.body) stmt(b.get());
+            for (auto& br : is->elifBranches) {
+                expr(br.condition.get(), true);
+                for (auto& b : br.body) stmt(b.get());
+            }
+            for (auto& b : is->elseBody) stmt(b.get());
+            return;
+        }
+        if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            expr(ws->condition.get(), true);
+            for (auto& b : ws->body) stmt(b.get());
+            return;
+        }
+        if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            expr(fs->iterable.get(), false);
+            expr(fs->withExpr.get(), false);
+            for (auto& b : fs->body) stmt(b.get());
+            return;
+        }
+        if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) stmt(b.get());
+            return;
+        }
+        if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) stmt(b.get());
+            for (auto& c : ts->catches) {
+                expr(c.guard.get(), true);
+                stmt(c.body.get());
+            }
+            for (auto& b : ts->finallyBody) stmt(b.get());
+            return;
+        }
+        if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            expr(cs->scrutinee.get(), false);
+            for (auto& arm : cs->arms) {
+                expr(arm.guard.get(), false);
+                expr(arm.exprBody.get(), false);
+                for (auto& s : arm.stmts) stmt(s.get());
+            }
+            return;
+        }
+    }
+};
+}  // namespace
+
+
+// fix #2952 (§8.6 / §28.9 / §28.3, v0.240): is the callee's parameter at
+// `paramIdx` provably NON-ESCAPING the callee body? Imported callees have no
+// body in this module ⇒ false (leak — the safe direction per #2823/#2874).
+// Locally-compiled MethodDecl / ConstructorDecl: walk the body with
+// ParamEscapeWalker; the result is cached per callee Decl.
+bool Emitter::isCalleeParamNonEscaping(const ast::Member* callee,
+                                       size_t paramIdx) {
+    if (!callee) return false;
+    // Check the cache first.
+    auto it = calleeParamNonEscape_.find(callee);
+    if (it != calleeParamNonEscape_.end())
+        return it->second.count(paramIdx) != 0;
+
+    // Build the cache entry by walking every parameter (the walker is O(N) per
+    // call, so amortising it across all Object/interface params of one callee
+    // is cheaper than per-parameter queries). Parameters that aren't
+    // Object/interface never box anyway and never reach the call-site release
+    // check, but walking them is cheap and keeps the cache complete.
+    std::unordered_set<size_t> nonEscape;
+    ParamEscapeWalker w{ctx_, nullptr};
+    auto walkParams = [&](const std::vector<ast::Param>& params,
+                          const std::vector<std::unique_ptr<ast::Stmt>>* body,
+                          const ast::Expr* exprBody) {
+        for (size_t i = 0; i < params.size(); ++i) {
+            if (!params[i].type) continue;
+            const sema::TypeRef* pt = ctx_.resolvedType(*params[i].type);
+            if (!pt || !isObjectOrInterfaceTarget(pt)) continue;
+            ParamEscapeWalker w{ctx_, params[i].type.get()};
+            if (body) {
+                for (auto& s : *body) w.stmt(s.get());
+            }
+            if (exprBody) w.expr(exprBody, false);
+            if (!w.escaped) nonEscape.insert(i);
+        }
+    };
+    if (auto* md = dynamic_cast<const ast::MethodDecl*>(callee)) {
+        if (md->bodyKind == ast::MethodBodyKind::Expression) {
+            walkParams(md->params, nullptr, md->exprBody.get());
+        } else if (md->bodyKind == ast::MethodBodyKind::Block) {
+            walkParams(md->params, &md->stmts, nullptr);
+        }
+        // Abstract or empty body ⇒ no params escape (nothing to escape
+        // through). Cache the empty set so subsequent queries are O(1).
+    } else if (auto* cd = dynamic_cast<const ast::ConstructorDecl*>(callee)) {
+        walkParams(cd->params, &cd->body, nullptr);
+    } else {
+        return false;
+    }
+    bool result = nonEscape.count(paramIdx) != 0;
+    calleeParamNonEscape_[callee] = std::move(nonEscape);
+    return result;
 }
 
 
