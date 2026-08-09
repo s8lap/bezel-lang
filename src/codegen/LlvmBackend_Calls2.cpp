@@ -6598,6 +6598,66 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
                             builder_.CreateCall(fn, {recv, disp});
                         }
+                    } else if (isListInterfaceName(recvTy)) {
+                        // fix #2970 (spec §28.2 / §28.9 / §8.1, stdlib §4.1–§4.3,
+                        // v0.240): the three ARRAY-BACKED list interfaces
+                        // (IList<T> / IReadOnlyList<T> / IOwningList<T>) carry
+                        // the same bz_array_t* at runtime as the concrete
+                        // Array<T> / OwningArray<T> they implement — so an
+                        // explicit `e.Dispose()` where `e: IList<T>` routes
+                        // through `bz_array_free`, mirroring the concrete-array
+                        // arm below. Before this fix the disposal chain had no
+                        // arm for the interface head; the chain fell through to
+                        // the generic vtable dispatch (emitDisposeAndReclaim →
+                        // load word 0 as vtable → call slot 2), but word 0 of
+                        // a bz_array_t* is the data pointer, not a vtable —
+                        // the indirect call jumped into the middle of the
+                        // array's payload and the program SEGFAULTED. MEASURED
+                        // on 001a661 (exit 139): `var e: IList<int> :=
+                        // new Array<int>(2); e.Dispose();` emitted `mov (%rax),
+                        // %rcx ; call *0x10(%rcx)` where %rax was the array
+                        // pointer and %rcx became the data buffer address —
+                        // a wild jump into the heap.
+                        //
+                        // The same array-backing assumption the indexer bridge
+                        // (LlvmBackend_Assign.cpp, #401) already keys on: the
+                        // runtime model is that IList<T>-typed slots hold
+                        // bz_array_t* and only that. A user class declaring
+                        // `: IList<T>` is a hypothetical not actually served by
+                        // the rest of the compiler either (no itable wiring;
+                        // #853 stays open for the polymorphic collection
+                        // interfaces). Polymorphic collection interfaces
+                        // (IReadOnlyCollection<T> / ICollection<T> /
+                        // IOwningCollection<T>) span incompatible runtime
+                        // representations and need runtime discrimination —
+                        // deferred; see the TODO below.
+                        //
+                        // IOwningList<T> is the OWNING list interface
+                        // (stdlib §4.2): its element disposer is the same
+                        // `elementPolicyFor` thunk the concrete
+                        // OwningArray<T>.Dispose() arm uses, so the
+                        // disposing-setter cascade runs for an interface-
+                        // typed receiver exactly as it does for the
+                        // concrete owning array.
+                        {
+                            bool listIfaceOwning = false;
+                            (void)isListInterfaceName(recvTy, &listIfaceOwning);
+                            const sema::TypeRef* arrElem =
+                                (!recvTy->genericArgs.empty())
+                                    ? recvTy->genericArgs[0] : nullptr;
+                            llvm::Function* elemDisp =
+                                elementPolicyFor(arrElem, listIfaceOwning)
+                                    .disposerThunk;
+                            llvm::Value* disp = elemDisp
+                                ? llvm::cast<llvm::Value>(elemDisp)
+                                : llvm::ConstantPointerNull::get(ptrTy());
+                            const char* freeName = checkedDisposal_
+                                ? "bz_array_mark_disposed"
+                                : "bz_array_free";
+                            auto* fn = declareC(freeName,
+                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                            builder_.CreateCall(fn, {recv, disp});
+                        }
                     } else if (isCollectionTypeName(recvTy)) {
                         // #362 / stdlib §4.5: explicit Dispose() on an owning
                         // collection cascades disposal into its class elements;
