@@ -1,6 +1,6 @@
 # Dual-oracle gate investigation (2026-08-10)
 
-## TL;DR
+## Summary
 
 The Bezel integration gate runs each cycle **twice**: once plain, once with
 `BEZEL_AOT_FORCE_SANITIZE=address` (ASan-instrumented). Both must pass for a
