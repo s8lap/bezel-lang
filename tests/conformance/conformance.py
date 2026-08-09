@@ -1,0 +1,436 @@
+"""conformance.py — the spec-example conformance harness, ported from
+run_conformance.sh (#3010 gate-infra migration; per Plan-A 5.1).
+
+WHAT THIS DOES
+  For each non-`skip` case in manifest.tsv:
+    - classify the fragment by a content heuristic and wrap it in the standard
+      module/class/Main harness (or compile it as a library / as-is program),
+    - compile it under a MemoryMax/swap=0 cgroup cage with a 30 s timeout,
+    - check the manifest expectation: `error` ⇒ must compile-fail;
+      `compiles` ⇒ no crash/signal; `run:X` ⇒ stdout first line; `rc:N` ⇒ exit.
+  Exit code 70 (runtime unhandled-exception) is acceptable for `compiles`;
+  >=128 / 139 / 134 is a crash/signal ⇒ FAIL.
+
+WHY PYTHON
+  The bash harness had no unit tests and — the load-bearing gap, per Plan-A 5.1
+  — NO `PASS>0` guard: if the manifest loop read nothing (manifest moved/empty,
+  or every case `skip`), then PASS=0, FAIL=0 ⇒ exit 0, a SILENT GREEN over a run
+  that validated nothing. main() now FAILS LOUD when PASS==0. The wrap
+  heuristics, crash classification, and expectation evaluation are pure
+  functions of the source/exit text, so they are unit-tested directly
+  (test_conformance.py); the subprocess cage is the only non-pure seam and is
+  injectable via the `run` callable.
+
+MEMORY DISCIPLINE
+  Every bezelc call AND every compiled-program run is wrapped in
+  `systemd-run --user --scope -q -p MemoryMax=4G -p MemorySwapMax=0 -- timeout
+  30`, exactly as the bash did. Cases are processed SEQUENTIALLY.
+
+Stdlib only (subprocess/tempfile/re/csv); no pytest, no new deps (#3010).
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# -----------------------------------------------------------------------
+# Wrap modes (mirror run_conformance.sh wrap_fragment's emitted mode strings)
+# -----------------------------------------------------------------------
+WRAP_AS_IS_PROGRAM = "as-is-program"  # has `module` + `method Main` → run as-is
+WRAP_AS_IS_LIB = "as-is-lib"          # has `module`, no Main → compile as library
+WRAP_LIB = "lib"                      # wrapped with `module Conf;`, compile -c
+WRAP_STMT = "stmt"                    # wrapped as Main-body statements
+
+# Per-case compile/run timeout (seconds), inside the systemd-run scope. per the
+# bash harness comment block.
+CASE_TIMEOUT_S = 30
+
+# The MemoryMax/MemorySwapMax cage every bezelc invocation and every
+# compiled-program run is wrapped in (#3010 memory discipline; anti-freeze
+# cgroup policy). Sequential, never parallel.
+_CAGE_ARGV = ["systemd-run", "--user", "--scope", "-q",
+              "-p", "MemoryMax=4G", "-p", "MemorySwapMax=0",
+              "--", "timeout", str(CASE_TIMEOUT_S)]
+
+# -----------------------------------------------------------------------
+# Wrap heuristic — PURE function of the source text.
+# Mirrors run_conformance.sh wrap_fragment()'s grep cascade.
+# -----------------------------------------------------------------------
+
+# Step 1: already-declared module (grep -qE over the whole body).
+_MODULE_RE = re.compile(r'^\s*module\s+\w', re.MULTILINE)
+_MAIN_RE = re.compile(r'\bmethod\s+Main\b')
+
+# `first_nonblank`: the first line matching `^[[:space:]]*[^[:space:]/]` — the
+# first non-blank line that does not start with `/` (a comment leader). grep -m1.
+_FNS_LINE_RE = re.compile(r'^[ \t]*[^ \t/]')
+
+# Steps 2-6: applied to the first-nonblank line. Translations of the bash EREs.
+_TYPE_DECL_RE = re.compile(
+    r'^\s*(?:(?:public|private|internal)\s+)?'
+    r'(?:(?:sealed|abstract|static)\s+)*'
+    r'(?:class|record|enum|interface)\s+\w')
+_EXT_RE = re.compile(r'^\s*extension\b')
+_IMPORT_RE = re.compile(r'^\s*import\s+')
+_METHOD_RE = re.compile(
+    r'^\s*(?:(?:public|private|internal|protected)\s+)?'
+    r'(?:(?:static|virtual|override|abstract|async)\s+)*'
+    r'(?:method|property|constructor|destructor)\s+')
+_FIELD_RE = re.compile(
+    r'^\s*(?:(?:public|private|internal)\s+)?'
+    r'(?:(?:owned|readonly|static)\s+)?_?\w+\s*:\s*\w')
+
+
+def first_nonblank_line(code):
+    """The first non-blank, non-`/`-leading line, mirroring
+    `grep -m1 -E '^[[:space:]]*[^[:space:]/]'`. None when no line qualifies
+    (the bash then falls through every first-nonblank check to the default)."""
+    for line in code.splitlines():
+        if _FNS_LINE_RE.match(line):
+            return line
+    return None
+
+
+def _indent_four(code):
+    """Replicate `sed 's/^/    /'`: prepend four spaces to every line. sed
+    treats a trailing newline as a line terminator (no phantom final empty
+    line), so one trailing newline is stripped and re-added. The compiler does
+    not care about a trailing newline; matching sed keeps the wrapped source
+    byte-close to the bash harness for the equivalence proof."""
+    trailing_nl = code.endswith("\n")
+    body = code[:-1] if trailing_nl else code
+    indented = "\n".join("    " + line for line in body.split("\n"))
+    return indented + ("\n" if trailing_nl else "")
+
+
+def classify_wrap(code):
+    """Return (wrap_mode, wrapped_src) for a fragment body. A pure translation
+    of run_conformance.sh wrap_fragment()'s heuristic cascade; the wrapped_src
+    concatenations mirror the bash printf/cat templates exactly."""
+    fn = first_nonblank_line(code)
+
+    # 1. Already has a module declaration?
+    if _MODULE_RE.search(code):
+        if _MAIN_RE.search(code):
+            return WRAP_AS_IS_PROGRAM, code
+        return WRAP_AS_IS_LIB, code
+
+    # 2. Type declaration at module level → wrap as library.
+    if fn is not None and _TYPE_DECL_RE.match(fn):
+        return WRAP_LIB, "module Conf;\n\n" + code
+
+    # 3. Extension block at module scope (§26.x) → wrap as library.
+    if fn is not None and _EXT_RE.match(fn):
+        return WRAP_LIB, "module Conf;\n\n" + code
+
+    # 4. Import statement → wrap as statements, with a Main so imports resolve.
+    if fn is not None and _IMPORT_RE.match(fn):
+        return (WRAP_STMT,
+                "module Conf;\n" + code
+                + "\nclass W\n  public static method Main() end Main;\nend W;\n")
+
+    # 5. Method/property/ctor/dtor declaration → wrap inside a class, library.
+    if fn is not None and _METHOD_RE.match(fn):
+        return WRAP_LIB, "module Conf;\nclass W\n" + code + "\nend W;\n"
+
+    # 6. Field declaration → wrap inside a class (with a Main), library.
+    if fn is not None and _FIELD_RE.match(fn):
+        return (WRAP_LIB,
+                "module Conf;\nclass W\n" + code
+                + "\n  public static method Main() end Main;\nend W;\n")
+
+    # 7. Default: treat as statements in Main.
+    return (WRAP_STMT,
+            "module Conf;\nclass W\n  public static method Main()\n"
+            + _indent_four(code) + "\n  end Main;\nend W;\n")
+
+
+# -----------------------------------------------------------------------
+# Preamble splice — for notes=preamble cases. Mirrors the awk splice.
+# -----------------------------------------------------------------------
+
+_SPLICE_MODULE_LINE_RE = re.compile(r'^[ \t]*module[ \t]')
+
+
+def splice_preamble(wrapped_src, preamble_text):
+    """Insert preamble_text immediately after the first `module ...` line, the
+    awk splice in run_conformance.sh for `notes=preamble` cases. awk's
+    `getline` + `print` line-terminates every preamble line, so a missing
+    trailing newline on the preamble file is supplied here."""
+    pad = preamble_text if preamble_text.endswith("\n") else preamble_text + "\n"
+    out = []
+    spliced = False
+    for line in wrapped_src.splitlines(keepends=True):
+        out.append(line)
+        if not spliced and _SPLICE_MODULE_LINE_RE.match(line):
+            out.append(pad)
+            spliced = True
+    return "".join(out)
+
+
+# -----------------------------------------------------------------------
+# Crash classification + run-expectation evaluation — PURE.
+# -----------------------------------------------------------------------
+
+def is_crash(rc):
+    """per run_conformance.sh: SIGSEGV/SIGABRT/etc. surface as 128+signal
+    (>= 128) or the core-dump codes 139 (SIGSEGV) / 134 (SIGABRT) explicitly.
+    Exit 70 is the runtime unhandled-exception code and is NOT a crash."""
+    return rc >= 128 or rc in (134, 139)
+
+
+def _first_line(text):
+    """`cat | tr -d '\\r' | head -1`: first line of text with all CR stripped."""
+    no_cr = text.replace("\r", "")
+    nl = no_cr.find("\n")
+    return no_cr if nl < 0 else no_cr[:nl]
+
+
+def _snippet(log, cut_chars, head_bytes):
+    """`head -c N | tr '\\n' ' ' | cut -c1-M`: a flat one-line preview of the
+    compile log. ASCII diagnostics only — byte vs char slicing coincides."""
+    flat = log[:head_bytes].replace("\n", " ")
+    return flat[:cut_chars]
+
+
+def evaluate_run(expectation, run_rc, run_stdout):
+    """Evaluate a stmt/program case's RUN phase against its expectation. Pure.
+    Returns (passed, kind, detail): passed is True/False; for a failure `kind`
+    is the bracketed category and `detail` the text after it; for a pass both
+    are empty. Mirrors run_conformance.sh's run-phase decision tree."""
+    crash = is_crash(run_rc)
+    if expectation == "compiles":
+        if crash:
+            return False, "crash/signal", "exit code {}".format(run_rc)
+        return True, "", ""
+    if expectation.startswith("run:"):
+        expected = expectation[len("run:"):]
+        actual = _first_line(run_stdout)
+        if actual == expected:
+            return True, "", ""
+        return False, "wrong-result", "expected='{}' got='{}'".format(expected, actual)
+    m = re.match(r'^rc:(\d+)$', expectation)
+    if m:
+        expected_rc = int(m.group(1))
+        if run_rc == expected_rc:
+            return True, "", ""
+        return False, "wrong-result", "expected exit {} got {}".format(expected_rc, run_rc)
+    # Unknown expectation — pass iff it ran without crashing.
+    if crash:
+        return False, "crash/signal", "exit code {}".format(run_rc)
+    return True, "", ""
+
+
+# -----------------------------------------------------------------------
+# Manifest reading — faithful TSV split (no quote processing, like bash read).
+# -----------------------------------------------------------------------
+
+def read_manifest(path):
+    """Read manifest.tsv into a list of case dicts. Splits on TAB with no quote
+    handling (mirrors `IFS=$'\\t' read -r ...`); skips the `case-id` header row
+    and blank lines. Fields shorter than 6 are padded so `notes` is always
+    present (empty when the manifest omits it)."""
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for raw in f:
+            line = raw.rstrip("\n").rstrip("\r")
+            if line == "":
+                continue
+            fields = line.split("\t")
+            if fields[0] == "case-id":
+                continue
+            while len(fields) < 6:
+                fields.append("")
+            rows.append({
+                "case_id": fields[0], "doc": fields[1], "section": fields[2],
+                "cls": fields[3], "expectation": fields[4], "notes": fields[5],
+            })
+    return rows
+
+
+# -----------------------------------------------------------------------
+# The caged subprocess seam.
+# -----------------------------------------------------------------------
+
+def caged_run(cmd, cwd=None):
+    """Run cmd under the systemd-run MemoryMax/swap=0 cage + `timeout`, merging
+    stderr into stdout. Returns (rc, combined_text). timeout's exit is 124.
+    This is the ONLY non-pure seam in a case run; run_case accepts it via the
+    `run` parameter so tests inject a fake and never touch bezelc/systemd."""
+    proc = subprocess.run(_CAGE_ARGV + list(cmd), cwd=cwd,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    text = proc.stdout.decode("utf-8", errors="replace")
+    return proc.returncode, text
+
+
+# -----------------------------------------------------------------------
+# Run one case. `run` is injectable (production: caged_run; tests: a fake).
+# Returns (status, kind, detail) — see evaluate_run for the shape.
+# -----------------------------------------------------------------------
+
+def run_case(case, bezelc, cases_dir, tmpdir, preamble_text, run=caged_run):
+    case_id = case["case_id"]
+    src_path = os.path.join(cases_dir, case_id + ".bzl")
+    if not os.path.isfile(src_path):
+        return "FAIL", "compile-error", "source file missing"
+
+    with open(src_path, encoding="utf-8") as f:
+        code = f.read()
+
+    wrap_mode, wrapped = classify_wrap(code)
+    if case.get("notes") == "preamble" and preamble_text is not None:
+        wrapped = splice_preamble(wrapped, preamble_text)
+
+    wrap_file = os.path.join(tmpdir, case_id + "_wrapped.bzl")
+    with open(wrap_file, "w", encoding="utf-8") as f:
+        f.write(wrapped)
+
+    out_exe = os.path.join(tmpdir, case_id + "_out")
+    flags = ["-c", "-o", out_exe] if wrap_mode in (WRAP_LIB, WRAP_AS_IS_LIB) \
+        else ["-o", out_exe]
+
+    compile_rc, compile_log = run([bezelc] + flags + [wrap_file])
+
+    # timeout check FIRST (before the error-class branch), as in the bash.
+    if compile_rc == 124:
+        return "FAIL", "timeout", "compile timed out"
+
+    if case["cls"] == "error":
+        if compile_rc != 0:
+            return "PASS", "", ""
+        snippet = _snippet(compile_log, 80, 120)
+        return "FAIL", "missing-diagnostic", "compiled without error: " + snippet
+
+    if compile_rc != 0:
+        snippet = _snippet(compile_log, 120, 200)
+        return "FAIL", "compile-error", snippet
+
+    if wrap_mode in (WRAP_LIB, WRAP_AS_IS_LIB):
+        # Library mode: compile success is the whole check. (The bash prints a
+        # distinct "[lib-only; no run check]" suffix when the expectation was
+        # neither compiles nor n/a; reproduce it for output parity.)
+        if case["expectation"] in ("compiles", "n/a"):
+            return "PASS", "", ""
+        return "PASS", "", "[lib-only; no run check]"
+
+    if not (os.path.exists(out_exe) and os.access(out_exe, os.X_OK)):
+        return "PASS", "", "[compiled; no runnable artifact]"
+
+    run_rc, run_log = run([out_exe])
+    if run_rc == 124:
+        return "FAIL", "timeout", "run timed out"
+
+    passed, kind, detail = evaluate_run(case["expectation"], run_rc, run_log)
+    if passed:
+        return "PASS", "", ""
+    return "FAIL", kind, detail
+
+
+def _format_line(status, case_id, kind, detail):
+    """The per-case print line, matching run_conformance.sh exactly."""
+    if status == "PASS":
+        return "PASS " + case_id + ((" " + detail) if detail else "")
+    return "FAIL " + case_id + " [" + kind + "] " + detail
+
+
+# -----------------------------------------------------------------------
+# CLI main. exit 1 on FAIL>0 AND on PASS==0 (the Plan-A 5.1 silent-green guard).
+# -----------------------------------------------------------------------
+
+def _here_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def main(argv, base_dir=None, run=caged_run):
+    """Run the conformance sweep and print the per-case + summary report.
+
+    `base_dir` (default: this module's directory) locates manifest.tsv, cases/,
+    and preamble.bzl; `run` (default: caged_run) is the subprocess seam run_case
+    uses. Both are injectable so test_conformance.py can drive a synthetic
+    manifest under a fake `run` without touching bezelc/systemd — that is how
+    the Plan-A 5.1 PASS>0 silent-green guard is unit-pinned.
+
+    Returns 0 iff every non-skip case passed AND at least one passed; 1
+    otherwise (FAIL>0 OR PASS==0)."""
+    if len(argv) < 1 or argv[0] in ("-h", "--help"):
+        print("Usage: run_conformance.py <bezelc-binary>", file=sys.stderr)
+        return 1
+    bezelc = argv[0]
+    if not os.access(bezelc, os.X_OK):
+        print("ERROR: bezelc binary not found or not executable: " + bezelc,
+              file=sys.stderr)
+        return 1
+
+    here = base_dir or _here_dir()
+    cases_dir = os.path.join(here, "cases")
+    manifest = os.path.join(here, "manifest.tsv")
+    preamble_file = os.path.join(here, "preamble.bzl")
+    preamble_text = None
+    if os.path.isfile(preamble_file):
+        with open(preamble_file, encoding="utf-8") as f:
+            preamble_text = f.read()
+
+    if not os.path.isfile(manifest):
+        print("ERROR: manifest not found: " + manifest, file=sys.stderr)
+        return 1
+
+    scratch = "/var/tmp/bezel-scratch"
+    try:
+        os.makedirs(scratch, exist_ok=True)
+    except OSError:
+        scratch = None  # fall back to the system temp dir below
+    tmpdir = tempfile.mkdtemp(
+        prefix="conf_run.", dir=(scratch if scratch and os.path.isdir(scratch)
+                                 else None))
+
+    counts = {"PASS": 0, "FAIL": 0, "SKIP": 0}
+    fail_kinds = {}
+
+    print("=== Conformance sweep ===")
+    print("bezelc: " + bezelc)
+    print("")
+
+    try:
+        for case in read_manifest(manifest):
+            if case["cls"] == "skip":
+                counts["SKIP"] += 1
+                continue
+            status, kind, detail = run_case(
+                case, bezelc, cases_dir, tmpdir, preamble_text, run=run)
+            counts[status] += 1
+            if status == "FAIL":
+                fail_kinds[kind] = fail_kinds.get(kind, 0) + 1
+            print(_format_line(status, case["case_id"], kind, detail))
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    print("")
+    print("=== Results ===")
+    print("PASS:    {}".format(counts["PASS"]))
+    print("FAIL:    {}".format(counts["FAIL"]))
+    print("SKIP:    {}".format(counts["SKIP"]))
+    print("")
+    print("Failure breakdown:")
+    # Mirror the bash's fixed ordering of failure categories.
+    for kind in ("compile-error", "wrong-result", "crash/signal",
+                 "missing-diagnostic", "timeout"):
+        print("  {:20} {}".format(kind + ":", fail_kinds.get(kind, 0)))
+
+    if counts["FAIL"] > 0:
+        return 1
+    # per Plan-A 5.1: a green over a run that validated NOTHING is not green.
+    # If the manifest loop read no passable case (manifest moved/empty, or every
+    # case `skip`), FAIL LOUD rather than exit 0 over PASS=0/FAIL=0.
+    if counts["PASS"] == 0:
+        print("## CONFORMANCE FAILURE: PASS=0 — no case passed. The manifest is "
+              "empty, missing, or every case is 'skip'; a green over a run that "
+              "validated nothing is NOT green (Plan-A 5.1).", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
