@@ -25,6 +25,16 @@ import os
 import re
 import sys
 
+# Reuse the #3010 Phase 0 atomic writer: the run-summary that gate.sh reads
+# (the BEZEL_RUN_SUMMARY bridge, see write_run_summary) must survive a crash
+# mid-write — a half-written target is the #3000/#3003 shape.
+from gate import io
+
+# Schema for the MERGED run summary run_parallel writes for gate.sh to read
+# (one per run, vs. one per shard for the v1 shard summary above). Distinct
+# schema name so a reader that expects a shard summary refuses a run summary.
+RUN_SCHEMA = "bezel.run-summary.v1"
+
 # The schema every shard JSON carries. run_parallel's agreement check asserts
 # this so a future field rename cannot silently make the two parses diverge.
 SCHEMA = "bezel.shard-summary.v1"
@@ -201,6 +211,233 @@ def check_agreement(logdir):
     return mismatches
 
 
+# ---------------------------------------------------------------------------
+# Phase 2c: run-level accounting from the structured JSON shard summaries.
+#
+# `account` replaces run_parallel.sh's per-shard grep of the legacy
+# "N passed, M failed" line (run_parallel.sh:202-254) AND gate.sh's harvest of
+# the printed TOTAL / per-binary lines (gate.sh:831, :855-860). It reads the
+# per-shard JSON summaries + the per-shard rc.<name>.<i> files and produces the
+# SAME accounting the legacy greps did: grand totals, per-binary ran/expected,
+# and the integrity flags + defect lists that drive run_parallel's exit code
+# and the "## GATE FAILURE: shard crash / undercount" banner.
+#
+# CRASH DETECTION reads rc.<name>.<i> (the subshell's recorded process exit),
+# NOT the JSON `rc` field: test_main.cpp writes the JSON just before `return`
+# (test_main.cpp:281-318), so a shard killed mid-run (segfault/timeout) never
+# reaches the JSON write, and the JSON `rc` field only ever records a normal
+# test-failure exit. The rc FILE is the only signal that catches a kill — this
+# mirrors run_parallel.sh:202-207 (`cat rc...; ${rc:-1} -ne 0`) exactly.
+# per #3012, #1861, #2100.
+
+
+def _read_rc_files(logdir):
+    """Read every rc.<name>.<i> exit-code file in `logdir`.
+
+    Returns {(name, idx): rc_int}. A missing file maps to nothing here; the
+    account() loop treats an absent key as rc=1 (crash), matching
+    run_parallel's `${rc:-1}` default. rc files have NO extension (unlike the
+    .log/.json shard files), so they are parsed directly rather than via
+    _split_shard_name (whose suffix stripping assumes a non-empty suffix)."""
+    out = {}
+    for path in sorted(glob.glob(os.path.join(logdir, "rc.*"))):
+        base = os.path.basename(path)
+        core = base[len("rc."):]  # <name>.<idx>
+        name, _, idx = core.rpartition(".")
+        if not name or not idx.isdigit():
+            continue
+        try:
+            with open(path) as f:
+                raw = f.read().strip()
+        except OSError:
+            raw = ""
+        out[(name, int(idx))] = int(raw) if raw.lstrip("-").isdigit() else 1
+    return out
+
+
+def account(logdir, conc, names, subset=False):
+    """Compute run_parallel's full accounting from the structured JSON shard
+    summaries + the rc files.
+
+    `conc` is the per-binary shard count (run_parallel's resource cap);
+    `names` is the ordered list of binary labels run_parallel launched;
+    `subset` is True iff BEZEL_TEST_LIST was set (the selected-count integrity
+    mode, #2100) — this is the JSON equivalent of the legacy "did the summary
+    line carry 'selected'" test, read from the run config that determined it
+    (the JSON always carries a `selected` field, so it cannot itself distinguish
+    list mode from a filter; the env config can, and does, cleanly).
+
+    Faithful to run_parallel.sh:185-270: per-binary ran==expected (#1861),
+    every-shard-printed-a-summary (#1861), empty-subset-never-a-pass (#2100).
+    Returns the run-summary dict (see RUN_SCHEMA)."""
+    rc_map = _read_rc_files(logdir)
+    summaries = {(s["binary"], s["shard_index"]): s["json"]
+                 for s in read_shard_summaries(logdir)}
+
+    total_pass = 0
+    total_fail = 0
+    shard_rc_ok = 1
+    count_ok = 1
+    summary_ok = 1
+    crashed_shards = []
+    missing_summary_shards = []
+    undercount_bins = []
+    global_selected = 0
+    bin_rows = []
+
+    for name in names:
+        b_pass = 0
+        b_fail = 0
+        b_registry = 0
+        b_selected = 0
+        b_summaries = 0
+        for i in range(conc):
+            key = (name, i)
+            rc = rc_map.get(key, 1)
+            if rc != 0:
+                shard_rc_ok = 0
+                crashed_shards.append("%s/%d" % (name, i))
+            js = summaries.get(key)
+            if js is None:
+                # No structured summary: the shard validated NONE of its slice
+                # (crashed before the write, or a path that exit()d the harness
+                # mid-loop). summary_ok below catches it unconditionally.
+                missing_summary_shards.append("%s/%d" % (name, i))
+                continue
+            b_summaries += 1
+            b_pass += int(js.get("passed", 0))
+            b_fail += int(js.get("failed", 0))
+            t = int(js.get("total", 0))
+            if t > b_registry:
+                b_registry = t
+            if subset:
+                s = int(js.get("selected", 0))
+                if s > b_selected:
+                    b_selected = s
+        if subset:
+            b_expected = b_selected
+            what = "selected"
+        else:
+            b_expected = b_registry
+            what = "registered"
+        b_ran = b_pass + b_fail
+        if b_expected > 0 and b_ran != b_expected:
+            count_ok = 0
+            undercount_bins.append(
+                "%s: ran %d of %d %s" % (name, b_ran, b_expected, what))
+        # EVERY shard must have written a structured summary. A shard missing
+        # one validated NONE of its slice, so a "0 failed" aggregate is not
+        # trustworthy regardless of exit code — stricter than the undercount
+        # check and never lets a dropped slice pass green (#1861).
+        if b_summaries != conc:
+            summary_ok = 0
+        if subset:
+            global_selected += b_selected
+        total_pass += b_pass
+        total_fail += b_fail
+        bin_rows.append({
+            "name": name, "passed": b_pass, "failed": b_fail,
+            "ran": b_ran, "expected": b_expected, "registry": b_registry,
+            "selected": b_selected, "summaries": b_summaries,
+        })
+
+    ran = total_pass + total_fail
+    expected_all = sum(r["expected"] for r in bin_rows)
+    registry_all = sum(r["registry"] for r in bin_rows)
+    subset_empty = 1 if (subset and global_selected == 0) else 0
+    integrity_ok = (shard_rc_ok and count_ok and summary_ok
+                    and not subset_empty)
+    return {
+        "schema": RUN_SCHEMA,
+        "total_pass": total_pass,
+        "total_fail": total_fail,
+        "ran": ran,
+        "expected_all": expected_all,
+        "registry_all": registry_all,
+        "nbin": len(names),
+        "njobs": len(names) * conc,
+        "conc": conc,
+        "subset_mode": bool(subset),
+        "global_selected": global_selected,
+        "subset_empty": bool(subset_empty),
+        "shard_rc_ok": bool(shard_rc_ok),
+        "count_ok": bool(count_ok),
+        "summary_ok": bool(summary_ok),
+        "integrity_ok": bool(integrity_ok),
+        "crashed_shards": crashed_shards,
+        "missing_summary_shards": missing_summary_shards,
+        "undercount_bins": undercount_bins,
+        "binaries": bin_rows,
+    }
+
+
+def _shell_quote(s):
+    """Quote a string for a bash single-quoted context (handles embedded ')."""
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def emit_shell(acc):
+    """Emit the accounting dict as shell-sourceable assignments (KEY=VALUE and
+    bash array literals) for run_parallel.sh to `eval`. One python call
+    replaces the legacy per-shard grep+sed harvest. Keys are rp_-prefixed so the
+    eval cannot clobber run_parallel's loop temporaries."""
+    lines = []
+    flag = lambda b: "1" if b else "0"
+    lines.append("rp_total_pass=%d" % acc["total_pass"])
+    lines.append("rp_total_fail=%d" % acc["total_fail"])
+    lines.append("rp_ran=%d" % acc["ran"])
+    lines.append("rp_expected_all=%d" % acc["expected_all"])
+    lines.append("rp_registry_all=%d" % acc["registry_all"])
+    lines.append("rp_nbin=%d" % acc["nbin"])
+    lines.append("rp_njobs=%d" % acc["njobs"])
+    lines.append("rp_subset_mode=%s" % flag(acc["subset_mode"]))
+    lines.append("rp_global_selected=%d" % acc["global_selected"])
+    lines.append("rp_subset_empty=%s" % flag(acc["subset_empty"]))
+    lines.append("rp_shard_rc_ok=%s" % flag(acc["shard_rc_ok"]))
+    lines.append("rp_count_ok=%s" % flag(acc["count_ok"]))
+    lines.append("rp_summary_ok=%s" % flag(acc["summary_ok"]))
+    lines.append("rp_integrity_ok=%s" % flag(acc["integrity_ok"]))
+    for key in ("crashed_shards", "missing_summary_shards", "undercount_bins"):
+        vals = " ".join(_shell_quote(x) for x in acc[key])
+        lines.append("rp_%s=(%s)" % (key, vals))
+    rows = acc["binaries"]
+    lines.append("rp_bin_names=(%s)" % " ".join(_shell_quote(r["name"]) for r in rows))
+    lines.append("rp_bin_pass=(%s)" % " ".join("%d" % r["passed"] for r in rows))
+    lines.append("rp_bin_fail=(%s)" % " ".join("%d" % r["failed"] for r in rows))
+    lines.append("rp_bin_expected=(%s)" % " ".join("%d" % r["expected"] for r in rows))
+    lines.append("rp_bin_registry=(%s)" % " ".join("%d" % r["registry"] for r in rows))
+    lines.append("rp_bin_selected=(%s)" % " ".join("%d" % r["selected"] for r in rows))
+    return "\n".join(lines)
+
+
+def write_run_summary(path, acc):
+    """Write the accounting dict to `path` atomically — the BEZEL_RUN_SUMMARY
+    bridge from run_parallel to gate.sh. gate.sh reads this for the gtest grand
+    total (gate.sh:831) and the per-binary ran map (gate.sh:855-860) instead of
+    grepping run_parallel's printed log: the per-shard JSONs themselves live in
+    run_parallel's temp logdir and are reaped on a clean exit (run_parallel's
+    _rp_keep trap), so a persistent merged artifact is the only handle gate.sh
+    can hold. Atomic via io.atomic_json_write (#3010)."""
+    io.atomic_json_write(path, acc)
+
+
+def harvest_run_summary(path):
+    """Read a run-summary written by write_run_summary. Returns
+    (grand_passed, ran_map) where ran_map is an ordered {binary: passed} dict,
+    or (None, None) if the file is missing/unparseable/wrong-schema — gate.sh
+    then falls back to its legacy grep (the switch keeps the grep as a fallback
+    until N gates prove the JSON path, per the Phase 2c methodology)."""
+    obj = read_shard_summary(path)
+    if obj is None or obj.get("schema") != RUN_SCHEMA:
+        return None, None
+    ran = {}
+    for row in obj.get("binaries", []):
+        name = row.get("name")
+        if name is not None:
+            ran[name] = int(row.get("passed", 0))
+    return int(obj.get("total_pass", 0)), ran
+
+
 def _main_check(logdir):
     mismatches = check_agreement(logdir)
     n_json = len(read_shard_summaries(logdir))
@@ -218,13 +455,70 @@ def _main_check(logdir):
     return 0
 
 
+def _main_account(argv):
+    """`summary.py account <logdir> --conc N [--subset] [--run-summary PATH]
+    [names ...]` — compute the run accounting from JSON shard summaries and
+    print shell-sourceable rp_* assignments. run_parallel evals this; the
+    rp_integrity_ok flag drives its exit. [--run-summary PATH] additionally
+    writes the merged JSON for gate.sh to read (the BEZEL_RUN_SUMMARY bridge).
+    """
+    import argparse
+    p = argparse.ArgumentParser(prog="summary.py account", add_help=True)
+    p.add_argument("logdir", help="run_parallel shard logdir (summary.*.json)")
+    p.add_argument("--conc", type=int, required=True,
+                   help="per-binary shard count (run_parallel's resource cap)")
+    p.add_argument("--subset", action="store_true",
+                   help="BEZEL_TEST_LIST mode: expected = selected, not registry")
+    p.add_argument("--run-summary", default=None,
+                   help="also write the merged run-summary JSON to PATH")
+    p.add_argument("names", nargs="*", help="binary labels run_parallel launched")
+    args = p.parse_args(argv)
+    acc = account(args.logdir, args.conc, args.names, subset=args.subset)
+    if args.run_summary:
+        write_run_summary(args.run_summary, acc)
+    sys.stdout.write(emit_shell(acc) + "\n")
+    # Exit 0 = accounting computed (the integrity verdict is in rp_integrity_ok,
+    # which run_parallel reads — a failed run is not a failure to compute).
+    return 0
+
+
+def _main_run_summary(argv):
+    """`summary.py run-summary harvest <path>` — read a BEZEL_RUN_SUMMARY and
+    print shell-sourceable rp_run_* assignments for gate.sh. Emits
+    rp_run_present=0 when the file is absent/wrong-schema so gate.sh falls back
+    to its legacy grep (the grep stays a fallback until N gates prove the JSON
+    path, per the Phase 2c methodology)."""
+    if len(argv) < 2 or argv[0] != "harvest":
+        sys.stderr.write("usage: summary.py run-summary harvest <path>\n")
+        return 2
+    gtests, ran = harvest_run_summary(argv[1])
+    if gtests is None:
+        sys.stdout.write("rp_run_present=0\n")
+        return 0
+    # GATE_BIN_RAN format (gate.sh:855-860): space-separated "name:passed"
+    # pairs, matching the legacy grep+awk harvest so the awk merge at gate.sh
+    # :330-347 consumes it unchanged.
+    pairs = " ".join("%s:%d" % (k, v) for k, v in ran.items())
+    sys.stdout.write("rp_run_present=1\n")
+    sys.stdout.write("rp_run_gtests=%d\n" % gtests)
+    sys.stdout.write('rp_run_bin_ran="%s"\n' % pairs)
+    return 0
+
+
 def main(argv):
     if len(argv) >= 2 and argv[1] == "check":
         if len(argv) < 3:
             print("usage: summary.py check <logdir>", file=sys.stderr)
             return 2
         return _main_check(argv[2])
-    print("usage: summary.py check <logdir>", file=sys.stderr)
+    if len(argv) >= 2 and argv[1] == "account":
+        return _main_account(argv[2:])
+    if len(argv) >= 2 and argv[1] == "run-summary":
+        if len(argv) < 3:
+            print("usage: summary.py run-summary harvest <path>", file=sys.stderr)
+            return 2
+        return _main_run_summary(argv[2:])
+    print("usage: summary.py {check|account|run-summary} ...", file=sys.stderr)
     return 2
 
 
