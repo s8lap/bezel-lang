@@ -149,7 +149,14 @@ bool ExprTC::implicitlyConvertible(const TypeRef* from, const TypeRef* to) {
     if (from->kind == TypeRef::Kind::Named && !from->declaration &&
         to->kind   == TypeRef::Kind::Named &&  to->declaration &&
         to->declaration->kind == ast::TypeDeclKind::Interface &&
-        to->declaration->name == "IReadOnlySpan") {
+        to->declaration->name == "IReadOnlySpan" &&
+        // fix #3022 (§11.3, v0.240): only the §4.16 BUILTIN interface has
+        // moduleName.empty() — SymbolCollection (local) and ModuleLoader
+        // (imported) populate moduleName on every real TypeSymbol. Without
+        // this gate a user interface named IReadOnlySpan would be admitted
+        // as the §4.16 target and codegen would box a span through a
+        // non-existent vtable.
+        to->declaration->moduleName.empty()) {
         // Inline name extraction (callsNamedTypeSimpleName is defined later).
         std::string_view fromN;
         if (from->astNode && from->astNode->name &&
@@ -3516,7 +3523,16 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                 !recvTy->astNode->name->parts.empty())
                                 spanHead = recvTy->headName();
                         } else if (!recvTy->declaration->decl ||
-                                   recvTy->declaration->name == "IReadOnlySpan") {
+                                   // fix #3022 (§11.3, v0.240): gate the
+                                   // IReadOnlySpan builtinClassSym match on
+                                   // moduleName.empty() so a USER interface
+                                   // named IReadOnlySpan (local or imported)
+                                   // does not get the §4.16 span-receiver
+                                   // typing — SymbolCollection and
+                                   // ModuleLoader populate moduleName on
+                                   // every real TypeSymbol.
+                                   (recvTy->declaration->name == "IReadOnlySpan" &&
+                                    recvTy->declaration->moduleName.empty())) {
                             spanHead = recvTy->declaration->name;
                         }
                     }
@@ -3867,9 +3883,14 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // result was otherwise left null → the downstream operator saw an
                 // untyped receiver). Range's own members (Contains/GetEnumerator)
                 // resolve through their dedicated handlers and are unaffected.
-                bool isRangeLinqRecv =
+                // fix #3022 (§11.3, v0.240): the `Range` head must be the §5 builtin
+                    // Range<T>, not a user class named Range — gate on
+                    // moduleName.empty() (the discriminator the rest of
+                    // the front-end adopted after #2995/#2997).
+                    bool isRangeLinqRecv =
                     recvTy && recvTy->kind == TypeRef::Kind::Named &&
                     recvTy->declaration && recvTy->declaration->name == "Range" &&
+                    recvTy->declaration->moduleName.empty() &&
                     !recvTy->genericArgs.empty();
                 // stdlib §5 (#755): an `IGrouping<TKey, T>` receiver. `IGrouping :
                 // IEnumerable<T>` (stdlib §5:3076), so the whole §5 operator and
@@ -4188,9 +4209,17 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                 // codegen and `.Length`/`.Get` paths recognize); GetString → string;
                 // Name → string. Only Utf8 reaches here (the other singletons are
                 // rejected at member access).
+                // fix #3022 (§11.3, v0.240): the Encoding head must be the stdlib §3.2
+                // builtin, not a user class named Encoding — gate on
+                // moduleName.empty() (the discriminator the rest of the
+                // front-end adopted after #2995/#2997). Without the gate
+                // a user class named `Encoding` reaches stdlib §3.2's
+                // specific member-typing arm and codegen tries to box
+                // `Encoding.Utf8` as a built-in singleton.
                 if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
                     recvTy->declaration &&
-                    recvTy->declaration->name == "Encoding") {
+                    recvTy->declaration->name == "Encoding" &&
+                    recvTy->declaration->moduleName.empty()) {
                     if (m == "GetBytes" && ce.args.size() <= 1) {
                         // fix #526 / stdlib §3.2: 1-arg GetBytes(s: string)
                         // returns owned Array<byte>. Use makeConcreteCollectionResult
@@ -7952,11 +7981,20 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     // rejected here with a §3.6-derived-type-properties rule-2
                     // diagnostic naming the classification, the deciding payload,
                     // and the owning-match remedy (§35.5).
+                    // fix #3022 (§11.3, v0.240): the Result choice must be the stdlib §35.2
+                    // builtin, not a user choice named Result — gate on
+                    // moduleName.empty() (the discriminator the rest of
+                    // the front-end adopted after #2995/#2997). Without
+                    // the gate a user choice named `Result` reaches
+                    // stdlib §35.2's specific combinator-typing arm and
+                    // codegen routes the call to the result-specific
+                    // lowering on a non-result value.
                     if (recvTy && recvTy->kind == TypeRef::Kind::Named &&
                             recvTy->declaration &&
                             recvTy->declaration->kind ==
                                 ast::TypeDeclKind::Choice &&
                             recvTy->declaration->name == "Result" &&
+                            recvTy->declaration->moduleName.empty() &&
                             recvTy->genericArgs.size() == 2 &&
                             (m == "Map" || m == "MapError" ||
                              m == "AndThen" || m == "UnwrapOr")) {
@@ -8014,12 +8052,18 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                             // probe: if fnTy->funcReturn is a Named Result
                             // choice with two generic args, treat its first
                             // arg as U; otherwise treat the funcReturn as U.
+                            // fix #3022 (§11.3, v0.240): the nested `Result<U, E>` lambda-return
+                            // type in `AndThen` must be the stdlib §35.2
+                            // builtin choice — gate on moduleName.empty()
+                            // so a user choice named `Result` is not
+                            // unwrapped to steal its first generic arg.
                             if (m == "AndThen" &&
                                 uArg && uArg->kind == TypeRef::Kind::Named &&
                                 uArg->declaration &&
                                 uArg->declaration->kind ==
                                     ast::TypeDeclKind::Choice &&
                                 uArg->declaration->name == "Result" &&
+                                uArg->declaration->moduleName.empty() &&
                                 uArg->genericArgs.size() == 2) {
                                 uArg = uArg->genericArgs[0];
                             }
@@ -12223,9 +12267,17 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         // miscompile (a null receiver → crash). A clear compile error is the
         // sound outcome until a real singleton object is modeled.
         if (auto* tt = ctx_.exprType(*ma.target)) {
+            // fix #3022 (§11.3, v0.240): `targetIsEncoding` must NOT match
+            // a USER class named Encoding — gate on moduleName.empty()
+            // (the discriminator the rest of the front-end adopted after
+            // #2995/#2997). Without it a user class named `Encoding`
+            // trips the stdlib §3.2 "Encoding is usable only as the
+            // immediate receiver" diagnostic on a program that contains
+            // no §3.2 built-in.
             bool targetIsEncoding =
                 tt->kind == TypeRef::Kind::Named && tt->declaration &&
-                tt->declaration->name == "Encoding";
+                tt->declaration->name == "Encoding" &&
+                tt->declaration->moduleName.empty();
             bool targetIsDirectSingleton = false;
             if (auto* inner =
                     dynamic_cast<const ast::MemberAccessExpr*>(ma.target.get())) {
@@ -12908,8 +12960,24 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
             // correctly via strlen / bz_wstrlen), and giving it a type changes
             // what the §5.1 no-implicit-conversion rule sees at every existing
             // use site. Measured, not inferred, and filed rather than folded in.
+            // fix #3022 (§11.3, v0.240): gate the RawBytes-specific `.Length` typing
+            // on moduleName.empty() so a USER class named RawBytes does
+            // not get the builtin pointer-length typing — the FFI
+            // pointer-length lowering is built-in specific. The Pointer
+            // leg above uses `common::isFfiBufferBuiltinName` (which
+            // already has its own user-type exclusion, see comment); this
+            // is the matching leg for the §10.3 RawBytes-only spelling
+            // the comment block above describes. NOTE: the test for
+            // user class `class RawBytes { … }` with a method `Length`
+            // (e.g. an int-returning `Length()`) was previously typed
+            // int by this branch and so silently short-circuited the
+            // real method dispatch; the gate restores the §11.3
+            // "no member `Length`" rejection for a user class while
+            // leaving the FFI builtin path unchanged.
             if (tt && tt->kind == TypeRef::Kind::Named && tt->declaration &&
-                tt->declaration->name == "RawBytes" && ma.member == "Length") {
+                tt->declaration->name == "RawBytes" &&
+                tt->declaration->moduleName.empty() &&
+                ma.member == "Length") {
                 ctx_.setExprType(&ma, ctx_.primitiveTypeRef(PrimitiveType::Int));
                 return;
             }
