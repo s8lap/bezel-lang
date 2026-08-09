@@ -96,7 +96,7 @@ struct Entry {
     const char* reason;
 };
 
-// The twelve WARNING-severity `internal:` degrades as of v0.240, each with the
+// The fourteen WARNING-severity `internal:` degrades as of v0.240, each with the
 // judgement #2924 asks for.  Ordered by file, then by the tag.
 const Entry kWarningDegrades[] = {
     {"src/codegen/LlvmBackend_Assign.cpp", "#2833",
@@ -185,10 +185,28 @@ const Entry kWarningDegrades[] = {
      "Narrowed like its #2434 twin (a unit-typed return value is #2915's "
      "exemption; a built-in member call that demanded a value is #2935's "
      "Error) without changing what it substitutes when it does fire"},
+
+    {"src/codegen/LlvmBackend_Stmts.cpp", "#2961",
+     Disposition::WrongValue,
+     "the AssignmentStmt localSlot arm: `if (!rhs) return false;` keeps the "
+     "target's PREVIOUS value rather than substituting `getNullValue`. A wrong "
+     "value (the slot keeps stale state) is bounded to the assignment's "
+     "target — no null pointer escapes, no dereference site is fed garbage. "
+     "Mirror of #2961's twin below at the generic lvalueAddr arm."},
+
+    {"src/codegen/LlvmBackend_Stmts.cpp", "#2961",
+     Disposition::WrongValue,
+     "the AssignmentStmt generic lvalueAddr arm (the `this.f := <expr>` and "
+     "indexer-set cases): same `if (!rhs) return false;` keep-previous-value "
+     "shape as the localSlot arm above. The retained value is whatever was "
+     "stored there before; no null-pointer substitution, no UAF. The hazard "
+     "is a stale field/indexer slot — bounded, observable, and now diagnosed."},
 };
 
-// How many of the twelve can hand a user a memory-unsafe binary. Pinned as its
-// own number so that changing a disposition is a deliberate edit in two places.
+// How many of the fourteen can hand a user a memory-unsafe binary. Pinned as
+// its own number so that changing a disposition is a deliberate edit in two
+// places. The two #2961 entries are WrongValue (no null pointer is produced),
+// so this count is unchanged at 9 from the twelve-degrade population.
 constexpr std::size_t kUnsafePointerCount = 9;
 
 // Locate the repo root from this translation unit's own path:
