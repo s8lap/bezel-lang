@@ -26,6 +26,15 @@ NOT yet wired into gate.sh (Wave 2 replaces the bash block at gate.sh:882-973
 with a call here). Preserves the bash invariants (missing-binary=>hard-fail
 #3011, enumerate==0=>hard-fail, zero-rows=>hard-fail, ran>=expected superset
 OK) — pinned by test_coverage.py.
+
+Phase 4b (`arbitration.py`, #1861 / #2100) ports the flake arbitration
+(gate.sh:432-524) as a unit-tested Python module. FOUNDATION ONLY: not wired
+into gate.sh yet (Wave 2 substitutes the call). Ports arbitrate() +
+arb_run_suite() and the 2c legacy-grep site at :451 in one move (the
+`^[0-9]+ passed, [0-9]+ failed` harvest moves into _parse_summary). The five
+invariants (ran-nothing-is-not-a-pass, [FAIL]-never-sampled, `<none>`-strip,
+the 0/1/2 return contract never collapsed, ARB_ENV forces ASan) are each
+pinned by test_arbitration.py.
 """
 
-__all__ = ["io", "summary", "verdict", "coverage"]
+__all__ = ["io", "summary", "verdict", "coverage", "arbitration"]
