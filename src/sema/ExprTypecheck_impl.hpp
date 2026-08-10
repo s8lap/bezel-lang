@@ -64,13 +64,45 @@ bool selfComparableIface(const TypeRef* t, const TypeSymbol* icomparable);
 // type parameter) walked past it into codegen. `reportCollectionLiteralBadTarget`
 // emits the general §15.4 rejection for those; the interface report above stays
 // the more specific message for the shape it names.
+// per §15.4 (#3031): the predicate ALSO consults the literal's FORM. The
+// dictionary-literal form `[k: v, ...]` is admitted only at the dictionary
+// family (`Dictionary<K,V>`/`OwningDictionary<K,V>`/`SortedDictionary<K,V>`,
+// §15.4 last paragraph); the sequence-literal form `[e1, e2, ...]` is admitted
+// at every sequence-shaped target but NOT at the dictionary family. Pre-fix the
+// predicate took the target alone, so a dict literal at any sequence-shaped
+// target (and vice versa) reached codegen, neither materializer claimed it,
+// and the slot was degraded to a zero-initialized value (the #2434/#2491
+// `internal:` notes — a silent wrong value, the worse failure mode). The `isDict`
+// argument is the literal's `cl->isDict`. The empty-literal carve-out
+// (`[]` admitted at every §15.4 collection target, including dictionary —
+// the spec lets the target type choose between empty seq and empty dict)
+// is handled at the call sites because they already have the literal
+// available; the predicate's form-only answer is the right one for sites
+// that have ALREADY addressed the empty case independently (the inline-array
+// N-element check at ExprTypecheck.cpp:9717 is the existing instance).
 bool isCollectionLiteralInterfaceTarget(const TypeRef* t);
-bool isCollectionLiteralAdmissibleTarget(const TypeRef* t);
+bool isCollectionLiteralAdmissibleTarget(const TypeRef* t, bool isDict);
+// §15.4 (v0.240): the empty literal carve-out — is `t` on the §15.4 closed
+// collection-target list? The empty literal `[]` is admitted at every
+// listed target (the target type decides between empty seq and empty dict);
+// at every other target (Object, int, a class with no
+// `FromCollectionLiteral`, a bare type parameter) the empty literal is
+// still rejected with the generic "cannot target" diagnostic (the §15.4
+// carve-out sentence: "An empty literal in a non-collection or
+// undeterminable context is the usual 'cannot infer target type' compile
+// error"). The inline-array case is separate: inline arrays require `≥ 1`
+// elements regardless of form/empty status, so this predicate returns
+// false for inline arrays and the call sites' emptiness check is
+// independent.
+bool isCollectionLiteralEmptyAdmissibleTarget(const TypeRef* t);
 void reportCollectionLiteralInterfaceTarget(DiagnosticEngine& diags,
                                             SourceLocation loc,
                                             std::string_view ifaceName);
 void reportCollectionLiteralBadTarget(DiagnosticEngine& diags,
                                       SourceLocation loc, const TypeRef* target);
+void reportCollectionLiteralDictFormBadTarget(DiagnosticEngine& diags,
+                                              SourceLocation loc,
+                                              const TypeRef* target);
 
 // §27.1.1 (v0.180): exact structural equality of two TypeRefs — the INVARIANT
 // fallback for a function-value slot that is not a bare, non-generic

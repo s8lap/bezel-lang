@@ -317,6 +317,30 @@ void reportCollectionLiteralBadTarget(DiagnosticEngine& diags,
         "target type and assign that (§15.4)");
 }
 
+// per §15.4 (#3031): the DICTIONARY-FORM specific rejection. §15.4's last
+// paragraph states the form-vs-target split explicitly: "The dictionary literal
+// form `[k1: v1, k2: v2, ...]` (colon-separated pairs) targets ONLY the
+// built-in `Dictionary<K, V>` and `OwningDictionary<K, V>`." The target
+// spelling is the same as the generic rejection above so the message names
+// the type the user must change, but the remediation is different — the
+// literal's FORM is the wrong thing here, not the target type. (The
+// `SortedDictionary<K,V>` family member is included both because it lives on
+// the same runtime as `Dictionary<K,V>` and because §15.4's `OwningDictionary`
+// synonym is the owning form of the same head; the user-extensible
+// dictionary-literal protocol is §18 deferred.)
+void reportCollectionLiteralDictFormBadTarget(DiagnosticEngine& diags,
+                                              SourceLocation loc,
+                                              const TypeRef* target) {
+    std::string spelled = collectionLiteralTargetSpelling(target);
+    diags.report(
+        Severity::Error, loc,
+        "a dictionary literal `[k: v, ...]` cannot target the type `" +
+        spelled + "` — §15.4 admits the dictionary-literal form only at "
+        "`Dictionary<K, V>`/`OwningDictionary<K, V>`/`SortedDictionary<K, V>`; "
+        "remove the key/value pairs to use the sequence-literal form, or "
+        "change the target type to a dictionary (§15.4)");
+}
+
 // per §15.4 (#1825): the POSITIVE side of `isCollectionLiteralInterfaceTarget`.
 // A collection literal is admissible (i.e. codegen can materialise it
 // against this target) when the target is one of:
@@ -325,7 +349,8 @@ void reportCollectionLiteralBadTarget(DiagnosticEngine& diags,
 //     paths, but the LAMBDA-BODY materialiser routes through here too;
 //   * a CONCRETE builtin collection named type (`Array`/`OwningArray`,
 //     `Stack`/`OwningStack`, `Queue`/`OwningQueue`, `LinkedList`/
-//     `OwningLinkedList`, `Set`/`OwningSet`, `Dictionary`/`OwningDictionary`)
+//     `OwningLinkedList`, `Set`/`OwningSet`, `Dictionary`/`OwningDictionary`/
+//     `SortedDictionary`)
 //     — matched by name in codegen's materializeHeapCollectionLiteral /
 //     materializeHeapDictLiteral;
 //   * a user type that declared `FromCollectionLiteral` (stdlib §15.4 — the
@@ -334,17 +359,48 @@ void reportCollectionLiteralBadTarget(DiagnosticEngine& diags,
 // isCollectionLiteralInterfaceTarget). Declared in ExprTypecheck_impl.hpp —
 // shared with the lambda-body materialisation path (#1825) and any future
 // site that needs the same positive check.
-bool isCollectionLiteralAdmissibleTarget(const TypeRef* t) {
+// per §15.4 (#3031): the predicate ALSO consults the literal's FORM. The
+// dictionary-literal form `[k: v, ...]` is admitted only at the dictionary
+// family (`Dictionary<K,V>`/`OwningDictionary<K,V>`/`SortedDictionary<K,V>`);
+// the sequence-literal form `[e1, e2, ...]` is admitted at every OTHER
+// §15.4 target (inline arrays, the sequence-shaped collection heads, and a
+// user type opting in via `FromCollectionLiteral` — §15.4.1 is sequence-only).
+// A target that pairs the wrong form of literal is rejected; the
+// diagnostics are `reportCollectionLiteralBadTarget` (target not on list)
+// and `reportCollectionLiteralDictFormBadTarget` (target IS on list but
+// pairs the wrong form — the remediation is to change the literal's form,
+// not the target type).
+// SPEC §15.4 EMPTY-LITERAL CARVE-OUT: the empty literal `[]` is admitted at
+// EVERY collection target listed on §15.4 ("the empty literal `[]` is
+// admitted for every collection target listed above … the target type
+// determines whether `[]` constructs an empty sequence collection or an
+// empty dictionary"). The parser therefore parses `[]` as the sequence
+// form (`isDict=false`) with zero elements, and the target type is the
+// only signal of which shape it built. The predicate below answers the
+// form-vs-target question for an arbitrary literal; the call sites handle
+// the empty case inline (short-circuiting to "admitted at any §15.4 list
+// target, excluding inline arrays") because they already have the literal
+// available. The inline-array case is independent: inline arrays require
+// `≥ 1` elements (the existing #2914-gate at ExprTypecheck.cpp:9717), so
+// the empty literal is REJECTED at an inline-array target regardless of
+// the form-vs-target question.
+bool isCollectionLiteralAdmissibleTarget(const TypeRef* t, bool isDict) {
     if (!t) return false;
-    // Inline array: any sized [N]T / [N owned]T.
-    if (t->kind == TypeRef::Kind::InlineArray) return true;
+    // Inline array: only the sequence form admits (no dict entries in an
+    // inline array). The empty-literal carve-out does NOT apply here:
+    // inline arrays require `≥ 1` elements (§15.4, the cell-typed
+    // local-init check at ExprTypecheck.cpp:9717 is the existing gate).
+    if (t->kind == TypeRef::Kind::InlineArray) return !isDict;
     if (t->kind != TypeRef::Kind::Named) return false;
     // A collection INTERFACE has no concrete backing → never admissible.
     if (isCollectionLiteralInterfaceTarget(t)) return false;
     // A user type that opted in via FromCollectionLiteral: walk its members
-    // for a static method of that exact name. Mirrors the codegen side (the
-    // runtime calls the static `FromCollectionLiteral(elements)` factory).
+    // for a static method of that exact name. §15.4.1 makes the protocol
+    // sequence-only — the dict form has no user-extensible dispatch today
+    // (rationale §18 deferred), so a dict literal at a FromCollectionLiteral
+    // user type is rejected here, not deferred to codegen.
     if (t->declaration) {
+        if (isDict) return false;
         for (const Symbol* m : t->declaration->members) {
             const auto* ms = dynamic_cast<const MethodSymbol*>(m);
             if (!ms || ms->name != "FromCollectionLiteral" || ms->params.empty())
@@ -359,10 +415,53 @@ bool isCollectionLiteralAdmissibleTarget(const TypeRef* t) {
         return false;
     }
     // Builtin collections: Array/OwningArray/Stack/OwningStack/Queue/
-    // OwningQueue/Set/OwningSet/LinkedList/OwningLinkedList/Dictionary/
-    // OwningDictionary — matched by simple name (the #1414 stage-3 registry
-    // is the single source of truth, but a name-only check is sufficient
-    // here because the codegen side does the same).
+    // OwningQueue/Set/OwningSet/LinkedList/OwningLinkedList + Dictionary/
+    // OwningDictionary/SortedDictionary — matched by simple name (the #1414
+    // stage-3 registry is the single source of truth, but a name-only check
+    // is sufficient here because the codegen side does the same).
+    if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
+        return false;
+    std::string_view n = t->headName();
+    // §15.4 last paragraph: only the dictionary family accepts the dict form.
+    if (n == "Dictionary" || n == "OwningDictionary" || n == "SortedDictionary")
+        return isDict;
+    // Every other §15.4 head is sequence-shaped; the seq form only.
+    return !isDict && (n == "Array" || n == "OwningArray" || n == "Stack" ||
+                       n == "OwningStack" || n == "Queue" || n == "OwningQueue" ||
+                       n == "Set" || n == "OwningSet" || n == "LinkedList" ||
+                       n == "OwningLinkedList");
+}
+
+// per §15.4 (v0.240): the empty literal `[]` is admitted at every collection
+// target on §15.4's closed list. This predicate answers the membership
+// question — is `t` on the list — so the call sites can short-circuit the
+// form-vs-target check for an empty literal: empty + on list → admit; empty
+// + off list → reject (the §15.4 sentence: "An empty literal in a non-
+// collection or undeterminable context is the usual 'cannot infer target
+// type' compile error"). The form-vs-target check is separate because the
+// non-empty forms obey the §15.4 form-vs-target split; the empty carve-out
+// exists because the parser cannot syntactically distinguish "empty seq"
+// from "empty dict" — both are written `[]` and the target type decides.
+// Inline arrays are EXCLUDED: they require `≥ 1` elements regardless of
+// form (§15.4 last paragraph). User types that opt in via
+// `FromCollectionLiteral` are also EXCLUDED: the spec lists only the
+// built-in collections for the empty carve-out, and these user types have
+// no dispatch for a zero-element literal (a `FromCollectionLiteral([])`
+// call is not in the protocol).
+bool isCollectionLiteralEmptyAdmissibleTarget(const TypeRef* t) {
+    if (!t) return false;
+    // Inline arrays require `≥ 1` elements regardless of form.
+    if (t->kind == TypeRef::Kind::InlineArray) return false;
+    if (t->kind != TypeRef::Kind::Named) return false;
+    // A collection INTERFACE has no concrete backing → not on §15.4 list.
+    if (isCollectionLiteralInterfaceTarget(t)) return false;
+    // A user type that opted in via FromCollectionLiteral: empty literals
+    // are NOT part of the protocol (the spec lists only the built-in
+    // collections). User types with no opt-in are not on the list anyway.
+    if (t->declaration) return false;
+    // Builtin collections: Array/OwningArray/Stack/OwningStack/Queue/
+    // OwningQueue/Set/OwningSet/LinkedList/OwningLinkedList + Dictionary/
+    // OwningDictionary/SortedDictionary.
     if (!t->astNode || !t->astNode->name || t->astNode->name->parts.empty())
         return false;
     std::string_view n = t->headName();
@@ -370,7 +469,7 @@ bool isCollectionLiteralAdmissibleTarget(const TypeRef* t) {
            n == "OwningStack" || n == "Queue" || n == "OwningQueue" ||
            n == "Set" || n == "OwningSet" || n == "LinkedList" ||
            n == "OwningLinkedList" || n == "Dictionary" ||
-           n == "OwningDictionary";
+           n == "OwningDictionary" || n == "SortedDictionary";
 }
 
 // §22.6 classify how `argTy` matches `paramTy` at one argument position.
@@ -10278,12 +10377,47 @@ void ExprTC::checkArgsAgainstParams(
         // value. Reject here (the literal is untyped, so checkAssignable below
         // would not catch it). Passing a CONCRETE collection (e.g. an
         // `Array<T>` variable) to the same parameter remains fine.
-        if (dynamic_cast<const ast::CollectionLiteralExpr*>(a.value.get()) &&
-            isCollectionLiteralInterfaceTarget(paramTy)) {
-            reportCollectionLiteralInterfaceTarget(
-                ctx_.diagnostics(), a.value->span.begin,
-                callsNamedTypeSimpleName(paramTy));
-            continue;
+        if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                a.value.get())) {
+            // per §15.4 (#1174): a collection literal passed directly to a
+            // parameter of interface type (IEnumerable<T>/IList<T>/ICollection<T>/
+            // IReadOnly*) is not admissible — the literal has no concrete backing
+            // to materialize into and silently miscompiled to an empty/garbage
+            // value. Reject here (the literal is untyped, so checkAssignable below
+            // would not catch it). Passing a CONCRETE collection (e.g. an
+            // `Array<T>` variable) to the same parameter remains fine.
+            if (isCollectionLiteralInterfaceTarget(paramTy)) {
+                reportCollectionLiteralInterfaceTarget(
+                    ctx_.diagnostics(), a.value->span.begin,
+                    callsNamedTypeSimpleName(paramTy));
+                continue;
+            }
+            // per §15.4 (#3031): the full §15.4 target+form check at the
+            // call-arg position. A dict literal at a sequence-shaped
+            // parameter (and vice versa) is rejected with the
+            // form-specific diagnostic, NOT the generic "cannot target"
+            // form — the remediation is to change the literal's form, not
+            // the parameter type. Otherwise the literal reached codegen's
+            // inline-array arm with a `ptr` slot and the materializer
+            // returned null, producing a zero-initialized value at the
+            // parameter slot (the #2434 / #2491 `internal:` notes — a
+            // silent wrong value, the worse failure mode). The empty
+            // literal `[]` is admitted at every §15.4 collection target
+            // (the empty carve-out — membership-only).
+            const bool isEmpty = !cl->isDict && cl->elements.empty();
+            const bool admitted = isEmpty
+                ? isCollectionLiteralEmptyAdmissibleTarget(paramTy)
+                : isCollectionLiteralAdmissibleTarget(paramTy, cl->isDict);
+            if (paramTy && paramTy->kind != TypeRef::Kind::Error && !admitted) {
+                if (cl->isDict &&
+                    isCollectionLiteralAdmissibleTarget(paramTy, /*isDict=*/false))
+                    reportCollectionLiteralDictFormBadTarget(
+                        ctx_.diagnostics(), a.value->span.begin, paramTy);
+                else
+                    reportCollectionLiteralBadTarget(
+                        ctx_.diagnostics(), a.value->span.begin, paramTy);
+                continue;
+            }
         }
         checkAssignable(ctx_.exprType(*a.value),
                         paramTy,

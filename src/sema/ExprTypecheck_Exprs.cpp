@@ -6872,11 +6872,21 @@ void ExprTC::visitChildren(const ast::Expr& e) {
             // lowerLambda) then reads `ctx_.exprType(*lam.exprBody)` and
             // materialises against the target type, mirroring the
             // `return [e1, …]` path in lowerReturnStmt.
-            if (lamTargetRet &&
-                isCollectionLiteralAdmissibleTarget(lamTargetRet) &&
-                dynamic_cast<const ast::CollectionLiteralExpr*>(
+            // per §15.4 (#3031): the predicate also consults the literal's
+            // FORM. The empty literal `[]` is admitted at every §15.4
+            // collection target — the empty carve-out is membership-only.
+            if (auto* clE = dynamic_cast<const ast::CollectionLiteralExpr*>(
                     lam->exprBody.get())) {
-                ctx_.setExprType(lam->exprBody.get(), lamTargetRet);
+                const bool isEmpty = !clE->isDict && clE->elements.empty();
+                const bool admitted = lamTargetRet && (
+                    (isEmpty &&
+                     isCollectionLiteralEmptyAdmissibleTarget(lamTargetRet)) ||
+                    (!isEmpty &&
+                     isCollectionLiteralAdmissibleTarget(lamTargetRet,
+                                                         clE->isDict)));
+                if (admitted) {
+                    ctx_.setExprType(lam->exprBody.get(), lamTargetRet);
+                }
             }
             visitExpr(*lam->exprBody);
         }
@@ -6899,21 +6909,42 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // reject it here too rather than miscompile. The idiom is a block body
         // binding an explicitly-typed local:
         // `(x) => do var inner: Array<U> := [...]; return inner; end`.
+        // per §15.4 (#3031): the form-vs-target split applies here too — a
+        // dict literal at a sequence-shaped lambda target (or vice versa) is
+        // a form mismatch, not a missing-target case. Distinguish the two
+        // with the dedicated form-specific diagnostic so the user is told
+        // to change the literal's form, not bind a local.
         if (lam->exprBody &&
             dynamic_cast<const ast::CollectionLiteralExpr*>(lam->exprBody.get()) &&
             !ctx_.exprType(*lam->exprBody)) {
-            ctx_.diagnostics().report(
-                Severity::Error, lam->exprBody->span.begin,
-                "collection literal has no determinable target type as a "
-                "lambda's expression body — a collection literal is well-typed "
-                "only against a concrete collection target (an inline array, or "
-                "`Array<T>`/`OwningArray<T>`, `Set`, `Stack`, `Queue`, "
-                "`LinkedList`, `Dictionary` and their owning forms), never a "
-                "collection interface such as the `IEnumerable<U>` a "
-                "`SelectMany`/`Select` selector returns; use a block body with "
-                "an explicitly-typed local instead "
-                "(`(x) => do var inner: Array<U> := [...]; return inner; end`) "
-                "(§15.4)");
+            const auto* cl =
+                static_cast<const ast::CollectionLiteralExpr*>(
+                    lam->exprBody.get());
+            if (lamTargetRet &&
+                !isCollectionLiteralInterfaceTarget(lamTargetRet) &&
+                isCollectionLiteralAdmissibleTarget(lamTargetRet, /*isDict=*/false)) {
+                if (cl->isDict)
+                    reportCollectionLiteralDictFormBadTarget(
+                        ctx_.diagnostics(), lam->exprBody->span.begin,
+                        lamTargetRet);
+                else
+                    reportCollectionLiteralBadTarget(
+                        ctx_.diagnostics(), lam->exprBody->span.begin,
+                        lamTargetRet);
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, lam->exprBody->span.begin,
+                    "collection literal has no determinable target type as a "
+                    "lambda's expression body — a collection literal is well-typed "
+                    "only against a concrete collection target (an inline array, or "
+                    "`Array<T>`/`OwningArray<T>`, `Set`, `Stack`, `Queue`, "
+                    "`LinkedList`, `Dictionary` and their owning forms), never a "
+                    "collection interface such as the `IEnumerable<U>` a "
+                    "`SelectMany`/`Select` selector returns; use a block body with "
+                    "an explicitly-typed local instead "
+                    "(`(x) => do var inner: Array<U> := [...]; return inner; end`) "
+                    "(§15.4)");
+            }
         }
         for (const auto& s : lam->stmts) if (s) visitStmt(*s);
         // issue #777 / §30.6: forgotten `await` in an expression-bodied async

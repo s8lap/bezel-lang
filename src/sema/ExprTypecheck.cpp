@@ -9768,21 +9768,49 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // reported; staying silent there is the standard cascade
                 // suppression, and it is also why the predicate is asked only
                 // for a type that actually resolved.
-                if (ld->initializer && lsym->declType &&
-                    lsym->declType->kind != TypeRef::Kind::Error &&
-                    dynamic_cast<const ast::CollectionLiteralExpr*>(
-                        ld->initializer.get()) &&
-                    !isCollectionLiteralAdmissibleTarget(lsym->declType)) {
-                    if (isCollectionLiteralInterfaceTarget(lsym->declType))
-                        reportCollectionLiteralInterfaceTarget(
-                            ctx_.diagnostics(), ld->initializer->span.begin,
-                            namedTypeSimpleName(lsym->declType));
-                    else
-                        reportCollectionLiteralBadTarget(
-                            ctx_.diagnostics(), ld->initializer->span.begin,
-                            lsym->declType);
-                    currentScope_->names[ld->name] = lsym;
-                    return;  // reported; skip the assignability check below
+                // per §15.4 (#3031): the predicate now also consults the
+                // literal's FORM — a dict literal at a sequence-shaped target
+                // (and vice versa) is rejected here, not deferred to codegen.
+                // Distinguish the form-vs-target mismatch from the "target not
+                // on §15.4's list" miss so the diagnostic names the right
+                // remediation (change the literal's form, not the target type).
+                // The empty literal `[]` is special-cased: §15.4 admits it at
+                // every collection target listed (the target type decides
+                // between empty seq and empty dict), but REJECTS it at every
+                // other target (the §15.4 sentence: "An empty literal in a
+                // non-collection or undeterminable context is the usual
+                // 'cannot infer target type' compile error"). The empty
+                // carve-out is membership-only — the form-vs-target question
+                // is bypassed for empty literals.
+                if (auto* cl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                        ld->initializer.get())) {
+                    const bool isEmpty = !cl->isDict && cl->elements.empty();
+                    const bool admitted = isEmpty
+                        ? isCollectionLiteralEmptyAdmissibleTarget(lsym->declType)
+                        : isCollectionLiteralAdmissibleTarget(lsym->declType,
+                                                              cl->isDict);
+                    if (lsym->declType &&
+                        lsym->declType->kind != TypeRef::Kind::Error &&
+                        !admitted) {
+                        if (isCollectionLiteralInterfaceTarget(lsym->declType))
+                            reportCollectionLiteralInterfaceTarget(
+                                ctx_.diagnostics(), ld->initializer->span.begin,
+                                namedTypeSimpleName(lsym->declType));
+                        else if (cl->isDict &&
+                                 isCollectionLiteralAdmissibleTarget(
+                                     lsym->declType, /*isDict=*/false))
+                            reportCollectionLiteralDictFormBadTarget(
+                                ctx_.diagnostics(),
+                                ld->initializer->span.begin,
+                                lsym->declType);
+                        else
+                            reportCollectionLiteralBadTarget(
+                                ctx_.diagnostics(),
+                                ld->initializer->span.begin,
+                                lsym->declType);
+                        currentScope_->names[ld->name] = lsym;
+                        return;  // reported; skip the assignability check below
+                    }
                 }
                 // per §14.1/§14.2 + §A.7 (issue #391): return-target generic
                 // type-argument inference. When the initializer is a call to a
@@ -10059,6 +10087,44 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                     rs->value.get())) {
                 inferReturnTargetTypeArgs(*retCall, currentReturnType_,
                                           /*outNeedsInfer=*/nullptr);
+            }
+        }
+        // per §15.4 (#3031): extend the literal-vs-target gate to the
+        // `return` position. The codegen side (`lowerReturnStmt`,
+        // LlvmBackend_Stmts.cpp) tries both materializers and falls through
+        // to a zero/null return value (#2491) when the literal's form does
+        // not match the return type — a silently wrong value. Reject here
+        // before `checkAssignable` so the literal+target pair is checked at
+        // every site uniformly. The interface arm stays as the call-arg
+        // path handles it (#1174), and the unit/primitive return path is
+        // unaffected (the predicate's null-check rejects a non-Error nulled
+        // return type). The empty literal `[]` is admitted at every §15.4
+        // collection target (the empty carve-out — membership-only) and
+        // rejected at every other target.
+        if (auto* retCl = dynamic_cast<const ast::CollectionLiteralExpr*>(
+                rs->value.get())) {
+            const bool isEmpty = !retCl->isDict && retCl->elements.empty();
+            const bool admitted = isEmpty
+                ? isCollectionLiteralEmptyAdmissibleTarget(currentReturnType_)
+                : isCollectionLiteralAdmissibleTarget(currentReturnType_,
+                                                      retCl->isDict);
+            if (returnCtx_ == ReturnCtx::ValueMethod && currentReturnType_ &&
+                currentReturnType_->kind != TypeRef::Kind::Error && !admitted) {
+                if (isCollectionLiteralInterfaceTarget(currentReturnType_))
+                    reportCollectionLiteralInterfaceTarget(
+                        ctx_.diagnostics(), rs->value->span.begin,
+                        namedTypeSimpleName(currentReturnType_));
+                else if (retCl->isDict &&
+                         isCollectionLiteralAdmissibleTarget(
+                             currentReturnType_, /*isDict=*/false))
+                    reportCollectionLiteralDictFormBadTarget(
+                        ctx_.diagnostics(), rs->value->span.begin,
+                        currentReturnType_);
+                else
+                    reportCollectionLiteralBadTarget(
+                        ctx_.diagnostics(), rs->value->span.begin,
+                        currentReturnType_);
+                return;  // skip the assignability check below
             }
         }
         // Slice T3: a returned value must be primitive-assignable to
