@@ -3874,6 +3874,45 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind,
             builder_.SetInsertPoint(contBB);
             continue;
         }
+        // fix #2900 / §28.9 / §28.3 (v0.240): the `Object`-slot / string-borrow
+        // twin of the box-release arm directly above. A non-escaping
+        // Object/interface local whose initializer was a bare string-typed
+        // identifier (one of `objectStringReleaseEligible_`) holds an
+        // independent +1 on the heap string (the bind site in
+        // `lowerLocalDecl` emitted `bz_string_retain`); at scope end the
+        // state bit is consulted and, if still set, bz_string_release frees
+        // exactly the alias's reference (no UAF: the source's own +1 lives in
+        // the source's slot; no double-free: the alias is the sole owner of
+        // this +1). The state bit lets a plain `o := <non-string>`
+        // reassignment flip the slot out of the string-release path so a
+        // class instance / box / null is never mis-released as a string.
+        // Mirrors `boxRelease` + `boxReleaseState` exactly. `slot` is the
+        // Object alloca.
+        if (it->objectStringRelease) {
+            if (!it->objectStringReleaseState) {
+                llvm::Value* s = builder_.CreateLoad(
+                    ptrTy(), it->slot, "ostr.rel");
+                emitStringRelease(s);
+                continue;
+            }
+            llvm::Value* armed = builder_.CreateLoad(
+                llvm::Type::getInt1Ty(llvm_), it->objectStringReleaseState,
+                "ostr.rel.armed");
+            auto* releaseBB = llvm::BasicBlock::Create(
+                llvm_, "ostr.rel.do", currentFn_);
+            auto* contBB = llvm::BasicBlock::Create(
+                llvm_, "ostr.rel.cont", currentFn_);
+            builder_.CreateCondBr(armed, releaseBB, contBB);
+            builder_.SetInsertPoint(releaseBB);
+            llvm::Value* s = builder_.CreateLoad(
+                ptrTy(), it->slot, "ostr.rel");
+            emitStringRelease(s);
+            builder_.CreateStore(builder_.getFalse(),
+                                 it->objectStringReleaseState);
+            builder_.CreateBr(contBB);
+            builder_.SetInsertPoint(contBB);
+            continue;
+        }
         // fix #1747 / §28.9 / §9.7 / §28.3: a plain `var` RECORD local bound
         // from a record-returning CALL (`var p := Mk()`), proven non-escaping
         // by the conservative escape walk (StringEscapeWalker with

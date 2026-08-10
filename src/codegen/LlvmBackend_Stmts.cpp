@@ -996,6 +996,30 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         // state is entry-block relative, so the assignment's
                         // basic block inherits the store.
                     }
+                    // fix #2900 / §28.9 / §28.3 (v0.240): the object-string-
+                    // release twin of the box-state lookup above. An
+                    // Object/interface local in `objectStringBorrowAll_` whose
+                    // state bit was registered at lowerLocalDecl gets a
+                    // drop-on-overwrite bz_string_release of the displaced
+                    // old value (gated on the state bit saying the slot is
+                    // currently a string) and a state-bit update from the new
+                    // source's static kind. Mirrors the box arm exactly so the
+                    // state bits cannot drift in opposite directions.
+                    llvm::AllocaInst* ostrState = nullptr;
+                    if (llvm::AllocaInst* local = localSlot(*as->target)) {
+                        for (auto scopeIt = disposeStack_.rbegin();
+                             scopeIt != disposeStack_.rend() && !ostrState;
+                             ++scopeIt) {
+                            for (auto dispIt = scopeIt->rbegin();
+                                 dispIt != scopeIt->rend(); ++dispIt) {
+                                if (dispIt->slot == local &&
+                                    dispIt->objectStringRelease) {
+                                    ostrState = dispIt->objectStringReleaseState;
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     int newBoxKind = boxState
                         ? boxLocalAssignmentSourceKind(as->value.get())
                         : -1;
@@ -1012,6 +1036,31 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                         llvm::Value* oldBox = builder_.CreateLoad(
                             ptrTy(), addr, "box.reassign.old");
                         emitBoxRelease(oldBox);
+                        builder_.CreateBr(contBB);
+                        builder_.SetInsertPoint(contBB);
+                    }
+                    // The new source kind for the object-string state bit.
+                    // A bare string-typed identifier (the only shape admitted
+                    // at the LocalDecl level) ⇒ true; everything else ⇒ false.
+                    // This is the SAME test `isObjectStringSource` (declared
+                    // below) runs; reusing it is the only way the bit update
+                    // and the bind site can stay in lockstep.
+                    int newOstrKind = ostrState
+                        ? isObjectStringSource(as->value.get())
+                        : -1;
+                    if (ostrState && newOstrKind >= 0) {
+                        llvm::Value* oldIsStr = builder_.CreateLoad(
+                            llvm::Type::getInt1Ty(llvm_), ostrState,
+                            "ostr.reassign.old.armed");
+                        auto* releaseBB = llvm::BasicBlock::Create(
+                            llvm_, "ostr.reassign.release", currentFn_);
+                        auto* contBB = llvm::BasicBlock::Create(
+                            llvm_, "ostr.reassign.store", currentFn_);
+                        builder_.CreateCondBr(oldIsStr, releaseBB, contBB);
+                        builder_.SetInsertPoint(releaseBB);
+                        llvm::Value* oldStr = builder_.CreateLoad(
+                            ptrTy(), addr, "ostr.reassign.old");
+                        emitStringRelease(oldStr);
                         builder_.CreateBr(contBB);
                         builder_.SetInsertPoint(contBB);
                     }
@@ -1032,6 +1081,9 @@ bool Emitter::lowerStmt(const ast::Stmt& s) {
                     if (boxState)
                         builder_.CreateStore(
                             builder_.getInt1(newBoxKind > 0), boxState);
+                    if (ostrState && newOstrKind >= 0)
+                        builder_.CreateStore(
+                            builder_.getInt1(newOstrKind > 0), ostrState);
                     // §22.12 rule 2 store atomicity (v0.181, #1556): a store into
                     // a static REFERENCE field is a single pointer-word write the
                     // runtime performs atomically — no torn reference is ever

@@ -7808,6 +7808,7 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     valueLikeChoiceCallResultReleaseEligible_.clear();
     valueLikeChoiceCallResultReleaseEligibleFn_ = fn;
     boxReleaseEligibleFn_ = fn;
+    objectStringReleaseEligibleFn_ = fn;  // fix #2900
     // §27.5 / §28.9 / #672: which +1-box-producer locals are captured by exactly
     // one lambda env, so the owning lambda's envdtor may perform the deferred
     // (escape-suppressed) scope-end box release.
@@ -7824,6 +7825,11 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
     if (ci.bodyKind == ast::MethodBodyKind::Block && ci.stmts) {
         collectUnwindIneligible(*ci.stmts);
         collectMoveOnlyArrayTransferred(*ci.stmts);
+        // fix #2900: must run BEFORE collectStringReleaseEligible so the
+        // source `s`'s producer/borrow walks see the populated
+        // `objectStringBorrowAll_` set and admit `var o: Object := s;` as
+        // a borrow.
+        collectObjectStringReleaseEligible(*ci.stmts);
         collectStringReleaseEligible(*ci.stmts);
         collectRecordCallResultReleaseEligible(*ci.stmts);  // fix #1747
         collectValueLikeChoiceCallResultReleaseEligible(*ci.stmts);  // fix #2428
@@ -12395,6 +12401,44 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
     if (v)
         armStringLocalRefcount(static_cast<const void*>(declNode), slot, v,
                                init);
+    // fix #2900 / §28.9 / §28.3 (v0.240): an Object/interface-typed `var` local
+    // whose initializer is a bare string-typed identifier is a string-aliased
+    // slot — the Object slot must own its own +1 (the source `s` keeps its
+    // own; both releases are sound). RETAIN at the bind site so the slot
+    // points to an independently-referenced heap string, and register the
+    // state-bit-gated bz_string_release as a Disposal{objectStringRelease} so
+    // scope-end reclaims the alias's +1 — gated on the same conservative
+    // escape walk the string-typed #2764 path uses (objectStringReleaseEligible_).
+    // A `string` literal is an rc sentinel, so the retain is a no-op there; a
+    // `+1` producer's `+1` is still in the source's slot (the retain is
+    // independent), so both source and alias release independently — no
+    // double-free, no leak, no UAF. Reassigned locals additionally get a state
+    // bit so a plain `o := <non-string>` flips the slot out of the string
+    // path (the box-vs-class discriminator's parallel for strings). Fires
+    // only on Object/interface-typed `var` locals (the gate in
+    // collectObjectStringReleaseEligible); other shapes are unaffected.
+    if (v && v->getType()->isPointerTy() &&
+        currentFn_ == objectStringReleaseEligibleFn_ &&
+        objectStringBorrowAll_.count(static_cast<const void*>(declNode)) &&
+        !disposeStack_.empty()) {
+        // Retain: the Object slot now owns an independent +1.
+        emitStringRetain(v);
+        bool reassigned = objectStringReassignedLocals_.count(
+            dynamic_cast<const ast::LocalDecl*>(declNode)) != 0;
+        llvm::AllocaInst* state = nullptr;
+        if (reassigned) {
+            state = entryAlloca(llvm::Type::getInt1Ty(llvm_));
+            // Initializer is a string-typed identifier — the slot is a string.
+            builder_.CreateStore(builder_.getInt1(true), state);
+        }
+        if (objectStringReleaseEligible_.count(
+                static_cast<const void*>(declNode))) {
+            Disposal d{slot, nullptr};
+            d.objectStringRelease = true;
+            d.objectStringReleaseState = state;
+            disposeStack_.back().push_back(d);
+        }
+    }
     // fix #2115 / §28.9 / §35.4: a value-like choice local whose construction
     // mints a +1 string payload (e.g. `var a := Msg.Note("he" + "llo");`) owns
     // that payload with no other owner — the §35.3 construction path stores the
@@ -17934,6 +17978,17 @@ struct StringEscapeWalker {
     // the alias site, so for them a copy genuinely aliases a single reference
     // and must keep tainting the source.
     const std::unordered_set<const void*>* borrowRetainedAliases = nullptr;
+    // fix #2900 / §28.9 / §28.3 (v0.240): the `Object`-slot / string-borrow
+    // twin of `borrowRetainedAliases` above. The walker's `LocalDecl` arm
+    // treats a `var o: Object := s;` binding (the destination `ld` is in
+    // this set) as a BORROW of `s`, not an escape — the Object slot owns
+    // its own +1 via the codegen-side retain, so the source's release stays
+    // armed. Mutually-exclusive with the `borrowRetainedAliases` arm
+    // (a `string`-typed local goes through that arm, an `Object`-typed one
+    // through this) so the two checks are independent. Non-null only in
+    // `stringReleaseMode`; when null every into-local binding stays a
+    // conservative escape, matching the pre-#2900 behavior.
+    const std::unordered_set<const void*>* objectStringBorrowAliases = nullptr;
 
     bool isTargetIdent(const ast::Expr* e) {
         auto* id = dynamic_cast<const ast::IdentifierExpr*>(e);
@@ -18784,6 +18839,29 @@ struct StringEscapeWalker {
             // un-retained alias (§27.5), and must stay conservative.
             if (stringReleaseMode && !inLambda && borrowRetainedAliases &&
                 borrowRetainedAliases->count(static_cast<const void*>(ld)) &&
+                isTargetIdent(ld->initializer.get())) {
+                expr(ld->initializer.get(), /*safeRead=*/true);
+                return;
+            }
+            // fix #2900 / §28.9 / §28.3 (v0.240): the `var o: Object := s;`
+            // shape (and the same over an interface-typed alias) is a BORROW
+            // of `s`, not an escape — the Object slot is admitted to
+            // `objectStringBorrowAll_` by `collectObjectStringReleaseEligible`,
+            // which RETAINs at bind and (when non-escaping) RELEASEs at scope
+            // end via the new `objectStringRelease` Disposal (state-bit
+            // gated). So the source `s` keeps its own +1 and its own release,
+            // and the alias has an independent +1 of its own. This is the
+            // Object-typed twin of the `stringBorrowAll_` arm directly above
+            // — the relaxation is conditional on the SAME `stringReleaseMode`
+            // opt-in, the SAME `borrowRetainedAliases` set, and the SAME
+            // `isTargetIdent` shape so a `var o := s + "x"` still falls
+            // through to the conservative escape position. Without this arm
+            // the walker taints `s` on the alias, the producer's release is
+            // suppressed, and one heap string leaks per bind (#2900: unbounded
+            // in a service loop).
+            if (stringReleaseMode && !inLambda && objectStringBorrowAliases &&
+                !borrowRetainedAliases->count(static_cast<const void*>(ld)) &&
+                objectStringBorrowAliases->count(static_cast<const void*>(ld)) &&
                 isTargetIdent(ld->initializer.get())) {
                 expr(ld->initializer.get(), /*safeRead=*/true);
                 return;
@@ -20330,6 +20408,12 @@ void Emitter::collectStringReleaseEligible(
         // escape — see the borrowRetainedAliases member comment. The set is
         // fully populated by the scan above, before any walk runs.
         w.borrowRetainedAliases = &stringBorrowAll_;
+        // fix #2900: mirror the object-string-aliased set so a `var other
+        // := o;` (a copy of an `Object` alias that itself aliases a string)
+        // is also a borrow — `other` retains, `o`'s own +1 stays in `o`,
+        // and the source's release stays armed. Must run AFTER
+        // collectObjectStringReleaseEligible (which populates the set).
+        w.objectStringBorrowAliases = &objectStringBorrowAll_;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringReleaseEligible_.insert(static_cast<const void*>(ld));
@@ -20356,6 +20440,10 @@ void Emitter::collectStringReleaseEligible(
         // reason a copy of a producer leaked the producer's. `b`'s own retain
         // is independent of `a`'s, so `a` keeps its release.
         w.borrowRetainedAliases = &stringBorrowAll_;
+        // fix #2900: mirror the object-string-aliased set, same reason as
+        // the producer loop above (a copy of an `Object` alias of a
+        // string is a borrow too).
+        w.objectStringBorrowAliases = &objectStringBorrowAll_;
         for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
         if (!w.escaped)
             stringBorrowRetainEligible_.insert(static_cast<const void*>(ld));
@@ -22077,6 +22165,35 @@ int Emitter::boxLocalAssignmentSourceKind(const ast::Expr* valueExpr) {
 }
 
 
+// fix #2900 / §28.9 / §28.3 (v0.240): is `valueExpr` a bare string-typed
+// IDENTIFIER (the only shape the `Object`-slot / string-borrow relaxation
+// admits at the LocalDecl level)? A `+1` producer (`"x" + y` /
+// interpolation) is NOT admitted — a producer's `+1` is in its own slot,
+// and reusing it in an Object-aliased retain would alias the same heap
+// string with two releases from one producer. A boxed value, a class
+// reference, a null literal, a `s!` rebind, a `s.Length` call, anything
+// other than a bare string LocalIdentifier ⇒ false (a non-string source
+// flips the state bit to false, so scope-end skips the string release).
+// Mirrors the gate collectObjectStringReleaseEligible applies at the
+// LocalDecl level; reusing it is the only way the bind site, the
+// reassignment site, and the eligibility collector stay in lockstep.
+int Emitter::isObjectStringSource(const ast::Expr* valueExpr) {
+    if (!valueExpr) return -1;
+    const sema::TypeRef* srcTy = ctx_.exprType(*valueExpr);
+    if (!srcTy || srcTy->nullable) return 0;
+    if (srcTy->kind != sema::TypeRef::Kind::Primitive ||
+        srcTy->primitive != sema::PrimitiveType::String) return 0;
+    auto* id = dynamic_cast<const ast::IdentifierExpr*>(valueExpr);
+    if (!id) return 0;
+    auto* loc = dynamic_cast<const sema::LocalSymbol*>(ctx_.exprSymbol(*id));
+    if (!loc || !loc->decl) return 0;
+    // Parameter / capture source excluded — caller's reference, not ours.
+    auto* srcLd = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+    if (!srcLd) return 0;
+    return 1;
+}
+
+
 // #422 / #429 (box RETURN) / §8.6 / §28.9: is local `ld` initialized by a
 // known +1 box producer? The target must be Object/interface, and the shared
 // #2960 source classifier must say the initializer is fresh-box. A class
@@ -22554,6 +22671,143 @@ void Emitter::collectBoxReleaseEligible(
         boxReleaseEligible_.insert(static_cast<const void*>(ld));
         if (w.sawManagedAssignment)
             boxReassignedLocals_.insert(static_cast<const void*>(ld));
+    }
+}
+
+
+// fix #2900 / §28.9 / §28.3 (v0.240): `var o: Object := s;` and the same shape
+// over an interface-typed alias — an Object/interface local whose initializer
+// is a bare string-typed IDENTIFIER. The codegen retains a +1 in the Object
+// slot at bind and (if non-escaping) releases it at scope end via a state-bit
+// gated bz_string_release, so the source's +1 stays in the source's slot and
+// the alias has its own. This is the Object-typed twin of #2764's
+// `stringBorrowAll_`: the walker's `LocalDecl` arm accepts these as borrows
+// (so the source's release stays armed), the bind site retains, the disposal
+// path releases.
+//
+// WHY A STATE BIT. The Object slot can hold a string, a box, a class instance,
+// a closure, or null; bz_string_release on any of the latter is wrong. The bit
+// tracks "is the current slot value a string" — the initializer seeds it from
+// the static source kind (a string identifier ⇒ true), each plain `:=`
+// reassignment updates it (a class/box source ⇒ false), and scope-end disposal
+// consults it before bz_string_release. The state-bit machinery is the parallel
+// of `boxReleaseState` for boxes; the design is intentionally symmetrical so a
+// future "Object slot can hold a string OR a box" can compose both bits
+// without re-deriving the state.
+//
+// NARROW SCOPE (per the issue's prescription). Only the EXACT `var <name>: T
+// := <string-identifier>` shape is admitted; any sub-expression initializer
+// (`var o := s + "x"`, `var o := s.ToString()`, `var o := s!`) walks the
+// initializer as the existing escape position — the issue's option (a) is
+// about the bare alias, not a re-derived reference. A `string?`-declared source
+// is excluded (the null/sentinel handling already differs and a retain on a
+// possibly-null slot is the wrong shape). A parameter-typed source is excluded
+// (§28.1 makes a `string` parameter the caller's borrow; a callee-side
+// retain+release would over-release the caller's reference — separate
+// concern). A `using var` target is excluded (its disposal comes from
+// registerUsingDisposal). A reassigned target is admitted with the state-bit
+// path; an escaping target stays an conservative escape and is left to leak
+// (the safe direction, mirroring every other eligibility set's overflow).
+void Emitter::collectObjectStringReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body) {
+    objectStringBorrowAll_.clear();
+    objectStringReleaseEligible_.clear();
+    objectStringReassignedLocals_.clear();
+    // Candidate scan: an Object/interface-typed `var` local (non-using, with
+    // an initializer) whose initializer is a bare string-typed IdentifierExpr
+    // referring to a NON-PARAMETER string local. The identifier must be a
+    // LocalSymbol with a non-null `decl` (a `string` LocalDecl); a parameter
+    // is excluded by construction (a `string` parameter's reference belongs to
+    // the caller). The source local's declared type must be a NON-NULLABLE
+    // `string` primitive — the nullable case has different null-handling and
+    // a retain on a possibly-null slot is the wrong shape.
+    std::vector<const ast::LocalDecl*> candidates;
+    std::function<void(const ast::Stmt*)> scan = [&](const ast::Stmt* s) {
+        if (!s) return;
+        if (auto* ld = dynamic_cast<const ast::LocalDecl*>(s)) {
+            if (ld->isUsing || !ld->initializer) return;
+            if (!isObjectOrInterfaceTarget(
+                    ld->type ? ctx_.resolvedType(*ld->type) : nullptr))
+                return;
+            auto* id = dynamic_cast<const ast::IdentifierExpr*>(
+                ld->initializer.get());
+            if (!id) return;
+            auto* loc = dynamic_cast<const sema::LocalSymbol*>(
+                ctx_.exprSymbol(*id));
+            if (!loc || !loc->decl) return;  // not a local → parameter/field
+            auto* srcLd = dynamic_cast<const ast::LocalDecl*>(loc->decl);
+            if (!srcLd) return;  // not a LocalDecl → parameter or capture
+            const sema::TypeRef* srcTy = srcLd->type
+                ? ctx_.resolvedType(*srcLd->type)
+                : (srcLd->initializer
+                       ? ctx_.exprType(*srcLd->initializer)
+                       : nullptr);
+            if (!srcTy || srcTy->nullable) return;
+            if (srcTy->kind != sema::TypeRef::Kind::Primitive ||
+                srcTy->primitive != sema::PrimitiveType::String) return;
+            candidates.push_back(ld);
+            objectStringBorrowAll_.insert(static_cast<const void*>(ld));
+        }
+        // Reassigned-target scan: identical shape to the box collector's —
+        // every plain `:=` (and compound `:=`) into one of the candidate
+        // locals is recorded so the reassignment site can release the old
+        // string value before overwriting. Mirrors `boxReassignedLocals_`.
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            if (auto* tid = dynamic_cast<const ast::IdentifierExpr*>(
+                    as->target.get())) {
+                auto* tsym = dynamic_cast<sema::LocalSymbol*>(
+                    ctx_.exprSymbol(*tid));
+                if (tsym) {
+                    if (auto* tld = dynamic_cast<const ast::LocalDecl*>(
+                            tsym->decl)) {
+                        if (objectStringBorrowAll_.count(
+                                static_cast<const void*>(tld)))
+                            objectStringReassignedLocals_.insert(tld);
+                    }
+                }
+            }
+        }
+        if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
+            for (auto& b : is->ifBranch.body) scan(b.get());
+            for (auto& br : is->elifBranches)
+                for (auto& b : br.body) scan(b.get());
+            for (auto& b : is->elseBody) scan(b.get());
+        } else if (auto* ws = dynamic_cast<const ast::WhileStmt*>(s)) {
+            for (auto& b : ws->body) scan(b.get());
+        } else if (auto* fs = dynamic_cast<const ast::ForStmt*>(s)) {
+            for (auto& b : fs->body) scan(b.get());
+        } else if (auto* d = dynamic_cast<const ast::DoEndBlock*>(s)) {
+            for (auto& b : d->body) scan(b.get());
+        } else if (auto* ts = dynamic_cast<const ast::TryStmt*>(s)) {
+            for (auto& b : ts->body) scan(b.get());
+            for (auto& c : ts->catches) scan(c.body.get());
+            for (auto& b : ts->finallyBody) scan(b.get());
+        } else if (auto* cs = dynamic_cast<const ast::CaseStmt*>(s)) {
+            for (auto& arm : cs->arms)
+                for (auto& a : arm.stmts) scan(a.get());
+        }
+    };
+    for (auto& s : body) scan(s.get());
+
+    // Escape walk: admit a candidate into the release set iff the same
+    // conservative walk that #2764 / #2481 / #2115 use proves the source
+    // never escapes. The walker is the SHARED StringEscapeWalker with
+    // `stringReleaseMode` and `scrutineeBorrowMode` set, so the plain
+    // `s := <new-value>` and case-scrutinee relaxations fire (otherwise
+    // the #1997 / #2481 cases that #2764 already covers would regress —
+    // the Object twin would be the strict one). `borrowRetainedAliases` is
+    // left as the SHARED `stringBorrowAll_` so a copy-of-an-alias (`var p
+    // := o;` with `o: Object := s`) is also a borrow, exactly as a
+    // copy-of-a-string is.
+    for (const ast::LocalDecl* ld : candidates) {
+        StringEscapeWalker w{ctx_, static_cast<const void*>(ld)};
+        w.stringReleaseMode = true;
+        w.scrutineeBorrowMode = true;
+        w.borrowRetainedAliases = &stringBorrowAll_;
+        w.objectStringBorrowAliases = &objectStringBorrowAll_;
+        for (auto& s : body) { w.stmt(s.get()); if (w.escaped) break; }
+        if (!w.escaped)
+            objectStringReleaseEligible_.insert(static_cast<const void*>(ld));
     }
 }
 

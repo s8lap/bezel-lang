@@ -1054,6 +1054,25 @@ private:
         // coerced to Object/interface is never mistaken for a box. Null for the
         // legacy unconditional form (kept as a defensive fallback).
         llvm::AllocaInst* boxReleaseState = nullptr;
+        // fix #2900 / §28.9 / §28.3 (v0.240): the `Object`-slot / string-borrow
+        // twin of `boxRelease`. A non-escaping `var` Object/interface local
+        // whose initializer was a bare string-typed identifier (one of
+        // `objectStringReleaseEligible_`) holds an independent +1 on the heap
+        // string (the bind site emitted `bz_string_retain`); at scope end the
+        // state bit is consulted and, if still set, bz_string_release frees
+        // exactly the alias's reference (no UAF: the source's own +1 lives in
+        // the source's slot; no double-free: the alias is the sole owner of
+        // this +1). The state bit lets a plain `o := <non-string>` reassignment
+        // flip the slot out of the string-release path so a class instance /
+        // box / null is never mis-released as a string. Mirrors
+        // `boxRelease` + `boxReleaseState` exactly. `slot` is the Object alloca.
+        bool objectStringRelease = false;
+        // fix #2900: per-slot i1 alloca tracking whether the Object slot's
+        // CURRENT pointer is a string. The initializer and each plain `:=`
+        // update it from the stored expression's static source kind; scope-end
+        // release consults the flag before bz_string_release. Null for the
+        // no-reassign path (the entry-block initialization is its only update).
+        llvm::AllocaInst* objectStringReleaseState = nullptr;
         // fix #1747 / §28.9 / §9.7 / §28.3: a plain `var` RECORD local (value
         // type) bound from a RECORD-RETURNING CALL (`var p := Mk()`) whose
         // declared type owns at least one `string` field, and which the
@@ -10169,6 +10188,43 @@ private:
     void collectBoxReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body);
 
+    // fix #2900 / §28.9 / §28.3 (v0.240): the set of `var` Object/interface
+    // LocalDecl nodes whose initializer is a bare string-typed IDENTIFIER (e.g.
+    // `var o: Object := s;` with `s: string`). These are the cross-type alias
+    // of #2764's `stringBorrowAll_`: every member is RETAINED at bind so the
+    // Object slot holds an INDEPENDENT +1 on the same heap string the source
+    // owns, and a non-escaping subset is RELEASED at scope end via the
+    // `objectStringRelease` Disposal (a state-bit-gated bz_string_release — the
+    // Disposal's existing `stringRelease` arm would also work, but the state
+    // bit lets a plain `o := <non-string>` reassignment flip the slot out of
+    // the string-release path so a class instance / box / null is never
+    // mis-released as a string). The StringEscapeWalker's `LocalDecl` arm
+    // accepts these (treats the binding as a borrow) so the source `s` keeps
+    // its own +1 and its own release is armed. The pre-existing #2764 path
+    // covers the string→string copy analog; the state-bit machinery is the
+    // parallel of `boxReleaseState` for boxes. A `string?`-declared source is
+    // excluded — the null/sentinel handling already differs and a retain on a
+    // possibly-null slot is the wrong shape. A parameter-typed source is
+    // excluded — §28.1 makes a `string` parameter the caller's borrow, so a
+    // callee-side retain+release would over-release the caller's reference.
+    std::unordered_set<const void*> objectStringBorrowAll_;
+    // The non-escaping subset of `objectStringBorrowAll_` — armed with a scope-
+    // end Disposal at lowerLocalDecl. Mirrors `stringBorrowRetainEligible_`.
+    std::unordered_set<const void*> objectStringReleaseEligible_;
+    // Object/interface-typed string-borrow locals that are REASSIGNED in the
+    // body. The reassignment site (lowerStmt's `:=` arm) consults the state
+    // bit, releases the old value if it was a string, and updates the bit to
+    // the new source kind — the same pattern `boxReassignedLocals_` uses for
+    // box-vs-class dispatch. Populated by `collectObjectStringReleaseEligible`
+    // (a statement walk, identical in shape to the box one).
+    std::unordered_set<const ast::LocalDecl*> objectStringReassignedLocals_;
+    // Pin token: the function `collectObjectStringReleaseEligible` analyzed
+    // (mirrors `stringReleaseEligibleFn_` / `boxReleaseEligibleFn_`).
+    llvm::Function* objectStringReleaseEligibleFn_ = nullptr;
+    // Compute the three sets above for a block body (see the .cpp).
+    void collectObjectStringReleaseEligible(
+        const std::vector<std::unique_ptr<ast::Stmt>>& body);
+
     // §27.5 / §28.9 / #672 / #802: the set of +1-box-producer LOCAL DECL NODES
     // (ast::Node*) that are captured by AT LEAST ONE lambda env in the function
     // body. A captured boxed-value local has its scope-end bz_box_release
@@ -10284,6 +10340,14 @@ private:
     // provenance is unknown and must remain conservatively unmanaged. This ONE
     // discriminator feeds both the pre-pass and AssignmentStmt emission.
     int boxLocalAssignmentSourceKind(const ast::Expr* valueExpr);
+    // fix #2900 / §28.9 / §28.3: is `valueExpr` a bare string-typed
+    // IDENTIFIER (the only shape the Object-slot / string-borrow
+    // relaxation admits)? 1 for yes, 0 for a non-string source, -1 for
+    // unknown (no exprType, the conservative fallback). The reassignment
+    // site feeds this into the per-slot `objectStringReleaseState` so a
+    // plain `o := <non-string>` flips the slot out of the string-release
+    // path.
+    int isObjectStringSource(const ast::Expr* valueExpr);
 
     // True if local `ld` starts with a known +1 box producer. Reassignment-
     // capable locals use the same source classifier above plus a runtime i1
