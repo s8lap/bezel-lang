@@ -883,19 +883,6 @@ const char* bz_task_error(void* task);
 // Null when the fault carried only a message.
 void* bz_task_error_obj(void* task);
 
-// §30.9 / #3030: null the task's error_obj slot. Codegen's scope-end
-// fault-disposal preamble reads error_obj via bz_task_error_obj, calls
-// emitDisposeAndReclaim on the result, and then calls bz_task_fire_and_forget.
-// Pre-#3030 bz_task_free never read error_obj, so leaving the field dangling
-// was fine; post-#3030 the FAST path of bz_task_fire_and_forget inspects
-// error_obj to decide whether to dispose it (the FAST path is reachable from
-// the explicit `Task.FireAndForget(owned t)` user-facing call, which has no
-// codegen preamble), so a non-null dangling field would be re-disposed ->
-// double-free. This setter nulls the field after codegen's dispose so the
-// FAST path's `if (error_obj && ...)` guard sees null and skips. Lock-free:
-// by the time codegen runs the preamble the task has settled.
-void  bz_task_clear_error_obj(void* task);
-
 // §30.10 / #1529: true if `task`'s error_obj is a BORROWED reference from an
 // input task's owned fault (a WhenAll/WhenAll<T> aggregate that propagated an
 // input's fault), not owned by `task` itself. Consulted before any fault-

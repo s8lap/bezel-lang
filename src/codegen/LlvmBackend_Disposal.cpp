@@ -444,24 +444,6 @@ void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
         builder_.CreateBr(eaBB);
         builder_.SetInsertPoint(dispBB);
         emitDisposeAndReclaim(eo);
-        // §30.9 / #3030: the task's error_obj field still holds a dangling
-        // pointer to the exception we just freed. bz_task_fire_and_forget
-        // (called below) takes the FAST path on a settled task and its
-        // error_obj-disposal guard would re-dispose the freed pointer. Null
-        // the field now so the FAST path's `if (error_obj && ...)` sees null.
-        // The deferBB branch (bz_defer_exc_dispose) does NOT need this null
-        // — the deferred dispose runs at the catch arm's terminal act, after
-        // which control leaves the task; bz_task_fire_and_forget's FAST-path
-        // check on that task then sees the original (still-set) error_obj,
-        // but by then the deferred dispose is the disposer of record and
-        // re-disposal is the path the in-flight mechanism serializes
-        // (the bz_defer_exc_dispose helper flags the task to skip the
-        // bz_task_fire_and_forget disposal). This is the same boundary the
-        // pre-existing code relied on; we only need the null-write for the
-        // synchronous-dispose branch here.
-        auto* clearEoFn = declareC("bz_task_clear_error_obj",
-                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
-        builder_.CreateCall(clearEoFn, {oldVal});
         builder_.CreateBr(eaBB);
         builder_.SetInsertPoint(eaBB);
     }
@@ -1738,15 +1720,6 @@ void Emitter::emitTcsRelease(llvm::Value* tcs) {
         builder_.CreateBr(eaBB);
         builder_.SetInsertPoint(dispBB);
         emitDisposeAndReclaim(eo);
-        // §30.9 / #3030: null the task's error_obj field after dispose
-        // (mirrors the same call in emitTaskDisposal, see there for the
-        // double-dispose / dangling-pointer rationale). The owning-field
-        // disposal here also eventually calls bz_task_fire_and_forget on the
-        // task struct (field-store abandonment, #2173 / #1889), so the
-        // same dangling-field guard is required.
-        auto* clearEoFn = declareC("bz_task_clear_error_obj",
-                                   llvm::Type::getVoidTy(llvm_), {ptrTy()});
-        builder_.CreateCall(clearEoFn, {t});
         builder_.CreateBr(eaBB);
         builder_.SetInsertPoint(eaBB);
     }
@@ -4508,19 +4481,6 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind,
                 builder_.CreateBr(eaBB);
                 builder_.SetInsertPoint(dispBB);
                 emitDisposeAndReclaim(eo);
-                // §30.9 / #3030: null the task's error_obj field after dispose
-                // (third of three sites: emitTaskDisposal at line ~446, the
-                // OwningTCS field-store disposal at line ~1740, and THIS site
-                // — the Task<...> result-binding / await-fault scope-end
-                // disposal of an owned task local in a `try { ... } catch`
-                // arm or the await-result re-raise). All three funnel into
-                // bz_task_fire_and_forget (or its checked sibling) below; the
-                // same dangling-field guard is required to keep #3030's
-                // FAST-path error_obj-disposal from re-disposing a freed
-                // pointer.
-                auto* clearEoFn = declareC("bz_task_clear_error_obj",
-                                           llvm::Type::getVoidTy(llvm_), {ptrTy()});
-                builder_.CreateCall(clearEoFn, {t});
                 builder_.CreateBr(eaBB);
                 builder_.SetInsertPoint(eaBB);
             }
