@@ -6786,6 +6786,291 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                     unit->kind = TypeRef::Kind::Unit;
                     ctx_.setExprType(&ce, unit);
                 }
+                // fix #3024 (§11.7 / §22.6, v0.240): per-static-class
+                // closed-surface guard for the static-class names whose
+                // member-call surface is documented in stdlib but which the
+                // existing colName-block arms above do not stamp — Task
+                // (§6.7), Stopwatch (§8.1), CancellationTokenSource (§6.1)
+                // — extending the #3021 pattern that previously covered
+                // File/Directory/Path/Debug/Domain. The brief originally
+                // filed #3024 as a separate issue so a later lane could
+                // extend the same fix in one place rather than redo the
+                // gate three times.
+                //
+                // The codegen gate in 'Emitter::emittedSideEffectSince'
+                // (LlvmBackend_impl.hpp:12225) fires only for INSTANCE
+                // member calls on built-in values — its 'builtinReceiverOf
+                // MemberCall' helper reads 'ctx_.exprType(*ma->target)',
+                // which is null for a type-identifier receiver like 'Task'
+                // (the IdentifierExpr visitor only sets the *symbol* for
+                // a builtin static class, not its exprType — see
+                // ExprTypecheck_Exprs.cpp:1088). So 'Task.TotallyBogusMember
+                // (1, 2)' on a class with no instance path went through
+                // the static-call dispatch, never triggered the gate,
+                // and degraded to zero with only the §2434 internal
+                // warning. Mirror the per-instance-type closed-surface
+                // arms further below (lines 6914-7775, the "no member `M`
+                // on `R`; documented surface: ..." diagnostic family)
+                // with a per-static-class arm stamping the documented
+                // surface per the stdlib §-citation.
+                //
+                // Builtin-only gate (the regression #3021 hit at Wave 3
+                // gate): the colName lambda at line 3512 falls back to
+                // the IdentifierExpr head for a declaration-less
+                // built-in, so a USER class that happens to share a name
+                // with a covered static class (e.g. `Path.Deserialize(d)`
+                // on `record Path(…): ISerializable, IDeserializable` —
+                // a legal §11.3 user record whose Deserialize is the
+                // synthesized IDeserializable member) ALSO has colName
+                // == "Path" and would be wrongly rejected by a naive
+                // name-only check. The user record's TypeRef carries a
+                // non-null `declaration` (the user's `ast::TypeDecl`,
+                // with `decl` set) populated by TypeResolution; a
+                // built-in static class's receiver either has no recvTy
+                // at all (the IdentifierExpr path never stamps exprType
+                // for a builtin static class) or has a `declaration`
+                // that points at a builtinClassSym (synthetic, decl ==
+                // null). So: only fire the reject when `!recvTy` (the
+                // canonical "this is the builtin name in a static-call
+                // position" shape). The earlier colName-block arms above
+                // already stamp `exprType` for the documented members
+                // they handle — known void members (Debug.Assert/
+                // WriteLine, File.Write* family, etc.) intentionally
+                // leave `exprType` null, and the membership check below
+                // is name-only, so the diagnostic does NOT fire for
+                // them. Excluded from this list: `Encoding` (abstract,
+                // has its own §3.2 singleton-property reject at line
+                // 12208), `BitConverter` (already rejected via the
+                // `rejectBuiltinStatic()` helper at line 15810),
+                // `BinarySerializer` / `BinaryDeserializer` /
+                // `JsonSerializer` / `JsonDeserializer` (already
+                // rejected via the `rcn == "X"` arms at lines 8006-8100,
+                // and §11.3 user classes of the same name would
+                // otherwise be wrongly false-rejected — see #2996 which
+                // fixed exactly that), `Linq` (a module name with no
+                // static-class surface — `Linq.X` is a name-lookup
+                // failure, not a member-call failure).
+                {
+                    struct StaticSurface {
+                        std::string_view colName;
+                        std::initializer_list<std::string_view> members;
+                        std::string_view surface;
+                        std::string_view stdlibSection;
+                    };
+                    static const StaticSurface kStaticSurfaces[] = {
+                        // §7.3 File — 12 static methods (4 async, 8 sync).
+                        {"File",
+                         {"ReadAllText", "ReadAllTextAsync", "WriteAllText",
+                          "WriteAllTextAsync", "ReadAllBytes", "WriteAllBytes",
+                          "ReadAllLines", "WriteAllLines", "Exists", "Delete",
+                          "Copy", "Move"},
+                         "ReadAllText(path), ReadAllBytes(path), "
+                         "ReadAllLines(path), "
+                         "ReadAllTextAsync(path, token := CancellationToken.None), "
+                         "WriteAllText(path, contents), WriteAllBytes(path, "
+                         "Array<byte>|ReadOnlySpan<byte>), "
+                         "WriteAllLines(path, IEnumerable<string>), "
+                         "WriteAllTextAsync(path, contents, "
+                         "token := CancellationToken.None), "
+                         "Exists(path), Delete(path), Copy(source, dest, "
+                         "overwrite), Move(source, dest)",
+                         "7.3"},
+                        // §7.4 Directory — 5 method names (Delete is two
+                        // arities; one entry covers both).
+                        {"Directory",
+                         {"Exists", "CreateDirectory", "Delete", "GetFiles",
+                          "GetDirectories"},
+                         "Exists(path), CreateDirectory(path), Delete(path), "
+                         "Delete(path, recursive), GetFiles(path), "
+                         "GetDirectories(path)",
+                         "7.4"},
+                        // §7.4 Path — 6 methods, all returning string.
+                        {"Path",
+                         {"Combine", "GetFileName", "GetExtension",
+                          "GetFileNameWithoutExtension", "GetDirectoryName",
+                          "GetFullPath"},
+                         "Combine(a, b), GetFileName(path), GetExtension(path), "
+                         "GetFileNameWithoutExtension(path), "
+                         "GetDirectoryName(path), GetFullPath(path)",
+                         "7.4"},
+                        // §8.2 Debug — 3 static methods (Assert has two
+                        // arities), all unit-returning.
+                        {"Debug",
+                         {"Assert", "WriteLine"},
+                         "Assert(condition), Assert(condition, message), "
+                         "WriteLine(message)",
+                         "8.2"},
+                        // §6.8 Domain — Spawn with many overloads
+                        // (sync/async, generic/non-generic, with/without
+                        // args/result). One entry covers the whole family.
+                        {"Domain",
+                         {"Spawn"},
+                         "Spawn(entry), Spawn<A>(entry, owned A), "
+                         "Spawn<A>(entry, A), Spawn<R>(entry) -> "
+                         "owned OwningTask<R>|owned Task<R>, plus the async "
+                         "entry variants and the with-args/with-result "
+                         "overloads (stdlib §6.8)",
+                         "6.8"},
+                        // §6.7 (v0.240 / #3024) — Task static helpers.
+                        // The full set per stdlib §6.7 (lines 2855-2993)
+                        // + the §30.5 Pattern B (FromOwnedResult) +
+                        // §30.10 aggregators (WhenAll, WhenAny, WhenEach,
+                        // and their <T>/Owned variants) + the
+                        // §30.9 FireAndForget. Wait is NOT listed —
+                        // Wait() is the synchronous escape hatch (§30.3),
+                        // an INSTANCE method on a Task / Task<T> receiver
+                        // (handled by the §30.3 rcn=="Task"/"OwningTask"
+                        // block at line 6783 above, which stamps unit +
+                        // the §30.3 async-context reject); listing it
+                        // here would be a duplicate and would intercept
+                        // the legitimate Wait() call on a Task instance
+                        // before the rcn block ran.
+                        {"Task",
+                         {"Delay", "FromResult", "FromOwnedResult",
+                          "FromException", "FromCancelled", "WhenAll",
+                          "WhenAllOwned", "WhenAny", "WhenEach",
+                          "WhenEachOwned", "FireAndForget"},
+                         "Delay(int)|Delay(TimeSpan)|Delay(int, "
+                         "CancellationToken)|Delay(TimeSpan, "
+                         "CancellationToken) -> Task; "
+                         "FromResult<T>(value: T) -> Task<T>; "
+                         "FromOwnedResult<T>(owned value: T) -> "
+                         "OwningTask<T> (Pattern B, §30.5); "
+                         "FromException<T>(exc) -> Task<T>; "
+                         "FromCancelled<T>() -> Task<T>; "
+                         "WhenAll(tasks: Array<Task>) -> Task; "
+                         "WhenAll<T>(tasks: Array<Task<T>>) -> "
+                         "Task<Array<T>>; "
+                         "WhenAllOwned<T>(owned tasks: "
+                         "OwningArray<OwningTask<T>>) -> "
+                         "OwningTask<OwningArray<T>> (§30.10); "
+                         "WhenAny(tasks: Array<Task>) -> "
+                         "Task<int> (winner index, §6.7); "
+                         "WhenEach(tasks: Array<Task>) -> "
+                         "IAsyncEnumerable<Task> (§30.10); "
+                         "WhenEach<T>(tasks: Array<Task<T>>) -> "
+                         "IAsyncEnumerable<Task<T>>; "
+                         "WhenEachOwned<T>(owned tasks: "
+                         "OwningArray<OwningTask<T>>) -> "
+                         "IOwningAsyncEnumerable<OwningTask<T>> "
+                         "(§30.10); "
+                         "FireAndForget(owned task) (§30.9)",
+                         "6.7"},
+                        // §8.1 (v0.240 / #3024) — Stopwatch static factory
+                        // only. Instance methods Start/Stop/Reset/Restart
+                        // are handled by the per-instance-type arms
+                        // below (rcn == "Stopwatch" arms). Elapsed,
+                        // ElapsedMilliseconds, ElapsedTicks are
+                        // PROPERTIES, dispatched through
+                        // resolveMemberAccess (not a method call).
+                        {"Stopwatch",
+                         {"StartNew"},
+                         "StartNew() -> owned Stopwatch (factory)",
+                         "8.1"},
+                        // §6.1 (v0.240 / #3024) — CancellationTokenSource
+                        // static factories. Instance members (Token, Cancel,
+                        // CancelAfter, Dispose) are handled by the rcn ==
+                        // "CancellationTokenSource" arm above at line 6297
+                        // (Token) and by the per-instance-type arms below
+                        // (Cancel/CancelAfter return unit; Dispose returns
+                        // unit). WithCancelAfter, CreateLinked,
+                        // CreateLinkedAll are the three documented static
+                        // factories.
+                        {"CancellationTokenSource",
+                         {"WithCancelAfter", "CreateLinked",
+                          "CreateLinkedAll"},
+                         "WithCancelAfter(delay: TimeSpan) -> "
+                         "owned CancellationTokenSource; "
+                         "CreateLinked(a: CancellationToken, "
+                         "b: CancellationToken) -> "
+                         "owned CancellationTokenSource (§30.8); "
+                         "CreateLinkedAll(parents: "
+                         "Array<CancellationToken>) -> "
+                         "owned CancellationTokenSource (§30.8)",
+                         "6.1"},
+                    };
+                    // Builtin-only gate: the receiver of a static call on
+                    // a built-in static class is an IdentifierExpr whose
+                    // exprType was never stamped (only its symbol was, via
+                    // ExprTypecheck_Exprs.cpp:1088's `setExprSymbol`); for
+                    // a USER class with the same name (a §11.3-allowed
+                    // collision — `Path.Deserialize(d)` on
+                    // `record Path(…): IDeserializable` is the canonical
+                    // case that broke #3021 at Wave 3), the user record's
+                    // TypeRef carries a non-null `declaration` populated by
+                    // TypeResolution, so recvTy is non-null and the
+                    // IsCancellationRequested-like dispatch correctly
+                    // leaves the user class to its own resolver. Skip the
+                    // table entirely when recvTy is set — that is the
+                    // single fact that distinguishes "this is the builtin
+                    // name in a static-call position" from "this is a user
+                    // type that happens to share a name with a builtin".
+                    if (!recvTy) {
+                        // Builtin-only gate (the regression #3021 hit at
+                        // Wave 3 gate — `Path.Deserialize(d)` on
+                        // `record Path(…): IDeserializable` is a legal
+                        // §11.3 user record whose Deserialize is the
+                        // synthesized IDeserializable member, and the
+                        // user's `Path` IdentifierExpr has colName ==
+                        // "Path" via the fallback branch above; a
+                        // name-only check wrongly false-rejected it).
+                        //
+                        // The single fact that distinguishes "this is
+                        // the builtin name in a static-call position"
+                        // from "this is a user type that happens to
+                        // share a name with a builtin" is the Symbol
+                        // attached to the IdentifierExpr: a builtin
+                        // static class's exprSymbol (set by
+                        // ExprTypecheck_Exprs.cpp:1088 via
+                        // `setExprSymbol(&e, builtinClassSym(name))`)
+                        // is a TypeSymbol whose `decl` field is
+                        // `nullptr` — synthetic, no backing
+                        // ast::TypeDecl — because the builtin class
+                        // has no source declaration. A user class's
+                        // TypeSymbol has `decl != nullptr` pointing
+                        // at the user's real TypeDecl (set by
+                        // TypeResolution's registerDecl). So: only
+                        // fire the reject when the receiver
+                        // IdentifierExpr's exprSymbol is the
+                        // declaration-less builtin-class TypeSymbol
+                        // (not a user-class TypeSymbol, not null,
+                        // not anything else).
+                        auto* tgtId = dynamic_cast<const ast::IdentifierExpr*>(
+                            ma->target.get());
+                        TypeSymbol* tgtSym = tgtId
+                            ? dynamic_cast<TypeSymbol*>(
+                                ctx_.exprSymbol(*tgtId))
+                            : nullptr;
+                        bool isBuiltinStatic =
+                            tgtSym && tgtSym->decl == nullptr;
+                        if (isBuiltinStatic) {
+                            for (const auto& s : kStaticSurfaces) {
+                                if (colName != s.colName) continue;
+                                bool known = false;
+                                for (auto km : s.members) {
+                                    if (m == km) { known = true; break; }
+                                }
+                                if (!known) {
+                                    ctx_.diagnostics().report(
+                                        Severity::Error, ce.span.begin,
+                                        std::string("no member `") +
+                                            std::string(m) +
+                                        "` on `" + std::string(s.colName) +
+                                        "`; documented surface: " +
+                                        std::string(s.surface) +
+                                        " (stdlib §" +
+                                        std::string(s.stdlibSection) + ")");
+                                }
+                                // Only one StaticSurface row matches
+                                // per receiver — stop scanning after
+                                // the match (the loop above already
+                                // skips rows whose colName doesn't
+                                // match).
+                                break;
+                            }
+                        }
+                    }
+                }
                 // §2.5: DateTime instance method return types.
                 // The receiver's TypeRef uses builtinClassSym (non-null declaration,
                 // null decl) so colName is empty; check via declaration->name directly.
