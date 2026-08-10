@@ -8742,7 +8742,27 @@ void ExprTC::runMethodBody(
     if (clauses) {
         for (const auto& c : *clauses) {
             if (!c.expr) continue;
+            // §22.16 (v0.240, #2942): while visiting a clause, the
+            // IdentifierExpr path can detect `result` / `old` and emit a
+            // context-aware diagnostic — inside an `ensures`, the contextual
+            // keywords are not yet implemented (per this issue); in any
+            // other position, they are reported as contextual keywords
+            // reserved for `ensures` rather than the generic "unresolved
+            // identifier" the user gets today. The flag is saved and
+            // restored across each clause so a lambda nested inside a
+            // clause body returns to "not in a clause" (a lambda body is
+            // its own callable — the contextual-keyword context does not
+            // extend into it, exactly like the per-method scope).
+            const bool saveInClause = inContractClause_;
+            const ContractClauseKind saveClauseKind = currentClauseKind_;
+            inContractClause_ = true;
+            currentClauseKind_ =
+                (c.kind == ast::ContractClause::Kind::Ensures)
+                    ? ContractClauseKind::Ensures
+                    : ContractClauseKind::Requires;
             visitExpr(*c.expr);
+            inContractClause_ = saveInClause;
+            currentClauseKind_ = saveClauseKind;
             // §22.16 "Clause typing: bool, pure, borrow-only": each clause
             // expression must be `bool` (§4.1 — no truthiness). Conservative
             // like checkConditionIsBool: skip when the type is unresolved so

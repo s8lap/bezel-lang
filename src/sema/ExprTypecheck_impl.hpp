@@ -487,6 +487,27 @@ private:
     // (not just set) so nested lambdas behave correctly.
     bool inLambda_ = false;
 
+    // §22.16 (v0.240, #2942): true while visiting a contract clause's
+    // expression (`requires` / `ensures`). Used by the IdentifierExpr
+    // resolution path to give a context-aware diagnostic when the contextual
+    // keywords `result` / `old` appear inside a clause (or outside one):
+    // inside `ensures`, they are rejected as not-yet-implemented per #2942;
+    // outside any clause (or inside a `requires`/`invariant` clause, where
+    // §22.16 also forbids them), they are reported as contextual keywords
+    // reserved for `ensures` rather than the generic "unresolved identifier"
+    // — the loud-reject path the issue asks for. Reset to false across every
+    // lambda boundary (a nested lambda body is its own callable, not a
+    // clause context) and set from `runMethodBody`'s clause loop.
+    bool inContractClause_ = false;
+    // §22.16 (v0.240, #2942): the kind of the clause currently being visited,
+    // or `None` when not inside a clause. Read by the IdentifierExpr handler
+    // to choose between the inside-`ensures` (not-yet-implemented) and
+    // outside-`ensures` (contextual-keyword) diagnostics. Mirror of the
+    // AST's `ast::ContractClause::Kind`, kept as a plain enum here so the
+    // sema layer does not pull in the AST header for a 3-valued flag.
+    enum class ContractClauseKind { None, Requires, Ensures };
+    ContractClauseKind currentClauseKind_ = ContractClauseKind::None;
+
     // per §24.3: when about to visit an event-handler lambda argument
     // (`<event>.Subscribe(h)` / `.Add` / `.Remove`, or `event += h`), this
     // holds the event's payload type so the lambda's untyped parameter is

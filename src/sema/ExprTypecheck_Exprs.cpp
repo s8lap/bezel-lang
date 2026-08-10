@@ -1170,10 +1170,46 @@ void ExprTC::visitExpr(const ast::Expr& e) {
             // keeps today's "unresolved identifier" error.
             ctx_.setExprSymbol(&e, typeParamMarker(id->name));
         } else if (currentScope_) {
-            ctx_.diagnostics().report(
-                Severity::Error, id->span.begin,
-                std::string("unresolved identifier `") +
-                std::string(id->name) + "`");
+            // §22.16 (v0.240, #2942): `result` and `old` are contextual
+            // keywords (§22.16 / Appendix B.2), valid only inside an
+            // `ensures` clause — `result` denotes the method's return
+            // value (typed as the declared return type, read as a borrow),
+            // `old(E)` denotes the value of `E` at method entry. Neither
+            // is implemented in this revision (issue #2942); both fall
+            // through to ordinary name lookup and report "unresolved
+            // identifier". Replace that generic error with a context-aware
+            // one — outside `ensures`, point the user at §22.16's keyword
+            // rule; inside an `ensures` clause, point them at this issue
+            // (the "loud, hence safe" Option-A path the issue asks for).
+            // Inside a `requires` clause or an `invariant` member, §22.16
+            // also forbids these names, so the outside-`ensures` diagnostic
+            // applies uniformly — only `ensures` is the permitted position.
+            if (id->name == "result" || id->name == "old") {
+                if (currentClauseKind_ == ContractClauseKind::Ensures) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, id->span.begin,
+                        std::string("the contextual keyword `") +
+                        std::string(id->name) +
+                        "` is not yet implemented in `ensures` clauses "
+                        "(\xc2\xa7""22.16, v0.240; issue #2942) \xe2\x80\x94 "
+                        "postconditions cannot name the return value or "
+                        "the entry snapshot until that fix lands");
+                } else {
+                    ctx_.diagnostics().report(
+                        Severity::Error, id->span.begin,
+                        std::string("`") + std::string(id->name) +
+                        "` is a contextual keyword reserved for `ensures` "
+                        "clauses (\xc2\xa7""22.16, v0.240; issue #2942); "
+                        "it is not an identifier and cannot be referenced "
+                        "from a method body, a `requires` clause, or an "
+                        "`invariant` member");
+                }
+            } else {
+                ctx_.diagnostics().report(
+                    Severity::Error, id->span.begin,
+                    std::string("unresolved identifier `") +
+                    std::string(id->name) + "`");
+            }
         }
         return;
     }
@@ -6722,6 +6758,16 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         // nested lambdas.
         bool saveInLambda = inLambda_;
         inLambda_ = true;
+        // §22.16 (v0.240, #2942): a lambda body is its own callable, not a
+        // clause context. The contextual-keyword diagnostic for `result` /
+        // `old` is meaningless inside a lambda (a lambda has no return value
+        // to bind to, and is not in any member's clause scope). Saved/restored
+        // so a nested lambda inside a clause does not falsely inherit the
+        // surrounding clause's tracking.
+        const bool saveInContractClause = inContractClause_;
+        const ContractClauseKind saveClauseKind = currentClauseKind_;
+        inContractClause_ = false;
+        currentClauseKind_ = ContractClauseKind::None;
         // §22.4 (v0.183, #1585): a lambda is its own callable — a `return`
         // inside it never discharges the enclosing method's out-nullability
         // postcondition. Clear the set for the lambda body and restore after.
@@ -7001,6 +7047,8 @@ void ExprTC::visitChildren(const ast::Expr& e) {
         inBindAtom_ = saveInBindAtom;  // §17.15 (#2098)
         inIteratorMethod_ = saveIter;
         inLambda_ = saveInLambda;
+        inContractClause_ = saveInContractClause;
+        currentClauseKind_ = saveClauseKind;
         loopDepth_ = saveLoop;
         loopLabelStack_ = std::move(saveLoopLabels);  // §21.5 (v0.201)
         loopEdgeNarrowing_ = std::move(saveLoopEdges);  // §7.4 (#2152)
