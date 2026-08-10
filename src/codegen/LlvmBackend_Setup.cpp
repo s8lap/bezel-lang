@@ -24032,6 +24032,33 @@ llvm::Value* Emitter::materializeHeapCollectionLiteral(
     if (cl->elements.empty() && cl->keys.empty() && isDictTypeName(collTy))
         return materializeHeapDictLiteral(cl, collTy);
 
+    // fix #2957 (§15.4.1, v0.240): a USER-DEFINED target type that opts into
+    // the literal protocol via a static `FromCollectionLiteral` factory —
+    // §15.4.1's two recognized signatures (ReadOnlySpan<U> borrowing form,
+    // owned OwningArray<U> owning form). Intercepted BEFORE the
+    // `!isCollectionTypeName(collTy)` guard below because user types have
+    // rt->declaration != null (the #2997 empty-moduleName split: a real
+    // declaration means NOT a builtin) so the name-based collection check
+    // declines them; without this interception the local-decl / field-init /
+    // return / call-argument arms fall through to the inline-array GEP path
+    // on a bare-`ptr` slot and the LLVM verifier aborts on the resulting
+    // malformed GEP. The materializer emits the static factory call and
+    // returns the `owned C<U>` it produces; the four positional arms reuse
+    // their existing slot-allocation + disposal-registration logic with no
+    // further changes (the result is a bare `ptr`, exactly the shape of a
+    // built-in `Array<T>` materialization).
+    if (collTy->declaration) {
+        if (llvm::Value* userVal = materializeUserTypeCollectionLiteral(cl, collTy))
+            return userVal;
+        // materializeUserTypeCollectionLiteral returned null → the user type
+        // has no recognized `FromCollectionLiteral` signature. Fall through
+        // so the inline-array GEP path catches the genuine bug case (the
+        // type was admitted by sema's §15.4 closed list but has no
+        // recognized lowering). That fall-through ICE is loud, not silent —
+        // exactly the failure mode the issue's repro measures, so a future
+        // spec gap (e.g. a §15.4.1 third form) is immediately visible.
+    }
+
     // §4.6/§4.7 (#738): LinkedList<T>/OwningLinkedList<T> are bz_llist_t-backed,
     // not bz_array_t — and isCollectionTypeName deliberately EXCLUDES them, so
     // handle the literal here (before that guard) via bz_llist_alloc +
@@ -24305,8 +24332,303 @@ llvm::Value* Emitter::materializeCollectionLiteralForArg(
         return materializeHeapDictLiteral(cl, collTy);
     // Every sequence-literal form (Array/OwningArray/Set/OwningSet/Stack/Queue and
     // owned forms, LinkedList/OwningLinkedList). materializeHeapCollectionLiteral
-    // routes Set→materializeHeapSetLiteral and LinkedList internally.
+    // routes Set→materializeHeapSetLiteral and LinkedList internally; on a miss
+    // it falls through to materializeUserTypeCollectionLiteral, which handles
+    // the §15.4.1 user-type opt-in (`FromCollectionLiteral` static factory).
     return materializeHeapCollectionLiteral(cl, collTy);
+}
+
+
+// fix #2957 (§15.4.1, v0.240): materialize a sequence literal `[e1, …, en]`
+// against a USER-DEFINED target type C<U> that opts into the literal protocol by
+// declaring a static `FromCollectionLiteral` factory (§15.4.1). The protocol
+// has two recognized signatures:
+//   * BORROWING form — `FromCollectionLiteral(elements: ReadOnlySpan<U>):
+//     owned C<U>` for a C<U> whose elements are borrows.
+//   * OWNING    form — `FromCollectionLiteral(elements: owned
+//     OwningArray<U>): owned C<U>` for a C<U> that owns its elements
+//     (`U: class`).
+// Pre-fix: codegen had NO arm for a user-defined FCL target. Sema admitted the
+// literal (§15.4's closed-list gate added by #2914 explicitly opts in to
+// user-defined FCL types), the local-decl arm fell through to the inline-array
+// GEP path, and `GEP ptr, ptr %0, i32 0, i32 0` (a 2-index GEP into a single
+// `ptr` slot) tripped the LLVM verifier with "Invalid indices for GEP pointer
+// type!" — every local-decl / field-init / call-arg / return position
+// containing a `var x: C<U> := [e1, …, en]` aborted codegen. The call-argument
+// arm had the same defect via `materializeCollectionLiteralForArg` (which is
+// just a thin wrapper around the heap materializer).
+//
+// Fix: detect the user type + static `FromCollectionLiteral` and emit the
+// call ourselves. For the BORROWING form we allocate an `[N x U]` buffer in
+// the function's entry block, store the lowered element values into it
+// (lifetime encloses only the call — §15.4.1 "Lowering" Borrowing form), and
+// build the ReadOnlySpan<U> value via buildArraySpan (the {ptr, i32, i32}
+// bz.arrayspan struct). For the OWNING form we delegate to
+// materializeHeapCollectionLiteral on a synthesized `OwningArray<U>` TypeRef,
+// so the resulting `bz_array_t*` has the standard class-element disposer
+// header stamped and the standard exception-path unwind cleanup (the
+// #1292/#2771 partial-fill-throw safety the built-in literal arm owns).
+//
+// The static call's signature: `owned C<U>` return → a bare `ptr` (a
+// heap-object pointer), no receiver argument (it's static). `methodFns_[ms]`
+// is populated by `declareFunctions()` (line 1726) which runs before any
+// method body is lowered, so the LLVM function pointer is already available.
+//
+// Returns null when `collTy` is not a user-defined FCL target or the signature
+// is unrecognised, so callers (materializeHeapCollectionLiteral and the
+// four positional arms) fall through to the next dispatch option without
+// miscompiling.
+//
+// // per §15.4.1
+llvm::Value* Emitter::materializeUserTypeCollectionLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy) {
+    if (!cl || !collTy) return nullptr;
+    // §15.4.1 is sequence-only — the dict-literal form has no user-extensible
+    // dispatch today (rationale §18 deferred). Decline cleanly.
+    if (cl->isDict) return nullptr;
+    // Must be a user-defined type (has a sema::TypeSymbol declaration), NOT a
+    // built-in collection head (those have rt->declaration == null by
+    // builtinClassSym convention — ExprTypecheck_Calls.cpp #2997's empty-
+    // moduleName split). The builtin path is handled by
+    // materializeHeapCollectionLiteral; reaching here with a builtin is the
+    // "unrecognized target" case.
+    if (collTy->kind != sema::TypeRef::Kind::Named) return nullptr;
+    if (!collTy->declaration) return nullptr;
+
+    // Walk the user type's members for a PUBLIC STATIC method named exactly
+    // `FromCollectionLiteral` (§15.4.1: name-based recognition). The walk
+    // mirrors the sema-side gate (ExprTypecheck_Calls.cpp lines 397-413) and
+    // §15.4.1's "the method must be public, must be static, must be declared
+    // directly on the collection type" rule. Multiple matches decline — the
+    // sema side already rejects declaring both forms, so anything reaching
+    // here should be exactly one.
+    const sema::TypeSymbol* targetType = collTy->declaration;
+    sema::MethodSymbol* fclMs = nullptr;
+    for (const sema::Symbol* m : targetType->members) {
+        const auto* ms = dynamic_cast<const sema::MethodSymbol*>(m);
+        if (!ms || ms->name != "FromCollectionLiteral") continue;
+        if (ms->params.empty()) continue;
+        bool isStatic = false;
+        for (auto mod : ms->modifiers)
+            if (mod == "static") { isStatic = true; break; }
+        if (!isStatic) continue;
+        fclMs = const_cast<sema::MethodSymbol*>(ms);
+        break;
+    }
+    if (!fclMs) return nullptr;
+    // LLVM function pointer for the static factory. declareFunctions
+    // populates methodFns_ before any method body is lowered, so this is
+    // always present for a user-declared method. As a defense-in-depth, if the
+    // method's LLVM function is missing (e.g. a future ordering change to
+    // declareFunctions), declare it from the AST decl's signature and emit the
+    // call — the body-emission loop iterates `methodFns_` and will fill it in
+    // before linking, so the forward-declared name resolves cleanly.
+    llvm::Function* fclFn = nullptr;
+    auto mfit = methodFns_.find(fclMs);
+    if (mfit != methodFns_.end()) {
+        fclFn = mfit->second;
+    } else {
+        // §15.4.1: a user type's static `FromCollectionLiteral` is declared on
+        // the type itself (no receiver). Use methodFnType to derive the LLVM
+        // function signature from the AST MethodDecl (the same path
+        // methodFns_-miss fallbacks in Calls2's dispatch use for an
+        // imported method, mirrored here for local-method late declaration).
+        if (llvm::FunctionType* fty = methodFnType(fclMs)) {
+            std::string fnName = functionName(fclMs);
+            if (auto* existing = module_->getFunction(fnName)) {
+                fclFn = existing;
+            } else {
+                fclFn = llvm::Function::Create(
+                    fty, llvm::Function::ExternalLinkage,
+                    fnName, module_.get());
+                methodFns_[fclMs] = fclFn;
+            }
+        }
+    }
+    if (!fclFn) return nullptr;
+
+    // Identify the form from the (sole) parameter's resolved type.
+    //   * ReadOnlySpan<U>    → BORROWING form
+    //   * OwningArray<U>     → OWNING form (the spec requires `U: class`,
+    //                          but sema owns that check — we accept any U
+    //                          and let dispose semantics in the runtime
+    //                          header disposer be the source of truth).
+    //   * anything else      → unrecognised signature, decline.
+    auto* param = dynamic_cast<sema::ParameterSymbol*>(fclMs->params.front());
+    if (!param || !param->declType) return nullptr;
+    const sema::TypeRef* paramTy = ctx_.resolvedType(*param->declType);
+    if (!paramTy || paramTy->kind != sema::TypeRef::Kind::Named || !paramTy->astNode ||
+        paramTy->astNode->name->parts.empty()) return nullptr;
+    std::string_view paramName = paramTy->astNode->name->parts[0];
+    const sema::TypeRef* elemTy = (!paramTy->genericArgs.empty())
+                                      ? paramTy->genericArgs[0]
+                                      : nullptr;
+
+    llvm::Value* argVal = nullptr;
+
+    // ─── BORROWING form ────────────────────────────────────────────────────
+    // Build a heap-allocated bz_array_t<U> as the span's backing storage, fill
+    // it with the n element values via bz_array_add, and pass it as the
+    // source field of the ReadOnlySpan<U> value. The span's indexer reads
+    // through bz_array_len / bz_array_get (LlvmBackend_Assign.cpp lines 374
+    // and 383), so the source MUST be a real bz_array_t* — not a raw element
+    // buffer; the spec's "the storage for the span may be stack-allocated"
+    // allowance is interpreted to mean "the backing is allocated by codegen
+    // and released after the call" (consistent with the lifetime rule and
+    // with the indexer's runtime contract), not "the backing is a raw memory
+    // region the indexer then walks". For an empty literal we still allocate
+    // a bz_array_t of Count 0 and pass it through (the indexer handles Length
+    // 0 cleanly via the bounds check).
+    //
+    // The span struct is built via buildArraySpan, the same helper
+    // Array<T>.AsReadOnlySpan() and the Span/ReadOnlySpan constructors use —
+    // so the receiver's parameter type (a bz.arrayspan-shaped struct) matches
+    // the lowered parameter type declared by `declareFunctions()` for the FCL
+    // method.
+    if (paramName == "ReadOnlySpan") {
+        llvm::Type* elemLlvmTy = elemTy ? lowerTypeRef(elemTy) : i32();
+        std::size_t n = cl->elements.size();
+        int64_t esz = collectionElemSize(paramTy);
+        // Allocate the bz_array_t. Capacity = max(16, n) — matches the
+        // default the built-in literal arm uses. For n == 0 we still allocate
+        // a Count-0 array (the runtime contract needs a real bz_array_t*).
+        int64_t cap = std::max<int64_t>(16, (int64_t)n);
+        auto* allocFn = declareC("bz_array_alloc", ptrTy(), {i64(), i64()});
+        llvm::Value* arr = builder_.CreateCall(
+            allocFn, {builder_.getInt64(esz), builder_.getInt64(cap)},
+            "fcl.borrow.arr");
+        // Borrowing form — no element disposer (the runtime header disposer
+        // is null). Mirrors the literal arm's call when name is "Array" (a
+        // borrowing family); the OwningArray stampOwningElemDisposer call
+        // happens only in the owning form below.
+        if (n > 0) {
+            auto* addFn = declareC("bz_array_add",
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy(), i64()});
+            for (std::size_t i = 0; i < n; ++i) {
+                if (!cl->elements[i]) continue;
+                llvm::Value* ev = lowerExpr(*cl->elements[i]);
+                if (!ev) {
+                    // #1386: ICE — lowerExpr returned null for a user-type
+                    // FCL literal element. Same posture as the built-in
+                    // literal arms.
+                    ctx_.diagnostics().report(
+                        Severity::Error,
+                        cl->elements[i]->span.begin,
+                        "internal: lowerExpr returned null for "
+                        "FromCollectionLiteral element — #2957");
+                    continue;
+                }
+                // §8.6: box a value-typed source against an interface/object
+                // element type.
+                if (elemTy) ev = boxForTarget(ev, elemTy, cl->elements[i].get());
+                // §5.1: widen/narrow a numeric element to the declared
+                // element type.
+                if (ev->getType() != elemLlvmTy) {
+                    if (ev->getType()->isIntegerTy() &&
+                        elemLlvmTy->isIntegerTy()) {
+                        unsigned eb = ev->getType()->getIntegerBitWidth();
+                        unsigned db = elemLlvmTy->getIntegerBitWidth();
+                        ev = db > eb
+                                 ? builder_.CreateSExt(ev, elemLlvmTy)
+                                 : builder_.CreateTrunc(ev, elemLlvmTy);
+                    }
+                }
+                llvm::AllocaInst* slot = entryAlloca(ev->getType());
+                builder_.CreateStore(ev, slot);
+                builder_.CreateCall(addFn, {arr, slot, builder_.getInt64(esz)});
+            }
+        }
+        // Build the ReadOnlySpan<U> value { ptr source=arr, i32 start=0,
+        // i32 length=n }. The bz_array_t backing is scope-end-disposed
+        // (registered below) — released "after the call returns" per §15.4.1
+        // "Lowering" Borrowing form. Scope-end is a sound relaxation: the
+        // factory must not retain the span beyond its own execution, so
+        // nothing in the callee depends on the backing outliving the call,
+        // and the per-call allocation is reclaimed before the enclosing
+        // scope exits anyway. The borrowing form owns no elements (a
+        // null per-element disposer), so the reclamation is the backing
+        // free only.
+        llvm::AllocaInst* arrSlot = entryAlloca(ptrTy());
+        builder_.CreateStore(arr, arrSlot);
+        argVal = buildArraySpan(arr, builder_.getInt32(0),
+                                builder_.getInt32(static_cast<unsigned>(n)));
+        // Register scope-end disposal of the bz_array_t backing. The
+        // `collection` Disposal kind fires bz_array_free(slot, disposer) on
+        // BOTH the normal and unwind exits of the enclosing scope — so a
+        // throwing FCL factory (an edge case the spec doesn't explicitly
+        // cover, but worth doing right) reclaims the backing via the
+        // exception path's emitDisposals loop rather than leaking.
+        if (!disposeStack_.empty()) {
+            Disposal d{arrSlot, nullptr};
+            d.collection = true;  // bz_array_free path; elemDisposer = null
+                                   // (borrowing form owns no elements)
+            disposeStack_.back().push_back(d);
+        }
+    }
+    // ─── OWNING form ───────────────────────────────────────────────────────
+    // Build an `owned OwningArray<U>` temporary via the same machinery as a
+    // built-in OwningArray literal, then pass it (by value, ownership
+    // transfer) into the factory. materializeHeapCollectionLiteral does the
+    // bz_array_alloc + bz_array_add + disposer-stamp + partial-fill-throw
+    // unwind cleanup the #2771/#2635 spec-correct arm requires, so we
+    // delegate rather than reimplement.
+    //
+    // We synthesise a concrete `OwningArray<U>` TypeRef (the same shape
+    // builtinByteArrayTypeRef uses for `Array<byte>`): Named, declaration
+    // null (the #2997 empty-moduleName split identifies built-ins; the
+    // OwningArray head passes the #1414 stage-3 registry test), astNode
+    // `OwningArray`, genericArgs[0] = elemTy.
+    else if (paramName == "OwningArray") {
+        // The factory's parameter carries an `owned` modifier per the spec
+        // example; sema's `modifier == "owned"` path applies, so the
+        // materializer does not need to dispose the array after the call
+        // (ownership transfers into the callee, exactly like a regular
+        // owned-parameter argument). A non-owned parameter is an
+        // unrecognized signature for §15.4.1; decline.
+        if (param->modifier != "owned") return nullptr;
+        // Synthesize a fresh OwningArray<U> TypeRef (no AST — same trick
+        // as builtinByteArrayTypeRef / builtinTaskArrayTypeRef).
+        sema::TypeRef* ownArrTy = ctx_.makeTypeRef();
+        ownArrTy->kind = sema::TypeRef::Kind::Named;
+        ownArrTy->declaration = nullptr;
+        auto* qn = new ast::QualifiedName;
+        qn->parts.push_back("OwningArray");
+        auto* t = new ast::Type;
+        t->kind = ast::TypeKind::Named;
+        t->name.reset(qn);
+        ownArrTy->astNode = t;
+        if (elemTy) ownArrTy->genericArgs.push_back(
+            const_cast<sema::TypeRef*>(elemTy));
+        // Materialize the literal as if `using var tmp: OwningArray<U> :=
+        // [e1, …]` — returns a `ptr` to the freshly-allocated bz_array_t.
+        // The element-policy stamping + exception-path cleanup are
+        // inherited unchanged. Ownership transfers into the call below
+        // (the parameter is `owned`); no caller-side disposal.
+        argVal = materializeHeapCollectionLiteral(cl, ownArrTy);
+        if (!argVal) return nullptr;
+    }
+    else {
+        // Unrecognised `FromCollectionLiteral` signature — neither
+        // ReadOnlySpan nor OwningArray. §15.4.1 lists exactly two;
+        // anything else is a programmer error the sema gate should have
+        // caught (and a future fix may reject here with a sourced
+        // diagnostic).
+        return nullptr;
+    }
+
+    if (!argVal) return nullptr;
+    // Emit the static call. fclFn's signature: (paramType) -> owned C<U>
+    // (a `ptr`). No receiver argument (it's static); no `this` to bind.
+    // The result is an owned `ptr` — exactly the shape lowerLocalDecl /
+    // field-init / return / call-arg expect from materializeHeapCollectionLiteral,
+    // so the four positional arms reuse their existing slot-allocation +
+    // disposal-registration logic with no further changes.
+    //
+    // The borrowing form's bz_array_t backing is reclaimed via the
+    // Disposal entry pushed above — scope-end (normal AND unwind) release
+    // per §15.4.1 "Lowering" Borrowing form. No immediate-after-call free
+    // is needed; the registration handles both exits.
+    return builder_.CreateCall(fclFn, {argVal}, "fcl.result");
 }
 
 
@@ -24513,6 +24835,23 @@ llvm::Value* Emitter::lowerByteArrayFactoryArg(const ast::Expr& argExpr) {
 Emitter::Disposal Emitter::buildCollectionTempDisposal(
         llvm::Value* slot, const sema::TypeRef* collTy) {
     auto* alloca = llvm::cast<llvm::AllocaInst>(slot);
+    // fix #2957 (§15.4.1, v0.240): a USER-DEFINED class type (a FCL factory's
+    // `owned C<U>` result) — dispose via the class's vtable slot-2 Dispose,
+    // NOT via bz_array_free (the previous fall-through treated every
+    // collection target as an array, so a `Consume([…])` call-arg whose
+    // parameter is a user class would free the Bag pointer as if it were a
+    // bz_array_t* → UAF / SEGFAULT, observed as the call-arg-pos #2957 SEGV).
+    // The `cls`-set Disposal entry is the same shape `registerUsingDisposal`
+    // uses for a `using var x: C := …` and dispatches through `cls`'s
+    // disposerFns_ (the class's Dispose method). Mirrors the FCL result
+    // being an `owned C<U>` in the four positional arms.
+    if (collTy->declaration &&
+        (collTy->declaration->kind == ast::TypeDeclKind::Class ||
+         collTy->declaration->kind == ast::TypeDeclKind::Interface)) {
+        Disposal d{alloca, collTy->declaration};
+        d.dynamicDispose = true;  // emit vtable slot-2 dispatch (any class)
+        return d;
+    }
     bool isOwning =
         collTy->astNode && collTy->astNode->name &&
         !collTy->astNode->name->parts.empty() &&

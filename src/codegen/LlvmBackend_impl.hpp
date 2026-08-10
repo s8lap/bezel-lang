@@ -10485,6 +10485,22 @@ private:
     llvm::Value* materializeCollectionLiteralForArg(
         const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy);
 
+    // fix #2957 (§15.4.1, v0.240): materialize a sequence-literal `[…]` against a
+    // USER-defined target type that opts into the literal protocol by declaring a
+    // static `FromCollectionLiteral` factory (§15.4.1). Two recognized signatures:
+    //   - borrowing form: `(elements: ReadOnlySpan<U>): owned C<U>`
+    //   - owning    form: `(elements: owned OwningArray<U>): owned C<U>` (`U: class`)
+    // The borrowing form materializes a STACK-ALLOCATED buffer of the n element
+    // values (lifetime encloses only the call, per §15.4.1) and builds a
+    // ReadOnlySpan<U> value over it via buildArraySpan; the owning form
+    // materializes an `owned OwningArray<U>` temporary via the same machinery as
+    // a built-in OwningArray literal. The static call is then emitted and its
+    // `owned C<U>` result returned. Returns null when `collTy` is not a user
+    // type with a recognized `FromCollectionLiteral` signature (caller falls
+    // through to the next dispatch arm). // per §15.4.1
+    llvm::Value* materializeUserTypeCollectionLiteral(
+        const ast::CollectionLiteralExpr* cl, const sema::TypeRef* collTy);
+
     // #999 / stdlib §10: a synthesized, concrete `Array<byte>` sema::TypeRef for
     // the byte-array FFI factory arguments (RawBytes.From / CString.FromBytes,
     // both taking a BORROW `Array<byte>`). Those intrinsic call sites have no
