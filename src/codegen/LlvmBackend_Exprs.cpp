@@ -5647,33 +5647,13 @@ llvm::Value* Emitter::lowerVirtualPropertyGet(const ast::Expr& e) {
     // vtable slot was still populated by buildVtable (which ran for imported
     // classes too); we only need to derive the return type, which rides the
     // importedMemberType side table (set by the loader from MetaMember::type).
-    //
-    // fix #2944 (§12.1 / §14.1 / §23, v0.240): the call-site TYPE MUST be
-    // computed from the sema-resolved expr type — not from the AST `pd->type` —
-    // when the static type of the receiver BINDs a generic parameter the base
-    // declared `T` against. Otherwise `g.Item` where `g: GBase<string>` lowers
-    // the call's expected return type from the base declaration's bare `T`
-    // (which `lowerType` resolves to the i32 ERASED PLACEHOLDER, because no
-    // active genericSubst_ binds T here) while the per-instantiation vtable
-    // slot holds a spec body whose actual return type is `string` (`ptr`) —
-    // LLVM IR verifier aborts the build with "Function return type does not
-    // match operand type of return inst!" (and the read of the returned i32
-    // as a `%bz.string` base pointer fails first, "GEP base pointer is not a
-    // vector or a vector of pointers"). `ctx_.exprType(e)` is the post-
-    // substitution sema type (§14.1) — T is already bound to `string` here —
-    // and `lowerTypeRef` on it returns `ptr`, matching the slot.
     llvm::Type* valTy = nullptr;
-    if (sema::TypeRef* resolved = ctx_.exprType(e)) {
-        valTy = lowerTypeRef(resolved);
-    }
-    if (!valTy) {
-        if (pd) {
-            valTy = lowerType(pd->type.get());
-        } else {
-            // Imported property: get the resolved type from the side table.
-            if (sema::TypeRef* tr = ctx_.importedMemberType(ps))
-                valTy = lowerTypeRef(tr);
-        }
+    if (pd) {
+        valTy = lowerType(pd->type.get());
+    } else {
+        // Imported property: get the resolved type from the side table.
+        if (sema::TypeRef* tr = ctx_.importedMemberType(ps))
+            valTy = lowerTypeRef(tr);
     }
     if (!valTy) valTy = i32();
     auto* fnTy = llvm::FunctionType::get(valTy, {ptrTy()}, false);
