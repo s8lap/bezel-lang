@@ -441,6 +441,23 @@ void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
         auto* deferFn = declareC("bz_defer_exc_dispose",
                                  llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(deferFn, {eo});
+        // §30.9 / #3030: null the task's error_obj field even on the
+        // DEFER path. The exception is in flight (the await/`.Result`
+        // re-raise marked it borrowed) and the catch arm's terminal act
+        // is the disposer of record (it disposes via bz_is_exc_deferred →
+        // emitDisposeAndReclaim + bz_clear_exc_deferred, the §30.9
+        // in-flight-deferral contract). The task's error_obj field, if
+        // left non-null after the defer, would be re-disposed by
+        // bz_task_fire_and_forget's FAST path below (the #3030 fix's
+        // new `if (error_obj && !fault_borrowed)` arm) — and the catch
+        // arm then reads the freed pointer (SIGSEGV / ASan UAF). The
+        // dispBB branch (synchronous dispose) gets the same null-write
+        // a few lines below for the same reason. Without this null the
+        // in-flight path becomes a use-after-free the moment #3030's
+        // FAST-path disposal guard is enabled.
+        auto* clearEoDeferFn = declareC("bz_task_clear_error_obj",
+                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(clearEoDeferFn, {oldVal});
         builder_.CreateBr(eaBB);
         builder_.SetInsertPoint(dispBB);
         emitDisposeAndReclaim(eo);
@@ -449,16 +466,6 @@ void Emitter::emitTaskDisposal(const sema::TypeRef* taskTy,
         // (called below) takes the FAST path on a settled task and its
         // error_obj-disposal guard would re-dispose the freed pointer. Null
         // the field now so the FAST path's `if (error_obj && ...)` sees null.
-        // The deferBB branch (bz_defer_exc_dispose) does NOT need this null
-        // — the deferred dispose runs at the catch arm's terminal act, after
-        // which control leaves the task; bz_task_fire_and_forget's FAST-path
-        // check on that task then sees the original (still-set) error_obj,
-        // but by then the deferred dispose is the disposer of record and
-        // re-disposal is the path the in-flight mechanism serializes
-        // (the bz_defer_exc_dispose helper flags the task to skip the
-        // bz_task_fire_and_forget disposal). This is the same boundary the
-        // pre-existing code relied on; we only need the null-write for the
-        // synchronous-dispose branch here.
         auto* clearEoFn = declareC("bz_task_clear_error_obj",
                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(clearEoFn, {oldVal});
@@ -1735,15 +1742,29 @@ void Emitter::emitTcsRelease(llvm::Value* tcs) {
         auto* deferFn = declareC("bz_defer_exc_dispose",
                                  llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(deferFn, {eo});
+        // §30.9 / #3030: null the task's error_obj field even on the
+        // DEFER path. The exception is in flight (the await/`.Result`
+        // re-raise marked it borrowed) and the catch arm's terminal act
+        // is the disposer of record (it disposes via bz_is_exc_deferred →
+        // emitDisposeAndReclaim + bz_clear_exc_deferred, the §30.9
+        // in-flight-deferral contract). The task's error_obj field, if
+        // left non-null after the defer, would be re-disposed by
+        // bz_task_fire_and_forget's FAST path below (the #3030 fix's
+        // new `if (error_obj && !fault_borrowed)` arm) — and the catch
+        // arm then reads the freed pointer (SIGSEGV / ASan UAF). The
+        // dispBB branch (synchronous dispose) gets the same null-write
+        // a few lines below for the same reason.
+        auto* clearEoDeferFn = declareC("bz_task_clear_error_obj",
+                                        llvm::Type::getVoidTy(llvm_), {ptrTy()});
+        builder_.CreateCall(clearEoDeferFn, {t});
         builder_.CreateBr(eaBB);
         builder_.SetInsertPoint(dispBB);
         emitDisposeAndReclaim(eo);
-        // §30.9 / #3030: null the task's error_obj field after dispose
-        // (mirrors the same call in emitTaskDisposal, see there for the
-        // double-dispose / dangling-pointer rationale). The owning-field
-        // disposal here also eventually calls bz_task_fire_and_forget on the
-        // task struct (field-store abandonment, #2173 / #1889), so the
-        // same dangling-field guard is required.
+        // §30.9 / #3030: the task's error_obj field still holds a dangling
+        // pointer to the exception we just freed. bz_task_fire_and_forget
+        // (called below) takes the FAST path on a settled task and its
+        // error_obj-disposal guard would re-dispose the freed pointer. Null
+        // the field now so the FAST path's `if (error_obj && ...)` sees null.
         auto* clearEoFn = declareC("bz_task_clear_error_obj",
                                    llvm::Type::getVoidTy(llvm_), {ptrTy()});
         builder_.CreateCall(clearEoFn, {t});
@@ -4505,6 +4526,17 @@ void Emitter::emitDisposals(const std::vector<Disposal>& scope, bool isUnwind,
                 auto* deferFn = declareC("bz_defer_exc_dispose",
                                          llvm::Type::getVoidTy(llvm_), {ptrTy()});
                 builder_.CreateCall(deferFn, {eo});
+                // §30.9 / #3030: null the task's error_obj field on the
+                // DEFER path too. The catch arm's terminal act is the
+                // disposer of record (this is the in-flight-deferral
+                // contract); leaving the field non-null lets
+                // bz_task_fire_and_forget's FAST path below re-dispose the
+                // in-flight exception, and the catch arm then reads the
+                // freed pointer (UAF). The dispBB branch (synchronous
+                // dispose) gets the same null-write a few lines below.
+                auto* clearEoDeferFn = declareC("bz_task_clear_error_obj",
+                                                llvm::Type::getVoidTy(llvm_), {ptrTy()});
+                builder_.CreateCall(clearEoDeferFn, {t});
                 builder_.CreateBr(eaBB);
                 builder_.SetInsertPoint(dispBB);
                 emitDisposeAndReclaim(eo);
