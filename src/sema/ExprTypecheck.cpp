@@ -9379,6 +9379,31 @@ void ExprTC::visitMember(const ast::Member& m) {
             }
             currentType_ = save;
         }
+    } else if (auto* inv = dynamic_cast<const ast::InvariantDecl*>(&m)) {
+        // §22.16 (v0.240, #2941): the invariant predicate's expression is
+        // type-checked under the same clause rules as a `requires`/`ensures`
+        // clause. We use the property-getter shape (no `this` is bound for
+        // ctor-style purposes — invariants are evaluated on a fully-
+        // constructed instance, so `this` and its fields are readable) but
+        // with `returnCtx_` forced to ValueMethod and the return type set
+        // to `bool` so the predicate must type-check to a bool. A
+        // clause-mode predicate (which is what §22.16 wants) is admitted by
+        // the visitExpr / runMethodBody plumbing — `throw` / `await` are
+        // rejected by the PureBodyWalker (PureChecker.cpp
+        // `checkInvariantExpr`); `old`/`result` are rejected by the same
+        // walker under its clauseMode_ flag.
+        if (inv->expr) {
+            ReturnCtx saveRet = returnCtx_;
+            TypeRef* saveRetTy = currentReturnType_;
+            returnCtx_ = ReturnCtx::ValueMethod;
+            // The predicate's free names are `this`, fields, statics, and
+            // module-level types. The walker's scope chain picks up
+            // currentScope_ (= moduleScope_ for class-body members) and
+            // currentType_'s members, exactly like a property getter.
+            runMethodBody({}, nullptr, inv->expr.get(), nullptr);
+            returnCtx_ = saveRet;
+            currentReturnType_ = saveRetTy;
+        }
     }
 }
 

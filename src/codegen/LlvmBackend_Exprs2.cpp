@@ -5129,6 +5129,23 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
             }
         }
         emitNewPendingCheck(obj);
+        // §22.16 (v0.240, #2941): construction exit — evaluate the class
+        // invariant of the constructed type AFTER the ctor call returns
+        // normally and BEFORE the `obj` reference is exposed to the caller
+        // (§22.16 "Every fresh instance satisfies its full dynamic class
+        // invariant before it is observable"). Imported types' invariant
+        // records are declaration facts, so emitInvariantCheck is a no-op
+        // for them — their invariants were already checked at construction
+        // time in the exporter. Skipped when the ctor threw (the
+        // emitNewPendingCheck above branched to the unwind edge). The
+        // `disposeAndFreeOnThrow = true` flag wires the construction-exit
+        // unwind (§22.16 "the partially-constructed instance unwinds under
+        // §22.9's ordinary machinery"): a violated invariant here disposes
+        // + frees `obj` before ContractViolationException propagates,
+        // matching §22.9's ordinary cleanup shape so the heap block and
+        // every owned field are reclaimed.
+        emitInvariantCheck(obj, rt->declaration,
+                            /*disposeAndFreeOnThrow=*/true);
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
         // #1833 (b): the importedGenericWithBody path recorded
@@ -5509,6 +5526,16 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // its own unwind path without freeing `this`; reclaim the instance block
         // here, the allocating site, exactly once on the unwind edge.
         emitNewPendingCheck(obj);  // CG20: an imported constructor may throw
+        // §22.16 (v0.240, #2941): construction exit on the imported-ctor
+        // path — evaluate the class invariant of the constructed type
+        // (a no-op for the imported type itself, since the exporter
+        // already evaluated it; but fires for any same-module-derived
+        // invariant chain). Skipped on the throw edge. The
+        // `disposeAndFreeOnThrow = true` flag wires the §22.9 unwind
+        // shape: a violated invariant disposes + frees `obj` before
+        // ContractViolationException propagates.
+        emitInvariantCheck(obj, rt->declaration,
+                            /*disposeAndFreeOnThrow=*/true);
         genericSubst_ = std::move(savedSubst);
         genericSubstSemaTy_ = std::move(savedSemaTy);
         // #1833 (b): the imported-ctor path iterates ne.args manually (no
@@ -5658,6 +5685,21 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
                         for (llvm::Value* cl : ctorClosureArgs)
                             emitClosureRelease(cl);
                     }
+                    // §22.16 (v0.240, #2941): construction exit on the
+                    // explicit-ctor / non-generic / no-inline path —
+                    // evaluate the class invariant of the constructed type
+                    // AFTER the ctor call returns normally and BEFORE the
+                    // `obj` reference is exposed to the caller. Skipped on
+                    // the throw edge (emitNewPendingCheck above branched
+                    // to the unwind edge). The `disposeAndFreeOnThrow =
+                    // true` flag wires the §22.9 unwind shape: a violated
+                    // invariant disposes + frees `obj` before
+                    // ContractViolationException propagates, matching the
+                    // ordinary ctor-throw cleanup (which only frees, no
+                    // Dispose — the invariant-throw path is the correct
+                    // shape and the ctor-throw gap is a known follow-up).
+                    emitInvariantCheck(obj, rt->declaration,
+                                        /*disposeAndFreeOnThrow=*/true);
                 } else {
                     // Inline the constructor body with the generic
                     // substitution so field stores use concrete types.
@@ -5795,6 +5837,14 @@ llvm::Value* Emitter::lowerNew(const ast::NewExpr& ne) {
         // base ctor's own cleanup disposed the base subobject without freeing
         // `this`, so reclaim the instance block here on the throw edge.
         emitNewPendingCheck(obj);  // CG20: the base constructor may throw
+        // §22.16 (v0.240, #2941): construction exit (no-explicit-ctor path).
+        // The implicit-base + field-init sequence is the construction body,
+        // so the invariant check fires here on the normal-completion edge.
+        // The `disposeAndFreeOnThrow = true` flag wires the §22.9 unwind
+        // shape: a violated invariant disposes + frees `obj` before
+        // ContractViolationException propagates.
+        emitInvariantCheck(obj, rt->declaration,
+                            /*disposeAndFreeOnThrow=*/true);
     }
     // CG-generic: record the substitution for this new object so that
     // lowerLocalDecl can associate it correctly even when the outer

@@ -634,6 +634,14 @@ private:
     const std::vector<ast::ContractClause>* ensuresClauses_ = nullptr;
     std::string ensuresTypeName_;
     std::string ensuresMemberName_;
+    // §22.16 (v0.240, #2941): the class whose invariant must be checked at
+    // the EXIT edge of this instrumented public method. Null when the
+    // currently-armed epilogue belongs to a non-public, static, or non-class
+    // member (no invariant check fires). Populated by `armEnsuresEpilogue`
+    // and consumed by `finalizeEnsuresEpilogue` after the ensures clauses
+    // run, before the original ret — the §22.16 ordering "ensures clauses,
+    // then the invariant".
+    const sema::TypeSymbol* ensuresInvariantClass_ = nullptr;
     // CG9: the `this` pointer of the instance method currently being
     // emitted (null in static methods). Kept as a value, not a slot —
     // `this` is never reassignable.
@@ -5997,15 +6005,20 @@ private:
     // `ensuresExitBB_` / `ensuresResultSlot_` so `emitReturn` redirects to
     // the epilogue, and the epilogue evaluates each `ensures` clause in
     // declaration order, throwing ContractViolationException on a false
-    // clause. Returns true iff the epilogue was armed (i.e. `clauses`
-    // contains at least one `ensures` clause). `returnTypeNode` is the
-    // declared return type (null for constructors / unit methods); it is
-    // carried so the epilogue can box/coerce the result temp exactly as the
-    // original return would have done.
+    // clause. `invariantClass` is the class whose invariant must also fire
+    // at this method's exit (per §22.16 "Entry and normal exit of every
+    // public instance method") — null when the caller is non-public,
+    // static, or a non-class member. Returns true iff the epilogue was
+    // armed (has at least one `ensures` clause OR an invariant class to
+    // check). `returnTypeNode` is the declared return type (null for
+    // constructors / unit methods); it is carried so the epilogue can
+    // box/coerce the result temp exactly as the original return would
+    // have done.
     bool armEnsuresEpilogue(
         llvm::Function* fn, const std::vector<ast::ContractClause>& clauses,
         const ast::Type* returnTypeNode,
-        std::string_view typeName, std::string_view memberName);
+        std::string_view typeName, std::string_view memberName,
+        const sema::TypeSymbol* invariantClass);
 
     // §22.16 Slice 4b: emit the armed ensures epilogue at the current
     // insertion point. The caller (emitFunctionBody / emitConstructorBody)
@@ -6015,6 +6028,45 @@ private:
     // throws on failure, then performs the original return (ret value / ret
     // void). Clears the armed state.
     void finalizeEnsuresEpilogue();
+
+    // §22.16 (v0.240, #2941): emit runtime checks for the class invariant
+    // of `classType` (a class with declared `invariant(E);` members). Walks
+    // the class hierarchy base-first (§22.16 "evaluated base-first,
+    // declaration order within each class") and for each class evaluates
+    // every invariant member's expression in declaration order, throwing
+    // ContractViolationException on a false predicate. The predicate's
+    // expression is lowered with `currentThis_` rebound to `thisVal`, so
+    // the check observes the live instance. Evaluated at the construction-
+    // exit / public-entry / public-exit boundaries §22.16 fixes — emitted
+    // from `lowerNew` (construction exit) and from the public-method entry
+    // / exit sites. No-op when `classType` declares no source-defined
+    // invariants or when `insideInvariantCheck_` is true (the check
+    // itself is interior code, so re-entry would infinite-loop if a
+    // predicate invoked a pure public method that itself fires the check).
+    //
+    // `disposeAndFreeOnThrow` is the construction-exit mode (§22.16
+    // "the partially-constructed instance unwinds under §22.9's ordinary
+    // machinery"): at construction exit `thisVal` IS the heap allocation
+    // the new site owns, so a throw must Dispose + free it before
+    // ContractViolationException propagates — the §22.9 ownership discipline
+    // would free the block on the throw edge anyway, and the invariant
+    // throw must follow the same path (Dispose + free) so the heap block
+    // and any owned fields it holds are reclaimed. At method entry/exit
+    // `thisVal` is a BORROW on the caller's owning slot, so the caller is
+    // responsible for disposal — passing `disposeAndFreeOnThrow = false`
+    // (the default) leaves the throw BB to surface
+    // ContractViolationException unchanged.
+    void emitInvariantCheck(llvm::Value* thisVal,
+                            const sema::TypeSymbol* classType,
+                            bool disposeAndFreeOnThrow = false);
+
+    // §22.16 (v0.240, #2941): true while emitting an invariant check, so
+    // nested pure-method calls (a clause may call a `pure` public method
+    // of the same instance without recursion, §22.16 "Invariant evaluation
+    // is a boundary-time read of instance state") suppress the re-entry
+    // check. Pushed/popped by emitInvariantCheck around the predicate
+    // walk — no other site touches it.
+    bool insideInvariantCheck_ = false;
 
     // CG20/CG40: throw `excVal` (or re-raise the enclosing catch arm's
     // exception when `excVal` is null and one is in flight): store it to

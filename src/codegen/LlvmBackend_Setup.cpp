@@ -5018,23 +5018,29 @@ void Emitter::emitRequiresPrologue(
 // lowered with the redirect in effect; `finalizeEnsuresEpilogue` (called by
 // the body-emission driver after the body is complete) populates the
 // epilogue block. Idempotent in the sense that a body with no `ensures`
-// clauses returns false and emitReturn is unchanged.
+// clauses returns false and emitReturn is unchanged. `invariantClass` is the
+// class whose invariant must be evaluated at the EXIT edge of this public
+// method (per §22.16 "Entry and normal exit of every public instance method");
+// null when the caller is a non-public, static, or non-class member (no
+// invariant check fires there).
 bool Emitter::armEnsuresEpilogue(
     llvm::Function* fn, const std::vector<ast::ContractClause>& clauses,
     const ast::Type* returnTypeNode,
-    std::string_view typeName, std::string_view memberName) {
+    std::string_view typeName, std::string_view memberName,
+    const sema::TypeSymbol* invariantClass) {
     bool hasEnsures = false;
     for (const auto& c : clauses)
         if (c.kind == ast::ContractClause::Kind::Ensures && c.expr) {
             hasEnsures = true;
             break;
         }
-    if (!hasEnsures) return false;
+    if (!hasEnsures && !invariantClass) return false;
     ensuresFn_ = fn;
     ensuresClauses_ = &clauses;
     ensuresReturnTypeNode_ = returnTypeNode;
     ensuresTypeName_ = std::string(typeName);
     ensuresMemberName_ = std::string(memberName);
+    ensuresInvariantClass_ = invariantClass;
     ensuresExitBB_ = llvm::BasicBlock::Create(llvm_, "ens.exit", fn);
     // Result temp: only needed when the function returns a value. For a
     // unit method or a constructor (void return) the epilogue evaluates
@@ -5079,6 +5085,8 @@ void Emitter::finalizeEnsuresEpilogue() {
     ensuresReturnTypeNode_ = nullptr;
     ensuresTypeName_.clear();
     ensuresMemberName_.clear();
+    const sema::TypeSymbol* invClass = ensuresInvariantClass_;
+    ensuresInvariantClass_ = nullptr;
 
     builder_.SetInsertPoint(exitBB);
     for (const auto& c : *clauses) {
@@ -5102,6 +5110,17 @@ void Emitter::finalizeEnsuresEpilogue() {
         emitThrowContractViolation(msgStr);
         builder_.SetInsertPoint(contBB);
     }
+    // §22.16 (v0.240, #2941): public method exit — evaluate the class
+    // invariant AFTER ensures clauses and BEFORE the original ret. The
+    // §22.16 ordering is "ensures clauses, then the invariant", which is
+    // exactly this position: every borrow the frame holds is still live
+    // (scope-end disposals haven't run yet), the return value is bound, and
+    // out-params are settled. Skipped for non-public, static, or non-class
+    // members (invClass is null in those cases — populated only by
+    // armEnsuresEpilogue when the visibility gate fires).
+    if (invClass) {
+        emitInvariantCheck(currentThis_, invClass);
+    }
     // Reload the result temp (if any) and emit the original return. We
     // temporarily swap `currentReturnTypeNode_` so emitReturn's box/coerce
     // matches what the original return sites would have done.
@@ -5112,6 +5131,109 @@ void Emitter::finalizeEnsuresEpilogue() {
         : nullptr;
     emitReturn(fn, rv);  // inert: ensuresFn_ is null so no redirect
     currentReturnTypeNode_ = savedRetNode;
+}
+
+
+// §22.16 (v0.240, #2941): emit runtime checks for the class invariant of
+// `classType`. Walks the class hierarchy BASE-FIRST (§22.16 "evaluated
+// base-first, declaration order within each class"): for each class in the
+// chain (root base → most-derived), evaluate every `invariant(E);` member's
+// expression in declaration order. A false predicate throws
+// ContractViolationException with a message naming the class and member
+// text; otherwise the next predicate runs. The check fires on every public
+// instance method entry/exit, every public setter entry/exit, and at
+// construction exit (the latter is wired at `new` sites, not ctor bodies,
+// per the spec's "most-derived" requirement — a base ctor completing as
+// part of a derived construction is NOT an instrumentation point).
+//
+// Predicate lowering caveat. The predicate's expression is a normal Bezel
+// expression that reads `this`'s fields (and may call `pure` public methods
+// of the same instance — §22.16 "Invariant evaluation is a boundary-time
+// read of instance state"). We rebound `currentThis_` to `thisVal` so the
+// predicate's field reads GEP through the right base. We also suppress
+// re-entry via `insideInvariantCheck_`: a predicate that invokes a `pure`
+// public method would otherwise fire this same check at the public method's
+// entry, infinite-looping. The spec admits that invariant evaluation runs as
+// interior code ("calls to pure members of the same instance without
+// recursion") — that's exactly what this flag models.
+void Emitter::emitInvariantCheck(llvm::Value* thisVal,
+                                 const sema::TypeSymbol* classType,
+                                 bool disposeAndFreeOnThrow) {
+    if (!classType || insideInvariantCheck_) return;
+    // Find source-defined invariants across the base chain. A class with no
+    // invariants at any level is a no-op (the common case).
+    struct Inv { const sema::TypeSymbol* cls; const ast::InvariantDecl* decl; };
+    std::vector<Inv> chain;
+    for (const sema::TypeSymbol* c = classType; c; c = baseClassOf(c)) {
+        const auto* td = dynamic_cast<const ast::TypeDecl*>(c->decl);
+        if (!td) continue;  // imported: invariant records, no AST
+        for (const auto& m : td->members) {
+            if (auto* inv = dynamic_cast<const ast::InvariantDecl*>(m.get())) {
+                if (inv->expr && !inv->isStatic) {
+                    chain.push_back({c, inv});
+                }
+            }
+        }
+    }
+    // §22.16 base-first → base at the END of the vector, most-derived at
+    // the FRONT (we built the chain most-derived-first above). Reverse so
+    // the iteration order is base-first.
+    std::reverse(chain.begin(), chain.end());
+    if (chain.empty()) return;
+
+    // Push the interior-code gate.
+    const bool savedInside = insideInvariantCheck_;
+    insideInvariantCheck_ = true;
+
+    // Rebind this so predicate field reads resolve through the supplied
+    // pointer. Restore on the way out so the surrounding function's `this`
+    // is unchanged.
+    llvm::Value* savedThis = currentThis_;
+    currentThis_ = thisVal;
+    // The predicate's name lookup (sema) may have populated paramSlots_ /
+    // locals_ for the function we are LOWERING IN — the invariant's free
+    // names (`this`, fields, statics, parameters) are looked up via
+    // currentThis_ + scope. We save and rely on the predicate lowering
+    // path; nothing else here mutates the per-function scope.
+
+    for (const auto& iv : chain) {
+        llvm::Value* condV = lowerExpr(*iv.decl->expr);
+        if (!condV) continue;  // purity/type-error already diagnosed upstream
+        llvm::Value* failed = builder_.CreateNot(condV, "inv.fail");
+        auto* throwBB =
+            llvm::BasicBlock::Create(llvm_, "inv.throw", currentFn_);
+        auto* contBB =
+            llvm::BasicBlock::Create(llvm_, "inv.cont", currentFn_);
+        builder_.CreateCondBr(failed, throwBB, contBB);
+        builder_.SetInsertPoint(throwBB);
+        if (disposeAndFreeOnThrow) {
+            // §22.16 (v0.240, #2941, review follow-up): "the partially-
+            // constructed instance unwinds under §22.9's ordinary
+            // machinery." §22.9's ordinary throw-edge cleanup is
+            // Dispose + free (see emitConstructorBody's cleanupBB at
+            // ~LlvmBackend_Setup.cpp:10391 — `specializedDisposerCoreFor`
+            // runs the destructor body + every owned field + base
+            // chain, then `free(obj)`). At construction-exit `thisVal`
+            // IS the heap allocation the new site owns; without this
+            // a violated invariant at construction would propagate
+            // ContractViolationException with the block + every owned
+            // field still live — a heap leak ASan flags immediately.
+            // Method-entry / method-exit do NOT pass this flag: there
+            // `thisVal` is a borrow on the caller's owning slot, and
+            // the caller's scope-end disposal already covers it.
+            builder_.CreateCall(
+                specializedDisposerCoreFor(classType), {thisVal});
+            builder_.CreateCall(freeFn(), {thisVal});
+        }
+        std::string msg = std::string("invariant of ") +
+                          std::string(iv.cls->name) + " failed";
+        llvm::Value* msgStr = lowerStringLiteral("\"" + msg + "\"", false);
+        emitThrowContractViolation(msgStr);
+        builder_.SetInsertPoint(contBB);
+    }
+
+    currentThis_ = savedThis;
+    insideInvariantCheck_ = savedInside;
 }
 
 
@@ -7781,16 +7903,43 @@ void Emitter::emitFunctionBody(sema::MethodSymbol* ms, llvm::Function* fn) {
                     ms->parent ? ms->parent->name : std::string_view{},
                     md->name);
             }
+            // §22.16 (v0.240, #2941): public method entry — the class
+            // invariant is evaluated AFTER `requires` clauses (the §22.16
+            // ordering: "requires clauses, then the invariant") and BEFORE
+            // any body execution. Restricted to PUBLIC INSTANCE methods
+            // (§22.16 "The visibility boundary": non-public calls are the
+            // implementation's interior where an algorithm may pass through
+            // broken intermediate states; static methods are exempt per the
+            // never-instrumented list). The this-receiver unchecked-face
+            // refinement is a follow-up — for this slice every public
+            // instance method call goes through the checked face, and the
+            // `insideInvariantCheck_` guard prevents a clause that invokes a
+            // pure public method of the same instance from re-entering the
+            // check (§22.16 "Invariant evaluation itself runs as interior
+            // code, so a clause may call a pure public method of the same
+            // instance without recursion").
+            const bool isPublicInstanceMethod =
+                !isStaticMethod(ms) &&
+                ms->visibility == ast::Visibility::Public &&
+                ms->parent &&
+                ms->parent->kind == ast::TypeDeclKind::Class &&
+                ms->name != std::string_view("Dispose");
+            if (isPublicInstanceMethod) {
+                emitInvariantCheck(currentThis_, ms->parent);
+            }
             // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
             // epilogue before lowering the body. If armed, emitReturn
             // redirects every normal-completion path through the epilogue
             // block, which evaluates the ensures clauses and only then
-            // performs the original ret. Finalized after the body is
-            // complete (below).
+            // performs the original ret. The §22.16 (v0.240, #2941) exit-
+            // edge invariant check (after ensures, before ret) is wired
+            // through the `invariantClass` parameter. Finalized after the
+            // body is complete (below).
             armEnsuresEpilogue(fn, md->contractClauses, md->returnType.get(),
                                ms->parent ? ms->parent->name
                                           : std::string_view{},
-                               md->name);
+                               md->name,
+                               isPublicInstanceMethod ? ms->parent : nullptr);
         }
     }
 
@@ -8966,12 +9115,18 @@ void Emitter::emitConstructorBody(sema::ConstructorSymbol* cs, llvm::Function* f
                              "constructor");
         // §22.16 (v0.203, #2053) Slice 4b: arm the ensures single-exit
         // epilogue for the ctor (return type is null — ctor's return is
-        // void, so no result temp). Finalized at body-end (below).
+        // void, so no result temp). Finalized at body-end (below). The
+        // §22.16 (v0.240, #2941) invariant check at construction exit is
+        // wired at the `new` site, NOT in the ctor body — a base ctor
+        // completing mid-chain is not an instrumentation point, so the
+        // epilogue-level invariantClass here is null (every ctor is
+        // potentially mid-chain from the calling ctor's perspective).
         armEnsuresEpilogue(fn, cd->contractClauses,
                            /*returnTypeNode=*/nullptr,
                            cs->parent ? cs->parent->name
                                       : std::string_view{},
-                           "constructor");
+                           "constructor",
+                           /*invariantClass=*/nullptr);
     }
 
     // CG16 (§12.8): a leading `base(...)`/`this(...)` chain call runs
