@@ -14849,6 +14849,43 @@ void Emitter::registerUnwindOwnedParam(sema::Symbol* psym,
             return;
         }
     }
+    // fix #3033 / §28.3 / §28.11 (v0.240): the SAME shape as the #1957 builtin
+    // branch above, one family further out — a COLLECTION-typed `owned`
+    // parameter (`OwningArray<T>`, `Array<T>`, `OwningDictionary<K,V>`,
+    // `LinkedList<T>`, `Set<T>`, `Stack<T>`, `Queue<T>`, …) is likewise a
+    // compiler-known builtin with NO user TypeSymbol (`rt->declaration ==
+    // nullptr`), so `isClassOrInterfaceRef` below rejects it and the §28.3
+    // auto-drop registration was skipped entirely — the container's backing
+    // (`bz_array_t` / `bz_dict_t` / `bz_llist_t`) and, for the owning family,
+    // every element it still held were never freed. The compiler had already
+    // promised otherwise, in the very diagnostic that fires at this site:
+    // "owned parameter `elements` is implicitly disposed at the end of the
+    // method (§28.3 auto-drop)". §28.3 (v0.240, line 6621): "Every owned local
+    // (and undischarged `owned` parameter) is disposed exactly once on every
+    // path by the affine auto-drop"; §28.11 for the owning family: "The
+    // collection's `Dispose()` cascades through every element."
+    //
+    // The classification is NOT re-derived here: `buildCollectionTempDisposal`
+    // is the existing (slot, TypeRef) → Disposal helper that already picks the
+    // right runtime free and the right per-element/per-value disposer from
+    // `elementPolicyFor`, and is the same selection `registerUsingDisposal`
+    // makes for a named `using var` collection local. Reusing it is what keeps
+    // the auto-drop and `using var` spellings from drifting.
+    //
+    // SCOPED to the auto-drop (never-discharged) case deliberately. A collection
+    // param that IS discharged on the normal path (moved / returned / disposed)
+    // would need an unwind-ONLY entry, but the collection/dict/linkedList
+    // branches of `emitDisposals` carry no `releaseOnUnwindOnly` gate and do not
+    // null the slot after freeing, so registering one would double-free on an
+    // unwind that follows the discharge. That residual (an owned collection
+    // param leaking on the exception edge before its discharge point) is
+    // pre-existing and left untouched here; filed separately.
+    if (ps->autoDropAtScopeEnd &&
+        (isLinkedListTypeName(rt) || isDictTypeName(rt) ||
+         isCollectionTypeName(rt))) {
+        disposeStack_.front().push_back(buildCollectionTempDisposal(slot, rt));
+        return;
+    }
     if (!isClassOrInterfaceRef(rt) && !isClassOrInterfaceRef(resolveTypeParamRef(rt)))
         return;
     Disposal d{slot, nullptr};

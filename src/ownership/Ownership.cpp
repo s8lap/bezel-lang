@@ -700,6 +700,18 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                     // disposal obligation; a borrow parameter is never Owned here.
                     if (ps->modifier == "owned") {
                         ps->autoDropAtScopeEnd = true;
+                        // fix #3033 / §28.10 (v0.240): the fourth remedy used to
+                        // read "rebind it with `using var`", naming a spelling
+                        // that is NOT a discharge. §28.10 *Adopting a named owned
+                        // binding*, verbatim: "An **unmarked** `using var y := x;`
+                        // where `x` is a named owned binding does *not* adopt: it
+                        // is a borrow, pinned per the subsection below, and `x`
+                        // retains the obligation." Only the MARKED form adopts —
+                        // "`using var y := owned x;` transfers a named owned local
+                        // or `owned` parameter into a scope-bound binding: `y`
+                        // takes over the disposal obligation". So a user who
+                        // followed the old text verbatim got this same warning
+                        // again and no discharge; name the marker.
                         ctx_.diagnostics().report(
                             Severity::Warning,
                             st.obligationOrigin ? st.obligationOrigin->span.begin
@@ -708,8 +720,12 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                             std::string(sym->name) +
                             "` is implicitly disposed at the end of the method "
                             "(§28.3 auto-drop); `move` / `return` / `.Dispose()` "
-                            "it, or rebind it with `using var`, to discharge it "
-                            "explicitly");
+                            "it, or adopt it with `using var " +
+                            std::string(sym->name) + "2 := owned " +
+                            std::string(sym->name) +
+                            ";` (the `owned` marker is required — an unmarked "
+                            "`using var` rebind is a borrow-pin, §28.10), to "
+                            "discharge it explicitly");
                         continue;
                     }
                 }
