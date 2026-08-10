@@ -6457,6 +6457,22 @@ private:
     ArrEnumMachinery ensureStackEnumMachinery(llvm::Type* elemTy);
     llvm::Value* wrapStackAsIEnumerator(llvm::Value* arr,
                                         const sema::TypeRef* iEnumTy);
+    // fix #2987 (§28.3 / §28.9 / §29.2, v0.240): the OWNING sibling of
+    // wrapStackAsIEnumerator — same 4-field struct layout ({vtable, arr, idx,
+    // esz}, populated identically: idx = bz_array_len(arr) for the §4.11
+    // pop-order before-first cursor), but the vtable's slot-1 Dispose frees
+    // the backing array AND the wrapper frame in one call
+    // (`bz_array_free(self->arr, null); free(self)`). Slot 4 stamps fresh
+    // NON-owning clones (GetEnumerator) so a per-loop enumerator disposes
+    // only its own struct while the wrapper owns the array exactly once.
+    // Used at the §29.2 local-decl coercion when the source is an unbound
+    // `new` (the local-decl site's "sole owner" shape) — mirrors
+    // wrapOwnedArrayAsIEnumerable's role for Array/OwningArray/OwningBuffer/
+    // Queue/OwningQueue. For borrowed sources (a named local already owned
+    // elsewhere, a parameter, a field), keep the plain borrowing wrap so the
+    // shared source is not double-freed.
+    llvm::Value* wrapOwnedStackAsIEnumerator(llvm::Value* arr,
+                                             const sema::TypeRef* iEnumTy);
 
     // §29 / §12.9 (#1850): wrap an array-backed collection whose ELEMENTS are
     // themselves array-backed collections viewed covariantly as IEnumerable<T>
@@ -6628,6 +6644,33 @@ private:
     // started-flag needed (exhaustion is next_node == null).
     llvm::Value* wrapLinkedListAsIEnumerable(llvm::Value* list,
                                              const sema::TypeRef* iEnumTy);
+    // fix #2987 (§28.3 / §28.9 / §29.2, v0.240): the OWNING sibling of
+    // wrapLinkedListAsIEnumerable — same 4-field struct layout ({vtable, list,
+    // current, next}) and the same node-walking MoveNext/Current, but the
+    // vtable's slot-1 Dispose frees the backing list AND the wrapper frame
+    // (`bz_llist_free(self->list, null); free(self)`). Slot 4 stamps fresh
+    // NON-owning clones (GetEnumerator) so a per-loop enumerator disposes
+    // only its own struct while the wrapper owns the list exactly once.
+    // Used at the §29.2 local-decl coercion when the source is an unbound
+    // `new` — the local-decl site's "sole owner" shape — mirroring
+    // wrapOwnedArrayAsIEnumerable's role for Array-family. For borrowed
+    // sources (a named local already owned elsewhere, a parameter, a field),
+    // keep the plain borrowing wrap so the shared source is not double-freed.
+    llvm::Value* wrapOwnedLinkedListAsIEnumerable(llvm::Value* list,
+                                                  const sema::TypeRef* iEnumTy);
+    // fix #2987 / #1069: cached (struct type + plain vtable) machinery for
+    // the LinkedList<T> IEnumerable wrapper. Both wrapLinkedListAsIEnumerable
+    // (the named-source / shared-source borrowing wrap) and
+    // wrapOwnedLinkedListAsIEnumerable (the unbound-`new` OWNING wrap, #2987)
+    // share this machinery — the OWNING wrap only adds a slot-1 OWNING Dispose
+    // and an OWNING vtable that points at it. Cached/keyed by element type via
+    // the "llenum.<elem>" struct name and "bz$llenum$<elem>$" function prefix,
+    // so one set per element type per module.
+    struct LlEnumMachinery {
+        llvm::StructType* stTy = nullptr;
+        llvm::GlobalVariable* vtGV = nullptr;
+    };
+    LlEnumMachinery ensureLinkedListEnumMachinery(llvm::Type* elemTy);
 
     // #2471 (stdlib §4.8/§4.12; language spec §29.1, v0.236): wrap a
     // Dictionary<K,V>'s entries as a vtable-backed IEnumerable<DictionaryEntry<K,V>>.

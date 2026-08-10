@@ -7761,6 +7761,154 @@ llvm::Value* Emitter::wrapStackAsIEnumerator(llvm::Value* arr,
     return en;
 }
 
+// fix #2987 (§28.3 / §28.9 / §29.2, v0.240): the OWNING sibling of
+// wrapStackAsIEnumerator. Same 4-field struct layout ({vtable, arr, idx, esz})
+// and same before-first cursor (idx = bz_array_len(arr) — runtime value, for
+// §4.11 pop order), but a SEPARATE vtable whose slot-1 Dispose frees the
+// backing bz_array AND the wrapper frame in one call. Mirror of
+// wrapOwnedArrayAsIEnumerable for the reverse-order Stack machinery —
+// ensureStackEnumMachinery itself is unchanged (it still builds the BORROWING
+// vtable the non-`new` local-decl cases, the explicit-GetEnumerator path, and
+// the argument/return coercions reuse); this is the lone OWNING variant the
+// "unbound `new` Stack" local-decl case needs. Slot-1 Dispose walks the
+// wrapper struct (same struct type as the plain wrap) to free the bz_array
+// the wrapper OWNS — the snapshotted idx/esz are not part of the owning
+// responsibility. Slot 4 stamps fresh NON-owning clones (GetEnumerator) so a
+// per-loop enumerator disposes only its own struct while the wrapper owns the
+// array exactly once at the local's scope end (§28.3 — leak-free, no
+// double-free). Element-disposer-less bz_array_free is correct at the
+// local-decl site because the source is an unbound `new` by construction, so
+// it is EMPTY (a collection constructor argument is a capacity, not contents,
+// per stdlib §4.4), which is the same predicate #2975 manifestation 3 used to
+// gate the Array local-decl fix.
+llvm::Value* Emitter::wrapOwnedStackAsIEnumerator(llvm::Value* arr,
+                                                  const sema::TypeRef* iEnumTy) {
+    llvm::Type* elemTy = i32();
+    if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
+        elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
+    // Reuse the plain struct type (same layout: vtable, arr, idx, esz) and the
+    // plain MoveNext/Current functions (direction is purely an idx-encoding
+    // detail; the wrapper struct is identical). esz is shared too — both
+    // forward and reverse wrappers index with the same element stride.
+    ArrEnumMachinery m = ensureStackEnumMachinery(elemTy);
+    llvm::StructType* stTy = m.stTy;
+
+    // Element-name key (same scheme as ensureStackEnumMachinery) so the
+    // owning Dispose / GetEnumerator / vtable are created once per element
+    // type and shared across every OWNING Stack wrap in the module.
+    std::string elemName = elemTy->isIntegerTy() ?
+        ("i" + std::to_string(elemTy->getIntegerBitWidth())) :
+        (elemTy->isPointerTy() ? "ptr" : "f");
+    std::string plainPrefix = "bz$stackenum$" + elemName + "$";
+    std::string prefix = "bz$stackenumown$" + elemName + "$";
+
+    // Owning Dispose: bz_array_free(self->arr, null); free(self).
+    auto* dispFn = module_->getFunction(prefix + "Dispose");
+    if (!dispFn) {
+        dispFn = llvm::Function::Create(
+            llvm::FunctionType::get(llvm::Type::getVoidTy(llvm_), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "Dispose", module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", dispFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = dispFn->arg_begin();
+        llvm::Value* arrPtr = b.CreateLoad(ptrTy(),
+            b.CreateStructGEP(stTy, self, 1));
+        auto* freeArrFn = module_->getOrInsertFunction(
+            "bz_array_free", llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false))
+            .getCallee();
+        b.CreateCall(
+            llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()}, false),
+            freeArrFn, {arrPtr, llvm::ConstantPointerNull::get(ptrTy())});
+        auto* freeFn = module_->getOrInsertFunction(
+            "free", llvm::FunctionType::get(
+                llvm::Type::getVoidTy(llvm_), {ptrTy()}, false)).getCallee();
+        b.CreateCall(llvm::FunctionType::get(
+            llvm::Type::getVoidTy(llvm_), {ptrTy()}, false), freeFn, {self});
+        b.CreateRetVoid();
+    }
+
+    // Owning GetEnumerator: a fresh NON-owning clone over the same shared
+    // array (the plain BORROWING machinery's vtable — `m.vtGV` — is what
+    // keeps a per-loop enumerator from freeing the shared array). Positioned
+    // before the first element (idx = bz_array_len(arr), re-fetched fresh
+    // in THIS clone — never copied from `self`'s idx, which may already be
+    // partway through its own walk) so a second `for`/manual walk over the
+    // same source replays the §4.11 top-to-bottom pop order from the top,
+    // per §29.11. Mirrors the plain machinery's GetEnumerator field-for-field
+    // except for the vtable stamp.
+    auto* geFn = module_->getFunction(prefix + "GetEnumerator");
+    if (!geFn) {
+        geFn = llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "GetEnumerator",
+            module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", geFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = geFn->arg_begin();
+        uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
+        auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+        auto* callocC = module_->getOrInsertFunction("calloc", callocFT).getCallee();
+        llvm::Value* clone = b.CreateCall(callocFT, callocC,
+            {llvm::ConstantInt::get(i64(), 1),
+             llvm::ConstantInt::get(i64(), (int64_t)cloneSz)});
+        // Clone gets the NON-owning vtable (borrows the array — the OWNING
+        // wrapper above is the array's sole owner).
+        b.CreateStore(m.vtGV, b.CreateStructGEP(stTy, clone, 0));
+        llvm::Value* arrCp = b.CreateLoad(ptrTy(),
+            b.CreateStructGEP(stTy, self, 1));
+        b.CreateStore(arrCp, b.CreateStructGEP(stTy, clone, 1));
+        llvm::Value* eszCp = b.CreateLoad(i64(),
+            b.CreateStructGEP(stTy, self, 3));
+        b.CreateStore(eszCp, b.CreateStructGEP(stTy, clone, 3));
+        // before-first cursor: idx = bz_array_len(arr) — fresh fetch, not
+        // copied from `self` (the §4.11 pop-order before-first is a RUNTIME
+        // value, not a fixed sentinel).
+        auto* lenFT = llvm::FunctionType::get(i64(), {ptrTy()}, false);
+        auto* lenFn2 = module_->getOrInsertFunction("bz_array_len", lenFT)
+            .getCallee();
+        llvm::Value* len = b.CreateCall(lenFT, lenFn2, {arrCp});
+        b.CreateStore(len, b.CreateStructGEP(stTy, clone, 2));
+        b.CreateRet(clone);
+    }
+
+    // Owning vtable: [0]=self, [1]=owning Dispose, [2]=plain MoveNext,
+    // [3]=plain Current, [4]=owning GetEnumerator. Slots 2/3 reuse the plain
+    // machinery's functions (the direction-only change lives in the cursor
+    // encoding, which they don't touch).
+    auto* mnFn = module_->getFunction(plainPrefix + "MoveNext");
+    auto* curFn = module_->getFunction(plainPrefix + "Current");
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getGlobalVariable(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: self-ptr (below)
+            dispFn, mnFn, curFn, geFn
+        };
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
+    // Allocate + fill the OWNING enumerator instance { owningVt, arr, idx=len, esz }.
+    uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
+    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+    llvm::Value* en = builder_.CreateCall(callocFn2,
+        {builder_.getInt64(1), builder_.getInt64(stSz)}, "stkenumown");
+    builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, en, 0));
+    builder_.CreateStore(arr, builder_.CreateStructGEP(stTy, en, 1));
+    auto* lenFn = declareC("bz_array_len", i64(), {ptrTy()});
+    llvm::Value* len = builder_.CreateCall(lenFn, {arr});
+    builder_.CreateStore(len, builder_.CreateStructGEP(stTy, en, 2));
+    builder_.CreateStore(builder_.getInt64(m.esz),
+        builder_.CreateStructGEP(stTy, en, 3));
+    return en;
+}
+
 // §29 / §12.9 (#1850): a factory `ptr F(ptr backing)` wrapping a bz_array_t*
 // `backing` (whose static type is `storedTy`) as the covariant view `viewTy`.
 //
@@ -8145,20 +8293,18 @@ llvm::Value* Emitter::wrapNestedArrayAsIEnumerable(llvm::Value* arr,
 }
 
 
-// #1069: node-walking IEnumerable wrapper for (Owned)LinkedList<T>. Mirrors
-// wrapArrayAsIEnumerable but the cursor is a bz_llist node pointer rather than an
-// index. Struct { ptr vtable, ptr llist, ptr current_node, ptr next_node }:
-//   - next_node    : the node MoveNext will return next (init = first node).
-//   - current_node : the node Current reads (set by MoveNext).
-// Exhaustion is next_node == null; no started-flag is needed. The wrapper SHARES
-// the list (no ownership), so an owning list still disposes its elements once at
-// its binder's scope end; Dispose just frees the enumerator struct.
-llvm::Value* Emitter::wrapLinkedListAsIEnumerable(llvm::Value* list,
-                                                  const sema::TypeRef* iEnumTy) {
-    llvm::Type* elemTy = i32();
-    if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
-        elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
-
+// fix #2987 / #1069: shared machinery for the LinkedList/T> IEnumerable
+// wrapper — the cached struct type, the plain (BORROWING) Dispose, the
+// node-walking MoveNext/Current, the GetEnumerator that re-positions a fresh
+// clone before the head, and the BORROWING vtable. Both wrapLinkedListAsIEnumerable
+// (the named-source / shared-source borrowing wrap) and
+// wrapOwnedLinkedListAsIEnumerable (the unbound-`new` OWNING wrap, #2987) share
+// this single machinery — the OWNING wrap only adds a slot-1 OWNING Dispose
+// and an OWNING vtable that points at it. Cached/keyed by element type via
+// the "llenum.<elem>" struct name and "bz$llenum$<elem>$" function prefix,
+// so one set per element type per module.
+Emitter::LlEnumMachinery Emitter::ensureLinkedListEnumMachinery(llvm::Type* elemTy) {
+    LlEnumMachinery m;
     std::string elemName = elemTy->isIntegerTy()
         ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
         : (elemTy->isPointerTy() ? "ptr" : "f");
@@ -8283,11 +8429,174 @@ llvm::Value* Emitter::wrapLinkedListAsIEnumerable(llvm::Value* list,
         vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
     }
 
+    m.stTy = stTy;
+    m.vtGV = vtGV;
+    return m;
+}
+
+// #1069: node-walking IEnumerable wrapper for (Owned)LinkedList<T>. Mirrors
+// wrapArrayAsIEnumerable but the cursor is a bz_llist node pointer rather than an
+// index. Struct { ptr vtable, ptr llist, ptr current_node, ptr next_node }:
+//   - next_node    : the node MoveNext will return next (init = first node).
+//   - current_node : the node Current reads (set by MoveNext).
+// Exhaustion is next_node == null; no started-flag is needed. The wrapper SHARES
+// the list (no ownership), so an owning list still disposes its elements once at
+// its binder's scope end; Dispose just frees the enumerator struct.
+llvm::Value* Emitter::wrapLinkedListAsIEnumerable(llvm::Value* list,
+                                                  const sema::TypeRef* iEnumTy) {
+    llvm::Type* elemTy = i32();
+    if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
+        elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
+    LlEnumMachinery m = ensureLinkedListEnumMachinery(elemTy);
+    llvm::StructType* stTy = m.stTy;
+    llvm::GlobalVariable* vtGV = m.vtGV;
+
     // Allocate and fill the enumerator: { vtable, list, current=null, next=first }.
     uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
     auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
     llvm::Value* en = builder_.CreateCall(callocFn2,
         {builder_.getInt64(1), builder_.getInt64((int64_t)stSz)}, "llenum");
+    builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, en, 0));
+    builder_.CreateStore(list, builder_.CreateStructGEP(stTy, en, 1));
+    builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                         builder_.CreateStructGEP(stTy, en, 2));  // current
+    auto* firstFn = declareC("bz_llist_first_node", ptrTy(), {ptrTy()});
+    llvm::Value* first = builder_.CreateCall(firstFn, {list}, "ll.first");
+    builder_.CreateStore(first, builder_.CreateStructGEP(stTy, en, 3));  // next
+    return en;
+}
+
+// fix #2987 (§28.3 / §28.9 / §29.2, v0.240): the OWNING sibling of
+// wrapLinkedListAsIEnumerable. Same 4-field struct layout ({vtable, list,
+// current, next}) and the same node-walking MoveNext/Current bodies (both
+// reused from ensureLinkedListEnumMachinery's plain machinery, since the
+// node-walking logic never touches element ownership), but a SEPARATE vtable
+// whose slot-1 Dispose frees the backing bz_llist AND the wrapper frame in
+// one call. Mirror of wrapOwnedArrayAsIEnumerable for the LinkedList
+// machinery — the plain wrap's struct type and MoveNext/Current functions are
+// unchanged (still keyed on element type); this is the lone OWNING variant
+// the "unbound `new` LinkedList" local-decl case needs. Slot 4 stamps fresh
+// NON-owning clones (GetEnumerator) so a per-loop enumerator disposes only
+// its own struct while the wrapper owns the list exactly once at the local's
+// scope end (§28.3 — leak-free, no double-free). Element-disposer-less
+// bz_llist_free is correct at the local-decl site because the source is an
+// unbound `new` by construction, so it is EMPTY (no constructor takes
+// elements; collection constructors reserve a node pool, not contents —
+// mirroring #2975 manifestation 3's empty-by-construction predicate).
+llvm::Value* Emitter::wrapOwnedLinkedListAsIEnumerable(
+        llvm::Value* list, const sema::TypeRef* iEnumTy) {
+    llvm::Type* elemTy = i32();
+    if (iEnumTy && !iEnumTy->genericArgs.empty() && iEnumTy->genericArgs[0])
+        elemTy = lowerTypeRef(iEnumTy->genericArgs[0]);
+    // Ensure the plain machinery exists (struct type, plain Dispose, plain
+    // MoveNext, plain Current, plain GetEnumerator, plain vtable) — the OWNING
+    // wrap reuses slots 2/3 of the OWNING vtable (MoveNext/Current, identical
+    // bodies, never touch ownership) and stamps GetEnumerator clones with the
+    // plain vtable (so per-loop enumerators free only their own struct).
+    LlEnumMachinery m = ensureLinkedListEnumMachinery(elemTy);
+    llvm::StructType* stTy = m.stTy;
+    llvm::GlobalVariable* plainVtGV = m.vtGV;
+
+    std::string elemName = elemTy->isIntegerTy()
+        ? ("i" + std::to_string(elemTy->getIntegerBitWidth()))
+        : (elemTy->isPointerTy() ? "ptr" : "f");
+    std::string plainPrefix = "bz$llenum$" + elemName + "$";
+    std::string prefix = "bz$llenumown$" + elemName + "$";
+    auto* voidTy = llvm::Type::getVoidTy(llvm_);
+
+    // --- Owning Dispose: bz_llist_free(self->list, null); free(self).
+    auto* dispFn = module_->getFunction(prefix + "Dispose");
+    if (!dispFn) {
+        dispFn = llvm::Function::Create(
+            llvm::FunctionType::get(voidTy, {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "Dispose",
+            module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", dispFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = dispFn->arg_begin();
+        llvm::Value* listPtr = b.CreateLoad(ptrTy(),
+            b.CreateStructGEP(stTy, self, 1));
+        auto* freeLstFn = module_->getOrInsertFunction(
+            "bz_llist_free",
+            llvm::FunctionType::get(voidTy, {ptrTy(), ptrTy()}, false))
+            .getCallee();
+        b.CreateCall(
+            llvm::FunctionType::get(voidTy, {ptrTy(), ptrTy()}, false),
+            freeLstFn, {listPtr, llvm::ConstantPointerNull::get(ptrTy())});
+        auto* freeFn = module_->getOrInsertFunction(
+            "free", llvm::FunctionType::get(voidTy, {ptrTy()}, false))
+            .getCallee();
+        b.CreateCall(llvm::FunctionType::get(voidTy, {ptrTy()}, false),
+                     freeFn, {self});
+        b.CreateRetVoid();
+    }
+
+    // --- Owning GetEnumerator: fresh NON-owning clone over the same shared
+    // list. Stamped with the PLAIN vtable (slot 1 Dispose = free(self) only,
+    // never the shared backing list) so a per-loop enumerator disposes only
+    // its own struct — exactly the contract the borrowing wrap already gives
+    // every named-source LinkedList caller. Slots 2/3 are the same plain
+    // MoveNext/Current bodies, so iteration order matches the borrowing
+    // wrapper field-for-field (§29.11 re-iterability).
+    auto* geFn = module_->getFunction(prefix + "GetEnumerator");
+    if (!geFn) {
+        geFn = llvm::Function::Create(
+            llvm::FunctionType::get(ptrTy(), {ptrTy()}, false),
+            llvm::Function::InternalLinkage, prefix + "GetEnumerator",
+            module_.get());
+        auto* bb = llvm::BasicBlock::Create(llvm_, "entry", geFn);
+        llvm::IRBuilder<> b(bb);
+        llvm::Value* self = geFn->arg_begin();
+        uint64_t cloneSz = module_->getDataLayout().getTypeAllocSize(stTy);
+        auto* callocFT = llvm::FunctionType::get(ptrTy(), {i64(), i64()}, false);
+        auto* callocC = module_->getOrInsertFunction("calloc", callocFT)
+                            .getCallee();
+        llvm::Value* clone = b.CreateCall(callocFT, callocC,
+            {llvm::ConstantInt::get(i64(), 1),
+             llvm::ConstantInt::get(i64(), (int64_t)cloneSz)});
+        // Clone gets the PLAIN (BORROWING) vtable — same plainVtGV the
+        // borrowing wrap uses for named sources, so the per-loop enumerator
+        // frees only its own struct.
+        b.CreateStore(plainVtGV, b.CreateStructGEP(stTy, clone, 0));
+        llvm::Value* lst = b.CreateLoad(ptrTy(),
+            b.CreateStructGEP(stTy, self, 1));
+        b.CreateStore(lst, b.CreateStructGEP(stTy, clone, 1));
+        auto* firstFT = llvm::FunctionType::get(ptrTy(), {ptrTy()}, false);
+        auto* firstFn = module_->getOrInsertFunction("bz_llist_first_node",
+                                                     firstFT).getCallee();
+        llvm::Value* first = b.CreateCall(firstFT, firstFn, {lst});
+        b.CreateStore(first, b.CreateStructGEP(stTy, clone, 3));  // next
+        b.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),
+                      b.CreateStructGEP(stTy, clone, 2));         // current
+        b.CreateRet(clone);
+    }
+
+    // --- Owning vtable: [0]=self, [1]=owning Dispose, [2]=plain MoveNext,
+    // [3]=plain Current, [4]=owning GetEnumerator. MoveNext/Current reuse
+    // the plain machinery (the node-walking bodies never touch element
+    // ownership; only slot 1's Dispose determines who frees the backing).
+    auto* mnFn = module_->getFunction(plainPrefix + "MoveNext");
+    auto* curFn = module_->getFunction(plainPrefix + "Current");
+    std::string vtName = prefix + "vtable";
+    auto* vtGV = module_->getGlobalVariable(vtName);
+    if (!vtGV) {
+        auto* vtTy = llvm::ArrayType::get(ptrTy(), 5);
+        std::vector<llvm::Constant*> elems = {
+            llvm::ConstantPointerNull::get(ptrTy()),  // slot 0: self-ptr (below)
+            dispFn, mnFn, curFn, geFn
+        };
+        vtGV = new llvm::GlobalVariable(*module_, vtTy, /*isConst=*/true,
+            llvm::GlobalValue::InternalLinkage,
+            llvm::ConstantArray::get(vtTy, elems), vtName);
+        elems[0] = llvm::ConstantExpr::getPointerCast(vtGV, ptrTy());
+        vtGV->setInitializer(llvm::ConstantArray::get(vtTy, elems));
+    }
+
+    // Allocate + fill the OWNING enumerator instance { owningVt, list, current=null, next=first }.
+    uint64_t stSz = module_->getDataLayout().getTypeAllocSize(stTy);
+    auto* callocFn2 = declareC("calloc", ptrTy(), {i64(), i64()});
+    llvm::Value* en = builder_.CreateCall(callocFn2,
+        {builder_.getInt64(1), builder_.getInt64((int64_t)stSz)}, "llenumown");
     builder_.CreateStore(vtGV, builder_.CreateStructGEP(stTy, en, 0));
     builder_.CreateStore(list, builder_.CreateStructGEP(stTy, en, 1));
     builder_.CreateStore(llvm::ConstantPointerNull::get(ptrTy()),

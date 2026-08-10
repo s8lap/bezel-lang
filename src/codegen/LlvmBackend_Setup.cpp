@@ -11457,10 +11457,30 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                     // reverse machinery as the argument/return sites and the
                     // explicit .GetEnumerator()/for-loop paths) instead of the
                     // forward wrapArrayAsIEnumerable, so all coercion
-                    // positions agree on top-to-bottom (pop) order. Still a
-                    // plain BORROW — same contract as the unchanged
+                    // positions agree on top-to-bottom (pop) order). Still a
+                    // plain BORROW by default — same contract as the unchanged
                     // wrapArrayAsIEnumerable call below.
-                    v = wrapStackAsIEnumerator(v, declTR);
+                    //
+                    // fix #2987 (§28.3 / §28.9 / §29.2, v0.240): an UNBOUND
+                    // `new` of a Stack/OwingStack bound here is the SAME shape
+                    // #2975 manifestation 3 fixed for Array/Queue/OwningBuffer,
+                    // but with a different fix shape — there is no OWNING
+                    // forward-machinery variant, only the borrowing
+                    // wrapStackAsIEnumerator existed. Free the source backing
+                    // at the declaration site is unsound (the local is iterated
+                    // *after* the declaration — see issue body); the
+                    // structurally correct fix is an OWNING variant of the
+                    // reverse machinery (wrapOwnedStackAsIEnumerator), exactly
+                    // mirroring wrapOwnedArrayAsIEnumerable's role for the
+                    // forward machinery. Gated on the initializer being a
+                    // `new` EXPRESSION for the same alias-rejection reason as
+                    // the Array case: a producer-init IDENTIFIER source is
+                    // still owned by that identifier and taking ownership here
+                    // would DOUBLE-FREE it. A `new` at this site is bound to
+                    // no other name by construction.
+                    v = (dynamic_cast<const ast::NewExpr*>(init) != nullptr)
+                        ? wrapOwnedStackAsIEnumerator(v, declTR)
+                        : wrapStackAsIEnumerator(v, declTR);
                 // fix #2975 manifestation 3 (§28.3 / §28.9 / §29.2, v0.240):
                 // an UNBOUND `new` of an array-family collection widened at
                 // this decl site. `wrapArrayAsIEnumerable` builds a BORROWING
@@ -11505,16 +11525,57 @@ void Emitter::lowerLocalDecl(const ast::Node* declNode, const ast::Expr* init,
                 // untouched, so an owning set still disposes each element exactly
                 // once at its own binder's scope end. registerIterableSourceDisposal
                 // frees the snapshot at this local's scope end (`wrappedHere`).
+                //
+                // fix #2987 (§28.3 / §28.9 / §29.2, v0.240): the snapshot is
+                // INDEPENDENT of the source set (it owns its own key table — the
+                // §389 `bz_lazy_from_set` API materialises a fresh key snapshot,
+                // distinct from the live source), so it is sound to free the
+                // source right here at the local-decl site for the same
+                // "unbound `new` ⇒ sole owner" shape the RETURN coercion's
+                // #2299 fix transplanted (`freeDictSourceNow(v)` under
+                // `srcOwnedByCallee`). Gated on the initializer being a `new`
+                // EXPRESSION for the same alias-rejection reason the Array
+                // arm uses: a producer-init IDENTIFIER source is still owned
+                // by that identifier and freeing it here would DOUBLE-FREE
+                // when the identifier's own scope end fires. A `new` at this
+                // site is bound to no other name by construction. MEASURED on
+                // the pre-fix compiler: 200 iterations of `using var e:
+                // IEnumerable<int> := new Set<int>();` leaked 17600 bytes in
+                // 200 allocations under LSan.
                 uint64_t ksz = 0;
                 genericBackingType(initTR, 0, /*isSet=*/true, &ksz);
+                llvm::Value* srcSet = v;  // capture the source set BEFORE the snapshot
                 auto* setFn = declareC("bz_lazy_from_set", ptrTy(), {ptrTy(), i64()});
                 llvm::Value* lazy = builder_.CreateCall(
-                    setFn, {v, builder_.getInt64((int64_t)ksz)}, "setenum.lazy");
+                    setFn, {srcSet, builder_.getInt64((int64_t)ksz)}, "setenum.lazy");
                 v = drainLazyPipelineToOwnedIEnumerable(lazy, declTR);
+                if (dynamic_cast<const ast::NewExpr*>(init) != nullptr)
+                    freeDictSourceNow(srcSet);
             } else if (initTR && isLinkedListTypeName(initTR)) {
                 // #1177: (Owned)LinkedList<T> is node-based (bz_llist) — wrap
                 // with the node-walking enumerator, mirroring buildOrderedArgs.
-                v = wrapLinkedListAsIEnumerable(v, declTR);
+                // Still a plain BORROW by default — same contract as the
+                // unchanged #1069/#1177 case the borrowing wrap gives every
+                // named-source LinkedList caller.
+                //
+                // fix #2987 (§28.3 / §28.9 / §29.2, v0.240): an UNBOUND `new`
+                // of an (Owned)LinkedList bound here is the SAME shape the
+                // Array and Stack local-decl fixes address, with the same
+                // alias-rejection predicate — a producer-init IDENTIFIER
+                // source is still owned by that identifier, so taking
+                // ownership here would DOUBLE-FREE it. A `new` at this site
+                // is bound to no other name by construction. Use the OWNING
+                // wrap instead: its slot-1 Dispose frees the backing bz_llist
+                // AND the wrapper frame, exactly once, mirroring
+                // wrapOwnedArrayAsIEnumerable for the array family. MEASURED
+                // on the pre-fix compiler: 200 iterations of `using var e:
+                // IEnumerable<int> := new LinkedList<int>();` leaked 11144
+                // bytes in 199 allocations under LSan (issue body #2987
+                // "manifestation 3, NOT measured" — now measured at this
+                // fix's commit).
+                v = (dynamic_cast<const ast::NewExpr*>(init) != nullptr)
+                    ? wrapOwnedLinkedListAsIEnumerable(v, declTR)
+                    : wrapLinkedListAsIEnumerable(v, declTR);
             } else if (initTR && isLazyEnumerableType(initTR)) {
                 // #1911 / stdlib §5 / §29.11: a lazy LINQ pipeline (Select/Where/…
                 // → a bz_lazy_t*) bound to an EXPLICIT `IEnumerable<T>` local. The
