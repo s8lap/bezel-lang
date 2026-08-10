@@ -591,6 +591,20 @@ public:
     //   IEqualityComparer: Equals(a: T, b: T): bool; GetHashCode(value: T): int
     // Returns nullptr for any non-builtin-interface name.
     TypeSymbol* builtinInterfaceSym(std::string_view name);
+    // fix #3023 (§11.2 / §14.1 / §2.8.3 rule 5, v0.240): a non-creating
+    // lookup for the synthesized builtin interface symbol. Returns the cached
+    // TypeSymbol or `nullptr` if none has been minted yet — never mints one,
+    // which `builtinInterfaceSym` does as a side effect and which mutates
+    // `symbols_` (a `push_back` can reallocate). The only call site that needs
+    // this is `declareVtables` Pass B (LlvmBackend_Setup.cpp:3874), which is
+    // iterating `ctx_.symbols()` and would otherwise invalidate its iterators
+    // by triggering a reallocation from inside the loop body. Every other
+    // caller of `builtinInterfaceSym` is past sema and outside any
+    // `symbols_` iteration, so the creating form is correct for them.
+    TypeSymbol* builtinInterfaceSymIfCached(std::string_view name) const {
+        auto it = builtinInterfaceCache_.find(std::string(name));
+        return it != builtinInterfaceCache_.end() ? it->second : nullptr;
+    }
 
     // #2776 / #2787: the CLOSED set of builtin interfaces that get a REAL
     // synthesized Interface TypeSymbol (see TypeResolution_Names.cpp's

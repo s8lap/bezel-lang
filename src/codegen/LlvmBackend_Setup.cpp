@@ -3865,10 +3865,22 @@ void Emitter::declareVtables() {
         // Detected by IDENTITY against builtinInterfaceSym (#1867's convention),
         // never by name, so a USER interface that happens to be called
         // `IComparable` keeps ordinary external linkage.
+        // fix #3023 (§11.2 / §14.1 / §2.8.3 rule 5, v0.240): use the non-creating
+        // lookup — `builtinInterfaceSym` mints and push_backs into `symbols_`
+        // on a cache miss, which can reallocate the vector and invalidate the
+        // `ctx_.symbols()` iterators this loop is walking. With a user-
+        // declared `interface IReadOnlySpan<T>` (a builtin-interface NAME),
+        // the cache is cold at this point, so the creating form dropped 8+
+        // new symbols mid-iteration and the dangling iterators silently
+        // skipped the user's class C (it was collected, but the post-
+        // reallocation view of `symbols_` lost it). `descArray_[C]` was
+        // therefore never populated, and Pass D's
+        // `elems[0] = descArray_[ts]` produced a null `llvm::Constant*` that
+        // `llvm::ConstantArray::get` dereferenced → SIGSEGV.
         bool synthesizedBuiltinIface =
             ts->kind == ast::TypeDeclKind::Interface && !ts->name.empty() &&
             sema::SemaContext::isSynthesizedBuiltinInterfaceName(ts->name) &&
-            ts == ctx_.builtinInterfaceSym(ts->name);
+            ts == ctx_.builtinInterfaceSymIfCached(ts->name);
         descArray_[ts] = new llvm::GlobalVariable(
             *module_, arrTy, /*isConstant=*/true,
             synthesizedBuiltinIface
