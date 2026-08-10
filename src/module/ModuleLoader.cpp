@@ -2104,16 +2104,37 @@ static std::string buildSyntheticFieldInitSource(const MetaTypeDecl& td,
 // source omits sibling/base types" limitation (#710 / #2290 bug 2) is a
 // separate, harder shape (a ctor body can reach arbitrary members, not
 // just type names) and remains tracked there.
+//
+// fix #2874 (§2.8.2 / §22.8 step 2, v0.240): added `bool isStatic` parameter.
+// `false` skips the load-time diagnostic on parse/sema failure (a program
+// that merely imports the module without ever constructing the offending
+// generic still has to build, §2.8.2) and replaces the final `decl = parsedFd`
+// attach with `setImportedInstanceFieldInitExpr` — keeping `decl` null so the
+// imported-member layout fallbacks continue to consult `importedMemberType`
+// (storageType / #662). See `importedInstanceFieldInitExpr` (SemaContext.hpp)
+// and the construction-site fallback in `emitOwnFieldInit` for the matching
+// reader side.
 static bool parseAndAttachFieldInit(
     const MetaTypeDecl& td,
     const std::string& moduleName,
     const MetaMember& target,
     sema::FieldSymbol* importedFs,
     const sema::TypeSymbol& importedType,
-    sema::SemaContext& mainCtx) {
+    sema::SemaContext& mainCtx,
+    bool isStatic) {
     std::string source = buildSyntheticFieldInitSource(td, moduleName);
 
     auto reject = [&](const char* reason) {
+        // fix #2874 (§2.8.2, v0.240): the instance-field path MUST NOT become
+        // a load-time reject (a program that merely imports the module
+        // without ever constructing the offending generic still has to build).
+        // The construction-site diagnostic #2860 added to `emitOwnFieldInit`
+        // is the fallback that fires at the offending `new`, naming the field
+        // and initializer shape — the SAME shape §2.8.2 wants named, just
+        // deferred until the construction site that would have observed the
+        // wrong value. Silently return so the text remains in
+        // `importedInstanceFieldInitText` for that path.
+        if (!isStatic) return;
         mainCtx.diagnostics().report(
             Severity::Error, SourceLocation{},
             "cannot import static field '" + td.name + "." + target.name +
@@ -2323,7 +2344,23 @@ static bool parseAndAttachFieldInit(
 
     // Attach: importedFs->decl now points at a live ast::FieldDecl whose
     // `initializer` genericInstSfinitFn's existing loop lowers and stores.
-    importedFs->decl = parsedFd;
+    //
+    // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): for an INSTANCE field,
+    // `decl` MUST stay null — `decl == nullptr` is the discriminator every
+    // imported-member fallback in the backend keys on (storageType /
+    // recordFieldType / isOwnedReferenceField / …). Instead, publish the
+    // parsed initializer into the side table that emitOwnFieldInit reads
+    // ahead of its constant-foldable replay and its construction-site
+    // diagnostic fallback. The Expr* rides in `sf` (kept alive via
+    // ownImportedAst below), so the side-table pointer is valid for the
+    // lifetime of this SemaContext.
+    if (isStatic) {
+        importedFs->decl = parsedFd;
+    } else {
+        if (parsedFd->initializer)
+            mainCtx.setImportedInstanceFieldInitExpr(importedFs,
+                                                     parsedFd->initializer.get());
+    }
     mainCtx.ownImportedSource(std::move(source));
     mainCtx.ownImportedAst(std::move(sf));
     mainCtx.ownImportedAuxiliary(semaDiag);
@@ -2568,24 +2605,40 @@ static void loadMetadataPass2(
             // path on (`storageType`'s `mem->decl == nullptr` guard above all),
             // so attaching one would silently re-route an imported generic's
             // instance layout through a TypeRef resolved in the throwaway
-            // context. `fieldInitText` now also rides an INSTANCE field of a
-            // generic class (ModuleMetadataBuilder), so gate the attach on the
-            // `static` modifier — the shape #2351 was written for — and record
-            // the instance field's text for the §2.8.2 construction-site
-            // diagnostic instead. Running an instance initializer importer-side
-            // (the strictly better outcome §2.8.2 asks for) needs the storage
-            // predicates that classify a member's runtime-managed kind to stop
-            // returning false for an imported member; that is FILED, not guessed
-            // at here.
+            // context.
+            //
+            // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): the strictly better
+            // outcome §2.8.2 wants — carry AND RUN an imported generic's
+            // non-constant instance field initializer — IS now reached, by the
+            // SAME parse-and-attach pipeline as #2351 but with the final
+            // `importedFs->decl = parsedFd` step replaced by
+            // `setImportedInstanceFieldInitExpr(importedFs, parsedFd->initializer)`,
+            // leaving `decl` null so the imported-member layout fallbacks
+            // continue to consult `importedMemberType` (storageType / #662).
+            // A parse/sema failure is a NO-OP for the instance path
+            // (a program that merely imports the offending generic still has
+            // to build, §2.8.2); the construction-site diagnostic #2860 added
+            // is the fallback, and the text in `importedInstanceFieldInitText`
+            // drives it.
             bool isStaticMember = false;
             for (const std::string& mod : mm.modifiers)
                 if (mod == "static") { isStaticMember = true; break; }
             if (isStaticMember) {
                 parseAndAttachFieldInit(td, md.moduleName, mm, importedFs, *t,
-                                        ctx);
+                                        ctx, /*isStatic=*/true);
             } else {
+                // ALWAYS record the source text: emitOwnFieldInit's existing
+                // diagnostic path keys on it when neither the constant-fold
+                // replay NOR the parsed-expr lowering produced a value
+                // (parse failed / parse succeeded but lower returned null).
+                // Cost: one std::string copy per non-static imported field.
                 ctx.setImportedInstanceFieldInitText(importedFs,
                                                      mm.fieldInitText);
+                // fix #2874: best-effort reconstruction. On success the
+                // side-table expr drives emitOwnFieldInit's lower path; on
+                // failure the construction-site diagnostic still fires.
+                parseAndAttachFieldInit(td, md.moduleName, mm, importedFs, *t,
+                                        ctx, /*isStatic=*/false);
             }
         }
 

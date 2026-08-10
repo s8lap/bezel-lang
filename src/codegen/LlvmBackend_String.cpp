@@ -2581,6 +2581,26 @@ const sema::TypeRef* Emitter::recordFieldType(const sema::FieldSymbol* fs) {
     if (auto* fd = dynamic_cast<const ast::FieldDecl*>(fs->decl))
         if (fd->type)
             return ctx_.resolvedType(*fd->type);
+    // fix #2874 (§2.8.2 / §22.8 / §4.6 / §28.9, v0.240): an IMPORTED instance
+    // field's type rides ctx_.importedMemberType(fs) (the loader synthesizes a
+    // null-type posParam only for §9.1 positional-vs-body discrimination, not
+    // the type itself; the type itself is never recoverable from posParam for
+    // a #2516 imported positional field, and fs->decl is null for every
+    // imported member). Without this fallback isStringStorageMember /
+    // isClosureStorageMember / boxStorageFields_-membership all returned false
+    // for EVERY imported generic's instance field — a string field's §4.6
+    // retain is skipped at STORE time (no producer-side release to balance a
+    // missing consumer-side one) AND the §4.6 release is skipped at the
+    // matching DISPOSAL time (no consumer-side release to balance a missing
+    // producer-side one). Today both sides are skipped, so the string is
+    // balanced by accident; flipping the predicate in only ONE place would
+    // convert a leak into a UAF. The two sides read this predicate through
+    // isStringStorageMember / emitStringRetain / bz_string_release at the
+    // SAME site, so a single edit here is the single point of fix.
+    if (!fs->posParam && !fs->decl) {
+        if (const sema::TypeRef* rt = ctx_.importedMemberType(fs))
+            return rt;
+    }
     return nullptr;
 }
 

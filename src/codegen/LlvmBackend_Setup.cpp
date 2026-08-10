@@ -9381,6 +9381,29 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
             init = fd->initializer.get();
         else if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
             init = pd->autoInitializer.get();  // CG33: `property X := v;`
+        // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): an IMPORTED generic
+        // class's instance field initializer whose `fieldInitText` (#2860)
+        // re-parsed and sema-typed successfully at LOAD time — ModuleLoader
+        // published the parsed ast::Expr* into `importedInstanceFieldInitExpr`
+        // (a side table keyed by the imported FieldSymbol; the Expr* rides in
+        // the loader's imported-AST arena so the pointer is valid for the
+        // lifetime of this compilation). Use it as the field's `init` so the
+        // standard lowering path below handles §5.1 widening, §23.1 nullable
+        // wrap, §8.6 box, and §4.6 string/closure retention identically to a
+        // locally-declared field's initializer. The decl stays null per
+        // ModuleLoader.cpp's parse-and-attach contract — the imported-member
+        // layout fallbacks (storageType / recordFieldType) still consult
+        // `importedMemberType`. Set BEFORE the constant-fold replay so a
+        // literal initializer that ALSO folds (e.g. `:= 5`) gets the same
+        // single lowering path either way; the constant-fold replay below is
+        // the legacy fast path for the historical carriage (#2351 only
+        // carried `valueText` for static fields).
+        if (!init && m->decl == nullptr) {
+            if (const ast::Expr* parsedInit =
+                    ctx_.importedInstanceFieldInitExpr(m)) {
+                init = parsedInit;
+            }
+        }
         auto idxIt = fieldIndex_.find(m);
         if (!init && m->decl == nullptr) {
             // fix #2524: imported generic no-ctor bases are monomorphized here,
@@ -9443,7 +9466,18 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
             // `idxIt != end()` is required as well: a member with no slot in
             // THIS struct is not one this walk is responsible for, and
             // complaining about it would be a false reject.
-            if (!replayed && idxIt != fieldIndex_.end()) {
+            //
+            // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): the diagnostic also
+            // gates on `!init`, so a successful load-time reconstruction
+            // (which sets `init` from `importedInstanceFieldInitExpr` above)
+            // FALLS THROUGH to the standard init lowering below — running the
+            // initializer importer-side, which is the strictly better outcome
+            // §2.8.2 wants over the construction-site reject. A failed
+            // reconstruction (or one that lowered to null) leaves `init`
+            // null and the diagnostic still fires — strictly smaller failure
+            // surface than pre-#2874, when EVERY non-constant instance
+            // initializer was rejected.
+            if (!replayed && !init && idxIt != fieldIndex_.end()) {
                 if (const std::string* initText =
                         ctx_.importedInstanceFieldInitText(m)) {
                     const sema::TypeSymbol* owner =
@@ -9482,7 +9516,14 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                             "at its \xC2\xA7""7.9 default (#2860)");
                 }
             }
-            continue;
+            // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): a successful
+            // load-time reconstruction set `init` above, so this loop
+            // iteration falls through to the standard init lowering path —
+            // the initializer RUNS, exactly as it does for a locally-
+            // declared field. Only the no-init case (no source initializer,
+            // or one the reconstruction path could not parse) takes the
+            // `continue` and leaves the field at its §7.9 default.
+            if (!init) continue;
         }
         if (!init) continue;  // no initializer → calloc-zeroed
         if (idxIt == fieldIndex_.end()) continue;
@@ -9501,6 +9542,24 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                 if (fd->type) fieldRt = ctx_.resolvedType(*fd->type);
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
                 if (pd->type) fieldRt = ctx_.resolvedType(*pd->type);
+            // fix #2874 (§2.8.2 / §22.8, v0.240): for an IMPORTED field
+            // (m->decl == nullptr) the field's declared TypeRef rides
+            // ctx_.importedMemberType(m). Without this fallback the §23.1
+            // nullable-value wrap, the §8.6 Object/interface box, the §15.4
+            // collection-literal materialization, and the §5.1 widening all
+            // see a null `fieldRt` — and the lowering either stores a bare
+            // scalar over a {i8,T} slot (clobbering hasValue, the (c)
+            // symptom of #2860), omits the box (storing bits as a pointer),
+            // or treats a heap-collection slot as an inline array (malformed
+            // IR / null). Same fallback every site below uses; see also
+            // recordFieldType (LlvmBackend_String.cpp) which lights up the
+            // §4.6 / §8.6 store-side retain and dispose-side release for the
+            // same predicate.
+            if (!fieldRt) {
+                if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m))
+                    if (ms->decl == nullptr)
+                        fieldRt = ctx_.importedMemberType(ms);
+            }
             if (fieldRt) {
                 if (llvm::Value* arr =
                         materializeHeapCollectionLiteral(cl, fieldRt)) {
@@ -9568,6 +9627,24 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                 if (fd->type) fieldRt = ctx_.resolvedType(*fd->type);
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
                 if (pd->type) fieldRt = ctx_.resolvedType(*pd->type);
+            // fix #2874 (§2.8.2 / §22.8, v0.240): for an IMPORTED field
+            // (m->decl == nullptr) the field's declared TypeRef rides
+            // ctx_.importedMemberType(m). Without this fallback the §23.1
+            // nullable-value wrap, the §8.6 Object/interface box, the §15.4
+            // collection-literal materialization, and the §5.1 widening all
+            // see a null `fieldRt` — and the lowering either stores a bare
+            // scalar over a {i8,T} slot (clobbering hasValue, the (c)
+            // symptom of #2860), omits the box (storing bits as a pointer),
+            // or treats a heap-collection slot as an inline array (malformed
+            // IR / null). Same fallback every site below uses; see also
+            // recordFieldType (LlvmBackend_String.cpp) which lights up the
+            // §4.6 / §8.6 store-side retain and dispose-side release for the
+            // same predicate.
+            if (!fieldRt) {
+                if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m))
+                    if (ms->decl == nullptr)
+                        fieldRt = ctx_.importedMemberType(ms);
+            }
             if (fieldRt) {
                 if (llvm::Value* tbl = materializeHeapDictLiteral(cl, fieldRt)) {
                     builder_.CreateStore(
@@ -9616,6 +9693,24 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                 if (fd->type) fieldRt = ctx_.resolvedType(*fd->type);
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
                 if (pd->type) fieldRt = ctx_.resolvedType(*pd->type);
+            // fix #2874 (§2.8.2 / §22.8, v0.240): for an IMPORTED field
+            // (m->decl == nullptr) the field's declared TypeRef rides
+            // ctx_.importedMemberType(m). Without this fallback the §23.1
+            // nullable-value wrap, the §8.6 Object/interface box, the §15.4
+            // collection-literal materialization, and the §5.1 widening all
+            // see a null `fieldRt` — and the lowering either stores a bare
+            // scalar over a {i8,T} slot (clobbering hasValue, the (c)
+            // symptom of #2860), omits the box (storing bits as a pointer),
+            // or treats a heap-collection slot as an inline array (malformed
+            // IR / null). Same fallback every site below uses; see also
+            // recordFieldType (LlvmBackend_String.cpp) which lights up the
+            // §4.6 / §8.6 store-side retain and dispose-side release for the
+            // same predicate.
+            if (!fieldRt) {
+                if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m))
+                    if (ms->decl == nullptr)
+                        fieldRt = ctx_.importedMemberType(ms);
+            }
             if (fieldRt && isNullableValueTy(fieldRt))
                 v = coerceReturnToNullableValue(v, fieldRt,
                                                 isUnsignedTargetExpr(*init));
@@ -9645,6 +9740,24 @@ void Emitter::emitOwnFieldInit(const sema::TypeSymbol* t, llvm::Value* obj,
                 if (fd->type) fieldRt = ctx_.resolvedType(*fd->type);
             if (auto* pd = dynamic_cast<const ast::PropertyDecl*>(m->decl))
                 if (pd->type) fieldRt = ctx_.resolvedType(*pd->type);
+            // fix #2874 (§2.8.2 / §22.8, v0.240): for an IMPORTED field
+            // (m->decl == nullptr) the field's declared TypeRef rides
+            // ctx_.importedMemberType(m). Without this fallback the §23.1
+            // nullable-value wrap, the §8.6 Object/interface box, the §15.4
+            // collection-literal materialization, and the §5.1 widening all
+            // see a null `fieldRt` — and the lowering either stores a bare
+            // scalar over a {i8,T} slot (clobbering hasValue, the (c)
+            // symptom of #2860), omits the box (storing bits as a pointer),
+            // or treats a heap-collection slot as an inline array (malformed
+            // IR / null). Same fallback every site below uses; see also
+            // recordFieldType (LlvmBackend_String.cpp) which lights up the
+            // §4.6 / §8.6 store-side retain and dispose-side release for the
+            // same predicate.
+            if (!fieldRt) {
+                if (auto* ms = dynamic_cast<const sema::MemberSymbol*>(m))
+                    if (ms->decl == nullptr)
+                        fieldRt = ctx_.importedMemberType(ms);
+            }
             v = boxForTarget(v, fieldRt, init);
         }
         // #429 / §4.6 / §28.9: a CLASS string field / auto-property initializer

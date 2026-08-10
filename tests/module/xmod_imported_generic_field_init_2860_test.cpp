@@ -457,21 +457,39 @@ BEZEL_TEST(xmod_imported_generic_field_init_2860,
 
 // ===========================================================================
 // T7 — §2.8.2 "No restrictions beyond visibility". `owned cell: Cell2860 :=
-// new Cell2860()` is not compile-time-constant, so it has NO carriage in the
-// artifact interface: nothing reaches the consumer at all. Without this change
-// the construction compiled and left the non-nullable owned field on the §7.9
-// null watermark — measured: `Cell.Live` stayed 0 inside the `using var` scope
-// and the first `g.cell.tag` read SEGV'd. It must now be a LOCATED compile
-// error naming the field, per §2.8.2. Asserted on the diagnostic TEXT, not on
-// a bare failure flag — the coarse "did it fail" oracle cannot tell a genuine
-// rejection from a crash.
+// new Cell2860()` pre-#2874 had no carriage in the artifact interface: nothing
+// reached the consumer at all. The construction compiled and left the
+// non-nullable owned field on the §7.9 null watermark — measured: `Cell.Live`
+// stayed 0 inside the `using var` scope and the first `g.cell.tag` read SEGV'd.
+// §2.8.2 requires a located compile error naming the field in that case.
+// Post-#2874 the load-time parse-and-attach reconstructs `new Cell2860()` and
+// RUNS it (Cell.Live is 1, `g.cell.tag` reads 3, ASan-clean). The diagnostic
+// still fires for shapes the parse genuinely cannot reconstruct — an
+// initializer that references an INTERNAL helper class (visible to the
+// library's own compile but absent from the exported metadata, §13.2) fails
+// the importer's resolveTypes and triggers the diagnostic. This row pins that
+// the diagnostic is still a load-time-equivalent-fallback rather than gone:
+// the same named-diagnostic, location, and §2.8.2 contract, just for the
+// shapes that ACTUALLY fail to cross the boundary.
 // ===========================================================================
 BEZEL_TEST(xmod_imported_generic_field_init_2860,
            t7_uncarriable_initializer_is_a_named_diagnostic_2_8_2) {
     namespace fs = std::filesystem;
     std::string stem = "bz2860_t7_" + std::to_string(std::rand());
     std::string aObj;
-    BEZEL_EXPECT_TRUE(buildLib2860(stem, kLibOwned2860, aObj));
+    BEZEL_EXPECT_TRUE(buildLib2860(stem,
+        "module LibOwn2860; "
+        "public class Cell2860 public tag: int := 3; end Cell2860; "
+        "internal class Internal2860 "
+        "  public static method make(): owned Cell2860 => new Cell2860(); "
+        "end Internal2860; "
+        "public class GOwn2860<T> "
+        "  public v: T; "
+        "  public owned cell: Cell2860 := Internal2860.make(); "
+        "  public tail: int := 55; "
+        "end GOwn2860; "
+        "public class Plain2860 public tail: int := 66; end Plain2860;",
+        aObj));
     TempFile2860 aObjFile(aObj);
     if (!std::ifstream(aObj).good()) return;
 

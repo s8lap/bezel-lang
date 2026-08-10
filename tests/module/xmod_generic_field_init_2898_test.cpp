@@ -162,21 +162,36 @@ BEZEL_TEST(xmod_generic_field_init_2898, hex_operand_in_generic_field_initialize
 // --- OVER-ACCEPTANCE controls: what must STILL be rejected ------------------
 //
 // #2898 widens what crosses the artifact boundary, so the guard it relaxes must
-// be shown still to fire. Both of these are §2.8.2 rejections that must survive:
-// the fix folds only LITERAL arithmetic, and its identifier resolver answers
-// "not a constant" for every name deliberately — `renderConstExpr` renders a
-// bare identifier as its NAME, which has no guaranteed importer-side meaning, so
-// resolving names here would let a same-named-but-different const on the
-// importing side silently supply a value. A loud rejection is the correct
-// outcome for anything the fold cannot reach; #2874 covers carrying genuinely
-// non-constant initializers.
+// be shown still to fire. #2874 widens further: it CARRIES everything the
+// load-time parse-and-attach can reconstruct. A literal-arithmetic call on a
+// string (`100 + "abcdefg".Length` — sema resolves `"abcdefg".Length` to `int`
+// and `100 + int` to `int`, the slot gets the value) and a float-arithmetic
+// expression (`1.5 + 0.5` — sema + lowerExpr produces f64 2.0) are BOTH
+// carriable post-#2874, so the pre-#2874 "still rejected" shapes are no
+// longer the right over-acceptance controls. The new controls must exercise
+// a shape that genuinely fails to reconstruct across the module boundary:
+// a reference to an INTERNAL helper class — visible to the LIBRARY's own
+// compile (the field initializer text is exported verbatim) but absent from
+// the metadata (only public types are exported, §13.2), so the importer's
+// synthetic-source resolveTypes fails and the §2.8.2 construction-site
+// diagnostic fires.
 
-// A call in the initializer is not a §17.14 constant expression: still rejected.
+// An initializer that calls a method on an INTERNAL helper class: the helper
+// is in the library's own scope but NOT in the metadata, so the importer's
+// synthetic source cannot resolve the call. §2.8.2 "must reject with a
+// diagnostic naming the shape" still applies — the diagnostic fires at the
+// construction site, exactly as the pre-#2874 false-reject did. The test
+// pins that the load-time parse did NOT silently widen to "carry anything";
+// genuine visibility gaps remain a loud reject.
 BEZEL_TEST(xmod_generic_field_init_2898, non_constant_initializer_still_rejected_spec_2_8_2) {
     BEZEL_EXPECT_EQ(
         buildAndRun("bezel_2898_rej",
-            "module SLib; public class St<T> "
-            "  public tag: int := 100 + \"abcdefg\".Length; public v: T; "
+            "module SLib; "
+            "internal class Internal2898 "
+            "  public static method make(): int => 100; "
+            "end Internal2898; "
+            "public class St<T> "
+            "  public tag: int := Internal2898.make(); public v: T; "
             "  public constructor(x: T) v := x; end constructor; end St;",
             "module SApp; import SLib; class C "
             "  public static method Main(): int "
@@ -185,14 +200,22 @@ BEZEL_TEST(xmod_generic_field_init_2898, non_constant_initializer_still_rejected
         -1);
 }
 
-// A FLOAT constant expression: `foldIntConst` is integer-only by construction,
-// so this still renders "" and is still rejected. Pins that the fix did not
-// quietly widen to a domain it cannot evaluate.
+// A FLOAT constant expression: post-#2874 this RUNS (the parse succeeds, the
+// lowerExpr emits `fadd` and the slot stores 2.0), so the pre-#2874
+// over-acceptance assertion no longer holds — the new over-acceptance is the
+// same internal-helper reference (above), exercised on a `double` slot so a
+// reader of this file cannot mistakenly conclude "post-#2874 float is
+// rejected". What remains rejected is the visibility-gap shape, regardless
+// of the slot type.
 BEZEL_TEST(xmod_generic_field_init_2898, float_constant_initializer_still_rejected_spec_2_8_2) {
     BEZEL_EXPECT_EQ(
         buildAndRun("bezel_2898_dbl",
-            "module DLib; public class Db<T> "
-            "  public tag: double := 1.5 + 0.5; public v: T; "
+            "module DLib; "
+            "internal class InternalD2898 "
+            "  public static method make(): double => 1.5; "
+            "end InternalD2898; "
+            "public class Db<T> "
+            "  public tag: double := InternalD2898.make() + 0.5; public v: T; "
             "  public constructor(x: T) v := x; end constructor; end Db;",
             "module DApp; import DLib; class C "
             "  public static method Main(): int "

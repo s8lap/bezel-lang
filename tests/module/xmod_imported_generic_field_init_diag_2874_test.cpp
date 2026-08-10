@@ -7,10 +7,18 @@
 //      format must reject the export, or the import, with a diagnostic naming
 //      the shape; it must not alter the instantiation's semantics."
 //
-// #2874 asks for the strictly better outcome — carry AND RUN such an
-// initializer. That is DECLINED in this commit, with the measurement, and the
-// remainder is filed. What is fixed here is the diagnostic itself, on two counts
-// that a user meets before ever meeting the limitation:
+// #2874 (carry AND RUN) lands the strictly better outcome: most initializers
+// are now reconstructed at LOAD time and run importer-side, leaving the §2.8.2
+// construction-site diagnostic as the FALLBACK for shapes the reconstruction
+// genuinely cannot handle (a parse/sema failure). This file exercises the
+// diagnostic against a deliberately-uncarriable fixture: an initializer that
+// references an INTERNAL helper class — the helper is visible to the
+// library's own compile (the field initializer text is exported verbatim) but
+// NOT in the metadata (only public types are exported, §13.2), so the
+// importer's synthetic-source resolveTypes fails and the diagnostic fires.
+//
+// What is fixed here is the diagnostic itself, on two counts that a user meets
+// before ever meeting the limitation:
 //
 //  (1) IT WAS UNLOCATED ON THE ORDINARY PATH. `importedFieldInitDiagLoc_` was
 //      set only on `lowerNew`'s no-explicit-ctor branch. An imported generic
@@ -30,8 +38,8 @@
 //      `sema::foldIntConst` and is integer-only. The message now says what is
 //      true (it did not fold) and names the issue that tracks the difference.
 //
-// Neither change relaxes the rejection: every row below that was rejected before
-// is still rejected, and the carriable-initializer row still builds and runs.
+// Neither change relaxes the rejection: every row below that is still rejected
+// by the fallback path, and the carriable-initializer row still builds and runs.
 
 #include <cstdio>
 #include <cstdlib>
@@ -137,14 +145,21 @@ std::string app2874(const std::string& moduleName, const std::string& lib,
 
 // The row the fix is for: the imported generic has an EXPLICIT CONSTRUCTOR, so
 // construction runs through `inlineCtorBody`. Before the fix the diagnostic came
-// out at `0:0`; it must now name the `new`'s own line.
+// out at `0:0`; it must now name the `new`'s own line. The fixture uses an
+// internal helper class as the uncarriable element so the diagnostic still
+// fires post-#2874 (most shapes now RUN importer-side; only genuine
+// reconstruction failures fall through to the diagnostic).
 BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
            explicit_ctor_construction_site_is_located_spec_2_8_2) {
     std::string stem = "bz2874_loc_" + std::to_string(std::rand());
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2874(stem,
-        "module Lib2874A; public class GA2874<T> "
-        "  public v: T; public items: Array<int> := [1, 2, 3]; "
+        "module Lib2874A; "
+        "internal class InternalA2874 "
+        "  public static method foo(): Array<int> => new Array<int>(); "
+        "end InternalA2874; "
+        "public class GA2874<T> "
+        "  public v: T; public items: Array<int> := InternalA2874.foo(); "
         "  public constructor(x: T) v := x; end constructor; end GA2874;",
         aObj));
     TempFile2874 aObjFile(aObj);
@@ -174,14 +189,20 @@ BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
 // CONTROL, passes both ways: the no-explicit-ctor spelling was already located
 // (its branch set the location), and must stay so. Together with the row above
 // this is what shows the axis was "does the imported generic have an explicit
-// constructor", not "is the initializer uncarriable".
+// constructor", not "is the initializer uncarriable". Same Internal-helper
+// fixture so the diagnostic still fires.
 BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
            no_ctor_construction_site_stays_located_spec_2_8_2) {
     std::string stem = "bz2874_noctor_" + std::to_string(std::rand());
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2874(stem,
-        "module Lib2874B; public class GB2874<T> "
-        "  public v: T?; public items: Array<int> := [1, 2, 3]; end GB2874;",
+        "module Lib2874B; "
+        "internal class InternalB2874 "
+        "  public static method foo(): Array<int> => new Array<int>(); "
+        "end InternalB2874; "
+        "public class GB2874<T> "
+        "  public v: T?; public items: Array<int> := InternalB2874.foo(); "
+        "end GB2874;",
         aObj));
     TempFile2874 aObjFile(aObj);
     if (!std::ifstream(aObj).good()) return;
@@ -205,17 +226,23 @@ BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
 // imported generics, one carriable and one not, on two different lines — and the
 // carriable one comes FIRST, so a location that leaked from the previous
 // construction (or was never restored) would name the wrong line. Run in both
-// orders so neither a stale nor a never-set location can pass.
+// orders so neither a stale nor a never-set location can pass. The "Bad"
+// generic uses an Internal-helper fixture so the diagnostic fires post-#2874;
+// the "Ok" generic uses a carriable literal so its construction succeeds and
+// only the second construction's diagnostic is asserted.
 BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
            each_construction_gets_its_own_location_spec_2_8_2) {
     std::string stem = "bz2874_two_" + std::to_string(std::rand());
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2874(stem,
         "module Lib2874C; "
+        "internal class InternalC2874 "
+        "  public static method foo(): Array<int> => new Array<int>(); "
+        "end InternalC2874; "
         "public class Ok2874<T> public v: T; public tag: int := 107; "
         "  public constructor(x: T) v := x; end constructor; end Ok2874; "
         "public class Bad2874<T> public v: T; "
-        "  public items: Array<int> := [1, 2, 3]; "
+        "  public items: Array<int> := InternalC2874.foo(); "
         "  public constructor(x: T) v := x; end constructor; end Bad2874;",
         aObj));
     TempFile2874 aObjFile(aObj);
@@ -256,9 +283,16 @@ BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
 
 // `:= 1.5 + 0.5` IS a §17.14 compile-time-constant expression by that section's
 // own list; it is the CARRIAGE that cannot fold it (#2898's fold is
-// integer-only). The old text told the reader it is not a compile-time constant.
+// integer-only). Pre-#2874 the diagnostic said "not a compile-time constant"
+// (false). Post-#2874, with the carriage half working, the construction
+// SUCCEEDS for this exact shape — lowerExpr on the reconstructed AST emits
+// `fadd` and the slot stores 2.0. So this row tests the same shape's NEW
+// behaviour: the field reads 2.0, not the §7.9 default. The diagnostic's
+// "did not fold" text is preserved (it now names a strictly smaller failure
+// surface — only genuine parse/sema failures reach it), but the fold-only
+// limitation is no longer one of them.
 BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
-           unfoldable_constant_expression_is_not_called_non_constant_spec_17_14) {
+           unfoldable_constant_expression_now_runs_spec_17_14) {
     std::string stem = "bz2874_fold_" + std::to_string(std::rand());
     std::string aObj;
     BEZEL_EXPECT_TRUE(buildLib2874(stem,
@@ -275,19 +309,18 @@ BEZEL_TEST(xmod_imported_generic_field_init_diag_2874,
     writeSource2874(bSrc.path,
         app2874("App2874D", "Lib2874D",
                 "    using var g := new GD2874<int>(1);\n"
+                "    if g.d <> 2.0 then return 1; end if;\n"
                 "    return 0;\n"));
 
-    std::string err;
-    bool ok = compileImportCaptureErr2874(bSrc.path, bExe.path, aObj, err);
-    // Still rejected: the fold genuinely cannot reach it.
-    BEZEL_EXPECT_TRUE(!ok);
-    // Says what is true...
-    BEZEL_EXPECT_TRUE(err.find("did not fold") != std::string::npos);
-    BEZEL_EXPECT_TRUE(err.find("#2874") != std::string::npos);
-    // ...and no longer says what is false.
-    BEZEL_EXPECT_TRUE(
-        err.find("only a compile-time-constant initializer crosses") ==
-        std::string::npos);
+    bezel::Driver driver;
+    std::vector<bezel::Dependency> deps;
+    bezel::Dependency d;
+    d.metadataPath = aObj;
+    d.objectPath = aObj;
+    deps.push_back(d);
+    BEZEL_EXPECT_TRUE(driver.compileFile(bSrc.path, bExe.path, deps).success);
+    int status = std::system(bExe.path.c_str());
+    BEZEL_EXPECT_TRUE(status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 // --- OVER-ACCEPTANCE control ------------------------------------------------

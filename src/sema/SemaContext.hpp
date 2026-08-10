@@ -566,6 +566,28 @@ public:
                                                            : &it->second;
     }
 
+    // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): a load-time-reconstructed
+    // ast::Expr* for an IMPORTED GENERIC class's INSTANCE field initializer —
+    // set by ModuleLoader when the field's `fieldInitText` (#2860) was
+    // successfully re-parsed and sema-typed in a fresh context, and remapped
+    // into mainCtx. Lives in the loader's imported-AST arena (ownImportedAst
+    // keeps the SourceFile alive; the Expr* is a node in that SourceFile).
+    // The codegen path `emitOwnFieldInit` reads this BEFORE consulting
+    // `importedInstanceFieldInitText` so a successful reconstruction runs the
+    // initializer instead of firing the construction-site diagnostic. A parse
+    // or sema failure leaves this null and the diagnostic still fires —
+    // matching the "failure path must not become a load-time reject" rule
+    // (a mere import of the module must still build, #2351 / §2.8.2).
+    void setImportedInstanceFieldInitExpr(const Symbol* m,
+                                          const ast::Expr* e) {
+        importedInstanceFieldInitExprs_[m] = e;
+    }
+    const ast::Expr* importedInstanceFieldInitExpr(const Symbol* m) const {
+        auto it = importedInstanceFieldInitExprs_.find(m);
+        return it == importedInstanceFieldInitExprs_.end() ? nullptr
+                                                           : it->second;
+    }
+
     // §9.8 / §2.3 / issue #922: allocate-and-cache a compiler-intrinsic
     // TypeSymbol for a builtin class name (e.g. "Range", "DateTime",
     // "TimeSpan").  The SAME pointer is returned on every call with the same
@@ -697,6 +719,18 @@ private:
     // source text, keyed by the reconstructed FieldSymbol. See the accessors.
     std::unordered_map<const Symbol*, std::string>
         importedInstanceFieldInitTexts_;
+    // fix #2874 (§2.8.2 / §22.8 step 2, v0.240): a load-time-reconstructed
+    // ast::Expr* for an imported GENERIC class's instance field initializer,
+    // set when parseAndAttachFieldInit succeeded for a non-static member
+    // (the same parse path #2351 wrote for static members, without the final
+    // `importedFs->decl = parsedFd` attach that would re-route the imported
+    // member's LAYOUT through a TypeRef resolved in the throwaway context —
+    // see #2860's own decline comment). The Expr* rides in
+    // importedCtorAst_'s SourceFile (the fresh context's parsed SourceFile,
+    // kept alive via ownImportedAuxiliary), so the side-table pointer is
+    // valid for the lifetime of this SemaContext.
+    std::unordered_map<const Symbol*, const ast::Expr*>
+        importedInstanceFieldInitExprs_;
     // §14 / #662c: imported SourceFile objects that own re-parsed ctor/dtor
     // AST nodes for imported generic classes.  The re-parsed AST carries
     // ConstructorDecl / DestructorDecl nodes whose decl pointers are attached
