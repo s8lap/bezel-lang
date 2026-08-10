@@ -22197,6 +22197,7 @@ void Emitter::collectBoxReleaseEligible(
         const std::vector<std::unique_ptr<ast::Stmt>>& body) {
     boxReleaseEligible_.clear();
     boxReassignedLocals_.clear();  // fix #2960
+    reassignedOpaqueLocals_.clear();  // fix #2968
     // fix #2960 / §8.6 / §28.9: consider every non-using Object/interface
     // LocalDecl, not only one whose INITIALIZER is a box. A string/class/null
     // initializer may be followed by `p := <value>`; the assignment then mints
@@ -22214,6 +22215,22 @@ void Emitter::collectBoxReleaseEligible(
                 : (ld->initializer ? ctx_.exprType(*ld->initializer) : nullptr);
             if (!ld->isUsing && isObjectOrInterfaceTarget(targetTy))
                 candidates.push_back(ld);
+        }
+        // fix #2968 (§8.1 / §8.5 / §18.5 / §28.9, v0.240): record any local
+        // REASSIGNED at statement level, so the §2968 `Object`-slot narrowing
+        // (which reads the local's INITIALIZER type) declines on it. Compound
+        // assignment counts too — `AssignmentStmt` covers every `op`. See
+        // `reassignedOpaqueLocals_` for the two expression-position mutation
+        // forms this walk deliberately does not see.
+        if (auto* as = dynamic_cast<const ast::AssignmentStmt*>(s)) {
+            if (auto* tid =
+                    dynamic_cast<const ast::IdentifierExpr*>(as->target.get())) {
+                auto* tsym = dynamic_cast<sema::LocalSymbol*>(ctx_.exprSymbol(*tid));
+                if (tsym)
+                    if (auto* tld =
+                            dynamic_cast<const ast::LocalDecl*>(tsym->decl))
+                        reassignedOpaqueLocals_.insert(tld);
+            }
         }
         if (auto* is = dynamic_cast<const ast::IfStmt*>(s)) {
             for (auto& b : is->ifBranch.body) scan(b.get());

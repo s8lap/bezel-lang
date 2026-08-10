@@ -384,7 +384,18 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     builder_.SetInsertPoint(liveBB);
                     sema::TypeRef liveTy = *rt;
                     liveTy.nullable = false;
-                    llvm::Value* liveStr = emitValueToString(ev, &liveTy);
+                    // fix #2968: the LIVE arm of a nullable OPAQUE slot
+                    // (`Object?` holding a vtable-less built-in) reaches
+                    // `emitValueToString` → `lowerObjectToString` and
+                    // double-frees exactly as the non-nullable spelling did.
+                    // Narrow it the same way; the surrounding runtime null
+                    // check still renders "null" on the null arm, and the
+                    // narrowing only fires when the slot's initializer names a
+                    // vtable-less built-in class (so it cannot be null here
+                    // unless the local was reassigned, which declines).
+                    llvm::Value* liveStr =
+                        tryOpaqueSlotBuiltinRender(ev, &liveTy, part.expr.get());
+                    if (!liveStr) liveStr = emitValueToString(ev, &liveTy);
                     auto* liveEnd = builder_.GetInsertBlock();
                     builder_.CreateBr(endBB);
                     builder_.SetInsertPoint(nullBB);
@@ -397,7 +408,27 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                     phi->addIncoming(nullStr, nullEnd);
                     pv = phi;
                 } else if (rt && rt->kind == sema::TypeRef::Kind::Primitive) {
-                    pv = emitPrimitiveToString(ev, rt->primitive);
+                    // fix #2968 (spec §8.1 / §8.5 / §18.5 / §28.9, v0.240):
+                    // `Object` is a PRIMITIVE kind here (sema maps the
+                    // universal root to `PrimitiveType::Object`), so an
+                    // `Object`-typed hole falls straight into
+                    // `emitPrimitiveToString`, whose `P::Object` arm calls
+                    // `lowerObjectToString` — and `bz_obj_is_string`'s
+                    // NEGATIVE test ("word 0 is not an emitted vtable ⇒ a
+                    // string") mis-answers "string" for a vtable-less built-in
+                    // sitting in that slot per §8.1. The receiver is then
+                    // retained as a string and released by the consumer: the
+                    // measured double free. Ask FIRST whether the AST source
+                    // statically narrows the slot to a vtable-less built-in
+                    // class; if so render via the §2923 helper. If not, fall
+                    // through unchanged — correct for a genuine string, for a
+                    // user class, and for a box.
+                    if (llvm::Value* r = tryOpaqueSlotBuiltinRender(
+                            ev, rt, part.expr.get())) {
+                        pv = r;
+                    } else {
+                        pv = emitPrimitiveToString(ev, rt->primitive);
+                    }
                 } else if (rt && rt->kind == sema::TypeRef::Kind::Named &&
                            rt->declaration &&
                            rt->declaration->kind == ast::TypeDeclKind::Enum) {
@@ -518,7 +549,14 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                             // skip the broken `emitValueToString` call; if no,
                             // fall through (correct for user class; deferral per
                             // #2969 for the unanalysed built-in case).
-                            if (llvm::Value* r = tryBuiltinIfaceHeadRender(
+                            //
+                            // fix #2968: `Object` (§8.1's universal root) is
+                            // the other opaque slot that reaches here, and it
+                            // fails the same way — the helper now gates on it
+                            // too, so `var o: Object := mx; $"{o}"` renders
+                            // via the §2923 helper instead of double-freeing
+                            // `mx` through `lowerObjectToString`.
+                            if (llvm::Value* r = tryOpaqueSlotBuiltinRender(
                                     ev, rt, part.expr.get())) {
                                 pv = r;
                             } else {

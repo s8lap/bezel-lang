@@ -6170,9 +6170,19 @@ private:
     // caller falls through to its existing dispatch (correct for the user-
     // class arm; incomplete for the unanalysed built-in case, which #2969
     // records as a deferred hole pending an owner-signed-off direction).
-    llvm::Value* tryBuiltinIfaceHeadRender(llvm::Value* val,
-                                           const sema::TypeRef* frt,
-                                           const ast::Expr* src);
+    //
+    // fix #2968 (spec §8.1 / §8.5 / §18.5 / §28.9, v0.240): the same routing
+    // now also fires when `frt` is the universal root `Object` — #2969's own
+    // deferred residual, and the same defect one level further out. An
+    // `Object` slot holds a built-in AS ITSELF per §8.1, so it has no vtable
+    // at word 0 and `bz_obj_is_string` mis-answers "string" for it, producing
+    // the #2968 double free. Unlike an interface-head slot, an `Object` slot
+    // CAN hold a real `string`; the AST-source narrowing below is what keeps
+    // that case (and the user-class case) on their correct existing paths.
+    // See the definition for the §8.1 quote and why boxing is not the remedy.
+    llvm::Value* tryOpaqueSlotBuiltinRender(llvm::Value* val,
+                                            const sema::TypeRef* frt,
+                                            const ast::Expr* src);
 
     // §9.6 (#946/#947/#948): emit (once) an Equals thunk `i1(ptr this, ptr other)`
     // for a CLASS — the user `Equals(Object?)` override if present (walking the
@@ -10066,6 +10076,38 @@ private:
     // sidecar bit has no reserved frame field; that shape remains conservatively
     // leaked rather than reading an uninitialized bit after resume.
     std::unordered_set<const void*> boxReassignedLocals_;
+
+    // fix #2968 (spec §8.1 / §8.5 / §18.5 / §28.9, v0.240): every LocalDecl
+    // that is REASSIGNED by a statement-level `AssignmentStmt` in the current
+    // function body. `tryOpaqueSlotBuiltinRender` narrows an `Object`-typed
+    // slot to its INITIALIZER's static type; that narrowing describes the slot
+    // only while it still holds the initializer's value. Without this set,
+    //
+    //     var o: Object := mx;   // mx: Mutex
+    //     o := "hi";
+    //     Console.WriteLine($"{o}");
+    //
+    // would render "Mutex" — a REGRESSION, because the pre-fix dynamic path
+    // renders a genuine string CORRECTLY (`bz_obj_is_string`'s premise is true
+    // for a real string). A reassigned local therefore declines the narrowing
+    // and keeps its existing dispatch.
+    //
+    // Populated by collectBoxReleaseEligible (which already walks every
+    // statement of the body). Membership-tested only — never iterated — so it
+    // introduces no pointer-keyed iteration-order nondeterminism.
+    //
+    // KNOWN RESIDUAL (documented, not silently accepted): two mutation forms
+    // are NOT recorded here — assignment to the local from inside a lambda
+    // that captures it (§7.4's "mutably captured", whose analysis lives in
+    // sema's ExprTC::computeMutablyCaptured and is not plumbed through to
+    // codegen) and mutation through a `ref`/`out` argument. Both are
+    // expression-position mutations this statement-level walk does not see.
+    // When either occurs the narrowing can render the wrong TYPE NAME; it
+    // remains memory-safe (the renderer returns a sentinel-rc literal and
+    // retains nothing), so the #2968 double free stays fixed in all cases.
+    // Tracked as a follow-up; see the definition of
+    // tryOpaqueSlotBuiltinRender.
+    std::unordered_set<const ast::LocalDecl*> reassignedOpaqueLocals_;
     // The function for which boxReleaseEligible_ was computed (mirrors
     // stringReleaseEligibleFn_): a lambda/thunk body lowered mid-function
     // inherits no eligibility, so its boxed-value locals just leak (never

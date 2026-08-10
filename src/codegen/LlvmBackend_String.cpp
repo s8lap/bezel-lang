@@ -2732,23 +2732,71 @@ llvm::Value* Emitter::emitVtablelessBuiltinToString(llvm::Value* val,
 // instance routes to the class disposal) is untouched — its predicate is
 // `iterFormatWrappedDecls_`, never reaches the BuiltinInterfaceHead path here.
 //
-// WHAT IT DOES NOT FIX. The two cases the issue body flags as needing a
-// decision: the OBJECT-slot spelling (`var o: Object := e; $"…{o}"`, tracked
-// separately as #2968) and the explicit `.ToString()` call on a built-in
-// interface head (rejected at sema on the parent commit, #2457). Both are
-// logged in the test's header so the boundary is explicit.
-llvm::Value* Emitter::tryBuiltinIfaceHeadRender(llvm::Value* val,
-                                                const sema::TypeRef* frt,
-                                                const ast::Expr* src) {
+// WHAT IT DOES NOT FIX. The explicit `.ToString()` call on a built-in
+// interface head (rejected at sema on the parent commit, #2457). Logged in
+// the test's header so the boundary is explicit.
+//
+// fix #2968 (spec §8.1 / §8.5 / §18.5 / §28.9, v0.240): the OBJECT-slot
+// spelling — which #2969 recorded above as its own deferred residual — is the
+// SAME defect one level further out, and it admits the SAME remedy, so this
+// helper now gates on `Object` as well as on the interface heads.
+//
+// §8.1 makes `var o: Object := mx;` legal without a conversion, verbatim:
+//
+//   "classes, interfaces, `string`, heap arrays (`Array<T>`,
+//    `OwningArray<T>`), and function types are reference types whose values
+//    are already heap-allocated and reach `Object` directly through the
+//    inheritance chain"
+//
+// So the built-in sits in the slot AS ITSELF, with no vtable at word 0, and
+// `bz_obj_is_string`'s NEGATIVE test ("word 0 is not one of the emitted
+// vtables ⇒ a string") answers "string" for it. `lowerObjectToString` then
+// returns the receiver as a string and retains it — the retain landing on the
+// built-in's own bytes at the `%bz.string` rc offset — and the consumer's
+// matching release frees a live object. That is #2968's measured double free.
+//
+// WHY BOXING IS NOT THE FIX. #2968's filing offered "box the built-in on
+// assignment to `Object`" as option 2. The §8.1 sentence quoted above puts
+// these receivers explicitly on the REFERENCE side of §8.6's boxing line, so
+// boxing them would contradict §8.1's classification. Option 2 is closed
+// unless the spec is amended, which is a separate workflow.
+//
+// WHY THE `Object` SLOT IS SAFE TO ADMIT HERE (and the string hazard the
+// interface-head arm never faced). An interface-head slot cannot hold a
+// `string`; an `Object` slot can. The narrowing below is therefore load-
+// bearing in a way it was not for #2969: it fires ONLY when the initializer's
+// static type is a vtable-less built-in CLASS. `string` is in neither reserved
+// table (common/BuiltinRegistry.cpp), so `isVtableLess` answers false for it
+// and a genuine `var o: Object := "hi";` still falls through to
+// `lowerObjectToString`, whose `bz_obj_is_string` premise is TRUE for a real
+// string. A user class likewise carries a `declaration` and falls through to
+// its correct vtable dispatch. Only the receivers whose premise is false are
+// routed away.
+llvm::Value* Emitter::tryOpaqueSlotBuiltinRender(llvm::Value* val,
+                                                 const sema::TypeRef* frt,
+                                                 const ast::Expr* src) {
     if (!val || !val->getType()->isPointerTy()) return nullptr;
-    if (!frt || frt->kind != sema::TypeRef::Kind::Named || frt->declaration)
-        return nullptr;
-    // §2923 deliberately excluded interface heads from the vtable-less
-    // discriminator; the interface slot may hold a user class. We are the
-    // OTHER arm of the exclusion — we only fire when the AST source
-    // statically narrows the runtime value to a built-in class.
-    std::string_view bn = builtinTypeName(frt);
-    if (bn.empty() || !common::isBuiltinInterfaceHead(bn)) return nullptr;
+    if (!frt) return nullptr;
+    // The two OPAQUE slot spellings that reach this helper. Note they are
+    // different TypeRef KINDS, which is why the gate is not a single test:
+    //   * `Object` — sema models the universal root as a PRIMITIVE
+    //     (TypeResolution.cpp maps the name to `PrimitiveType::Object`), NOT
+    //     as a Named ref. This is #2968's slot, and it is also why the #2969
+    //     Named-only gate never fired for it.
+    //   * a built-in INTERFACE HEAD — a declaration-less Named ref (#2969).
+    const bool isObjectSlot =
+        frt->kind == sema::TypeRef::Kind::Primitive &&
+        frt->primitive == sema::PrimitiveType::Object;
+    if (!isObjectSlot) {
+        // §2923 deliberately excluded interface heads from the vtable-less
+        // discriminator; the interface slot may hold a user class. We are the
+        // OTHER arm of the exclusion — we only fire when the AST source
+        // statically narrows the runtime value to a built-in class.
+        if (frt->kind != sema::TypeRef::Kind::Named || frt->declaration)
+            return nullptr;
+        std::string_view bn = builtinTypeName(frt);
+        if (bn.empty() || !common::isBuiltinInterfaceHead(bn)) return nullptr;
+    }
     if (!src) return nullptr;
     // §2923's `common::isVtableLessBuiltinClassName` test asks whether the
     // RUNTIME TYPE carries no Bezel vtable at word 0 — i.e. is one of the
@@ -2774,6 +2822,14 @@ llvm::Value* Emitter::tryBuiltinIfaceHeadRender(llvm::Value* val,
     if (!loc || !loc->decl) return nullptr;
     auto* ld = dynamic_cast<const ast::LocalDecl*>(loc->decl);
     if (!ld || !ld->initializer) return nullptr;
+    // fix #2968: the narrowing below reads the INITIALIZER's static type, so
+    // it describes the slot only while the slot still holds the initializer's
+    // value. A statement-level reassignment invalidates it — and for an
+    // `Object` slot the wrong answer would be a REGRESSION, not merely a
+    // missed fix (`var o: Object := mx; o := "hi";` renders correctly TODAY
+    // via the dynamic path, whose `bz_obj_is_string` premise a real string
+    // satisfies). Decline rather than narrow.
+    if (reassignedOpaqueLocals_.count(ld)) return nullptr;
     const sema::TypeRef* srcRt = ctx_.exprType(*ld->initializer);
     if (!isVtableLess(srcRt)) return nullptr;
     // The receiver retains NOTHING (the literal has a sentinel rc), so this
