@@ -391,7 +391,8 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     const std::vector<const TypeRef*>& argTypes,
     const std::vector<bool>& fillsDefault,
     const std::vector<std::string>& candNames, SourceLocation loc,
-    const std::string& calleeDesc, const std::string& extraNote) {
+    const std::string& calleeDesc, const std::string& extraNote,
+    const std::vector<const ast::Expr*>& argExprs) {
     OverloadResult res;
     const std::size_t nCand = paramTypes.size();
     const std::size_t nArg = argTypes.size();
@@ -436,7 +437,42 @@ ExprTC::OverloadResult ExprTC::resolveOverload(
     for (std::size_t c = 0; c < nCand; ++c) {
         grid[c].resize(nArg);
         for (std::size_t i = 0; i < nArg; ++i) {
-            ArgMatch m = classifyArg(argTypes[i], paramTypes[c][i]);
+            // fix #2985 (§22.6 + §5.1 v0.240 *Constant narrowing*): delegate
+            // to narrowIntConstantToTarget first so an in-range compile-time
+            // int constant (literal, local / member const, enum constant of
+            // the underlying type) is re-typed against THIS candidate's
+            // parameter TYPE before classifyArg judges Exact / Convert /
+            // NotApplicable. Without the call, `Pick(3)` against
+            // `Pick(byte)`/`Pick(string)` sees the literal's `int` typed as
+            // such against every candidate: `int → byte` is a NARROWING, not
+            // in §5.1's widening table, so it is NotApplicable; `int →
+            // string` is NotApplicable; both are rejected; the unique-winner
+            // resolution that §5.1's own worked example (`Set(level: byte)`
+            // called as `Set(3)`) promises fails. The narrower int types
+            // (byte / sbyte / short / ushort / uint / ulong) are precisely
+            // those narrowIntConstantToTarget re-types for; everything
+            // else (widening int, non-int target) returns `from` unchanged,
+            // preserving the prior behaviour and the §5.1 widening-table
+            // membership (without this delegation the inner classifyArg
+            // would still be the authority for the widening arm, exactly
+            // as before). Empty `argExprs` (the pre-#2985 call shape on any
+            // site that does not yet supply the AST arguments) skips the
+            // re-type and keeps the old behaviour verbatim.
+            const TypeRef* argTy = argTypes[i];
+            if (!argExprs.empty() && i < argExprs.size() && argExprs[i]) {
+                // narrowIntConstantToTarget's signature takes TypeRef* (the
+                // #2925 mutating re-typing variant); both argTypes[i] and
+                // paramTypes[c][i] are const TypeRef*, so const_cast matches
+                // the existing pre-pass at line ~1141's pattern. The
+                // function may setExprType on the expression when the rule
+                // applies (a side effect that the existing pre-pass already
+                // documents); the AST itself is not touched.
+                argTy = narrowIntConstantToTarget(
+                    argExprs[i],
+                    const_cast<TypeRef*>(argTypes[i]),
+                    const_cast<TypeRef*>(paramTypes[c][i]));
+            }
+            ArgMatch m = classifyArg(argTy, paramTypes[c][i]);
             grid[c][i] = m;
             if (m == ArgMatch::NotApplicable) applicable[c] = false;
         }
@@ -1056,6 +1092,52 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     // §22.6 defaulted-arity tie-break (v0.181, #1561): does candidate c's
     // binding leave any parameter to be filled by its declared default?
     std::vector<bool> fillsDefault(cands.size(), false);
+    // fix #2985 (§22.6 / §5.1, v0.240): §5.1 "Constant narrowing" says "An
+    // expression of integer type that is a compile-time constant implicitly
+    // converts to any integer type whose range contains its value" and the
+    // worked example names `Set(level: byte)` called as `Set(3)` as a well-
+    // typed case. §22.6 overload resolution classifies each (candidate, arg)
+    // cell by `classifyArg`, which calls `implicitlyConvertible` on the
+    // argument's static type — and that type was already set by an EARLIER
+    // `typecheckExpression` pass to `int` (a literal `3` has type `int`,
+    // `C.GK` and a named `const` resolve to their declared `int`). `Pick(3)`
+    // against `Pick(byte)`/`Pick(string)` therefore sees `int → byte` as a
+    // NARROWING, which §5.1 does NOT list in its widening table, and rejects
+    // every candidate — even though §5.1 explicitly admits the conversion via
+    // the constant-narrowing carve-out.
+    //
+    // narrowIntConstantToTarget is the single §5.1 narrowing implementation
+    // (#2925) — it re-types an integer-literal/const expression to a narrower
+    // integer target when (a) the source is plain `int` and (b) the value fits
+    // the target. Running it per candidate on each argument lets `classifyArg`
+    // see the post-narrowing type: `Pick(3)` against `Pick(byte)` becomes
+    // `byte → byte` (exact), against `Pick(string)` stays inapplicable, so the
+    // unique winner is `Pick(byte)` exactly as §5.1's worked example promises.
+    //
+    // SUBTLETY — ORDER DEPENDENCE. narrowIntConstantToTarget mutates the
+    // argument's recorded type in the typecheck side table via setExprType, so
+    // the LAST candidate that successfully narrows a given argument wins the
+    // recorded type. With two narrower-integer candidates (e.g. `Pick(byte)`
+    // and `Pick(short)`), the first-declared one wins the recorded type and
+    // the other becomes inapplicable (`byte → short` is a §5.1 widening, so
+    // it stays applicable, but then `short → byte` for the inverse order is
+    // not — the resolver still picks a unique candidate, just whichever
+    // declaration the resolver saw first). This is recorded as an
+    // implementation choice — the spec does not say what to do when two
+    // narrower-integer overloads both fit a constant, because §22.6's "no
+    // candidate is unambiguously better" rule expects EXACT vs CONVERT to
+    // decide, and both post-narrowing candidates are exact. An OUT-OF-RANGE
+    // constant still falls through (narrowIntConstantToTarget returns `from`
+    // unchanged when `fitsInIntType` is false), so an ambiguity remains
+    // diagnosable when a narrower candidate truly does not fit.
+    //
+    // OUT OF SCOPE — qualified const `C.GK` (filed as #2986). foldIntConstExprTC
+    // only resolves local/module consts through `lookupName`; a class member
+    // const is reached through a different lookup chain and may fold to a
+    // different value than #2985's #2925 fix delivered. Scoping this lane to
+    // the case `narrowIntConstantToTarget` already supports (literals + local /
+    // module consts); bundling #2986 would risk regressing this fix when the
+    // member-const resolver changes.
     for (std::size_t c = 0; c < cands.size(); ++c) {
         const auto& params = decls[c]->params;
         for (std::size_t j = 0; j < params.size(); ++j) {
@@ -1067,10 +1149,37 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
             const TypeRef* pt = params[j].type
                                     ? ctx_.resolvedType(*params[j].type)
                                     : nullptr;
-            const TypeRef* at = ce.args[static_cast<std::size_t>(ai)].value
-                                    ? ctx_.exprType(
-                                          *ce.args[static_cast<std::size_t>(ai)]
-                                               .value)
+            const ast::CallArgument* carg =
+                ce.args[static_cast<std::size_t>(ai)].value
+                    ? &ce.args[static_cast<std::size_t>(ai)]
+                    : nullptr;
+            // §22.3 / §14.5: ref/out arguments alias the caller's storage, so
+            // §22.6's exact-type rule applies (§22.3 "A `ref` argument naming a
+            // mutable local … is a true alias"; §14.5 "a `ref` or `out`
+            // parameter position unifies exactly"). The §5.1 narrowing carve-
+            // out does not apply to ref/out positions, so skip them here —
+            // `classifyArg` will see the un-narrowed type and reject unless
+            // the types already match exactly.
+            const bool skipNarrow =
+                !carg || carg->modifier == "ref" || carg->modifier == "out" ||
+                carg->modifier == "out var" ||
+                carg->modifier == "out using var" ||
+                carg->modifier == "out owned var";
+            if (!skipNarrow && carg && carg->value && pt) {
+                // narrowIntConstantToTarget re-types the expression via
+                // ctx_.setExprType when the rule applies; the subsequent
+                // ctx_.exprType below picks up the narrowed type. It is a
+                // no-op when (a) the source is not plain `int`, (b) the target
+                // is not a narrower integer, or (c) the value does not fit —
+                // the very predicates that let the existing checkArgsAgainst-
+                // Params path avoid false positives on non-constant or out-of-
+                // range values.
+                (void)narrowIntConstantToTarget(carg->value.get(),
+                                                ctx_.exprType(*carg->value),
+                                                const_cast<TypeRef*>(pt));
+            }
+            const TypeRef* at = carg && carg->value
+                                    ? ctx_.exprType(*carg->value)
                                     : nullptr;
             paramTypes[c].push_back(pt);
             argTypeRows[c].push_back(at);
@@ -1109,7 +1218,23 @@ MethodSymbol* ExprTC::resolveMethodOverload(MethodSymbol* initial,
     }
     OverloadResult r = resolveOverload(
         paramTypes, argTypes, fillsDefault, candNames, ce.span.begin,
-        std::string("`") + std::string(initial->name) + "`", extNote);
+        std::string("`") + std::string(initial->name) + "`", extNote,
+        // fix #2985 (§22.6 + §5.1): pass the AST expressions so the
+        // per-candidate narrowing arm can re-type a compile-time int constant
+        // via narrowIntConstantToTarget before classifyArg. ce.args is the
+        // call's argument list (§A.5); each CallArgument carries a
+        // std::unique_ptr<Expr> as its expression. Skip discard positions
+        // (whose value is null) so the inner loop's `argExprs[i]` check
+        // sees null and bypasses the re-type for the discard column
+        // (consistency with the existing `narrowIntConstantToTarget`
+        // pre-pass above, which already skips !carg->value).
+        [&]() {
+            std::vector<const ast::Expr*> es;
+            es.reserve(ce.args.size());
+            for (const auto& a : ce.args)
+                es.push_back(a.value.get());
+            return es;
+        }());
     switch (r.outcome) {
         case OverloadOutcome::Resolved:
             return cands[r.winnerIndex];
@@ -10046,15 +10171,30 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
                     fillsDefault[c] = true;
                     continue;
                 }
-                paramTypes[c].push_back(
-                    params[j].type
-                        ? substituteMemberType(
-                              ctx_.resolvedType(*params[j].type), &ne, t)
-                        : nullptr);
-                argTypeRows[c].push_back(
+                TypeRef* pt = params[j].type
+                                  ? substituteMemberType(
+                                        ctx_.resolvedType(*params[j].type),
+                                        &ne, t)
+                                  : nullptr;
+                const ast::CallArgument* carg =
                     ne.args[static_cast<std::size_t>(ai)].value
-                        ? ctx_.exprType(
-                              *ne.args[static_cast<std::size_t>(ai)].value)
+                        ? &ne.args[static_cast<std::size_t>(ai)]
+                        : nullptr;
+                // fix #2985 (§22.6 / §5.1, v0.240): same §5.1 constant-narrowing
+                // delegation as resolveMethodOverload above — a `new T(3)` against
+                // `constructor(x: byte)` / `constructor(x: string)` is a textbook
+                // §5.1 constant-narrowing case (the worked example in §5.1 names
+                // it directly). See the resolveMethodOverload block above for the
+                // full rationale and the order-dependence caveat.
+                if (carg && carg->value && pt && carg->modifier.empty()) {
+                    (void)narrowIntConstantToTarget(
+                        carg->value.get(),
+                        ctx_.exprType(*carg->value), pt);
+                }
+                paramTypes[c].push_back(pt);
+                argTypeRows[c].push_back(
+                    carg && carg->value
+                        ? ctx_.exprType(*carg->value)
                         : nullptr);
                 argIdxRows[c].push_back(ai);
             }
@@ -10074,9 +10214,28 @@ void ExprTC::checkNewExprArgs(const ast::NewExpr& ne, TypeSymbol* t) {
         // winner needs no further per-argument check (each arg is already
         // exact or §5.1-convertible). On Undecidable we defer (no check),
         // matching the prior "overloaded → skip" behavior.
+        //
+        // fix #2985 (§22.6 + §5.1): pass the AST expressions so the
+        // per-candidate narrowing arm re-types a compile-time int constant
+        // for the constructor overload's parameter, matching the method-call
+        // dispatch's behaviour (`new Pick(3)` against `new(byte)` /
+        // `new(string)` resolves uniquely by §5.1, exactly like `Pick(3)`).
         resolveOverload(paramTypes, argTypes, fillsDefault, candNames,
                         ne.span.begin,
-                        std::string("`new ") + std::string(t->name) + "`");
+                        std::string("`new ") + std::string(t->name) + "`",
+                        /*extraNote=*/std::string(),
+                        // ne.args is the call's argument list (NewExpr
+                        // shares the §A.5 CallArgument shape with the
+                        // call-method path). Skip discard positions (whose
+                        // value is null) — the inner loop's `argExprs[i]`
+                        // check sees null and bypasses the re-type.
+                        [&]() {
+                            std::vector<const ast::Expr*> es;
+                            es.reserve(ne.args.size());
+                            for (const auto& a : ne.args)
+                                es.push_back(a.value.get());
+                            return es;
+                        }());
         return;
     }
     if (ctors.empty()) {

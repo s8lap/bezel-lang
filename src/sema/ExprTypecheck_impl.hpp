@@ -1736,7 +1736,9 @@ private:
         const std::vector<bool>& fillsDefault,
         const std::vector<std::string>& candNames, SourceLocation loc,
         const std::string& calleeDesc,
-        const std::string& extraNote = std::string());
+        const std::string& extraNote = std::string(),
+        const std::vector<const ast::Expr*>& argExprs =
+            std::vector<const ast::Expr*>());
 
     // §22.6 method-overload resolution. Given the initially-resolved
     // MethodSymbol for a call and the call site, returns the MethodSymbol
