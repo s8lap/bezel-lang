@@ -4845,6 +4845,46 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
                         "internal: return-value expression failed to lower to a "
                         "value (degraded to a zero/null return value) — #2491");
                 }
+                // fix #2944 (§12.1 / §14.1 / §23, v0.240, NARROW): an
+                // EXPRESSION-bodied property GETTER built as the shared/erased
+                // TEMPLATE (tag 0 — `declareVtables` Pass D's first emission,
+                // before any per-instantiation tag is installed) lowers its
+                // body without an active substitution, so the lowered value of
+                // an expression that REACHES a `T`-typed field through a
+                // GENERIC BASE (`D2<U> : GBase<string>` reads `v2: T` declared
+                // in `GBase`) is the i32 ERASED PLACEHOLDER. The function's
+                // declared RETURN TYPE was built from
+                // `lowerType(pd->type)` — which respects the OVERRIDE's
+                // concrete annotation (e.g. `Item: string` -> ptr) — so the
+                // body's `ret i32` inside a `ptr`-returning function fails
+                // IR verification: "Function return type does not match
+                // operand type of return inst!". The METHOD twin
+                // (`emitReturn`, LlvmBackend_Setup.cpp ~10818) handles the
+                // BLOCK-bodied analogue by substituting a type-correct
+                // `ret null` whenever `emittingGenericTemplateBody_` is
+                // true; this site bypasses emitReturn and was missing the
+                // guard, so the same shape on the EXPRESSION-GETTER face
+                // was a hard abort.
+                //
+                // NARROW PREDICATE — !cls->genericParams.empty(). §2759's
+                // residual (`public virtual property O: Object => 0;` on a
+                // non-generic `Base`) is the EXACT same mismatch on a
+                // non-generic class: body returns i32, function returns
+                // ptr. The previous lane's fix (commit c5974ef) armed the
+                // coercion for every tag-0 emission, which made #2759's
+                // pinned-as-broken test build successfully and was reverted
+                // (commit 671726f). Restricting the coercion to GENERIC
+                // classes leaves the §2759 path untouched (its build failure
+                // is the deliberate safe direction, per the test's own
+                // comment) and only arms the substitution-erased-template
+                // case where the body references a generic-base field with
+                // no active `genericSubst_`. A generic class with a
+                // non-type-param property (`Item: int get => a`) has
+                // matching body and return types, so the coercion no-ops
+                // even when the predicate fires.
+                if (v && v->getType() != valTy && accessorSpecTagNow() == 0 &&
+                    !cls->genericParams.empty())
+                    v = llvm::Constant::getNullValue(valTy);
                 builder_.CreateRet(v ? v
                                      : llvm::Constant::getNullValue(valTy));
             }
@@ -4860,9 +4900,37 @@ llvm::Function* Emitter::ensurePropertyAccessorFn(const sema::TypeSymbol* cls,
             // returns void and has no return-representation contract.
             accessorReturnTypeNode_ = pd->type.get();
             accessorReturnTypeFn_   = fn;
+            // fix #2944 (§12.1 / §14.1 / §23, v0.240, NARROW): a BLOCK-bodied
+            // property GETTER built as the shared/erased TEMPLATE (tag 0)
+            // lowers its body's `return v;` through `emitReturn` with no
+            // active substitution, so the value carries the i32 ERASED
+            // PLACEHOLDER for a `T`-typed field reached through a generic
+            // base, while the function's declared RETURN TYPE comes from
+            // the OVERRIDE's concrete annotation (`Item: string` -> ptr).
+            // `emitReturn`'s `emittingGenericTemplateBody_` guard
+            // (LlvmBackend_Setup.cpp ~10818) would coerce the mismatched
+            // return to a type-correct `ret null`, but the flag is set
+            // only by `emitFunctionBody` for METHOD templates — this
+            // getter's body is emitted INSIDE `ensurePropertyAccessorFn`,
+            // never via `emitFunctionBody`.
+            //
+            // NARROW PREDICATE — !cls->genericParams.empty(). Same shape
+            // as the expression-getter arm above: §2759's
+            // `public virtual property O: Object get => do return _n;
+            // end;` (block form) on a non-generic `Holder` would also
+            // mismatch (body i32, function ptr) and was deliberately
+            // pinned as a build failure. Restricting the arm to GENERIC
+            // classes preserves the §2759 residual — and since the §2759
+            // test is only the expression-bodied variant, the block-form
+            // arm here is the more conservative choice: it never fires
+            // for non-generic classes regardless of body shape.
+            bool savedEmittingGenericTemplateBody = emittingGenericTemplateBody_;
+            if (accessorSpecTagNow() == 0 && !cls->genericParams.empty())
+                emittingGenericTemplateBody_ = true;
             lowerScopedBlock(blockGet->stmts);
             if (!builder_.GetInsertBlock()->getTerminator())
                 emitImplicitReturn(fn);
+            emittingGenericTemplateBody_ = savedEmittingGenericTemplateBody;
         }
     } else {
         // --- Setter body: bind the implicit `value` param (anchored on pd). ---
