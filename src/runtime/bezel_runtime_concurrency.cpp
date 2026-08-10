@@ -854,6 +854,23 @@ void* bz_task_error_obj(void* tp) {
     return ((bz_task_t*)tp)->error_obj;
 }
 
+// §30.9 / #3030: null the task's error_obj slot. Codegen's scope-end
+// fault-disposal preamble (emitTaskDisposal, LlvmBackend_Disposal.cpp) reads
+// error_obj via bz_task_error_obj, calls emitDisposeAndReclaim on the result,
+// and then calls bz_task_fire_and_forget. Pre-#3030 bz_task_free never read
+// error_obj, so leaving the field dangling was fine; post-#3030 the FAST path
+// of bz_task_fire_and_forget inspects error_obj to decide whether to dispose
+// it (the FAST path is reachable from the explicit `Task.FireAndForget(owned
+// t)` user-facing call, which has no codegen preamble), so a non-null
+// dangling field would be re-disposed -> double-free. This setter nulls the
+// field after codegen's dispose so the FAST path's `if (error_obj && ...)`
+// guard sees null and skips. Lock-free: by the time codegen runs the
+// preamble the task has settled (the FAST path is the only reachable arm).
+void  bz_task_clear_error_obj(void* tp) {
+    if (!tp) return;
+    ((bz_task_t*)tp)->error_obj = nullptr;
+}
+
 // §30.10 / #1529: true if `tp`'s error_obj (if any) is a BORROWED reference
 // from an input task's owned fault (set on a WhenAll/WhenAll<T> aggregate that
 // propagated an input's fault) rather than owned by `tp` itself. Codegen's
@@ -1708,6 +1725,28 @@ void  bz_task_fire_and_forget(void* tp) {
     { std::lock_guard<std::mutex> lk(task->mtx); already_done = task->done; }
     if (already_done) {
         // Fast path: task is complete; free immediately without the scheduler.
+        // §30.9 (v0.240) / #3030: the task owns its fault exception and must
+        // dispose it exactly once, regardless of which path settled it. The
+        // emitTaskDisposal scope-end path (LlvmBackend_Disposal.cpp) runs an
+        // `bz_task_is_error` → `bz_task_error_obj` → `bz_dispose_class_obj`
+        // preamble BEFORE this call, so arrives here with error_obj already
+        // null. The explicit `Task.FireAndForget(owned t)` user-facing call
+        // (LlvmBackend_Calls.cpp §6.7 arm) calls bz_task_fire_and_forget
+        // directly with NO preamble — a synchronous-throw task reaches this
+        // arm with error_obj set, and pre-#3030 the `bz_task_free` reclaim
+        // reclaims the task struct + error_msg but NOT the exception object,
+        // leaking the entire Bezel exception (and, with it, anything the
+        // exception owns — including the §31.4 CauseChain snapshot). Mirror
+        // the slow path's guarded disposal before bz_task_free runs. The same
+        // `!fault_borrowed` guard skips a WhenAll/WhenAll<T> aggregate that
+        // BORROWED its fault from an input task (§30.10 / #1529 — the input
+        // remains the sole owner). No-lock read: by the time this runs the
+        // task has settled — the same invariant bz_task_free's lock-free
+        // reads below already rely on.
+        if (task->error_obj && !task->fault_borrowed) {
+            bz_dispose_class_obj(task->error_obj);
+            task->error_obj = nullptr;
+        }
         bz_task_free(tp);
     } else {
         // Slow path: task still running at scope end (the "still-running"
