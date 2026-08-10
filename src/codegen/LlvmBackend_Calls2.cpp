@@ -8930,6 +8930,29 @@ bool Emitter::computeAncestorGenericSubst(
     // today changes. It still refuses rather than guessing — any parameter the
     // active map does not bind bails out, keeping the "never install a
     // substitution we cannot prove" discipline of #2840/#2860/#2873/#2882.
+    //
+    // fix #2909 (§14.1 / §12 "Inheritance and Dispatch" / §22.8, v0.240,
+    // LOOSENED SEED): the "bail if any param is unbound" guard above is
+    // wrong for a generic class whose OWN parameter is not referenced by
+    // its OWN base clause — e.g. `class Coll<U> : Base<string>` reads the
+    // inherited `Base<T>.bv` as a BARE identifier inside one of its
+    // methods. `implicitFieldAddr` synthesizes a no-generic-args receiver
+    // for `Coll<U>` and calls this helper; in the SHARED TEMPLATE body the
+    // active substitution is empty (U has no concrete binding yet), but
+    // T is fully resolvable from the base clause alone
+    // (`Base<string>`, no U reference). The strict bail refused the whole
+    // walk, the substitution was never installed, and `classStruct(Base)`
+    // used the T→i32 ERASED PLACEHOLDER — `bv` lowered as i32, then `.Length`
+    // GEP'd a `%bz.string` and the verifier aborted. RELAX the seed: bind
+    // the params the active map actually carries, leave the rest unbound.
+    // The chain walk populates curArgs only with the bindings it consults,
+    // and the END check below rejects any binding that is still a bare
+    // type-parameter ref — that means some level of the chain needed a
+    // parameter the receiver never pins, which is the same "we cannot
+    // prove" refusal just deferred until the walk actually consulted it.
+    // The "never install a substitution we cannot prove" discipline is
+    // preserved: every key in the returned map is bound to a CONCRETE
+    // TypeRef or the whole call returns false.
     const bool seedFromActiveSubst =
         recvTy->genericArgs.empty() && !curParams.empty();
     if (!seedFromActiveSubst &&
@@ -8937,8 +8960,11 @@ bool Emitter::computeAncestorGenericSubst(
     for (std::size_t gi = 0; gi < curParams.size(); ++gi) {
         if (seedFromActiveSubst) {
             auto ait = genericSubstSemaTy_.find(curParams[gi]);
-            if (ait == genericSubstSemaTy_.end() || !ait->second) return false;
-            curArgs[curParams[gi]] = ait->second;
+            // fix #2909: leave unbound rather than bailing — the chain walk
+            // only consults params the base clauses reference, so an
+            // unreferenced enclosing-class param (Coll<U>.U) is harmless.
+            if (ait != genericSubstSemaTy_.end() && ait->second)
+                curArgs[curParams[gi]] = ait->second;
             continue;
         }
         // §14.1 / §19.3 (v0.226, #2202): the receiver may itself have been
@@ -9007,6 +9033,18 @@ bool Emitter::computeAncestorGenericSubst(
     for (const sema::Symbol* gp : ancestor->genericParams) {
         auto it = curArgs.find(gp->name);
         if (it == curArgs.end() || !it->second) return false;
+        // fix #2909: reject any binding that is STILL a bare type-parameter
+        // ref — that means some level of the chain needed a parameter the
+        // receiver never pins (e.g. `class D<T> : M<T> : B<T>` in the
+        // template body of D: every chain link asks for the open T, and we
+        // cannot pin it without an active substitution). Without this
+        // guard the relaxed seed would install `T → bare T ref`, then
+        // `lowerTypeRef` would happily produce the i32 ERASED PLACEHOLDER
+        // and we would silently regress the §2759-style "template
+        // substituted with placeholder" bug. Concreteness means: not a
+        // bare generic-parameter reference (Named with no declaration +
+        // single-part name / importedName).
+        if (isBareTypeParamRef(it->second)) return false;
         outSubst[gp->name] = lowerTypeRef(it->second);
         outSema[gp->name] = it->second;
     }
