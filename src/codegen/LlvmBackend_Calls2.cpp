@@ -6658,6 +6658,80 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
                                 llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
                             builder_.CreateCall(fn, {recv, disp});
                         }
+                    } else if (isCollectionInterfaceName(recvTy)) {
+                        // fix #3026 (spec §28.2 / §28.9 / §8.1, stdlib §4.1 /
+                        // §4.6-§4.9, v0.240): the three POLYMORPHIC collection
+                        // interfaces (IReadOnlyCollection<T> / ICollection<T> /
+                        // IOwningCollection<T>) are implemented by collections
+                        // with INCOMPATIBLE runtime representations —
+                        // Array/Stack/Queue/OwningBuffer/OwningStack/OwningQueue
+                        // (bz_array_t*), LinkedList/OwningLinkedList
+                        // (bz_llist_t*), and Dictionary/Set/OwningSet/SortedSet
+                        // (bz_dict_t*). The static type erases which concrete
+                        // backing is held, the runtime structs share no kind
+                        // header, and a single emit call is unsound — it would
+                        // read garbage on the wrong backing's layout. The
+                        // #2970 fix extended the chain to the ARRAY-BACKED LIST
+                        // interfaces (IList<T> / IReadOnlyList<T> /
+                        // IOwningList<T>), whose implementing set is
+                        // Array<T> / OwningArray<T> and only that — so the
+                        // static assumption is sound there. The polymorphic
+                        // collection interfaces have no such restriction.
+                        //
+                        // The runtime foundation (see
+                        // bezel_runtime_internal.hpp's BZ_RUNTIME_KIND_*
+                        // constants + the kind field appended to each struct)
+                        // is a negative-int64 sentinel at offset 48 for
+                        // bz_array_t / bz_llist_t (both structs append the
+                        // tag at the same offset so the runtime helper
+                        // `bz_runtime_dispose` can probe ONE offset) and at
+                        // offset 88 for bz_dict_t. The runtime helper probes
+                        // offset 48 first (a bz_dict_t's order_count at
+                        // offset 56 is non-negative and cannot collide with
+                        // the negative sentinels), then offset 88 for the
+                        // dict.
+                        // The disposer argument is computed from the STATIC
+                        // element type T (the same shape the concrete
+                        // Array<T>/LinkedList<T>/Dictionary<K,V> arms use):
+                        //   * IReadOnlyCollection<T> / ICollection<T> —
+                        //     borrowing; pass null (sound for Array<T>,
+                        //     LinkedList<T>, Set<T>, Dictionary<K,V> — every
+                        //     borrowing implementing type).
+                        //   * IOwningCollection<T> — owning; pass the
+                        //     class-element disposer `elementPolicyFor(T,
+                        //     /*owning=*/true)` yields (sound for
+                        //     OwningArray<T>, OwningLinkedList<T>,
+                        //     OwningSet<T> — every owning implementing type).
+                        // The null-dispose check in bz_*_free matches the
+                        // Set<T> borrowing case (where bz_dict_free does not
+                        // dispose values); the class-element disposer matches
+                        // the OwningSet<T> case (where bz_dict_free disposes
+                        // values, which are the owned keys).
+                        {
+                            // IOwningCollection<T> is the OWNING polymorphic
+                            // collection interface — dispose cascades.
+                            // isCollectionInterfaceName returns true for the
+                            // three heads (IReadOnlyCollection / ICollection /
+                            // IOwningCollection); only IOwningCollection is
+                            // owning, the other two are borrowing.
+                            std::string_view ifaceHead =
+                                builtinTypeName(recvTy);
+                            bool ifaceOwning = ifaceHead == "IOwningCollection";
+                            const sema::TypeRef* arrElem =
+                                (!recvTy->genericArgs.empty())
+                                    ? recvTy->genericArgs[0] : nullptr;
+                            llvm::Function* elemDisp =
+                                ifaceOwning
+                                    ? elementPolicyFor(arrElem, /*owning=*/true)
+                                          .disposerThunk
+                                    : nullptr;
+                            llvm::Value* disp = elemDisp
+                                ? llvm::cast<llvm::Value>(elemDisp)
+                                : llvm::ConstantPointerNull::get(ptrTy());
+                            auto* fn = declareC("bz_runtime_dispose",
+                                llvm::Type::getVoidTy(llvm_), {ptrTy(), ptrTy()});
+                            builder_.CreateCall(fn, {recv, disp});
+                        }
                     } else if (isCollectionTypeName(recvTy)) {
                         // #362 / stdlib §4.5: explicit Dispose() on an owning
                         // collection cascades disposal into its class elements;

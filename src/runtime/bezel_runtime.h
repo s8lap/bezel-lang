@@ -288,6 +288,22 @@ int64_t bz_dict_count(void* d);
 // Mismatch → codegen throws InvalidOperationException (per §29.12).
 int64_t bz_dict_get_mod(void* d);
 
+// fix #3026 (spec §28.2 / §28.9 / §8.1, stdlib §4.1 / §4.6-§4.9, v0.240):
+// dispose a heap-collection pointer whose concrete backing is unknown at the
+// call site (a polymorphic collection-interface receiver —
+// IReadOnlyCollection<T> / ICollection<T> / IOwningCollection<T>). Reads the
+// kind tag (see BZ_RUNTIME_KIND_* in bezel_runtime_internal.hpp) the alloc
+// fn stamped and dispatches to bz_array_free / bz_llist_free / bz_dict_free
+// accordingly. `dispose_elem` is the static-element-type disposer the caller
+// computed (null for borrowing, the class-element disposer for
+// IOwningCollection<T>); see the helper's definition for the sentinel layout
+// and probe order.
+void     bz_runtime_dispose(void* p, void (*dispose_elem)(void*));
+// Diagnostic accessor for the kind tag (returns BZ_RUNTIME_KIND_NONE on null
+// or on an untagged pointer). Used by codegen / tests; never by emitted
+// code.
+int64_t  bz_runtime_kind(void* p);
+
 // Enumerate all keys as (char*, int64_t len) pairs. The caller must free the
 // returned arrays with free(). `*keys_out` and `*lens_out` are malloc'd arrays.
 void bz_dict_keys_str(void* d, char*** keys_out, int64_t** lens_out,

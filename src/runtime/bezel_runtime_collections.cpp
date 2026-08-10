@@ -3,6 +3,76 @@
 #include "bezel_runtime_internal.hpp"
 
 // ---------------------------------------------------------------------------
+// fix #3026 (spec §28.2 / §28.9 / §8.1, stdlib §4.1 / §4.6-§4.9, v0.240):
+// the polymorphic collection-interface dispose dispatcher. The dispose chain
+// in LlvmBackend_Calls2.cpp's `isCollectionInterfaceName` arm (IReadOnlyCollection<T>
+// / ICollection<T> / IOwningCollection<T>) emits a call to this helper
+// instead of a single bz_*_free: the static type erases which concrete
+// backing the runtime value holds, and the three backings have incompatible
+// structs (bz_array_t / bz_llist_t / bz_dict_t). Each struct carries a
+// `kind` field (see the BZ_RUNTIME_KIND_* constants on bz_array_t) set by
+// its alloc fn; this helper reads the field and dispatches to the matching
+// free. `dispose_elem` is the static-element-type disposer the caller
+// computed (null for borrowing, the class-element disposer for IOwningCollection<T>)
+// and is sound for every backing because bz_array_free / bz_llist_free /
+// bz_dict_free all accept the same dispose_elem signature (and a null
+// dispose_elem is a no-op for Set<T> where bz_dict_free does not dispose
+// values).
+//
+// PROBE ORDER. bz_array_t and bz_llist_t both carry their kind at the same
+// offset 48 (bz_llist_t's struct has an 8-byte padding slot for this
+// reason — see the comment on the struct). bz_dict_t's struct is larger and
+// carries its kind at offset 88 (its order_count field occupies offset 56,
+// a non-negative count that cannot collide with the negative sentinels).
+// The probes walk offset 48 first, then offset 88.
+//
+// SENTINEL VALUES. The kind sentinels are negative int64 values (-1 / -2 /
+// -3). order_count (the bz_dict_t field at offset 56) is a non-negative
+// count of valid insertions — it cannot equal a negative sentinel — so the
+// first probe can never false-positive a dict as an array or llist. A
+// positive sentinel would not have this property (a freshly constructed
+// dict has order_count == 0, but a populated dict's order_count grows
+// without a natural upper bound and could in principle collide with a
+// small positive sentinel).
+//
+// UNTAGGED POINTER. An untagged pointer (BZ_RUNTIME_KIND_NONE = 0, or any
+// other value the probes do not match) is treated as a bounded leak —
+// return without doing anything. The trade is the same one #2967/#2970
+// record for the prior diagnostic-untagged positions, and the only path
+// that produces an untagged pointer is fresh stack scratch the runtime
+// never hands to codegen, so the no-op is defensive rather than
+// observable. // per §28.9 / §28.2
+// ---------------------------------------------------------------------------
+extern "C" void bz_runtime_dispose(void* p, void (*dispose_elem)(void*)) {
+    if (!p) return;
+    // Probe offset 48 first — both bz_array_t and bz_llist_t carry the
+    // kind here. The negative sentinel values rule out a bz_dict_t
+    // false-positive (its order_count at offset 56 is non-negative).
+    int64_t k48 = 0;
+    memcpy(&k48, (uint8_t*)p + 48, sizeof(int64_t));
+    if (k48 == BZ_RUNTIME_KIND_ARRAY) { bz_array_free(p, dispose_elem); return; }
+    if (k48 == BZ_RUNTIME_KIND_LLIST) { bz_llist_free(p, dispose_elem); return; }
+    // bz_dict_t's kind lives at offset 88 (struct ends at 96). Reading
+    // there is safe — the alloc sized the struct for it.
+    int64_t k88 = 0;
+    memcpy(&k88, (uint8_t*)p + 88, sizeof(int64_t));
+    if (k88 == BZ_RUNTIME_KIND_DICT) { bz_dict_free(p, dispose_elem); return; }
+    // untagged — bounded leak (see header).
+}
+
+extern "C" int64_t bz_runtime_kind(void* p) {
+    if (!p) return BZ_RUNTIME_KIND_NONE;
+    int64_t k48 = 0;
+    memcpy(&k48, (uint8_t*)p + 48, sizeof(int64_t));
+    if (k48 == BZ_RUNTIME_KIND_ARRAY) return k48;
+    if (k48 == BZ_RUNTIME_KIND_LLIST) return k48;
+    int64_t k88 = 0;
+    memcpy(&k88, (uint8_t*)p + 88, sizeof(int64_t));
+    if (k88 == BZ_RUNTIME_KIND_DICT) return k88;
+    return BZ_RUNTIME_KIND_NONE;
+}
+
+// ---------------------------------------------------------------------------
 // bz_array_t — dynamic array
 // ---------------------------------------------------------------------------
 
@@ -14,6 +84,7 @@ void* bz_array_alloc(int64_t elem_size, int64_t initial_cap) {
     // claiming capacity over a NULL buffer and the first add wrote through it.
     auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
     if (!arr) bz_alloc_fail("Array<T> header");
+    arr->kind = BZ_RUNTIME_KIND_ARRAY;  // fix #3026
     if (initial_cap > 0) {
         arr->data = calloc((size_t)initial_cap, (size_t)elem_size);
         if (!arr->data) bz_alloc_fail("Array<T> backing store");
@@ -36,6 +107,7 @@ int64_t bz_array_capacity(void* arrp) {
 // for i in 0..<n without requiring Add() first. All n elements are calloc'd to 0.
 void* bz_array_alloc_count_n(int64_t elem_size, int64_t n) {
     auto* arr = (bz_array_t*)calloc(1, sizeof(bz_array_t));
+    arr->kind = BZ_RUNTIME_KIND_ARRAY;  // fix #3026
     if (n > 0) {
         arr->data = calloc((size_t)n, (size_t)elem_size);
         arr->capacity = n;
@@ -394,6 +466,12 @@ struct bz_dict_t {
     // (Add/Update/Remove/Clear). Captured by for-in codegen at loop start;
     // checked on each iteration — mismatch → InvalidOperationException.
     int64_t     mod_count;
+    // fix #3026: kind tag (BZ_RUNTIME_KIND_DICT) set by bz_dict_alloc /
+    // bz_dict_alloc_generic. APPENDED last so prior offsets (buckets@0,
+    // count@8, capacity@16, key_size@24, hash_fn@32, eq_fn@40, order@48,
+    // order_count@56, order_cap@64, disposed@72, mod_count@80) are
+    // preserved — existing codegen reads them at fixed offsets.
+    int64_t     kind;
 };
 
 static uint32_t fnv1a(const char* s, int64_t len) {
@@ -507,6 +585,7 @@ static void dict_rehash(bz_dict_t* d) {
 void* bz_dict_alloc(void) {
     auto* d = (bz_dict_t*)calloc(1, sizeof(bz_dict_t));
     if (!d) bz_alloc_fail("Dictionary<K,V> header");
+    d->kind = BZ_RUNTIME_KIND_DICT;  // fix #3026
     d->capacity = 8;
     d->buckets = (bz_entry_t*)calloc(8, sizeof(bz_entry_t));
     if (!d->buckets) bz_alloc_fail("Dictionary<K,V> bucket array");
@@ -721,6 +800,7 @@ void* bz_dict_alloc_generic(int64_t key_size,
                               bool     (*eq)(const void* a, const void* b)) {
     auto* d = (bz_dict_t*)calloc(1, sizeof(bz_dict_t));
     if (!d) bz_alloc_fail("Dictionary<K,V> header");
+    d->kind = BZ_RUNTIME_KIND_DICT;  // fix #3026
     d->capacity = 8;
     d->buckets = (bz_entry_t*)calloc(8, sizeof(bz_entry_t));
     if (!d->buckets) bz_alloc_fail("Dictionary<K,V> bucket array");
@@ -1430,6 +1510,14 @@ struct bz_llist_t {
     // mutation (AddFirst/Last/Before/After, Remove*, Pop*). Captured by
     // lowerLinkedListFor at loop start; checked per iteration.
     int64_t          mod_count;
+    // fix #3026: kind tag (BZ_RUNTIME_KIND_LLIST) set by bz_llist_alloc at
+    // offset 48 — the same offset bz_array_t's kind uses, so the runtime
+    // helper bz_runtime_dispose can probe ONE offset (48) for both array-
+    // and llist-backed polymorphic collection interfaces. Sized to keep
+    // the prior offsets (head@0, tail@8, count@16, elem_size@24,
+    // next_seq@32, mod_count@40) unchanged — existing codegen and
+    // runtime read those at fixed offsets.
+    int64_t          kind;
 };
 
 // Allocate a node with elem_size bytes of value storage, stamping it with the
@@ -1447,6 +1535,8 @@ static bz_llist_node_t* llist_node_alloc(bz_llist_t* l, int64_t elem_size,
 
 void* bz_llist_alloc(int64_t elem_size) {
     auto* l = (bz_llist_t*)calloc(1, sizeof(bz_llist_t));
+    if (!l) bz_alloc_fail("LinkedList<T> header");
+    l->kind = BZ_RUNTIME_KIND_LLIST;  // fix #3026
     l->elem_size = elem_size;
     return l;
 }
