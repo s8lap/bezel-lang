@@ -7430,6 +7430,32 @@ std::optional<long long> ExprTC::foldIntConstExprTC(const ast::Expr& e) {
         if (!val) return std::nullopt;
         return foldIntConst(*val, resolve, d + 1);
     };
+    // fix #2986 (§17.14 / §5.1 / §22.12, v0.240): admit a qualified class
+    // const `C.GK` as a compile-time integer constant so it can drive §5.1
+    // narrowing. The bare-name resolver above walks lexical / enclosing-type
+    // consts only — a class-member const sits one scope higher (behind a
+    // Named-type head) and needs its own path here. Per §A.8 / §22.12 (#1095)
+    // `K.V` is already a const-init shape in a class-level initializer;
+    // §17.14 narrows the same shape to a smaller integer target. The head is
+    // required to be a single-segment module-visible TypeSymbol (a class);
+    // an unresolvable head, a non-class head (an instance field/property),
+    // an inherited member whose look-up misses, or a non-const member all
+    // return nullopt and fall back to the historical narrowing diagnostic so
+    // no false accept is lifted.
+    if (auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(&e)) {
+        TypeSymbol* t = nullptr;
+        if (auto* id =
+                dynamic_cast<const ast::IdentifierExpr*>(ma->target.get()))
+            if (Symbol* head = lookupName(id->name))
+                t = dynamic_cast<TypeSymbol*>(head);
+        if (!t) return std::nullopt;
+        Symbol* mem = lookupMember(t, ma->member);
+        auto* cms = dynamic_cast<ConstMemberSymbol*>(mem);
+        if (!cms) return std::nullopt;
+        auto* cd = dynamic_cast<const ast::ConstDecl*>(cms->decl);
+        if (!cd || !cd->value) return std::nullopt;
+        return foldIntConst(*cd->value, resolve, 1);
+    }
     return foldIntConst(e, resolve, 0);
 }
 
