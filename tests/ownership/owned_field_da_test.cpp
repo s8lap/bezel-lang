@@ -21,6 +21,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckFieldInit;
 
 namespace {
@@ -50,6 +51,8 @@ BEZEL_TEST(own_field_da, owned_field_without_init_missing_assignment_diagnoses) 
         "  end constructor; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "non-nullable field `_t` (§7.9"));
 }
 
 BEZEL_TEST(own_field_da, owned_field_with_initializer_ok_without_assignment) {
@@ -85,6 +88,8 @@ BEZEL_TEST(own_field_da, non_owned_reference_field_required) {
         "  end constructor; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "non-nullable field `_t` (§7.9"));
 }
 
 BEZEL_TEST(own_field_da, nullable_reference_field_not_required) {
@@ -109,6 +114,8 @@ BEZEL_TEST(own_field_da, multiple_ctors_each_must_assign) {
         "  end constructor; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "non-nullable field `_t` (§7.9"));
 }
 
 BEZEL_TEST(own_field_da, this_chained_ctor_transfers_responsibility) {
@@ -141,6 +148,8 @@ BEZEL_TEST(own_field_da, base_chained_ctor_does_not_transfer) {
         "  end constructor; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "non-nullable field `_t` (§7.9"));
 }
 
 BEZEL_TEST(own_field_da, no_constructor_with_owned_field_diagnoses) {
@@ -152,6 +161,8 @@ BEZEL_TEST(own_field_da, no_constructor_with_owned_field_diagnoses) {
         "  private owned _t: T;"
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "non-nullable field `_t` needs an initializer"));
 }
 
 BEZEL_TEST(own_field_da, multiple_owned_fields_all_required) {
@@ -164,6 +175,8 @@ BEZEL_TEST(own_field_da, multiple_owned_fields_all_required) {
         "  end constructor; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "non-nullable field `_b` (§7.9"));
 }
 
 // §7.9 requires the field be "assigned" — it does not mandate `this.`

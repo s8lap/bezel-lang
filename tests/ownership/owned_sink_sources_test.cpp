@@ -29,6 +29,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -98,6 +99,8 @@ BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_field_rejected_28_3) {
         "  end Main; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be stored into an `owned` field"));
 }
 
 // ---- Finding [19]: indexer borrow `coll[i]` into an OWNED ARGUMENT --------
@@ -116,6 +119,8 @@ BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_arg_builtin_rejected_28
         "  end Main; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.8: the same indexer-borrow into a USER-defined owned sink method (not the
@@ -128,6 +133,8 @@ BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_arg_user_method_rejecte
         "  end Use; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.11 (#395 routing through the extended classifier): the indexer-borrow as
@@ -141,6 +148,8 @@ BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_setter_rejected_28_11) 
         "  end Use; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.8: an indexer-borrow into an owned CONSTRUCTOR argument. REJECTED.
@@ -157,6 +166,8 @@ BEZEL_TEST(owned_sink_sources, indexer_borrow_into_owned_ctor_arg_rejected_28_8)
         "  end Use; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // ---- Finding [20]: NON-owned class-field read `obj.f` into an OWNED FIELD --
@@ -177,6 +188,8 @@ BEZEL_TEST(owned_sink_sources, nonowned_field_read_into_owned_field_rejected_28_
         "end Sink2; "
         "class C end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be stored into an `owned` field"));
 }
 
 // §28.8: a non-owned class-field read passed to an owned sink argument. The
@@ -189,6 +202,8 @@ BEZEL_TEST(owned_sink_sources, nonowned_field_read_into_owned_arg_rejected_28_8)
         "  end Use; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // ---- #403: bare `this` into an owned sink --------------------------------
@@ -205,6 +220,8 @@ BEZEL_TEST(owned_sink_sources, this_into_owned_arg_rejected_28_3) {
         "end R; "
         "class C end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.3 / §28.5: bare `this` stored into an owned field — same hazard, owned-
@@ -222,6 +239,8 @@ BEZEL_TEST(owned_sink_sources, this_into_owned_field_rejected_28_3) {
         "end R; "
         "class C end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be stored into an `owned` field"));
 }
 
 // ============================ POSITIVES ===================================

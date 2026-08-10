@@ -10,6 +10,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -38,6 +39,7 @@ BEZEL_TEST(own_join, owned_vs_borrowed_at_merge_diagnosed) {
         "else x := source.Inner; "
         "end;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "branch ownership conflict"));
 }
 
 BEZEL_TEST(own_join, owned_on_both_branches_carries_obligation) {
@@ -49,6 +51,7 @@ BEZEL_TEST(own_join, owned_on_both_branches_carries_obligation) {
     // Both branches produce owned → joined as Owned with obligation.
     // No discharge after the merge → diagnostic.
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "would be dropped here without disposal"));
 }
 
 BEZEL_TEST(own_join, owned_on_both_branches_and_discharged_clean) {
@@ -119,4 +122,5 @@ BEZEL_TEST(own_join, three_branch_chain_with_clash) {
         "else x := source.Inner; "
         "end;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "branch ownership conflict"));
 }

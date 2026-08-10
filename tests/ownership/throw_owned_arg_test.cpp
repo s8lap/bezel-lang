@@ -44,6 +44,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -106,6 +107,8 @@ BEZEL_TEST(throw_owned_arg, borrow_param_to_owned_ctor_arg_rejected_28_8) {
         "  throw new Wrap(b); "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.8 / §31.1 — the same borrow flowing in with an explicit `owned` call-site
@@ -116,6 +119,8 @@ BEZEL_TEST(throw_owned_arg, borrow_param_explicit_owned_modifier_rejected_28_8) 
         "  throw new Wrap(owned b); "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §31.1 / §28.8 (#404 completion) — `catch e => throw new WrapE(e)`: the catch-
@@ -133,6 +138,8 @@ BEZEL_TEST(throw_owned_arg, catch_binding_to_owned_ctor_arg_rejected_31_1) {
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §31.1 / §28.8 — same as above with an explicit `move` on the catch binding.
@@ -146,6 +153,8 @@ BEZEL_TEST(throw_owned_arg, catch_binding_move_to_owned_ctor_arg_rejected_31_1) 
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // =====================================================================
@@ -216,6 +225,8 @@ BEZEL_TEST(throw_owned_arg, rethrow_borrowed_binding_rejected_31_1) {
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "the thrown value must be an OWNED exception"));
 }
 
 // §31.2.4 — wrapping with a fresh no-arg exception: `throw new

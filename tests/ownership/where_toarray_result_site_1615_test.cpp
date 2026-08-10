@@ -38,6 +38,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 using bezel::test::runJit;
 
@@ -77,6 +78,8 @@ BEZEL_TEST(where_toarray_result_site_1615,
     // a genuine parse error (§A.7 requires parens around lambda params), not
     // a silently-accepted program.
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "retired pre-v0.217 lambda spelling"));
 }
 
 // ---- Correct, spec-conformant form is unaffected -----------------------

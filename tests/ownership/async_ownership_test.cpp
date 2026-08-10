@@ -50,6 +50,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -165,6 +166,9 @@ BEZEL_TEST(async_own_suspend, owned_at_await_dropped_through_later_block_diagnos
         "await p.MakeUnit(); "
         "if true then var z := 1; else var z := 2; end; "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "would be dropped here without disposal") ||
+        hasErrorMessage(r, "is implicitly disposed"));
 }
 
 // ---------------------------------------------------------------------------
@@ -187,6 +191,9 @@ BEZEL_TEST(async_own_patternA, await_bare_producer_into_var_diagnosed) {
     auto r = parseAndCheckOwnership(wrap(
         "var r := await p.MakeShared(); "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "Pattern A") ||
+        hasErrorMessage(r, "borrowed result"));
 }
 
 // Pattern A (v0.182, §30.5/§28.3, #1570): a bare producer call awaited in an
@@ -242,6 +249,9 @@ BEZEL_TEST(async_own_patternA, await_bare_producer_into_var_still_diagnosed) {
         "var r := await p.MakeShared(); "
         "Use(r); "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "Pattern A") ||
+        hasErrorMessage(r, "borrowed result"));
 }
 
 // Pattern A: `return await Producer()` is the one admitted bare-producer
@@ -390,6 +400,9 @@ BEZEL_TEST(async_own_patternA, plain_owned_class_never_used_across_suspend_still
         "var x := new T(); "
         "await p.MakeUnit(); "));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "would be dropped here without disposal") ||
+        hasErrorMessage(r, "is implicitly disposed"));
 }
 
 // SB01-D2 (#1868): a plain owned `OwningTask<T>` (Pattern B) local never awaited

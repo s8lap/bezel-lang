@@ -46,6 +46,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -76,6 +77,8 @@ BEZEL_TEST(deferred_activation_frame_return_1660,
         "  public static method Id(t: OwningTask<Cell>): OwningTask<Cell> => t; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned through the owning-type"));
 }
 
 // The `IOwningEnumerable<T>` sibling — a plain parameter passthrough.
@@ -87,6 +90,8 @@ BEZEL_TEST(deferred_activation_frame_return_1660,
         "      IOwningEnumerable<Cell> => src; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned through the owning-type"));
 }
 
 // A receiver `owned`-field read returned through `IOwningEnumerable<T>` — the
@@ -103,6 +108,8 @@ BEZEL_TEST(deferred_activation_frame_return_1660,
         "  public method Get(): IOwningEnumerable<Cell> return field; end Get; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned through the owning-type"));
 }
 
 // The `OwningTask<T>` receiver-owned-field sibling.
@@ -117,6 +124,8 @@ BEZEL_TEST(deferred_activation_frame_return_1660,
         "  public method Get(): OwningTask<Cell> return field; end Get; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned through the owning-type"));
 }
 
 // ★ SOUNDNESS REGRESSION GUARD — the coverage gap that let the double-free
@@ -149,6 +158,8 @@ BEZEL_TEST(deferred_activation_frame_return_1660,
         "  end Consume; "
         "end P;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow may not be returned through the owning-type"));
 }
 
 // ===========================================================================

@@ -21,6 +21,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 // ---------------------------------------------------------------------------
@@ -91,6 +92,8 @@ BEZEL_TEST(channel_spawn_sink_692_693,
         "  end P; "
         "end W;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §30.15 POSITIVE boundary: ChannelSender<T> with class-typed T and a `new`
@@ -191,6 +194,8 @@ BEZEL_TEST(channel_spawn_sink_692_693,
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §30.14 NEGATIVE: a borrow at pos 2 must also be rejected. This pins the
@@ -218,6 +223,8 @@ BEZEL_TEST(channel_spawn_sink_692_693,
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §30.14 / #693 residual: Domain.Spawn(entry, move X, ownedProducingCall())
@@ -282,6 +289,8 @@ BEZEL_TEST(channel_spawn_sink_692_693,
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // ---------------------------------------------------------------------------
@@ -376,6 +385,8 @@ BEZEL_TEST(channel_spawn_sink_692_693,
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §30.14 / §28.3 NEGATIVE: re-moving a moved-from clone after Spawn must be
@@ -402,5 +413,7 @@ BEZEL_TEST(channel_spawn_sink_692_693,
         "  end Main; "
         "end Program;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "already moved out"));
 }
 

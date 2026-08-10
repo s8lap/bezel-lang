@@ -23,6 +23,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -171,6 +172,8 @@ BEZEL_TEST(owned_sink, add_borrowed_param_rejected) {
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.8: the same with an explicit `owned` call-site modifier on a borrow
@@ -183,6 +186,8 @@ BEZEL_TEST(owned_sink, add_owned_modifier_on_borrowed_param_rejected) {
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.8 / §28.3: `move` of a borrowed parameter is not a legal owned
@@ -195,6 +200,8 @@ BEZEL_TEST(owned_sink, add_move_borrowed_param_rejected) {
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.8: a borrowed *local* (bound to a borrow source that the caller does
@@ -210,6 +217,8 @@ BEZEL_TEST(owned_sink, add_borrowed_local_rejected) {
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.8 / stdlib §4.5: the owning-collection `set(owned)` indexer with a
@@ -224,6 +233,8 @@ BEZEL_TEST(owned_sink, indexer_set_borrowed_param_rejected) {
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §28.8: passing a borrowed parameter as the `owned` argument of a
@@ -241,6 +252,8 @@ BEZEL_TEST(owned_sink, new_ctor_borrowed_param_rejected) {
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // ---- Built-in owning-collection sinks (stdlib §4.5) ----------------------
@@ -285,6 +298,8 @@ BEZEL_TEST(owned_sink, builtin_array_add_borrow_rejected) {
         "  a.Add(b); "
         "end M;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // stdlib §4.9: `OwningDictionary<K, V>.Add(key, owned value)` — the owned
@@ -296,6 +311,8 @@ BEZEL_TEST(owned_sink, builtin_dict_add_borrow_value_rejected) {
         "  d.Add(\"k\", b); "
         "end M;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // stdlib §6.7 / §30.10 (#1121): Task.WhenAllOwned<T>(owned tasks:

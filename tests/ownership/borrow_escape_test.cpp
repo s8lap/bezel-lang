@@ -37,15 +37,26 @@ BEZEL_TEST(own_escape, return_member_call_on_using_var_diagnosed) {
         "  return c.View(); "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "§28.3 borrow-lifetime rule"));
 }
 
+// Issue #2988 — this test previously read `c.Inner` on the `wrap()` Connection
+// (which has no `Inner` member), so the assertion passed on the unknown-member
+// (#414) diagnostic rather than the §28.3 borrow-escape rule it names. Pointing
+// the read at a member that actually exists (`_v`) and pinning the §28.3 rule's
+// specific message makes the test specific to the rule: if the §28.3 check
+// regresses, this test now goes red on a missing-message assertion instead of
+// staying green on the unrelated unknown-member error.
 BEZEL_TEST(own_escape, return_field_access_on_using_var_diagnosed) {
     auto r = parseAndCheckOwnership(wrap(
         "public method LeakField(): View "
         "  using var c := new Connection(); "
-        "  return c.Inner; "
+        "  return c._v; "
         "end LeakField;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "§28.3 borrow-lifetime rule"));
 }
 
 BEZEL_TEST(own_escape, return_member_call_on_param_clean) {
@@ -146,6 +157,8 @@ BEZEL_TEST(own_escape, return_reference_field_on_using_var_still_diagnosed) {
         "  return c.Inner; "
         "end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "§28.3 borrow-lifetime rule"));
 }
 
 // §23.4 / §28.3 (FINDING [6]): reading a VALUE-typed USER-DEFINED indexer
@@ -203,6 +216,8 @@ BEZEL_TEST(own_escape, return_reference_user_indexer_on_using_var_diagnosed) {
         "    return v; "
         "  end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "§28.9 / §9.7 borrow-lifetime rule"));
 }
 
 // §28.3 / §28.11 GUARD (cardinal risk): a built-in `OwningArray<R>` slot read
@@ -221,6 +236,8 @@ BEZEL_TEST(own_escape, return_owned_array_slot_on_using_var_diagnosed) {
         "  return v; "
         "end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "§28.9 / §9.7 borrow-lifetime rule"));
 }
 
 // §28.3 (D15): a VALUE-typed built-in collection indexer `a[0]` (`Array<int>`,
@@ -387,6 +404,8 @@ BEZEL_TEST(own_escape, return_class_field_from_using_var_still_diagnosed_641) {
         "  return popped.Child; "
         "end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "§28.3 borrow-lifetime rule"));
 }
 
 // §28.3 GUARD (#641): INDIRECT class-field escape is still diagnosed.
@@ -405,6 +424,8 @@ BEZEL_TEST(own_escape, return_class_field_indirect_from_using_var_still_diagnose
         "  return x; "
         "end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "§28.9 / §9.7 borrow-lifetime rule"));
 }
 
 // ── #1136 / §27.7 / §28.3: function-value call result on a `using var` ────────
@@ -437,6 +458,8 @@ BEZEL_TEST(own_escape, return_using_var_itself_still_diagnosed_1136) {
         "end Get; "
         "public static method Main(): int return 0; end Main; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "using var"));
 }
 
 // ===========================================================================
@@ -462,6 +485,8 @@ BEZEL_TEST(own_escape, return_member_call_on_plain_var_diagnosed) {
         "  return c.View(); "
         "end Leak;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "§28.3 borrow-lifetime rule"));
 }
 
 // §28.3 (#1960 NEGATIVE): the field-access twin of
@@ -475,6 +500,8 @@ BEZEL_TEST(own_escape, return_reference_field_on_plain_var_diagnosed) {
         "  return c.Inner; "
         "end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "§28.3 borrow-lifetime rule"));
 }
 
 // §28.3 (#1960 POSITIVE control — must NOT be over-rejected): a bare-identifier
@@ -516,6 +543,8 @@ BEZEL_TEST(own_escape, return_span_of_plain_var_array_diagnosed) {
         "    return local.AsSpan(); "
         "  end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "returned span views"));
 }
 
 // §9.7 / §4.14 (#1959 NEGATIVE): the `using var` source is likewise rejected
@@ -528,6 +557,8 @@ BEZEL_TEST(own_escape, return_span_of_using_var_array_diagnosed) {
         "    return local.AsSpan(); "
         "  end Leak; end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(bezel::test::hasErrorMessage(
+        r, "returned span views"));
 }
 
 // §9.7 / §4.14 (#1959 POSITIVE control — must NOT be over-rejected): a span

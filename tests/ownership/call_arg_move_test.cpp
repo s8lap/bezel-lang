@@ -10,6 +10,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -61,6 +62,7 @@ BEZEL_TEST(own_call_arg, read_after_owned_arg_diagnoses) {
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "already moved out"));
 }
 
 BEZEL_TEST(own_call_arg, read_after_move_arg_diagnoses) {
@@ -73,6 +75,7 @@ BEZEL_TEST(own_call_arg, read_after_move_arg_diagnoses) {
         "  end M; "
         "end C;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "already moved out"));
 }
 
 BEZEL_TEST(own_call_arg, owned_arg_in_initializer_consumes) {
@@ -143,4 +146,5 @@ BEZEL_TEST(own_call_arg, read_after_new_move_arg_diagnosed) {
         "  s.Take(move t); "
         "end M;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "already moved out"));
 }

@@ -29,6 +29,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -63,6 +64,8 @@ BEZEL_TEST(throw_owned_operand, rethrow_caught_binding_rejected_31_1) {
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "the thrown value must be an OWNED exception"));
 }
 
 // §31.1 (#1569): throwing a non-`owned` (borrowed) parameter — its owner is the
@@ -74,6 +77,8 @@ BEZEL_TEST(throw_owned_operand, throw_borrowed_param_rejected_31_1) {
         "  throw p; "
         "end Re;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "the thrown value must be an OWNED exception"));
 }
 
 // ── ACCEPTED — owned producers and the spec-blessed re-raise forms ────────────
@@ -174,6 +179,8 @@ BEZEL_TEST(throw_owned_operand, throw_borrowed_binding_in_guard_rejected_31_1_15
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "the thrown value must be an OWNED exception"));
 }
 
 // ACCEPTED: a fresh `new` thrown FROM THE GUARD is the canonical owned

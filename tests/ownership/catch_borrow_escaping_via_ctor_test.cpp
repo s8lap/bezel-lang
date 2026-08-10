@@ -37,6 +37,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -86,6 +87,8 @@ BEZEL_TEST(catch_borrow_via_ctor, throw_new_with_catch_borrow_arg_rejected_31_1)
         "  end Handle; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "caught exception `ex` may not be passed to a constructor"));
 }
 
 // =====================================================================
@@ -106,6 +109,8 @@ BEZEL_TEST(catch_borrow_via_ctor, return_new_with_catch_borrow_arg_rejected_31_1
         "  end Handle; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "caught exception `ex` may not be passed to a constructor"));
 }
 
 // =====================================================================
@@ -143,6 +148,8 @@ BEZEL_TEST(catch_borrow_via_ctor, rethrow_borrowed_binding_rejected_31_1) {
         "  end Handle; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "the thrown value must be an OWNED exception"));
 }
 
 // CONTROL (§31.1): reading `ex.Message` (a value/string projection) and
@@ -200,6 +207,8 @@ BEZEL_TEST(catch_borrow_via_ctor, regression_store_to_owned_field_rejected_31_1)
         "  end Handle; "
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "caught exception `ex` may not be assigned to a field"));
 }
 
 // REGRESSION GUARD: the bare re-throw `throw;` (null operand) is the one

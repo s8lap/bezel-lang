@@ -41,6 +41,7 @@
 #include "support/ownership_support.hpp"
 #include "test_harness.hpp"
 
+using bezel::test::hasErrorMessage;
 using bezel::test::parseAndCheckOwnership;
 
 namespace {
@@ -97,6 +98,7 @@ BEZEL_TEST(catch_owned_sink, pass_binding_to_owned_param_rejected_31_1) {
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §31.1 / §28.8 — same with an explicit `owned` call-site modifier on the
@@ -109,6 +111,7 @@ BEZEL_TEST(catch_owned_sink, pass_binding_to_owned_param_explicit_modifier_rejec
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §31.1 / §28.8 — `move ex` into the owned parameter. `move` of a borrow is no
@@ -122,6 +125,7 @@ BEZEL_TEST(catch_owned_sink, move_binding_to_owned_param_rejected_31_1) {
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §31.1 / §28.8 — indirect via a re-borrow holder: `var b := ex; this.Set(b);`.
@@ -138,6 +142,7 @@ BEZEL_TEST(catch_owned_sink, pass_reborrow_holder_to_owned_param_rejected_31_1) 
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §31.1 / §28.11 — the owning-collection `set(owned)` indexer: `s[0] := ex;`
@@ -156,6 +161,7 @@ BEZEL_TEST(catch_owned_sink, pass_binding_to_set_owned_indexer_rejected_31_1) {
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(r, "a borrow cannot be passed where an `owned` value is required"));
 }
 
 // §31.1 / §28.3 / §28.5 — assigning the catch binding to an `owned` field
@@ -170,6 +176,8 @@ BEZEL_TEST(catch_owned_sink, assign_binding_to_owned_field_rejected_31_1) {
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "caught exception `ex` may not be assigned to a field"));
 }
 
 // §31.1 / §28.8 — passing the catch binding as an `owned` CONSTRUCTOR argument
@@ -192,6 +200,9 @@ BEZEL_TEST(catch_owned_sink, pass_binding_to_owned_ctor_arg_rejected_31_1) {
         "  end Handle; "
         "end Holder;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "this call consumes `ex`") ||
+        hasErrorMessage(r, "scope-bound"));
 }
 
 // =====================================================================
@@ -250,6 +261,8 @@ BEZEL_TEST(catch_owned_sink, rethrow_borrowed_binding_rejected_31_1) {
         "  end; "
         "end Handle;"));
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
+    BEZEL_EXPECT_TRUE(hasErrorMessage(
+        r, "the thrown value must be an OWNED exception"));
 }
 
 // §31.2.4 — wrapping: `throw new InvalidOperationException();` raises a fresh
