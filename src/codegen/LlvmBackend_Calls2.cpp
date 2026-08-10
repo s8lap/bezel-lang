@@ -337,9 +337,17 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value && call.args[1].value) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
+        // fix #2938 / §22.3: §22.3-admitted accessor targets (property /
+        // indexer) bracket through `resolveOutAddrWithBracket`; the write-back
+        // flushes at the normal-return exit below.
         llvm::Type* et = nullptr;
-        llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-        if (!outAddr) return nullptr;
+        std::vector<AccessorRefArg> outArgs;
+        llvm::Value* outAddr = resolveOutAddrWithBracket(
+            *call.args[1].value, et, outArgs);
+        if (!outAddr) {
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+            return nullptr;
+        }
         llvm::Value* len = loadStringLen(s);
         llvm::Value* ok = builder_.CreateICmpEQ(
             len, builder_.getInt64(1), "chtp.ok");
@@ -350,6 +358,7 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // §11.8 / §2.19 (#1470): nullable-companion aware store for `T.TryParse`
         // dispatched through IParsable<char> into a generic `out T?`.
         storeTryParseOut(outAddr, et, sel, ok);
+        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         return ok;
     }
     // stdlib §9.3 / §2.19: decimal.TryParse(s, out result): bool — routes to
@@ -358,9 +367,15 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         call.args[0].value && call.args[1].value) {
         llvm::Value* s = lowerExpr(*call.args[0].value);
         if (!s) return nullptr;
+        // fix #2938 / §22.3: see char.TryParse above.
         llvm::Type* et = nullptr;
-        llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-        if (!outAddr) return nullptr;
+        std::vector<AccessorRefArg> outArgs;
+        llvm::Value* outAddr = resolveOutAddrWithBracket(
+            *call.args[1].value, et, outArgs);
+        if (!outAddr) {
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+            return nullptr;
+        }
         auto* fn = declareC("bz_decimal_try_parse", i32(), {ptrTy(), ptrTy()});
         // §11.8 / §2.19 (#1470): the runtime writes a BARE decimal through the
         // pointer it is given. When the out slot is a nullable companion `{i8,
@@ -387,6 +402,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
                 builder_.CreateLoad(decimalStructType(), decScratch, "dectp.v");
             storeTryParseOut(outAddr, et, dv, okDec);
         }
+        // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         return okDec;
     }
 
@@ -848,9 +865,15 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
         llvm::Value* strData = loadStringData(strVal);
+        // fix #2938 / §22.3: see char.TryParse above.
         llvm::Type* et = nullptr;
-        llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-        if (!outAddr) return nullptr;
+        std::vector<AccessorRefArg> outArgs;
+        llvm::Value* outAddr = resolveOutAddrWithBracket(
+            *call.args[1].value, et, outArgs);
+        if (!outAddr) {
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+            return nullptr;
+        }
         // strtod(data, &endptr)
         auto* strtodFn = declareC("strtod",
             llvm::Type::getDoubleTy(llvm_), {ptrTy(), ptrTy()});
@@ -884,6 +907,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         } else {
             storeTryParseOut(outAddr, et, selD, okD);
         }
+        // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         return okD;
     }
 
@@ -905,10 +930,21 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
         llvm::Value* strData = loadStringData(strVal);
-        // Get address of the out parameter.
+        // Get address of the out parameter. // per §22.3 / #2938
+        // fix #2938: a property or indexer slot target is admitted by §22.3
+        // and resolves through the §22.3 copy-in/copy-out bracket; `lvalueAddr`
+        // alone declines, so the builtin call bailed (#2434) and the
+        // write-back silently dropped. resolveOutAddrWithBracket populates
+        // `outArgs` with the bracket record when the target is accessor-
+        // mediated; the write-back flushes at the normal-return exit below.
         llvm::Type* et = nullptr;
-        llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-        if (!outAddr) return nullptr;
+        std::vector<AccessorRefArg> outArgs;
+        llvm::Value* outAddr = resolveOutAddrWithBracket(
+            *call.args[1].value, et, outArgs);
+        if (!outAddr) {
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+            return nullptr;
+        }
         // strtoll/strtoull(data, &endptr, 10) for validation.
         auto* strtoFnT = (pt == P::ULong)
             ? declareC("strtoull", i64(), {ptrTy(), ptrTy(), i32()})
@@ -973,6 +1009,9 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
             // §11.8 / §2.19 (#1470): nullable-companion aware store (see above).
             storeTryParseOut(outAddr, et, selV, ok);
         }
+        // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+        // The TryParse path never throws, so emit is always true.
+        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         return ok;
     }
 
@@ -984,9 +1023,15 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         llvm::Value* strVal = lowerExpr(*call.args[0].value);
         if (!strVal) return nullptr;
         llvm::Value* strData = loadStringData(strVal);
+        // fix #2938 / §22.3: see char.TryParse above.
         llvm::Type* et = nullptr;
-        llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-        if (!outAddr) return nullptr;
+        std::vector<AccessorRefArg> outArgs;
+        llvm::Value* outAddr = resolveOutAddrWithBracket(
+            *call.args[1].value, et, outArgs);
+        if (!outAddr) {
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+            return nullptr;
+        }
         auto* strcasecmpFn = declareC("strcasecmp", i32(), {ptrTy(), ptrTy()});
         // Build "true" and "false" constant C-strings.
         llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
@@ -1010,6 +1055,8 @@ llvm::Value* Emitter::tryLowerPrimitiveStaticCall(const ast::CallExpr& call) {
         // §11.8 / §2.19 (#1470): nullable-companion aware store for `T.TryParse`
         // dispatched through IParsable<bool> into a generic `out T?`.
         storeTryParseOut(outAddr, et, cmpTrue, ok);
+        // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         return ok;
     }
 

@@ -2511,9 +2511,15 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
     // unchanged. Before this fix it fell through → malformed IR (bug16).
     if ((m == "TryPopFirst" || m == "TryPopLast") &&
         call.args.size() == 1 && call.args[0].value) {
+        // fix #2938 / §22.3: see TryPop in Calls.cpp.
         llvm::Type* outTy = nullptr;
-        llvm::Value* outAddr = lvalueAddr(*call.args[0].value, outTy);
-        if (!outAddr) return nullptr;
+        std::vector<AccessorRefArg> outArgs;
+        llvm::Value* outAddr = resolveOutAddrWithBracket(
+            *call.args[0].value, outTy, outArgs);
+        if (!outAddr) {
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+            return nullptr;
+        }
         auto* cntFn = declareC("bz_llist_count", i64(), {ptrTy()});
         llvm::Value* cnt = builder_.CreateCall(cntFn, {recv}, "lltrypop.cnt");
         llvm::Value* nonEmpty = builder_.CreateICmpNE(
@@ -2536,6 +2542,8 @@ llvm::Value* Emitter::tryLowerLinkedListInstanceCall(const ast::CallExpr& call) 
         }
         builder_.CreateBr(endBB);
         builder_.SetInsertPoint(endBB);
+        // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
         auto* phi = builder_.CreatePHI(i1(), 2, "lltrypop.r");
         phi->addIncoming(builder_.getTrue(), foundBB);
         phi->addIncoming(builder_.getFalse(), preBB);
@@ -3832,9 +3840,22 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                             builder_.SetInsertPoint(endBB);
                             return builder_.getFalse();
                         }
+                        // fix #2938 / §22.3: see TryGetValue in Calls.cpp.
+                        // The pre-fix branch was `if (outAddr)` at both store
+                        // sites, so a null lvalueAddr silently dropped the
+                        // write. With the bracket, the slot is always present
+                        // — only the writeback gating changes — so both stores
+                        // run unconditionally and the bracket flushes at the
+                        // merge block.
                         llvm::Type* outTy = nullptr;
-                        llvm::Value* outAddr =
-                            lvalueAddr(*call.args[0].value, outTy);
+                        std::vector<AccessorRefArg> outArgs;
+                        llvm::Value* outAddr = resolveOutAddrWithBracket(
+                            *call.args[0].value, outTy, outArgs);
+                        if (!outAddr) {
+                            emitAccessorRefArgWriteBacks(outArgs,
+                                                         /*emit=*/false);
+                            return nullptr;
+                        }
                         // okBB: load, bswap if BE, bitcast, store to out, jump end
                         builder_.SetInsertPoint(okBB);
                         llvm::Value* raw =
@@ -3862,6 +3883,9 @@ llvm::Value* Emitter::tryLowerArraySpanCall(const ast::CallExpr& call) {
                         }
                         builder_.CreateBr(endBB);
                         builder_.SetInsertPoint(endBB);
+                        // fix #2938 / §22.3: flush any bracket on the
+                        // normal-return edge.
+                        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
                         auto* phi = builder_.CreatePHI(i1(), 2, "bba.tryres");
                         phi->addIncoming(builder_.getTrue(),  okBB);
                         phi->addIncoming(builder_.getFalse(), failBB);
@@ -4036,12 +4060,21 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
             //   - pointer outEty (class/string): store rawItem directly.
             if (mname == "TryReceive" && call.args.size() == 1 &&
                 call.args[0].value) {
-                // The out argument's address.
+                // The out argument's address. // fix #2938 / §22.3
+                // Pre-fix the fallback was a temp slot — a null lvalueAddr
+                // silently dropped the write. resolveOutAddrWithBracket falls
+                // back to the §22.3 bracket, so the write lands in the
+                // caller's property/indexer on normal return.
                 llvm::Type* outEty = nullptr;
-                llvm::Value* outSlot = lvalueAddr(*call.args[0].value, outEty);
+                std::vector<AccessorRefArg> outArgs;
+                llvm::Value* outSlot = resolveOutAddrWithBracket(
+                    *call.args[0].value, outEty, outArgs);
                 if (!outSlot) {
-                    // Fallback: create a temporary slot.
-                    outSlot = entryAlloca(ptrTy());
+                    // The previous fallback path was a scratch slot; with the
+                    // bracket, no fallback is needed — the slot is always
+                    // present once resolution succeeds.
+                    emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                    return nullptr;
                 }
                 // Allocate a ptr-sized slot for the raw item pointer.
                 llvm::AllocaInst* rawSlot = entryAlloca(ptrTy());
@@ -4110,6 +4143,8 @@ llvm::Value* Emitter::tryLowerChannelAndDomainCall(const ast::CallExpr& call) {
                 }
                 builder_.CreateBr(contBB);
                 builder_.SetInsertPoint(contBB);
+                // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
                 return builder_.CreateICmpNE(ok, builder_.getInt32(0), "ch.try.r");
             }
 

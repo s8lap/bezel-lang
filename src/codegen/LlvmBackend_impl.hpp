@@ -11597,6 +11597,19 @@ private:
     void emitAccessorRefArgWriteBacks(std::vector<AccessorRefArg>& recs,
                                       bool emit);
 
+    // fix #2938 (§22.3 / §23.3 / §23.4, v0.240) — built-in out-target address
+    // resolver. Returns the slot address where the builtin call should write
+    // the out value: `lvalueAddr` for true-alias locations (local / field /
+    // static / inline-array element), or the §22.3 copy-in/copy-out bracket
+    // for accessor-mediated targets (property / indexer) — the latter
+    // populates `sink` for the caller to flush via emitAccessorRefArgWriteBacks
+    // after the call completes. `outTy` is set to the slot's effective type
+    // (the location's own exprType for the bracket path; the type the caller
+    // passed in for the alias path).
+    llvm::Value* resolveOutAddrWithBracket(
+        const ast::Expr& target, llvm::Type*& outTy,
+        std::vector<AccessorRefArg>& sink);
+
     // #1955 / §28.3: null the caller's slot for a call ARGUMENT that transferred
     // a bare owned LOCAL / owned PARAMETER's ownership to an owned recipient at a
     // lowering site OUTSIDE buildOrderedArgs — an owning-collection element-

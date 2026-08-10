@@ -4504,9 +4504,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             isOwnedSetRecv && arrElemIsClass && arrIsOwning) {
             llvm::Value* query = lowerExpr(*call.args[0].value);
             if (!query) return nullptr;
+            // fix #2938 / §22.3: see TryGetValue above.
             llvm::Type* outTy = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, outTy);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, outTy, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             // False-path null now (§22.3 / #891 pre-null convention); the
             // found path below overwrites it. T is always class (`where T:
             // class`, stdlib §4.10), so this is always a plain nullable
@@ -4552,6 +4558,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::BasicBlock* foundEnd = builder_.GetInsertBlock();
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             auto* phi2 = builder_.CreatePHI(i1(), 2, "tt.r");
             phi2->addIncoming(builder_.getTrue(), foundEnd);
             phi2->addIncoming(builder_.getFalse(), condBB);
@@ -4855,9 +4863,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // the TryGetValue out-write; bz_array_len/get/remove_at already exist.
         if ((m == "TryPop" || m == "TryDequeue" || m == "TryPeek") &&
             call.args.size() == 1 && call.args[0].value) {
+            // fix #2938 / §22.3: see TryGetValue above.
             llvm::Type* outTy = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[0].value, outTy);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[0].value, outTy, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             // v0.171 (#1336): the out param is `T?`. A value instantiation
             // (Stack<int>/Queue<int>) uses the tagged `{i8,T}` slot; a class
             // instantiation a nullable pointer. On the FALSE (empty) path the
@@ -4914,6 +4928,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             auto* phi = builder_.CreatePHI(i1(), 2, "trypop.r");
             phi->addIncoming(builder_.getTrue(), foundBB);
             phi->addIncoming(builder_.getFalse(), preBB);
@@ -4984,9 +5000,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
         // malformed IR (bug16). Modeled on TryPop + the PopFirst/PopLast pop.
         if ((m == "TryPopFirst" || m == "TryPopLast") &&
             call.args.size() == 1 && call.args[0].value) {
+            // fix #2938 / §22.3: see TryPop above.
             llvm::Type* outTy = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[0].value, outTy);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[0].value, outTy, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             // v0.171 (#1336): the out param is `owned T?`. Owning collections
             // require class elements, so the slot is a nullable pointer; still,
             // handle the tagged-struct form uniformly. False path → null.
@@ -5023,6 +5045,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             }
             builder_.CreateBr(endBB);
             builder_.SetInsertPoint(endBB);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             auto* phi = builder_.CreatePHI(i1(), 2, "trypopfl.r");
             phi->addIncoming(builder_.getTrue(), foundBB);
             phi->addIncoming(builder_.getFalse(), preBB);
@@ -5727,9 +5751,15 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             call.args[0].value && call.args[1].value) {
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
+            // fix #2938 / §22.3: see TryGetValue above.
             llvm::Type* outTy = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, outTy);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, outTy, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             auto* tmpSlot = entryAlloca(ptrTy());
             // §28.11, #891: pre-null tmpSlot so that on the key-not-found
             // (false) path — where bz_dict_pop_value_* does NOT write *out —
@@ -5784,6 +5814,8 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             } else {
                 builder_.CreateStore(valPtr, outAddr);
             }
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return found;
         }
         // .TryGetValue(k, out v): bool
@@ -5794,8 +5826,14 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             llvm::Value* k = lowerExpr(*call.args[0].value);
             if (!k) return nullptr;
             // Get the address of the out parameter.
+            // fix #2938 / §22.3: a property or indexer slot target is admitted
+            // by §22.3 and resolves through the §22.3 copy-in/copy-out bracket;
+            // `lvalueAddr` alone declines, so the builtin call bailed and the
+            // write-back silently dropped. `outArgs` carries the bracket record
+            // for the normal-return write-back flush at the merge block below.
             llvm::Type* outTy = nullptr;
             llvm::Value* outAddr;
+            std::vector<AccessorRefArg> outArgs;
             if (call.args[1].isDiscard) {
                 // §22.4 (#1301): `dict.TryGetValue(key, out _)` — the discard has
                 // no destination lvalue (the spec's canonical form: the receiving
@@ -5806,8 +5844,12 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
                 if (!outTy) outTy = ptrTy();
                 outAddr = entryAlloca(outTy);
             } else {
-                outAddr = lvalueAddr(*call.args[1].value, outTy);
-                if (!outAddr) return nullptr;
+                outAddr = resolveOutAddrWithBracket(
+                    *call.args[1].value, outTy, outArgs);
+                if (!outAddr) {
+                    emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                    return nullptr;
+                }
             }
             // bz_dict_try_get_* writes the stored void* into *tmpSlot.
             // For pointer values: the void* IS the string/object pointer.
@@ -5872,6 +5914,9 @@ llvm::Value* Emitter::tryLowerCollectionInstanceCall(const ast::CallExpr& call) 
             builder_.CreateStore(coerceToNullableSlot(outTy, dv), outAddr);
             builder_.CreateBr(tgEndBB);
             builder_.SetInsertPoint(tgEndBB);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            // The TryGetValue path never throws, so emit is always true.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return found;
         }
         // .GetOrAdd(k, factory): V  (stdlib §4.8 borrowing / §4.9 owning)
@@ -7030,13 +7075,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             if (btn653 == "Weak") {
                 if (mname == "TryUpgrade" && call.args.size() == 1 &&
                     call.args[0].value) {
+                    // fix #2938 / §22.3: see TryGetValue above.
                     llvm::Type* slotTy = nullptr;
-                    llvm::Value* outAddr = lvalueAddr(*call.args[0].value, slotTy);
-                    if (!outAddr) return builder_.getFalse();
+                    std::vector<AccessorRefArg> outArgs;
+                    llvm::Value* outAddr = resolveOutAddrWithBracket(
+                        *call.args[0].value, slotTy, outArgs);
+                    if (!outAddr) {
+                        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                        return builder_.getFalse();
+                    }
                     auto* fn = declareC("bz_weak_try_upgrade", i32(),
                                         {ptrTy(), ptrTy()});
                     llvm::Value* r = builder_.CreateCall(fn, {handle, outAddr},
                                                          "weak.tryupgrade");
+                    // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+                    emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
                     return builder_.CreateICmpNE(r, builder_.getInt32(0),
                                                  "weak.upgraded");
                 }
@@ -7655,9 +7708,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
             // Address of the out parameter (slot pre-created by ensureOutVarSlots).
+            // fix #2938 / §22.3: see TryGetValue in tryLowerBuiltinClassCall.
             llvm::Type* et = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, et, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             // #1238: use strtoll (not strtol) for unambiguous 64-bit result so
             // we can range-check to [INT32_MIN, INT32_MAX] before truncating.
             auto* strtollTry = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
@@ -7689,6 +7748,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* trunc32 = builder_.CreateTrunc(val64, i32());
             llvm::Value* sel32 = builder_.CreateSelect(ok, trunc32, builder_.getInt32(0), "tryc.sel");
             builder_.CreateStore(sel32, outAddr);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return ok;
         }
         // per stdlib §2.3 / #1356: Convert.TryToInt64(value: string, out result: long): bool.
@@ -7697,9 +7758,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
+            // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et64 = nullptr;
-            llvm::Value* outAddr64 = lvalueAddr(*call.args[1].value, et64);
-            if (!outAddr64) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr64 = resolveOutAddrWithBracket(
+                *call.args[1].value, et64, outArgs);
+            if (!outAddr64) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             auto* strtollT64 = declareC("strtoll", i64(), {ptrTy(), ptrTy(), i32()});
             auto* endSlotT64 = entryAlloca(ptrTy());
             llvm::Value* val64_t = builder_.CreateCall(
@@ -7719,6 +7786,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* sel64 = builder_.CreateSelect(
                 ok64, val64_t, builder_.getInt64(0), "tryc64.sel");
             builder_.CreateStore(sel64, outAddr64);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return ok64;
         }
         // per stdlib §2.3 / #1356: Convert.TryToDouble(value: string, out result: double): bool.
@@ -7727,9 +7796,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
+            // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* etd = nullptr;
-            llvm::Value* outAddrd = lvalueAddr(*call.args[1].value, etd);
-            if (!outAddrd) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddrd = resolveOutAddrWithBracket(
+                *call.args[1].value, etd, outArgs);
+            if (!outAddrd) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             auto* strtodTr = declareC("strtod",
                 llvm::Type::getDoubleTy(llvm_), {ptrTy(), ptrTy()});
             auto* endSlotTd = entryAlloca(ptrTy());
@@ -7751,6 +7826,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 okTd, dvTd,
                 llvm::ConstantFP::get(llvm::Type::getDoubleTy(llvm_), 0.0), "tryd.sel");
             builder_.CreateStore(selTd, outAddrd);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return okTd;
         }
         // per stdlib §2.3 / #1356: Convert.TryToDecimal(value: string, out result: decimal): bool.
@@ -7762,12 +7839,26 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::AllocaInst* slotDec = entryAlloca(dst);
             auto* fn = declareC("bz_decimal_try_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* okDec = builder_.CreateCall(fn, {strVal, slotDec}, "trydec.ok");
+            // fix #2938 / §22.3: see Convert.TryToInt32 above. Note the
+            // existing branch was `if (outAddrdec) { ... }` (the value
+            // assignment was conditional on outAddrdec being non-null,
+            // so a null lvalueAddr silently dropped the write). With the
+            // bracket, the slot is always present — only the writeback
+            // gating changes — so the assignment runs unconditionally.
             llvm::Type* etdec = nullptr;
-            llvm::Value* outAddrdec = lvalueAddr(*call.args[1].value, etdec);
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddrdec = resolveOutAddrWithBracket(
+                *call.args[1].value, etdec, outArgs);
+            if (!outAddrdec) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             if (outAddrdec) {
                 llvm::Value* resultDec = builder_.CreateLoad(dst, slotDec, "trydec.val");
                 builder_.CreateStore(resultDec, outAddrdec);
             }
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(okDec, builder_.getInt32(0), "trydec.bool");
         }
         // per stdlib §2.3 / #1356: Convert.TryToBoolean(value: string, out result: bool): bool.
@@ -7794,10 +7885,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* cmpOneTB = builder_.CreateICmpEQ(
                 builder_.CreateCall(strcmpFnTB, {strData, oneGVTB}), builder_.getInt32(0));
             llvm::Value* boolResult = builder_.CreateOr(cmpTrueTB, cmpOneTB, "tryb.res");
+            // fix #2938 / §22.3: see Convert.TryToInt32 above. Same pattern as
+            // TryToDecimal: the existing branch was `if (outAddrb)` (the value
+            // assignment was conditional on outAddrb being non-null), so a null
+            // lvalueAddr silently dropped the write. With the bracket, the slot
+            // is always present — only the writeback gating changes — so the
+            // assignment runs unconditionally.
             llvm::Type* etb = nullptr;
-            llvm::Value* outAddrb = lvalueAddr(*call.args[1].value, etb);
-            if (outAddrb)
-                builder_.CreateStore(boolResult, outAddrb);
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddrb = resolveOutAddrWithBracket(
+                *call.args[1].value, etb, outArgs);
+            if (!outAddrb) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                // (return nullptr would skip the ok computation below; the
+                // pre-existing site returned okTB regardless.)
+                return nullptr;
+            }
+            builder_.CreateStore(boolResult, outAddrb);
             // TryToBoolean always succeeds for "true"/"1"/"false"/"0" input; if neither
             // matches we return false and store false — mirrors Convert.ToBoolean contract.
             llvm::Constant* falseStrTB = llvm::ConstantDataArray::getString(llvm_, "false", true);
@@ -7814,6 +7918,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* okTB = builder_.CreateOr(
                 builder_.CreateOr(cmpTrueTB, cmpOneTB),
                 builder_.CreateOr(cmpFalseTB, cmpZeroTB), "tryb.ok");
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return okTB;
         }
         // Convert.ToString(n, radix: int): string — radix-based conversion.
@@ -9585,13 +9691,23 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* fn = declareC("bz_decimal_try_parse", i32(),
                                 {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(fn, {strVal, slot}, "dec.tryp.ok");
-            // Write the result into the out parameter.
+            // Write the result into the out parameter. // fix #2938 / §22.3
+            // The pre-fix branch was `if (outAddr)`, which silently dropped
+            // the write when the target was an accessor-mediated location
+            // (lvalueAddr returned null). resolveOutAddrWithBracket falls back
+            // to the §22.3 bracket, so the assignment always runs and the
+            // bracket flushes below.
             llvm::Type* et = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-            if (outAddr) {
-                llvm::Value* result = builder_.CreateLoad(dst, slot, "dec.tryp.val");
-                builder_.CreateStore(result, outAddr);
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, et, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
             }
+            llvm::Value* result = builder_.CreateLoad(dst, slot, "dec.tryp.val");
+            builder_.CreateStore(result, outAddr);
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "dec.tryp.bool");
         }
     }
@@ -9666,9 +9782,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
             llvm::Value* strData = loadStringData(strVal);
+            // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, et, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             auto* strcasecmpFn = declareC("strcasecmp", i32(), {ptrTy(), ptrTy()});
             llvm::Constant* trueStr = llvm::ConstantDataArray::getString(llvm_, "true", true);
             unsigned tid = stringLiteralIdx_++;
@@ -9687,6 +9809,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                 builder_.getInt32(0), "btpc.isFalse");
             llvm::Value* ok = builder_.CreateOr(cmpTrue, cmpFalse, "btpc.ok");
             builder_.CreateStore(cmpTrue, outAddr);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return ok;
         }
     }
@@ -9780,9 +9904,15 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             const ast::Expr* parseArg = call.args[0].value.get();
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, et, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             // If the out slot is not a guid-struct slot (different elem type),
             // use our own slot and copy.  Normally outAddr is already the right size.
             auto* fn = declareC("bz_guid_try_parse", i32(), {ptrTy(), ptrTy()});
@@ -9797,6 +9927,8 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             // is the full-expression boundary for the argument (§28.3).
             if (isPlusOneStringProducer(parseArg))
                 emitStringRelease(strVal);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "guid.tryp.bool");
         }
         // per stdlib §2.6 / #1357: Guid.FromByteArray(bytes: Array<byte>): Guid
@@ -9890,13 +10022,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             call.args[0].value && call.args[1].value) {
             llvm::Value* strVal = lowerExpr(*call.args[0].value);
             if (!strVal) return nullptr;
+            // fix #2938 / §22.3: see Convert.TryToInt32 above.
             llvm::Type* et = nullptr;
-            llvm::Value* outAddr = lvalueAddr(*call.args[1].value, et);
-            if (!outAddr) return nullptr;
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddr = resolveOutAddrWithBracket(
+                *call.args[1].value, et, outArgs);
+            if (!outAddr) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
+            }
             auto* tryFn = declareC("bz_datetime_try_parse", i32(),
                                    {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, outAddr},
                                                   "dt.tryp.ok");
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "dt.tryp.bool");
         }
         // per stdlib §2.5 / #1357: DateTime.FromUnixTimeSeconds(seconds: long): DateTime
@@ -10759,17 +10899,27 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* ticksSlot = entryAlloca(i64());
             auto* tryFn = declareC("bz_datetime_try_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, ticksSlot}, "do.tryp.ok");
+            // fix #2938 / §22.3: see Convert.TryToDecimal above. Pre-fix was
+            // `if (outAddrdo)` (write dropped silently on null lvalueAddr); with
+            // the bracket the slot is always present and the writeback flushes
+            // below.
             llvm::Type* etdo = nullptr;
-            llvm::Value* outAddrdo = lvalueAddr(*call.args[1].value, etdo);
-            if (outAddrdo) {
-                llvm::Value* ticks = builder_.CreateLoad(i64(), ticksSlot, "do.tryp.ticks");
-                llvm::Value* tpd = builder_.getInt64(864000000000LL);
-                llvm::Value* dn = builder_.CreateTrunc(
-                    builder_.CreateSDiv(ticks, tpd), i32(), "do.tryp.dn");
-                llvm::Value* okBool = builder_.CreateICmpNE(ok, builder_.getInt32(0));
-                llvm::Value* sel = builder_.CreateSelect(okBool, dn, builder_.getInt32(0));
-                builder_.CreateStore(sel, outAddrdo);
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddrdo = resolveOutAddrWithBracket(
+                *call.args[1].value, etdo, outArgs);
+            if (!outAddrdo) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
             }
+            llvm::Value* ticks = builder_.CreateLoad(i64(), ticksSlot, "do.tryp.ticks");
+            llvm::Value* tpd = builder_.getInt64(864000000000LL);
+            llvm::Value* dn = builder_.CreateTrunc(
+                builder_.CreateSDiv(ticks, tpd), i32(), "do.tryp.dn");
+            llvm::Value* okBool = builder_.CreateICmpNE(ok, builder_.getInt32(0));
+            llvm::Value* sel = builder_.CreateSelect(okBool, dn, builder_.getInt32(0));
+            builder_.CreateStore(sel, outAddrdo);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "do.tryp.bool");
         }
     }
@@ -10846,14 +10996,21 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
             auto* msSlot = entryAlloca(i32());
             auto* tryFn = declareC("bz_timeonly_try_parse", i32(), {ptrTy(), ptrTy()});
             llvm::Value* ok = builder_.CreateCall(tryFn, {strVal, msSlot}, "to.tryp.ok");
+            // fix #2938 / §22.3: see Convert.TryToDecimal above.
             llvm::Type* etto = nullptr;
-            llvm::Value* outAddrto = lvalueAddr(*call.args[1].value, etto);
-            if (outAddrto) {
-                llvm::Value* ms = builder_.CreateLoad(i32(), msSlot, "to.tryp.ms");
-                llvm::Value* okBool = builder_.CreateICmpNE(ok, builder_.getInt32(0));
-                llvm::Value* sel = builder_.CreateSelect(okBool, ms, builder_.getInt32(0));
-                builder_.CreateStore(sel, outAddrto);
+            std::vector<AccessorRefArg> outArgs;
+            llvm::Value* outAddrto = resolveOutAddrWithBracket(
+                *call.args[1].value, etto, outArgs);
+            if (!outAddrto) {
+                emitAccessorRefArgWriteBacks(outArgs, /*emit=*/false);
+                return nullptr;
             }
+            llvm::Value* ms = builder_.CreateLoad(i32(), msSlot, "to.tryp.ms");
+            llvm::Value* okBool = builder_.CreateICmpNE(ok, builder_.getInt32(0));
+            llvm::Value* sel = builder_.CreateSelect(okBool, ms, builder_.getInt32(0));
+            builder_.CreateStore(sel, outAddrto);
+            // fix #2938 / §22.3: flush any bracket on the normal-return edge.
+            emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
             return builder_.CreateICmpNE(ok, builder_.getInt32(0), "to.tryp.bool");
         }
     }
@@ -10935,14 +11092,28 @@ llvm::Value* Emitter::tryLowerBuiltinClassCall(const ast::CallExpr& call) {
                     // The out-slot was pre-created in ensureOutVarSlots.
                     if (mname == "TryUpgrade" && call.args.size() == 1 &&
                         call.args[0].value) {
+                        // fix #2938 / §22.3: a property or indexer slot target
+                        // is admitted by §22.3 and resolves through the §22.3
+                        // copy-in/copy-out bracket; `lvalueAddr` alone declines,
+                        // so the builtin call bailed (#2434) and the write-back
+                        // silently dropped. `outArgs` carries the bracket record
+                        // for the normal-return write-back flush below.
                         llvm::Type* slotTy = nullptr;
-                        llvm::Value* outAddr = lvalueAddr(*call.args[0].value,
-                                                          slotTy);
-                        if (!outAddr) return builder_.getFalse();
+                        std::vector<AccessorRefArg> outArgs;
+                        llvm::Value* outAddr = resolveOutAddrWithBracket(
+                            *call.args[0].value, slotTy, outArgs);
+                        if (!outAddr) {
+                            emitAccessorRefArgWriteBacks(outArgs,
+                                                         /*emit=*/false);
+                            return builder_.getFalse();
+                        }
                         auto* fn = declareC("bz_weak_try_upgrade", i32(),
                                             {ptrTy(), ptrTy()});
                         llvm::Value* r = builder_.CreateCall(fn, {handle, outAddr},
                                                              "weak.tryupgrade");
+                        // fix #2938 / §22.3: flush any bracket on the
+                        // normal-return edge.
+                        emitAccessorRefArgWriteBacks(outArgs, /*emit=*/true);
                         return builder_.CreateICmpNE(r, builder_.getInt32(0),
                                                      "weak.upgraded");
                     }

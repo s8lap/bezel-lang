@@ -9773,6 +9773,60 @@ void Emitter::emitAccessorRefArgWriteBacks(std::vector<AccessorRefArg>& recs,
 }
 
 
+// fix #2938 (§22.3 / §23.3 / §23.4, v0.240) — built-in out-target address
+// resolver. The ~25 BUILTIN dispatch sites (`int.TryParse`,
+// `Dictionary.TryGetValue`, `Convert.TryToInt32`, `DateTime.TryParse`, …) each
+// hand-roll their out-target resolution with `lvalueAddr` alone:
+//
+//     llvm::Value* outAddr = lvalueAddr(*call.args[N].value, outTy);
+//     if (!outAddr) return nullptr;
+//
+// `lvalueAddr` only resolves TRUE-ALIAS locations (local / field / static /
+// inline-array element); a PROPERTY or INDEXER slot returns null, the call
+// bails, and the §22.3-admitted shape silently compiles to a dropped write
+// (#1302's user-method path was widened; #2462 the imported-method path;
+// #2579 the ctor-chain path; #2319 the element-policy path; this arm was
+// never widened). `resolveOutAddrWithBracket` is the unified fallback the
+// builtin sites reuse: try `lvalueAddr` first, and on null fall back to the
+// §22.3 copy-in/copy-out bracket via `emitAccessorRefArgCopyIn`, populating
+// `sink` so the caller can flush the write-back after the call.
+//
+// On success `outTy` is set to the slot's effective TYPE — for the
+// `lvalueAddr` path, the type the caller passed in (a true-alias location
+// reports its own width); for the bracket path, the LOCATION's type
+// (`lowerTypeRef(exprType(target))`), so the builtin's existing store
+// helpers (`storeTryOutValue`, `storeTryParseOut`, `CreateStore`) work
+// unchanged. The bracket's paramTy-driven widening refinement (#2266) is
+// deliberately NOT mirrored here: an imported method's own AST param is
+// never reconstructed (#1221's limitation), and §22.3's "exact referent
+// type" rule means the target's own exprType already gives the correct
+// slot type in the ordinary case (the imported-method twin at Calls2.cpp
+// ~7927 follows the same `paramTy=nullptr` convention).
+//
+// Returns null only when neither path produced an address — i.e. a §22.3-
+// rejected shape (read-only property, owned-state slot, static auto-property,
+// `out owned` of an inadmissible type) that the caller is expected to
+// surface as its own diagnostic. // per §22.3 / §23.3 / §23.4
+llvm::Value* Emitter::resolveOutAddrWithBracket(
+    const ast::Expr& target, llvm::Type*& outTy,
+    std::vector<AccessorRefArg>& sink) {
+    llvm::Value* v = lvalueAddr(target, outTy);
+    if (v) return v;
+    v = emitAccessorRefArgCopyIn(target, /*paramTy=*/nullptr,
+                                 /*isOut=*/true, sink);
+    if (v) {
+        // The bracket sized its slot to the LOCATION's type (widened to
+        // paramTy when larger). The store helpers use outTy to decide
+        // between a bare store and a `{i8,T}` tagged-struct marshalling
+        // (#1470); without this set, the bracket's slot would be mis-typed
+        // and the builtin's store could miss the value half.
+        if (const sema::TypeRef* et = ctx_.exprType(target))
+            outTy = lowerTypeRef(et);
+    }
+    return v;
+}
+
+
 bool Emitter::buildOrderedArgs(const std::vector<ast::Param>& params,
                       const std::vector<ast::CallArgument>& args,
                       std::vector<llvm::Value*>& out,
