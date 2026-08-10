@@ -1450,6 +1450,18 @@ static void bz_dispose_class_obj(void* obj) {
         typedef void (*DispFn)(void*);
         ((DispFn)vtbl[2])(obj);
     }
+    // issue 2330 / §31.4 / §30.9: reclaim a §31.4 CauseChain snapshot if `obj`
+    // is an exception carrying one. The shared exception Dispose above
+    // deliberately does NOT free CauseChain (#811/#1389: a still-borrowed
+    // exception's chain can be read after its Dispose has dispatched), so the
+    // free belongs at the terminal reclaim — here, immediately before the
+    // block goes away, which is the same position codegen's
+    // emitDisposeAndReclaim uses. A no-op for every non-exception object that
+    // reaches this helper (a WhenAllOwned input's successful result, say): the
+    // gate admits only a built-in exception vtable or a descriptor chain
+    // carrying a built-in exception ancestor, so the header read at offset 24
+    // never happens for a class without the §31.4 header.
+    bz_exc_reclaim_causechain_registered(obj);
     free(obj);
 }
 
@@ -3076,6 +3088,12 @@ void* bz_domain_spawn(void* (*entry_fn)(void*), void* arg_ptr,
                     typedef void (*DispFn)(void*);
                     ((DispFn)fault_vtbl[2])(fault_exc);
                 }
+                // issue 2330 / §31.4: the wrapped-and-discarded original owns a
+                // CauseChain snapshot if it was built by the (message, cause)
+                // constructor; the shared Dispose above does not free it (see
+                // bz_dispose_class_obj). Reclaim it at this terminal free, the
+                // same order codegen's reclaim site uses.
+                bz_exc_reclaim_causechain_registered(fault_exc);
                 free(fault_exc);
             }
             bz_task_complete_error_obj(sc->join_task, dfe_obj);

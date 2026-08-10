@@ -7423,6 +7423,25 @@ void Emitter::emitMainStaticInitPrologue() {
             builder_.CreateCall(initFn, {vit->second});
         }
     }
+    // issue 2330 / §31.4 / §30.9: hand the built-in exception vtable and
+    // type-descriptor tables to the runtime, for the same reason and by the
+    // same mechanism as the SerializationException vtable just above. The
+    // pure-runtime reclaim sites that free a disposed exception without going
+    // through codegen (bz_dispose_class_obj — Task.FireAndForget's
+    // abandoned-then-faulted continuation and the WhenAll/WhenAllOwned
+    // aggregate's input cleanup — and bz_domain_spawn's DomainFaultedException
+    // wrap) have no emitted argument to carry these tables, so they read what
+    // is registered here to reclaim a §31.4 CauseChain snapshot. Registered
+    // BEFORE the static-constructor loop below, so it is in place before any
+    // user code (and therefore before any task or domain) can run.
+    {
+        auto* excTablesInitFn = declareC("bz_exc_tables_init",
+                                         llvm::Type::getVoidTy(llvm_),
+                                         {ptrTy(), ptrTy()});
+        builder_.CreateCall(excTablesInitFn,
+                            {builtinExcVtableTablePtr(),
+                             builtinExcDescTablePtr()});
+    }
     // #720 / #796 / §22.13: every type with static state now initializes LAZILY
     // on first use (via bz$<T>$ensureinit at each static-access site) — non-
     // generic since #720, generic since #796. Skip any type that has a lazy

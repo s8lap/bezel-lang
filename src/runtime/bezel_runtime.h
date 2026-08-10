@@ -1874,6 +1874,24 @@ extern void* bz_ser_exc_vtable;
 // Register the SerializationException vtable; called by the generated main prologue.
 void bz_ser_exc_vtable_init(void* vtable);
 
+// issue 2330 / §31.4 / §30.9: register the built-in exception vtable and type-
+// descriptor tables with the runtime, from the same generated main prologue and
+// for the same reason as bz_ser_exc_vtable_init above. The pure-runtime
+// vtable-Dispose-then-free reclaim sites (bz_dispose_class_obj and
+// bz_domain_spawn's DomainFaultedException wrap, bezel_runtime_concurrency.cpp)
+// run with no codegen-supplied table argument; they reclaim a disposed
+// exception's §31.4 CauseChain snapshot through
+// bz_exc_reclaim_causechain_registered, which reads what was registered here.
+void bz_exc_tables_init(void** excVtableTable, void** excDescTable);
+
+// Reclaim `obj`'s §31.4 CauseChain snapshot using the tables registered by
+// bz_exc_tables_init. A no-op unless `obj` is a built-in exception or a user
+// subclass of one (the same gate the codegen reclaim site applies), so it is
+// safe to call on any class object about to be freed. Call it AFTER the virtual
+// Dispose dispatch and BEFORE freeing the object, matching the codegen terminal
+// reclaim site's order.
+void bz_exc_reclaim_causechain_registered(void* obj);
+
 // OwningBuffer<byte> helpers used by BinarySerializer/BinaryDeserializer.
 // bz_owned_buffer_alloc: allocate an OwningBuffer<byte> with the given bytes,
 // returning the opaque handle (an owned bz_array_t* wrapper). Caller owns it.
