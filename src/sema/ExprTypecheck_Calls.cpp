@@ -443,11 +443,20 @@ bool isCollectionLiteralAdmissibleTarget(const TypeRef* t, bool isDict) {
 // exists because the parser cannot syntactically distinguish "empty seq"
 // from "empty dict" — both are written `[]` and the target type decides.
 // Inline arrays are EXCLUDED: they require `≥ 1` elements regardless of
-// form (§15.4 last paragraph). User types that opt in via
-// `FromCollectionLiteral` are also EXCLUDED: the spec lists only the
-// built-in collections for the empty carve-out, and these user types have
-// no dispatch for a zero-element literal (a `FromCollectionLiteral([])`
-// call is not in the protocol).
+// form (§15.4 last paragraph).
+// §15.4.1 (v0.240) FCL carve-out — explicitly different from the form-vs-
+// target §15.4 rule, which is a form match (dict form vs seq form), and
+// instead a USER-EXTENSIBLE admission: "The empty literal `[]` targeting
+// such a type is admitted: the borrowing form receives an empty
+// `ReadOnlySpan<U>`; the owning form receives an empty `OwningArray<U>`.
+// The factory is responsible for handling the empty case." A user type
+// declaring `FromCollectionLiteral` is therefore ON the §15.4 list for
+// the empty-literal carve-out, just as it is for the non-empty sequence
+// form. The pre-fix code rejected this with a generic "user types have
+// no dispatch for a zero-element literal" comment; that was a real spec
+// violation measured against the §15.4.1 conformance test
+// `tests/conformance/cases/spec_0063.bzl:23` (`using var empty:
+// RingBuffer<int> := [];`).
 bool isCollectionLiteralEmptyAdmissibleTarget(const TypeRef* t) {
     if (!t) return false;
     // Inline arrays require `≥ 1` elements regardless of form.
@@ -455,10 +464,29 @@ bool isCollectionLiteralEmptyAdmissibleTarget(const TypeRef* t) {
     if (t->kind != TypeRef::Kind::Named) return false;
     // A collection INTERFACE has no concrete backing → not on §15.4 list.
     if (isCollectionLiteralInterfaceTarget(t)) return false;
-    // A user type that opted in via FromCollectionLiteral: empty literals
-    // are NOT part of the protocol (the spec lists only the built-in
-    // collections). User types with no opt-in are not on the list anyway.
-    if (t->declaration) return false;
+    // A user type that opted in via FromCollectionLiteral: §15.4.1 admits
+    // the empty literal at such a type. Walk its members for a static
+    // method of that exact name — the same walk the seq-form predicate
+    // uses at lines 404-413, mirrored here so a future opt-in shape
+    // (signature variant, visibility, etc.) is honored uniformly. A user
+    // type WITHOUT the opt-in is not on the §15.4 list and falls through
+    // to the builtin-name check, which returns false because its head
+    // name is not one of the §15.4 builtins.
+    if (t->declaration) {
+        for (const Symbol* m : t->declaration->members) {
+            const auto* ms = dynamic_cast<const MethodSymbol*>(m);
+            if (!ms || ms->name != "FromCollectionLiteral" ||
+                ms->params.empty())
+                continue;
+            // isStatic lives on the AST decl, not the Symbol (mirrors the
+            // sema-side pattern at ExprTypecheck_Exprs.cpp:6251-6254).
+            bool isStatic = false;
+            for (auto mod : ms->modifiers)
+                if (mod == "static") { isStatic = true; break; }
+            if (isStatic) return true;
+        }
+        return false;
+    }
     // Builtin collections: Array/OwningArray/Stack/OwningStack/Queue/
     // OwningQueue/Set/OwningSet/LinkedList/OwningLinkedList + Dictionary/
     // OwningDictionary/SortedDictionary.
