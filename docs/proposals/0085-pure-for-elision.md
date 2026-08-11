@@ -72,7 +72,7 @@ Ownership coherence: the loop introduces no owned values (borrow/copy iteration 
 
 ## 5. Corpus evidence
 
-- **The workaround is live in the corpus:** 26 `for var i in 0..<` index loops in `tests/`, 19 in `docs/` (grep, v0.241 HEAD) — among them Guide 06 §6's own `CountOf` example, written in the index form solely because of rule 5, with the rejected `for var c in text` shown beside it as a comment.
+- **The workaround is live in the corpus:** 26 `for var i in 0..<` index loops in `tests/`, **12** across the ten normative documents (grep for that literal shape, v0.241 HEAD) — among them Guide 06 §6's own `CountOf` example, written in the index form solely because of rule 5, with the rejected `for var c in text` shown beside it as a comment.
 - **The flip-polarity test:** `tests/sema/pure_body_22_15_test.cpp`, case `pure_enumerable_for_rejected_spec_22_15` (an `Array<int>`-sourced `for` in a pure body, currently `EXPECT hasMsg("for loop source")`) — becomes an **acceptance** test under this proposal; the rejection test is rewritten over an interface-typed source, which the amendment keeps rejecting. The neighboring `Range` acceptance case (`0..<10`) is unaffected.
 - **No accepted program changes:** the amendment admits previously-rejected programs only (a pure widening); non-pure bodies are untouched (the elision there remains the §29.2 optimization it always was).
 

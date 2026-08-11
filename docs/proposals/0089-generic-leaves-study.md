@@ -57,7 +57,7 @@ If the rule retires, a `case` over a generic sealed hierarchy (root or any leaf 
 Greps at v0.241:
 
 - **stdlib: zero** `sealed abstract` declarations at all — no generic (or non-generic) sealed class hierarchy exists in the library; the library's closed sums are choices (`Result<T, E>`) and enums. (Proposal 0019's `JsonValue` hierarchy — draft, unlanded — is non-generic.)
-- **docs: one** generic sealed root outside pinned history — §19.6's own `Result<T>`/`Message` teaching examples. The guides never show a generic sealed hierarchy.
+- **docs: one** generic sealed root outside pinned history — §19.6's own `Result<T>` teaching example (the neighbouring `Message` example's root is non-generic; its generic content is the `Tagged<U>` leaf of §19.6's undetermined worked case). The guides never show a generic sealed hierarchy.
 - **tests: six files** contain generic sealed roots — `sema/case_exhaustiveness_test.cpp` (39 occurrences: the #1816/#1862/#1874 determination suite itself), `sema/case_type_test_instantiation_1913_test.cpp`, `codegen/generic_type_test_arg_1843_test.cpp`, `codegen/result_stdlib_2047_test.cpp` (a pre-choice Result-name collision test, not a determination user), and two lit tests (the `?`-split warning pin; the §21.7 totality pin).
 - **Conclusion:** the rule is exercised **exclusively by its own spec-derived test family**. No organic in-tree code — stdlib, guide, example, or non-§19.6 test — matches a generic sealed hierarchy exhaustively.
 

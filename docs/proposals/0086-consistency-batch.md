@@ -22,13 +22,13 @@ Eight small items: two rule changes (1, 2), one spelling question (3), one vocab
 
 **Friction.** One value of one property is currently three different things by position: a *literal* `step 0` is a compile error (§16.4); a *computed* step of zero constructs fine, is defined for `IsEmpty` and `Contains` ("direction-agreeing" — §16.3's range-operations text spends a parenthetical worked example on it), and raises `ArgumentException` only at `GetEnumerator()` (§16.4). A range value can therefore carry a zero step around indefinitely — stored, passed, compared, membership-tested — and faults only if someone eventually iterates. The zero-step *deferral to `GetEnumerator`* is recorded nowhere (the #1340/v0.162 owner corrections cover the membership formula and step-independence, not this).
 
-**Proposal.** Validate at **construction**: evaluating a range expression whose computed step is zero raises `ArgumentException` at the expression. The constant case stays a compile error (§16.4, unchanged). Since range expressions are the sole producer of `Range<T>` values (the record is compiler-intrinsic and declares no constructor — §16.3; v0.241's §17.7 ruling closes `new` on builtins without declared constructors — the deserialization path §16.3 mentions for `Range<char>` validates identically), no zero-step `Range<T>` value can exist. Deletions follow: §16.3's direction-agreeing zero-step parenthetical (the state it describes is unconstructible), §16.4's at-`GetEnumerator` clause, §16.6's equal-bounds step-0 sentence. `IsEmpty`/`Contains`/`GetEnumerator` lose a case each.
+**Proposal.** Validate at **construction**: evaluating a range expression whose computed step is zero raises `ArgumentException` at the expression. The constant case stays a compile error (§16.4, unchanged). Since range expressions are the sole producer of `Range<T>` values (the record is compiler-intrinsic and declares no constructor — §16.3; v0.241's §17.7 ruling closes `new` on builtins without declared constructors — the deserialization path §16.3 mentions for `Range<char>` validates identically), no zero-step `Range<T>` value can exist. Deletions follow: §16.3's direction-agreeing zero-step parenthetical (the state it describes is unconstructible), §16.4's at-`GetEnumerator` clause, §16.6's equal-bounds step-0 sentence. `IsEmpty`/`Contains`/`GetEnumerator` lose a case each. One caveat the batch flags rather than hides: a range expression is not a method boundary — proposal 0079 §4 rejects `ArgumentException` for operators on exactly the no-parameter-to-name ground, and 0078 §5 likewise for casts — so the fault type here is a **third site** of the 0079-Q2/0078-Q1 ruling and folds into it; the `ArgumentException` spelling above is the drafted placeholder, and whatever those proposals land, this site lands the same answer (Q1's rider).
 
 **Alternative (status quo).** Keep laziness: "iteration is the operation a step parameterizes." Declined: `Contains` is *also* step-parameterized (through emptiness/direction, §16.3), so the principle is already half-false; and fault-at-earliest-point is the language's stated posture everywhere else (§5.1 constant narrowing, stdlib §1's negative-magnitudes-fault rule — which itself validates *constructor* arguments eagerly, the exact analogue).
 
 **Migration.** Newly **changed observable behavior**: a program constructing a computed-zero-step range and never iterating it now faults at construction (strictly earlier; strictly more programs fault). Corpus: the `range_literal_step_zero_1628` lit family is unaffected in verdicts — the literal-rejection pins stand; `…runtime_computed_step_zero_not_flagged_at_compile_time` stays correct as written (still not a compile-time flag; the fault moves from `GetEnumerator` to construction and the test gains the runtime assertion). No doc example constructs a computed zero step.
 
-**Q1** — validate at construction (recommended)?
+**Q1** — validate at construction (recommended)? Rider: the fault type lands consistently with the 0079-Q2/0078-Q1 ruling — this is a third site of that ruling (a range expression is no more a method boundary than a shift or a cast).
 
 ---
 
@@ -52,21 +52,21 @@ Eight small items: two rule changes (1, 2), one spelling question (3), one vocab
 
 **Candidate.** A dedicated modifier: `public closed class Shape` — one word meaning exactly the §11.7 semantics. `closed` is not currently a keyword (B.1/B.2 checked; zero corpus identifiers named `closed`); it would be reserved (B.3's discipline: new keywords "drawn from … words not currently used as identifiers in the standard library" — satisfied). §19.6's prose already says "closed hierarchy"/"closed set" eleven times — the word is the spec's own vocabulary for the concept.
 
-**Churn, honestly.** `sealed abstract` appears **42×** in docs (changelog excluded) and **86×** in tests — ~128 mechanical sites, plus every prose mention in §19.6/rationale §8.2/§9.5 and the guides' teaching. All grep-mechanical (the two-token sequence is unambiguous), and the no-users window argument (0074 item 1's precedent: "it only gets more expensive; the first external user makes it permanent") applies at full strength. But unlike 0074's rename this one also spends a **reserved word** — a permanent vocabulary cost — to relabel semantics nobody has reported misunderstanding *after* reading §11.7.
+**Churn, honestly.** `sealed abstract` appears **26×** across the ten normative documents excluding the pinned changelog (spec 16, rationale 8, Guide 03 2; the changelog carries 10 more, pinned) and **86×** in tests — **~112** mechanical sites, plus every prose mention in §19.6/rationale §8.2/§9.5 and the guides' teaching. All grep-mechanical (the two-token sequence is unambiguous), and the no-users window argument (0074 item 1's precedent: "it only gets more expensive; the first external user makes it permanent") applies at full strength. But unlike 0074's rename this one also spends a **reserved word** — a permanent vocabulary cost — to relabel semantics nobody has reported misunderstanding *after* reading §11.7.
 
 **The do-nothing option, framed fairly (the review's own low confidence).** The pair is learnable in one sentence, is already learned by every document in the tree, and rationale §9.5 exists precisely to teach it; C# users arrive knowing `sealed`, and `abstract` beside it is at least a *signal* that something non-default is happening — a fresh `closed` keyword is opaque until looked up too. The composition also has one virtue a single word lacks: `sealed` and `abstract` each keep their independent meanings elsewhere, and the §19.6 closed-set rule *already* covers hierarchies closed without the marker ("an `abstract` class whose only direct subclasses are themselves `sealed`"), so `closed` would name the root-marker idiom, not the concept.
 
 **Recommendation:** adopt `closed` — **the batch's lowest-confidence recommendation**, carried by the window argument and the delete-the-apology payoff (rationale §9.5 shrinks to one line recording the rename). If the owner declines, the deliverable degrades gracefully to a doc-only touch: §11.7 gains the one-sentence gloss "read `sealed` here as sealing the *module boundary*" at first use, and §9.5 stands as the record. A dual spelling (both accepted) is not offered — two spellings of one semantics is the kind of duplicate the no-dual discipline (stdlib §1) exists to prevent.
 
-**Migration (if adopted).** Newly **rejected**: `sealed abstract` (diagnostic names `closed`); newly **admitted**: `closed class`. ~128 mechanical sites; migration script per the `scripts/migrate_*.py` precedents. **Q3** — adopt `closed`, or decline and keep the pair (both defensible; recommendation above)?
+**Migration (if adopted).** Newly **rejected**: `sealed abstract` (diagnostic names `closed`); newly **admitted**: `closed class`. ~112 mechanical sites (scope above); migration script per the `scripts/migrate_*.py` precedents. **Q3** — adopt `closed`, or decline and keep the pair (both defensible; recommendation above)?
 
 ---
 
 ## 4. One name for the `hashable` property (§3.6/§14.2/§8.3, stdlib §1)
 
-**Friction.** One derived type property has two names: §3.6's table row calls it **equality-bearing**; the §14.2 constraint spells it **`hashable`**, with an inline apology ("the keyword names the capability site, the property keeps its §3.6 name"). Counted: `equality-bearing` 29× across spec/stdlib/rationale; `hashable` 8×. Two names for one concept is a documented seam, and every future rule citing the property must pick a side.
+**Friction.** One derived type property has two names: §3.6's table row calls it **equality-bearing**; the §14.2 constraint spells it **`hashable`**, with an inline apology ("the keyword names the capability site, the property keeps its §3.6 name"). Counted: `equality-bearing` **39×** across the spec, the stdlib doc, and the rationale; `hashable` **9×** in the same three documents. Two names for one concept is a documented seam, and every future rule citing the property must pick a side.
 
-**Proposal.** One term: **hashable**, everywhere. The §3.6 table row renames (`equality-bearing` → `hashable`), with a parenthetical "(formerly *equality-bearing*)" for one revision's findability; §8.3/§9.2/§35.7/stdlib mentions follow mechanically (~29 sites, doc-only). Direction of deference: §14.2 already defers to §3.6 for the definition ("decided per instantiation by §3.6's computation") — that stays; only the name unifies. Why `hashable` wins: it is the user-facing spelling (the constraint keyword, already reserved contextually in B.2 — renaming the *keyword* instead would be a source-breaking change for nothing), it names the capability the property gates (hash-container keys/elements), and it is one word.
+**Proposal.** One term: **hashable**, everywhere. The §3.6 table row renames (`equality-bearing` → `hashable`), with a parenthetical "(formerly *equality-bearing*)" for one revision's findability; §8.3/§9.2/§35.7/stdlib mentions follow mechanically (~39 sites across spec/stdlib/rationale, doc-only). Direction of deference: §14.2 already defers to §3.6 for the definition ("decided per instantiation by §3.6's computation") — that stays; only the name unifies. Why `hashable` wins: it is the user-facing spelling (the constraint keyword, already reserved contextually in B.2 — renaming the *keyword* instead would be a source-breaking change for nothing), it names the capability the property gates (hash-container keys/elements), and it is one word.
 
 **Alternative (status quo, the seam recorded).** The §14.2 parenthetical *is* the record; keeping it costs the dual vocabulary permanently. Declined — the fix is doc-only and mechanical. (The adjacent §14.4 "slight imprecision" the review noted — `where T: class` admitting `string`/function types that owning collections then reject — is a *documented* seam with a real type-system reason and is deliberately **not** batched here; it would be a rule change, not vocabulary.)
 
@@ -133,13 +133,13 @@ Eight small items: two rule changes (1, 2), one spelling question (3), one vocab
 
 - Item 1: `range_literal_step_zero_1628` lit family (8 files) — verdicts preserved, one test gains a runtime assertion; no doc example constructs a computed zero step.
 - Item 2: **0** `x := x mod c` sites outside §17.2's own sentence (the honesty note).
-- Item 3: `sealed abstract` **42** docs + **86** tests occurrences (the churn number).
-- Item 4: `equality-bearing` **29** / `hashable` **8** occurrences (the seam's size); `closed` and `equality`-adjacent identifier collisions: **0**.
+- Item 3: `sealed abstract` **26** occurrences across the ten normative documents excluding the pinned changelog + **86** in tests (the churn number).
+- Item 4: `equality-bearing` **39** / `hashable` **9** occurrences across spec/stdlib/rationale (the seam's size); `closed` and `equality`-adjacent identifier collisions: **0**.
 - Items 5–8: doc-only; no corpus exposure.
 
 ## 10. Questions for the owner (collected)
 
-- **Q1** (item 1): range step validated at construction? *Recommended.*
+- **Q1** (item 1): range step validated at construction, fault type folded into the shared 0079-Q2/0078-Q1 ruling (item 1's rider)? *Recommended.*
 - **Q2** (item 2): add `mod=`? *Recommended, weakly — the corpus supports "uncommon"; the argument is rule-shape.*
 - **Q3** (item 3): `closed` replacing `sealed abstract`, or decline-with-gloss? *Recommended: `closed` — lowest-confidence item; the fallback text is in the item.*
 - **Q4** (item 4): unify vocabulary on `hashable`? *Recommended.*
@@ -150,6 +150,7 @@ Eight small items: two rule changes (1, 2), one spelling question (3), one vocab
 
 ## 11. Interactions
 
+- Item 1 ↔ **proposals 0079/0078** (#3045/#3044): the fault-type rider (item 1's Q1) is a third site of their shared Q2/Q1 ruling; 0079's Interactions carries the reciprocal pointer.
 - Item 2 ↔ **proposal 0079** (#3045): both edit §6.6/§17.2; textual coordination at landing.
 - Item 3 ↔ **proposal 0089** (#3055): §19.6's sealed-hierarchy bullet names `sealed abstract` throughout; if both land, the rename and the 0089 outcome should be sequenced in one §19.6 edit pass.
 - Item 4 ↔ **proposal 0084** (#3050): 0084 changes when the property holds; item 4 renames it. Either order; cross-cite.

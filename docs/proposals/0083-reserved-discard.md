@@ -75,25 +75,25 @@ Rows 1–4 are today's three discard positions plus the `when` marker: no progra
 
 ## 5. Corpus evidence
 
-Counted at v0.241 (`grep -rn` over `docs/`, `tests/`, stdlib doc; changelog excluded as pinned history):
+Counted at v0.241 — occurrence counts by substring grep, shapes as named per row, over `tests/` (C++ harness strings and lit `.bzl` files, recursively) and the **ten normative documents** in `docs/` (proposals excluded; the pinned changelog's contribution broken out per row where it appears):
 
 | Shape | Count | Disposition |
 |---|---|---|
-| `var _ := e;` (plain) | **128** in tests; **2** in docs (both §17.13's own teaching examples); **0** in the stdlib doc | tests: all are bind-and-ignore (`var _ := a + b;` result-typing probes and similar); mechanical rewrite to `_ := e;` — semantics preserved (the values are non-owned or the end-of-statement release is equivalent for the probe's purpose; each rewritten test re-verified by its own run). Docs: rewritten by this amendment |
+| `var _ := e;` (plain) | **128** in tests; **3** in the spec (all §17.13's own teaching text — the binding example, the recap sentence, the worked example) plus **2** in the pinned changelog; **0** in the stdlib doc | tests: all are bind-and-ignore (`var _ := a + b;` result-typing probes and similar); mechanical rewrite to `_ := e;` — semantics preserved (the values are non-owned or the end-of-statement release is equivalent for the probe's purpose; each rewritten test re-verified by its own run). Docs: the spec sites are rewritten by this amendment (the changelog is pinned history) |
 | Reads of any `_` binding | **0** anywhere | the readable-binding corner is exercised by no code — only by §17.13's worked example |
-| `using var _ := e;` | **87** | unchanged (row 6) |
-| `out _` | **78** | unchanged |
-| `ref _` (genuine) | **0** (the two grep hits are `ref _f`/`ref _name` — underscore-*prefixed* fields, untouched) | nothing breaks; the ruling's corner had no users |
+| `using var _ := e;` | **72** — 46 in tests + 26 across the ten normative documents (spec 17, stdlib 1, changelog 8) | unchanged (row 6) |
+| `out _` | **69** — 55 in tests + 14 across the ten normative documents (spec 9, changelog 5) | unchanged |
+| `ref _` (genuine) | **8** occurrences in tests, all in one file — `tests/module/xmod_ctor_out_discard_2658_test.cpp` (one live source line, `var w := new W8(ref _);`, in its U3 case `imported_ctor_ref_discard_is_declined_loudly`; the rest comment references); **3** across the ten normative documents (the spec's §17.13-adjacent ruling text and the changelog's #2679 entry) | U3 pins the current decline by diagnostic text (`#2658`, "no constructor call could be lowered"); under row 7 it flips to the new unconditional diagnostic — the decline itself is preserved, its message re-pointed (§8) |
 | `lambda` parameters named `_` | **2** (`tests/codegen/event_test.cpp`, `lambda(_) => …` twice); plus destructure-slot `_` uses (already wildcard positions) | semantics preserved as ignores (neither body reads `_`) |
 | Parameters `(_: T)`, fields/consts/types named `_`, `out var _`, `for var _` | **0** each | nothing to migrate |
 
-**The migration claim, from the greps:** nothing of value breaks. Exactly one shape needs rewriting (128 test `var _ :=` sites, a one-line `sed` class reviewed per file), zero sites read a `_` binding, and the two genuinely-affected lambda sites keep their meaning without edits.
+**The migration claim, from the greps:** nothing of value breaks. Exactly one shape needs rewriting (128 test `var _ :=` sites, a one-line `sed` class reviewed per file), zero sites read a `_` binding, the two genuinely-affected lambda sites keep their meaning without edits, and the one `ref _`-pinning test re-points its expected diagnostic (row 7) with its decline verdict intact.
 
 ## 6. Alternatives considered
 
 1. **Status quo + record the corner.** Write the rationale entry defending the identifier reading. Declined: rationale §3.2 already *disowns* it ("cannot be read"), and the recorded costs — the #2679 ruling, §17.13's recap subsection, the write-once corollary — keep accruing at every future modifier or binding form.
 2. **C#'s design** (contextual discard: `_` is a discard only when no `_` binding is in scope). This is approximately today's rule, and is the source of the split-brain; C# keeps it for backward compatibility Bezel does not have. Declined.
-3. **Reserve `_` and also delete `using var _`** (force naming for scope-end holds). Declined: the anonymous scope-end hold is a real, corpus-proven idiom (87 sites; stdlib §4.11's own `using var _ := PopAt(index);` example), and it is discard-*shaped* — it binds nothing readable. Row 6 keeps it as the one owning `_` form, now honestly anonymous.
+3. **Reserve `_` and also delete `using var _`** (force naming for scope-end holds). Declined: the anonymous scope-end hold is a real, corpus-proven idiom (72 sites across tests and the ten normative documents, §5; stdlib §4.11's own `using var _ := PopAt(index);` example), and it is discard-*shaped* — it binds nothing readable. Row 6 keeps it as the one owning `_` form, now honestly anonymous.
 4. **Reserve every `_`-leading identifier.** Breaks the `_camelCase` convention (§1.3) and thousands of corpus sites for no semantic gain. Declined; only the bare token is reserved.
 5. **Make method-parameter `_` an ignore (row 11 alternative).** Uniform with lambdas, but method parameter names are call-site-addressable (§22.5 named arguments) and interface-carried (§2.8.2) — an unnameable slot would need rules for named-argument skipping and interface matching. Lambdas have neither concern (function-type parameter names are documentation, A.5 `FuncParamType`). Declined as the default; offered as Q2.
 
@@ -109,7 +109,7 @@ Counted at v0.241 (`grep -rn` over `docs/`, `tests/`, stdlib doc; changelog excl
 - **lexer/parser** (`src/lexer`, `src/parser`): bare `_` becomes its own token; the parser's existing `isDiscard` plumbing (#2679) simplifies — the flag *is* the token. Grammar alternatives per §2.
 - **sema** (`src/sema/SymbolCollection.cpp`, `ExprTypecheck*`): declaration sites reject the token (rows 5, 8, 11–13) with the §3 diagnostics; lambda/`for` binding paths skip binding for the ignore forms; the expression-position read error falls out of name resolution (no symbol can exist).
 - **codegen**: nothing — ignores lower as today's unused bindings do, minus the dead store.
-- **tests**: spec-cited regression tests per `tests/README.md` — one per row of §1's table (rejections with diagnostic-text checks in the lit lane; the ignore forms' semantics in the gtest lanes, including owning-iteration `for var _` disposal and `lambda(_, _)` legality); plus the 128-site mechanical migration, landed as its own commit so the behavioral tests diff cleanly.
+- **tests**: spec-cited regression tests per `tests/README.md` — one per row of §1's table (rejections with diagnostic-text checks in the lit lane; the ignore forms' semantics in the gtest lanes, including owning-iteration `for var _` disposal and `lambda(_, _)` legality); plus the 128-site mechanical migration, landed as its own commit so the behavioral tests diff cleanly. The existing `xmod_ctor_out_discard_2658` U3 case (`imported_ctor_ref_discard_is_declined_loudly`), which pins today's `ref _` decline by the `#2658` "no constructor call could be lowered" diagnostic, is re-pointed at row 7's diagnostic in the same change — the decline verdict does not move.
 - **Size:** moderate by breadth, small by depth — many small sites, no new analysis.
 
 ## 9. Questions for the owner
