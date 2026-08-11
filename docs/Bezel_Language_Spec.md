@@ -1,6 +1,6 @@
 # Bezel Language Specification
 
-**Version 0.243 — August 2026**
+**Version 0.244 — August 2026**
 
 Bezel is a compiled language for services and tools, with ownership-based memory management and no garbage collector. The compiler tracks ownership of every heap object and ensures that each one is disposed exactly once. Borrowing lets you pass references without transferring ownership, with lifetimes checked at compile time rather than enforced by a runtime. The result aims to give you the safety of a managed language and the predictability of a manual one, without the ceremony of either.
 
@@ -69,7 +69,7 @@ A token is a keyword, identifier, literal, operator, or punctuation symbol. Whit
 <a id="sec-identifiers"></a>
 ### 1.3 Identifiers
 
-An identifier begins with a Unicode letter or underscore (`_`) and continues with letters, digits, or underscores. Identifiers are case-sensitive: `Foo`, `foo`, and `FOO` are distinct. The bare identifier `_` is a valid identifier name everywhere it appears as a name; in three specific positions (pattern, out-argument, discard-statement left-hand side) it has additional meaning as a discard, described in [§17.13](#sec-the-discard-_).
+An identifier begins with a Unicode letter or underscore (`_`) and continues with letters, digits, or underscores. Identifiers are case-sensitive: `Foo`, `foo`, and `FOO` are distinct. The bare underscore `_` is **not** an identifier: it is a reserved token (Appendix [B.1](#sec-reserved-keywords)) — the discard, whose sanctioned forms and rejected positions are [§17.13](#sec-the-discard-_) — never declarable and never readable as a name. Identifiers merely *containing* underscores (`_camelCase`, `snake_case`, `_f`) are ordinary identifiers; only the bare single-character token is reserved.
 
 The convention is `PascalCase` for types, methods, properties, and other public members; `_camelCase` for private fields; `camelCase` for parameters and locals. The compiler does not enforce these conventions. The lowercase keyword `string` and the standard-library type name `String` (`System.String`) name the same type — they are interchangeable in source — but the lexer treats them as different tokens: `string` is a reserved keyword (Appendix B) producing a primitive type token; `String` is an ordinary PascalCase identifier whose meaning is established by name resolution against the auto-imported standard library. The same dual-form rule applies to the other primitive-keyword aliases listed in [§3.4](#sec-keyword-aliases-for-built-in-types).
 
@@ -515,7 +515,7 @@ The derived type properties of this revision:
 | **trivial-dispose** | [§28](#sec-resource-management) intro, [§28.9](#sec-runtime-managed-types) | classes whose disposal provably runs no user code and releases only memory: no destructor, no `owned` fields of non-trivial-dispose type, no owning-inline-array fields, trivial-dispose base |
 | **borrow-bearing** | [§9.7](#sec-records-and-disposal) | records (and inline arrays, [§15.1](#sec-inline-arrays); choices, [§35.4](#sec-choice-classification)) carrying at least one borrow of a non-runtime-managed reference type |
 | **choice classification** | [§35.4](#sec-choice-classification) | every choice type, as value-like, borrow-bearing, or owning — the classification on which a choice's copyability, lifetime tracking, and disposal obligation depend |
-| **auto-hashable** (formerly *auto-equality-bearing*) | [§9.2](#sec-body-records) | records and value-like choices for which `=`, `GetHashCode`, and `ToString` are synthesized ([§35.7](#sec-choice-equality)) |
+| **auto-hashable** (formerly *auto-equality-bearing*) | [§9.2](#sec-body-records) | records and value-like choices for which `=`, `GetHashCode`, and `ToString` are synthesized ([§35.7](#sec-choice-equality)); membership is computed after `equality skip` exclusions ([§9.2](#sec-equality-skip)) |
 | **serialization-eligible** | [§9.8](#sec-serialization-synthesis) | records, enums, and value-like choices for which `Serialize`/`Deserialize` are synthesized ([§35.7](#sec-choice-equality)) |
 | **hashable** (formerly *equality-bearing*) | [§8.3](#sec-equals-and-gethashcode), [§9.2](#sec-body-records) | types usable where consistent `Equals`/`GetHashCode` are required (hash-container keys/elements): every type except (a) a record that is neither auto-hashable nor declares user equality, and (b) a choice that is not value-like auto-hashable ([§35.7](#sec-choice-equality) — owning and borrow-bearing choices are not hashable); *declaring user equality* means (`operator =`/`<>` with `Equals(T)`/`GetHashCode` per the [§25.2](#sec-operator-overloading-restrictions) co-declaration rule) |
 | **element category** | [§28.11](#sec-collection-element-ownership), stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans) | every type, as collection-element: value, runtime-managed reference, class/interface, or move-only value — the classification on which collection and buffer slot semantics dispatch |
@@ -526,7 +526,7 @@ Common rules, normative for every derived type property:
 
 1. **Computed, never declared.** A derived type property cannot be asserted, opted into, or waived by annotation. It follows from structure; the only way to change it is to change the structure.
 2. **Per-instantiation evaluation for generics.** For a generic type or member, the property is evaluated at each instantiation, after substituting the type arguments. A generic body type-checks under the weakest assumption its constraints establish; an instantiation that violates a property-dependent requirement is rejected *at the instantiation site*, with a diagnostic naming the property, the offending type argument, and the structural reason ([§28.5](#sec-owned-fields)'s generic-owned-field check and the owning-collection element restriction of [§14.4](#sec-owned-as-a-generic-argument) follow this pattern).
-3. **Part of the public contract.** A declaration change that flips a derived type property of a public type — adding a destructor flips trivial-dispose; adding a computed property in the wrong form flips auto-hashable — is a breaking change for clients relying on it, exactly as a signature change is. Library documentation should state the properties a type's clients are expected to rely on.
+3. **Part of the public contract.** A declaration change that flips a derived type property of a public type — adding a destructor flips trivial-dispose; adding a computed property in the wrong form flips auto-hashable; adding or removing `equality skip` on a member ([§9.2](#sec-equality-skip)) flips comparison results and hash values for clients and can flip auto-hashable/hashable — is a breaking change for clients relying on it, exactly as a signature change is (the artifact interface carries the clause as it carries `serialized` clauses, [§2.8.2](#sec-artifact-interface)). Library documentation should state the properties a type's clients are expected to rely on.
 4. **Named in diagnostics.** A diagnostic produced by a property-dependent rule names the property in the words of the table above, so the reader can find the defining section.
 
 Dispatch of *behavior* (not merely admissibility) on a derived type property — as the element category does for buffer and collection slot semantics ([§28.11](#sec-collection-element-ownership), stdlib [§4.14](Bezel_Standard_Library.md#sec-owned-buffers-and-spans)) — is reserved to compiler-known standard-library types; it is not a user-available mechanism in this revision; two scoped exceptions are recorded. The **C-compatible** classification ([§32.13](#sec-c-compatible-records)) — whose consequence is a static representation guarantee, compile-time-visible and constant, never behavior dispatch — was ratified with the FFI's structured-data design (rationale §16.5). The **choice classification** ([§35.4](#sec-choice-classification)) does flip per-instantiation behavior (copy vs. move on assignment, disposal vs. none at scope end), and is admitted because the dispatch is performed by the language on a language construct — derived from structure, identical for every user, with no user-programmable hook — the recorded generalization path of the compiler-known specializations (rationale §5.15); users still cannot write code conditioned on a type parameter's category.
@@ -1257,8 +1257,8 @@ For each positional record, the compiler generates:
 
 - A primary constructor whose parameters are the positional fields, in declaration order.
 - Public read-only properties, one per positional field, with the same names.
-- Value equality (`=`, `<>`) based on all positional fields — generated only when every positional field is of an admissible component type ([§9.3](#sec-combined-form)); a positional record with an inadmissible field declares fine, but comparing it is a compile error rather than silent reference equality.
-- `GetHashCode` based on all positional fields.
+- Value equality (`=`, `<>`) based on all positional fields (one marked `equality skip` excepted — [§9.2](#sec-equality-skip)) — generated only when every participating positional field is of an admissible component type ([§9.3](#sec-combined-form)); a positional record with an inadmissible field declares fine, but comparing it is a compile error rather than silent reference equality.
+- `GetHashCode` based on the same participating positional fields.
 - `ToString` formatted as `"TypeName(Field1: value1, Field2: value2)"`.
 
 Positional field names are PascalCase by convention; the compiler does not transform them.
@@ -1293,7 +1293,7 @@ end Rectangle;
 
 A body-only record receives auto-generated `=`, `<>`, `GetHashCode`, and `ToString` over its **auto-properties** (and only its auto-properties) when every **instance** member of the record is one of:
 
-- An auto-property whose type is an **admissible component type** (below).
+- An auto-property whose type is an **admissible component type** (below) — or an auto-property marked `equality skip` regardless of its type (the clause removes it from the computation; [the `equality skip` clause](#sec-equality-skip) below).
 - A method or expression-bodied (computed) property — these contribute no storage and do not participate in equality. What their bodies compute is irrelevant to eligibility — equality, hashing, and `ToString` are defined over storage only, so no behavior of a computed member can affect their correctness.
 - An overload of a non-equality operator.
 - A constructor — regardless of what its body does (see the eligibility note below).
@@ -1312,7 +1312,7 @@ Such a record is said to be **auto-hashable** — a derived type property ([§3.
 
 A body record is **not** auto-hashable — and `=` on it without an explicit overload is a compile error — when it contains:
 
-- An explicit field declaration (storage that is not an auto-property).
+- An explicit field declaration (storage that is not an auto-property) — **unless the field is marked `equality skip`** (the clause below), which removes it from the membership computation entirely: a skipped member cannot disqualify the record.
 - An `override` of `Equals` or `GetHashCode`. Declaring either means the author has taken over equality, and the synthesized structural `=` would silently ignore the override; the record is therefore not auto-hashable, and `=`/`<>` (and the direct `.Equals`/`.GetHashCode` calls above) are a compile error unless the author also declares the `operator =`/`<>` overloads. (An `override` of `ToString` alone suppresses only the auto-`ToString`; auto-`Equals`/auto-`GetHashCode`/`=` remain — the author took over formatting, not equality.)
 
 A validating or normalizing constructor is fully compatible with auto-equality. `with` bypasses constructors ([§9.5](#sec-non-destructive-update-with)); the synthesized `Deserialize` runs a matching declared constructor ([§9.8](#sec-serialization-synthesis)).
@@ -1328,6 +1328,38 @@ The error is at the call site, not the declaration site; declaring a non-auto-ha
 A body-only record with zero auto-properties (and no other storage) is auto-hashable by the membership rule above. The generated `=` returns `true` for every pair of values; the generated `GetHashCode` returns a fixed implementation-defined constant; the generated `ToString` produces `"TypeName()"` — the type name followed by empty parens, the natural specialization of the property-listing format for zero properties. Such a record represents a singleton-by-value: every instance is equal to every other. The `with` expression on such a record is a compile error (no fields to replace), and `default(T)` produces the (single) value.
 
 `with` ([§9.5](#sec-non-destructive-update-with)) and `default` ([§17.11](#sec-the-default-operator)) are independent of equality; they apply to any record that satisfies their own rules.
+
+<a id="sec-equality-skip"></a>
+#### The `equality skip` clause
+
+A storage component may carry the clause **`equality skip`** (`EqualityClause ::= "equality" "skip"`, Appendix [A.3](#sec-type-declarations)/[A.4](#sec-members); `equality` is a contextual keyword, Appendix [B.2](#sec-contextual-keywords) — exactly `serialized`'s row). The clause attaches to a positional field, an auto-property, an **explicit field declaration**, or a choice payload field ([§35.7](#sec-choice-equality)), mirroring `serialized skip`'s ([§9.8](#sec-serialization-synthesis)) grammar, placement, and discipline; only the `skip` form exists — rename and `optional` have no equality analogue, so the vocabulary is one word, closed.
+
+A storage component marked `equality skip` is **removed from the auto-equality membership computation**: it does not participate in the generated `=`/`<>`, `Equals(T)`/`Equals(Object?)`, or `GetHashCode`, and it is exempt from the admissible-component-type requirement — a member whose type is inadmissible, including an explicit field declaration, does not disqualify the record when marked `equality skip`. Every other role of the member is untouched: an equality-skipped component is still storage, still a `with` target ([§9.5](#sec-non-destructive-update-with) — the copy carries its value; a copied cache is at worst stale, the cache author's existing contract), still rendered by the generated `ToString` (one clause, one effect — renderings are not contracts), and still a serialized component when the type opts into [§9.8](#sec-serialization-synthesis) (the two packages' clauses are independent; [§9.8](#sec-serialization-synthesis)'s interaction rule). The membership computation is one computation with per-package clauses: wherever it is reused — [§9.8](#sec-serialization-synthesis)'s body-record eligibility, [§35.7](#sec-choice-equality)'s choice equality, [§3.6](#sec-derived-type-properties)'s auto-hashable property — the reuse sees the clause of *its own* package applied to **participation** ([§9.8](#sec-serialization-synthesis) applies `serialized skip`; this package applies `equality skip`), while the **eligibility gate** reads both packages' skips ([§9.8](#sec-serialization-synthesis)'s gate sentence).
+
+```bezel
+record Interval
+  public readonly property Lo: int;
+  public readonly property Hi: int;
+  private equality skip _cachedLen: int;    // excluded from =, Equals, GetHashCode —
+                                            //   and the package survives the field
+  public constructor(lo: int, hi: int)
+    Lo := lo;
+    Hi := hi;
+    _cachedLen := hi - lo;
+  end constructor;
+end Interval;
+// new Interval(1, 5) = new Interval(1, 5) is true whatever the cache states.
+```
+
+The worked consequences:
+
+- **The rescue reaches the disqualifier list's first bullet only.** The *second* disqualifier — an `override` of `Equals`/`GetHashCode` — is untouched and unrescuable: the author who takes over equality has taken over all of it; `equality skip` composes with the *generated* members only. A record with both an equality-skipped member and an `Equals` override is simply not auto-hashable (the override governs) — and the skip clause on it is **not** an error: it is meaningful to a reader and future-proof against the override's removal. (Contrast [§9.8](#sec-serialization-synthesis)'s inert-annotation error, which fires when the *type* is outside synthesis entirely; here the type is a record and the package is merely suppressed.)
+- **Hashing coherence cannot break ([§8.3](#sec-equals-and-gethashcode)).** The generated `=` and the generated `GetHashCode` are computed over the *same* reduced member set: if `a = b`, every participating member compares equal, and the hash combines exactly those members' hashes in declaration order ([§8.3](#sec-equals-and-gethashcode)'s order-sensitive combiner, unchanged) — so `a.GetHashCode() = b.GetHashCode()` holds by construction. No configuration exists in which a member is hashed but not compared, or compared but not hashed.
+- **All members skipped.** A record whose every storage component is equality-skipped has an empty participating set and takes the zero-auto-property semantics above verbatim: every pair of values equal, a fixed implementation-defined hash, `ToString` unchanged (it renders the auto-properties, skipped or not). Defined, no diagnostic — the zero-property record draws none, and an all-skipped record is the same value semantically.
+- **The recursive admissibility rule is unchanged in shape.** "Another record that is itself auto-hashable" evaluates the inner record *with its own skips applied* — the same reuse discipline, not a new rule: the property is [§3.6](#sec-derived-type-properties)-derived, computed per type from its declaration, and the outer record consumes the inner's verdict. An inner record rescued by `equality skip` is admissible as a component exactly as any auto-hashable record is.
+- **What the skip is not.** Not custom equality logic — skip only *excludes*; a record needing projection equality still declares the operators under [§25.2](#sec-operator-overloading-restrictions)'s co-declaration rule, the sanctioned route for logic. Not a mutability license — [§9.4](#sec-mutability)'s advice stands; a skipped *mutable* member is the expected use (a cache mutated behind `readonly` structure), but skipping does not make mutating *participating* members any safer. Not available to classes — classes have no auto-equality ([§8.3](#sec-equals-and-gethashcode): reference equality); nothing to skip.
+
+The clause is admitted on storage components only. On a computed (expression-bodied) property, a method, a static member, an enum constant, or a choice *case* (the case is the discriminant — skipping it is incoherent), `equality skip` is a **compile error**, mirroring [§9.8](#sec-serialization-synthesis)'s inert-annotation rule: such members never participate in equality, and silently ignoring the clause would be the inert-looking-but-load-bearing annotation rationale [§18](Bezel_Design_Rationale.md#sec-things-deferred) warns against. Adding or removing `equality skip` on a public type's member is a **breaking change** ([§3.6](#sec-derived-type-properties) rule 3): it flips comparison results and hash values for clients, and can flip the auto-hashable/hashable derived properties; the artifact interface ([§2.8.2](#sec-artifact-interface)) carries the clause exactly as it carries `serialized` clauses.
 
 <a id="sec-combined-form"></a>
 ### 9.3 Combined form
@@ -1348,7 +1380,7 @@ The auto-generated members are present and the body adds further members. Confli
 - The body may not declare a constructor with the same parameter list as the auto-generated primary constructor.
 - The body may not declare a property with the same name as a positional field's auto-generated property.
 
-**Eligibility of the combined form.** The [§9.2](#sec-body-records) membership and disqualifier rules apply to the combined form with the positional fields counted as storage components alongside the body's auto-properties: every storage component must be of an admissible component type, and a disqualifying body member (an `Equals`/`GetHashCode` override, or a member outside the §9.2 list) suppresses the auto-generated equality members — the declaration itself stays legal, and any *use* of `=`/`<>`/`.Equals`/`.GetHashCode` on the type gets §9.2's existing use-site error. The same use-site-error discipline applies to a **purely positional** record whose fields fall outside the admissible-component rule: it declares fine, but comparing it is a compile error rather than silent reference-shaped equality.
+**Eligibility of the combined form.** The [§9.2](#sec-body-records) membership and disqualifier rules apply to the combined form with the positional fields counted as storage components alongside the body's auto-properties: every storage component must be of an admissible component type, and a disqualifying body member (an `Equals`/`GetHashCode` override, or a member outside the §9.2 list) suppresses the auto-generated equality members — the declaration itself stays legal, and any *use* of `=`/`<>`/`.Equals`/`.GetHashCode` on the type gets §9.2's existing use-site error. The same use-site-error discipline applies to a **purely positional** record whose fields fall outside the admissible-component rule: it declares fine, but comparing it is a compile error rather than silent reference-shaped equality. A positional field may carry **`equality skip`** ([§9.2](#sec-equality-skip); grammar A.3 `PositionalField`): the field is excluded from equality but present, constructed, and rendered, and — as everywhere — a skipped field's inadmissible type does not disqualify the record.
 
 <a id="sec-mutability"></a>
 ### 9.4 Mutability
@@ -1434,7 +1466,7 @@ A type is **serialization-eligible** — a derived type property ([§3.6](#sec-d
 
 - **Enums** are always serialization-eligible. The synthesized form writes the member *name* as a string (via `WriteString`) and reads it back by matching against the declared members; an encoded name matching no declared member raises `SerializationException` on read (on write no failing case exists — every enum value is a declared value, [§5.4](#sec-enum-casts)). When several constants share one underlying value ([§10.2](#sec-explicit-values)), the synthesized form writes the **first-declared** constant's name for that value and accepts every declared name on read (all denote the same value, so the round trip is stable). Writing the name rather than the underlying integer makes the encoded form stable against reordering or renumbering of members and self-describing in text formats; programs that need the integer form serialize `int(e)` (or the underlying-typed cast) explicitly through a hand-written `Serialize`.
 - **Positional records** ([§9.1](#sec-positional-records)) are serialization-eligible when every positional field's type is serialization-eligible **and record-admissible** (the record clause below — heap collections and other class-typed components are class components only). The synthesized form is an object whose field names are the positional-field names in declaration order.
-- **Body records** ([§9.2](#sec-body-records)) are serialization-eligible under exactly the auto-equality membership conditions of [§9.2](#sec-body-records) — the §9.2 member list and admissible-component rule are the single normative statement, applied here unchanged — *and* additionally every auto-property's type is serialization-eligible. The serialized components are the auto-properties in declaration order; computed (expression-bodied) properties are not serialized, exactly as they do not participate in equality or `ToString`. With the record clause below, positional and body records agree: a heap-collection component makes either form ineligible, with the same remedy.
+- **Body records** ([§9.2](#sec-body-records)) are serialization-eligible under exactly the auto-equality membership conditions of [§9.2](#sec-body-records) — the §9.2 member list and admissible-component rule are the single normative statement, applied here unchanged, evaluated with **both packages' skips applied** (the eligibility gate: a member marked `serialized skip` *or* `equality skip` ([§9.2](#sec-equality-skip)) is structurally absent from the membership conditions for this check — see the interaction rule below) — *and* additionally every auto-property's type is serialization-eligible. The serialized components are the auto-properties in declaration order; computed (expression-bodied) properties are not serialized, exactly as they do not participate in equality or `ToString`. With the record clause below, positional and body records agree: a heap-collection component makes either form ineligible, with the same remedy.
 - A component type is **serialization-eligible** when it is: a primitive (`bool`, the integer types, `float`, `double`, `decimal`, `char`); `string`; an enum; another serialization-eligible record; a value-like serialization-eligible choice ([the choice subsection](#sec-choice-serialization)); a serialization-eligible **synthesized class** (a class that declares `ISerializable`/`IDeserializable` and whose serialized components are each serialization-eligible, below); a `Shared<T>` or `Weak<T>` whose `T` is a serialization-eligible class; a nullable `T?` whose `T` is serialization-eligible (encoded as the value or `WriteNull`/`TryReadNull`); or a standard sequence collection (`Array<T>`, `OwningArray<T>`, `LinkedList<T>`, etc., and inline arrays `[N]T`) whose element type is serialization-eligible (encoded with `BeginArray`/`EndArray`). A standard dictionary (`Dictionary<K, V>`, `OwningDictionary<K, V>`) is serialization-eligible when both `K` and `V` are serialization-eligible (encoded as an array of key/value pairs to admit non-string keys uniformly). Of these, the class-typed rows — synthesized classes, `Shared<T>`/`Weak<T>`, and the heap collections (sequence and dictionary alike, which are class types, [§3.1](#sec-type-kinds)) — are admissible in **class** components only; for records see the record clause below.
 
 A type that declares `: ISerializable` or `: IDeserializable` but is **not** serialization-eligible is a **compile error at the conformance declaration**, naming the first offending member and the reason (mirroring the auto-equality non-membership error of [§9.2](#sec-body-records), but reported at the declaration rather than the use site, because the conformance declaration is the explicit opt-in and the obstruction should be reported where the promise is made). The error names the remedy: remove the conformance, make the offending component serializable, or hand-write `Serialize`/`Deserialize` (which suppresses synthesis — see below).
@@ -1540,7 +1572,7 @@ A choice ([§35](#sec-choices)) opts in by declaring `: ISerializable` / `: IDes
 
 Hand-writing `Serialize` (respectively a recognized static `Deserialize`) **suppresses** synthesis of that direction, exactly as a manually declared `Equals`/`GetHashCode` suppresses auto-equality. The two directions are independent: a type may synthesize one and hand-write the other. Declaring `: ISerializable` without an eligible structure and without a hand-written `Serialize` is the compile error above; declaring it *with* a hand-written `Serialize` is always valid regardless of eligibility (the hand-written body is the contract).
 
-Synthesis composes with auto-equality and `ToString`: a body record may be simultaneously auto-hashable and serialization-eligible; the feature sets are independent packages over the same auto-properties. The `serialized` clause affects only serialization synthesis — it has no effect on auto-equality, `ToString`, `with`, or any other use of the member. The `serialized` clause is a single closed grammar production ([Appendix A](#sec-appendix-a)); apart from it, `: ISerializable, IDeserializable` is ordinary interface-conformance syntax ([§11](#sec-classes-and-interfaces)) and the normative content is the eligibility rule, the generated-body semantics, and the customization semantics defined here. The wire shapes are normative so that independent implementations agree; the rationale for the specific choices (names not integers for enums, declaration order, key/value-pair dictionaries) and for the modifier-not-attribute design is in [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection).
+Synthesis composes with auto-equality and `ToString`: a body record may be simultaneously auto-hashable and serialization-eligible; the feature sets are independent packages over the same auto-properties, each scoping the shared [§9.2](#sec-body-records) membership computation with its own clause. The `serialized` clause affects only serialization synthesis — it has no effect on auto-equality, `ToString`, `with`, or any other use of the member — and `equality skip` ([§9.2](#sec-equality-skip)) affects only auto-equality: **a clause never crosses packages' participation** (`equality skip` does not hide a member from the wire; `serialized skip` does not change what `=` compares). The one shared reading is the **eligibility gate**: where this section reuses §9.2's membership conditions to decide whether synthesis can run at all, a member skipped by *either* clause is not "a member outside the §9.2 list" for either package's eligibility check — which is what keeps a record with an equality-skipped explicit cache field serialization-eligible with no second clause (explicit fields were never serialized components, so the one clause suffices). The `serialized` clause is a single closed grammar production ([Appendix A](#sec-appendix-a)); apart from it, `: ISerializable, IDeserializable` is ordinary interface-conformance syntax ([§11](#sec-classes-and-interfaces)) and the normative content is the eligibility rule, the generated-body semantics, and the customization semantics defined here. The wire shapes are normative so that independent implementations agree; the rationale for the specific choices (names not integers for enums, declaration order, key/value-pair dictionaries) and for the modifier-not-attribute design is in [§5.19](Bezel_Design_Rationale.md#sec-serialization-without-reflection).
 
 ---
 
@@ -3470,9 +3502,9 @@ Bare `throw` outside a catch arm body is a compile error, with the same diagnost
 <a id="sec-the-discard-_"></a>
 ### 17.13 The discard `_`
 
-The identifier `_` is a *discard* — a sink that consumes a value without binding it to a name. Discard is permitted in three positions; in every other position `_` is treated as a normal identifier (it may, for example, be used as a private field name).
+The bare token `_` is **reserved** ([§1.3](#sec-identifiers), Appendix [B.1](#sec-reserved-keywords)): it is never an identifier — never declarable, never readable as a name. It is a *discard* — a sink that consumes or ignores a value without binding it. Every position in which `_` can appear is one of the sanctioned forms of this section — a discard or wildcard, an ignore, or the anonymous owning binding — or a compile error whose diagnostic names the sanctioned forms (the rejected positions are listed at the end). A discard is valid exactly where receiving-and-ignoring a value is coherent, and an error everywhere else. Identifiers merely *containing* underscores (`_camelCase`, `_f`) are ordinary identifiers and unaffected by this section.
 
-**Pattern position.** Inside a `case` arm or destructuring pattern, `_` matches any value without binding.
+**Pattern position.** Inside a `case` arm or destructuring pattern, `_` matches any value without binding. (The `when` construct's `_` catch-all arm, [§19.1](#sec-forms), is the same wildcard reading.)
 
 ```bezel
 case shape of
@@ -3490,7 +3522,7 @@ if dict.TryGetValue(key, out _) then    // we only care that it was present
 end;
 ```
 
-`out _` does not introduce a variable; the receiving slot is internal to the compiler and is not observable. The argument is type-inferred from the parameter's declared type. A type annotation on `out _` is not permitted (`out _: int` is a syntax error), mirroring the rule for `out var name` ([§22.4](#sec-inline-out-declarations)) — the discard takes its type from the parameter without ambiguity. The discard composes with `out` only. `ref _` is not a discard form: after `ref`, `_` is an ordinary identifier per this section's three-position rule — it must resolve to a binding named `_` in scope, to which [§22.3](#sec-ref-and-out-argument-locations)'s `ref`-argument location rules then apply, and an unresolved `_` is the ordinary unknown-identifier error. (An `out` parameter is pure output, so "receive and ignore" is coherent; a `ref` parameter reads its incoming value, which a discard could not supply.)
+`out _` does not introduce a variable; the receiving slot is internal to the compiler and is not observable. The argument is type-inferred from the parameter's declared type. A type annotation on `out _` is not permitted (`out _: int` is a syntax error), mirroring the rule for `out var name` ([§22.4](#sec-inline-out-declarations)) — **a bare ignore takes its type from context, never an annotation**, one rule uniform across every ignore form of this section (`out _`, lambda-parameter `_`, `for var _`). The discard composes with `out` only: **`ref _` is a compile error** — a `ref` argument reads its operand, which a discard cannot supply; pass a named location ([§22.3](#sec-ref-and-out-argument-locations)). (An `out` parameter is pure output, so "receive and ignore" is coherent.) `out var _` is likewise a compile error — it would declare nothing; write `out _`, which already means exactly this ([§22.4](#sec-inline-out-declarations)).
 
 **Discard statement.** The form `_ := expression;` evaluates `expression` and discards its value. The discard statement is syntactically distinct from assignment: `_` is not an lvalue, and the form is recognized lexically by the leading `_` token.
 
@@ -3521,7 +3553,7 @@ The discard statement's legality depends on the static type of `expression`:
   _ := new FileStream(path, FileMode.Open);   // OK: opened, then disposed at end of statement
   ```
 
-  The difference from `using var _ := expression;` is **disposal timing**, not legality: `_ := …` disposes at end of *statement*; `using var _ := …` disposes at end of *scope*. Both work for any class type. (Corollary: because `_ := expr;` is lexically a discard statement, a local *declared* `var _` can never be re-assigned — any later `_ := expr;` is a new discard, not an assignment to it. `_` bindings are write-once through assignment syntax — a `ref` argument can still write the location, [§22.3](#sec-ref-and-out-argument-locations).) (Auto-drop, [§28.3](#sec-owned-local-discharge-requirement), makes the obligation always satisfiable; the discard names the immediate-disposal point.)
+  The difference from `using var _ := expression;` is **disposal timing**, not legality: `_ := …` disposes at end of *statement*; `using var _ := …` disposes at end of *scope*. Both work for any class type. (Auto-drop, [§28.3](#sec-owned-local-discharge-requirement), makes the obligation always satisfiable; the discard names the immediate-disposal point.)
 
 - **Interface-typed expressions:** discard is **permitted** and disposes the value at the end of the discard statement, calling `Dispose()` on the *runtime* type (disposal is virtual). Because the discard disposes rather than abandons, there is no cross-module hazard: an interface reference may bind any conforming implementation, and a future implementation in another module may add a non-trivial destructor, but whatever the runtime type, `_ := expr;` disposes it correctly. `using var _ := expr;` remains available when end-of-*scope* (rather than end-of-statement) disposal is wanted.
 
@@ -3539,7 +3571,10 @@ using var _ := new FileStream(path, FileMode.Open);     // OK — disposed at sc
 The discard form acknowledges a deliberately-unused value *and* discharges its disposal obligation: for an owned class or move-only value, `_ := …` disposes it at end of statement. The disposal contract remains universal — a class instance with a non-trivial `Dispose()` reaches an owned location, becomes the operand of `using var`, is explicitly disposed, is discarded with `_ := …`, or is auto-dropped at scope end ([§28.3](#sec-owned-local-discharge-requirement)) — but no path leaks. The only discards that remain errors are `Task`/`Task<T>` (use `Task.FireAndForget`, since disposing a task abandons a running operation — a semantic, not a leak, concern).
 
 <a id="sec-recap-of-the-difference-between-discard-and-using-var-_"></a>
-#### Recap of the difference between discard and `using var _`
+<a id="sec-the-anonymous-owning-binding"></a>
+#### The anonymous owning binding `using var _`
+
+`using var _ := expression;` (and `await using var _ := …;` in async contexts, [§28.12](#sec-asynchronous-disposal)) is the **one `_` form that owns storage**: it binds the value to an unnamed scope-bound local — scope-end disposal, non-reassignability, and every other [§28.10](#sec-using-var) rule of a named `using var`, the borrow-pin case included — and binds **no name**: `_` is not in scope after the declaration, and nothing can read the value. It is the scope-end counterpart of the discard statement; the choice between the two is one of **disposal timing**, not legality:
 
 ```bezel
 _ := expression;            // value evaluated; if owned, disposed at END OF
@@ -3556,25 +3591,11 @@ using var _ := expression;  // value bound to an unnamed local that is
                             //   class type.
 ```
 
-The choice between `_ := …` and `using var _ := …` for an owned value is one of **disposal timing**, not legality: `_ := …` disposes immediately (end of statement), `using var _ := …` at end of scope. Use `_ := …` to dispose an owned result you do not need *now*; use `using var _ := …` when the value must outlive the statement but you do not want to name it.
+Use `_ := …` to dispose an owned result you do not need *now*; use `using var _ := …` when the value must outlive the statement but you do not want to name it.
 
-Note the distinction between discarding and binding:
+**Ignore forms.** Two binding positions admit `_` as a **true ignore** — accepted, binding nothing: a **lambda parameter** ([§27.3](#sec-lambda-expressions)) — the ignored slot still contributes to the function type, and because nothing is named several ignores may coexist (`lambda(_, _) => 0` is legal) — and a **`for` loop variable** ([§21.4](#sec-the-for-statement)) — `for var _ in xs do … end;` iterates for effects with the element unbound, [§29.2](#sec-desugaring-of-for)'s semantics unchanged (in an owning iteration the unbound element is disposed per iteration exactly as a bound-but-unused one is). No parameter modifier and no type annotation composes with a bare ignore.
 
-```bezel
-_ := ComputeResult();             // DISCARD: evaluates and (if owned) disposes at end of
-                                  //   statement; for value/runtime-managed types, just
-                                  //   drops (a trivial class value is freed, §28.9).
-var _ := ComputeResult();         // BINDING: declares a local variable named "_" and assigns.
-                                  //   Subject to normal unused-variable warnings; if the value
-                                  //   is owned it auto-drops at scope end (§28.3), with the
-                                  //   plain-var must-use warning.
-using var _ := ComputeResult();   // BINDING with disposal at scope end (no must-use warning).
-                                  //   Works for any class type, including non-trivial-dispose.
-```
-
-The forms are syntactically distinct. `_ :=` (no `var`) is the discard; `var _ :=` is a binding to a local whose name happens to be `_`; `using var _ :=` is the same binding with the using-var disposal rule. Outside the three discard positions (pattern, out-argument, discard statement), `_` is an ordinary identifier.
-
-A worked example: `var _ := 5; Console.WriteLine(_);` declares a local named `_` with value 5 and prints it. The second `_` is the local — it appears in expression position, where `_` is just an identifier — not a discard. The discard is statement-level only (`_ := expr;`); it cannot be read.
+**Rejected positions.** Everything else is a compile error whose diagnostic names the sanctioned forms: `var _ := e;` and `const _ := e;` (`_` is a discard, not a declarable name — the diagnostic names both remedies, `_ := e;` for end-of-statement release or `using var _ := e;` for the anonymous scope-end hold; [§21.1](#sec-variable-declarations)); `out var _` and `ref _` (above); every declaration named `_` — a method or constructor parameter (parameter names are call-site-addressable API surface, [§22.5](#sec-optional-parameters-and-named-arguments), carried by the artifact interface, [§2.8.2](#sec-artifact-interface) — choose a name), a field, property, method, type, module, enum constant, choice case, loop label ([§21.5](#sec-break-and-continue)), or alias; and a bare `_` in expression position (`_` is not a value — nothing binds it, so no such read can resolve).
 
 <a id="sec-constant-expressions"></a>
 ### 17.14 Constant expressions
@@ -4174,6 +4195,8 @@ const MaxUsers := 1000;               // const with inferred type
 
 A non-nullable local must be assigned before it is read ([§7.9](#sec-definite-assignment-for-non-nullable-fields)).
 
+A local cannot be named `_`: the bare underscore is the reserved discard token ([§1.3](#sec-identifiers), [§17.13](#sec-the-discard-_)). `var _ := e;` is a compile error whose diagnostic names both sanctioned spellings — `_ := e;` to evaluate and release the value at end of statement, or `using var _ := e;` to hold it anonymously until scope end ([§17.13](#sec-the-discard-_), [§28.10](#sec-using-var)); `const _ := e;` is likewise rejected (a never-readable constant is useless by construction).
+
 <a id="sec-runtime-const-locals"></a>
 #### Runtime `const` locals
 
@@ -4251,6 +4274,8 @@ end;
 for var x: int in source do ... end;
 ```
 
+The loop variable may be the ignore `_` ([§17.13](#sec-the-discard-_)): `for var _ in source do … end;` iterates for the body's effects with the element unbound — nothing is named, and the body cannot read the element. A type ascription on the ignore is rejected (`for var _: T in …` — a bare ignore takes its type from context, never an annotation, [§17.13](#sec-the-discard-_)). The iteration protocol's borrow/ownership semantics ([§29.2](#sec-desugaring-of-for)) are unchanged by the spelling; in an owning iteration ([§29.2](#sec-desugaring-of-for)'s owning path) the unbound element is disposed at each iteration's end exactly as a bound-but-unused iteration variable would be.
+
 The loop variable is freshly bound on each iteration: a lambda captured inside the body sees the value of that specific iteration. Because the binding is fresh each iteration, assigning to the loop variable inside the body affects only that iteration — it does not alter how many iterations run, nor the next iteration's value, even when the source is a `Range<T>` the compiler has optimized into a counted loop.
 
 If the source is empty, the body does not execute.
@@ -4278,7 +4303,7 @@ After `break name;`, execution continues at the first statement after the labele
 
 On the way to its target, the jump exits every intervening scope — inner loop bodies, `do … end` blocks, `try` bodies — and each performs its ordinary exit obligations ([§28.3](#sec-local-variables-ownership-and-borrows), [§28.10](#sec-using-var), [§31.2](#sec-try-catch-finally)): `using var`/`await using var` disposals and pending `finally` blocks run in reverse order of establishment, and the jump is a body-exit edge of every loop body it exits, so each such body's iteration variable is subject to its own [§29.2](#sec-desugaring-of-for)/[§28.3](#sec-local-variables-ownership-and-borrows) discharge rule at the jump site. The labeled forms add or alter no disposal rule.
 
-**Label scope, namespace, and duplicates.** A loop label is in scope throughout its loop statement and lives in a namespace of its own: it is never resolved against — and never collides with — variables, parameters, types, or members, and it is not an expression (a local `scan` and a label `scan` may coexist; `nameof` does not accept a label). A loop label that repeats a label already in scope at its declaration — the label of an enclosing labeled loop in the same callable body — is a compile error at the inner label: labels do not shadow. Loops that do not enclose one another may reuse a label freely; their labels are never simultaneously in scope. `_` is an ordinary identifier in label position ([§1.3](#sec-identifiers)); it gains no discard meaning here ([§17.13](#sec-the-discard-_)'s three-position list is unchanged).
+**Label scope, namespace, and duplicates.** A loop label is in scope throughout its loop statement and lives in a namespace of its own: it is never resolved against — and never collides with — variables, parameters, types, or members, and it is not an expression (a local `scan` and a label `scan` may coexist; `nameof` does not accept a label). A loop label that repeats a label already in scope at its declaration — the label of an enclosing labeled loop in the same callable body — is a compile error at the inner label: labels do not shadow. Loops that do not enclose one another may reuse a label freely; their labels are never simultaneously in scope. `_` is not a valid loop label: a label is a declaration, and `_` cannot be declared ([§1.3](#sec-identifiers), [§17.13](#sec-the-discard-_)).
 
 **Callable boundary.** The enclosing-loop search — for the labeled and unlabeled forms alike — is confined to the callable ([§21.7](#sec-the-return-statement)'s list: method, constructor, destructor, lambda, property accessor, indexer accessor) whose body contains the statement. A `break` or `continue` inside a lambda cannot target a loop of the defining method, labeled or not; a compile error. A loop label is correspondingly visible only within its own callable body: a loop inside a lambda may reuse an enclosing method's label without conflict, since the outer label is not in scope there.
 
@@ -4477,7 +4502,7 @@ arguments are never aliases of each other or of anything else during the call.
 var success := parser.TryParse("42", out var num);
 ```
 
-`out var name` declares a new variable inline. Its type is inferred from the method's `out` parameter declaration; an explicit type annotation is not permitted in the inline form.
+`out var name` declares a new variable inline. Its type is inferred from the method's `out` parameter declaration; an explicit type annotation is not permitted in the inline form. `out var _` is a compile error — it would declare nothing; write `out _`, which already means exactly this ([§17.13](#sec-the-discard-_)).
 
 The variable's scope is the enclosing block, from the call onward. It is in scope in both branches of any surrounding `if` and after the call.
 
@@ -5233,7 +5258,7 @@ A pure body may contain exactly the following; the list is closed, and everythin
 2. **Locals and frame-local mutation.** Variable declarations of every [§21.1](#sec-variable-declarations) form; assignment, compound assignment, and `++`/`--` where the target's **root is a local variable or by-value parameter of this body and the access path from that root traverses only value-typed storage** (record fields, inline-array slots). The first class-typed dereference on a path leaves the frame and makes the target prohibited. Mutating a record local, a record parameter copy, or an inline-array local is frame-private and admitted.
 3. **Value, record, enum, choice, and string construction and operations.** All built-in operators on primitives, enums, and `string` (concatenation included); interpolated strings (each interpolated value's implied `ToString`/`Format` call is governed by rule 6); explicit and implicit conversions; range construction; record construction and `with` update, provided the invoked constructor is compiler-synthesized-pure or declared `pure`; choice construction — the payload-free case reference and the payload-case application ([§35.3](#sec-choice-construction); a choice has no user constructors, [§35.2](#sec-choice-members)) — provided every payload argument is itself admitted under these rules **and the constructed choice's classification is not owning** ([§35.4](#sec-choice-classification)): constructing an owning-classified choice is rejected whatever case is selected — even its payload-free and value-payload cases mint an owned move-only value ([§35.3](#sec-choice-construction)) that no admitted operation of this fragment can discharge (the move-only return is rejected above; `move`, `owned` arguments, and the other consuming positions are prohibited by this list), so the error lands at the construction site rather than deferring into the scope-end disposal machinery the fragment fences off; for a generic choice the classification is per-instantiation and the check is enforced at the instantiation or use site ([§35.11](#sec-choice-generics)); inline-array construction and literals of value/record element type.
 4. **Defining lambdas and forming method references.** Closure allocation is runtime-managed ([§28.9](#sec-runtime-managed-types)) — permitted like string concatenation. A lambda *body* defined inside a pure body is **not** checked under these rules: it is a separate function that provably cannot run during the pure call (invoking function-typed values is prohibited, rule 6's contrapositive), and its later invocation happens at the caller's effect discipline. Captures follow [§28.3](#sec-local-variables-ownership-and-borrows)/[§28.9](#sec-runtime-managed-types) unchanged. (Forming a method reference *from* a pure method loses the purity fact at the formation boundary — function types carry no purity in this revision.)
-5. **All control flow.** `if`/`elif`/`else`, `case`/`when`, `while`, `for`, `do … end`, `break`/`continue`/`return`, `try`/`catch`/`finally`, and `throw` — including the bare re-raise; a caught exception binding is a borrow ([§31.1](#sec-the-throw-operand)) and is readable under rule 1. A `for` loop is admitted when its desugaring does not construct an enumerator: over `Range<T>` of primitive steppable type, the direct counted-loop form ([§16.5](#sec-iteration), [§29.2](#sec-desugaring-of-for)) — elsewhere an admitted elision — is **the normative semantics inside a pure body**; over inline arrays, spans, `ReadOnlyStringSpan`, and value-typed `OwningBuffer<T>` the desugaring is already the direct indexed loop. A `for` over an `IEnumerable<T>`-typed source (including `Array<T>` and `string`) is **rejected**: the desugaring constructs an enumerator class instance; the remedy is an index loop (`for var i in 0..<xs.Count do … xs[i] … end;`).
+5. **All control flow.** `if`/`elif`/`else`, `case`/`when`, `while`, `for`, `do … end`, `break`/`continue`/`return`, `try`/`catch`/`finally`, and `throw` — including the bare re-raise; a caught exception binding is a borrow ([§31.1](#sec-the-throw-operand)) and is readable under rule 1. A `for` loop is admitted when its desugaring does not construct an enumerator: over `Range<T>` of primitive steppable type, the direct counted-loop form ([§16.5](#sec-iteration), [§29.2](#sec-desugaring-of-for)) — elsewhere an admitted elision — is **the normative semantics inside a pure body**; over inline arrays, spans, `ReadOnlyStringSpan`, and value-typed `OwningBuffer<T>` the desugaring is already the direct indexed loop; and over a source whose **static type at this body's own check site** is concretely **`Array<T>`, `OwningArray<T>`, class-typed `OwningBuffer<T>`, or `string`**, [§29.2](#sec-desugaring-of-for)'s admitted protocol elision is likewise **the normative semantics inside a pure body**: the compiler emits the direct indexed loop — a bounds read and per-element reads, rule-1 material — and constructs no enumerator. (The bound is read as an intrinsic length fact of the concrete layout, exactly as the counted loop's endpoints are; where an implementation lowers it as the accessor call, the accessors in question are the stdlib's intrinsic `pure` reads — `string.Length` and the indexer, stdlib [§9.6](Bezel_Standard_Library.md#sec-string); the `Count` properties, stdlib [§4](Bezel_Standard_Library.md#sec-system-collections-generic) — so both lowerings satisfy the fragment: "a bounds read" commits to neither.) The iteration variable's type and state are [§29.2](#sec-desugaring-of-for)'s for the elided form (a value copy for value elements and `string`; a borrow of the element for class-typed elements — default iteration over `OwningArray<T>` remains borrowing). A source whose static type is an **interface** (`IEnumerable<T>` included) or a **generic type parameter** — even one instantiated at a concrete sequence type — remains **rejected**: the remedy is an index loop (`for var i in 0..<xs.Count do … xs[i] … end;`). The structural-modification fault of [§29.12](#sec-mutation-during-iteration) is preserved by the elision as everywhere; inside a pure region no admitted operation can structurally modify a collection (stores through class-typed paths and non-pure calls are both prohibited), so the fault path is statically unreachable there and an implementation may omit its check in pure bodies with no observable difference.
 6. **Calls to pure members.** A call — method, operator, accessor read, or constructor in the admitted positions — is permitted iff the member **declared on the receiver's static type** (or the statically resolved member, for statics and extensions) is `pure`-declared or pure-classified (below). Every entry point of the task, domain, channel, event, synchronization, and I/O surfaces is excluded by this one rule — none is or can be `pure`-declared — with no per-API enumeration.
 7. **`throw`, with the construction carve-out below.**
 
@@ -5921,6 +5946,8 @@ end;
 ```
 
 Inside a value-returning block-bodied lambda, `return` is required on every exit path.
+
+**Ignored parameters.** A parameter slot may be the ignore `_` ([§17.13](#sec-the-discard-_)): it is accepted, binds nothing, and contributes its slot to the lambda's function type as normal — under a target type `(T, U) -> U`, `lambda(_, x) => x` ignores its first argument. Because nothing is named, several ignores may coexist: `lambda(_, _) => 0` is legal. No parameter modifier and no type annotation compose with the bare ignore — `FuncParamMods` with `_` is rejected (a `ref` parameter reads and writes through its operand, which an ignore cannot supply, and a `scoped` parameter that binds nothing stores nothing), and a typed ignore slot is spelled by the target type, exactly the [§27.4](#sec-parameter-type-inference) inference story. The destructure-slot `_` ([§27.4](#sec-lambda-parameter-destructuring)) is the same nothing-is-bound reading per slot.
 
 **Which block-bodied lambdas return a value.** A block-bodied lambda is a **procedure lambda** — its type is `(…) -> ()` — exactly when no path through its body executes a value-carrying `return e;`: its exits are bare `return;` and falling off the end. A body where one path returns a value and another exits without one is a compile error, the same totality rule as for methods. A target type, when present, is checked against this classification — a procedure-bodied lambda does not convert to a value-returning function type, nor the reverse.
 
@@ -7194,6 +7221,8 @@ An expression whose arm-meet is **owned** — a `??`, an `if` expression, or an 
 
 **Adopting a named owned binding (derives: [K3.4](#sec-kernel-k3)).** `using var y := owned x;` transfers a named owned local or `owned` parameter into a scope-bound binding: `y` takes over the disposal obligation and `x` is left moved-from — the binding-position form of the [§22.3](#sec-parameter-modifiers) transfer marker ([§28.3](#sec-local-variables-ownership-and-borrows)). An **unmarked** `using var y := x;` where `x` is a named owned binding does *not* adopt: it is a borrow, pinned per the subsection below, and `x` retains the obligation.
 
+**The anonymous binding.** `using var _ := expression;` (and `await using var _ := …;`, [§28.12](#sec-asynchronous-disposal)) is the **anonymous owning binding** ([§17.13](#sec-the-discard-_)): the same scope-end disposal, non-reassignability, admission rules, and borrow-pin case as a named `using var` — with no name bound. `_` is not in scope after the declaration, and nothing can read the value; the form is the sanctioned spelling for holding a value to scope end without naming it (`using var _ := mutex.Acquire();`). Adoption composes: `using var _ := owned x;` consumes `x` into the anonymous binding exactly as the named form would.
+
 `using var` accepts a value-type or runtime-managed right-hand side. For ordinary value types and runtime-managed types, the disposal at scope end is a no-op (these types do not require disposal per [§28.9](#sec-runtime-managed-types)), and the only effect is the reassignability restriction. For move-only inline arrays (`[N owned]…`, [§15.3](#sec-move-only-value-types)), the local's owned slots are auto-disposed at scope end regardless of whether `using var` is used; the only additional effect of `using var` on a move-only local is the reassignability restriction. The uniform admissibility of `using var` across value-typed, runtime-managed, and move-only RHSes makes it safe to use uniformly in generic code or in compiler-generated desugarings (such as the for-loop body of [§29.2](#sec-desugaring-of-for)) without inspecting the underlying type kind.
 
 To dispose before the enclosing method returns, nest in a `do ... end`:
@@ -7649,7 +7678,7 @@ When `source` has type `ArraySpan<T>` or `ReadOnlyArraySpan<T>` (stdlib [§4.15]
 
 When `source` has type `IReadOnlySpan<TElement>` (stdlib [§4.16](Bezel_Standard_Library.md#sec-ireadonlyspan)), the desugaring is a direct indexed loop over `0..<source.Length`, accessing each element via `source[i]`. The iteration variable's type is `TElement`. Indexer and `Length` access through the interface are virtual dispatches (vtable lookup, indirect call); the iteration is correspondingly slower than iterating a concrete span type. Authors writing inner loops should iterate over concrete span types where peak per-element throughput matters; the interface-typed for-loop is the convenient form for code where breadth across span sources is more important than performance. The lifetime constraint is the standard one: the `IReadOnlySpan<TElement>` value (a boxed borrow-bearing record per the rule of [§8.6](#sec-boxing-of-borrow-bearing-records)) may not outlive the source of the underlying span's borrow, which the compiler tracks through the boxed-value lifetime constraint.
 
-More generally, the compiler may elide the `IEnumerable`/`IEnumerator` protocol and the associated heap allocation whenever it can prove that the observable behavior is identical to the desugared form. For heap arrays (`Array<T>`, `OwningArray<T>`) and strings, the compiler is expected to emit direct indexed loops as an optimization (these types do implement `IEnumerable<T>`, but the protocol is elided when the compiler can see the type concretely). For inline arrays (`[N]T`), the direct indexed loop is mandatory rather than optimizational — inline arrays are not class types and do not implement `IEnumerable<T>` at all ([§15.1.2](#sec-inline-array-members)). For range literals with constant endpoints, the compiler emits tight counted loops with no allocation. These optimizations ensure that the common `for` patterns — iterating an array, a string, or a numeric range — incur no disposal overhead from `IEnumerator<T>: IDisposable`.
+More generally, the compiler may elide the `IEnumerable`/`IEnumerator` protocol and the associated heap allocation whenever it can prove that the observable behavior is identical to the desugared form. For heap arrays (`Array<T>`, `OwningArray<T>`) and strings, the compiler is expected to emit direct indexed loops as an optimization (these types do implement `IEnumerable<T>`, but the protocol is elided when the compiler can see the type concretely). Inside a `pure` body this elision is **normative** for the concretely-typed sources, per [§22.15](#sec-pure-body-rules) rule 5. For inline arrays (`[N]T`), the direct indexed loop is mandatory rather than optimizational — inline arrays are not class types and do not implement `IEnumerable<T>` at all ([§15.1.2](#sec-inline-array-members)). For range literals with constant endpoints, the compiler emits tight counted loops with no allocation. These optimizations ensure that the common `for` patterns — iterating an array, a string, or a numeric range — incur no disposal overhead from `IEnumerator<T>: IDisposable`.
 
 <a id="sec-iterator-yield-ownership"></a>
 #### Iterator yield ownership
@@ -10039,7 +10068,7 @@ Generic choices need no determination machinery: for `case r of Ok(var v) => …
 <a id="sec-choice-equality"></a>
 ### 35.7 Equality, hashing, `ToString`
 
-A **value-like** choice is **auto-hashable** ([§3.6](#sec-derived-type-properties), the [§9.2](#sec-body-records) property) when every payload field of every case is a [§9.2](#sec-body-records) admissible component type, with one addition to the recursive rule: another auto-hashable choice is admissible. The generated `=` is true exactly when both operands have the same active case and every corresponding payload compares equal by its type's `=`; the generated `GetHashCode` combines the case discriminant with the per-payload hashes (order-sensitive, [§8.3](#sec-equals-and-gethashcode)); the generated `ToString` produces `"TypeName.CaseName(field1: value1, …)"`, and `"TypeName.CaseName"` for a payload-free case. Methods, computed properties, statics, and non-equality operators neither qualify nor disqualify, per §9.2's membership list.
+A **value-like** choice is **auto-hashable** ([§3.6](#sec-derived-type-properties), the [§9.2](#sec-body-records) property) when every payload field of every case is a [§9.2](#sec-body-records) admissible component type, with one addition to the recursive rule: another auto-hashable choice is admissible. The generated `=` is true exactly when both operands have the same active case and every corresponding payload compares equal by its type's `=`; the generated `GetHashCode` combines the case discriminant with the per-payload hashes (order-sensitive, [§8.3](#sec-equals-and-gethashcode)); the generated `ToString` produces `"TypeName.CaseName(field1: value1, …)"`, and `"TypeName.CaseName"` for a payload-free case. Methods, computed properties, statics, and non-equality operators neither qualify nor disqualify, per §9.2's membership list. A payload field marked **`equality skip`** ([§9.2](#sec-equality-skip); grammar A.3 `CaseField`) is excluded from its case's payload comparison and hash, and an inadmissible payload so marked does not force the use-site error — the same rule, the same reuse. The clause is not admitted on a choice *case* (the case is the discriminant — skipping it is incoherent; a compile error, [§9.2](#sec-equality-skip)).
 
 A choice that is **not** auto-hashable — any borrow-bearing or owning choice (class-typed payloads are outside the admissible-component rule, exactly as class-typed record fields are), and any value-like choice with an inadmissible payload — draws [§9.2](#sec-body-records)'s **use-site compile error** on `=`, `<>`, and direct `Equals`/`GetHashCode` calls, unless the author declares the operators under [§25.2](#sec-operator-overloading-restrictions)'s co-declaration rule. Declaring the choice is fine; comparing it is the error, with the same remedies §9.2 names. *(This follows the record precedent, not [§15.3](#sec-move-only-value-types)'s inline-array borrowing-equality precedent: reference equality smuggled inside a value type's `=` is virtually never the intended semantics — rationale [§9.6](Bezel_Design_Rationale.md#sec-choices-why-a-new-kind).)*
 
@@ -10110,6 +10139,13 @@ Whitespace and comments are recognized by the lexer and may appear between any t
 
 ```
 Identifier      ::= IdentStart IdentCont*
+                              /* The bare single-character `_` is NOT an
+                                 Identifier: it is lexed as its own reserved
+                                 token — the discard (§1.3, §17.13, B.1) — and
+                                 no Identifier production ever matches it.
+                                 Identifiers may begin with or contain `_`
+                                 (`_camelCase`, `_f`, `snake_case`); only the
+                                 bare token is reserved. */
 IdentStart      ::= Letter | "_"
 IdentCont       ::= IdentStart | Digit
 Letter          ::= /any Unicode letter/
@@ -10227,7 +10263,30 @@ RecordDecl      ::= Visibility? "record" Identifier GenericParams?
                     GenericConstraints*
                     ( ";" | RecordBody )
 PositionalFields ::= "(" PositionalField ("," PositionalField)* ","? ")"
-PositionalField ::= Identifier ":" Type SerializedClause?
+PositionalField ::= Identifier ":" Type SerializedClause? EqualityClause?
+EqualityClause  ::= "equality" "skip"
+                              /* Per-member exclusion from auto-equality
+                                 (§9.2 "The `equality skip` clause"),
+                                 mirroring SerializedClause: the marked
+                                 storage component is removed from the
+                                 §9.2 membership computation and cannot
+                                 disqualify the record. `equality` is
+                                 contextual (B.2), and within the clause
+                                 `skip` is likewise contextual; only the
+                                 skip form exists (no rename, no optional).
+                                 Attached at PositionalField, the
+                                 auto-property alternative of PropertyDecl
+                                 (A.4), FieldDecl (A.4), and CaseField —
+                                 in the fixed order SerializedClause?
+                                 EqualityClause? where both slots exist
+                                 (an arbitrary but stated order, keeping
+                                 the grammar LL; each clause at most once).
+                                 NOT on EnumConstant (an enum value is not
+                                 a component) and NOT on ChoiceCase (the
+                                 case is the discriminant); on computed
+                                 properties, methods, and statics the
+                                 clause is a compile error (§9.2's
+                                 inert-annotation rule). */
 SerializedClause ::= "serialized" ( "skip" | SerializedName )
 SerializedName   ::= StringLiteral? "optional"?   /* at least one of the two
                                                      must be present */
@@ -10273,7 +10332,7 @@ ChoiceCase      ::= Identifier CasePayload? SerializedClause?
                                  form only; `skip` and `optional` are rejected
                                  semantically, as on enum constants (§9.8). */
 CasePayload     ::= "(" CaseField ("," CaseField)* ","? ")"
-CaseField       ::= "owned"? Identifier ":" Type SerializedClause?
+CaseField       ::= "owned"? Identifier ":" Type SerializedClause? EqualityClause?
                               /* The payload field form is PositionalField plus
                                  the optional leading `owned` marker; the
                                  marker's admissibility follows §28.1's type
@@ -10369,11 +10428,21 @@ IfaceIndexer    ::= "pure"? "readonly"? "property" "[" ParamList "]" ":" Type
                                  Accessor uses the `;`-terminated AccessorBody (no
                                  implementation), enforced semantically. See §23.3. */
 FieldDecl       ::= Visibility "static"? ("owned" | "scoped")? "readonly"?
-                    Identifier ":" Type (":=" Expression)? ";"
+                    EqualityClause? Identifier ":" Type (":=" Expression)? ";"
                               /* "scoped" fields (§28.14) hold storage-
                                  bounded callbacks: function-typed only,
                                  invocable/overwritable/clearable, never read
                                  out as an escaping value. */
+                              /* EqualityClause here is the point of §9.2's
+                                 clause: an explicit field is §9.2's
+                                 disqualifier, and the clause is what
+                                 un-disqualifies it (record bodies; on a
+                                 class field, and on a static field
+                                 anywhere, it is rejected semantically —
+                                 §9.2). SerializedClause never appears on
+                                 FieldDecl: explicit fields are not
+                                 serialized components of a record
+                                 (§9.8). */
 ConstDecl       ::= Visibility "static"? "const" Identifier (":" Type)?
                     ":=" ConstExpr ";"
 
@@ -10424,7 +10493,9 @@ PropertyDecl    ::= Visibility "static"? "pure"? VirtualKind?
                     "readonly"? "property" Identifier ":" Type
                     PropertyBody
 PropertyBody    ::= "=>" Expression ";"
-                  | AutoAccessorVis? (":=" Expression)? SerializedClause? ";"   /* auto-property */
+                  | AutoAccessorVis? (":=" Expression)? SerializedClause? EqualityClause? ";"   /* auto-property */
+                              /* the two clauses in the fixed order shown,
+                                 each at most once (A.3 EqualityClause). */
                   | Accessor* "end" Identifier? ";"
 AutoAccessorVis ::= Visibility ("get" | "set")   /* e.g. `private set` */
 Accessor        ::= Visibility? "pure"? "get" AccessorBody
@@ -10516,6 +10587,13 @@ NestedTypeDecl  ::= ClassDecl | InterfaceDecl | RecordDecl | EnumDecl
 ParamList       ::= Param ("," Param)* ","?
 Param           ::= ParamModifiers? Identifier ":" Type (":=" Expression)?
                     OutNullPostcond?
+                              /* A method/constructor parameter cannot be named
+                                 `_` — the bare token is not an Identifier
+                                 (A.1), and the rejection diagnostic says why:
+                                 parameter names are call-site-addressable API
+                                 surface (§22.5, §2.8.2); choose a name
+                                 (§17.13). Lambda parameters differ: LambdaParam
+                                 (A.7) admits the bare-`_` ignore. */
                               /* `owned` precedes the identifier in every
                                  named-declaration position — Param, LambdaParam
                                  (via FuncParamMods, A.7), FieldDecl,
@@ -10575,14 +10653,15 @@ ArgModifiers    ::= "ref"
                                  producers rejected (§9.7). */
 ArgExpression   ::= Expression | "_"
                               /* The "_" alternative is admitted by the grammar
-                                 in any argument position; it is semantically
-                                 valid only when the corresponding parameter
-                                 is `out` and the caller chooses to ignore the
-                                 produced value (§22.4). The compiler rejects
-                                 the discard "_" in non-out positions —
-                                 including after `ref`, where the token
-                                 instead reads as an ordinary identifier that
-                                 must resolve (§17.13). */
+                                 in any argument position and is the ONLY
+                                 reading of `_` there — no Expression contains
+                                 the bare token (A.1). It is semantically valid
+                                 only when the corresponding parameter is `out`
+                                 and the caller chooses to ignore the produced
+                                 value (§22.4); in every non-out position —
+                                 `ref _` included — it is a compile error
+                                 (§17.13: a `ref` argument reads its operand,
+                                 which a discard cannot supply). */
 
 EnumMember      ::= MethodDecl | ExpressionPropertyDecl
                   | StaticReadonlyDecl | StaticConstDecl
@@ -10726,8 +10805,17 @@ WhenStmt        ::= "when" WhenArm ("," WhenArm)* ","? "end" "when"? ";"
                                  §35.5's, identical to the atom's. */
 
 LocalDecl       ::= "var" Identifier (":" Type)? (":=" Expression)? ";"
-                  | "using" "var" Identifier (":" Type)? ":=" Expression ";"
-                  | "await" "using" "var" Identifier (":" Type)? ":=" Expression ";"
+                  | "using" "var" (Identifier | "_") (":" Type)? ":=" Expression ";"
+                  | "await" "using" "var" (Identifier | "_") (":" Type)? ":=" Expression ";"
+                              /* `var _ := e;` does not parse as a LocalDecl —
+                                 `_` is not an Identifier (A.1) — and is
+                                 rejected with the two-remedy diagnostic:
+                                 `_ := e;` (end of statement) or
+                                 `using var _ := e;` (scope end) — §17.13,
+                                 §21.1. The `"_"` alternative on the using-var
+                                 forms is the anonymous owning binding
+                                 (§17.13, §28.10): scope-end disposal, no name
+                                 bound. */
                               /* The `await using var` form is admitted by the
                                  grammar at any LocalDecl position; it is
                                  valid only inside `async` methods and `async`
@@ -10805,10 +10893,16 @@ LoopLabel       ::= Identifier ":"
 WhileStmt       ::= LoopLabel? "while" Expression "do" Statement*
                     "end" ("while" | Identifier)? ";"
 
-ForStmt         ::= LoopLabel? "for" "var" Identifier (":" Type)? "in" Expression
+ForStmt         ::= LoopLabel? "for" "var" (Identifier | "_") (":" Type)? "in" Expression
                     "do" Statement* "end" ("for" | Identifier)? ";"
-                  | LoopLabel? "await" "for" "var" Identifier (":" Type)? "in" Expression
+                  | LoopLabel? "await" "for" "var" (Identifier | "_") (":" Type)? "in" Expression
                     ("with" Expression)? "do" Statement* "end" ("for" | Identifier)? ";"
+                              /* The `"_"` alternative is the loop-variable
+                                 ignore (§21.4, §17.13): binds nothing. The
+                                 grammar over-admits the ascription on it;
+                                 `for var _: T in …` is rejected semantically —
+                                 a bare ignore takes its type from context,
+                                 never an annotation (§17.13). */
 
 DoEndBlock      ::= "do" Statement* "end" "do"? ";"
 
@@ -11018,7 +11112,15 @@ LambdaExpr      ::= "async"? "lambda" "(" LambdaParams? ")"
                                  deterministically before the arrow. */
 LambdaParams    ::= LambdaParam ("," LambdaParam)* ","?
 LambdaParam     ::= FuncParamMods? Identifier (":" Type)?
+                  | "_"
                   | LambdaDestructure
+                              /* The bare `"_"` alternative is the parameter
+                                 ignore (§27.3, §17.13): accepted, binds
+                                 nothing, contributes its slot to the function
+                                 type; duplicate `_` parameters are legal
+                                 (nothing is named). No FuncParamMods and no
+                                 annotation compose with it — a typed ignore
+                                 slot is spelled by the target type (§27.4). */
 LambdaDestructure ::= QualifiedName "(" LambdaSlot ("," LambdaSlot)* ","? ")"
 LambdaSlot      ::= Identifier | "_" | LambdaDestructure
                               /* Positional-record destructuring in parameter
@@ -11243,7 +11345,7 @@ Constant        ::= "-"? (IntLiteral | FloatLiteral)
 <a id="sec-reserved-keywords"></a>
 ### B.1 Reserved keywords
 
-The following identifiers are keywords. Most are reserved unconditionally and may not be used as user-defined names. The **contextual keywords** (`convention`, `ensures`, `env`, `get`, `hashable`, `invariant`, `notnull`, `of`, `old`, `operator`, `polymorphic`, `pure`, `requires`, `result`, `scoped`, `sendable`, `serialized`, `set`, `step`, `symbol`, `value`, `variadic`) have keyword meaning only in specific syntactic positions and may be used as identifiers elsewhere; see [§B.2](#sec-contextual-keywords).
+The following identifiers are keywords. Most are reserved unconditionally and may not be used as user-defined names. The **contextual keywords** (`convention`, `ensures`, `env`, `equality`, `get`, `hashable`, `invariant`, `notnull`, `of`, `old`, `operator`, `polymorphic`, `pure`, `requires`, `result`, `scoped`, `sendable`, `serialized`, `set`, `step`, `symbol`, `value`, `variadic`) have keyword meaning only in specific syntactic positions and may be used as identifiers elsewhere; see [§B.2](#sec-contextual-keywords).
 
 **Unconditionally reserved:**
 
@@ -11251,9 +11353,11 @@ The following identifiers are keywords. Most are reserved unconditionally and ma
 
 **Contextual (see [§B.2](#sec-contextual-keywords)):**
 
-`convention`, `ensures`, `env`, `get`, `hashable`, `invariant`, `notnull`, `of`, `old`, `operator`, `polymorphic`, `pure`, `requires`, `result`, `scoped`, `sendable`, `serialized`, `set`, `step`, `symbol`, `value`, `variadic`.
+`convention`, `ensures`, `env`, `equality`, `get`, `hashable`, `invariant`, `notnull`, `of`, `old`, `operator`, `polymorphic`, `pure`, `requires`, `result`, `scoped`, `sendable`, `serialized`, `set`, `step`, `symbol`, `value`, `variadic`.
 
 All keywords are lowercase. Type identifiers in PascalCase (`Object`, `Array`, `Type`, `Exception`, `IDisposable`, `Task`, etc.) are not keywords; they are names defined by the standard library or by compiler intrinsics.
+
+**The reserved token `_`.** The bare underscore is reserved as a **token**, not as a keyword in the word sense: it is held out of the identifier namespace like a punctuation symbol — the discard/wildcard of [§17.13](#sec-the-discard-_) — and can never be declared or read as a name ([§1.3](#sec-identifiers)). Identifiers merely containing underscores are unaffected. (Holding a token out of the identifier namespace so a form stays re-introducible or unambiguous is [§B.3](#sec-future-reservations)'s existing discipline; `_` is that discipline applied permanently.)
 
 <a id="sec-contextual-keywords"></a>
 ### B.2 Contextual keywords
@@ -11269,6 +11373,7 @@ The following keywords from [§B.1](#sec-reserved-keywords) carry meaning only i
 | `get`, `set` | Property and indexer accessor declarations (block form) and auto-property accessor visibility shorthand | Anywhere else |
 | `operator` | After `static method` in an operator overload declaration | Anywhere else |
 | `serialized` | The `serialized` clause on a positional field, auto-property, or enum constant (field-name customization, [§9.8](#sec-serialization-synthesis)). Within that clause, `skip` and `optional` are likewise contextual and are not reserved | Anywhere else: as an identifier |
+| `equality` | The `equality skip` clause on a positional field, auto-property, explicit record field, or choice payload field (per-member auto-equality exclusion, [§9.2](#sec-equality-skip)). Within that clause, `skip` is likewise contextual and is not reserved — exactly `serialized`'s row | Anywhere else: as an identifier |
 | `polymorphic` | The class-body `polymorphic (…)` registry member (class serialization synthesis, [§9.8](#sec-serialization-synthesis)) | Anywhere else: as an identifier |
 | `of` | The scrutinee/arm delimiter in a `case` expression ([§19](#sec-the-case-construct)) | Anywhere else: as an identifier |
 | `scoped` | The storage-bounded modifier on a function-typed parameter or field, on a class/interface-typed borrow parameter, and its call-site argument marker ([§28.14](#sec-scoped-callback-parameters), [§22.3](#sec-parameter-modifiers)) | Anywhere else: as an identifier |
@@ -11310,6 +11415,7 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 ### C.1 Type system
 
 - Every variable, field, parameter, and return value has a declared or inferred type.
+- The bare token `_` is never a declarable or readable name ([§1.3](#sec-identifiers), [§17.13](#sec-the-discard-_)): a declaration naming `_` — a local (`var _`, `const _`), a method or constructor parameter, a field, property, method, type, module, enum constant, choice case, loop label, or alias — is a compile error, as are `out var _`, `ref _` in argument position, and any expression-position read of `_`. The sanctioned `_` forms are the discard/wildcard positions of [§17.13](#sec-the-discard-_), the anonymous owning binding `using var _`/`await using var _` ([§28.10](#sec-using-var)), and the lambda-parameter and `for var _` ignores ([§27.3](#sec-lambda-expressions), [§21.4](#sec-the-for-statement)); a type ascription or parameter modifier on a bare ignore is likewise rejected (its type comes from context, never an annotation).
 - Implicit conversions occur only as listed in [§5.1](#sec-implicit-conversions).
 - When more than one overload is applicable to a call only because arguments match through different implicit conversions ([§5.1](#sec-implicit-conversions)), the call resolves to the candidate that is unambiguously better — exact on every argument where another candidate converts, and never worse. An exact match is preferred over any implicit conversion; built-in implicit conversions are not ranked against one another. If no candidate is unambiguously better, the call is ambiguous and is a compile error citing the candidates ([§22.6](#sec-implicit-conversion-ranking)); the programmer disambiguates with an explicit cast. This mirrors overloaded method-reference resolution ([§27.6](#sec-method-references-to-overloaded-methods)). A candidate applicable without filling any parameter default is preferred over one that fills defaults ([§22.6](#sec-implicit-conversion-ranking)).
 - Generic-method type arguments are inferred per [§14.5](#sec-type-argument-inference): explicit lists are all-or-nothing; bindings for a type parameter must agree exactly (no common-supertype join); lambdas bind in a second phase; the call's target type only completes parameters the arguments left unbound; a failed inference makes that candidate inapplicable; and an otherwise-tied non-generic candidate beats a generic one — the last comparison before ambiguity, after the defaulted-arity tie-break ([§22.6](#sec-overloading)). Class/record-level type arguments are never inferred from constructor arguments.
@@ -11341,7 +11447,8 @@ This appendix consolidates the invariants the compiler enforces. It is a checkli
 - An `end`-label that is supplied — an identifier for named constructs, or a construct keyword (with operator token where applicable) for keyword-labelled constructs — must match the construct it closes; a mismatch is a compile error. The unlabelled form `end;` is always valid ([§1.6](#sec-statements-and-termination)).
 - A `closed` class may be subclassed only within its declaring module; external subclasses are rejected. The spelling `sealed abstract` is rejected, the diagnostic naming `closed` ([§11.7](#sec-static-classes)).
 - An enum implementing an interface must provide matching public members for every interface member.
-- Calling `.Equals(Object?)`, `.Equals(T)`, or `.GetHashCode()` directly on a non-auto-hashable body record ([§9.2](#sec-body-records)) is a compile error at the call site; the user must declare custom equality or simplify the record to an auto-hashable form. Calls through an `Object`-typed receiver bypass the static-type check and reach the inherited `Object.Equals`/`GetHashCode` at runtime (reference equality / identity-based hash), but this is rare in practice.
+- Calling `.Equals(Object?)`, `.Equals(T)`, or `.GetHashCode()` directly on a non-auto-hashable body record ([§9.2](#sec-body-records)) is a compile error at the call site; the user must declare custom equality, mark the disqualifying member `equality skip` ([§9.2](#sec-equality-skip)), or simplify the record to an auto-hashable form. Calls through an `Object`-typed receiver bypass the static-type check and reach the inherited `Object.Equals`/`GetHashCode` at runtime (reference equality / identity-based hash), but this is rare in practice.
+- A storage component marked `equality skip` ([§9.2](#sec-equality-skip)) is removed from the auto-equality membership computation — excluded from the generated `=`/`<>`, `Equals`, and `GetHashCode`, exempt from the admissible-component requirement, and unable to disqualify its record or choice — while every other role (storage, `with`, `ToString`, serialization participation) is untouched; the generated `=` and `GetHashCode` compute over the same reduced set, so equal values hash equal by construction. The clause on a computed property, method, static member, enum constant, choice case, or class field is a compile error (the [§9.8](#sec-serialization-synthesis) inert-annotation discipline); on a member of a record whose `Equals`/`GetHashCode` override suppresses the package it is meaningful, not an error.
 
 <a id="sec-appendix-c-visibility"></a>
 ### C.2 Visibility

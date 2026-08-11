@@ -1,6 +1,6 @@
 # Bezel Guide 3: Modeling Data
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.242.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.244.*
 
 Bezel gives you five ways to declare a data shape and three ways to select over one. This guide is the picking rule for each. The definitions live in the spec (§9 records, §10 enums, §11 classes, §19 selection, §35 choices), and the *why* behind the design is rationale §9.6. For choosing a **failure signal** (`T?` vs `Try` vs `Result` vs `requires`/exceptions), see Guide 2 §7 — that table is the home; this guide does not repeat it.
 
@@ -40,6 +40,7 @@ Boundary calls that come up in practice:
 
 - **Enum vs choice.** The moment one alternative needs a payload, it is a `choice`. Do not encode payloads beside an enum in parallel fields — the compiler cannot tie them together. A `choice` case carries its payload, and the `case` arms bind it.
 - **Record vs class.** If two instances with the same components should be *the same value* — dictionary keys, messages, coordinates — it is a `record`. If it has a lifecycle (opened, mutated, disposed) or identity matters, it is a `class`. A record cannot hold an owned resource; that is the design, not a limitation (spec §28.5 — copy-semantics holders cannot carry disposal obligations).
+- **A cache field on a record.** Mark it `equality skip` — `private equality skip _cachedLen: int;` — and the structural `=`/hash package survives with the cache excluded (spec §9.2); the clause mirrors `serialized skip`. An *unannotated* cache field still makes comparison a loud compile error, never silent reference equality.
 - **Choice vs closed hierarchy.** A `choice` is data-first: a fixed case list, pattern-matched everywhere, no per-case methods. A `closed` hierarchy is behavior-first: each leaf is a class with its own members and can carry owned state, and `case` over the leaves is still exhaustive (§19.6). Reach for the hierarchy when cases have *behavior*; reach for the choice when cases are *shapes of data*.
 - **Choice vs `T?`.** A choice with one meaningful payload and one empty case is what `T?` already provides — use `T?` (the recorded rule; DECLINED.md's `Option<T>` entry).
 
