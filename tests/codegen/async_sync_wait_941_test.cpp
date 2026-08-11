@@ -405,11 +405,11 @@ BEZEL_TEST(async_sync_wait_941, owned_task_second_await_after_fault_raises_ioe_1
         "    using var t := C.FaultProducer(); "
         "    var r: int := 0; "
         "    try "
-        "      var _: int := await t; "      // first await — faults
+        "      _ := await t; "               // first await — faults
         "    catch Exception => r := 1; "    // caught: r=1
         "    end; "
         "    try "
-        "      var _: int := await t; "      // second await — IOE (spent)
+        "      _ := await t; "               // second await — IOE (spent)
         "    catch InvalidOperationException => r := 2; "
         "    end; "
         "    return r; "
@@ -439,7 +439,7 @@ BEZEL_TEST(async_sync_wait_941, owned_task_second_await_after_success_raises_ioe
         "    catch Exception => r := 0; "
         "    end; "
         "    try "
-        "      var _: int := await t; "      // second await — IOE (spent)
+        "      _ := await t; "               // second await — IOE (spent)
         "    catch InvalidOperationException => r := 2; "
         "    end; "
         "    return r; "

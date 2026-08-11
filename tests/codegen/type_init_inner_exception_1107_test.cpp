@@ -36,7 +36,7 @@ BEZEL_TEST(type_init_inner_exception_1107, inner_is_not_null) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kFailingInit +
         "class C public static method Main(): int "
-        "  try var _ := FS._v; "
+        "  try _ := FS._v; "
         "  catch var ex: TypeInitializationException => do "
         "    if ex.InnerException is not null then return 55; else return 1; end; "
         "  end end; "
@@ -50,7 +50,7 @@ BEZEL_TEST(type_init_inner_exception_1107, inner_is_derived_type) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kFailingInit +
         "class C public static method Main(): int "
-        "  try var _ := FS._v; "
+        "  try _ := FS._v; "
         "  catch var ex: TypeInitializationException => do "
         "    if ex.InnerException is ArgumentException then return 55; else return 1; end; "
         "  end end; "
@@ -79,7 +79,7 @@ BEZEL_TEST(type_init_inner_exception_1107, inner_as_cast_and_message) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kFailingInit +
         "class C public static method Main(): int "
-        "  try var _ := FS._v; "
+        "  try _ := FS._v; "
         "  catch var ex: TypeInitializationException => do "
         "    var inner: Exception? := ex.InnerException; "
         "    if inner <> null then "
@@ -101,7 +101,7 @@ BEZEL_TEST(type_init_inner_exception_1107, inner_message_direct_chain_1266) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") + kFailingInit +
         "class C public static method Main(): int "
-        "  try var _ := FS._v; "
+        "  try _ := FS._v; "
         "  catch var ex: TypeInitializationException => do "
         "    return ex.InnerException!.Message.Length; "  // 9 (was 0)
         "  end end; "

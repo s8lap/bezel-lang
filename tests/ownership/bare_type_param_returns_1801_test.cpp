@@ -80,7 +80,7 @@ BEZEL_TEST(bare_type_param_returns,
         "    var a := new C(); "
         "    var b := new C(); "
         "    var m := Util.Pick(a, b); "
-        "    var _ := Util.Sink(owned a); "  // consume `a` while `m` live
+        "    _ := Util.Sink(owned a); "  // consume `a` while `m` live
         "    var p := m.Poke(); "            // `m`'s surviving use
         "    b.Dispose(); "
         "    return p; "
@@ -117,7 +117,7 @@ BEZEL_TEST(bare_type_param_returns,
         "    var b := new C(); "
         "    var m := Util.Pick(a, b); "
         "    var p := m.Poke(); "            // `m`'s last use, before the consume
-        "    var _ := Util.Sink(owned a); "  // now safe — `m` is dead
+        "    _ := Util.Sink(owned a); "  // now safe — `m` is dead
         "    b.Dispose(); "
         "    return p; "
         "  end Main; "
@@ -179,7 +179,7 @@ BEZEL_TEST(bare_type_param_returns,
         "    var a := new C(); "
         "    var b := new C(); "
         "    var m := Box<C>.GetIt(a, b); "
-        "    var _ := Box<C>.Sink(owned a); "
+        "    _ := Box<C>.Sink(owned a); "
         "    var p := m.Poke(); "
         "    b.Dispose(); "
         "    return p; "
@@ -217,7 +217,7 @@ BEZEL_TEST(bare_type_param_returns,
         "    var a := new C(); "
         "    var b := new C(); "
         "    var m := recv.Choose(a, b); "
-        "    var _ := Util.Sink(owned recv); "  // consume the receiver
+        "    _ := Util.Sink(owned recv); "  // consume the receiver
         "    var p := m.Poke(); "
         "    a.Dispose(); b.Dispose(); "
         "    return p; "

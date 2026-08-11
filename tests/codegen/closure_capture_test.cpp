@@ -34,7 +34,7 @@ BEZEL_TEST(codegen_closures_27_5, mutation_inside_visible_outside) {
         "  public static method Main(): int "
         "    var x := 0; "
         "    var setX := lambda() => do x := 5; return x; end; "
-        "    var _ := setX(); "
+        "    _ := setX(); "
         "    return x; "          // sees the lambda's write through the shared cell
         "  end Main; "
         "end C;"), 5);
@@ -66,7 +66,7 @@ BEZEL_TEST(codegen_closures_27_5, counter_observed_from_outside) {
         "  public static method Main(): int "
         "    var count := 0; "
         "    var inc := lambda() => do count := count + 1; return count; end; "
-        "    var _ := inc(); "
+        "    _ := inc(); "
         "    var __ := inc(); "
         "    return count; "      // both increments hit the shared cell
         "  end Main; "
@@ -102,7 +102,7 @@ BEZEL_TEST(codegen_closures_27_5, two_lambdas_share_one_variable) {
         "    var x := 10; "
         "    var bump := lambda() => do x := x + 2; return x; end; "
         "    var read := lambda() => x; "
-        "    var _ := bump(); "   // x := 12 through the shared cell
+        "    _ := bump(); "   // x := 12 through the shared cell
         "    return read(); "     // the other lambda sees 12
         "  end Main; "
         "end C;"), 12);
@@ -168,7 +168,7 @@ BEZEL_TEST(codegen_closures_27_5, captured_parameter_is_shared) {
         "module M; class C "
         "  public static method Bump(n: int): int "
         "    var f := lambda() => do n := n + 100; return n; end; "
-        "    var _ := f(); "
+        "    _ := f(); "
         "    return n; "          // the param's shared cell now holds n + 100
         "  end Bump; "
         "  public static method Main(): int "
@@ -185,7 +185,7 @@ BEZEL_TEST(codegen_closures_27_5, reference_typed_capture_shared) {
         "  public static method Main(): int "
         "    var s := \"hi\"; "
         "    var setter := lambda() => do s := \"hello\"; return 0; end; "
-        "    var _ := setter(); "
+        "    _ := setter(); "
         "    return s.Length; "   // s now \"hello\" → length 5
         "  end Main; "
         "end C;"), 5);
@@ -330,7 +330,7 @@ BEZEL_TEST(codegen_closures_27_5, ref_param_capture_visible_to_caller_1207) {
         "  end BumpRef; "
         "  public static method Main(): int "
         "    var v := 10; "
-        "    var _ := BumpRef(ref v); "
+        "    _ := BumpRef(ref v); "
         "    return v; "   // caller observes 110 — write went through ref
         "  end Main; "
         "end C;"), 110);

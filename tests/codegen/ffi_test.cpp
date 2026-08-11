@@ -78,7 +78,7 @@ BEZEL_TEST(codegen_cg26, putchar_writes_stdout) {
         "module M; "
         "extern \"c\" public method putchar(c: int): int; end; "
         "class C public static method Main(): int "
-        "  var _ := putchar(72); var _2 := putchar(105); "
+        "  _ := putchar(72); var _2 := putchar(105); "
         "  var _3 := putchar(10); return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_EQ(out, std::string("Hi\n"));
@@ -234,7 +234,7 @@ BEZEL_TEST(codegen_ffi_types, cstring_arg_marshals_to_libc_puts_32_6) {
         "module M; "
         "extern \"c\" public method puts(s: CString): int; end; "
         "class C public static method Main(): int "
-        "  var _ := puts(\"hello-ffi\"); return 0; "
+        "  _ := puts(\"hello-ffi\"); return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_EQ(out, std::string("hello-ffi\n"));
 }
@@ -282,7 +282,7 @@ BEZEL_TEST(codegen_ffi_types, cstring_nonascii_puts_utf8_bytes_32_6) {
         "module M; "
         "extern \"c\" public method puts(s: CString): int; end; "
         "class C public static method Main(): int "
-        "  var _ := puts(\"A\\u0100B\"); return 0; "
+        "  _ := puts(\"A\\u0100B\"); return 0; "
         "end Main; end C;");
     // 0x41 0xC4 0x80 0x42 + '\n'
     std::string expected;
@@ -553,7 +553,7 @@ BEZEL_TEST(codegen_ffi_types, rawbytes_param_two_slot_marshalling_spec_32_5_1720
         "  var b: Array<byte> := "
         "    [72, 101, 108, 108, 111, 44, 32, 87, 111, 114, 108, 100, 33]; "
         "  using var rb := RawBytes.From(b); "
-        "  var _ := write(1, rb, 5); "
+        "  _ := write(1, rb, 5); "
         "  return 0; "
         "end Main; end C;"), std::string("Hello, World!"));
 }

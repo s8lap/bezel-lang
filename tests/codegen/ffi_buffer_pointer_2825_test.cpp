@@ -286,7 +286,7 @@ BEZEL_TEST(codegen_ffi_pointer_2825, cstring_pointer_aliases_buffer_spec_32_10) 
         "class C "
         "  public static method Main(): int "
         "    using var c := CString.From(\"abc\"); "
-        "    var _ := memset(c.Pointer, 88, 1); "
+        "    _ := memset(c.Pointer, 88, 1); "
         "    var s := string.From(c); "
         "    if s = \"Xbc\" then return 42; end; "
         "    return 1; "

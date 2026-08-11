@@ -307,7 +307,7 @@ const char* kCapturedOwnedDisposedOnce =
     "    do "
     "      using var r := new R(); "
     "      var f: () -> int := lambda() => r.Tag(); "
-    "      var _ := f(); "
+    "      _ := f(); "
     "    end; "
     "    return _n; "                 // exactly one disposal → 1
     "  end Main; "
@@ -333,7 +333,7 @@ const char* kCapturedOwnedLoopDisposedOnce =
     "      do "
     "        using var r := new R(); "
     "        var f: () -> int := lambda() => r.Tag(); "
-    "        var _ := f(); "
+    "        _ := f(); "
     "      end; "
     "      i := i + 1; "
     "    end; "

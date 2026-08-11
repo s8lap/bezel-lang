@@ -303,7 +303,7 @@ BEZEL_TEST(owned_coll_acc_654a, owned_queue_peek_does_not_remove_count_unchanged
         "    using var oq := new Queue<int>(); "
         "    oq.Enqueue(10); oq.Enqueue(20); "
         "    var before := oq.Count; "
-        "    var _ := oq.Peek(); "
+        "    _ := oq.Peek(); "
         "    var after := oq.Count; "
         "    return before * 10 + after; " // 2*10+2 = 22
         "  end Main; end C;"), 22);

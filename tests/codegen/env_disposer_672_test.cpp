@@ -261,7 +261,7 @@ const char* kNullEnvdtorDoesNotDisposeCapture =
     "    do "
     "      using var r := new R(); "
     "      var f: () -> int := lambda() => r.Tag(); "
-    "      var _ := f(); "
+    "      _ := f(); "
     "    end; "
     "    return _n; "   // must be exactly 1
     "  end Main; "
@@ -282,7 +282,7 @@ const char* kNullEnvdtorLoopDoesNotDoubleDispose =
     "      do "
     "        using var r := new R(); "
     "        var f: () -> int := lambda() => r.Tag(); "
-    "        var _ := f(); "
+    "        _ := f(); "
     "      end; "
     "      i := i + 1; "
     "    end; "

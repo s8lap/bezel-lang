@@ -110,7 +110,7 @@ BEZEL_TEST(codegen_cg9, method_combines_field_and_param) {
         "    _sum := _sum + a; _sum := _sum + b; return _sum; "
         "  end AddAll; end Acc; "
         "class C public static method Main(): int "
-        "  var x := new Acc(); var _ := x.AddAll(10, 20); "
+        "  var x := new Acc(); _ := x.AddAll(10, 20); "
         "  return x.AddAll(5, 7); "
         "end Main; end C;"), 42);
 }

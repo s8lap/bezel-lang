@@ -248,7 +248,7 @@ const char* kBorrowArgReadsFieldThenThrow =
     "    throw new AppErr(); "
     "  end Test; "
     "  public static method Main(): int "
-    "    try var _ := C.Test(new Cell()); "
+    "    try _ := C.Test(new Cell()); "
     "    catch AppErr => return Cell.n; "
     "    end; "
     "    return -1; "

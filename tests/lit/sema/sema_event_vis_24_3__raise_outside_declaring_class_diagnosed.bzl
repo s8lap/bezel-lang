@@ -7,7 +7,7 @@
 // the static type of the event member outside the declaring class is the
 // interface, which has no Raise method."
 
-module M; record Ev(N: int); class Button public event Clicked: Ev; public method Inside() var _ := this; end Inside; end Button; class Other public method Outside(b: Button) b.Clicked.Raise(new Ev(1)); end Outside; end Other;
+module M; record Ev(N: int); class Button public event Clicked: Ev; public method Inside() _ := this; end Inside; end Button; class Other public method Outside(b: Button) b.Clicked.Raise(new Ev(1)); end Outside; end Other;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: event `Clicked` is accessed from outside its declaring class `Button`, where its static type is the subscribe-only interface `IEvent<T>` — `.Raise` is not available; only `.Subscribe` may be used here
 // CHECK-SAME: (§24.3)

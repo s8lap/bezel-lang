@@ -188,7 +188,7 @@ BEZEL_TEST(destructor_supersede_during_unwind_2358,
         "    var first: int := 0; "
         "    try "
         "      using var r := new ResThrows(); "
-        "      var _ := FS._v; "
+        "      _ := FS._v; "
         "      return 1; "
         "    catch var ex: TypeInitializationException => do first := 20; end, "
         "      var ex: DisposalFault => do first := 30; end "
@@ -197,7 +197,7 @@ BEZEL_TEST(destructor_supersede_during_unwind_2358,
         // TypeInitializationException with a live InnerException — proving
         // the cached inner survived the first TIE's supersede-dispose above.
         "    try "
-        "      var _ := FS._v; "
+        "      _ := FS._v; "
         "      return 1; "
         "    catch var ex: TypeInitializationException => do "
         // Native process exit codes are 8-bit (WEXITSTATUS), so encode the

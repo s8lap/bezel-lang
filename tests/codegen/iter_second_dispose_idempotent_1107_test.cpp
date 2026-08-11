@@ -193,7 +193,7 @@ class Main
   public static method Main(): int
     var e := C.Gen();
     if e.MoveNext() then
-      var _ := e.Current;
+      _ := e.Current;
     end;
     e.Dispose();
     e.Dispose();
@@ -279,7 +279,7 @@ class Test
   public static method Main(): int
     var e := Gen();
     while e.MoveNext() do
-      var _ := e.Current;
+      _ := e.Current;
     end;
     e.Dispose();
     return 0;
@@ -316,7 +316,7 @@ class Test
   public static method Main(): int
     var e := Gen(new R());
     while e.MoveNext() do
-      var _ := e.Current;
+      _ := e.Current;
     end;
     e.Dispose();
     return R._n;

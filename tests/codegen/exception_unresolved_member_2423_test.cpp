@@ -318,7 +318,7 @@ BEZEL_TEST(codegen_exception_unresolved_member_2423,
         "  end Throw; "
         "end FS; "
         "class C public static method Main(): int "
-        "  try var _ := FS._v; "
+        "  try _ := FS._v; "
         "  catch var ex: TypeInitializationException => do "
         "    if ex.InnerException is not null then return 55; else return 1; "
         "    end; "

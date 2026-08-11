@@ -5,7 +5,7 @@
 //
 // §6.2: float + decimal → rejected (float and decimal don't implicitly convert).
 
-module M; class C public static method M(a: float, b: decimal): int var _ := a + b; return 0; end M; end C;
+module M; class C public static method M(a: float, b: decimal): int _ := a + b; return 0; end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: operator `+` has no implicit conversion between operand types `float` and `decimal`
 // CHECK-SAME: (§6.2)

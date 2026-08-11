@@ -124,7 +124,7 @@ BEZEL_TEST(codegen_decimal_2273, parse_fraction_cannot_absorb_dropped_digit_rais
     BEZEL_EXPECT_EQ(run(prog(
         "var r := 0; "
         "try "
-        "  var _ := Decimal.Parse(\"99999999999999999999999999999.9\"); "
+        "  _ := Decimal.Parse(\"99999999999999999999999999999.9\"); "
         "catch OverflowException => r := 1; "
         "end; "
         "return r; ")), 1);
@@ -189,7 +189,7 @@ BEZEL_TEST(codegen_decimal_2273, parse_exponent_form_rejected_spec_9_3) {
     BEZEL_EXPECT_EQ(run(prog(
         "var r := 0; "
         "try "
-        "  var _ := Decimal.Parse(\"1.5e2\"); "
+        "  _ := Decimal.Parse(\"1.5e2\"); "
         "catch FormatException => r := 1; "
         "catch OverflowException => r := 2; "
         "end; "
@@ -202,7 +202,7 @@ BEZEL_TEST(codegen_decimal_2273, parse_compensating_exponent_rejected_spec_9_3) 
     BEZEL_EXPECT_EQ(run(prog(
         "var r := 0; "
         "try "
-        "  var _ := Decimal.Parse(\"1000000000000000000000000000000e-3\"); "
+        "  _ := Decimal.Parse(\"1000000000000000000000000000000e-3\"); "
         "catch FormatException => r := 1; "
         "catch OverflowException => r := 2; "
         "end; "
@@ -245,7 +245,7 @@ BEZEL_TEST(codegen_decimal_2273, parse_second_decimal_point_rejected_spec_9_3) {
     BEZEL_EXPECT_EQ(run(prog(
         "var r := 0; "
         "try "
-        "  var _ := Decimal.Parse(\"1.2.3\"); "
+        "  _ := Decimal.Parse(\"1.2.3\"); "
         "catch FormatException => r := 1; "
         "end; "
         "return r; ")), 1);

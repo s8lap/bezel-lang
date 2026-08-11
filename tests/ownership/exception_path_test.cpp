@@ -116,7 +116,7 @@ BEZEL_TEST(own_exc, nested_block_moved_local_not_auto_dropped_1257) {
         "class C "
         "  public static method Take(owned x: R): int return 0; end Take; "
         "  public static method Main(): int "
-        "    do var r := new R(); var _ := Take(move r); end; "
+        "    do var r := new R(); _ := Take(move r); end; "
         "    return 0; "
         "  end Main; "
         "end C;");

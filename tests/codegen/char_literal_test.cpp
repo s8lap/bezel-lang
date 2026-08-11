@@ -70,7 +70,7 @@ BEZEL_TEST(codegen_cg32, char_passed_to_putchar) {
         "module M; "
         "extern \"c\" public method putchar(c: int): int; end; "
         "class C public static method Main(): int "
-        "  var _ := putchar('H'); var _2 := putchar('i'); "
+        "  _ := putchar('H'); var _2 := putchar('i'); "
         "  var _3 := putchar('\\n'); return 0; "
         "end Main; end C;");
     BEZEL_EXPECT_EQ(out, std::string("Hi\n"));

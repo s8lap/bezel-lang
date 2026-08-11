@@ -11,7 +11,7 @@
 // RUN: %bezelc -c -o %t.o %s
 // RUN: %bezelc -c %s 2>&1 | FileCheck --check-prefix=NODIAG --allow-empty %s
 
-module M; import System.Threading; class C public static async method Test(): Task using var ch := new Channel<int>(); var _ := await ch.Receive(); end Test; end C;
+module M; import System.Threading; class C public static async method Test(): Task using var ch := new Channel<int>(); _ := await ch.Receive(); end Test; end C;
 
 // NODIAG-NOT: error
 // NODIAG-NOT: §

@@ -7,7 +7,7 @@
 // error still applies; this pre-existed in mixed_numeric_test — confirm
 // the incompatibility check is preserved even after decimal is implemented.
 
-module M; class C public static method M(a: double, b: decimal): int var _ := a + b; return 0; end M; end C;
+module M; class C public static method M(a: double, b: decimal): int _ := a + b; return 0; end M; end C;
 
 // CHECK: :{{[0-9]+}}:{{[0-9]+}}: operator `+` has no implicit conversion between operand types `double` and `decimal`
 // CHECK-SAME: (§6.2)

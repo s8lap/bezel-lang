@@ -63,7 +63,7 @@ BEZEL_TEST(codegen_decimal_1829, parse_40_digit_integer_raises_overflow_spec_4_4
     BEZEL_EXPECT_EQ(run(prog(
         "var r := 0; "
         "try "
-        "  var _ := Decimal.Parse(\"1234567890123456789012345678901234567890\"); "
+        "  _ := Decimal.Parse(\"1234567890123456789012345678901234567890\"); "
         "catch OverflowException => r := 1; "
         "end; "
         "return r; ")), 1);
@@ -77,7 +77,7 @@ BEZEL_TEST(codegen_decimal_1829, parse_maxvalue_plus_one_raises_overflow_spec_4_
     BEZEL_EXPECT_EQ(run(prog(
         "var r := 0; "
         "try "
-        "  var _ := Decimal.Parse(\"79228162514264337593543950336\"); "
+        "  _ := Decimal.Parse(\"79228162514264337593543950336\"); "
         "catch OverflowException => r := 1; "
         "end; "
         "return r; ")), 1);
@@ -90,7 +90,7 @@ BEZEL_TEST(codegen_decimal_1829, parse_30_digit_integer_raises_overflow_spec_4_4
     BEZEL_EXPECT_EQ(run(prog(
         "var r := 0; "
         "try "
-        "  var _ := Decimal.Parse(\"123456789012345678901234567890\"); "
+        "  _ := Decimal.Parse(\"123456789012345678901234567890\"); "
         "catch OverflowException => r := 1; "
         "end; "
         "return r; ")), 1);

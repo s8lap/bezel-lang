@@ -734,8 +734,9 @@ BEZEL_TEST(undisposed_leak, discard_inline_owned_partial_null_slots_1016) {
 }
 
 // §25 / §28.3 (#965): a user-defined BINARY operator overload declared with an
-// `owned` return produces a FRESH owned value. Bound to a plain `var` (or
-// discarded via `var _ :=`), that operator result is an owned producer that
+// `owned` return produces a FRESH owned value. Bound to a plain `var` (whether
+// or not the binding is ever read), that operator result is an owned producer
+// that
 // auto-drops at scope end (§28.3 affine auto-drop) — disposed exactly once. Before
 // the producerState fix the operator result classified Borrowed → no auto-drop →
 // the result leaked. Cell.n returns to 0; ASan confirms no leak / no double-free.
@@ -749,13 +750,18 @@ const char* kOpCell =
     "end Cell; ";
 }  // namespace
 
-// `var _ := a + b` — the #965 part-2 repro. The owned operator result is
-// auto-dropped (discharged) at scope end; Cell.n returns to 0.
+// `var d := a + b` with `d` never read — the #965 part-2 repro. The owned
+// operator result is auto-dropped (discharged) at scope end; Cell.n returns
+// to 0. (Spelled `var _ := a + b` until v0.244: `_` is now the reserved
+// discard token and is never declarable, §1.3/§17.13, so the never-read
+// binding gets an ordinary name. The spelling matters — the discard
+// `_ := a + b;` would dispose at end of STATEMENT as an unbound owned
+// temporary, which is the sibling of this path, not this path.)
 BEZEL_TEST(undisposed_leak, operator_owned_result_discard_auto_dropped_965) {
     std::string src = std::string("module M; ") + kOpCell +
         "class C public static method Main(): int "
         "  do using var a := new Cell(1); using var b := new Cell(2); "
-        "     var _ := a + b; end; "       // owned operator result auto-dropped
+        "     var d := a + b; end; "   // owned operator result auto-dropped
         "  return Cell.n; "                 // 0 — disposed exactly once
         "end Main; end C;";
     BEZEL_EXPECT_EQ(runOwn(src), 0);

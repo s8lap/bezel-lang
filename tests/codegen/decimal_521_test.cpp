@@ -184,7 +184,7 @@ BEZEL_TEST(codegen_521_divzero, divide_by_zero_raises_exception_spec_4_4_6_4) {
         "try "
         "  var a := 1.0m; "
         "  var b := 0.0m; "
-        "  var _ := a / b; "
+        "  _ := a / b; "
         "catch DivideByZeroException => r := 1; "
         "end; "
         "return r; ")), 1);
@@ -197,7 +197,7 @@ BEZEL_TEST(codegen_521_divzero, mod_by_zero_raises_exception_spec_4_4_6_4) {
         "try "
         "  var a := 5.0m; "
         "  var b := 0.0m; "
-        "  var _ := a mod b; "
+        "  _ := a mod b; "
         "catch DivideByZeroException => r := 1; "
         "end; "
         "return r; ")), 1);
@@ -521,7 +521,7 @@ BEZEL_TEST(codegen_521_overflow, max_plus_one_raises_overflow_spec_6_4) {
         "try "
         "  var big := Decimal.MaxValue; "
         "  var one := Decimal.One; "
-        "  var _ := big + one; "
+        "  _ := big + one; "
         "catch OverflowException => r := 1; "
         "end; "
         "return r; ")), 1);
@@ -534,7 +534,7 @@ BEZEL_TEST(codegen_521_overflow, max_times_two_raises_overflow_spec_6_4) {
         "try "
         "  var big := Decimal.MaxValue; "
         "  var two := 2m; "
-        "  var _ := big * two; "
+        "  _ := big * two; "
         "catch OverflowException => r := 1; "
         "end; "
         "return r; ")), 1);
@@ -549,7 +549,7 @@ BEZEL_TEST(codegen_521_overflow, min_minus_one_raises_overflow_spec_6_4) {
         "try "
         "  var small := Decimal.MinValue; "
         "  var one := Decimal.One; "
-        "  var _ := small - one; "
+        "  _ := small - one; "
         "catch OverflowException => r := 1; "
         "end; "
         "return r; ")), 1);
@@ -570,7 +570,7 @@ BEZEL_TEST(codegen_521_overflow, parse_out_of_range_raises_overflow_spec_6_4_9_3
     BEZEL_EXPECT_EQ(run(prog(
         "var r := 0; "
         "try "
-        "  var _ := Decimal.Parse(\"100000000000000000000000000000\"); "
+        "  _ := Decimal.Parse(\"100000000000000000000000000000\"); "
         "catch OverflowException => r := 1; "
         "end; "
         "return r; ")), 1);
@@ -582,7 +582,7 @@ BEZEL_TEST(codegen_521_overflow, parse_malformed_raises_format_spec_9_3) {
     BEZEL_EXPECT_EQ(run(prog(
         "var r := 0; "
         "try "
-        "  var _ := Decimal.Parse(\"abc\"); "
+        "  _ := Decimal.Parse(\"abc\"); "
         "catch FormatException => r := 1; "
         "end; "
         "return r; ")), 1);
@@ -596,7 +596,7 @@ BEZEL_TEST(codegen_521_overflow, overflow_catchable_execution_continues_spec_6_4
         "var caught := 0; "
         "try "
         "  var big := Decimal.MaxValue; "
-        "  var _ := big + big; "
+        "  _ := big + big; "
         "catch OverflowException => caught := 1; "
         "end; "
         "if caught = 1 then return 42; end; "
@@ -659,7 +659,7 @@ BEZEL_TEST(codegen_521_overflow, aot_max_plus_one_catches_and_returns_42_spec_6_
         "  try "
         "    var big := Decimal.MaxValue; "
         "    var one := Decimal.One; "
-        "    var _ := big + one; "
+        "    _ := big + one; "
         "    return 1; "
         "  catch OverflowException => return 42; "
         "  end; "
@@ -680,7 +680,7 @@ BEZEL_TEST(codegen_521_overflow, keyword_receiver_statics_agree_spec_5) {
         "  var b := decimal.MaxValue; "
         "  if a = b and decimal.One = Decimal.One and decimal.Zero = 0.0m then "
         "    try "
-        "      var _ := decimal.MaxValue + decimal.One; "
+        "      _ := decimal.MaxValue + decimal.One; "
         "      return 2; "
         "    catch OverflowException => return 42; "
         "    end; "

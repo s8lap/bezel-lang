@@ -316,7 +316,7 @@ const char* kClassCaptureBorrow =
     "    do "
     "      using var r := new R(); "
     "      var f: () -> int := lambda() => r.Tag(); "  // borrow capture — no retain/release
-    "      var _ := f(); "                        // invoke
+    "      _ := f(); "                        // invoke
     "    end; "                                   // using-var disposes r exactly once
     "    return _n; "   // must be exactly 1
     "  end Main; "
@@ -335,7 +335,7 @@ const char* kClassCaptureBorrowLoop =
     "      do "
     "        using var r := new R(); "
     "        var f: () -> int := lambda() => r.Tag(); "
-    "        var _ := f(); "
+    "        _ := f(); "
     "      end; "
     "      i := i + 1; "
     "    end; "
