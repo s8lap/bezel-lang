@@ -48,7 +48,7 @@ std::string wrap(const std::string& body) {
     return std::string(
         "module M; "
         "class T destructor end destructor; end T; "
-        "class Error end Error; "
+        "class Error: Exception end Error; "
         "class C "
         "  public method Risky() end Risky; "
         "  public method Done() end Done; "
@@ -62,7 +62,7 @@ std::string wrapParam(const std::string& params, const std::string& body) {
     return std::string(
         "module M; "
         "class T destructor end destructor; end T; "
-        "class Error end Error; "
+        "class Error: Exception end Error; "
         "class C "
         "  public method Risky() end Risky; "
         "  public method Done() end Done; "

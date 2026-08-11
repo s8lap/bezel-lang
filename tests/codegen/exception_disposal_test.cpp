@@ -177,7 +177,7 @@ void expectExitAndLeakFree(const std::string& source, int expectedExitCode) {
 // Per §28.3 it is disposed implicitly during unwinding (count == 1). The leak
 // left _n at 0.
 const char* kPlainLocalUnwind =
-    "module M; class AppError end AppError; "
+    "module M; class AppError: Exception end AppError; "
     "class R "
     "  public static _n: int := 0; "
     "  destructor _n := _n + 1; end destructor; "
@@ -200,7 +200,7 @@ BEZEL_TEST(codegen_excdisp_21, plain_owned_local_disposed_on_unwind) {
 // unwind (count == 2). Confirms the plain var joins the existing using-var
 // unwind disposal rather than displacing it.
 const char* kMixedPlainAndUsing =
-    "module M; class AppError end AppError; "
+    "module M; class AppError: Exception end AppError; "
     "class R "
     "  public static _n: int := 0; "
     "  destructor _n := _n + 1; end destructor; "
@@ -228,7 +228,7 @@ BEZEL_TEST(codegen_excdisp_21, plain_and_using_both_disposed_on_unwind) {
 // (discharging the caller). Consume throws before discharging x, so x is live
 // at the unwind out of Consume and is auto-disposed (count == 1).
 const char* kOwnedParamUnwind =
-    "module M; class AppError end AppError; "
+    "module M; class AppError: Exception end AppError; "
     "class R "
     "  public static _n: int := 0; "
     "  destructor _n := _n + 1; end destructor; "
@@ -366,7 +366,7 @@ const char* kCtorThrowAfterAssignCount =
     "  public constructor() end constructor; "
     "  destructor Res.count := Res.count + 1; end destructor; "
     "end Res; "
-    "class Boom end Boom; "
+    "class Boom: Exception end Boom; "
     "class Holder "
     "  private owned _r: Res; "
     "  public constructor() "
@@ -411,7 +411,7 @@ const char* kCtorThrowBeforeAssign =
     "  public constructor() end constructor; "
     "  destructor Res.count := Res.count + 1; end destructor; "
     "end Res; "
-    "class Boom end Boom; "
+    "class Boom: Exception end Boom; "
     "class Holder "
     "  private owned _r: Res?; "
     "  public constructor() "
@@ -451,7 +451,7 @@ const char* kCtorThrowAfterTwoFields =
     "  public constructor() end constructor; "
     "  destructor Res.count := Res.count + 1; end destructor; "
     "end Res; "
-    "class Boom end Boom; "
+    "class Boom: Exception end Boom; "
     "class Holder "
     "  private owned _a: Res; "
     "  private owned _b: Res; "
@@ -534,7 +534,7 @@ const char* kCtorThrowResultDropped =
     "  public constructor() end constructor; "
     "  destructor Res.count := Res.count + 1; end destructor; "
     "end Res; "
-    "class Boom end Boom; "
+    "class Boom: Exception end Boom; "
     "class Holder "
     "  private owned _r: Res; "
     "  public constructor() "
@@ -591,7 +591,7 @@ const char* kCtorThrowAfterNullableAssign =
     "  public constructor() end constructor; "
     "  destructor Res.count := Res.count + 1; end destructor; "
     "end Res; "
-    "class Boom end Boom; "
+    "class Boom: Exception end Boom; "
     "class Holder "
     "  private owned _r: Res?; "
     "  public constructor() "
@@ -653,7 +653,7 @@ const char* kOuterUsingInnerFinallyThrow =
     "  public static _count: int := 0; "
     "  destructor _count := _count + 1; end destructor; "
     "end R; "
-    "class E end E; "
+    "class E: Exception end E; "
     "class C "
     "  public static method Main(): int "
     "    try "
@@ -694,7 +694,7 @@ const char* kInnerFinallyBeforeOuterDispose =
     "class R "
     "  destructor Log._seq := Log._seq * 10 + 2; end destructor; "
     "end R; "
-    "class E end E; "
+    "class E: Exception end E; "
     "class C "
     "  public static method Main(): int "
     "    try "
@@ -766,7 +766,7 @@ const char* kTwoOuterUsingInnerFinallyThrow =
     "class B "
     "  destructor Log._seq := Log._seq * 10 + 2; end destructor; "
     "end B; "
-    "class E end E; "
+    "class E: Exception end E; "
     "class C "
     "  public static method Main(): int "
     "    try "
@@ -805,7 +805,7 @@ const char* kOuterUsingNoInnerFinallyThrow =
     "  public static _count: int := 0; "
     "  destructor _count := _count + 1; end destructor; "
     "end R; "
-    "class E end E; "
+    "class E: Exception end E; "
     "class C "
     "  public static method Main(): int "
     "    try "
@@ -834,7 +834,7 @@ const char* kCrossMethodUsingInnerFinallyThrow =
     "  public static _count: int := 0; "
     "  destructor _count := _count + 1; end destructor; "
     "end R; "
-    "class E end E; "
+    "class E: Exception end E; "
     "class C "
     "  public static method Work(): int "
     "    using var r := new R(); "
@@ -882,8 +882,8 @@ const char* kNestedTryNoFinallyReprop =
     "module M; "
     "class R public static _n: int := 0; "
     "  destructor _n := _n + 1; end destructor; end R; "
-    "class E1 end E1; "
-    "class E2 end E2; "
+    "class E1: Exception end E1; "
+    "class E2: Exception end E2; "
     "class C "
     "  public static method Main(): int "
     "    try "
@@ -915,8 +915,8 @@ const char* kNestedTryTwoOuterLocals =
     "module M; "
     "class R public static _n: int := 0; "
     "  destructor _n := _n + 1; end destructor; end R; "
-    "class E1 end E1; "
-    "class E2 end E2; "
+    "class E1: Exception end E1; "
+    "class E2: Exception end E2; "
     "class C "
     "  public static method Main(): int "
     "    try "
@@ -943,7 +943,7 @@ const char* kNestedTryInnerMatches =
     "module M; "
     "class R public static _n: int := 0; "
     "  destructor _n := _n + 1; end destructor; end R; "
-    "class E1 end E1; "
+    "class E1: Exception end E1; "
     "class C "
     "  public static method Main(): int "
     "    try "
@@ -1342,7 +1342,7 @@ BEZEL_TEST(exception_disposal_865, unreachable_dispose_still_unwind_disposed) {
         "module M; "
         "class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; end R; "
-        "class E end E; "
+        "class E: Exception end E; "
         "class C public static method Main(): int "
         "  try var r := new R(); throw new E(); r.Dispose(); "
         "  catch E => var d := 0; end; "
@@ -1357,7 +1357,7 @@ BEZEL_TEST(exception_disposal_865, conditional_false_dispose_unwind_disposed) {
         "module M; "
         "class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; end R; "
-        "class E end E; "
+        "class E: Exception end E; "
         "class C public static method Main(): int "
         "  var cond := false; "
         "  try var r := new R(); if cond then r.Dispose(); end; throw new E(); "
@@ -1374,7 +1374,7 @@ BEZEL_TEST(exception_disposal_865, conditional_true_dispose_no_double_free) {
         "module M; "
         "class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; end R; "
-        "class E end E; "
+        "class E: Exception end E; "
         "class C public static method Main(): int "
         "  var cond := true; "
         "  try var r := new R(); if cond then r.Dispose(); end; throw new E(); "
@@ -1417,7 +1417,7 @@ BEZEL_TEST(exception_disposal_900, out_owned_recipient_unwind_disposed) {
 // and LSan asserts no double-free.
 BEZEL_TEST(exception_disposal_900, out_owned_dispose_then_throw_no_double_free) {
     expectExitAndLeakFree(
-        std::string("module M; ") + kCellCtorDtor + "class E end E; "
+        std::string("module M; ") + kCellCtorDtor + "class E: Exception end E; "
         "class C public static method Main(): int "
         "  do using var s := new OwningStack<Cell>(); s.Push(new Cell()); "
         "    try do var ok := s.TryPop(out owned var item); "
@@ -1871,7 +1871,7 @@ BEZEL_TEST(codegen_excdisp_1466,
 // right after the if must still find and dispose it via the migrated
 // unwindOnly backstop. Pre-fix: R.count == 0 (leaked). Post-fix: R.count == 1.
 const char* kArr1602PredeclaredOutRecipientThrowAfterIf =
-    "module M; class AppError end AppError; "
+    "module M; class AppError: Exception end AppError; "
     "class R public static count: int := 0; "
     "  destructor R.count := R.count + 1; end destructor; end R; "
     "class C public static method Main(): int "
@@ -1897,7 +1897,7 @@ BEZEL_TEST(codegen_excdisp_1602,
 // condition chain shares the SAME condition scope across every if/elif test,
 // per #1387), covering the issue title's "if/elif's own CONDITION" verbatim.
 const char* kArr1602ElifCondPredeclaredOutRecipientThrowAfterIf =
-    "module M; class AppError end AppError; "
+    "module M; class AppError: Exception end AppError; "
     "class R public static count: int := 0; "
     "  destructor R.count := R.count + 1; end destructor; end R; "
     "class C public static method Main(): int "
@@ -1952,7 +1952,7 @@ BEZEL_TEST(codegen_excdisp_1602,
 // dispose it on that unwind; the discharge branch (shouldThrow=false, run
 // separately in the leak-free-normal-path test above) proves no double-free.
 const char* kArr1602InlineOutOwnedVarThrowBeforeLaterDischarge =
-    "module M; class AppError end AppError; "
+    "module M; class AppError: Exception end AppError; "
     "class R public static count: int := 0; "
     "  destructor R.count := R.count + 1; end destructor; end R; "
     "class C "

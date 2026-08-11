@@ -179,7 +179,7 @@ BEZEL_TEST(catch_borrow_via_ctor, throw_new_with_message_string_arg_clean_31_1) 
     // We need a Wrap variant that takes a string arg; reuse Wrap2-like class.
     auto r = parseAndCheckOwnership(std::string(
         "module M; "
-        "class WrapStr "
+        "class WrapStr: Exception "
         "  private _t: string?; "
         "  public constructor(t: string) "
         "    this._t := t; "

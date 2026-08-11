@@ -58,7 +58,7 @@ int run(const std::string& src) {
 
 // Exception with a static live-count — the standard leak / double-free oracle.
 const char* kExc =
-    "class Exc public static n: int := 0; "
+    "class Exc: Exception public static n: int := 0; "
     "  public constructor() Exc.n := Exc.n + 1; end constructor; "
     "  destructor Exc.n := Exc.n - 1; end destructor; "
     "end Exc; ";

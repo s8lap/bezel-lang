@@ -75,7 +75,7 @@ int compileAndRun(const std::string& source) {
 // now terminate abnormally with the chosen non-zero code.
 BEZEL_TEST(codegen_uncaught_exit, explicit_throw_out_of_main_nonzero) {
     BEZEL_EXPECT_EQ(compileAndRun(
-        "module M; class Boom end Boom; "
+        "module M; class Boom: Exception end Boom; "
         "class C public static method Main(): int "
         "  throw new Boom(); "
         "end Main; end C;"),
@@ -92,7 +92,7 @@ BEZEL_TEST(codegen_uncaught_exit, explicit_throw_out_of_main_nonzero) {
 // throw propagates out of Main as an uncaught exception (non-zero exit).
 BEZEL_TEST(codegen_uncaught_exit, expr_body_method_throw_out_of_main_nonzero) {
     BEZEL_EXPECT_EQ(compileAndRun(
-        "module M; class Boom end Boom; "
+        "module M; class Boom: Exception end Boom; "
         "class C "
         "  public static method Bad(): int => throw new Boom(); "
         "  public static method Main(): int => Bad(); "
@@ -148,7 +148,7 @@ BEZEL_TEST(codegen_uncaught_exit, normal_return_value_becomes_exit_code) {
 // no-handler path: the catch/finally/disposal machinery is untouched.
 BEZEL_TEST(codegen_uncaught_exit, caught_exception_finally_disposal_then_normal_exit) {
     BEZEL_EXPECT_EQ(compileAndRun(
-        "module M; class Boom end Boom; "
+        "module M; class Boom: Exception end Boom; "
         "class R "
         "  public static count: int := 0; "
         "  public constructor() end constructor; "

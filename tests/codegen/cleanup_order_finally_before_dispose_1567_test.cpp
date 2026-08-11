@@ -154,7 +154,7 @@ BEZEL_TEST(codegen_cleanup_order_1567,
            cleanup_order_exception_edge_reverse_regression_spec_28_10) {
     BEZEL_EXPECT_EQ(run(R"(
 module M;
-class E end E;
+class E: Exception end E;
 class C
   public static _seq: int := 0;
   public static method Main(): int

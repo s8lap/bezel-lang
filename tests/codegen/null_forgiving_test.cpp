@@ -13,7 +13,7 @@ namespace {
 
 int run(const std::string& body) {
     auto r = runAot(
-        std::string("module M; class T end T; "
+        std::string("module M; class T: Exception end T; "
                     "class C public static method Main(): int ") +
         body + " end Main; end C;");
     return r.ran ? r.exitCode : -999;

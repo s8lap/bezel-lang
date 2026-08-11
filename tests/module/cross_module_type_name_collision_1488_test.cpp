@@ -146,12 +146,12 @@ BEZEL_TEST(cross_module_type_name_collision_1488,
     int code = buildAndRunTwoLibs(
         // liba.bzl
         "module LibA; "
-        "public class Tx "
+        "public class Tx: Exception "
         "  public static method Hello(): string => \"hello from A\"; "
         "end Tx;",
         // libd.bzl
         "module LibD; "
-        "public class Tx "
+        "public class Tx: Exception "
         "  public static method Hello(): string => \"hello from D\"; "
         "end Tx;",
         // app.bzl
@@ -192,7 +192,7 @@ BEZEL_TEST(cross_module_type_name_collision_1488,
     int code = buildAndRunTwoLibs(
         // liba.bzl
         "module LibA; "
-        "public class Tx "
+        "public class Tx: Exception "
         "  public Tag: string; "
         "  public constructor(tag: string) Tag := tag; end constructor; "
         "  destructor end destructor; "
@@ -200,7 +200,7 @@ BEZEL_TEST(cross_module_type_name_collision_1488,
         "end Tx;",
         // libd.bzl
         "module LibD; "
-        "public class Tx "
+        "public class Tx: Exception "
         "  public Tag: string; "
         "  public constructor(tag: string) Tag := tag; end constructor; "
         "  destructor end destructor; "
@@ -241,7 +241,7 @@ BEZEL_TEST(cross_module_type_name_collision_1488,
           single_module_same_pattern_unaffected_control) {
     int code = buildAndRunSingle(
         "module Solo; "
-        "class Tx "
+        "class Tx: Exception "
         "  public static method Hello(): string => \"hello from Solo\"; "
         "end Tx; "
         "class Program "

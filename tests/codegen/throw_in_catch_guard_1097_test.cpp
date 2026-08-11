@@ -22,7 +22,7 @@ int run(const std::string& prog) {
     return r.ran ? r.exitCode : -999;
 }
 const char* E2 =
-    "module M; class E1 end E1; class E2 end E2; ";
+    "module M; class E1: Exception end E1; class E2: Exception end E2; ";
 }  // namespace
 
 // #1097: a `throw` in a `when` guard compiles (was an IR-verification crash).
@@ -104,7 +104,7 @@ BEZEL_TEST(throw_in_catch_guard_1097, normal_guard_false_falls_through) {
 // by the matching one (E1 -> guard throws E2 -> outer `catch E2`), rc=9.
 BEZEL_TEST(throw_in_catch_guard_1097, guard_throw_supersede_skips_nonmatching_arm) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E1 end E1; class E2 end E2; class E3 end E3; "
+        "module M; class E1: Exception end E1; class E2: Exception end E2; class E3: Exception end E3; "
         "class C public static method Main(): int "
         "  try "
         "    try throw new E1(); "
@@ -169,7 +169,7 @@ BEZEL_TEST(throw_in_catch_guard_1097, guard_throw_supersede_repeated_no_corrupti
 // `catch E1` (rc=5), NOT the inner arm body (which would return 1).
 BEZEL_TEST(throw_in_catch_guard_1097, guard_reraise_binding_propagates_to_outer_1150) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E1 end E1; "
+        "module M; class E1: Exception end E1; "
         "class C public static method Main(): int "
         "  try "
         "    try throw new E1(); "
@@ -187,7 +187,7 @@ BEZEL_TEST(throw_in_catch_guard_1097, guard_reraise_binding_propagates_to_outer_
 // catch it would return 9.
 BEZEL_TEST(throw_in_catch_guard_1097, guard_reraise_binding_skips_later_same_try_arm_1150) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E1 end E1; "
+        "module M; class E1: Exception end E1; "
         "class C public static method Main(): int "
         "  try "
         "    try throw new E1(); "

@@ -226,7 +226,7 @@ const char* kEventAndOwnedField =
 // (exit 42); the LSan leg asserts the EventSource is freed.
 const char* kCtorThrowAfterEventInit =
     "module M; "
-    "class Boom end Boom; "
+    "class Boom: Exception end Boom; "
     "class Widget3 "
     "  public event Tick; "
     "  public constructor() "

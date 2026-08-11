@@ -115,7 +115,7 @@ const char* kInterfaceClassBoxTransitions =
 
 const char* kThrowBeforeReplacementStore =
     "module M2960E; "
-    "class AppError2960E end AppError2960E; "
+    "class AppError2960E: Exception end AppError2960E; "
     "class C2960E "
     "  public static method Fail(i: int): int "
     "    if i >= 0 then throw new AppError2960E(); end; "

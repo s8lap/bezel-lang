@@ -41,7 +41,7 @@ namespace {
 // once. The AppError type is the thrown exception. `Boom()` throws unconditionally.
 constexpr const char* kPrelude =
     "module M; "
-    "class AppError end AppError; "
+    "class AppError: Exception end AppError; "
     "class Cell "
     "  public static live: int := 0; "
     "  public constructor() Cell.live := Cell.live + 1; end constructor; "
@@ -245,7 +245,7 @@ BEZEL_TEST(owned_marker_throw_before,
            assign_marker_interface_source_throw_before_28_3) {
     std::string src =
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "interface IThing method Ping(): int; end IThing; "
         "class Cell: IThing "
         "  public static live: int := 0; "

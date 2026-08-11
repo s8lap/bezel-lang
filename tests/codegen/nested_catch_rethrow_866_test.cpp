@@ -27,7 +27,7 @@ int run(const std::string& prog) {
 // (was SIGSEGV).
 BEZEL_TEST(nested_catch_rethrow_866, inner_try_then_rethrow_outer) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class Out end Out; class Inn end Inn; "
+        "module M; class Out: Exception end Out; class Inn: Exception end Inn; "
         "class C public static method Main(): int "
         "  try "
         "    try throw new Out(); "
@@ -45,9 +45,9 @@ BEZEL_TEST(nested_catch_rethrow_866, inner_try_then_rethrow_outer) {
 BEZEL_TEST(nested_catch_rethrow_866, inner_try_then_fallthrough_no_double_free) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class Out public static n: int := 0; "
+        "class Out: Exception public static n: int := 0; "
         "  destructor Out.n := Out.n + 1; end destructor; end Out; "
-        "class Inn end Inn; "
+        "class Inn: Exception end Inn; "
         "class C public static method Main(): int "
         "  var captured := -1; "
         "  try throw new Out(); "
@@ -63,7 +63,7 @@ BEZEL_TEST(nested_catch_rethrow_866, inner_try_then_fallthrough_no_double_free) 
 // (and frees the old caught exception) — the new exception is caught outside.
 BEZEL_TEST(nested_catch_rethrow_866, throw_new_leaving_arm_preserved) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class A end A; class B end B; "
+        "module M; class A: Exception end A; class B: Exception end B; "
         "class C public static method Main(): int "
         "  try try throw new A(); catch A => throw new B(); end; "
         "  catch B => return 42; end; "
@@ -74,7 +74,7 @@ BEZEL_TEST(nested_catch_rethrow_866, throw_new_leaving_arm_preserved) {
 // Deeper nesting: an inner try-with-two-catches inside the arm, then `throw;`.
 BEZEL_TEST(nested_catch_rethrow_866, deep_nested_then_rethrow) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class A end A; class B end B; class D end D; "
+        "module M; class A: Exception end A; class B: Exception end B; class D: Exception end D; "
         "class C public static method Main(): int "
         "  try try throw new A(); "
         "    catch A => do "
@@ -91,7 +91,7 @@ BEZEL_TEST(nested_catch_rethrow_866, deep_nested_then_rethrow) {
 // `throw;` after it still re-raises the outer exception.
 BEZEL_TEST(nested_catch_rethrow_866, inner_no_throw_then_rethrow) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class Out end Out; class Inn end Inn; "
+        "module M; class Out: Exception end Out; class Inn: Exception end Inn; "
         "class C public static method Main(): int "
         "  try try throw new Out(); "
         "    catch Out => do "

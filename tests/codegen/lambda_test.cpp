@@ -445,7 +445,7 @@ BEZEL_TEST(codegen_cg60, instance_method_ref_passed_as_arg) {
 // runs emitPendingCheck after the call (like a normal method call).
 BEZEL_TEST(codegen_cg60, lambda_body_throw_is_caught_719) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class AppErr end AppErr; "
+        "module M; class AppErr: Exception end AppErr; "
         "class C public static method Main(): int "
         "  var fn: () -> int := lambda() => throw new AppErr(); "
         "  try "

@@ -113,7 +113,7 @@ int run(const std::string& src) {
 // Shared prelude: a throwable marker class `E` and a disposal-counting class `R`.
 const char* kPre =
     "module M; "
-    "class E end E; "
+    "class E: Exception end E; "
     "class R "
     "  public static _n: int := 0; "
     "  public constructor() end constructor; "

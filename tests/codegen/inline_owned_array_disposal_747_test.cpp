@@ -287,7 +287,7 @@ BEZEL_TEST(codegen_inline_owned_747, captured_array_in_loop_read_disposed_806) {
 BEZEL_TEST(codegen_inline_owned_747, exception_unwind_disposes_both_slots) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class Dn "
         "  public static n: int := 0; "
         "  public constructor() end constructor; "

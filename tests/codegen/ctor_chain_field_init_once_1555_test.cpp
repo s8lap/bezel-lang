@@ -116,7 +116,7 @@ BEZEL_TEST(ctor_chain_init_once_1555, chain_call_throw_no_extra_disposal) {
     // constructor's unwinding has by then disposed everything its steps
     // initialized... so there is nothing further to dispose.")
     BEZEL_EXPECT_EQ(run(
-        "module M; class AppError end AppError; "
+        "module M; class AppError: Exception end AppError; "
         "class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
@@ -141,7 +141,7 @@ BEZEL_TEST(ctor_chain_init_once_1555, chaining_ctor_body_throw_runs_own_destruct
     // the ad hoc ctor-cleanup path never ran C's own destructor — _dtorRan
     // stayed 0.
     BEZEL_EXPECT_EQ(run(
-        "module M; class AppError end AppError; "
+        "module M; class AppError: Exception end AppError; "
         "class C "
         "  public static _dtorRan: int := 0; "
         "  public constructor() end constructor; "
@@ -161,7 +161,7 @@ BEZEL_TEST(ctor_chain_init_once_1555, chaining_ctor_body_reassign_then_throw) {
     // reassignment) and §22.9 (the generated Dispose() then disposes the
     // reassigned value) — total dispose count == 2.
     BEZEL_EXPECT_EQ(run(
-        "module M; class AppError end AppError; "
+        "module M; class AppError: Exception end AppError; "
         "class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
@@ -185,7 +185,7 @@ BEZEL_TEST(ctor_chain_init_once_1555, derived_chaining_body_throw_disposes_base_
     // walks the full base chain, so a derived this(...)-chaining ctor's body
     // throw must dispose both the derived AND base owned fields.
     BEZEL_EXPECT_EQ(run(
-        "module M; class AppError end AppError; "
+        "module M; class AppError: Exception end AppError; "
         "class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
@@ -210,7 +210,7 @@ BEZEL_TEST(ctor_chain_init_once_1555, generic_chaining_ctor_body_throw_runs_own_
     // per §14 (generic ctor inline, #585) / §22.9 — the inlineCtorBody path
     // ([B]) had the identical missing-destructor gap as the non-generic path.
     BEZEL_EXPECT_EQ(run(
-        "module M; class AppError end AppError; "
+        "module M; class AppError: Exception end AppError; "
         "class G<T> where T: class "
         "  public static _dtorRan: int := 0; "
         "  public constructor() end constructor; "
@@ -233,7 +233,7 @@ BEZEL_TEST(ctor_chain_init_once_1555, generic_chain_call_throw_no_double_free) {
     // call, so a chain-call-itself throw ran the (already-disposed) target's
     // cleanup a second time. rc must be 1 (single dispose), not a crash.
     BEZEL_EXPECT_EQ(run(
-        "module M; class AppError end AppError; "
+        "module M; class AppError: Exception end AppError; "
         "class R public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; "
         "end R; "
@@ -263,7 +263,7 @@ BEZEL_TEST(ctor_chain_init_once_1555, nested_base_target_this_chain_scoped_to_ba
     // vtable dispatch); Derived's destructor must NOT run — Derived's own
     // fields/state were never constructed (the throw is Derived's step 1).
     BEZEL_EXPECT_EQ(run(
-        "module M; class AppError end AppError; "
+        "module M; class AppError: Exception end AppError; "
         "class Base "
         "  public static _baseDtorRan: int := 0; "
         "  public constructor() end constructor; "

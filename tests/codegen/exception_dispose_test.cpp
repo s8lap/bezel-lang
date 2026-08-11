@@ -25,7 +25,7 @@ BEZEL_TEST(codegen_cg21, using_var_disposed_on_throw) {
     // during unwinding before the outer catch reads the counter.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class R "
         "  public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; "
@@ -41,7 +41,7 @@ BEZEL_TEST(codegen_cg21, using_var_disposed_on_throw) {
 BEZEL_TEST(codegen_cg21, two_using_vars_both_disposed_on_throw) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class R "
         "  public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; "
@@ -62,7 +62,7 @@ BEZEL_TEST(codegen_cg21, disposed_when_exception_crosses_call) {
     // after the call, the using var is disposed before the catch.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class R "
         "  public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; "
@@ -81,7 +81,7 @@ BEZEL_TEST(codegen_cg21, not_disposed_twice_on_normal_path) {
     // normal scope exit (not also via an unwind path).
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class R "
         "  public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; "
@@ -98,7 +98,7 @@ BEZEL_TEST(codegen_cg21, nested_scopes_dispose_inner_first_on_throw) {
     // Outer and inner using vars both disposed on the throw path.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class R "
         "  public static _n: int := 0; "
         "  destructor _n := _n + 1; end destructor; "

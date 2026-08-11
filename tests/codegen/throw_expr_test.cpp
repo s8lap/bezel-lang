@@ -20,7 +20,7 @@ int runProg(const std::string& program) {
     return r.ran ? r.exitCode : -999;
 }
 
-const char* kE = "module M; class E end E; class T public V: int := 0; end T; ";
+const char* kE = "module M; class E: Exception end E; class T public V: int := 0; end T; ";
 
 } // namespace
 

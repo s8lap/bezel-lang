@@ -220,7 +220,7 @@ BEZEL_TEST(class_element_set_literal_1070, borrowing_set_literal_no_dispose_spec
 // not leak. Pre-fix: the literal built nothing, so `Box._n` was 0.
 BEZEL_TEST(class_element_set_literal_1070, owning_set_literal_throw_partial_spec_15_4) {
     BEZEL_EXPECT_EQ(runChecked(
-        "module M; class AppError end AppError; "
+        "module M; class AppError: Exception end AppError; "
         "class Box "
         "  public static _n: int := 0; "
         "  public X: int; "

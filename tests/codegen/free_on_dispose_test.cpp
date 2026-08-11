@@ -204,7 +204,7 @@ const char* kOwnedField =
 // and its block is reclaimed during unwinding. (The thrown AppError object has a
 // separate, pre-existing lifecycle and is out of scope for #380.)
 const char* kExceptionPath =
-    "module M; class AppError end AppError; "
+    "module M; class AppError: Exception end AppError; "
     "class R "
     "  public static _n: int := 0; "
     "  destructor _n := _n + 1; end destructor; "

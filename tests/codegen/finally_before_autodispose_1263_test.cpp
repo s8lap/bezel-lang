@@ -96,7 +96,7 @@ int run(const std::string& src) {
 BEZEL_TEST(finally_before_autodispose_1263, exception_path_finally_first_spec_28_3) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") +
-        "class E end E; "
+        "class E: Exception end E; "
         "class C public static _seq: int := 0; "
         "  public static method Main(): int "
         "    C._seq := 0; "
@@ -150,7 +150,7 @@ BEZEL_TEST(finally_before_autodispose_1263, normal_path_finally_first_spec_28_3)
 BEZEL_TEST(finally_before_autodispose_1263, using_var_disposed_after_finally_spec_28_10) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") +
-        "class E end E; "
+        "class E: Exception end E; "
         "class C public static _seq: int := 0; "
         "  public static method Main(): int "
         "    C._seq := 0; "
@@ -179,7 +179,7 @@ BEZEL_TEST(finally_before_autodispose_1263, using_var_disposed_after_finally_spe
 BEZEL_TEST(finally_before_autodispose_1263, catch_then_finally_then_autodispose_spec_28_3) {
     BEZEL_EXPECT_EQ(run(
         std::string("module M; ") +
-        "class E end E; "
+        "class E: Exception end E; "
         "class C public static _seq: int := 0; "
         "  public static method Main(): int "
         "    C._seq := 0; "

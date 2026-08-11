@@ -56,7 +56,7 @@ int run(const std::string& program) {
 // declared after it in the generated Dispose() sequence.
 const char* kOwnedFieldStillDisposedWhenDestructorThrows =
     "module M; "
-    "class AppError end AppError; "
+    "class AppError: Exception end AppError; "
     "class Field "
     "  public static _n: int := 0; "
     "  destructor Field._n := Field._n + 1; end destructor; "
@@ -90,7 +90,7 @@ BEZEL_TEST(codegen_throwing_destructor_1546,
 // code proves all three counters are exactly 1.
 const char* kBodyFieldAndBaseChainAllRunWhenDestructorThrows =
     "module M; "
-    "class AppError end AppError; "
+    "class AppError: Exception end AppError; "
     "class Base "
     "  public static _baseRan: int := 0; "
     "  destructor Base._baseRan := Base._baseRan + 1; end destructor; "
@@ -135,7 +135,7 @@ BEZEL_TEST(codegen_throwing_destructor_1546,
 // `_f1Step`/`_f2Step` record which one ran first.
 const char* kFieldDisposalOrderPreservedWhenDestructorThrows =
     "module M; "
-    "class AppError end AppError; "
+    "class AppError: Exception end AppError; "
     "class F1 "
     "  public static _step: int := 0; "
     "  public static _f1Step: int := 0; "

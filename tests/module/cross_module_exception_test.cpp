@@ -107,7 +107,7 @@ int buildAndRunSingle(const std::string& src, const std::string& tag) {
 BEZEL_TEST(cross_module_exception, single_module_throw_uncaught_exits_70_spec_31_1) {
     int code = buildAndRunSingle(
         "module M; "
-        "class Boom end Boom; "
+        "class Boom: Exception end Boom; "
         "class C "
         "  public static method Main(): int "
         "    throw new Boom(); "
@@ -123,7 +123,7 @@ BEZEL_TEST(cross_module_exception, single_module_throw_uncaught_exits_70_spec_31
 BEZEL_TEST(cross_module_exception, single_module_throw_caught_handler_runs_spec_31_2) {
     int code = buildAndRunSingle(
         "module M; "
-        "class Boom end Boom; "
+        "class Boom: Exception end Boom; "
         "class C "
         "  public static method Main(): int "
         "    try "
@@ -146,7 +146,7 @@ BEZEL_TEST(cross_module_exception, cross_module_throw_uncaught_exits_70_spec_31_
     int code = buildAndRun(
         // lib_throw.bzl
         "module LibThrow; "
-        "public class Boom end Boom; "
+        "public class Boom: Exception end Boom; "
         "public class Raiser "
         "  public static method AlwaysRaise(): int "
         "    throw new Boom(); "
@@ -177,7 +177,7 @@ BEZEL_TEST(cross_module_exception, cross_module_throw_caught_in_importer_spec_31
     int code = buildAndRun(
         // lib.bzl
         "module LibCatch; "
-        "public class AppErr end AppErr; "
+        "public class AppErr: Exception end AppErr; "
         "public class Thrower "
         "  public static method Raise(): int "
         "    throw new AppErr(); "
@@ -210,7 +210,7 @@ BEZEL_TEST(cross_module_exception, cross_module_throw_with_field_readable_spec_3
     int code = buildAndRun(
         // lib.bzl: exception class carries a `code` field
         "module LibField; "
-        "public class CodeErr "
+        "public class CodeErr: Exception "
         "  public code: int; "
         "  public constructor(c: int) code := c; end constructor; "
         "  destructor end destructor; "

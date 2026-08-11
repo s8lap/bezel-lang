@@ -64,7 +64,7 @@ const bezel::ast::Type* firstCatchArmType(const bezel::test::SemaResult& r) {
 
 BEZEL_TEST(sema_types, catch_arm_type_resolved) {
     auto r = parseAndResolve(
-        "module M; class E end E; "
+        "module M; class E: Exception end E; "
         "class C public static method Main(): int "
         "  try return 0; catch E => return 1; end; return 2; "
         "end Main; end C;");

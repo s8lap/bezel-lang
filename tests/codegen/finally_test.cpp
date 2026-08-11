@@ -35,7 +35,7 @@ BEZEL_TEST(codegen_cg21b, finally_runs_on_normal_completion) {
 
 BEZEL_TEST(codegen_cg21b, finally_runs_after_catch) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E end E; class C "
+        "module M; class E: Exception end E; class C "
         "  public static _n: int := 0; "
         "  public static method Main(): int "
         "    try throw new E(); catch E => _n := 1; finally _n := _n + 10; end; "
@@ -48,7 +48,7 @@ BEZEL_TEST(codegen_cg21b, finally_runs_on_uncaught_propagation) {
     // Inner try has only a finally; the exception propagates to the outer
     // catch, but the inner finally runs first (sets the counter).
     BEZEL_EXPECT_EQ(run(
-        "module M; class E end E; class C "
+        "module M; class E: Exception end E; class C "
         "  public static _n: int := 0; "
         "  public static method Main(): int "
         "    try "
@@ -62,7 +62,7 @@ BEZEL_TEST(codegen_cg21b, finally_runs_on_uncaught_propagation) {
 BEZEL_TEST(codegen_cg21b, finally_runs_when_no_arm_matches) {
     // Inner catch doesn't match; finally runs, then the outer catches.
     BEZEL_EXPECT_EQ(run(
-        "module M; class A end A; class B end B; class C "
+        "module M; class A: Exception end A; class B: Exception end B; class C "
         "  public static _n: int := 0; "
         "  public static method Main(): int "
         "    try "
@@ -76,7 +76,7 @@ BEZEL_TEST(codegen_cg21b, finally_runs_when_no_arm_matches) {
 BEZEL_TEST(codegen_cg21b, finally_runs_when_arm_rethrows) {
     // The matching arm re-throws; finally still runs before propagation.
     BEZEL_EXPECT_EQ(run(
-        "module M; class E end E; class C "
+        "module M; class E: Exception end E; class C "
         "  public static _n: int := 0; "
         "  public static method Main(): int "
         "    try "
@@ -146,7 +146,7 @@ BEZEL_TEST(codegen_cg21b_546, finally_runs_then_function_value_returned) {
 // a cleared bz$exc and supersedes (or restores) correctly.
 BEZEL_TEST(codegen_cg21b, throw_in_finally_supersedes_original_720) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class AppErr end AppErr; class FinErr end FinErr; "
+        "module M; class AppErr: Exception end AppErr; class FinErr: Exception end FinErr; "
         "class C public static method Main(): int "
         "  try "
         "    try throw new AppErr(); "
@@ -160,7 +160,7 @@ BEZEL_TEST(codegen_cg21b, throw_in_finally_supersedes_original_720) {
 // #720 regression: a finally that does NOT throw lets the original propagate.
 BEZEL_TEST(codegen_cg21b, finally_no_throw_original_propagates_720) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class AppErr end AppErr; "
+        "module M; class AppErr: Exception end AppErr; "
         "class C public static method Main(): int "
         "  var ran := 0; "
         "  try "
@@ -186,7 +186,7 @@ BEZEL_TEST(codegen_cg21b, finally_no_throw_original_propagates_720) {
 // #1149: the finally's E2 supersedes E1 and is caught by the outer `catch E2`.
 BEZEL_TEST(finally_supersede_1149, finally_throw_supersedes_outer_catches) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E1 end E1; class E2 end E2; "
+        "module M; class E1: Exception end E1; class E2: Exception end E2; "
         "class C public static method Main(): int "
         "  try "
         "    try throw new E1(); finally throw new E2(); end; "
@@ -201,7 +201,7 @@ BEZEL_TEST(finally_supersede_1149, finally_throw_supersedes_outer_catches) {
 // matching one (the original E1 is superseded, never reaches the E1 arm).
 BEZEL_TEST(finally_supersede_1149, finally_throw_supersede_skips_nonmatching_arm) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E1 end E1; class E2 end E2; class E3 end E3; "
+        "module M; class E1: Exception end E1; class E2: Exception end E2; class E3: Exception end E3; "
         "class C public static method Main(): int "
         "  try "
         "    try throw new E1(); finally throw new E2(); end; "
@@ -217,7 +217,7 @@ BEZEL_TEST(finally_supersede_1149, finally_throw_supersede_skips_nonmatching_arm
 // terminate — exercises the supersede check path, finUTerm=false). E2 supersedes.
 BEZEL_TEST(finally_supersede_1149, finally_conditional_throw_supersedes) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E1 end E1; class E2 end E2; "
+        "module M; class E1: Exception end E1; class E2: Exception end E2; "
         "class C public static method Main(): int "
         "  var t := true; "
         "  try "
@@ -234,7 +234,7 @@ BEZEL_TEST(finally_supersede_1149, finally_conditional_throw_supersedes) {
 // JIT run here; a leak accumulates (caught by the ASan harness). rc=100.
 BEZEL_TEST(finally_supersede_1149, finally_throw_supersede_repeated_no_corruption) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E1 end E1; class E2 end E2; "
+        "module M; class E1: Exception end E1; class E2: Exception end E2; "
         "class C public static method Main(): int "
         "  var total := 0; var i := 0; "
         "  while i < 100 do "
@@ -260,7 +260,7 @@ BEZEL_TEST(finally_supersede_1149, finally_throw_supersede_repeated_no_corruptio
 // E1 must be freed, E2 must reach the outer `catch E2` (rc=6).
 BEZEL_TEST(finally_supersede_1216, finally_call_throw_supersedes_outer_catches) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E1 end E1; class E2 end E2; "
+        "module M; class E1: Exception end E1; class E2: Exception end E2; "
         "class C "
         "  private static method Boom(): int  throw new E2();  end Boom; "
         "  public static method Main(): int "
@@ -279,7 +279,7 @@ BEZEL_TEST(finally_supersede_1216, finally_call_throw_supersedes_outer_catches) 
 // accumulates (caught by the ASan harness). rc=100.
 BEZEL_TEST(finally_supersede_1216, finally_call_throw_supersede_repeated_no_corruption) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E1 end E1; class E2 end E2; "
+        "module M; class E1: Exception end E1; class E2: Exception end E2; "
         "class C "
         "  private static method Boom(): int  throw new E2();  end Boom; "
         "  public static method Main(): int "

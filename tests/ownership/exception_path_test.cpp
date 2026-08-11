@@ -27,7 +27,7 @@ namespace {
 std::string wrap(const std::string& body) {
     return std::string("module M; "
         "class T destructor end destructor; end T; "
-        "class Error end Error; "
+        "class Error: Exception end Error; "
         "class C public method M() ") + body + " end M; end C;";
 }
 
@@ -88,7 +88,7 @@ BEZEL_TEST(own_exc, nested_block_owned_local_before_throw_auto_dropped_1257) {
         // §28.9 (#2654): `R` is destructor-bearing (NON-trivial-dispose) so
         // the auto-drop obligation asserted below is real, not an artifact of
         // which code path happens to reach the §28.9 exemption.
-        "module M; class E end E; "
+        "module M; class E: Exception end E; "
         "class R destructor end destructor; end R; "
         "class C public static method Main(): int "
         "  try "

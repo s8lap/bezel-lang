@@ -194,7 +194,7 @@ BEZEL_TEST(owned_binding_marker, using_var_adopt_disposes_once_value_28_10) {
 BEZEL_TEST(owned_binding_marker, marked_transfer_disposes_on_unwind_edge_28_3) {
     std::string src =
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class Cell "
         "  public static live: int := 0; "
         "  public constructor() Cell.live := Cell.live + 1; end constructor; "
@@ -328,7 +328,7 @@ BEZEL_TEST(owned_binding_marker, plain_var_adopt_interface_disposes_once_28_3) {
 BEZEL_TEST(owned_binding_marker, plain_var_adopt_interface_disposes_on_unwind_28_3) {
     std::string src =
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "interface IThing method Ping(): int; end IThing; "
         "class Cell: IThing "
         "  public static live: int := 0; "

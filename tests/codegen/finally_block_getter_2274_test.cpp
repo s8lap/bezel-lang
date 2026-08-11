@@ -130,7 +130,7 @@ BEZEL_TEST(finally_block_getter_2274, break_out_of_try_runs_finally) {
 BEZEL_TEST(finally_block_getter_2274, throw_out_of_try_runs_finally_once) {
     BEZEL_EXPECT_EQ(runChecked(
         "module M;\n"
-        "class E end E;\n"
+        "class E: Exception end E;\n"
         "class Counter\n"
         "  private _n: int;\n"
         "  public constructor() _n := 4; end constructor;\n"

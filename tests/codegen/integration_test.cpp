@@ -55,7 +55,7 @@ BEZEL_TEST(integration, virtual_dispatch_through_base_param) {
 BEZEL_TEST(integration, cross_method_exception_propagation) {
     // A callee throws; the caller's try catches it after the call unwinds.
     BEZEL_EXPECT_EQ(compileAndRun(
-        "module M; class AppError end AppError; class C "
+        "module M; class AppError: Exception end AppError; class C "
         "  public static method Risky(n: int): int "
         "    if n < 0 then throw new AppError(); end; return n * 2; "
         "  end Risky; "
@@ -374,7 +374,7 @@ BEZEL_TEST(integration, exception_catch_app_error) {
     // User-defined exception type caught by its exact type.
     BEZEL_EXPECT_EQ(compileAndRun(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class C "
         "  public static method Main(): int "
         "    try throw new AppError(); "

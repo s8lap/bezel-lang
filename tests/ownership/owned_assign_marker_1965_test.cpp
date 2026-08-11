@@ -282,7 +282,7 @@ BEZEL_TEST(owned_assign_marker, loop_accumulator_disposes_all_once_28_7) {
 BEZEL_TEST(owned_assign_marker, marked_transfer_disposes_on_unwind_edge_28_3) {
     std::string src =
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class Cell "
         "  public static live: int := 0; "
         "  public constructor() Cell.live := Cell.live + 1; end constructor; "

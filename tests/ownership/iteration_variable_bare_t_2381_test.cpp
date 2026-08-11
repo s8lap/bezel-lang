@@ -90,7 +90,7 @@ BEZEL_TEST(iteration_variable_bare_t_2381,
            ienumerable_for_in_return_item_rejected_spec_28_3_v0_235) {
     auto r = parseAndCheckOwnership(
         "module M; "
-        "class C "
+        "class C: Exception "
         "  public constructor() end constructor; "
         "  destructor end destructor; "
         "end C; "
@@ -120,7 +120,7 @@ BEZEL_TEST(iteration_variable_bare_t_2381,
            array_indexer_return_accepted_spec_28_3_v0_235) {
     auto r = parseAndCheckOwnership(
         "module M; "
-        "class C "
+        "class C: Exception "
         "  public constructor() end constructor; "
         "  destructor end destructor; "
         "end C; "
@@ -144,7 +144,7 @@ BEZEL_TEST(iteration_variable_bare_t_2381,
            array_for_in_return_item_accepted_spec_28_3_v0_235) {
     auto r = parseAndCheckOwnership(
         "module M; "
-        "class C "
+        "class C: Exception "
         "  public constructor() end constructor; "
         "  destructor end destructor; "
         "end C; "
@@ -168,7 +168,7 @@ BEZEL_TEST(iteration_variable_bare_t_2381,
            ienumerable_for_in_return_item_where_t_value_accepted_spec_26_5_1) {
     auto r = parseAndCheckOwnership(
         "module M; "
-        "class C "
+        "class C: Exception "
         "  public constructor() end constructor; "
         "  destructor end destructor; "
         "end C; "
@@ -193,7 +193,7 @@ BEZEL_TEST(iteration_variable_bare_t_2381,
            ienumerable_for_in_return_item_mixed_domain_admitted_2064) {
     auto r = parseAndCheckOwnership(
         "module M; "
-        "class C "
+        "class C: Exception "
         "  public constructor() end constructor; "
         "  destructor end destructor; "
         "end C; "
@@ -215,7 +215,7 @@ BEZEL_TEST(iteration_variable_bare_t_2381,
            ienumerable_for_in_count_accepted_spec_29_2) {
     auto r = parseAndCheckOwnership(
         "module M; "
-        "class C "
+        "class C: Exception "
         "  public constructor() end constructor; "
         "  destructor end destructor; "
         "end C; "
@@ -240,7 +240,7 @@ BEZEL_TEST(iteration_variable_bare_t_2381,
            array_indexer_return_runs_at_class_substitution_spec_28_3) {
     std::string src =
         "module M; "
-        "class C "
+        "class C: Exception "
         "  public v: int := 0; "
         "  public constructor(n: int) v := n; end constructor; "
         "  destructor end destructor; "

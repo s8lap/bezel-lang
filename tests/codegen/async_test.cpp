@@ -2048,7 +2048,7 @@ BEZEL_TEST(async_444, await_call_site_type_arg_misparsed_as_comparison_is_error)
 // in codegen — the local was typed i32 and `bz_task_is_done` got an i32 (IR_FAIL).
 BEZEL_TEST(async_30_10, from_exception_await_reraises_738) {
     expectValueLeakFree(
-        "module M; class AppErr end AppErr; class C "
+        "module M; class AppErr: Exception end AppErr; class C "
         "  public static async method Main(): Task<int> "
         "    using var t := Task.FromException<int>(new AppErr()); "
         "    try var v := await t; return 99; "

@@ -64,7 +64,7 @@ BEZEL_TEST(codegen_generic_nullable_field_r33, compare_value_typeparam_nullable_
 BEZEL_TEST(codegen_generic_nullable_field_r33, force_unwrap_value_typeparam_field) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class E end E; "
+        "class E: Exception end E; "
         "class Box<T> "
         "  private _v: T?; "
         "  public method Set(v: T) _v := v; end Set; "

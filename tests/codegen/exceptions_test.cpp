@@ -30,7 +30,7 @@ int run(const std::string& program) {
 BEZEL_TEST(codegen_cg20, throw_caught_by_type) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class C public static method Main(): int "
         "  try throw new AppError(); catch AppError => return 42; end; "
         "  return 0; "
@@ -41,7 +41,7 @@ BEZEL_TEST(codegen_cg20, normal_path_skips_catch) {
     // No throw → the catch arm does not run; control falls past the try.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class C public static method Main(): int "
         "  try return 7; catch AppError => return 42; end; "
         "  return 0; "
@@ -52,7 +52,7 @@ BEZEL_TEST(codegen_cg20, caught_by_base_type) {
     // Throw a subclass, catch by its (user-defined) base.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class IoError : AppError end IoError; "
         "class C public static method Main(): int "
         "  try throw new IoError(); catch AppError => return 5; end; "
@@ -63,7 +63,7 @@ BEZEL_TEST(codegen_cg20, caught_by_base_type) {
 BEZEL_TEST(codegen_cg20, first_matching_arm_wins) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class A1 end A1; class A2 end A2; "
+        "class A1: Exception end A1; class A2: Exception end A2; "
         "class C public static method Main(): int "
         "  try throw new A2(); "
         "  catch A1 => return 1; "
@@ -77,7 +77,7 @@ BEZEL_TEST(codegen_cg20, multi_type_arm) {
     // One arm listing several types matches any of them.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class A1 end A1; class A2 end A2; "
+        "class A1: Exception end A1; class A2: Exception end A2; "
         "class C public static method Main(): int "
         "  try throw new A2(); catch A1 | A2 => return 9; end; "
         "  return 0; "
@@ -88,7 +88,7 @@ BEZEL_TEST(codegen_cg20, unmatched_arm_propagates_to_outer_try) {
     // Inner try doesn't match A2; it re-propagates to the outer try.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class A1 end A1; class A2 end A2; "
+        "class A1: Exception end A1; class A2: Exception end A2; "
         "class C public static method Main(): int "
         "  try "
         "    try throw new A2(); catch A1 => return 1; end; "
@@ -101,7 +101,7 @@ BEZEL_TEST(codegen_cg20, exception_propagates_across_calls) {
     // A callee throws; the caller's try catches after the call returns.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class C "
         "  public static method Boom() throw new AppError(); end Boom; "
         "  public static method Main(): int "
@@ -115,7 +115,7 @@ BEZEL_TEST(codegen_cg20, rethrow_propagates) {
     // A bare `throw;` inside a catch arm re-raises to the outer try.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class C public static method Main(): int "
         "  try "
         "    try throw new AppError(); catch AppError => throw; end; "
@@ -128,7 +128,7 @@ BEZEL_TEST(codegen_cg20, code_after_catch_runs_on_normal_path) {
     // When the try completes normally, execution continues after the try.
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppError end AppError; "
+        "class AppError: Exception end AppError; "
         "class C public static method Main(): int "
         "  var x := 0; "
         "  try x := 1; catch AppError => x := 2; end; "
@@ -140,7 +140,7 @@ BEZEL_TEST(codegen_cg20, code_after_catch_runs_on_normal_path) {
 // borrow of the caught type), usable in the arm body and in a `when` guard.
 BEZEL_TEST(codegen_cg20, catch_binding_in_body) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E public Code: int := 0; end E; "
+        "module M; class E: Exception public Code: int := 0; end E; "
         "class C public static method Main(): int "
         "  try var e := new E(); e.Code := 7; throw e; "
         "  catch var ex: E => return ex.Code; end; return 0; "
@@ -151,7 +151,7 @@ BEZEL_TEST(codegen_cg20, catch_binding_in_body) {
 // the exception continues to the next arm (it is not silently caught).
 BEZEL_TEST(codegen_cg20, catch_when_guard_false_skips_arm) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E end E; "
+        "module M; class E: Exception end E; "
         "class C public static method Main(): int "
         "  try throw new E(); "
         "  catch E when false => return 1; "
@@ -162,7 +162,7 @@ BEZEL_TEST(codegen_cg20, catch_when_guard_false_skips_arm) {
 BEZEL_TEST(codegen_cg20, catch_guard_reads_binding) {
     // The guard reads the bound exception; the first matching guard wins.
     BEZEL_EXPECT_EQ(run(
-        "module M; class E public Code: int := 0; end E; "
+        "module M; class E: Exception public Code: int := 0; end E; "
         "class C public static method Main(): int "
         "  try var e := new E(); e.Code := 2; throw e; "
         "  catch var ex: E when ex.Code = 1 => return 1; "
@@ -173,7 +173,7 @@ BEZEL_TEST(codegen_cg20, catch_guard_reads_binding) {
 
 BEZEL_TEST(codegen_cg20, catch_when_guard_true_enters_arm) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E end E; "
+        "module M; class E: Exception end E; "
         "class C public static method Main(): int "
         "  try throw new E(); "
         "  catch E when true => return 5; "
@@ -186,7 +186,7 @@ BEZEL_TEST(codegen_cg20, catch_when_guard_true_enters_arm) {
 // / `this(...)` chained constructor, and from an implicit base constructor.
 BEZEL_TEST(codegen_cg20, exception_from_constructor_body) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E end E; "
+        "module M; class E: Exception end E; "
         "class N public constructor() throw new E(); end constructor; end N; "
         "class C public static method Main(): int "
         "  try var n := new N(); return 0; catch E => return 7; end; "
@@ -195,7 +195,7 @@ BEZEL_TEST(codegen_cg20, exception_from_constructor_body) {
 
 BEZEL_TEST(codegen_cg20, exception_from_base_constructor) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E end E; "
+        "module M; class E: Exception end E; "
         "class B public constructor() throw new E(); end constructor; end B; "
         "class D : B public constructor() base(); end constructor; end D; "
         "class C public static method Main(): int "
@@ -205,7 +205,7 @@ BEZEL_TEST(codegen_cg20, exception_from_base_constructor) {
 
 BEZEL_TEST(codegen_cg20, exception_from_this_chained_constructor) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E end E; "
+        "module M; class E: Exception end E; "
         "class P "
         "  public constructor() this(1); end constructor; "
         "  public constructor(x: int) throw new E(); end constructor; "
@@ -217,7 +217,7 @@ BEZEL_TEST(codegen_cg20, exception_from_this_chained_constructor) {
 
 BEZEL_TEST(codegen_cg20, exception_from_implicit_base_constructor) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class E end E; "
+        "module M; class E: Exception end E; "
         "class B public constructor() throw new E(); end constructor; end B; "
         "class D : B end D; "
         "class C public static method Main(): int "
@@ -400,7 +400,7 @@ BEZEL_TEST(codegen_cg20, type_test_in_interpolated_string) {
 BEZEL_TEST(codegen_cg20, when_guard_allocation_does_not_misfire_720) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppErr end AppErr; "
+        "class AppErr: Exception end AppErr; "
         "class Helper public v: int; "
         "  public constructor(x: int) v := x; end constructor; end Helper; "
         "class C "
@@ -424,8 +424,8 @@ BEZEL_TEST(codegen_cg20, when_guard_allocation_does_not_misfire_720) {
 BEZEL_TEST(codegen_cg20, when_guard_throw_propagates_to_enclosing_720) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppErr end AppErr; "
-        "class GuardErr end GuardErr; "
+        "class AppErr: Exception end AppErr; "
+        "class GuardErr: Exception end GuardErr; "
         "class C "
         "  public static method Boom(): bool throw new GuardErr(); end Boom; "
         "  public static method Main(): int "
@@ -446,7 +446,7 @@ BEZEL_TEST(codegen_cg20, when_guard_throw_propagates_to_enclosing_720) {
 BEZEL_TEST(codegen_cg20, when_guard_false_restores_inflight_exception_720) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppErr end AppErr; "
+        "class AppErr: Exception end AppErr; "
         "class C "
         "  public static method No(): bool return false; end No; "
         "  public static method Main(): int "
@@ -523,13 +523,16 @@ BEZEL_TEST(codegen_cg20, throw_enum_rejected_739) {
     BEZEL_EXPECT_FALSE(r.ran);
 }
 
-// CONTROL: throwing a class instance (user exception) still compiles and runs;
-// the caught arm returns 42. Bezel permits throwing any class (§31.1), so a
-// non-`Exception`-derived class is accepted.
+// CONTROL: throwing a USER exception class instance still compiles and runs;
+// the caught arm returns 42. `AppErr` derives from `Exception`, which §31.1
+// (v0.243, proposal 0080 / #3046) requires of every throw operand — the
+// sentence this comment used to carry ("Bezel permits throwing any class
+// (§31.1), so a non-`Exception`-derived class is accepted") was the v0.182
+// ruling, and would be false about this program now that its class has a base.
 BEZEL_TEST(codegen_cg20, throw_user_class_still_accepted_739) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
-        "class AppErr end AppErr; "
+        "class AppErr: Exception end AppErr; "
         "class C public static method Main(): int "
         "  try throw new AppErr(); catch AppErr => return 42; end; "
         "  return 0; "

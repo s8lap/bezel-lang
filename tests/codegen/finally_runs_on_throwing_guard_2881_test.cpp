@@ -97,10 +97,10 @@ int runPlain(const std::string& program) {
 // throws, giving the emitNewPendingCheck flavour of a guard throw.
 const char* kPrelude =
     "module M; "
-    "class GX end GX; "
-    "class BX end BX; "
-    "class FX end FX; "
-    "class ZX end ZX; "
+    "class GX: Exception end GX; "
+    "class BX: Exception end BX; "
+    "class FX: Exception end FX; "
+    "class ZX: Exception end ZX; "
     "class Src "
     "  public static _live: int := 0; "
     "  public static _dtor: int := 0; "
@@ -279,8 +279,8 @@ BEZEL_TEST(finally_throwing_guard_2881,
            guard_throw_edge_interleaves_like_the_unmatched_edge_2881) {
     const char* kSeqPrelude =
         "module M; "
-        "class GX end GX; "
-        "class BX end BX; "
+        "class GX: Exception end GX; "
+        "class BX: Exception end BX; "
         "class T "
         "  public static method BodyBoom(): int throw new BX(); end BodyBoom; "
         "  public static method GuardBoom(): int throw new GX(); end GuardBoom; "
