@@ -1,6 +1,6 @@
 # Bezel Guide 5: Collections, Queries, and Iteration
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.238.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.243.*
 
 The surface here looks familiar: resizable arrays, dictionaries, sets, stacks and queues (stdlib §4), and a query surface of `Where`/`Select`/`GroupBy`-style operators over any `IEnumerable<T>` (stdlib §5, `import System.Collections.Linq;`). What is *not* familiar is how ownership runs through it, and that is what this guide teaches. Three rules change ingrained habits, each headed **How Bezel does it**. Every standard collection comes in **two families** — one that borrows its elements and one that owns them (§1). The loop variable of a `for` is not always yours to keep or dispose (§2, §3). And a **bound lazy query is single-consumption** — enumerate it twice and the compiler stops you (§4). Ownership basics (owned vs borrowed, `using var`, the `owned` marker) are Guide 1's job; the `Try` shapes and the `*OrNull` tier are Guide 2 §2. If you skim everything else, read the three **How Bezel does it** sections and the table in §8.
 
@@ -298,11 +298,12 @@ var idle := fleet.FirstOrNull(lambda(c) => not c.IsBusy());  // borrow of the el
 idle?.Ping();                     // fine while fleet lives — fleet is the backing
 ```
 
-**The trap is the minting pipeline.** Over a fresh-yield source — an iterator that `new`s its elements, or an operator chain over one — the element lives in the pipeline's *own* enumerator, which the terminal operator disposes before returning. The borrow you get back points at a disposed element, and the next use faults deterministically in checked mode (`DisposedAccessException`, spec §28.2):
+**The trap is the minting pipeline.** Over a fresh-yield source — an iterator that `new`s its elements, or an operator chain over one — the element lives in the pipeline's *own* enumerator, which the terminal operator disposes before returning. The borrow you get back points at a disposed element, and the next use faults deterministically in checked mode (`DisposedAccessException`, spec §28.2). Since v0.243 the compiler **warns at the accessor call** whenever the minting iterator is compiled in the same unit (stdlib §5; the predicate is spec §29.11's) — the diagnostic says the element does not survive the call and names the remedies below; a cross-module producer escapes the warning and keeps only the checked-mode fault:
 
 ```bezel
 using var probes := Probes(8);    // Probes is an iterator minting fresh Probe objects
-var p := probes.First();          // borrow of the element, sourced at probes — compiles
+var p := probes.First();          // borrow of the element — compiles, but WARNS
+                                  //   (stdlib §5, spec §29.11: same-unit minting root)
 p.Run();                          // checked mode: DisposedAccessException — the element
                                   //   died with First()'s internal enumerator
 ```
@@ -383,6 +384,6 @@ After the freeze no writer can exist — the consume takes the buffer, and the c
 | Zero-copy sub-range | spans via `AsSpan()` — bounded by the source's life (string spans exempt) |
 | Share bulk data across domains, forever | `FrozenArray<T>`, under `Shared<T>` |
 
-And the five traps, each a section above: **enumerating a bound query twice** (§4 — materialize); **escaping an iteration variable** from an interface-typed or minting source (§2 — concrete backing, or the owning path); **disposing a borrowed element** (§2 — only owners dispose; go through the owning collection or take the element out); **`First()` over a minting pipeline** (§6 — give the elements a backing first); **holding a span past its buffer** (§7 — the caller owns the storage).
+And the five traps, each a section above: **enumerating a bound query twice** (§4 — materialize); **escaping an iteration variable** from an interface-typed or minting source (§2 — concrete backing, or the owning path); **disposing a borrowed element** (§2 — only owners dispose; go through the owning collection or take the element out); **`First()` over a minting pipeline** (§6 — warned since v0.243 where the producer is same-unit, spec §29.11; give the elements a backing first); **holding a span past its buffer** (§7 — the caller owns the storage).
 
 Three habits carry most of it. Pick the family that states who disposes, and let `Dispose()` cascades and `Drain()` do the element work — hand-written disposal loops over collections are almost always the wrong shape. Treat everything a loop or accessor hands you at class elements as a borrow unless the name says transfer (`Pop`/`Drain`/`Take`). When you need it longer, take ownership explicitly rather than fighting the borrow checker. And treat a lazy query as a value you spend: bind it, consume it once, and reach for `ToArray()` the moment you need the results twice. The compiler enforces all three; the errors are it finding a leak, a dangle, or a silent re-execution before they happen.

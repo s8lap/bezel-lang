@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — drafted 2026-08-11 (owner-directed, from the elegance review) |
+| **Status** | superseded — graduated v0.243 (owner-ruled 2026-08-11, all Qs as recommended) |
 | **Tracking issue** | [#3046](https://github.com/s8lap/bezel-lang/issues/3046) |
 | **Target module(s)** | **spec** — §31.1 (the throw operand; the flagged ruling resolved), §31.2.1 (multi-type binding rule simplified; generic arm bound tightened), §31.2.3 (catch-all restored), §31.2.5 (the asterisk deleted), §17.12/§31.5 (wording), §22.15 (pure-throw carve-out's operand sentence), Appendix C.5 (invariant wording). **stdlib** — none (§2.17's hierarchy already complies). **rationale** — §11.3 area gains the decision record (or a new §11 subsection). **guides** — Guide 02 wording only (no non-`Exception` teaching exists to delete). |
 | **Written against** | spec/stdlib v0.241 |
