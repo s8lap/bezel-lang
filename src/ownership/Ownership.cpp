@@ -73,6 +73,31 @@ bool ownedParamIsFrameDisposable(const sema::ParameterSymbol& ps,
             pt->declaration->kind == ast::TypeDeclKind::Interface) &&
            !pt->declaration->isValueBuiltin;
 }
+
+// fix #3037 / §28.3 (v0.240): the source location of a §28.3 owned-binding
+// diagnostic. Most owned-binding kinds carry `obligationOrigin` populated by the
+// analysis (a back-pointer to the AST node where the obligation was created,
+// set at the `:= EXPR` site or at the for-iter seed). The PARAMETER arm does
+// not: a parameter's owned obligation is established at the parameter's own
+// declaration (the obligation's natural home — the parameter *is* an owned
+// slot from method entry, not from an expression), but `ast::Param` is NOT an
+// `ast::Node` (it carries a single `SourceLocation loc`, not a `span`), so
+// `LocalOwnership::obligationOrigin` was being seeded to `ps->decl` (which is
+// always null for parameters) and every parameter diagnostic fell through to
+// `SourceLocation{}` → `0:0`. SymbolCollection now stamps
+// `ParameterSymbol::declLoc` from the parser's `Param::loc`; this helper is
+// the uniform "use obligationOrigin when present, else the parameter's own
+// declLoc when the symbol is a parameter, else the default 0:0" diagnostic
+// site used at every §28.3 owned-binding emission. Keeping the fallback in
+// one place prevents the per-site drift the issue (#3037) describes.
+static SourceLocation obligationDiagLoc(sema::Symbol* sym,
+                                        const LocalOwnership& st) {
+    if (st.obligationOrigin) return st.obligationOrigin->span.begin;
+    if (auto* ps = dynamic_cast<sema::ParameterSymbol*>(sym)) {
+        return ps->declLoc;
+    }
+    return SourceLocation{};
+}
 }  // namespace
 
 // §28.1 (v0.196, #1817/#1860): isValueSubstitutionErased is declared in
@@ -459,8 +484,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // disposal itself is unchanged. // per §28.3/§29.8/§30.1
                         ctx_.diagnostics().report(
                             Severity::Warning,
-                            st.obligationOrigin ? st.obligationOrigin->span.begin
-                                                : SourceLocation{},
+                            obligationDiagLoc(sym, st),
                             std::string("owned parameter `") +
                             std::string(sym->name) +
                             "` is implicitly disposed by the frame at teardown "
@@ -502,8 +526,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // the frame's teardown is an implicit drop.
                         ctx_.diagnostics().report(
                             Severity::Warning,
-                            st.obligationOrigin ? st.obligationOrigin->span.begin
-                                                : SourceLocation{},
+                            obligationDiagLoc(sym, st),
                             std::string("owned parameter `") +
                             std::string(sym->name) +
                             "` is implicitly disposed by the frame at teardown "
@@ -714,8 +737,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
                         // again and no discharge; name the marker.
                         ctx_.diagnostics().report(
                             Severity::Warning,
-                            st.obligationOrigin ? st.obligationOrigin->span.begin
-                                                : SourceLocation{},
+                            obligationDiagLoc(sym, st),
                             std::string("owned parameter `") +
                             std::string(sym->name) +
                             "` is implicitly disposed at the end of the method "
@@ -875,8 +897,7 @@ void MethodOwnership::run(const std::vector<std::unique_ptr<ast::Stmt>>& body,
             }
             ctx_.diagnostics().report(
                 Severity::Error,
-                st.obligationOrigin ? st.obligationOrigin->span.begin
-                                    : SourceLocation{},
+                obligationDiagLoc(sym, st),
                 std::string("owned value in `") +
                 std::string(sym->name) +
                 "` would be dropped here without disposal "

@@ -106,6 +106,20 @@ std::vector<Symbol*> collectParams(const std::vector<ast::Param>& params,
         // §22.4 (v0.183, #1585): carry the out-nullability postcondition onto
         // the symbol so narrowing and override-match can consult it.
         sym->outNullPostcond = p.outNullPostcond;
+        // fix #3037 / §28.3 (v0.240): carry the parameter's own source
+        // location onto the symbol. The parser stamps `Param::loc` at the
+        // parameter's first token (modifier or name) — `Param` is not an
+        // `ast::Node` so it has no `span`, only this single SourceLocation.
+        // Without it, every §28.3 owned-parameter diagnostic that doesn't have
+        // a recorded `obligationOrigin` (the parameter arm — the obligation
+        // is established at the parameter declaration itself, not at an
+        // expression) would have fallen back to `SourceLocation{}` and
+        // printed `0:0`, pointing at nothing (the parameter is the only
+        // owned-binding kind whose diagnostic site is its declaration, not
+        // its first use site; the param arm has no "first use"). Mirrors
+        // fix #2418 (FieldSymbol/MethodSymbol/etc.) and fix #2482
+        // (PositionalField via FieldSymbol::declLoc).
+        sym->declLoc = (p.loc.line != 0) ? p.loc : sym->declLoc;
         out.push_back(sym);
     }
     return out;
