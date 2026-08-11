@@ -1,6 +1,6 @@
 # Bezel Guide 4: Concurrency — Tasks, Domains, and Channels
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.246.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.247.*
 
 The syntax here is mainstream async: `async` methods, `await`, tasks, cancellation tokens. The model underneath is not, and the habits that come with the syntax elsewhere will fight you. Four ideas carry the whole chapter. A **domain** runs one continuation at a time, so most code needs no locks (§1). A **task is a heap resource you own**, like every other class instance (§2). **No mutable state is ever reachable from two domains** — data crosses by ownership transfer or as immutable copies (§5). And fan-out defaults to a **structured scope**, not loose tasks (§4). If you skim everything else, read the three sections headed **How Bezel does it** and the table in §10.
 
@@ -313,7 +313,7 @@ The **type-keyed** half of the taxonomy is four per-type stdlib **facts** — **
 - **`static readonly` of a class type**: admitted **with a warning** — the singleton is reachable from every domain, and confining it to one (or ensuring its own synchronization) is your obligation. The warning is suppressed exactly where the type's own fact line carries the guarantee — **synchronized** or **immutable**: the synchronized handles below, the data-owning locks, and `FrozenArray<T>`.
 - **A mutable static** is a compile error unless it is one of four admitted forms: **(i)** an internally-synchronized handle — a type declaring **synchronized** and not **displacement-unbounded**: `Mutex`, `Semaphore`, the atomics, `ChannelSender<T>`, `SharedEventSource<T>`; **(ii)** the `Task?`/`Task<T>?` lazy cache (below); **(iii)** a value static of primitive or enum type — or the nullable form of either, or a plain (non-`owned`) inline array of those — admitted *with a warning* and no cross-domain promises; **(iv)** the owning-inline-array slot pool, likewise warned. (`Channel<T>` declares no facts — the channel is the single-consumer receiving end — publish a `ChannelSender<T>` static instead. The locks and `FrozenArray<T>` are kept out of form (i) by **displacement-unbounded**: a mutable static's overwrite never disposes what it displaces, and stranding a lock's whole interior — or a whole frozen array — is the cost the fact names.)
 
-**The `Task?` cache** is the one admitted mutable static that holds a value your own code computes — form (i)'s members are all internally-synchronized handles. It exists because async values do not belong in static initializers (`await` is illegal there). Cache the *task*, not the value, and let every consumer await it — Pattern A fan-out through process-lived storage (spec §22.13):
+**The `Task?` cache** is the one admitted warning-free mutable static that holds a value your own code computes — form (i)'s members are all internally-synchronized handles. It exists because async values do not belong in static initializers (`await` is illegal there). Cache the *task*, not the value, and let every consumer await it — Pattern A fan-out through process-lived storage (spec §22.13):
 
 ```bezel
 private static _cfg: Task<Config>? := null;              // §22.12 rule 2(ii)

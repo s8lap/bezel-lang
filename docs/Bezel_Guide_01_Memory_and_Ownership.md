@@ -1,6 +1,6 @@
 # Bezel Guide 1: Memory and Ownership
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.246.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.247.*
 
 Bezel has no garbage collector. Every heap object has exactly one owner responsible for disposing it. The compiler tracks ownership and guarantees every object is disposed exactly once — no leaks, no double-frees. This is an **affine** model: an owned value you do not explicitly discharge is auto-dropped at the end of its scope, with a must-use warning (§2's trivial-dispose classes excepted). A use-after-free or double-free is rejected outright. This guide shows the everyday patterns; it does not restate the full rules (see spec §28).
 
@@ -280,7 +280,7 @@ end Write;
 var displayName: string := user?.Name ?? "Anonymous";   // both sides are string
 ```
 
-`a ?? b` returns `a` when non-null, else `b`. The right side may be `T` or `T?`, and the result is nullable exactly when the right side is: `user?.Name ?? "Anonymous"` is a plain `string`, while `primary ?? fallback` over two `string?`s stays `string?`. It works whenever `a` and `b` agree on ownership: two `string`s, two borrows (their sources need not match; the result is a borrow you use while both stay live), or two owned values *freshly produced in the arms*. Writing two *named* owned locals as the arms makes it a borrow merge instead — a named owned binding read as an arm is a borrow, never a silent consume; so to coalesce two owned locals into one owned result, use an explicit `if`/`else` with `owned` transfers. `??` is rejected only when the two sides disagree on ownership — the same single rule §8 is about. The `?.` (null-conditional) and `??=` (assign-if-null) operators follow the same principle.
+`a ?? b` returns `a` when non-null, else `b`. The right side may be `T` or `T?`, and the result is nullable exactly when the right side is: `user?.Name ?? "Anonymous"` is a plain `string`, while `primary ?? fallback` over two `string?`s stays `string?`. It works whenever `a` and `b` agree on ownership: two `string`s, two borrows (their sources need not match; the result is a borrow you use while both stay live), or two owned values *freshly produced in the arms*. Writing two *named* owned locals as the arms makes it a borrow merge instead — a named owned binding read as an arm is a borrow, never a silent consume; so to coalesce two owned locals into one owned result, use the marked arms — `(if a <> null then move a else move b)` — or an explicit `if`/`else` with `move` transfers (Pattern B below). `??` is rejected only when the two sides disagree on ownership (and the marker is never written in a `??` operand — spec §28.3) — the same single rule §8 is about. The `?.` (null-conditional) and `??=` (assign-if-null) operators follow the same principle.
 
 **Fixing it inside the method, with no field.** The earlier `ResponseWriter` used an object-scoped field so the fallback outlived the method. You do not need a field — you need the owned fallback to be live *at the point of use*. The cleanest way is to stop trying to make one `target` span the merge. Instead, put the write where the fallback is in scope, using the nested-block tool the language provides for exactly this:
 

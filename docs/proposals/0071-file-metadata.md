@@ -7,6 +7,7 @@
 | **Target module(s)** | `System.IO` (extends stdlib §7.3 `File`; new `FileStatus`/`FileKind` types in a new §7.3b — numbering at docs-editor discretion, the 0009 precedent; 0017 already claims §7.3a) |
 | **Written against** | spec/stdlib **v0.227** |
 | **Gap-review item** | — (not among the [gap review](stdlib-gap-review-2026-07.md)'s 31 items; see §0) |
+| **Currency note** | Refreshed 2026-08-11 to v0.246: §17.11's zero-constant diagnostic is an error since v0.242 (was a warning) — the §8 claim conformed; the design is unaffected (`FileKind` has the zero constant). Written-against pin unchanged. |
 
 ---
 
@@ -184,7 +185,7 @@ One rule for "absent" — `FileNotFoundException` regardless of *which* componen
 5. **Handle-based stat (`FileStream.GetStatus()`)** — deferred: the race-free fstat companion for open files; `FileStream` already exposes `Length` (§7.1), which covers the observed need; add the full form when a real mtime-of-open-handle workload arrives.
 6. **Full POSIX mode bits / owner ids / `IsExecutable`** — declined per D5: not cross-platform-defensible as shared surface; a future platform-extensions section is the home if evidence arrives.
 7. **Async duals (`GetStatusAsync`)** — declined per §5, citing 0018 §7's recorded rule for metadata operations.
-8. **Try shape (b) (`TryGetStatus(path): FileStatus?`)** — considered, and raised as open question 6 rather than silently declined: stdlib §1's own criterion for shape (b) ("the payload is statically non-nullable, so a bool would carry no information") applies here verbatim, and shape (c) hands a result-ignoring caller a plausible-looking zero (`default(FileStatus)` reads as an empty regular file — `FileKind.File` is the zero constant, so §17.11's zero-constant warning does not fire). Shape (c) is proposed anyway for the spelling parallel with the `TryParse` family and the `out var` idiom the §9 examples lean on; note `FileStatus` would be the first user-visible record payload in shape (c) (every current shape-(c) out is a primitive or value builtin).
+8. **Try shape (b) (`TryGetStatus(path): FileStatus?`)** — considered, and raised as open question 6 rather than silently declined: stdlib §1's own criterion for shape (b) ("the payload is statically non-nullable, so a bool would carry no information") applies here verbatim, and shape (c) hands a result-ignoring caller a plausible-looking zero (`default(FileStatus)` reads as an empty regular file — `FileKind.File` is the zero constant, so §17.11's zero-constant error, a warning before v0.242, does not fire). Shape (c) is proposed anyway for the spelling parallel with the `TryParse` family and the `out var` idiom the §9 examples lean on; note `FileStatus` would be the first user-visible record payload in shape (c) (every current shape-(c) out is a primitive or value builtin).
 8. **Per-fact statics (`File.GetSize`, `File.GetLastWriteTime`)** — declined per D1: N syscalls, mutually-inconsistent reads, and a wider surface for the same information.
 
 ## 9. Tour by example

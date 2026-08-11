@@ -1,6 +1,6 @@
 # Bezel Guide 3: Modeling Data
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.246.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.247.*
 
 Bezel gives you five ways to declare a data shape and three ways to select over one. This guide is the picking rule for each. The definitions live in the spec (§9 records, §10 enums, §11 classes, §19 selection, §35 choices), and the *why* behind the design is rationale §9.6. For choosing a **failure signal** (`T?` vs `Try` vs `Result` vs `requires`/exceptions), see Guide 2 §7 — that table is the home; this guide does not repeat it.
 
@@ -41,7 +41,7 @@ Boundary calls that come up in practice:
 - **Enum vs choice.** The moment one alternative needs a payload, it is a `choice`. Do not encode payloads beside an enum in parallel fields — the compiler cannot tie them together. A `choice` case carries its payload, and the `case` arms bind it.
 - **Record vs class.** If two instances with the same components should be *the same value* — dictionary keys, messages, coordinates — it is a `record`. If it has a lifecycle (opened, mutated, disposed) or identity matters, it is a `class`. A record cannot hold an owned resource; that is the design, not a limitation (spec §28.5 — copy-semantics holders cannot carry disposal obligations).
 - **A cache field on a record.** Mark it `equality skip` — `private equality skip _cachedLen: int;` — and the structural `=`/hash package survives with the cache excluded (spec §9.2); the clause mirrors `serialized skip`. An *unannotated* cache field still makes comparison a loud compile error, never silent reference equality.
-- **Choice vs closed hierarchy.** A `choice` is data-first: a fixed case list, pattern-matched everywhere, no per-case methods. A `closed` hierarchy is behavior-first: each leaf is a class with its own members and can carry owned state, and `case` over the leaves is still exhaustive (§19.6). Reach for the hierarchy when cases have *behavior*; reach for the choice when cases are *shapes of data*.
+- **Choice vs closed hierarchy.** A `choice` is data-first: a fixed case list, pattern-matched everywhere, no per-case methods. A `closed` hierarchy is behavior-first: each leaf is a class with its own members and can carry owned state, and `case` over the leaves is still exhaustive (§19.6) — for *non-generic* hierarchies; the carve is in §2 below. Reach for the hierarchy when cases have *behavior*; reach for the choice when cases are *shapes of data*.
 - **Choice vs `T?`.** A choice with one meaningful payload and one empty case is what `T?` already provides — use `T?` (the recorded rule; DECLINED.md's `Option<T>` entry).
 
 ## 2. Selecting over a value — `(if …)`, `(when …)`, `(case …)`
@@ -64,7 +64,7 @@ var label  := (case outcome of                                 // shape dispatch
 
 - `elif` chains keep a short ladder inside the conditional atom (`(if c1 then a elif c2 then b else d)`). Once arms stop being conditions-on-different-things and start being cases-of-one-thing, switch to `case`.
 - `case` is the only form that *binds* — patterns destructure payloads (`Fetched(var body)`) and narrow types (`var c: Circle`). If you need the scrutinee's pieces, you want `case` regardless of arity.
-- Exhaustiveness: `case` over an enum, choice, or closed hierarchy needs no `_` arm when every case is covered (§19.6) — prefer that. A `_` arm silences the compiler's help when the type grows.
+- Exhaustiveness: `case` over an enum, choice, or closed hierarchy needs no `_` arm when every case is covered (§19.6) — prefer that. A `_` arm silences the compiler's help when the type grows. One carve (v0.245): when a closed hierarchy's root or any leaf is *generic*, leaf coverage is not attempted — no arrangement of type-pattern arms is a static proof, and the `case` is completable only by an irrefutable arm (an unguarded `_` or unguarded untyped `var`); a value-shaped sum there is better modeled as a `choice`, whose exhaustiveness is counted by case name and needs no `_` (§19.6).
 - Ownership in arms follows the meet rule (Guide 1 §8): arms must agree — all owned or all borrowed. A named owned binding as an arm is a borrow unless you mark it (`move x`, consume-if-selected).
 
 ## 3. Where the failure signal fits

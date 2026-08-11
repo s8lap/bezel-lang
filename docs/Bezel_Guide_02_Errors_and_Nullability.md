@@ -1,6 +1,6 @@
 # Bezel Guide 2: Errors and Nullability
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.246.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.247.*
 
 Most of the syntax here is mainstream: non-nullable by default, `?` for nullable, `?.`, `??`, exceptions with `try`/`catch`/`finally`. The *emphasis* is not. Bezel splits failure signals by one rule (the **failure-signal rule**, stdlib §1), and it is worth knowing the shape before the details (teaching order here, not the rule's band order):
 

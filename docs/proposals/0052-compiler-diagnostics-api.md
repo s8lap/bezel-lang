@@ -4,6 +4,7 @@
 **Tracking issue:** [#2039](https://github.com/s8lap/bezel-lang/issues/2039)
 **Target:** Tooling only — reference-compiler surface (`bezelc` output formats, a diagnostic-code catalogue, `--explain`, a batch query mode, staged server modes). **Zero normative spec change**, defended in §2.1: Appendix [D](../Bezel_Language_Spec.md#appendix-d-conformance-levels)'s diagnostic-identity latitude (v0.163) is exercised, not narrowed — the code registry is reference-compiler surface, deliberately *not* a spec registry. No grammar change, no stdlib change.
 **Written against:** spec v0.197 (stdlib/rationale at the same revision), compiler @ `bf96dd6`
+**Currency note:** Refreshed 2026-08-11 to v0.246: transfer-marker consume spellings respelled `move` in the §2 example and the `--explain BZL2803` display (v0.246). Written-against pin unchanged.
 
 This proposal expands item **P12** of [`future-directions-2026-07-18.md`](future-directions-2026-07-18.md) to commissioning depth. Where it sharpens or diverges from the P12 sketch, the divergence is recorded in §8. *Reference convention: an unprefixed §-reference is a language-spec reference; `stdlib §`, `rationale §`, and `0040 §`/`0043 §`/… prefixes are written out; this proposal's own sections are cited as "§N below" or from context.*
 
@@ -166,7 +167,7 @@ public class Program
     var buf := new Array<int>();
     buf.Add(41);
     var s := buf.AsSpan();      // `s` carries a borrow of `buf` (§9.7 record local)
-    var taken := owned buf;     // BZL2805: consume while `s` is live
+    var taken := move buf;      // BZL2805: consume while `s` is live
     _ := taken;
     return s.Length;
   end Main;
@@ -267,7 +268,7 @@ points at the consuming site.
 
 Rejected:                                Remedy (rebind after the transfer):
     var a := new Array<int>();               var a := new Array<int>();
-    var b := owned a;                        var b := owned a;
+    var b := move a;                         var b := move a;
     a.Add(1);        // BZL2803              b.Add(1);
 
 Related: BZL2801 (dropped without disposal), BZL2805 (consume-site freeze).
