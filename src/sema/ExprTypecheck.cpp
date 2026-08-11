@@ -9014,13 +9014,87 @@ void ExprTC::visitMember(const ast::Member& m) {
             // reject it. That is exactly the incompleteness its contract says
             // not to judge, and #1756's four reverts are the precedent.
             if (fd->type) {
-                if (TypeRef* fty = ctx_.resolvedType(*fd->type))
+                if (TypeRef* fty = ctx_.resolvedType(*fd->type)) {
+                    // per §15.4 (#2958): the §15.4 collection-literal target
+                    // gate that #2914 added at the LOCAL-DECL position and
+                    // #3031 extended to return / call-arg / lambda-body was
+                    // MISSING here. `checkAssignable` no-ops on a null `from`,
+                    // so a non-admissible field type (Object, int, string, a
+                    // class with no `FromCollectionLiteral`) walked past the
+                    // type-lattice check; codegen's materializeHeap* path then
+                    // returned null on the bad target and the slot was filled
+                    // with a zero/null value (the WORST of the three #2958
+                    // siblings — zero diagnostics, silently wrong value).
+                    // Mirror the local-decl arm's positive gate so the same
+                    // `isCollectionLiteralAdmissibleTarget` predicate that
+                    // rejected the same shape at `var o: Object := [...]` also
+                    // rejects it at `public Slot: Object := [...]`. The
+                    // local-decl position intentionally does NOT defer on a
+                    // generic-substituted target (`var x: T := [1, 2, 3]`
+                    // inside `Make<T>` rejects at declaration time even if a
+                    // later `Make<Array<int>>` could have substituted an
+                    // admissible target — #2914's accept-control at the
+                    // `Array<T>` head proves the generic-arg case still admits
+                    // when the head itself is on §15.4's list); match that
+                    // discipline here so a `Slot: T := [1, 2, 3]` in
+                    // `class Box<T>` cannot silently survive to a `Box<int>`
+                    // instantiation where `T` substitutes to `int` (the
+                    // #2958 silent-zero trap) or to `Box<Array<int>>` where
+                    // the substitution would have been admissible (a false
+                    // reject the local-decl position also pays).
+                    if (auto* cl = dynamic_cast<
+                                const ast::CollectionLiteralExpr*>(
+                                fd->initializer.get())) {
+                        const bool isEmpty =
+                            !cl->isDict && cl->elements.empty();
+                        const bool admitted =
+                            isEmpty
+                                ? isCollectionLiteralEmptyAdmissibleTarget(
+                                      fty)
+                                : isCollectionLiteralAdmissibleTarget(
+                                      fty, cl->isDict);
+                        if (fty->kind != TypeRef::Kind::Error &&
+                            !admitted) {
+                            if (isCollectionLiteralInterfaceTarget(fty))
+                                reportCollectionLiteralInterfaceTarget(
+                                    ctx_.diagnostics(),
+                                    fd->initializer->span.begin,
+                                    namedTypeSimpleName(fty));
+                            else if (cl->isDict &&
+                                     isCollectionLiteralAdmissibleTarget(
+                                         fty, /*isDict=*/false))
+                                reportCollectionLiteralDictFormBadTarget(
+                                    ctx_.diagnostics(),
+                                    fd->initializer->span.begin, fty);
+                            else
+                                reportCollectionLiteralBadTarget(
+                                    ctx_.diagnostics(),
+                                    fd->initializer->span.begin, fty);
+                            // Restore scope/flag state before returning
+                            // — the field-init's own save/restore at
+                            // lines 9077-9078 below is unreachable on this
+                            // path.
+                            currentScope_ = saveScope;
+                            inFieldInitializer_ = save;
+                            return;  // reported; skip the
+                                     // assignability check below
+                        }
+                    }
+                    // The §5.1 / §22.8 / §23.1 assignability check that
+                    // #2926 added still defers on `mentionsUnsubstitutedTypeParam`
+                    // (its contract says deferring is the SAFE direction —
+                    // a missed mention is what makes a check run against an
+                    // unsubstituted parameter); leave that deferral in place
+                    // for the assignability half, since #2926 has a
+                    // measurement-recorded false-reject probe that justifies
+                    // it for numeric widening.
                     if (!mentionsUnsubstitutedTypeParam(fty))
                         checkAssignable(ctx_.exprType(*fd->initializer), fty,
                                         fd->initializer->span.begin,
                                         std::string("initializer for field `") +
                                             std::string(fd->name) + "`",
                                         fd->initializer.get());
+                }
             }
             currentScope_ = saveScope;
             inFieldInitializer_ = save;
@@ -9292,7 +9366,61 @@ void ExprTC::visitMember(const ast::Member& m) {
             // `public property P: byte := 300;` truncated exactly as the field
             // spelling did. Same scope discipline as the FieldDecl arm.
             if (pd->type) {
-                if (TypeRef* pty = ctx_.resolvedType(*pd->type))
+                if (TypeRef* pty = ctx_.resolvedType(*pd->type)) {
+                    // per §15.4 (#2958): mirror the §15.4 collection-literal
+                    // target gate the FieldDecl arm just below gained. The
+                    // auto-property initializer initializes the same backing
+                    // field as an explicit field initializer (§23.1, §11.1's
+                    // "field and property initializers together as one
+                    // construction-time concept"), so the gate that #2914
+                    // added at local-decl and #3031 extended to return /
+                    // call-arg / lambda-body has to apply here too — without
+                    // it `public property P: Object := [1, 2, 3];` compiled
+                    // clean and the backing field was zero/null-filled (the
+                    // #2958 silent-wrong-value trap, same shape as the
+                    // explicit field-init sibling). The
+                    // `mentionsUnsubstitutedTypeParam` deferral is NOT used
+                    // here either, for the same reason as in the FieldDecl
+                    // arm — see that arm's comment for the measurement.
+                    if (auto* cl = dynamic_cast<
+                                const ast::CollectionLiteralExpr*>(
+                                pd->autoInitializer.get())) {
+                        const bool isEmpty =
+                            !cl->isDict && cl->elements.empty();
+                        const bool admitted =
+                            isEmpty
+                                ? isCollectionLiteralEmptyAdmissibleTarget(
+                                      pty)
+                                : isCollectionLiteralAdmissibleTarget(
+                                      pty, cl->isDict);
+                        if (pty->kind != TypeRef::Kind::Error &&
+                            !admitted) {
+                            if (isCollectionLiteralInterfaceTarget(pty))
+                                reportCollectionLiteralInterfaceTarget(
+                                    ctx_.diagnostics(),
+                                    pd->autoInitializer->span.begin,
+                                    namedTypeSimpleName(pty));
+                            else if (cl->isDict &&
+                                     isCollectionLiteralAdmissibleTarget(
+                                         pty, /*isDict=*/false))
+                                reportCollectionLiteralDictFormBadTarget(
+                                    ctx_.diagnostics(),
+                                    pd->autoInitializer->span.begin,
+                                    pty);
+                            else
+                                reportCollectionLiteralBadTarget(
+                                    ctx_.diagnostics(),
+                                    pd->autoInitializer->span.begin,
+                                    pty);
+                            currentScope_ = saveScope;
+                            inFieldInitializer_ = save;
+                            return;  // reported; skip the
+                                     // assignability check below
+                        }
+                    }
+                    // The assignability half still defers on
+                    // `mentionsUnsubstitutedTypeParam` for the same reason
+                    // as in the FieldDecl arm — see that arm's comment.
                     if (!mentionsUnsubstitutedTypeParam(pty))
                         checkAssignable(
                             ctx_.exprType(*pd->autoInitializer), pty,
@@ -9300,6 +9428,7 @@ void ExprTC::visitMember(const ast::Member& m) {
                             std::string("initializer for property `") +
                                 std::string(pd->name) + "`",
                             pd->autoInitializer.get());
+                }
             }
             currentScope_ = saveScope;
             inFieldInitializer_ = save;
