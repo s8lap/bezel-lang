@@ -2752,43 +2752,57 @@ llvm::Value* Emitter::lowerExprInner(const ast::Expr& e) {
                 // any unknown member already.
                 return nullptr;
             }
-            // Fallback for cases where the receiver's runtime layout might be a
-            // `%bz.string`. The fallback calls `loadStringLen`, which only
-            // produces a defined answer when the lowered value points at one.
-            // FIX #2933: this is now a POSITIVE list (return true ONLY when
-            // the receiver gives us NO information to rule a `%bz.string`
-            // layout out). Previously a NEGATIVE list — exclude known
-            // non-string builtins (StringBuilder, Buffer, FileStream,
-            // collections, FFI buffers) and assume EVERYTHING ELSE is a
-            // `%bz.string` — which silently mis-lowered any new reserved
-            // builtin that arrived without an exclusion entry: the "fifth
-            // missing category" #2809 fixed for the FFI buffer family, the
-            // "sixth" predicted by #2933 (and the structural reason #2809 /
-            // #2875 / #2923 were the same defect class). The reserved-name
-            // registry in src/common/BuiltinRegistry.cpp is the SINGLE
-            // authority for what each name means; routing through it makes
-            // an omission FAIL SAFE (no dedicated arm matches → no
-            // `.Length` handler fires → a downstream compile error,
-            // never a wild memory read). // per §4.6 (v0.240)
+            // Fallback for cases where sema type is truly unknown (e.g. e.Message
+            // on a built-in exception — sema doesn't know Message returns
+            // string). Only apply when the target has NO declaration (built-in
+            // exceptions) and NOT a Named type with a known user declaration
+            // (which might have a computed 'Length' property of its own).
+            // Exclude StringBuilder (has its own handler that sums part lengths)
+            // and Buffer<T> (has its own header-load handler below — the string
+            // fallback would call loadStringLen which loads field[1]=elem_size
+            // instead of field[0]=len, producing a wrong value per issue #545).
             auto isStringFallbackTarget = [&]() -> bool {
-                if (!tt) return true;  // unknown type — nothing safer to do
+                if (!tt) return true;  // unknown type → fallback
+                if (tt->kind != sema::TypeRef::Kind::Named || tt->declaration)
+                    return false;
                 if (!tt->astNode || !tt->astNode->name ||
                     tt->astNode->name->parts.empty())
-                    return true;       // degenerate TypeRef; no name to consult
-                // For every other Named receiver (declaration-less or not)
-                // defer to the dedicated arms lowerExpr runs AFTER this
-                // predicate: StringBuilder (§3), FileStream (§7.2), FFI
-                // buffers via isFfiBufferTypeRef (§10), OwningBuffer<T>
-                // (§4.14), collections (§4.14), LinkedList/Dictionary
-                // (§4.17), span/ReadOnlyStringSpan (§3.4). The explicit
-                // exclusions the previous negative list carried (StringBuilder,
-                // Buffer, FileStream, isCollectionTypeName, isFfiBufferBuiltin
-                // Name) are now REDUNDANT — each dedicated arm's predicate
-                // stands on its own — and any future reserved builtin added
-                // to isReservedBuiltinTypeName without a corresponding `.Length`
-                // arm will simply NOT be claimed here, which is the desired
-                // loud-fail shape.
-                return false;
+                    return true;
+                std::string_view n = tt->headName();
+                if (n == "StringBuilder") return false;  // has own handler
+                if (n == "Buffer") return false;          // issue #545: own handler
+                // stdlib §7.2 (#645): FileStream has its own `.Length` handler
+                // (bz_filestream_length). The string fallback's loadStringLen
+                // would read field[1] of the bz_filestream_t — the stored `path`
+                // POINTER — and hand it back as the file's length.
+                if (n == "FileStream") return false;
+                // #1006(b): an array-backed collection (`Array<T>` etc.) has its
+                // own `.Length` handler below (bz_array_len) that also reclaims an
+                // UNBOUND owned borrowing-array receiver (`P.Fold(s).Length`). Do
+                // NOT intercept it here — the string fallback's loadStringLen would
+                // read the array header's field[0] by layout coincidence and skip
+                // the reclaim, leaking the temporary (the value is right by luck
+                // but the temp leaks). Route to the dedicated array path instead.
+                if (isCollectionTypeName(tt)) return false;
+                // fix #2809 / §32.5 / stdlib §10.1–§10.3 (v0.240): the three
+                // FFI-boundary BUFFER classes have their own `.Length` handler
+                // below (strlen / bz_wstrlen / bz_rawbytes_length) and are the
+                // ONE receiver family here for which the fallback is a MEMORY
+                // ERROR rather than a wrong value: a `CString`/`WString` is a
+                // bare malloc'd null-terminated buffer with no header at all, so
+                // loadStringLen's `%bz.string` field-1 read (offset 8..15) runs
+                // off the end of a short buffer — `len(CString.From("abc"))`
+                // (13-byte buffer) was an ASan heap-buffer-overflow INSIDE the
+                // callee. The receiver reaches here only in the ANNOTATION
+                // TypeRef shape (`c: CString` on a parameter/field, declaration
+                // == null); the factory shape carries a builtinClassSym
+                // declaration and never entered this fallback, which is why the
+                // `using var` spelling always worked and only the parameter
+                // spelling crashed. RawBytes was right by layout coincidence
+                // ({ptr,len} field 1 == the byte count) — routed here too so it
+                // stops depending on that coincidence.
+                if (common::isFfiBufferBuiltinName(n)) return false;
+                return true;
             };
             if (ma->member == "Length" && isStringFallbackTarget() &&
                 (!tt ||
