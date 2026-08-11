@@ -4,6 +4,7 @@
 **Tracking issue:** [#2034](https://github.com/s8lap/bezel-lang/issues/2034)
 **Target:** Verification artifact only — a new top-level `formal/` tree (paper calculus, Lean 4 model, differential-validation bridge), **never a compiler build dependency** (§5.4). No spec, stdlib, grammar, or compiler changes. Two process touch points, both staged: (a) one checklist line added to [`spec-change-process.md`](spec-change-process.md) §9 at stage S3 (a §28/§30 change updates the model or records its exclusion); (b) an **advisory, optional** CI lane alongside the existing `.github/workflows/ci.yml`, never in `scripts/gate.sh`'s blocking path.
 **Written against:** spec v0.197 (stdlib/rationale at the same revision)
+**Currency note:** Refreshed 2026-08-11 to v0.246: the marked-transfer spelling is `move x` at every consume position (v0.246 unification — the calculus's `"owned" x` marked-transfer form, its Arg alternative, the T-Move/T-Frz/T-Call rule displays, and the §5.3 examples respelled; declaration positions — `Field`/`Param`/`Ret` `owned` — unchanged). ⚠ Two v0.243/v0.246 interactions are flagged for the S0 design pass, not fixed here (calculus `throw` of non-`Exception` classes vs v0.243; the §3.1 A7-by-omission note vs the v0.209/v0.246 A7 scope) — see the 2026-08-11 currency paper. Written-against pin unchanged.
 
 This proposal expands item **P7** of [`future-directions-2026-07-18.md`](future-directions-2026-07-18.md) to commissioning depth. It is the consumer proposal [0046](0046-ownership-kernel-consolidation.md) §11 pre-announces: the kernel principles **K1–K9** and the axiom register **A1–A14** are adopted from 0046 *verbatim* — this document introduces no parallel numbering, and every model artifact cites K/A ids as frozen at 0046's T1 landing. Where this document sharpens or diverges from the P7 sketch, the divergence is recorded in §11. *Reference convention: an unprefixed §-reference is a language-spec reference; `rationale §`, `stdlib §`, and `0046 §` prefixes are written out; this proposal's own sections are cited as "§N below" or from context.*
 
@@ -13,7 +14,7 @@ Build a mechanized model of Bezel's ownership core — the 0046 kernel — in Le
 
 ## 1. Problem and evidence
 
-**1.1 The core exhibit: a false soundness claim shipped, and stayed shipped, until a probe found it.** Rationale §5.1's v0.180 record, in its own words: what forced the consume-site freeze was the case with *"no runtime backstop of any kind"* — an object moved to another domain stays alive, no disposed flag is ever set, and a surviving pre-transfer borrow is a live data race, *"probe-confirmed, 2026-07 review — §30.14's isolation claim was false without the freeze."* The claim ("no mutable state is ever reachable from two domains") had been normative since v0.133; the hole was expressible in three lines (`var b := x; Domain.Spawn(W, owned x);` then use `b`); nothing in the process — spec review, compiler tests, the guides' re-traces — was *shaped* to find it, because each checks text or code against text, and this was a false *theorem*. It fell to an adversarial probe, years of revisions late. A mechanized isolation theorem fails to prove the moment the machine admits that program; the counterexample generator hands back the exact three-line witness.
+**1.1 The core exhibit: a false soundness claim shipped, and stayed shipped, until a probe found it.** Rationale §5.1's v0.180 record, in its own words: what forced the consume-site freeze was the case with *"no runtime backstop of any kind"* — an object moved to another domain stays alive, no disposed flag is ever set, and a surviving pre-transfer borrow is a live data race, *"probe-confirmed, 2026-07 review — §30.14's isolation claim was false without the freeze."* The claim ("no mutable state is ever reachable from two domains") had been normative since v0.133; the hole was expressible in three lines (`var b := x; Domain.Spawn(W, move x);` then use `b` — v0.246 marker spelling); nothing in the process — spec review, compiler tests, the guides' re-traces — was *shaped* to find it, because each checks text or code against text, and this was a false *theorem*. It fell to an adversarial probe, years of revisions late. A mechanized isolation theorem fails to prove the moment the machine admits that program; the counterexample generator hands back the exact three-line witness.
 
 **1.2 The record generalizes.** The run logs are a chronicle of ownership-soundness holes found empirically, after shipping, by adversarial discovery sweeps: the owned-field-move double-free matrix, the announced-kill join refinements (v0.184), the frame-carried-capture dangle that v0.196 closed (rationale §5.25 — an iterator frame over a capturing callback *"passed the frame-return check by the letter"* while the same borrow as a plain argument was rejected: a statically certain dangle, guarded by nothing), the drop-on-overwrite/borrow interaction (#1465, #2010/#2016). Each was a *consequence-interaction* bug — two individually sound rules composing unsoundly — which is precisely the class a model catches (the theorem quantifies over all compositions) and case-by-case review does not.
 
@@ -74,10 +75,10 @@ Stmt   ::= "skip" | Stmt ";" Stmt
          | "throw" Rhs | "try" Stmt "catch" x Stmt "end"
          | [ "var" x ":=" ] "call" m "(" Arg* ")"
 Rhs    ::= "new" C | "null" | x                   -- fresh | null | unmarked read (borrow)
-         | "owned" x                              -- marked transfer (K3.4)
+         | "move" x                               -- marked transfer (K3.4)
          | "move" x "." f                         -- owned field take (K9.1)
          | x "." f                                -- field read (borrow, source {x})
-Arg    ::= x | "owned" x | "move" x "." f | "new" C
+Arg    ::= x | "move" x | "move" x "." f | "new" C
 ```
 
 Two decided simplifications, both recorded in the disposition register: branch and loop conditions are **nondeterministic** (`*`) — data computation is irrelevant to every theorem, and `*` covers all path behaviors, which is strictly more adversarial than any concrete predicate; and the grammar is A-normal (§2.1). The absence of a transfer marker in any arm/operand position is axiom **A7 modeled by omission** — the grammar has no such position, which *is* the axiom's content.
@@ -137,11 +138,11 @@ The marked transfer, and the freeze as its guard (K3.4, K5):
 ```
         Gamma(x) = own C        not frozen(x, Gamma, L)
 T-Move  -----------------------------------------------
-        Gamma |- owned x : C [own] |> Gamma[x := moved]
+        Gamma |- move x : C [own] |> Gamma[x := moved]
 
         Gamma(x) = own C        frozen(x, Gamma, L)
 T-Frz   -----------------------------------------------    -- the v0.180 rule: a
-        Gamma |- owned x  REJECT(K5)                       --   transferring kill is
+        Gamma |- move x  REJECT(K5)                        --   transferring kill is
                                                            --   neither announced nor
                                                            --   flag-backstopped
 ```
@@ -205,7 +206,7 @@ Calls: the signature is the announcement, re-established against the actuals (K2
         Gamma(a1) = own C1        not frozen(a1, Gamma, L)      -- K3.3 consume,
         Gamma |- a2 : C2 [brw(S2)] |> Gamma                     --   K5-guarded
 T-Call  ----------------------------------------------------------------------
-        Gamma |- var y := call m(owned a1, a2) -| Gamma[a1 := moved][y := own]
+        Gamma |- var y := call m(move a1, a2) -| Gamma[a1 := moved][y := own]
         -- an owned-return call is a fresh producer at the caller (K1.5); had
         --   m declared C0 @ {p2}, y would instead be brw(S2) — the declared
         --   source set substituted with the actuals' sources (K2.4); a
@@ -253,7 +254,7 @@ E-UAK   ---------------------------------------------------------------
 
 ### 3.5 Layer 2 delta (sketch)
 
-Configurations become `(H, {D_1..D_n}, Chans)`: one binding/cleanup stack per domain, one shared heap partitioned by a per-domain root reachability map, channels as distinguished heap nodes exempt from the partition (§30.15: the only mutable objects reachable from more than one domain). New statements: `spawn m(owned x)` (capture-free by construction — the calculus's methods have no environment; §30.14's capture-free entry rule is the surface mechanism matching this, recorded like sealing in §2.2), `send c (owned x)`, `var y := recv c`, with `send`/spawn-argument positions being K3.3 consume positions (hence guarded by T-Frz — the load-bearing premise). Sendability: the argument's class must be transfer-closed over `CT` (all fields `owned`-sendable or `val`, coinductively — §30.14 rules 2–3). Channel close disposes undelivered items in reverse insertion order (§30.15), counted by T1's trace. Steps interleave domains arbitrarily at statement granularity; T3 is an invariant over all interleavings.
+Configurations become `(H, {D_1..D_n}, Chans)`: one binding/cleanup stack per domain, one shared heap partitioned by a per-domain root reachability map, channels as distinguished heap nodes exempt from the partition (§30.15: the only mutable objects reachable from more than one domain). New statements: `spawn m(move x)` (capture-free by construction — the calculus's methods have no environment; §30.14's capture-free entry rule is the surface mechanism matching this, recorded like sealing in §2.2), `send c (move x)`, `var y := recv c`, with `send`/spawn-argument positions being K3.3 consume positions (hence guarded by T-Frz — the load-bearing premise). Sendability: the argument's class must be transfer-closed over `CT` (all fields `owned`-sendable or `val`, coinductively — §30.14 rules 2–3). Channel close disposes undelivered items in reverse insertion order (§30.15), counted by T1's trace. Steps interleave domains arbitrarily at statement granularity; T3 is an invariant over all interleavings.
 
 ## 4. The theorems
 
@@ -311,7 +312,7 @@ The model carries the static semantics twice, on purpose: a **declarative** syst
 
 The bridge answers the question every model faces — *is this the same language the compiler implements?* — mechanically, not by inspection. Three levels, each a concrete deliverable:
 
-1. **Verdict differential (S1 gate).** A pretty-printer `bzlprint : Prog → .bzl` emits each calculus program as a real, self-contained Bezel module (classes with `owned` fields, static methods on a carrier class, the main body as `public static method Main()` per §33.2; `*`-branches specialized to literals per enumerated path — §3.4's oracle resolved at generation time). The harness runs `check` and `build/bezelc` over the same program and compares three-valued verdicts: accept / accept-with-warnings / reject. Diagnostic *identity* is compared at rule-family granularity (freeze-class, join-class, restoration-class, …), not message text (Q3). Example — the calculus program `var x := new R; var b := x; var y := owned x; use b` prints as:
+1. **Verdict differential (S1 gate).** A pretty-printer `bzlprint : Prog → .bzl` emits each calculus program as a real, self-contained Bezel module (classes with `owned` fields, static methods on a carrier class, the main body as `public static method Main()` per §33.2; `*`-branches specialized to literals per enumerated path — §3.4's oracle resolved at generation time). The harness runs `check` and `build/bezelc` over the same program and compares three-valued verdicts: accept / accept-with-warnings / reject. Diagnostic *identity* is compared at rule-family granularity (freeze-class, join-class, restoration-class, …), not message text (Q3). Example — the calculus program `var x := new R; var b := x; var y := move x; use b` prints as:
 
    ```bezel
    module Probe;
@@ -324,7 +325,7 @@ The bridge answers the question every model faces — *is this the same language
      public static method Main()
        var x := new R();
        var b := x;               // unmarked read: borrow of x (§28.3)
-       var y := owned x;         // marked transfer while b is live
+       var y := move x;          // marked transfer while b is live
        Console.WriteLine(b);     // keeps b live past the consume
      end Main;
    end P0001;

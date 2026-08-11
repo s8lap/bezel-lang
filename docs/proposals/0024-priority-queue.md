@@ -8,6 +8,7 @@
 | **Written against** | spec **v0.177**; stdlib companion v0.165 |
 | **Origin** | Gap review [#1403](https://github.com/s8lap/bezel-lang/issues/1403) item #11 (P0), wave D3 of the [stdlib gap DESIGN plan](stdlib-gap-design-plan-2026-07.md) |
 | **Scope** | Borrowing form only. The owning form (`OwningPriorityQueue<TElement, TPriority>` where `TElement: class`) is explicitly deferred to the #1334 two-axis review, which governs the owning-collection family shape. |
+| **Currency note** | Refreshed 2026-08-11 to v0.246: `auto-hashable` vocabulary (v0.242; formerly *auto-equality-bearing*). Written-against pin unchanged. |
 
 ---
 
@@ -75,7 +76,7 @@ This is the only shape consistent with §22.3: every out must be assigned on eve
 *(Numbered §4.19 after §4.18 `SortedSet<T>`; adjust at integration time if §4.18 is displaced.)*
 
 ```bezel
-// Auxiliary entry record. Auto-equality-bearing (§9.2 positional record).
+// Auxiliary entry record. Auto-hashable (§9.2 positional record).
 public record PriorityQueueEntry<TElement, TPriority>(
     Element: TElement,
     Priority: TPriority

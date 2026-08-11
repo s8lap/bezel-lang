@@ -6,7 +6,7 @@
 | **Tracking issue** | [#1461](https://github.com/s8lap/bezel-lang/issues/1461) |
 | **Target module(s)** | new `System.Text.Json` (the module named-but-deferred in stdlib §11); relates to §2.14/§2.15 (the serialization vocabulary + JSON format agent) without extending them |
 | **Written against** | spec **v0.177** / stdlib **v0.165** |
-| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); refreshed 2026-08-11 to v0.246: `closed` replaces `sealed abstract` (v0.242, §11.7/§19.6 quotations re-derived from the landed text), the no-binding match arm respelled as a bare type pattern per v0.244's reserved `_`. Written-against pin unchanged. |
 | **Wave** | D3 (gap-review item #21) |
 | **Depends on** | nothing to ship the parse/build/query core. The `WriteTo(TextWriter)` streaming-emit variant rides proposal 0006 (concrete `StreamWriter`/`TextWriter`); the embedded-field *read* round-trip rides an owner ruling (Open Question 1). |
 
@@ -24,8 +24,8 @@ This proposal designs the read/build/navigate/serialize core of that DOM and def
 
 Grep-verified against stdlib v0.177 / spec v0.177; cited, not invented:
 
-- **`sealed abstract class`** — spec §11.7: "The combination `sealed abstract` is permitted and creates a **closed abstract class** … the recommended way to define a closed hierarchy for exhaustive `case` matching (§19.6)." Subclasses must live in the declaring module; exhaustiveness holds across module boundaries (§19.6).
-- **Exhaustive `case` over a sealed hierarchy** — spec §19.6: "when the scrutinee's static type is a `sealed abstract` class … and every leaf type … is matched by a type pattern … no `_` arm is required. **Class leaves are matched by type-test patterns** (`var c: Circle => …`); positional destructuring (§19.3) applies to record leaves, not to class leaves."
+- **`closed class`** — spec §11.7: "A class declared with the **`closed`** modifier is a **closed abstract class** … The `closed` modifier is the recommended way to define a closed hierarchy for exhaustive `case` matching (§19.6)." (Spelled `sealed abstract` through v0.241; respelled v0.242.) Subclasses must live in the declaring module; exhaustiveness holds across module boundaries (§19.6).
+- **Exhaustive `case` over a closed hierarchy** — spec §19.6: "when the scrutinee's static type is a `closed` class … and every leaf type … is matched by a type pattern (with or without binding) … no `_` arm is required. **Class leaves are matched by type-test patterns** (`var c: Circle => …`); positional destructuring (§19.3) applies to record leaves, not to class leaves."
 - **Records cannot own, and cannot be leaves of a class hierarchy** — spec §9.6: "A record cannot derive from another record or from a class"; §28.5/§9.6: "Records cannot have destructors, `owned` fields, or implement `IDisposable`."
 - **Owned trees + cascade teardown** — spec §28.4 (destructor), §28.5 (owned fields: an owned field is disposed by the owner's cascade), §28.6 (leak prevention), §28.8 / §28.8.1 (ownership transfer via `move`-and-null). Precedent: proposal 0004's owned node trees (README: "owned node trees with cascade teardown").
 - **`OwningDictionary<K, V>` (§4.9)** — `where V: class`; get returns a **borrow**, `set(owned)` disposes the previous value; `PopValue(key): owned V` (the take-out), `Remove` disposes, `Add(key, owned value)`. **`OwningArray<T>` (§4.5)** — `where T: class`; indexer-get borrow, `set(owned)`; `Add(owned)`. Both require `T`/`V: class`, which `JsonValue` (a class) satisfies.
@@ -39,12 +39,12 @@ Grep-verified against stdlib v0.177 / spec v0.177; cited, not invented:
 
 ---
 
-## Design question 1 — the hierarchy: `sealed abstract` closed hierarchy vs single class + kind enum
+## Design question 1 — the hierarchy: `closed` hierarchy vs single class + kind enum
 
-### Decision — a `sealed abstract class JsonValue` with six `sealed class` leaves.
+### Decision — a `closed class JsonValue` with six `sealed class` leaves.
 
 ```bezel
-public sealed abstract class JsonValue
+public closed class JsonValue
   public abstract readonly property Kind: JsonKind;
   // accessors, navigation, and serialization — see Q3/Q4/Q6
 end JsonValue;
@@ -61,7 +61,7 @@ public enum JsonKind: byte
 end JsonKind;
 ```
 
-**Why the closed hierarchy wins.** §11.7 names `sealed abstract` as "the recommended way to define a closed hierarchy for exhaustive `case`," and §19.6 lets the compiler prove exhaustiveness with no `_` arm across module boundaries. A consumer processes any JSON value totally:
+**Why the closed hierarchy wins.** §11.7 names `closed` as "the recommended way to define a closed hierarchy for exhaustive `case`," and §19.6 lets the compiler prove exhaustiveness with no `_` arm across module boundaries. A consumer processes any JSON value totally:
 
 ```bezel
 public method Describe(v: JsonValue): string
@@ -71,7 +71,7 @@ public method Describe(v: JsonValue): string
     var s: JsonString => $"\"{s.Value}\"",
     var n: JsonNumber => n.Raw,
     var b: JsonBool   => (if b.Value then "true" else "false"),
-    var _: JsonNull   => "null");
+    JsonNull          => "null");     // bare type pattern — no binding (§19.3; `var _` is not declarable, §17.13)
 end Describe;
 ```
 
@@ -279,7 +279,7 @@ end BuildGreeting;
 **(a) `Parse` lives on `JsonValue`** as a static factory — no separate `Json` static class:
 
 ```bezel
-public sealed abstract class JsonValue
+public closed class JsonValue
   public static method Parse(text: string,
                              maxDepth: int := 64,
                              allowTrailingCommas: bool := false): owned JsonValue;   // JsonParseException
@@ -375,7 +375,7 @@ end JsonTypeException;
 
 public enum JsonKind: byte  Object, Array, String, Number, Bool, Null  end JsonKind;
 
-public sealed abstract class JsonValue
+public closed class JsonValue
   public abstract readonly property Kind: JsonKind;
 
   // Parse / emit (Q6)

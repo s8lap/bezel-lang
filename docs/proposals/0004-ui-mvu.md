@@ -7,7 +7,7 @@
 | **Written against** | spec v0.216 (owner-directed currency refresh 2026-07-22 — the draft predated `choice` and the v0.208 expression forms; §3's "honest sum-type gap" is now closed by the language and the examples use current syntax. Architecture unchanged.) |
 | **Design influences** | Elm (the architecture), iced/Rust (MVU without a VM), **not** SwiftUI's property wrappers, **not** React hooks (exploration-ui.md records why) |
 | **The one-line pitch** | The Elm runtime's defining constraint — updates are strictly serial — *is* Bezel's domain model; every piece of MVU maps to an existing language feature, and messages-as-data is exactly what sendability wants |
-| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); written-against pin unchanged. |
+| **Currency note** | Syntax refreshed to v0.228 spellings (2026-07-28 sweep); refreshed 2026-08-11 to v0.246: `closed` replaces `sealed abstract` (v0.242), `case move msg of` transfer-marker respell (v0.246). Written-against pin unchanged. |
 
 ## 1. The four pieces, in Bezel terms
 
@@ -86,10 +86,10 @@ Things this example is deliberately showing:
 
 Elm's `Msg` is a closed tagged union, and since v0.200 **so is Bezel's**: proposal 0041 graduated as the `choice` kind (§35) — a closed nominal sum with per-case payloads, qualified construction, positional destructuring, and full static exhaustiveness. The original draft's marker-interface encoding, and two of its three recorded costs, dissolve:
 
-1. **Static exhaustiveness — gone as a cost.** A choice scrutinee is matched by case coverage (§19.6/§35.5): `update` needs no `_` arm, and forgetting a new message case is a **compile error at every match**, not a silent no-op. The draft's "strongest argument for a future closed-set construct" was answered by the language (twice over — `sealed abstract` closed class hierarchies, §11.7/§19.6, are the second closed set; see cost 3 for where each fits).
+1. **Static exhaustiveness — gone as a cost.** A choice scrutinee is matched by case coverage (§19.6/§35.5): `update` needs no `_` arm, and forgetting a new message case is a **compile error at every match**, not a silent no-op. The draft's "strongest argument for a future closed-set construct" was answered by the language (twice over — `closed` class hierarchies, §11.7/§19.6, are the second closed set; see cost 3 for where each fits).
 2. **Ceremony — reduced.** A payload case is part of one declaration (`SetTo(value: int),`), payload-free kinds are bare case names, and message construction is a qualified value (`Msg.Increment`), not a `new`.
 3. **Collection payloads — the cost survives in a narrower, choice-shaped form.** A case that *owns* a collection (`UsersLoaded(owned names: Array<string>)`) makes the whole choice **owning-classified** (§35.4) and therefore **not directly sendable** (§35.12) — the same underlying rule that made collection-bearing records inadmissible in the original draft. Two spellings exist now, both closed-set and both exhaustively matchable, and choosing between them is this draft's refreshed open question 3:
-   - **(a) Split the message set.** UI-local messages stay one value-like sendable choice; effect-completion messages with owned collection payloads are leaves of a **`sealed abstract` hierarchy** of sealed sendable classes with `owned` fields (§11.7; §30.14 class rule 2 — the draft's original `UsersLoaded` shape, now under a *closed* root, so the update match over completions is exhaustive too, by leaf coverage §19.6).
+   - **(a) Split the message set.** UI-local messages stay one value-like sendable choice; effect-completion messages with owned collection payloads are leaves of a **`closed` hierarchy** of sealed sendable classes with `owned` fields (§11.7; §30.14 class rule 2 — the draft's original `UsersLoaded` shape, now under a *closed* root, so the update match over completions is exhaustive too, by leaf coverage §19.6).
    - **(b) One owning choice, enveloped at the boundary.** Keep every message in a single `choice Msg` and cross domains inside a transfer-closed carrier class — §35.12's recorded rule-2 admission: an owning-choice-typed field whose `owned` payload classes are sendable crosses inside its owner's ownership tree. One closed sum for `update` (the purest Elm reading), one envelope type on the wire.
 
 ## 4. Control beyond clicks: async effects as messages
@@ -104,7 +104,7 @@ public choice Msg
 end Msg;
 
 public static method Update(model: AppModel, msg: Msg, fx: Effects): AppModel
-  case owned msg of                         // owning match (§35.5): the active case's
+  case move msg of                          // owning match (§35.5): the active case's
     FetchUsers => do                        //   owned payload transfers into its binding
       // Effects.Run: spawn the task on a worker domain; when it completes,
       // its Msg result is POSTED back into this loop (a channel underneath —
@@ -147,7 +147,7 @@ No hooks, no property wrappers, no hidden per-component state, no auto-tracked s
 
 1. **Node representation** — class tree vs record tree vs hybrid (§5), now explicitly including the *model* half (§4: where do a model's collections live once messages can transfer them in).
 2. **Effects shape** — `fx` handle vs Elm-style `(Model, Cmd)` return (§4). Refreshed lean: Cmd-return, because v0.202 `pure` then applies to `update` as a checked declaration rather than a convention.
-3. ~~**Closed unions** — does the `Msg` exhaustiveness gap justify a `sealed interface`-class feature?~~ **Answered by the language** (2026-07-22 refresh): `choice` graduated in v0.200 (proposal 0041) and `sealed abstract` closed hierarchies already existed — §3 now uses them. The narrowed successor question: for messages that own collections, split-set-with-hierarchy vs one-owning-choice-plus-envelope (§3's spellings (a)/(b), §35.12).
+3. ~~**Closed unions** — does the `Msg` exhaustiveness gap justify a `sealed interface`-class feature?~~ **Answered by the language** (2026-07-22 refresh): `choice` graduated in v0.200 (proposal 0041) and closed class hierarchies (`closed`, §11.7) already existed — §3 now uses them. The narrowed successor question: for messages that own collections, split-set-with-hierarchy vs one-owning-choice-plus-envelope (§3's spellings (a)/(b), §35.12).
 4. **First backend** — immediate-mode-style software renderer (self-contained, testable) vs GTK/webview FFI (real widgets sooner, drags the FFI callback machinery §32.8/§32.10 forward). The exploration doc leans: software/canvas first for the reconciler's development, FFI backend second.
 
 ## 8. Sequencing

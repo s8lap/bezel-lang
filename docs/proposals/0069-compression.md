@@ -8,6 +8,7 @@
 | **Written against** | spec/stdlib **v0.227** |
 | **Origin** | Adversarial stdlib review pass, 2026-07 (confirmed gap). **Not** among the 31 ranked gaps of the [2026-07 gap review](stdlib-gap-review-2026-07.md) — this proposal extends that map: no stdlib section covers compression, no §11 deferred-module line names it, and no proposal 0001–0067 designs it. The nearest recorded trace is proposal [0002](0002-http-server.md)'s deferred list, which names "compression" with no design behind it |
 | **Design influences** | .NET `System.IO.Compression` (`GZipStream`/`DeflateStream`) for the wrapper concept — **not** its mode-enum constructor; proposal [0006](0006-stream-family.md) for the owned-wrapping stream discipline this proposal anchors on; zlib's deflate/inflate API as the streaming substrate model |
+| **Currency note** | Refreshed 2026-08-11 to v0.246: caller-side transfer marker respelled `move` (`Decompress(move fs)`); declaration-side `owned` unchanged. Written-against pin unchanged. |
 
 Every type and method this proposal builds on is cited to `Bezel_Standard_Library.md` or the language spec; everything new is **proposed** and appears in §5. Surface that exists only in another *proposal* (0006's `CopyToAsync`/`MemoryStream`, 0009's encodings) is cited as proposal surface, never as current stdlib.
 
@@ -60,7 +61,7 @@ Two shapes are needed, matching how the data arrives: **stream wrappers** (compr
 `GzipStream`/`DeflateStream` take the wrapped stream **owned** and store it in an owned field; the wrapper is the stream's sole owner, and disposing the wrapper disposes the stream through the spec [§28.4](../Bezel_Language_Spec.md#sec-the-destructor)/[§28.5](../Bezel_Language_Spec.md#sec-owned-fields) cascade. This is 0006 Q1's ruling applied to the next wrapper in the family, with the same §22.3 call-site ergonomics falling out:
 
 - The canonical wrap passes a **fresh producer** and needs no marker: `GzipStream.Decompress(new FileStream(path, FileMode.Open))`.
-- A caller holding a **named owned binding** writes the transfer marker and loses the binding: `GzipStream.Decompress(owned fs)` — `fs` is moved-from; the caller must not also dispose it.
+- A caller holding a **named owned binding** writes the transfer marker and loses the binding: `GzipStream.Decompress(move fs)` — `fs` is moved-from; the caller must not also dispose it.
 - One `using var`/`await using var` on the wrapper closes wrapper state *and* the underlying stream — the whole point of the owned-wrapping convention (0006 Q1: "disposal chains deterministically with zero ceremony").
 
 **Borrowed-inner (`leaveOpen`) construction is deferred to the same spec ruling 0006 deferred it to** — the §28.14 scoped-construction generalization (owner-accepted direction, RFC #1439). When that amendment lands, a `scoped`-parameter form arrives as a non-breaking addition here exactly as 0006 §5 plans for `StreamReader`; v1 ships owned-only for the same soundness reasons 0006 Q1 records (a silently-trusted borrow field is the §28 footgun). The in-memory capture case the borrow form would serve is covered today by Q4's `TakeStream` and by the one-shot forms (Q6).
