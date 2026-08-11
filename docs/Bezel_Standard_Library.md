@@ -1,6 +1,6 @@
 # Bezel Standard Library Specification
 
-**Companion to the Bezel Language Specification, v0.244 — August 2026**
+**Companion to the Bezel Language Specification, v0.245 — August 2026**
 
 This document specifies the standard library types referenced by the language specification. The language spec assumes these types exist and have certain shapes; this document defines those shapes.
 
@@ -63,6 +63,9 @@ The band-3/band-4 boundary, stated once: what distinguishes them is **where cons
 **Replay intercept points (v0.204).** The members of this library that consult the world outside the process — the clock and elapsed-time reads (§2.5, §8.1), entropy (§2.6, and §2.7's parameterless constructor), environment, argument, and process information (§2.4), console input (§2.1), and the file system (§7) — together with the scheduling and synchronized-object operations the language spec enumerates (language spec [§30.13](Bezel_Language_Spec.md#sec-determinism), *Determinism*) — are **intercept points**: a conforming runtime may record their results and later substitute the recorded values, and no program may observe the substitution except through the values themselves. Everything not so designated is pure computation and is deliberately not interceptable. A future addition to this library that reads the world must declare itself an intercept point in its own section at the time it is added.
 
 This document is normative for the names, signatures, and observable behavior listed; it is not normative for performance characteristics, internal data structures, or the choice of algorithm. Implementations are free to optimize.
+
+<a id="sec-statics-and-sharing-facts"></a>
+**Statics-and-sharing facts (v0.245, proposal 0087).** Certain library types carry up to four normative per-type **facts**, each declared on a **Facts** line in the type's own section: **synchronized** — the type's operations are internally synchronized *and* an instance is safe to reach from every domain (a conjunction: `Channel<T>` declares no fact however synchronized its internals — its single-consumer receiving end is kept domain-confined by recorded policy, the ground on §6.9's fact line); **immutable** — deeply immutable after construction, so cross-domain reach needs no machinery; **self-distributing** — the type already has its own sanctioned distribution channel, so `Shared<T>` wrapping is excluded (it would add a second); and **displacement-unbounded** — the value a mutable static's overwrite would strand (language spec [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 2's overwrite-never-disposes store semantics) is of unbounded, payload-scaled size **and that cost was ruled unacceptable for mutable statics of the type** — contrast the `Task?` cache's bounded acceptance (language spec §22.12 rule 2's store semantics) and `SharedEventSource<T>`'s accepted subscriber-list leak ([§6.5](#sec-events-ievent-eventsource)), neither of which carries the fact. The language spec **derives** its three statics-and-sharing sets from these facts by three normative formulas: [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 2's **form-(i)** set = synchronized ∧ ¬displacement-unbounded; [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 4's **warning-suppression set** = synchronized ∨ immutable; [§28.13](Bezel_Language_Spec.md#sec-shared-ownership)'s **`Shared`-payload synchronized set** = (synchronized ∨ immutable) ∧ ¬self-distributing. The fact lines are the single normative carrier of the memberships; the spec's membership parentheticals beside each formula are informative and derived (`scripts/check_docs.sh` check 3b recomputes them from the fact lines — and cross-checks these formulas and the fact-line roster — failing on divergence). A fact is granted or withdrawn only by **recorded ruling** — the ruling names the facts it grants and confronts each derived-set consequence in its record — and a type declaring no facts is in none of the derived sets.
 
 ---
 
@@ -1018,7 +1021,7 @@ The three properties are value-typed and copy out of a `catch` arm like any othe
 <a id="sec-shared-and-weak"></a>
 ### 2.16 `Shared<T>` and `Weak<T>`
 
-Scoped shared ownership (language spec [§28.13](Bezel_Language_Spec.md#sec-shared-ownership)): N handles jointly own one underlying value; the last handle's disposal disposes it. Both types are compiler-known; the shared count and last-one-disposes behavior are not expressible in user Bezel. Both are auto-imported with `System`. `Shared<T>` is sendable iff `T` is in the `Shared`-payload synchronized set of language spec [§28.13](Bezel_Language_Spec.md#sec-shared-ownership) (the normative seven-type enumeration of language spec §28.13 — `Mutex`, `Atomic<T>`, `AtomicInteger<T>`, `Semaphore`, `Locked<T>`, `RwLocked<T>`, `FrozenArray<T>`; the count is maintained with synchronized operations); `Weak<T>` and `Shared<T>` of any other `T` remain domain-local ([§30.14](Bezel_Language_Spec.md#sec-sendable-types)).
+Scoped shared ownership (language spec [§28.13](Bezel_Language_Spec.md#sec-shared-ownership)): N handles jointly own one underlying value; the last handle's disposal disposes it. Both types are compiler-known; the shared count and last-one-disposes behavior are not expressible in user Bezel. Both are auto-imported with `System`. `Shared<T>` is sendable iff `T` is in the `Shared`-payload synchronized set of language spec [§28.13](Bezel_Language_Spec.md#sec-shared-ownership) (derived there from the [§1](#sec-statics-and-sharing-facts) statics-and-sharing facts — currently `Mutex`, `Atomic<T>`, `AtomicInteger<T>`, `Semaphore`, `Locked<T>`, `RwLocked<T>`, `FrozenArray<T>`; the count is maintained with synchronized operations); `Weak<T>` and `Shared<T>` of any other `T` remain domain-local ([§30.14](Bezel_Language_Spec.md#sec-sendable-types)).
 
 ```bezel
 public class Shared<T>: IDisposable where T: class      // proper class types only;
@@ -3083,8 +3086,10 @@ zero-copy shared-read primitive (language spec [§30.14](Bezel_Language_Spec.md#
 admitted by **deep immutability** rather than synchronization machinery (v0.186 ruling) — so
 `Shared<FrozenArray<T>>` is sendable: clone one handle per worker domain, move the clones, and N domains read one
 buffer with zero bytes copied. A `static owned readonly` `FrozenArray<T>` is a sound all-domains singleton and draws
-no [§22.12](Bezel_Language_Spec.md#sec-static-members) rule-4 warning (the v0.186 suppression list); mutable statics
-of it remain rejected (rule 2 — it is deliberately not in the form-(i) set).
+no [§22.12](Bezel_Language_Spec.md#sec-static-members) rule-4 warning (rule 4's warning-suppression set, the v0.186
+ruling); mutable statics of it remain rejected (rule 2 — it is deliberately not in the form-(i) set).
+
+**Facts** ([§1](#sec-statics-and-sharing-facts)): `FrozenArray<T>` — **immutable** (deeply immutable after construction — the construction obligations below), **displacement-unbounded** (a stranded overwrite-displaced value is the whole array; and a frozen array has no mutability at all, so nothing demands static reassignment. Provenance: the v0.186 ruling above).
 
 ```bezel
 /// Compiler-intrinsic; T restricted to sendable value types and `string`.
@@ -3476,6 +3481,8 @@ end;
 
 **Visibility (v0.184; language spec [§30.13](Bezel_Language_Spec.md#sec-cross-thread-visibility)).** Releasing a `Lock` — disposing it — *publishes* the holder's writes: the release happens-before the next acquisition of the same `Mutex`, whichever domain or thread (including an FFI foreign thread) acquires next. `Semaphore`/`SemaphoreToken` ([§6.3](#sec-semaphore)) carry the same edge.
 
+**Facts** ([§1](#sec-statics-and-sharing-facts)): `Mutex` — **synchronized** (the v0.138 statement above: internally synchronized, reachable from every domain by design). `Lock` declares no facts (a held guard is domain-bound).
+
 `AcquireAsync` and `TryAcquireAsync` are the async counterparts. `AcquireAsync` returns a `OwningTask<Lock>` (Pattern B, single-consumer); `TryAcquireAsync` returns `OwningTask<Lock?>` — the same nullable shape inside a Pattern B task. Consumers write:
 
 ```bezel
@@ -3517,6 +3524,8 @@ end SemaphoreToken;
 
 **Sendability (language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)).** `Semaphore` is **sendable** and internally synchronized — like `Mutex` ([§6.2](#sec-mutex-and-lock)) it may be reached by multiple domains simultaneously; that is its purpose (`Shared<Semaphore>` is the cross-domain sharing idiom, language spec §28.13). `SemaphoreToken` is **not** sendable: a held permit is bound to the acquiring domain and released there, like `Lock` ([§6.2](#sec-mutex-and-lock)) — moving a held permit between domains would decouple acquisition from release.
 
+**Facts** ([§1](#sec-statics-and-sharing-facts)): `Semaphore` — **synchronized** (the *Sendability* statement above: internally synchronized and reached by multiple domains simultaneously by purpose — the §6.2 mutex genus; spec §30.14). `SemaphoreToken` declares no facts (a held permit is domain-bound).
+
 `AcquireAsync` returns `OwningTask<SemaphoreToken>`; awaiters consume the task under Pattern B (language spec [§30.5](Bezel_Language_Spec.md#sec-result-lifetime-and-task-disposal)) — the await must appear in an owned-consuming context. The natural call site:
 
 ```bezel
@@ -3529,6 +3538,8 @@ DoCriticalWork();
 ### 6.4 `Atomic<T>` and `AtomicInteger<T>`
 
 Atomic operations on primitive types. The split into two classes — one for the operations that make sense on any cell-sized primitive, one for the integer-arithmetic extensions — makes the intrinsic restriction visible in the type system: `Increment`, `Decrement`, and `Add` are members of `AtomicInteger<T>` and unavailable on `Atomic<T>`, so a typo like `var b := new Atomic<bool>(false); b.Increment();` is a name-resolution error rather than an opaque intrinsic-restriction error.
+
+**Facts** ([§1](#sec-statics-and-sharing-facts)): `Atomic<T>`, `AtomicInteger<T>` — **synchronized** (sequentially-consistent intrinsic operations — the §6.4 ordering statement below; sendable and safe to reach from every domain, spec §30.14).
 
 <a id="sec-atomict-load-store-exchange-compare-and-swap"></a>
 #### `Atomic<T>`: load, store, exchange, compare-and-swap
@@ -3739,8 +3750,10 @@ end SharedEventSource;
   end;
   ```
 - **User implementations of `ISharedEvent<T>`** are admissible but gain no retention right: a user-authored `Subscribe` body is verified under spec §28.14's ordinary call-bounded regime, so it can neither store its handler parameter nor forward it into a register position. **User classes cannot be cross-domain publication points in v1** (recorded; the lift path is §28.14's deferred unbounded tier, #1427). `SharedEventSource<T>` is `sealed`, so no derived class inherits the trusted position.
-- **Statics.** `SharedEventSource<T>` is in spec §22.12 rule 2's form-(i) synchronized set: the recommended shape `private static owned readonly _exiting: SharedEventSource<()> := new();` is admitted warning-free, with program-exit disposal (spec §22.13). The recommended public face is a static expression-bodied property of the interface face, as in the idiom below — a bare read of a `static` `owned` field returned as a borrow of process-lived static storage (spec §28.3/§28.6, v0.187). A *mutable* static of the type is admissible under rule 2's store semantics; note that overwrite-never-disposes means a displaced source leaks with its subscriber list intact until process exit — prefer `readonly`. The type is **not sendable** (spec §30.14): static reachability, not transfer, is its distribution mechanism — and it is deliberately not in spec §28.13's `Shared`-payload set (`Shared<SharedEventSource<T>>` would add a second distribution mechanism).
+- **Statics.** `SharedEventSource<T>` is in spec §22.12 rule 2's form-(i) synchronized set: the recommended shape `private static owned readonly _exiting: SharedEventSource<()> := new();` is admitted warning-free, with program-exit disposal (spec §22.13). The recommended public face is a static expression-bodied property of the interface face, as in the idiom below — a bare read of a `static` `owned` field returned as a borrow of process-lived static storage (spec §28.3/§28.6, v0.187). A *mutable* static of the type is admissible under rule 2's store semantics; note that overwrite-never-disposes means a displaced source leaks with its subscriber list intact until process exit — prefer `readonly`. The type is **not sendable** (spec §30.14): static reachability, not transfer, is its distribution mechanism — and it is deliberately not in spec §28.13's `Shared`-payload set (`Shared<SharedEventSource<T>>` would add a second distribution mechanism — the self-distributing fact, [§1](#sec-statics-and-sharing-facts); the Facts line below).
 - **The shared async twin is deferred.** `ISharedAsyncEvent<T>`/`SharedAsyncEventSource<T>` (a synchronized `RaiseAsync` awaiting each handler's task on the raising domain) ships when demand appears; until then a cross-domain async publication point is not spellable, and the channel bridge above is the alternative.
+
+**Facts** ([§1](#sec-statics-and-sharing-facts)): `SharedEventSource<T>` — **synchronized**, **self-distributing** (distributed by static reachability, spec §22.12 rule 5; wrapping it in a spec-§28.13 handle would add a second distribution mechanism). *Displacement-unbounded* was considered and declined: a displaced source leaks with its subscriber list intact (the *Statics* bullet above), an accepted cost — mutable statics of the type stay admitted. The instance sources `EventSource<T>`/`AsyncEventSource<T>` declare no facts (unsynchronized, domain-serial — above).
 
 The static idiom, complete:
 
@@ -4071,7 +4084,11 @@ There is no built-in cross-domain cancellation: `CancellationToken` is a borrow-
 <a id="sec-channel"></a>
 ### 6.9 `Channel<T>` and `ChannelSender<T>`
 
-Multiple-producer, single-consumer channel carrying sendable values between domains with ownership transfer at both ends (language spec [§30.15](Bezel_Language_Spec.md#sec-channels)). Both types are compiler-known and internally synchronized; together with `Mutex`, `Semaphore`, the atomics (`Atomic<T>`/`AtomicInteger<T>`), and the data-owning locks (`Locked<T>`/`RwLocked<T>`, v0.186) — stdlib [§6.2](#sec-mutex-and-lock)–[§6.4](#sec-atomict-and-atomicintegert), [§6.11](#sec-locked-and-rwlocked) — and, by deep immutability rather than machinery, `FrozenArray<T>` behind `Shared` handles or as a `static readonly` singleton ([§4.19](#sec-frozen-array), v0.186), they are the standard types two domains may reach simultaneously (the sendable, internally-synchronized set; language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)). T must be sendable; the instantiation is rejected otherwise (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)). A **mutable static** `Channel<T>` field is rejected by language spec [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 2 (v0.181), and a `static readonly Channel<T>` draws rule 4's warning: the channel object is the single-consumer *receiving* end and must stay confined to one consuming domain — when producers across many domains need a process-global send endpoint, publish a `ChannelSender<T>` static instead (rule 2's synchronized set).
+Multiple-producer, single-consumer channel carrying sendable values between domains with ownership transfer at both ends (language spec [§30.15](Bezel_Language_Spec.md#sec-channels)). Both types are compiler-known and internally synchronized; `ChannelSender<T>`, together with `Mutex`, `Semaphore`, the atomics (`Atomic<T>`/`AtomicInteger<T>`), and the data-owning locks (`Locked<T>`/`RwLocked<T>`, v0.186) — stdlib [§6.2](#sec-mutex-and-lock)–[§6.4](#sec-atomict-and-atomicintegert), [§6.11](#sec-locked-and-rwlocked) — and, by deep immutability rather than machinery, `FrozenArray<T>` behind `Shared` handles or as a `static readonly` singleton ([§4.19](#sec-frozen-array), v0.186), are the standard types two domains may reach simultaneously (the sendable, internally-synchronized set; language spec [§30.14](Bezel_Language_Spec.md#sec-sendable-types)); the `Channel<T>` receiving end is single-consumer by ownership and stays domain-confined. T must be sendable; the instantiation is rejected otherwise (language spec [§3.6](Bezel_Language_Spec.md#sec-derived-type-properties)). A **mutable static** `Channel<T>` field is rejected by language spec [§22.12](Bezel_Language_Spec.md#sec-static-members) rule 2 (v0.181), and a `static readonly Channel<T>` draws rule 4's warning: the channel object is the single-consumer *receiving* end and must stay confined to one consuming domain — when producers across many domains need a process-global send endpoint, publish a `ChannelSender<T>` static instead (rule 2's form-(i) set).
+
+**Facts** ([§1](#sec-statics-and-sharing-facts)): `ChannelSender<T>` — **synchronized**, **self-distributing** (senders are minted per producer from the channel, so a spec-§28.13 handle around one would add a second distribution mechanism).
+
+**Facts** ([§1](#sec-statics-and-sharing-facts)): `Channel<T>` — none (a recorded policy, not a property failure: the receiving end is single-consumer by ownership, and a process-global static would readmit the multi-consumer receive this section explicitly defers — the recorded ground of language spec §22.12 rule 2(i), v0.181; every statics/sharing exclusion above falls out of that policy).
 
 The signature surface dispatches on T's category, as with `OwningBuffer<T>` ([§4.14](#sec-owned-buffers-and-spans)). For class-typed (sendable) T:
 
@@ -4237,6 +4254,8 @@ categories** — `Locked<Dictionary<string, int>>` is admitted (the §4 sendabil
 collections of **class** elements do not (`Locked<Dictionary<string, Session>>` is rejected — own the values:
 `Locked<OwningDictionary<string, Session>>`).
 
+**Facts** ([§1](#sec-statics-and-sharing-facts)): `Locked<T>`, `RwLocked<T>` — **synchronized**, **displacement-unbounded** (a stranded overwrite-displaced value is the lock plus its entire interior — a payload-scaled cost the spec-§22.12 `Task?` cache's bounded acceptance does not cover; and no use case demands static reassignment of a lock, whose interior mutability lives behind its guards. Provenance: the v0.186 ruling, rationale [§12.8](Bezel_Design_Rationale.md#sec-locked-rwlocked)). The guard types declare no facts (a held guard is domain-bound).
+
 ```bezel
 public class Locked<T> where T: class          // compiler-known; T must additionally be a
                                                //   sendable class type (checked at instantiation)
@@ -4284,7 +4303,7 @@ end WriteGuard;
 ```
 
 The canonical process-global registry — the `static owned readonly` idiom (rule-4 warning suppressed by
-[§22.12](Bezel_Language_Spec.md#sec-static-members) rule 4's v0.186 suppression list; `owned` enrolls program-exit
+[§22.12](Bezel_Language_Spec.md#sec-static-members) rule 4's warning-suppression set, the v0.186 ruling; `owned` enrolls program-exit
 disposal and clears [§22.13](Bezel_Language_Spec.md#sec-static-initialization-order)'s disposal warning; a **mutable**
 static of a lock type remains rejected — put the mutability behind the guard):
 
@@ -4300,7 +4319,7 @@ public static class Sessions
 end Sessions;
 ```
 
-**Taking data out (v0.195).** A guard borrow cannot leave the `using var` scope (by design — the scope *is* the critical section), so a read that must escape uses one of: **(a) copy value data out** — return a record/`string`/primitive built from the interior (a `TryGetValue`d record escapes as a copy); **(b) compute under the guard** — do the work in the scope and let only value-shaped results leave; **(c) `PopValue`/`Take`** — transfer an entry's ownership out, removing it. A registry that must hand out live *references* to class-typed entries needs the entry type itself to be synchronized or deeply immutable (`Shared<T>` payloads are the closed §28.13 seven-type set; frozen class trees are the recorded §4.19 deferral) — a recorded gap, not an idiom this section can supply.
+**Taking data out (v0.195).** A guard borrow cannot leave the `using var` scope (by design — the scope *is* the critical section), so a read that must escape uses one of: **(a) copy value data out** — return a record/`string`/primitive built from the interior (a `TryGetValue`d record escapes as a copy); **(b) compute under the guard** — do the work in the scope and let only value-shaped results leave; **(c) `PopValue`/`Take`** — transfer an entry's ownership out, removing it. A registry that must hand out live *references* to class-typed entries needs the entry type itself to be synchronized or deeply immutable (`Shared<T>` payloads are spec §28.13's derived set — the [§1](#sec-statics-and-sharing-facts) facts; frozen class trees are the recorded §4.19 deferral) — a recorded gap, not an idiom this section can supply.
 
 Semantics and obligations (normative statement: language spec §30.12):
 

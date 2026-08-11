@@ -6,6 +6,8 @@
 
 *Currency note 2026-07-14: docs are now **v0.191** (defect-sweep revisions v0.189–v0.191, main `1469b21`); no proposal status changed — the delta is six new R0-layer compiler trackers (#1781–#1786, headlined by the §28.3 Task-family ownership ruling, #1786) and one new design-review item (#1787, iterable-frame ownership). The roadmap's 2026-07-14 refresh note carries the detail; this plan's dependency graph is unaffected.*
 
+*Currency note 2026-08-11: docs are now **v0.241** (this note's coverage horizon; the in-flight elegance-graduation program, v0.242+ / proposals 0078–0090, is deliberately not covered — its ledger rows land with the program-close banner: **[ELEGANCE-PROGRAM LEDGER — appended at program close]**). The gap since 2026-07-14 is large and this plan's ledger no longer describes the proposal population: the 2026-07-18 future-directions program added **0041–0054** (plus the separately-filed **0040** build-system sketch), the later trains added **0055–0077**, and twenty-nine proposals graduated in the interval, several partially (0044/0045/0051 Part A; 0061 §1; 0075 stages 1–2; 0076's criterial rule; 0077 stage 1) — the v0.198–v0.204 batch (0041–0046, 0048–0051 Part A; recorded in the roadmap's 2026-07-19/20 banners) plus the v0.205–v0.238 batch (0023, 0055–0059, 0061–0067, 0072–0077; recorded in the roadmap's 2026-08-11 banner). §1·Δ below carries the bucket-by-bucket deltas. Two standing §1 claims are corrected by the deltas: "no proposal is implemented yet" is no longer true (the 2026-07-20 impl run landed sixteen features of the v0.198–v0.204 layer — see the roadmap's banner), and the header's "all 39 numbered proposals (0001–0039)" now describes only this document's original DAG scope, not the ledger population. The dependency graph of §2 is unchanged for the 0001–0039 set; the new drafts' edges are recorded in §1·Δ(d) rather than merged into §2a's table. The 2026-07-28 proposals-syntax-currency sweep modernized retired spellings across all non-superseded proposals (38 sites, 15 files) — read it before picking up any pre-v0.217 draft.*
+
 ---
 
 ## 1. Status ledger
@@ -25,6 +27,52 @@
 | 0037 | Remove object-initializer blocks | v0.188 (`ebfa7e0`) | #1735 |
 | 0038 | Retire `ReadOnlyAsciiByteSpan` | v0.188 (`ebfa7e0`) | #1736 |
 | 0039 | One specificity rule for extensions | v0.188 (`ebfa7e0`) | #1307 (re-scoped) |
+
+### 1·Δ. Ledger deltas 2026-07-14 → 2026-08-11 (docs v0.191 → v0.241)
+
+**(a) Graduated (`superseded`) since this plan's last refresh — 29 proposals (10 in the v0.198–v0.204 batch + 19 in v0.205–v0.238).** The v0.198–v0.204 batch is summarized (the roadmap's 2026-07-19 banner is its detailed record); the v0.205+ batch is tabled in full. Every graduation is docs-only at landing; the impl-tracker column is the compiler catch-up.
+
+*v0.198–v0.204 (the future-directions graduation run, 2026-07-19):* **0046** ownership kernel → v0.198/v0.199 (zero compiler work; escalated rulings #2042/#2043 — both since ruled at v0.223); **0041** `choice` → v0.200 (#2044–#2047); **0048**/**0049**/**0050** → v0.201 (#2048–#2051); **0042** `pure` → v0.202 (#2052); **0043** contracts → v0.203 (#2053); **0044** spec deltas + **0045** normative deltas + **0051 Part A** → v0.204 (#2054/#2055). Substantially implemented by the 2026-07-20 run.
+
+*v0.205–v0.238:*
+
+| # | Proposal | Graduated | Impl trackers (compiler catch-up) |
+|---|---|---|---|
+| 0023 | Task.WhenEach — streaming fan-in family | v0.212 | tracker filed at landing (v0.212 entry); input seam #1813 resolved-and-closed v0.222 (#1881/#1655 remain) |
+| 0055 | Parenthesized contract clauses | v0.207 | the #2053 slice-1 parser lane (#2070 superseded) |
+| 0056 | Arm-position transfer marker | v0.209 | tracker filed at landing (v0.209 entry) |
+| 0057 | Paren-delimited expression forms | v0.208 | tracker filed at landing; corpus migrates with the parser |
+| 0058 | Readonly-field narrowing | v0.214 | trackers filed at landing (v0.214 entry) |
+| 0059 | Uniform trailing commas | v0.214 | trackers filed at landing (v0.214 entry) |
+| 0061 | Expression-form studies — **§1 only** (binding atom) | v0.216 | #2098; §2 stays an evidence-gated study |
+| 0062 | Small-stdlib ergonomics batch | v0.215 | trackers filed at landing; #2089 closed |
+| 0063 | Fluent-discard exemption | v0.215 | trackers filed at landing (v0.215 entry) |
+| 0064 | Keyword-led lambdas | v0.217 | #2101 (+#2102 adjacency, closed v0.220) |
+| 0065 | Named-destructure patterns | v0.224 | tracker filed at landing, sequenced with the #2079 syntax family (#1409 was the design tracker) |
+| 0066 | Method-local type declarations | v0.225 | tracker filed at landing (#1405 was the design tracker) |
+| 0067 | Small-stdlib ergonomics batch II | v0.228 | #2242 |
+| 0072 | Nullable-return convenience tier | v0.231 | #2347 |
+| 0073 | One-shot serialization facade | v0.232 | #2349 (+#2352 piggyback pin; rides #2337) |
+| 0074 | Small-stdlib ergonomics batch III (item 4 landed v0.230) | v0.231 | #2348 — carries the one BREAKING item, the `Environment` rename |
+| 0075 | Result ergonomics — **stages 1–2** | v0.233 | #2354/#2355; stage 3 = recorded deferrals, R5 gate re-armed |
+| 0076 | Error-model study — criterial rule; R1–R6 ruled 2026-07-29 | v0.229 | #2337 (SerializationException surface); #2338 (graduation obligations) |
+| 0077 | Silent tracking — **stage 1** | v0.238 | stage 2 = #2654/#2655/#2656/#2660 (landed ahead per Q4) + #2676 behind #2672 |
+
+**(b) New accepted (owner-review batch 2026-07-24, delegated rulings).** **0002** Http server — accepted (was draft; §1b's row and §2's Layer-2 gating unchanged in content); **0054** traceability — accepted, phase 1. Same batch discharged two §4b embedded sub-question gates: **0012**'s v1 scope + equality co-declaration ruled (#1445) and **0020**'s engine family ruled FINAL (#1449) — those two rows of §4b are done in their named parts (0020's `Match` shape is not recorded as ruled).
+
+**(c) New drafts / in-set status flips.** New drafts absent from every §1 bucket: **0040** build system (draft sketch, tooling-only; #1908 — the #1398 SCC kernel is its Stage 0); **0047** mechanized core semantics (draft; #2034); **0052** compiler diagnostics + query API (draft; #2039); **0053** property-based specification (draft; #2040); **0060** channel give-back protocol (draft consolidation stub, created v0.210 — makes the previously-phantom "give-back-protocol RFC" citations real; no design decided); **0068** cryptographic primitives (draft); **0069** compression: gzip + DEFLATE (draft); **0070** first-class `Uri` (draft); **0071** file metadata `FileStatus`/`File.GetStatus` (draft). In-set flips: **0004** MVU refreshed to v0.216 (still early draft, unscheduled); **0005** loses its "(stale)" qualifier in the README (still draft, XL); **0026** gained the 2026-07-28 `TakeLast`/`SkipLast` rider. §1c stays empty; §1·0's original nine rows are unchanged.
+
+**(d) New proposal-to-proposal dependencies declared by the new proposals** (README rows; not merged into §2a — the 0001–0039 DAG is unchanged):
+
+| Proposal | Declares |
+|---|---|
+| 0068 crypto | the **0007 OpenSSL-seam linkage** is its load-bearing open question; accumulators follow the 0008/0029 chaining shape; `RandomNumberGenerator` is a replay intercept point (0045 seam) |
+| 0069 compression | **hard: 0006** (stream wrappers over an owned inner stream); one-shots per **0009**'s shape; system-zlib is the owner question |
+| 0070 Uri | additive over **0001/0002** — their string-URL v1 surfaces stay frozen; no build-order edge |
+| 0071 file metadata | **0012/0016** bridges recorded for `ModifiedAt`; **zero overlap with 0017** (seam stated) |
+| 0053 property testing | parameterized **0022** test methods; **0041**-aware generators; exhaustive mode gated on **0042** purity; **0045** seed/journal determinism; the **0043** contract bridge |
+| 0047 Lean model | models **0046**'s kernel (K1–K9) |
+| 0060 give-back stub | consolidates the four deferred channel features (stdlib §6.9 material); no edges — nothing decided |
 
 ### 1a. Accepted (delegated) — owner-blessed, schedulable now (14)
 
