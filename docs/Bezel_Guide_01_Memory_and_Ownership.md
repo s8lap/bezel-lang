@@ -344,8 +344,8 @@ end;
 // An owned var still carries the disposal obligation; discharge it by
 // binding into a using var, returning it under an owned return type,
 // or storing it into an owned field:
-using var owned_x := move x;      // adopt for scoped disposal (transfer marker)
-owned_x.Process();
+using var adopted := move x;      // adopt for scoped disposal (transfer marker)
+adopted.Process();
 ```
 
 Pick A when the value is short-lived and you only need to read it; pick B when the value must outlive the `if`. A `var` that is owned but not yet under `using var` is still tracked. If it is neither disposed nor transferred, it auto-drops at scope end and the compiler raises the must-use warning (spec §28.3) — a drop is never silent. The mixed-ownership *merge* itself remains a hard error; its message names the variable and the disagreeing branches.

@@ -255,7 +255,7 @@ end LedgerMain;
 // Elsewhere:
 var ledger := new Channel<Transfer>();
 using var pay := ledger.NewSender();                       // mint before moving the channel
-using var actor := Domain.Spawn(LedgerMain, move ledger); // the receiving end moves in
+using var actor := Domain.Spawn(LedgerMain, move ledger);  // the receiving end moves in
 
 pay.Send(new Transfer("ada", "lin", 25m));                 // value payload: copied across
 pay.Dispose();                // last sender disposed: the channel closes and drains

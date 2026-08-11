@@ -3097,7 +3097,7 @@ public class FrozenArray<T>: IEnumerable<T>
   // Construction consumes or copies its source — after either, no writer can exist.
   public static method From(owned buffer: OwningBuffer<T>): owned FrozenArray<T>;
       // VALUE-TYPED T ONLY: O(1) — steals the storage; the buffer is consumed
-      //   (owned call-site marker; the proposal-0006 owned-vs-copy construction shape).
+      //   (the call-site transfer marker `move`; the proposal-0006 owned-vs-copy construction shape).
       //   No string-element form can exist: OwningBuffer<T> does not admit string (§4.14).
   public static method From(items: Array<T>): owned FrozenArray<T>;
       // Copies; the only construction form for T = string.
