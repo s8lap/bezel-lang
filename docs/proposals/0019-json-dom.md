@@ -417,6 +417,17 @@ end JsonValue;
 
 ---
 
+## Delegated rulings 2026-08-11 (stdlib-wave readiness; owner review in repo)
+
+Resolving the three open questions under the owner's 2026-08-11 delegation ("work autonomously... don't ask me for confirmations or rulings"; review-in-repo) (delegated ruling, 0012-precedent style), plus one dependency discharge. Status stays draft.
+
+1. **Q1 — (c) write-only in v1: RULED as recommended, with the reopening bar made exact.** The freeze this rests on was re-verified against the current docs: stdlib §2.14 at v0.247 is still the 13-write/15-read token set (0010's `WriteBytes`/`ReadBytes` remain proposal-only), and the freeze ruling (owner, 2026-07-04, 0010 Q2) is in force — any token addition is a rationale-recorded breaking major event. **(b) is declined outright**, not deferred: a §9.8 synthesis special-case bridging the concrete `JsonDeserializer` makes eligibility *format-dependent* for exactly one type (round-trips under JSON, silently ineligible under `BinaryDeserializer`), breaking §2.14's "serialize once, serialize to every format" guarantee at its only known exception — worse than the missing feature. **Reopening bar for (a):** a named consumer that must round-trip an *embedded* owned `JsonValue` field through the agent pair / §9.8 synthesis (whole-document schemaless data needs nothing — `JsonValue.Parse` covers it; and the v0.232 `Json` facade, being defined as the agent sequence, changes nothing here). When that consumer exists, the peek token is taken *as* 0010's defined breaking major event, deliberately and once.
+2. **Q2 — duplicate keys FAULT (`JsonParseException`); no last-wins mode in v1.** New ground since the pin: the typed deserialization path's landed contract (stdlib §2.15) makes duplicate fields an **unconditional error regardless of leniency settings** — the DOM faulting keeps one duplicate discipline across both JSON readers, where a last-wins DOM would read data the typed path rejects. Last-wins also masks producer bugs (two writers disagreeing about one key is a defect, not a preference). A lenient-ingest knob is evidence-gated: a named consumer that must read third-party duplicate-key JSON files the want, and if admitted it is an explicit parse option, never the default.
+3. **Q3 — strict: `AsInt()` on a fractional-notation lexeme (`1.0`, `2e0`) is `FormatException`.** `AsInt` asserts integral *syntax*; the numerically-integral leniency would make `1` and `1.0` indistinguishable at the call site and silently admit `2e0`, against the §2.18 strict-parse discipline. The explicit path (`AsDouble()` + explicit rounding) states the intent the leniency would hide. Consistent with `JsonNumber` storing the raw lexeme — the lexeme *is* the truth `AsInt` checks against.
+4. **Dependency discharge (the §6c note).** The §9.7/§9.8 class-in-record contradiction this proposal recorded as an owner-ruling dependency is **resolved in the current stdlib**: at v0.247, §2.14's record clause states a record cannot hold a class-typed serialized component at all, and names the sealed-class envelope as the remedy — this proposal's §6c class-envelope choice is now the normatively sanctioned form, not a sidestep, and the blocked record-envelope convenience form is dead by rule. The dependency is discharged with no residue; the §6c paragraph reads against v0.177 and is superseded by this note.
+
+With these, this proposal carries no open design question; the remaining path is the ordinary acceptance/graduation workflow.
+
 ## Declined alternatives (summary)
 
 | Alternative | Reason declined |

@@ -253,6 +253,17 @@ Adding such an API would require either:
 
 ---
 
+## Delegated rulings 2026-08-11 (stdlib-wave readiness; owner review in repo)
+
+Resolving the two standing design flags from the 2026-07-28 currency sweep (flags 4–5) and folding the v0.243 premise, under the owner's 2026-08-11 delegation ("work autonomously... don't ask me for confirmations or rulings"; review-in-repo) (delegated ruling, 0012-precedent style). Status stays draft.
+
+1. **No exception-factory exemption from the v0.201 factory-announcement rule; `Verify.Unreachable` is declared `owned VerificationException`.** The sweep asked whether factories whose result is conventionally immediately thrown are exempt from the announcement rule. Ruled **no exemption — announce**: the v0.201 rule's whole value is totality (every static class-returning signature announces its ownership contract), and an "immediately-thrown by convention" class is not signature-decidable — admitting it would re-open the instance↔static refactor hazard the rule closed, for one method's cosmetics. The announced form costs the intended idiom nothing: `throw` is an **announced owned-consume** (spec §31.1 — the same no-marker family as the consuming discard, §17.13), so `throw Verify.Unreachable(msg)` is unchanged, and the exception's disposal after the matching catch arm is the ordinary §31.1 lifecycle. Strictly better, in fact: a call that is *not* thrown now leaves an owned local the standard §28.3 discharge machinery flags — the "constructed and discarded a `VerificationException`" bug §4.3 warns about becomes compiler-visible, where an exemption would leave it silent. The §4.2 sketch already carried the `owned`; §8's ready-to-land text is conformed in place (it lacked the marker).
+2. **v0.243 premise fold (proposal 0080): strengthens, does not disturb.** Every throw operand now derives from `Exception`; `VerificationException: Exception` satisfies it, the §31.4 built-in-iff-built-in-producer placement argument is untouched, and §6.1's probe idiom stays legal. §4.1's finding (no `never` return type) is likewise unmoved — v0.243 changed the operand's type bound, not the type system's bottom; the factory-plus-`throw` idiom remains the sanctioned expression-position spelling.
+3. **The sweep's flag 4 (catch-arm spelling) is verified current.** §6.1's arms are the A.6 `CatchArm` shape (`var ex: T => do … end`); no residual pre-v0.207-era catch spelling remains in this document.
+4. **`Debug.CaptureStackTrace` deferral stands as recorded** (§6.2): evidence bar unchanged — a concrete consumer articulating the capture-at-any-point requirement, at which point it is runtime-primitive design, not stdlib surface.
+
+With these, this proposal carries no open design question; the remaining path is the ordinary acceptance/graduation workflow.
+
 ## 8. Proposed stdlib additions (ready-to-land text)
 
 The following is written to be inserted into `Bezel_Standard_Library.md`. Section numbers assigned at integration time.
@@ -307,7 +318,12 @@ release builds, and `condition` is always evaluated.
       // the factory pattern is the v1 idiom.  If a future spec revision adds
       // a `never`/noreturn annotation, this method's signature will be revisited;
       // the calling pattern `throw Verify.Unreachable(msg)` will remain valid.
-      public static method Unreachable(message: string := "unreachable"): VerificationException;
+      //
+      // `owned`: the v0.201 factory-announcement rule (ruling 2026-08-11, above).
+      // `throw` is an announced owned-consume (spec §31.1), so the idiom is
+      // unchanged; an un-thrown call leaves an owned local the §28.3 discharge
+      // machinery flags.
+      public static method Unreachable(message: string := "unreachable"): owned VerificationException;
     end Verify;
 
 Requires `import System.Diagnostics`.

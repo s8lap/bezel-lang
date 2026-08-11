@@ -109,7 +109,7 @@ public enum LogLevel: byte
   Trace,      // 0 — very fine-grained tracing
   Debug,      // 1 — developer diagnostics
   Info,       // 2 — normal significant events
-  Warning,    // 3 — something unexpected, still working
+  Warn,       // 3 — something unexpected, still working  (spelling ruled 2026-08-11, Q5)
   Error,      // 4 — an operation failed
   Critical,   // 5 — the application itself is in trouble
   None;       // 6 — a threshold that emits nothing (never a call argument)
@@ -182,7 +182,7 @@ All in `System.Diagnostics` (§8.3, requires `import System.Diagnostics`).
 
 ```bezel
 public enum LogLevel: byte
-  Trace, Debug, Info, Warning, Error, Critical, None;
+  Trace, Debug, Info, Warn, Error, Critical, None;   // Warn: one spelling per level (ruling 2026-08-11, Q5)
 end LogLevel;
 
 public record LogField(Name: string, Value: string);   // sendable value record (§30.14)
@@ -383,6 +383,18 @@ Inside a handler the logger is a field of the service object (`_log.Error("creat
 3. **Drop-counter aggregation.** v1 exposes `DroppedCount` per `ChannelLogger` (each domain-local). Global total (or a periodic sink-emitted "N dropped" summary) needs producers to communicate their counts — worth a v1 mechanism, or v2?
 4. **Default format + JSON.** Ship only `LogFormat.Line` (text) in v1 and defer a JSON formatter to `LogEvent: ISerializable` (which rides 0010's `DateTime` conformance)? Or make the sink take a pluggable `(LogEvent) -> string` formatter from the start?
 5. **`Warn` vs `Warning`.** The enum member is `Warning` (matches .NET); the convenience is `Warn` (shorter, matches most facades). Keep the asymmetry, or align both?
+
+## Delegated rulings 2026-08-11 (stdlib-wave readiness; owner review in repo)
+
+Resolving the five §6 questions under the owner's 2026-08-11 delegation ("work autonomously... don't ask me for confirmations or rulings"; review-in-repo) (delegated ruling, 0012-precedent style). Status stays draft.
+
+1. **Q1 — Fork A only in v1; Fork B is not shipped as stdlib surface.** Verified against the current statics rules (§22.12 as re-derived at v0.245, proposal 0087): `ILogger` declares neither the *synchronized* nor the *immutable* fact, so an interface-typed `static readonly` logger sits outside the derived warning-suppression set and draws rule 4's declaration-site warning **by construction**. A stdlib-shipped member whose canonical use warns by construction is the wrong default posture; explicit passing is the folder-wide stance (D-0001, 0002 §2.1's composition root). Fork B survives as a *documented user-side idiom* — any program may declare its own fixed `static readonly` logger and accept the warning knowingly — which is exactly what rule 4 is for; it just isn't stdlib surface. Fork C stays declined as drafted. **Evidence bar for revisiting B-as-stdlib:** sustained, recorded ergonomic pain threading loggers in the first real 0002-consumer programs.
+2. **Q2 — composition-root-runs-the-loop: CONFIRMED for v1.** It is the spec-canonical §30.15 arrangement (the receiving domain owns the channel) and pairs the sink loop with the app's own `TaskScope` teardown. The fully-isolated variant (channel moved into a dedicated sink domain) is recorded as the v2 shape with its stated constraint — all senders minted before the move — and waits for a consumer that needs OS-parallel sink work.
+3. **Q3 — drop-counter aggregation is v2.** Per-`ChannelLogger` `DroppedCount` is the honest v1: each counter is domain-local and race-free by construction. A global total is cross-domain mutable state — the exact surface the statics-×-domains rules restrict — and needs either a synchronized counter or sink-side aggregation; that design is done with the first consumer that actually alerts on drops, not speculatively.
+4. **Q4 — `LogFormat.Line` only in v1; JSON rides `LogEvent: ISerializable` (0010); no pluggable formatter parameter.** A `(LogEvent) -> string` formatter stored by the sink is a §28.14 storage-bounded `scoped` callback with capture machinery — real surface for a need the two named formats cover. It is additive behind the same sink surface later; declined now as speculative. (The §D2 strings-after-formatting decision already bounds what a formatter could do, so nothing is foreclosed.)
+5. **Q5 — align on the short form: the enum member becomes `Warn`.** One spelling per level, used by both the enum and the convenience methods (`Trace, Debug, Info, Warn, Error, Critical, None`). The proposal already chose `Info` over .NET's `Information`, so the short form is the established local convention; completing it beats preserving a one-off .NET match. Declined: keeping the asymmetry (two greppable names for one level — a discoverability tax with no payoff); aligning long (`Warning`/`Information` — abandons the already-chosen `Info`). The §3/§D4 enum listings are conformed in place.
+
+Also recorded: the 2026-07-28 sweep's flag 3 (a target-typed `new(…)` in §4.3) is no longer present — the current §4.3 spells every construction with explicit `new`. The one element-position construction spelling (`[LogField("user", name)]`, §D3) is left for the graduation critique to verify against §15.4's literal-element grammar. With the rulings above, this proposal carries no open design question; the remaining path is the ordinary acceptance/graduation workflow.
 
 ## 7. Relationship to existing work
 

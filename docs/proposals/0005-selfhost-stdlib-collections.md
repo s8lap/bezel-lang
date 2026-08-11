@@ -553,6 +553,21 @@ of definition site from instantiation site; the prelude is always co-loaded).
 subsequent slice (it requires `IOwningEnumerable<T>` machinery — stdlib §4.13 —
 which is a larger codegen feature).
 
+> **Delegated ruling 2026-08-11 (stdlib-wave readiness; owner review in repo) —
+> D3: ACCEPTED.** `Drain()` defers to its own slice. The `IOwningEnumerable<T>`
+> protocol machinery (stdlib §4.13) is a separable codegen feature with a fully
+> specified stdlib target, so the deferral loses no design information; folding
+> it into SH-3 would couple the architecture-validating slice to the largest
+> unproven codegen surface and blur the pass/fail signal the slice exists to
+> produce. Declined: requiring `Drain()` in SH-3 (couples the proof slice to
+> unrelated risk); dropping `Drain()` from the plan (it is required stdlib
+> surface — deferral, not removal). Consequence: SH-3's acceptance criteria
+> exclude `Drain()`; the follow-up slice picks it up with the §4.13 pattern as
+> its spec-shaped test target. (Housekeeping, recorded with the ruling: the
+> 2026-07-28 sweep's standing flag 1 — the wholesale pre-v0.168 staleness of
+> this document — was discharged by the mechanical refresh performed 2026-07-30,
+> per the provenance note above; no refresh gate remains ahead of a 0005 lane.)
+
 ### Slice SH-4: Self-Host Borrowing `Stack<T>` and `Queue<T>` / `OwningQueue<T>`
 
 **What:** Write `src/stdlib/stack.bzl`, `src/stdlib/queue.bzl`,
