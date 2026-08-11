@@ -1,2 +1,5 @@
-public method Area(): decimal => Width * Height;
-public method Max(a: int, b: int): int => (if a > b then a else b);
+case temperature of
+  var t when t > 30 => Console.WriteLine($"Hot: {t}"),
+  var t when t < 0 => Console.WriteLine($"Freezing: {t}"),
+  var t => Console.WriteLine($"Mild: {t}")
+end;

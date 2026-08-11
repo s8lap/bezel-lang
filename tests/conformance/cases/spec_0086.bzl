@@ -1,3 +1,3 @@
-if dict.TryGetValue(key, out _) then    // we only care that it was present
-  // ...
-end;
+var c := 5;
+c++;            // c is 6
+c--;            // c is 5

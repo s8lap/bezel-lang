@@ -1,4 +1,3 @@
-{expression}
-{expression,alignment}
-{expression:format}
-{expression,alignment:format}
+if dict.TryGetValue(key, out _) then    // we only care that it was present
+  // ...
+end;

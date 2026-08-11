@@ -1,7 +1,6 @@
-public method ReadAndClose(owned reader: StreamReader): IEnumerable<string>
-  using var r := reader;                  // ownership moves: parameter → local
-  while not r.AtEnd do
-    yield return r.ReadLine();
-  end;
-  // r disposed by using var when the iterator completes or is disposed early.
-end ReadAndClose;
+public method ReplaceAt(index: int, owned newValue: T)
+  var old := move pool[index];      // take from slot
+  pool[index] := newValue;           // restore slot with new value
+  old.Dispose();                     // dispose the old value
+  // (or `using var taken := move pool[index];` for scope-bound disposal)
+end ReplaceAt;

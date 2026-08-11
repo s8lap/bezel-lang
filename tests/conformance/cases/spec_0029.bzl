@@ -1,4 +1,6 @@
-public class BankAccount(name: string, initialBalance: decimal): IBankAccount
-  private _name: string := name;
-  private _balance: decimal := initialBalance;
-end BankAccount;
+enum HttpStatus
+  Ok := 200,
+  Created := 201,
+  NotFound := 404,
+  ServerError := 500;
+end HttpStatus;

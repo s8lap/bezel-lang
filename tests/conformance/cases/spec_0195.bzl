@@ -1,4 +1,2 @@
-public method Resize(newSize: int)
-  _buffer.Dispose();
-  _buffer := new Array<byte>(newSize);
-end Resize;
+record UserId(Value: int);
+record OrderId(Value: int);

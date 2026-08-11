@@ -1,12 +1,8 @@
-public async method OpenFilesAsync(paths: IEnumerable<string>): IOwningAsyncEnumerable<FileStream>
-  for var path in paths do
-    yield return await OpenAsync(path);    // each yielded FileStream is owned
-  end;
-end OpenFilesAsync;
+// Iteration variable from draining: task is owned, await consumes it
+for var task in taskArray.Drain() do
+  results.Add(await task);     // task discharged by the await; no further obligation
+end;
 
-public async method ProcessAllAsync(paths: IEnumerable<string>): Task
-  await for var fs in OpenFilesAsync(paths) do
-    using var f := fs;                      // discharge owned iteration variable
-    await ProcessOneAsync(f);
-  end;
-end ProcessAllAsync;
+// Local variable of owned task type
+var theTask := SomeFactory();   // theTask: owned OwningTask<T>
+using var result := await theTask;  // theTask discharged by the await

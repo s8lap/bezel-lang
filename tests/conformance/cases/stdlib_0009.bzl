@@ -1,7 +1,3 @@
-public interface IDisposable
-  method Dispose();
-end IDisposable;
-
-public interface IAsyncDisposable
-  method DisposeAsync(): Task;
-end IAsyncDisposable;
+public interface IComparable<T>
+  method CompareTo(other: T): int;
+end IComparable;

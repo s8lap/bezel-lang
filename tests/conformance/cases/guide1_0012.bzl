@@ -12,7 +12,7 @@ class ResponseWriter
     // only when its two sides disagree on ownership (see the note after
     // this section on why `dest ?? new FileStream(...)` does not compile).
     var target: Stream := dest ?? _fallback;   // borrows whichever is chosen
-    target.Write(payload, 0, payload.Length);
+    target.Write(payload, 0, payload.Count);
     target.Flush();
   end Write;
 end ResponseWriter;

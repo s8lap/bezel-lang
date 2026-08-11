@@ -1,4 +1,15 @@
-public record DateTime
+public record DateTime: IComparable<DateTime>, IEquatable<DateTime>
+  // v0.165 (#1357): ordering + construction. CompareTo = tick order (Kind not
+  // normalized, matching .NET); the <,>,<=,>= operator group agrees with CompareTo.
+  public constructor(year: int, month: int, day: int);
+  public constructor(year: int, month: int, day: int, hour: int, minute: int, second: int,
+                     millisecond: int := 0, kind: DateTimeKind := DateTimeKind.Unspecified);
+                              // ArgumentOutOfRangeException on invalid components
+  public method CompareTo(other: DateTime): int;
+  public readonly property Ticks: long;
+  public static method FromTicks(ticks: long, kind: DateTimeKind := DateTimeKind.Unspecified): DateTime;
+  public method ToUnixTimeSeconds(): long;
+  public static method FromUnixTimeSeconds(seconds: long): DateTime;
   public readonly property Year: int;
   public readonly property Month: int;        // 1..12
   public readonly property Day: int;          // 1..31
@@ -33,10 +44,14 @@ public record DateTime
 
   public method ToUtc(): DateTime;
   public method ToLocal(): DateTime;
+  public method ToString(): string;                // ISO 8601: "yyyy-MM-ddTHH:mm:ss"
   public method ToString(format: string): string;
 
   public static method Parse(s: string): DateTime;
   public static method TryParse(s: string, out result: DateTime): bool;
+  public static method ParseOrNull(s: string): DateTime?;   // v0.231 (§1 *OrNull tier): null exactly
+                                                            //   where Parse(s) raises; otherwise the
+                                                            //   parsed value
 
   public static method operator -(a: DateTime, b: DateTime): TimeSpan;
   public static method operator -(d: DateTime, t: TimeSpan): DateTime;
@@ -52,7 +67,11 @@ public enum DateTimeKind: byte
   Unspecified, Utc, Local;
 end DateTimeKind;
 
-public record TimeSpan
+public record TimeSpan: IComparable<TimeSpan>, IEquatable<TimeSpan>
+  // v0.165 (#1357): CompareTo = tick order; operator group agrees.
+  public method CompareTo(other: TimeSpan): int;
+  public readonly property Ticks: long;
+  public static method FromTicks(ticks: long): TimeSpan;
   public readonly property Days: int;
   public readonly property Hours: int;             // -23..23
   public readonly property Minutes: int;           // -59..59
@@ -70,7 +89,23 @@ public record TimeSpan
   public static method FromSeconds(seconds: double): TimeSpan;
   public static method FromMilliseconds(ms: double): TimeSpan;
 
+  public static readonly property Zero: TimeSpan;          // FromTicks(0) (v0.228)
+  public static readonly property MinValue: TimeSpan;      // FromTicks(long.MinValue)
+  public static readonly property MaxValue: TimeSpan;      // FromTicks(long.MaxValue)
+
+  public method ToString(): string;                // constant ("c") form (§2.18)
+  public method ToString(format: string): string;  // format vocabulary: §2.18
+
   public static method operator +(a: TimeSpan, b: TimeSpan): TimeSpan;
   public static method operator -(a: TimeSpan, b: TimeSpan): TimeSpan;
   public static method operator *(a: TimeSpan, factor: double): TimeSpan;
+                                     // computes over Ticks in double; OverflowException on a
+                                     //   product outside the tick range or a NaN operand
+                                     //   (v0.228 pin)
+  public static method operator /(a: TimeSpan, divisor: double): TimeSpan;
+                                     // same computation model and OverflowException rule
+                                     //   as * (v0.228); DivideByZeroException on
+                                     //   divisor = 0.0
+  public static method operator -(t: TimeSpan): TimeSpan;
+                                     // unary negation (v0.228); OverflowException on MinValue
 end TimeSpan;

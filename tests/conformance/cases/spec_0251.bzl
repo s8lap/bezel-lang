@@ -1,12 +1,4 @@
-public async method WithCleanupAsync(): Task
-  try
-    await DoWorkAsync();
-  catch
-    var ex: Exception => do
-      await LogErrorAsync(ex);
-      throw;
-    end
-  finally
-    await ReleaseResourcesAsync();
-  end;
-end WithCleanupAsync;
+// ConnectAsync is illustrative; see §28.12 note.
+await using var connection := await ConnectAsync(url);
+await connection.SendAsync(data);
+// At end of scope: connection.DisposeAsync() awaited.

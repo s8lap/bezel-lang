@@ -1,16 +1,16 @@
-/// <summary>
-/// Represents a bank account with deposit and withdrawal functionality.
-/// </summary>
-public class BankAccount: IBankAccount
-  /// <summary>
-  /// Deposits the specified amount into the account.
-  /// </summary>
-  /// <param name="amount">The amount to deposit. Must be positive.</param>
-  /// <exception cref="ArgumentException">Thrown when amount is non-positive.</exception>
-  public method Deposit(amount: decimal)
-    if amount <= 0m then
-      throw new ArgumentException("Amount must be positive.", nameof(amount));
-    end;
-    Balance := Balance + amount;
-  end Deposit;
-end BankAccount;
+public class Exception
+  public pure constructor();
+  public pure constructor(message: string);
+  public constructor(message: string, cause: Exception);   // snapshot chaining, below
+  public readonly property Message: string;
+  public readonly property StackTrace: string;             // formatted; "" when unavailable
+  public readonly property CauseChain: Array<ExceptionInfo>;   // empty when no cause
+end Exception;
+
+public record ExceptionInfo(TypeName: string, Message: string, StackTrace: string);
+
+public class ArgumentException: Exception
+  public pure constructor(message: string);
+  public pure constructor(message: string, paramName: string);
+  public readonly property ParamName: string?;   // null when not supplied
+end ArgumentException;

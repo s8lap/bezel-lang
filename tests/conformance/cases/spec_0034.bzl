@@ -1,3 +1,9 @@
-interface IList<T>: IReadOnlyList<T>, ICollection<T>
-  property [i: int]: T;
-end IList;
+enum Priority: IComparable<Priority>
+  Low, Medium, High;
+
+  public method CompareTo(other: Priority): int =>
+    (when
+      int(this) < int(other) => -1,
+      int(this) > int(other) => 1,
+      _ => 0);
+end Priority;

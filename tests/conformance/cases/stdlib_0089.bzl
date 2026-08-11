@@ -1,12 +1,28 @@
-public static async method WhenAllOwned<T>(
-  owned tasks: OwningArray<OwningTask<T>>
-): OwningTask<OwningArray<T>> where T: class
-  using var taskArray := tasks;                       // owned param to using var; disposes at end
-  var results := new OwningArray<T>(capacity := taskArray.Count);
-  for var task in taskArray.Drain() do                // drain yields owned OwningTask<T>
-    results.Add(await task);                          // await produces owned T (Pattern B);
-                                                      //   Add(owned item) is an owned-consuming
-                                                      //   context, satisfying §30.5
-  end;
-  return results;                                     // ownership transfers to caller
-end WhenAllOwned;
+public record CancellationToken
+  public static readonly property None: CancellationToken;
+  public readonly property IsCancellationRequested: bool;
+  public method ThrowIfCancellationRequested();
+  public method Register(scoped callback: () -> ()): owned Subscription;
+end CancellationToken;
+
+public class CancellationTokenSource
+  public constructor();
+
+  public static method WithCancelAfter(delay: TimeSpan): owned CancellationTokenSource;
+
+  // v0.173 (#810): a source cancelled when ANY parent token cancels (or by its
+  // own Cancel/CancelAfter). Two-token form for the everyday case (caller +
+  // deadline); array form for N parents.
+  public static method CreateLinked(a: CancellationToken, b: CancellationToken): owned CancellationTokenSource;
+  public static method CreateLinkedAll(parents: Array<CancellationToken>): owned CancellationTokenSource;
+
+  public readonly property Token: CancellationToken;
+  public readonly property IsCancellationRequested: bool;
+
+  public method Cancel();
+  public method CancelAfter(delay: TimeSpan);
+
+  destructor;       // signals cancellation to any tokens still observing,
+                           // unregisters from linked parents (v0.173), then
+                           // releases the registered-callback list
+end CancellationTokenSource;

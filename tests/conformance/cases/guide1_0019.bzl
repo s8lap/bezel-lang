@@ -8,5 +8,5 @@ end;
 // An owned var still carries the disposal obligation; discharge it by
 // binding into a using var, returning it under an owned return type,
 // or storing it into an owned field:
-using var owned_x := x;           // adopt for scoped disposal
-owned_x.Process();
+using var adopted := move x;      // adopt for scoped disposal (transfer marker)
+adopted.Process();

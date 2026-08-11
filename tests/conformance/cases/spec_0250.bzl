@@ -1,13 +1,16 @@
-public record CancellationToken
-  public static readonly property None: CancellationToken;
-  public readonly property IsCancellationRequested: bool;
-  public method ThrowIfCancellationRequested();
-  public method Register(callback: () -> ()): owned Subscription;
-end CancellationToken;
+// Canonical form: using-var binding
+using var token := await semaphore.AcquireAsync();
+DoCriticalWork();
+// At end of scope: token disposed, releasing the semaphore.
 
-public class CancellationTokenSource: IDisposable
-  public readonly property Token: CancellationToken;
-  public readonly property IsCancellationRequested: bool;
-  public method Cancel();
-  public method CancelAfter(delay: TimeSpan);
-end CancellationTokenSource;
+// Plain var binding — x is an owned local subject to standard discharge rules
+var token := await semaphore.AcquireAsync();
+TransferToHelper(move token);     // owned local consumed by owned parameter
+
+// Direct ownership transfer to a method call accepting owned
+results.Add(await loadTask);     // results: OwningArray<T>; Add takes owned
+
+// Direct return
+public async method Acquire(): OwningTask<Connection>
+  return await ConnectAsync(url);     // owned T flows to owned T return
+end Acquire;

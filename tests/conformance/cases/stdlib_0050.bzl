@@ -1,39 +1,27 @@
-public class Stack<T>: ICollection<T>
+public class LinkedList<T>: ICollection<T>
   public constructor();
-  public method Push(item: T);
-  public method Pop(): T;             // raises if empty
-  public method Peek(): T;
-  public method TryPop(out item: T): bool;
-  public method TryPeek(out item: T): bool;
-end Stack;
+  public constructor(source: IEnumerable<T>);
 
-public class OwningStack<T>: IOwningCollection<T> where T: class
-  public constructor();
-  public method Push(owned item: T);
-  public method Pop(): owned T;                   // raises if empty; transfers out
-  public method Peek(): T;                         // borrow of top element
-  public method TryPop(out owned item: T): bool;
-  public method TryPeek(out item: T): bool;       // out is borrow
-  public method Clear();                           // disposes every element
-  public method Drain(): IOwningEnumerable<T>;
-end OwningStack;
+  public pure readonly property Count: int;
+  public pure readonly property FirstNode: LinkedListNode<T>?;
+  public pure readonly property LastNode: LinkedListNode<T>?;
+  public pure readonly property First: T?;
+  public pure readonly property Last: T?;
 
-public class Queue<T>: ICollection<T>
-  public constructor();
-  public method Enqueue(item: T);
-  public method Dequeue(): T;
-  public method Peek(): T;
-  public method TryDequeue(out item: T): bool;
-  public method TryPeek(out item: T): bool;
-end Queue;
+  public method AddFirst(item: T): LinkedListNode<T>;
+  public method AddLast(item: T): LinkedListNode<T>;
+  public method AddBefore(node: LinkedListNode<T>, item: T): LinkedListNode<T>;
+  public method AddAfter(node: LinkedListNode<T>, item: T): LinkedListNode<T>;
+  public method RemoveFirst();
+  public method RemoveLast();
+  public method RemoveNode(node: LinkedListNode<T>);
+  public method Find(item: T): LinkedListNode<T>?;
+  // Plus the standard ICollection<T> operations: Add (appends at the tail,
+  // = AddLast — v0.195), Clear, Contains, Remove, IsReadOnly.
+end LinkedList;
 
-public class OwningQueue<T>: IOwningCollection<T> where T: class
-  public constructor();
-  public method Enqueue(owned item: T);
-  public method Dequeue(): owned T;
-  public method Peek(): T;                         // borrow of front element
-  public method TryDequeue(out owned item: T): bool;
-  public method TryPeek(out item: T): bool;       // out is borrow
-  public method Clear();                           // disposes every element
-  public method Drain(): IOwningEnumerable<T>;
-end OwningQueue;
+public class LinkedListNode<T>
+  public readonly property Value: T;
+  public readonly property Next: LinkedListNode<T>?;
+  public readonly property Previous: LinkedListNode<T>?;
+end LinkedListNode;

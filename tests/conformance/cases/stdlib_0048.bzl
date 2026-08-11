@@ -1,37 +1,46 @@
-public class Set<T>: ICollection<T>
+public class OwningArray<T>: IOwningList<T>, IOwningEnumerable<T> where T: class
+                                     // IOwningEnumerable: stated v0.195 — §4.13/spec §29.2's both-implemented rule presupposed it
   public constructor();
   public constructor(capacity: int);
-  public constructor(comparer: IEqualityComparer<T>);
 
-  // ICollection<T> operations (including Add(item: T) returning ()) plus:
-  public method TryAdd(item: T): bool;                 // returns whether added
-                                                       //   (false if duplicate)
-  public method UnionWith(other: IEnumerable<T>);
-  public method IntersectWith(other: IEnumerable<T>);
-  public method ExceptWith(other: IEnumerable<T>);
-  public method IsSubsetOf(other: IEnumerable<T>): bool;
-  public method IsSupersetOf(other: IEnumerable<T>): bool;
-end Set;
+  public pure readonly property Count: int;
+  public pure readonly property Capacity: int;
 
-public class OwningSet<T>: IOwningCollection<T> where T: class
-  public constructor();
-  public constructor(capacity: int);
-  public constructor(comparer: IEqualityComparer<T>);
+  public property [i: int]: T
+    get;                                     // borrow of slot
+    set(owned);                              // takes owned T; disposes previous value
+  end;
 
-  // IOwningCollection<T> operations plus:
-  public method TryAdd(owned item: T): bool;          // returns whether added
-                                                       //   (false if duplicate;
-                                                       //   passed item is disposed)
-  // Drain
-  public method Take(query: T): owned T;               // borrow-taking query;
-                                                       //   returns owned matched
-  public method TryTake(query: T, out owned removed: T?): bool;
-  public method Drain(): IOwningEnumerable<T>;
+  public method Add(owned item: T);
+  public method AddRange(owned items: OwningArray<T>);   // drains items into self
+  public method Insert(index: int, owned item: T);
+  public method RemoveAt(index: int);                    // disposes the removed element
+  public method Remove(item: T): bool;                   // borrow-taking query;
+                                                          //   disposes the matched element
+  public method Clear();                                  // disposes every element
+  public method Contains(item: T): bool;
+  public method IndexOf(item: T): int;
 
-  public method UnionWith(owned other: OwningSet<T>);   // drains other into self;
-                                                       //   duplicates disposed
-  public method IntersectWith(other: IEnumerable<T>);  // disposes elements not in other
-  public method ExceptWith(other: IEnumerable<T>);     // disposes elements in other
-  public method IsSubsetOf(other: IEnumerable<T>): bool;
-  public method IsSupersetOf(other: IEnumerable<T>): bool;
-end OwningSet;
+  public method Sort(comparer: (T, T) -> int);          // comparer takes borrows
+  public method Reverse();
+
+  // Drain methods — transfer ownership of elements out of the collection
+  public method PopAt(index: int): owned T;             // removes and returns owned
+  public method PopFirst(): owned T;                     // = PopAt(0); raises if empty
+  public method PopLast(): owned T;                      // = PopAt(Count - 1); raises if empty
+  public method TryPopFirst(out owned item: T?): bool;   // v0.171 (#1336): the false path assigns null (§22.3)
+  public method TryPopLast(out owned item: T?): bool;
+  public method Drain(): IOwningEnumerable<T>;             // iteration drains the source
+end OwningArray;
+
+public extension OwningArray<T> where T: class, IComparable<T>
+  public method Sort();
+end;
+
+public method Build(): owned OwningArray<Connection>
+  return [
+    Connect("a"),                          // each Connect returns owned Connection
+    Connect("b"),
+    Connect("c")
+  ];                                       // collection literal targets OwningArray<Connection>
+end Build;

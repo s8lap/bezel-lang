@@ -1,12 +1,8 @@
-public class OwningTaskCompletionSource<T> where T: class
-  public constructor();
-  public readonly property Task: OwningTask<T>;
+public class Semaphore
+  public async method AcquireAsync(): OwningTask<SemaphoreToken>;
+end Semaphore;
 
-  public method SetResult(owned result: T);
-  public method SetException(exception: Exception);
-  public method SetCancelled();
-
-  public method TrySetResult(owned result: T): bool;
-  public method TrySetException(exception: Exception): bool;
-  public method TrySetCancelled(): bool;
-end OwningTaskCompletionSource;
+// Caller:
+using var token := await sem.AcquireAsync();
+DoWork();
+// token disposed at scope end -> semaphore released.

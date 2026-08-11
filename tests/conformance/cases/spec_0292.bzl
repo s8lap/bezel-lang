@@ -1,68 +1,18 @@
-Statement       ::= LocalDecl | LocalConstDecl | AssignmentStmt | ExpressionStmt
-                  | DiscardStmt
-                  | IfStmt | WhileStmt | ForStmt | DoEndBlock
-                  | ReturnStmt | ThrowStmt | BreakStmt | ContinueStmt
-                  | TryStmt | YieldStmt
-                  | IncrementStmt
+import System.Interop;
 
-LocalDecl       ::= "var" Identifier (":" Type)? (":=" Expression)? ";"
-                  | "using" "var" Identifier (":" Type)? ":=" Expression ";"
-                  | "await" "using" "var" Identifier (":" Type)? ":=" Expression ";"
-                              /* The `await using var` form is admitted by the
-                                 grammar at any LocalDecl position; it is
-                                 valid only inside `async` methods and `async`
-                                 lambdas, enforced semantically (§28.12,
-                                 Appendix C.6). */
+// C: int sqlite3_exec(sqlite3*, const char* sql,
+//                     int (*cb)(void*, int, char**, char**),
+//                     void* user, char** errmsg);
+extern "sqlite3"
+  public method sqlite3_exec(db: IntPtr, sql: CString,
+      cb: (env, int, Ptr<IntPtr>, Ptr<IntPtr>) -> int,   // env: where C passes user-data INTO the callback
+      env,                                               // env: which extern argument carries it
+      errmsg: Ptr<IntPtr>): int;
+end;
 
-LocalConstDecl  ::= "const" Identifier (":" Type)? ":=" ConstExpr ";"
-                                /* local const; no visibility or static modifier */
-
-AssignmentStmt  ::= LValue AssignOp Expression ";"
-AssignOp        ::= ":=" | "+=" | "-=" | "*=" | "/=" | "&=" | "|=" | "^="
-                  | "<<=" | ">>=" | "??="
-LValue          ::= Identifier | "this"
-                  | LValue "." Identifier
-                  | LValue "[" ArgList "]"
-                              /* LValues have a restricted shape: the base must
-                                 be `Identifier` or `this`, and only `.field`
-                                 and `[index]` accesses extend the chain.
-                                 Method-call results cannot serve as the base
-                                 of an assignment; `getCache().items[0] := v`
-                                 does not parse. Such cases require extracting
-                                 the call result into a local variable first:
-                                 `var c := getCache(); c.items[0] := v;`. */
-
-DiscardStmt     ::= "_" ":=" Expression ";"            /* explicit discard */
-
-IncrementStmt   ::= LValue ("++" | "--") ";"
-ExpressionStmt  ::= Expression ";"
-
-IfStmt          ::= "if" Expression "then" Statement*
-                    ("elif" Expression "then" Statement*)*
-                    ("else" Statement*)?
-                    "end" ";"
-
-WhileStmt       ::= "while" Expression "do" Statement* "end" ";"
-
-ForStmt         ::= "for" "var" Identifier (":" Type)? "in" Expression
-                    "do" Statement* "end" ";"
-                  | "await" "for" "var" Identifier (":" Type)? "in" Expression
-                    ("with" Expression)? "do" Statement* "end" ";"
-
-DoEndBlock      ::= "do" Statement* "end" ";"
-
-ReturnStmt      ::= "return" Expression? ";"
-ThrowStmt       ::= "throw" Expression? ";"
-BreakStmt       ::= "break" ";"
-ContinueStmt    ::= "continue" ";"
-
-TryStmt         ::= "try" Statement* CatchBlock FinallyClause? "end" ";"
-                  | "try" Statement* FinallyClause "end" ";"
-CatchBlock      ::= "catch" CatchArm ("," CatchArm)* ","?
-CatchArm        ::= CatchPattern ("when" Expression)? "=>" ArmBody
-CatchPattern    ::= Type ("," Type)*                          /* no binding */
-                  | "var" Identifier ":" Type ("," Type)*      /* binding */
-FinallyClause   ::= "finally" Statement*
-
-YieldStmt       ::= "yield" "return" Expression ";"
-                  | "yield" "break" ";"
+// C: void qsort_r(void*, size_t, size_t,
+//                 int (*compar)(const void*, const void*, void*), void* arg);
+extern "libc"
+  public method qsort_r(base: Ptr<byte>, nmemb: UIntPtr, size: UIntPtr,
+      compar: (IntPtr, IntPtr, env) -> int, env): ();
+end;

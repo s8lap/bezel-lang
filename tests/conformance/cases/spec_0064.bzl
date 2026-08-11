@@ -1,1 +1,3 @@
-for var i in 2..5 do Process(arr[i]); end;
+var counts: [10]int;             // 10 zeros
+var maybe:  [5]Connection?;       // 5 nulls
+var verts:  [3]Vertex;            // 3 zero-initialized Vertex records (if Vertex zero-initializes)

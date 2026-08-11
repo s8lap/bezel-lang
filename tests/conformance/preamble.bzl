@@ -61,6 +61,10 @@ end Subscription;
 
 public class Parser
   public constructor() end constructor;
+  // v0.247 regeneration: the Guide 1/2 `Import` examples construct a Parser
+  // over an open FileStream and drain it (`parser.ReadAll()`).
+  public constructor(fs: FileStream) end constructor;
+  public method ReadAll() end ReadAll;
   destructor end destructor;
 end Parser;
 

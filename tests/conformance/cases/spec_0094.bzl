@@ -1,2 +1,5 @@
-var greeting := $"Hello, {name}!";
-var msg := $"({point.X}, {point.Y}) - area = {point.Area()}";
+case shape of
+  Circle(_) => "circle",
+  Rectangle(_, _) => "rectangle",
+  _ => "other"
+end;

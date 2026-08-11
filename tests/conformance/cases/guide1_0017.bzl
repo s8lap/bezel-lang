@@ -8,6 +8,6 @@ public method Write(dest: Stream?, payload: Array<byte>)
 end Write;
 
 private method Emit(sink: Stream, payload: Array<byte>)
-  sink.Write(payload, 0, payload.Length);
+  sink.Write(payload, 0, payload.Count);
   sink.Flush();
 end Emit;

@@ -1,3 +1,7 @@
-var evens := 0..100 step 2;          // 0, 2, 4, …, 100
-var down := 100..0 step -1;          // 100, 99, …, 0
-var fives := 0..<50 step 5;          // 0, 5, 10, …, 45
+var a: [3]int := [1, 2, 3];                       // inline array
+using var b: Array<int> := [1, 2, 3];             // heap array
+using var c: OwningArray<Connection> := [          // owning heap array
+  Connect("a"), Connect("b"), Connect("c")
+];
+
+ProcessBuffer([1, 2, 3]);                          // type from parameter

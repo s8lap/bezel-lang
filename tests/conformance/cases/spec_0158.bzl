@@ -1,21 +1,6 @@
-public record PropertyChangedEvent(Sender: Object, PropertyName: string);
-
-public interface INotifyPropertyChanged
-  event PropertyChanged: PropertyChangedEvent;
-end INotifyPropertyChanged;
-
-public class Person: INotifyPropertyChanged
-  public event PropertyChanged: PropertyChangedEvent;
-
-  private _name: string := "";
-
-  public property Name: string
-    get => _name;
-    set => do
-      if _name <> value then
-        _name := value;
-        PropertyChanged.Raise(new PropertyChangedEvent(this, nameof(Name)));
-      end;
-    end;
-  end Name;
-end Person;
+public static pure method Checked(x: int, low: int, high: int): int
+  if low > high then
+    throw new ArgumentException("low must not exceed high", nameof(low));
+  end;
+  return (if x < low then low else (if x > high then high else x));
+end Checked;

@@ -1,11 +1,9 @@
-public method ReportEach(items: IEnumerable<Connection>)
-  for var c in items do Console.WriteLine(c.Name); end;
-end ReportEach;
-
-public method UseOwnedPool()
-  using var pool := new OwningArray<Connection>();
-  pool.Add(Connect("a"));
-  pool.Add(Connect("b"));
-  ReportEach(pool);     // OK: OwningArray<Connection> implements IEnumerable<Connection>
-                        //     iteration yields borrows
-end UseOwnedPool;
+public method RightLoop(): owned Stream
+  var fresh := MakeStream();
+  while SomeCondition() do
+    fresh := MakeStream();   // refine fresh in the loop
+  end;
+  var old := move _resource;
+  _resource := fresh;
+  return old;
+end RightLoop;

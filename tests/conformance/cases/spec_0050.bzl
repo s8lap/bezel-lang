@@ -1,17 +1,6 @@
-class MyArray<T>
-  // ...
-end MyArray;
+public abstract class Shape
+  public abstract method Area(): decimal;
+  public abstract property Name: string;
 
-interface IComparable<T>
-  method CompareTo(other: T): int;
-end IComparable;
-
-record Pair<TFirst, TSecond>(First: TFirst, Second: TSecond);
-
-static class Utils
-  public static method Swap<T>(ref a: T, ref b: T)
-    var temp := a;
-    a := b;
-    b := temp;
-  end Swap;
-end Utils;
+  public method Describe(): string => $"A {Name} with area {Area()}";
+end Shape;

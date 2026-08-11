@@ -1,5 +1,3 @@
-class BankAccount
-  private owned _transactions: Array<Transaction>;       // non-nullable, owned
-  private owned _cache: TransactionCache?;               // nullable, owned
-  private _owner: Customer;                              // back-reference, not owned
-end BankAccount;
+_clicked += lambda(e) => UpdateStatus(e.X, e.Y);
+// later:
+_clicked -= lambda(e) => UpdateStatus(e.X, e.Y);   // a different lambda, no match

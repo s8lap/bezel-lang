@@ -1,8 +1,14 @@
-// Iteration variable from draining: task is owned, await consumes it
-for var task in taskArray.Drain() do
-  results.Add(await task);     // task discharged by the await; no further obligation
-end;
+public static method Squares(n: int): IEnumerable<int>
+  for var i in 0..<n do
+    yield return i * i;
+  end;
+end Squares;
 
-// Local variable of owned task type
-var theTask := SomeFactory();   // theTask: owned OwningTask<T>
-using var result := await theTask;  // theTask discharged by the await
+public static method TakeWhilePositive(numbers: IEnumerable<int>): IEnumerable<int>
+  for var n in numbers do
+    if n <= 0 then
+      yield break;
+    end;
+    yield return n;
+  end;
+end TakeWhilePositive;

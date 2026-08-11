@@ -1,15 +1,9 @@
-extern "libdl"
-  public method dlopen(filename: CString, flags: int): IntPtr;
-  public method dlclose(handle: IntPtr): int;
+try
+  DoWork();
+catch
+  var ex: TimeoutException => RetryWithBackoff(ex),
+  var ex: Exception => do          // the catch-all (§31.2.3)
+    Log(ex);
+    throw;
+  end
 end;
-
-public static class DynamicLoader
-  public static method LoadAndClose(name: string)
-    using var libname := CString.From(name);
-    var handle := dlopen(libname, RTLD_NOW);
-    if handle = IntPtr.Zero then
-      throw new IOException("Library failed to load");
-    end;
-    var result := dlclose(handle);
-  end LoadAndClose;
-end DynamicLoader;

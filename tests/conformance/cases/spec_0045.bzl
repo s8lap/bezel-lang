@@ -1,7 +1,3 @@
-interface IEnumerable<out T>
-  method GetEnumerator(): owned IEnumerator<T>;
-end IEnumerable;
-
-interface IComparer<in T>
-  method Compare(a: T, b: T): int;
-end IComparer;
+public static class Utils
+  public static method Max(a: int, b: int): int => (if a > b then a else b);
+end Utils;

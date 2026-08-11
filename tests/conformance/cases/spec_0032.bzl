@@ -1,3 +1,1 @@
-public class ResourceHolder(owned resource: Stream)
-  private owned _resource: Stream := resource;
-end ResourceHolder;
+public static method FromUnderlyingOrNull(value: U): E?;

@@ -55,33 +55,12 @@ end ISerializable;
 public interface IDeserializable
 end IDeserializable;
 
-public record Point(X: int, Y: int): ISerializable
-  public method Serialize(s: ISerializer)
-    s.BeginObject(2);
-    s.WriteFieldName("X"); s.WriteInt(X);
-    s.WriteFieldName("Y"); s.WriteInt(Y);
-    s.EndObject();
-  end Serialize;
-end Point;
-
-public record Point(X: int, Y: int): ISerializable, IDeserializable
-  public method Serialize(s: ISerializer)
-    s.BeginObject(2);
-    s.WriteFieldName("X"); s.WriteInt(X);
-    s.WriteFieldName("Y"); s.WriteInt(Y);
-    s.EndObject();
-  end Serialize;
-
-  public static method Deserialize(d: IDeserializer): Point
-    d.BeginObject();
-    var x := 0;  var y := 0;
-    // field-name dispatch omitted for brevity; a real implementation
-    // loops over ReadFieldName() and fills the locals
-    d.EndObject();
-    return new Point(x, y);
-  end Deserialize;
-end Point;
-
-public record Point(X: int, Y: int): ISerializable, IDeserializable;
-// compiler synthesizes Serialize(s: ISerializer) and the recognized
-// static Deserialize(d: IDeserializer): Point — no body needed
+public static method Deserialize(d: IDeserializer): T;          // value-type
+                                                                //   target (record,
+                                                                //   enum): no `owned`
+public static method Deserialize(d: IDeserializer): owned T;     // class target:
+                                                                //   `owned` return
+public static method Deserialize(d: IDeserializer): owned Shared<C>;  // co-owned entry:
+                                                                //   the class is itself
+                                                                //   a shared node
+// T = the declaring type; C = the declaring shared-node class; both written concretely.

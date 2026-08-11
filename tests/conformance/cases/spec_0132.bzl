@@ -1,5 +1,7 @@
-class BankAccount
-  private _balance: decimal := 0m;
-  private owned _transactions: Array<Transaction> := new Array<Transaction>();
-  private _createdAt: DateTime := DateTime.Now;
-end BankAccount;
+public method Add(a: int, b: int): int
+  return a + b;
+end Add;
+
+public method PrintGreeting(name: string)
+  Console.WriteLine($"Hello, {name}!");
+end PrintGreeting;

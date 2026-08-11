@@ -1,12 +1,18 @@
-record Vector2(X: double, Y: double)
-  public static method operator +(left: Vector2, right: Vector2): Vector2 =>
-    new Vector2(left.X + right.X, left.Y + right.Y);
+public class Account
+  private _balance: decimal := 0m;
+  private _limit: decimal := 0m;
 
-  public static method operator *(v: Vector2, scalar: double): Vector2 =>
-    new Vector2(v.X * scalar, v.Y * scalar);
-end Vector2;
+  invariant(_balance + _limit >= 0m);
 
-record Counter(Value: int)
-  public static method operator ++(c: Counter): Counter =>
-    new Counter(c.Value + 1);
-end Counter;
+  public constructor(limit: decimal)
+    requires(limit >= 0m)
+    _limit := limit;
+  end constructor;
+
+  public method Withdraw(amount: decimal)
+    requires(amount > 0m)
+    requires(amount <= _balance + _limit)
+    ensures(_balance = old(_balance) - amount)
+    _balance := _balance - amount;
+  end Withdraw;
+end Account;

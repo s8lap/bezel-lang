@@ -1,3 +1,2 @@
-public interface IDataSource
-  async event DataReceived: DataReceivedEvent;
-end IDataSource;
+public method Log(messages: Array<string>) ...
+Log(["hello", "world"]);

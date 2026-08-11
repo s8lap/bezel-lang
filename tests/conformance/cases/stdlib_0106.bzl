@@ -1,20 +1,29 @@
-/// Compiler-intrinsic; aliased by the keyword `char`.
-public record Char: IComparable<char>, IEquatable<char>
-  public static const MinValue: char;             // U+0000
-  public static const MaxValue: char;             // U+10FFFF (excluding surrogates)
+public interface ISharedEvent<out T>
+  method Subscribe(handler: (T) -> ()): owned Subscription;
+      // capture-free admission: the handler must be a non-capturing lambda or a
+      // static method reference — a stdlib-stated position in spec §28.14's
+      // capture-free register (the same register Domain.Spawn's entries live in),
+      // NOT a `scoped` storage-bounded position.
+end ISharedEvent;
 
-  public static method IsDigit(c: char): bool;
-  public static method IsLetter(c: char): bool;
-  public static method IsLetterOrDigit(c: char): bool;
-  public static method IsWhiteSpace(c: char): bool;
-  public static method IsUpper(c: char): bool;
-  public static method IsLower(c: char): bool;
-  public static method IsControl(c: char): bool;
-  public static method IsPunctuation(c: char): bool;
+public sealed class SharedEventSource<T>: ISharedEvent<T>
+  public constructor();
+  public method Subscribe(handler: (T) -> ()): owned Subscription;   // capture-free (as above)
+  public method Raise(payload: T);       // synchronized snapshot-raise; handlers run on the raising domain
+  public method Add(handler: (T) -> ());                             // capture-free (as above)
+  public method Remove(handler: (T) -> ());                          // call-bounded: compares only
+  destructor;                            // synchronized quiescence: severs the subscriber list under the
+                                         // same lock discipline as subscribe/raise
+end SharedEventSource;
 
-  public static method ToUpper(c: char): char;
-  public static method ToLower(c: char): char;
+public static class App
+  private static owned readonly _exiting: SharedEventSource<()> := new();
+  public static property Exiting: ISharedEvent<()> => _exiting;
 
-  public method ToString(): string;
-  public method CompareTo(other: char): int;
-end Char;
+  public static method NotifyExiting()
+    _exiting.Raise();
+  end NotifyExiting;
+end App;
+
+// consumer, any domain — handler must be capture-free (static method ref / non-capturing lambda):
+using var sub := App.Exiting.Subscribe(OnExit);

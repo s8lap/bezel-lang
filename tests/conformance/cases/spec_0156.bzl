@@ -1,5 +1,5 @@
-public record PropertyChangedEvent(Sender: Object, PropertyName: string);
-
-public interface INotifyPropertyChanged
-  event PropertyChanged: PropertyChangedEvent;
-end INotifyPropertyChanged;
+private static _cfg: Task<Config>? := null;
+public static async method GetConfig(): Task<Config>
+  if _cfg = null then _cfg := LoadConfigAsync(); end;
+  return await _cfg!;
+end GetConfig;

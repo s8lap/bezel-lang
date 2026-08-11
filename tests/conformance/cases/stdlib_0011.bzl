@@ -1,9 +1,7 @@
-public static class BitConverter
-  // float (32-bit) ↔ int bit pattern
-  public static method FloatToInt32Bits(value: float): int;
-  public static method Int32BitsToFloat(value: int): float;
+public interface IDisposable
+  method Dispose();
+end IDisposable;
 
-  // double (64-bit) ↔ long bit pattern
-  public static method DoubleToInt64Bits(value: double): long;
-  public static method Int64BitsToDouble(value: long): double;
-end BitConverter;
+public interface IAsyncDisposable
+  method DisposeAsync(): Task;
+end IAsyncDisposable;

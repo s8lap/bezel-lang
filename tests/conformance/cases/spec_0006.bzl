@@ -1,3 +1,1 @@
-var a: int := 2_000_000_000;
-var b: int := 2_000_000_000;
-var c := a + b;                       // OverflowException
+for var c in "hello" do Console.WriteLine(c); end;

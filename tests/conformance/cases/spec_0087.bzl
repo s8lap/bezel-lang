@@ -1,4 +1,6 @@
-_ := DoTelemetryAsync();                 // ERROR: Task is non-trivial-dispose
-Task.FireAndForget(DoTelemetryAsync());  // OK — supervised
-
-using var _ := new FileStream(path);     // OK — disposed at scope end
+// Source:                         // Desugars to:
+counts[category]++;                do
+                                     var __coll := counts;
+                                     var __idx := category;
+                                     __coll[__idx] := __coll[__idx] + 1;
+                                   end;

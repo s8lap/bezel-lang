@@ -1,7 +1,19 @@
-public async method LoadAllConfigs(paths: Array<string>): OwningTask<OwningArray<Config>>
-  var tasks := new OwningArray<OwningTask<Config>>();
-  for var path in paths do
-    tasks.Add(LoadConfigAsync(path));    // each task is OwningTask<Config>; transfers in
-  end;
-  return await Task.WhenAllOwned(tasks); // tasks consumed; returned array owns the configs
-end LoadAllConfigs;
+public extension IEnumerable<int>
+  public method Sum(): int;
+  public method Average(): double;
+end;
+
+public extension IEnumerable<long>
+  public method Sum(): long;
+  public method Average(): double;
+end;
+
+public extension IEnumerable<double>
+  public method Sum(): double;
+  public method Average(): double;
+end;
+
+public extension IEnumerable<decimal>
+  public method Sum(): decimal;
+  public method Average(): decimal;
+end;

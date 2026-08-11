@@ -1,8 +1,4 @@
-public interface IOwningEnumerable<T>: IDisposable where T: class
-  method GetOwningEnumerator(): owned IOwningEnumerator<T>;
-end IOwningEnumerable;
-
-public interface IOwningEnumerator<T>: IDisposable where T: class
-  method TakeCurrent(): owned T;        // transfers ownership (v0.161; was destructive property Current)
-  method MoveNext(): bool;
-end IOwningEnumerator;
+public class KeyNotFoundException: Exception
+  public constructor();
+  public constructor(message: string);
+end KeyNotFoundException;

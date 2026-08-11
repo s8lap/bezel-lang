@@ -1,17 +1,42 @@
-public class Shared<T>: IDisposable where T: class      // proper class types only;
-                                                         //   runtime-managed T rejected at instantiation
-  public constructor(owned value: T);                    // consumes the value; count = 1
+public class JsonSerializer: ISerializer, IDisposable
+  public constructor();
+  public constructor(options: JsonOptions);
+  // ISerializer surface (§2.14) implemented for JSON text.
+  public method ToBytes(): owned OwningBuffer<byte>;   // UTF-8 encoded result
+  public method ToString(): string;                   // convenience: UTF-8 → string
+end JsonSerializer;
 
-  public method Clone(): owned Shared<T>;                // count + 1; a new independent handle
-  public method Get(): T;                                // borrow of the underlying value;
-                                                         //   source: this handle (valid while it lives)
-  public method Downgrade(): owned Weak<T>;              // mint a non-owning observer
+public class JsonDeserializer: IDeserializer, IDisposable
+  public constructor(input: ReadOnlySpan<byte>);         // UTF-8 JSON
+  public constructor(input: ReadOnlyArraySpan<byte>);    // v0.165 (#1358): Array-world twin;
+                                                          //   borrowed identically for the deserializer's lifetime
+  public constructor(input: string);                  // convenience
+  public constructor(input: ReadOnlySpan<byte>, options: JsonOptions);
+  public constructor(input: ReadOnlyArraySpan<byte>, options: JsonOptions);  // v0.215: options parity
+  public constructor(input: string, options: JsonOptions);                   //   for every input form
+  // IDeserializer surface (§2.14) implemented for JSON text.
+end JsonDeserializer;
 
-  // Dispose(): count - 1; the last disposal disposes the underlying value.
-end Shared;
+public record JsonOptions(
+  Indented: bool,                 // pretty-print (serializer); ignored on read
+  IndentWidth: int,               // spaces per level when Indented; default 2
+  AllowTrailingCommas: bool,      // deserializer leniency; default false
+  IgnoreUnknownFields: bool,      // deserializer: skip input fields that match
+                                  //   no declared component instead of raising;
+                                  //   default false (strict)
+  MaxDepth: int                   // nesting guard; default 64
+);
 
-public class Weak<T>: IDisposable where T: class
-  public method TryUpgrade(out owned s: Shared<T>?): bool;   // true + a new strong handle
-                                                              //   if the value is still alive
-  // Does not keep the underlying value alive. Dispose() releases the observer.
-end Weak;
+public class BinarySerializer: ISerializer, IDisposable
+  public constructor();
+  // ISerializer surface (§2.14) implemented for the compact binary format.
+  public method ToBytes(): owned OwningBuffer<byte>;
+end BinarySerializer;
+
+public class BinaryDeserializer: IDeserializer, IDisposable
+  public constructor(input: ReadOnlySpan<byte>);         // strict
+  public constructor(input: ReadOnlyArraySpan<byte>);    // v0.165 (#1358): Array-world twin;
+                                                          //   borrowed identically for the deserializer's lifetime
+  public constructor(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool);
+  // IDeserializer surface (§2.14) implemented for the compact binary format.
+end BinaryDeserializer;

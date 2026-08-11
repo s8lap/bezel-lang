@@ -1,22 +1,3 @@
-enum Priority
-  Low, Medium, High;
-
-  public method IsUrgent(): bool => this = High;
-
-  public property Name: string => (case this of
-    Low => "Low",
-    Medium => "Medium",
-    High => "High"
-  );
-
-  public static readonly All: Array<Priority> := [Low, Medium, High];
-
-  public static method Parse(text: string): Priority?
-    return (case text of
-      "Low" => Low,
-      "Medium" => Medium,
-      "High" => High,
-      _ => null
-    );
-  end Parse;
-end Priority;
+var p1 := new Point(1, 2);
+var p2 := p1 with(Y := 99);             // Point(1, 99)
+var p3 := p2 with(X := 0, Y := 0);      // Point(0, 0)

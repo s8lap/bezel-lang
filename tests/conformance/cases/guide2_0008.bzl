@@ -1,5 +1,14 @@
-method Import(path: string)
-  using var fs := new FileStream(path, FileMode.Open);
-  using var parser := new Parser(fs);
-  parser.ReadAll();                // if this throws, parser then fs are
-end Import;                        // disposed automatically, innermost first
+public method ParsePort(text: string): Result<int, string>
+  if not int.TryParse(text, out var value) then
+    return Error($"not a number: {text}");    // bare case name: the declared
+  end;                                        //  return type supplies the choice
+  if value < 1 or value > 65535 then
+    return Error($"out of range: {value}");
+  end;
+  return Ok(value);
+end ParsePort;
+
+case ParsePort(arg) of
+  Ok(var p)    => Listen(p),
+  Error(var m) => Console.WriteLine($"bad port: {m}")
+end;                                  // exhaustive; no _ arm needed

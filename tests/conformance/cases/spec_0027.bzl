@@ -1,4 +1,4 @@
-case p of
-  Low => Console.WriteLine("low"),
-  Medium | High => Console.WriteLine("medium or high")
-end;
+public abstract class Shape: ISerializable, IDeserializable
+  polymorphic ("circle": Circle, "square": Square);
+  // ... other members ...
+end Shape;

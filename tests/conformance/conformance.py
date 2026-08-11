@@ -69,15 +69,25 @@ _MAIN_RE = re.compile(r'\bmethod\s+Main\b')
 _FNS_LINE_RE = re.compile(r'^[ \t]*[^ \t/]')
 
 # Steps 2-6: applied to the first-nonblank line. Translations of the bash EREs.
+# v0.247 corpus regeneration: `choice` joined the type-declaration alternation,
+# and TypeAliasDecl (`type X := T;`) / ExternBlock (`extern "lib" ... end;`)
+# gained lib-wrap dispatch — all three are TopDecls per spec Appendix A.1, but
+# the original cascade predates their appearance as fragment-leading forms in
+# the docs, so such fragments fell through to the stmt wrap and could never
+# compile.
 _TYPE_DECL_RE = re.compile(
     r'^\s*(?:(?:public|private|internal)\s+)?'
     r'(?:(?:sealed|abstract|static)\s+)*'
-    r'(?:class|record|enum|interface)\s+\w')
-_EXT_RE = re.compile(r'^\s*extension\b')
+    r'(?:class|record|enum|interface|choice)\s+\w')
+# Visibility prefix admitted since the v0.247 regeneration: §26.1 defaults
+# extensions to internal, so the docs' fragments now spell `public extension`.
+_EXT_RE = re.compile(r'^\s*(?:(?:public|private|internal)\s+)?extension\b')
+_TYPEALIAS_RE = re.compile(r'^\s*type\s+\w')
+_EXTERN_BLOCK_RE = re.compile(r'^\s*extern\b')
 _IMPORT_RE = re.compile(r'^\s*import\s+')
 _METHOD_RE = re.compile(
     r'^\s*(?:(?:public|private|internal|protected)\s+)?'
-    r'(?:(?:static|virtual|override|abstract|async)\s+)*'
+    r'(?:(?:static|virtual|override|abstract|async|pure)\s+)*'
     r'(?:method|property|constructor|destructor)\s+')
 _FIELD_RE = re.compile(
     r'^\s*(?:(?:public|private|internal)\s+)?'
@@ -126,11 +136,43 @@ def classify_wrap(code):
     if fn is not None and _EXT_RE.match(fn):
         return WRAP_LIB, "module Conf;\n\n" + code
 
-    # 4. Import statement → wrap as statements, with a Main so imports resolve.
+    # 3b. Type alias / extern block at module scope (TopDecls per spec
+    # Appendix A.1) → wrap as library. Added at the v0.247 regeneration.
+    if fn is not None and (_TYPEALIAS_RE.match(fn) or _EXTERN_BLOCK_RE.match(fn)):
+        return WRAP_LIB, "module Conf;\n\n" + code
+
+    # 4. Import statement → hoist the leading import block and dispatch on the
+    # remainder (v0.247 regeneration). The original template appended an empty
+    # `class W`, which only compiles when everything after the imports is a
+    # declaration; an import-led fragment whose remainder is STATEMENTS (the
+    # docs' LINQ examples) then leaves them stranded at module level. Splitting
+    # lets the remainder take whichever wrap it needs, with the imports re-homed
+    # directly after the module line (SourceFile ::= ModuleDecl Import* TopDecl*,
+    # spec A.1).
     if fn is not None and _IMPORT_RE.match(fn):
-        return (WRAP_STMT,
-                "module Conf;\n" + code
-                + "\nclass W\n  public static method Main() end Main;\nend W;\n")
+        lines = code.splitlines(keepends=True)
+        i = 0
+        while i < len(lines) and (
+                _IMPORT_RE.match(lines[i]) or not lines[i].strip()
+                or lines[i].lstrip().startswith("//")):
+            i += 1
+        lead, rest = "".join(lines[:i]), "".join(lines[i:])
+        if not lead.endswith("\n"):
+            lead += "\n"
+        if not rest.strip():
+            return (WRAP_STMT,
+                    "module Conf;\n" + code
+                    + "\nclass W\n  public static method Main() end Main;\nend W;\n")
+        mode, wrapped_rest = classify_wrap(rest)
+        # insert the import block right after the synthesized module line
+        rl = wrapped_rest.splitlines(keepends=True)
+        for j, line in enumerate(rl):
+            if _MODULE_RE.match(line):
+                wrapped = "".join(rl[:j + 1]) + lead + "".join(rl[j + 1:])
+                break
+        else:
+            wrapped = lead + wrapped_rest
+        return mode, wrapped
 
     # 5. Method/property/ctor/dtor declaration → wrap inside a class, library.
     if fn is not None and _METHOD_RE.match(fn):
@@ -155,19 +197,38 @@ def classify_wrap(code):
 _SPLICE_MODULE_LINE_RE = re.compile(r'^[ \t]*module[ \t]')
 
 
+_SPLICE_IMPORT_LINE_RE = re.compile(r'^[ \t]*import[ \t]')
+
+
 def splice_preamble(wrapped_src, preamble_text):
-    """Insert preamble_text immediately after the first `module ...` line, the
-    awk splice in run_conformance.sh for `notes=preamble` cases. awk's
-    `getline` + `print` line-terminates every preamble line, so a missing
-    trailing newline on the preamble file is supplied here."""
+    """Insert preamble_text after the first `module ...` line AND any imports
+    that immediately follow it (SourceFile ::= ModuleDecl Import* TopDecl*,
+    spec Appendix A.1 — a declaration spliced between the module line and an
+    import would make the import ill-placed). Derived from the awk splice in
+    run_conformance.sh for `notes=preamble` cases; the import hop was added at
+    the v0.247 regeneration. awk's `getline` + `print` line-terminates every
+    preamble line, so a missing trailing newline on the preamble file is
+    supplied here."""
     pad = preamble_text if preamble_text.endswith("\n") else preamble_text + "\n"
+    lines = wrapped_src.splitlines(keepends=True)
     out = []
+    i = 0
     spliced = False
-    for line in wrapped_src.splitlines(keepends=True):
-        out.append(line)
-        if not spliced and _SPLICE_MODULE_LINE_RE.match(line):
+    while i < len(lines):
+        out.append(lines[i])
+        if not spliced and _SPLICE_MODULE_LINE_RE.match(lines[i]):
+            # hop over the contiguous import block (blank lines included)
+            j = i + 1
+            while j < len(lines) and (
+                    _SPLICE_IMPORT_LINE_RE.match(lines[j])
+                    or not lines[j].strip()):
+                out.append(lines[j])
+                j += 1
             out.append(pad)
             spliced = True
+            i = j
+            continue
+        i += 1
     return "".join(out)
 
 

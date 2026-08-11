@@ -1,26 +1,38 @@
-Identifier      ::= IdentStart IdentCont*
-IdentStart      ::= Letter | "_"
-IdentCont       ::= IdentStart | Digit
-Letter          ::= /any Unicode letter/
-Digit           ::= "0".."9"
-HexDigit        ::= Digit | "a".."f" | "A".."F"
+public class ContractViolationException: Exception
+  public pure constructor(message: string);
+end ContractViolationException;
 
-IntLiteral      ::= DecLiteral | HexLiteral | BinLiteral
-DecLiteral      ::= Digit ("_"* Digit)* IntSuffix?
-HexLiteral      ::= "0x" HexDigit ("_"* HexDigit)* IntSuffix?
-BinLiteral      ::= "0b" ("0" | "1") ("_"* ("0" | "1"))* IntSuffix?
-IntSuffix       ::= "L" | "U" | "UL" | "LU"   /* case-insensitive */
+public class Exception
+  public pure constructor();
+  public pure constructor(message: string);
+  public constructor(message: string, cause: Exception);   // snapshot chaining, below
+  public readonly property Message: string;
+  public readonly property StackTrace: string;             // formatted; "" when unavailable
+  public readonly property CauseChain: Array<ExceptionInfo>;   // empty when no cause
+end Exception;
 
-FloatLiteral    ::= DigitGroup "." DigitGroup Exponent? FloatSuffix?
-                  | DigitGroup Exponent FloatSuffix?
-                  | DigitGroup FloatSuffix
-DigitGroup      ::= Digit ("_"* Digit)*
-Exponent        ::= ("e" | "E") ("+" | "-")? DigitGroup
-FloatSuffix     ::= "f" | "F" | "m" | "M"     /* m -> decimal */
+public record ExceptionInfo(TypeName: string, Message: string, StackTrace: string);
 
-CharLiteral     ::= "'" CharContent "'"
-StringLiteral   ::= '"' StringContent* '"'
-                  | '@"' VerbatimContent* '"'
-InterpString    ::= '$"' (InterpPart | StringContent)* '"'
-                  | '$@"' (InterpPart | VerbatimContent)* '"'
-InterpPart      ::= "{" Expression ("," "-"? IntLiteral)? (":" FormatSpec)? "}"
+public class ArgumentException: Exception
+  public pure constructor(message: string);
+  public pure constructor(message: string, paramName: string);
+  public readonly property ParamName: string?;   // null when not supplied
+end ArgumentException;
+
+Exception
+├─ ContractViolationException — a `requires`/`ensures`/`invariant` clause evaluated `false` ([§22.16](#sec-contract-clauses))
+├─ ArgumentException                — invalid arguments.
+│   └─ ArgumentNullException        — a null argument where non-null was required.
+├─ ArithmeticException              — base for arithmetic errors.
+│   ├─ OverflowException            — a value outside the destination type's or operation's domain: integer/decimal overflow ([§6.1](#sec-integer-arithmetic)/[§6.4](#sec-decimal-arithmetic)), checked narrowings and enum casts ([§5.2](#sec-explicit-conversions)/[§5.4](#sec-enum-casts)), out-of-domain shift counts ([§6.5](#sec-bitwise-operations)), a zero range step ([§16.4](#sec-stride)).
+│   └─ DivideByZeroException        — division by zero.
+├─ InvalidOperationException        — operation not valid in current state.
+│   └─ DisposedAccessException      — member access on a disposed instance (checked disposal mode only).
+├─ NotImplementedException          — placeholder for unimplemented code.
+├─ NullReferenceException           — null encountered where non-null required.
+├─ IndexOutOfRangeException         — array or string index out of bounds.
+├─ MatchFailureException            — case expression did not match.
+├─ OperationCanceledException       — operation cancelled via CancellationToken.
+├─ TypeInitializationException      — static initialization failed; wraps the original (`InnerException` null for the §22.13 cycle backstop).
+├─ FormatException                  — string does not conform to an expected format.
+└─ StackOverflowException           — call stack exhausted; cannot be caught; terminates the program.

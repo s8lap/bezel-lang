@@ -1,2 +1,2 @@
-var displayName: string := user?.Name ?? "Anonymous";
-_cache ??= new Cache();             // assign only if currently null
+var name: string := "Alice";        // non-nullable
+var middle: string? := null;        // nullable

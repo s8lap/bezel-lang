@@ -1,6 +1,4 @@
-try
-  using var fs := new FileStream(path);
-  ProcessFile(fs);
-finally
-  Log("file processing finished");
+catch
+  var ex: TransientException => Retry(ex),
+  var ex: Exception => throw          // re-raise unrecognized exceptions
 end;

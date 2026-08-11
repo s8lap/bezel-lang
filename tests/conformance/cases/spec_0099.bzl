@@ -1,6 +1,2 @@
-var grade := (case score of
-  90..100 => "A",
-  80..89 => "B",
-  70..<80 => "C",
-  _ => "F"
-);
+(var name := initializer; body)
+(var a := E1; var b := E2; body)

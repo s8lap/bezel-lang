@@ -1,7 +1,12 @@
-try
-  // protected statements
-catch
-  // arms (see §31.2.1)
-finally
-  // cleanup statements
-end;
+public async method WithCleanupAsync(): Task
+  try
+    await DoWorkAsync();
+  catch
+    var ex: Exception => do
+      await LogErrorAsync(ex);
+      throw;
+    end
+  finally
+    await ReleaseResourcesAsync();
+  end;
+end WithCleanupAsync;

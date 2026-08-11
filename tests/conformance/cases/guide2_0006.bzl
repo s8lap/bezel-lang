@@ -1,9 +1,10 @@
-private owned _lastError: Exception?;
+private owned _cache: OwningDictionary<string, Connection>;
 
-method Handle()
-  try
-    Risky();
-  catch
-    var ex: Exception => _lastError := ex;   // ERROR: ex is a borrow;
-  end;                                        //  cannot assign to an owned field
-end Handle;
+method TryTakeCached(name: string, out owned conn: Connection? when true): bool
+  if not _cache.ContainsKey(name) then
+    conn := null;                  // every out path must assign (throw paths exempt)
+    return false;
+  end;
+  conn := _cache.PopValue(name);   // takes ownership out of the cache
+  return true;
+end TryTakeCached;

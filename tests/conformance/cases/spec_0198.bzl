@@ -1,4 +1,1 @@
-public method ReplaceResource(owned resource: Stream)
-  _resource.Dispose();
-  _resource := resource;
-end ReplaceResource;
+type IntPredicate := Predicate<int>;       // Predicate<int>, which is (int) -> bool

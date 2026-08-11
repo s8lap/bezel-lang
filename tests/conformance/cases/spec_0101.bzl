@@ -1,11 +1,7 @@
-var description := (case score of
-  > 90 => "excellent",
-  > 70 => "good",
-  > 50 => "passing",
-  _    => Classify(score)            // helper for the multi-step case
-);
-
-private static method Classify(score: int): string
-  Log("low score: " + score.ToString());
-  return (if score < 0 then "invalid" else "failing");
-end Classify;
+42                  // int
+0xFF                // hex
+0b10101010          // binary
+1_234_567           // digit separators allowed except at start/end
+42L                 // long
+42U                 // uint
+42UL                // ulong

@@ -1,3 +1,2 @@
-extern "/opt/myapp/lib/libcustom.so.2.1"
-  public method DoWork(): int;
-end;
+throw new ArgumentException("Amount must be positive.", nameof(amount));
+throw;          // re-throw the current exception (in a catch arm body only)

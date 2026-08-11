@@ -1,7 +1,7 @@
-public method ReportEachGeneric<T>(items: IEnumerable<T>) where T: class
-  for var c in items do Console.WriteLine(c.Name); end;
-end ReportEachGeneric;
-
-// Call with Array<Connection>: T inferred as Connection.
-// Call with OwningArray<Connection>: T inferred as Connection.
-// Same generic instantiation for both source forms.
+public method ProcessAndReplace()
+  var fresh := new Stream();
+  using var old := move _resource;        // moved into using var; disposed at scope end
+  _resource := fresh;                      // restore
+  // ... use old ...
+  // at scope end: old.Dispose()
+end ProcessAndReplace;

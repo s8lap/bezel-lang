@@ -1,15 +1,32 @@
-public class SortedDictionary<K, V>: IDisposable where K: IComparable<K>
-  public constructor();
+public class OwningBuffer<T>                              // no IEnumerable conformance
+                                                          //   (value-typed; see "Iteration" below)
+  public constructor(length: int);                       // all slots default(T)
+                                                          //   requires T to have a default value
+  public constructor(length: int, init: (int) -> T);     // init returns T (no `owned`)
 
-  public readonly property Count: int;
+  public readonly property Length: int;
 
-  public property [key: K]: V;                  // get: KeyNotFoundException if absent
-                                                // set: insert or replace
-  public method ContainsKey(key: K): bool;
-  public method TryGetValue(key: K, out value: V?): bool;
-  public method Remove(key: K): bool;           // false if absent
-  public method Clear();
+  public property [i: int]: T
+    get;                                                  // borrow of slot (value copy
+                                                          //   for primitives at the use site)
+    set;                                                  // overwrites slot
+  end;
 
-  public readonly property FirstKey: K;         // least key; InvalidOperationException if empty
-  public readonly property LastKey: K;          // greatest key; InvalidOperationException if empty
-end SortedDictionary;
+  // move buf[i] NOT admitted (values have no ownership; use plain read)
+
+  // Foreign-memory access (v0.186; language spec §32.12) — admitted only for
+  //   FFI-pointee scalar and C-compatible-record T; see prose. The result type
+  //   lives in System.Interop (import required at the use site).
+  public method DangerousPointer(): Ptr<T>;
+
+  // Span views (v0.109)
+  public method AsSpan(): Span<T>;                          // full buffer, writable
+  public method AsSpan(start: int): Span<T>;                // from offset to end
+  public method AsSpan(start: int, length: int): Span<T>;
+  public method AsSpan(r: Range<int>): Span<T>;             // parallels Range slicing
+
+  public method AsReadOnlySpan(): ReadOnlySpan<T>;
+  public method AsReadOnlySpan(start: int): ReadOnlySpan<T>;
+  public method AsReadOnlySpan(start: int, length: int): ReadOnlySpan<T>;
+  public method AsReadOnlySpan(r: Range<int>): ReadOnlySpan<T>;
+end OwningBuffer;

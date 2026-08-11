@@ -1,27 +1,29 @@
-public class LinkedList<T>: ICollection<T>
+public class StringBuilder
   public constructor();
-  public constructor(source: IEnumerable<T>);
+  public constructor(capacity: int);
+  public constructor(initial: string);
 
-  public readonly property Count: int;
-  public readonly property FirstNode: LinkedListNode<T>?;
-  public readonly property LastNode: LinkedListNode<T>?;
-  public readonly property First: T?;
-  public readonly property Last: T?;
+  public readonly property Length: int;
+  public pure readonly property Capacity: int;
 
-  public method AddFirst(item: T): LinkedListNode<T>;
-  public method AddLast(item: T): LinkedListNode<T>;
-  public method AddBefore(node: LinkedListNode<T>, item: T): LinkedListNode<T>;
-  public method AddAfter(node: LinkedListNode<T>, item: T): LinkedListNode<T>;
-  public method RemoveFirst();
-  public method RemoveLast();
-  public method RemoveNode(node: LinkedListNode<T>);
-  public method Find(item: T): LinkedListNode<T>?;
-  // Plus the standard ICollection<T> operations: Add, Clear, Contains, Remove,
-  // IsReadOnly. (§28.11 v0.213, #2081: `DisposeElements()` removed with axiom A8.)
-end LinkedList;
+  public method Append(value: string): StringBuilder;
+  public method Append(value: char): StringBuilder;
+  public method Append(value: Object): StringBuilder;
+  // v0.165 (#1355): per-type overloads for bool and the numeric primitives —
+  // observable behavior = Append(value.ToString()); no Object boxing on the path.
+  public method Append(value: bool): StringBuilder;
+  public method Append(value: int): StringBuilder;      // + byte/sbyte/short/ushort/uint/long/ulong/float/double/decimal, same shape
+  public method Append(value: ReadOnlyStringSpan): StringBuilder;   // v0.222 (#1810): copies the span's
+                                                                    //   code points; = Append(value.ToString())
+                                                                    //   without the intermediate string
+  public method AppendLine(): StringBuilder;
+  public method AppendLine(value: string): StringBuilder;
+  public method AppendFormat(format: string, args: Array<Object>): StringBuilder;
 
-public class LinkedListNode<T>
-  public readonly property Value: T;
-  public readonly property Next: LinkedListNode<T>?;
-  public readonly property Previous: LinkedListNode<T>?;
-end LinkedListNode;
+  public method Insert(index: int, value: string): StringBuilder;
+  public method Remove(startIndex: int, length: int): StringBuilder;
+  public method Replace(oldValue: string, newValue: string): StringBuilder;
+  public method Clear(): StringBuilder;
+
+  public method ToString(): string;
+end StringBuilder;

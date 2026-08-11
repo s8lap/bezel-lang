@@ -1,3 +1,3 @@
-if animal is Dog then
-  animal.Bark();        // animal narrowed to Dog
-end;
+interface IList<T>: IReadOnlyList<T>, ICollection<T>
+  property [i: int]: T;
+end IList;

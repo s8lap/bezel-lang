@@ -1,3 +1,8 @@
-using var r := await LoadResourceAsync("/etc/foo");
-Process(r);
-// r disposed at scope end
+interface IAsyncEnumerable<out T>
+  method GetAsyncEnumerator(token: CancellationToken := CancellationToken.None): owned IAsyncEnumerator<T>;
+end IAsyncEnumerable;
+
+interface IAsyncEnumerator<out T>: IAsyncDisposable
+  method MoveNextAsync(): Task<bool>;
+  readonly property Current: T;
+end IAsyncEnumerator;

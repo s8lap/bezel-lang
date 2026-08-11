@@ -1,3 +1,3 @@
-public class BankAccount: IBankAccount
-  // members
-end BankAccount;
+enum Priority
+  Low, Medium, High;
+end Priority;

@@ -1,9 +1,5 @@
-class BankAccount
-  private owned _mutex: Mutex := new Mutex();
-  private _balance: decimal := 0m;
-
-  public method Deposit(amount: decimal)
-    using var guard := _mutex.Acquire();
-    _balance := _balance + amount;
-  end Deposit;
-end BankAccount;
+public async method ProcessFileAsync(path: string): Task
+  await for var line in ReadLinesAsync(path) do
+    Process(line);
+  end;
+end ProcessFileAsync;

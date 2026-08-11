@@ -1,18 +1,12 @@
-extension IEnumerable<T>
-  public method First(): T
-    for var item in this do return item; end;
-    throw new InvalidOperationException("empty sequence");
-  end First;
-end;
+record Vector2(X: double, Y: double)
+  public static method operator +(left: Vector2, right: Vector2): Vector2 =>
+    new Vector2(left.X + right.X, left.Y + right.Y);
 
-extension IEnumerable<int>
-  public method First(): int
-    // optimized for int (an implementation may, for example,
-    // short-circuit on the `Array<int>` storage layout).
-    for var item in this do return item; end;
-    throw new InvalidOperationException("empty sequence");
-  end First;
-end;
+  public static method operator *(v: Vector2, scalar: double): Vector2 =>
+    new Vector2(v.X * scalar, v.Y * scalar);
+end Vector2;
 
-var xs: Array<int> := [1, 2, 3];
-var s := xs.First();                          // selects the IEnumerable<int> overload
+record Counter(Value: int)
+  public static method operator ++(c: Counter): Counter =>
+    new Counter(c.Value + 1);
+end Counter;
