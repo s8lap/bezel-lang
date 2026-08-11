@@ -117,9 +117,15 @@ public:
     // Dependency to an importer's compileFile. Unlike the executable path, no
     // `Main` is required (§33.6: a library has no entry point) and no link runs.
     // `deps` lets a dependency itself import further dependencies (acyclic).
+    // `opts` is consulted for exactly one bit on this path — the proposal 0082
+    // stage-1 prototype's `scopedAwaitBind` (#3048, off by default). The
+    // library build's codegen options remain the ones this path builds for
+    // itself (`isMainModule=false`, §33.6); no other flag's meaning changes
+    // here, so every existing caller is unaffected by the added parameter.
     CompileResult compileObject(const std::string& path,
                                 const std::string& objectPath,
-                                const std::vector<Dependency>& deps = {});
+                                const std::vector<Dependency>& deps = {},
+                                const codegen::CodegenOptions& opts = {});
 };
 
 } // namespace bezel

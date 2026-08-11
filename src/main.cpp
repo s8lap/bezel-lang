@@ -18,7 +18,8 @@ constexpr const char* kVersion =
 void printUsage(std::ostream& out) {
     out << "usage: bezelc [--version] [--help] [-c] [-o <output>] "
            "[--import <artifact>]... [--checked-disposal] "
-           "[--sanitize=address] <source-file>\n"
+           "[--sanitize=address] [--experimental-scoped-await-bind] "
+           "<source-file>\n"
            "  -c                 compile to a native object (a library, §2.4) "
            "with embedded\n"
            "                     interface metadata; do not link, no `Main` "
@@ -42,7 +43,12 @@ void printUsage(std::ostream& out) {
            "code is\n"
            "                     caught at the access (JIT→AOT memory net); "
            "executable\n"
-           "                     builds only (not -c)\n";
+           "                     builds only (not -c)\n"
+           "  --experimental-scoped-await-bind\n"
+           "                     PROTOTYPE (proposal 0082 §3, issue #3048; not a\n"
+           "                     language feature): admit `var x := await\n"
+           "                     <fresh Task<T> producer>;` by desugaring it to\n"
+           "                     `using var $t := <producer>; var x := await $t;`\n";
 }
 
 // Default executable name from the source path: drop the directory and the
@@ -106,6 +112,12 @@ int main(int argc, char** argv) {
             codegenOpts.checkedDisposal = true;
             continue;
         }
+        if (arg == "--experimental-scoped-await-bind") {
+            // Proposal 0082 §3 stage-1 prototype (#3048). Off by default; with
+            // the flag absent the compiler is bit-for-bit what it was.
+            codegenOpts.scopedAwaitBind = true;
+            continue;
+        }
         if (arg == "--sanitize=address") {
             // JIT→AOT test-harness migration §2 (memory net): run LLVM's
             // AddressSanitizerPass over the generated module and link the
@@ -163,7 +175,7 @@ int main(int argc, char** argv) {
     bezel::Driver driver;
     const bezel::CompileResult result =
         compileObjectOnly
-            ? driver.compileObject(inputPath, outputPath, deps)
+            ? driver.compileObject(inputPath, outputPath, deps, codegenOpts)
             : driver.compileFile(inputPath, outputPath, deps, codegenOpts);
     return result.success ? 0 : 1;
 }

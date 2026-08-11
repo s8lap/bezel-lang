@@ -65,6 +65,21 @@ struct CodegenOptions {
     // when set) so the ASan runtime that defines `__asan_report_*` /
     // `asan.module_ctor` is present.
     bool sanitizeAddress = false;
+
+    // Proposal 0082 §3 — the *scoped await-bind*, stage-1 PROTOTYPE (#3048),
+    // OFF BY DEFAULT. CLI: `--experimental-scoped-await-bind`.
+    //
+    // Despite living in CodegenOptions — the one options struct the driver
+    // already plumbs from `main` through `Driver::compileFile` (the
+    // `--checked-disposal` precedent) — this bit is a FRONT-END knob and is
+    // never read by codegen. `Driver::compileExecutableObject` consults it to
+    // decide whether to run the proposal §3 AST desugaring
+    // (`src/driver/ScopedAwaitBind.{hpp,cpp}`) between the parse and the rest
+    // of the pipeline; every pass after that point, this backend included, is
+    // unaware the prototype exists. It nonetheless CHANGES THE EMITTED OBJECT
+    // (a program that did not compile now does), so the AOT test harness's
+    // content-addressed cache keys on it exactly as on the three bits above.
+    bool scopedAwaitBind = false;
 };
 
 // Build an LLVM module for `src` (already checked, using `ctx`'s side tables),

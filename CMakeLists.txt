@@ -244,7 +244,8 @@ add_library(bezel_core STATIC
     src/module/ModuleMetadata.cpp
     src/module/ModuleMetadataBuilder.cpp
     src/module/ModuleLoader.cpp
-    src/driver/Driver.cpp)
+    src/driver/Driver.cpp
+    src/driver/ScopedAwaitBind.cpp)
 target_include_directories(bezel_core PUBLIC src)
 # LLVM headers as SYSTEM so their warnings don't trip our -Wall/-Werror.
 target_include_directories(bezel_core SYSTEM PUBLIC ${LLVM_INCLUDE_DIRS})

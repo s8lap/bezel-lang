@@ -13,6 +13,7 @@
 #include "ast/Node.hpp"
 #include "codegen/CodeGen.hpp"
 #include "codegen/LlvmBackend.hpp"
+#include "driver/ScopedAwaitBind.hpp"
 #include "lexer/Lexer.hpp"
 #include "module/ModuleLoader.hpp"
 #include "module/ModuleMetadataBuilder.hpp"
@@ -157,6 +158,73 @@ void injectStdlibPrelude(ast::SourceFile& unit) {
     static const std::string ioSrc(kIoPreludeSource);
     injectOnePrelude(unit, resultSrc);   // stdlib §2.20 Result<T, E>
     injectOnePrelude(unit, ioSrc);       // stdlib §7.1/§7.2 System.IO enums
+}
+
+// Proposal 0082 §3 stage-1 PROTOTYPE (#3048), reached only when
+// `CodegenOptions::scopedAwaitBind` is set — off by default, so with the flag
+// off not one instruction of this runs and the pipeline below is bit-for-bit
+// what it was.
+//
+// Collect the sites the scoped await-bind would desugar. The set is NOT
+// computed by any new classification: it is exactly the set of `await`
+// locations at which the UNMODIFIED ownership pass reports the §30.5 Pattern A
+// consumer-side rejection. The front-end is therefore run once over a
+// THROWAWAY DiagnosticEngine (nothing is printed and nothing is kept but the
+// locations); the real compilation then proceeds over the rewritten AST with
+// its own engine, so a program's diagnostics are unaffected by this pass ever
+// having run. See src/driver/ScopedAwaitBind.hpp for why the prototype is
+// shaped this way (it is the C3 evidence).
+//
+// The phase sequence below mirrors compileExecutableObject's verbatim, so the
+// classification run cannot diverge from the run whose diagnostic it reads.
+std::vector<SourceLocation> collectScopedAwaitBindSites(
+    const std::string& source, const std::vector<Dependency>& deps) {
+    std::vector<SourceLocation> sites;
+
+    DiagnosticEngine scratch;
+    Lexer lexer(source, scratch);
+    Parser parser(lexer, scratch);
+    std::unique_ptr<ast::SourceFile> unit = parser.parseCompilationUnit();
+    if (!unit || scratch.hasErrors()) return sites;   // parse gates the front-end
+
+    injectStdlibPrelude(*unit);
+    sema::SemaContext ctx(scratch);
+    sema::collectSymbols(*unit, ctx);
+    {
+        std::vector<std::string> depMetaPaths;
+        depMetaPaths.reserve(deps.size());
+        for (const Dependency& dep : deps)
+            if (!dep.metadataPath.empty())
+                depMetaPaths.push_back(dep.metadataPath);
+        std::string depErr, failedPath;
+        if (!depMetaPaths.empty() &&
+            !bezel::module::loadDependencies(depMetaPaths, ctx, &depErr,
+                                             &failedPath))
+            return sites;   // the real run reports it; stay silent here
+    }
+    sema::resolveTypes(*unit, ctx);
+    sema::typecheckExpressions(*unit, ctx);
+    sema::checkPureBodies(*unit, ctx);
+    sema::checkDefiniteAssignment(*unit, ctx);
+    sema::checkStaticInitCycles(*unit, ctx);
+    ownership::checkOwnership(*unit, ctx);
+
+    for (const Diagnostic& d : scratch.diagnostics()) {
+        if (d.severity != Severity::Error) continue;
+        if (d.message.rfind(proto::kPatternARejectPrefix, 0) == 0)
+            sites.push_back(d.location);
+    }
+    return sites;
+}
+
+// The prototype's single entry point into the real pipeline: rewrite `unit` in
+// place when the flag is on. A no-op — not even a parse — when it is off.
+void maybeDesugarScopedAwaitBinds(bool enabled, const std::string& source,
+                                  const std::vector<Dependency>& deps,
+                                  ast::SourceFile& unit) {
+    if (!enabled) return;
+    proto::rewriteScopedAwaitBinds(unit,
+                                   collectScopedAwaitBindSites(source, deps));
 }
 
 } // namespace
@@ -353,6 +421,13 @@ CompileResult Driver::compileExecutableObject(
     // check and codegen below already gate on a clean front-end. Valid programs
     // (no parse errors) are unaffected: the block runs precisely as before.
     if (unit && !diagnostics.hasErrors()) {
+        // Proposal 0082 §3 stage-1 PROTOTYPE (#3048), OFF BY DEFAULT: rewrite
+        // `var x := await <fresh Task<T> producer>;` into the two-line form
+        // `using var $t := <producer>; var x := await $t;` — a source-level
+        // macro expansion into today's language, so every pass below runs
+        // UNMODIFIED over an ordinary `using var` (§28.10). With the flag off
+        // this call returns immediately and the pipeline is unchanged.
+        maybeDesugarScopedAwaitBinds(opts.scopedAwaitBind, source, deps, *unit);
         // stdlib §2.20 (#2047): make the auto-imported `Result<T, E>` choice
         // available by injecting its synthesized declaration before symbol
         // collection, so user references to `Result<T, E>` resolve.
@@ -484,7 +559,8 @@ CompileResult Driver::compileExecutableObject(
 
 CompileResult Driver::compileObject(const std::string& path,
                                     const std::string& objectPath,
-                                    const std::vector<Dependency>& deps) {
+                                    const std::vector<Dependency>& deps,
+                                    const codegen::CodegenOptions& opts) {
     std::string source;
     if (!readFile(path, source)) {
         std::cerr << "bezelc: error: cannot open '" << path << "'\n";
@@ -500,6 +576,12 @@ CompileResult Driver::compileObject(const std::string& path,
     // recovery AST. See compileFile for the full rationale — the same parse-
     // gates-the-front-end rule applies to this library/object path.
     if (unit && !diagnostics.hasErrors()) {
+        // Proposal 0082 §3 stage-1 PROTOTYPE (#3048), OFF BY DEFAULT — the
+        // library/object path mirrors compileExecutableObject. `opts` is read
+        // for this ONE bit here; the library build's codegen options stay the
+        // locally-built `libOpts` below, so no other flag's meaning changes on
+        // this path.
+        maybeDesugarScopedAwaitBinds(opts.scopedAwaitBind, source, deps, *unit);
         // stdlib §2.20 (#2047): inject the auto-imported `Result<T, E>` choice
         // (the library/object path mirrors compileFile).
         injectStdlibPrelude(*unit);

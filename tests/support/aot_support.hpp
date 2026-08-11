@@ -1262,6 +1262,10 @@ inline std::string modeString(const codegen::CodegenOptions& opts) {
     s += "sa=";  s += opts.sanitizeAddress ? '1' : '0';
     s += ";cd="; s += opts.checkedDisposal ? '1' : '0';
     s += ";mm="; s += opts.isMainModule ? '1' : '0';
+    // Proposal 0082 stage-1 prototype (#3048): a FRONT-END desugaring, but one
+    // that changes the emitted object (a program that did not compile now
+    // does), so it belongs in the key like any codegen-mode bit.
+    s += ";sab="; s += opts.scopedAwaitBind ? '1' : '0';
     s += ';';
     return s;
 }
@@ -1348,9 +1352,10 @@ inline std::string computeCacheKey(std::string_view source,
 // residual is unchanged from k2; pair such an update with a cache wipe.
 
 // The codegen-mode component of K1: every CodegenOptions bit that alters the
-// EMITTED OBJECT. All three do (sanitizeAddress adds the AddressSanitizer pass,
-// checkedDisposal emits §28.2 guards, isMainModule decides whether a native
-// `main` is lowered), so this is modeString's set under its own schema tag —
+// EMITTED OBJECT. All of them do (sanitizeAddress adds the AddressSanitizer
+// pass, checkedDisposal emits §28.2 guards, isMainModule decides whether a
+// native `main` is lowered, scopedAwaitBind runs the #3048 front-end
+// desugaring), so this is modeString's set under its own schema tag —
 // kept as a separate function so that if the two ever diverge (an option that
 // changes only the link line, say), each key can move independently.
 inline std::string codegenModeString(const codegen::CodegenOptions& opts) {
@@ -1358,6 +1363,7 @@ inline std::string codegenModeString(const codegen::CodegenOptions& opts) {
     s += "sa=";  s += opts.sanitizeAddress ? '1' : '0';
     s += ";cd="; s += opts.checkedDisposal ? '1' : '0';
     s += ";mm="; s += opts.isMainModule ? '1' : '0';
+    s += ";sab="; s += opts.scopedAwaitBind ? '1' : '0';   // #3048, see modeString
     s += ';';
     return s;
 }
@@ -2164,7 +2170,8 @@ inline std::string runAotOut(std::string_view source) {
 // ---------------------------------------------------------------------------
 inline JitResult runAotCheckedImpl(std::string_view source,
                                     const char* name,
-                                    bool detectLeaks) {
+                                    bool detectLeaks,
+                                    codegen::CodegenOptions opts = {}) {
     JitResult r;
 
     // SKIP if the C toolchain (which the driver shells out to for the ASan link)
@@ -2202,7 +2209,8 @@ inline JitResult runAotCheckedImpl(std::string_view source,
     // --- Compile + link with generated-code ASan, forked (S3), served from the
     //     link-cache (keyed sanitizeAddress=1, so it never collides with a plain
     //     build of the same source). ---------------------------------------
-    codegen::CodegenOptions opts;
+    // `opts` arrives from the caller (default-constructed for the plain
+    // runAotChecked); this harness owns exactly one bit of it.
     opts.sanitizeAddress = true;
     aot_detail::CompileStatus cc =
         aot_detail::cachedCompile(source, srcPath, exePath, opts, ccErr);
@@ -2285,6 +2293,15 @@ inline JitResult runAotCheckedImpl(std::string_view source,
 
 inline JitResult runAotChecked(std::string_view source) {
     return runAotCheckedImpl(source, "runAotChecked", /*detectLeaks=*/true);
+}
+
+// runAotChecked with extra front-end/codegen options (the ASan/LSan bit is
+// still this harness's own). Used by tests that must exercise a non-default
+// compiler mode under the memory net - e.g. the proposal 0082 stage-1
+// prototype flag (#3048), whose whole subject is disposal timing.
+inline JitResult runAotChecked(std::string_view source,
+                               const codegen::CodegenOptions& opts) {
+    return runAotCheckedImpl(source, "runAotChecked", /*detectLeaks=*/true, opts);
 }
 
 // runAotCheckedLenient — issue #2214. Like runAotChecked but with
