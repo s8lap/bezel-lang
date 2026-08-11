@@ -521,7 +521,23 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                     advance(); // past name
                     advance(); // past ":"
                 }
-                arm.types.push_back(parseType());
+                // §31.2.1 (v0.243, #3046) — SPAN STAMPING. `Parser::parseType`
+                // populates no span, so every `ast::Type` node carries the
+                // degenerate 0:0 and a diagnostic anchored on a catch-arm TYPE
+                // (the #1939 erasure guard, and the v0.243 arm-type rule)
+                // reported `0:0` — the #1307/#2496 degenerate-span class,
+                // measured on this very shape. Stamp it HERE, in the catch-arm
+                // parse only, so no other Type-anchored diagnostic's location
+                // can move. `stampSpan` is a no-op on an already-stamped node.
+                // The start location is read BEFORE parseType consumes the
+                // token and the end AFTER, in separate statements — argument
+                // evaluation order is unspecified, so this must not be one call.
+                {
+                    SourceLocation tstart = current_.location;
+                    auto ty = parseType();
+                    arm.types.push_back(
+                        stampSpan(std::move(ty), tstart, current_.location));
+                }
                 // §31.2.1 / §A.6 (v0.167, #1371): multi-type alternatives are
                 // now `|`-separated — the same alternatives spelling as case
                 // patterns. The comma is exclusively the arm separator, so no
@@ -529,7 +545,10 @@ std::unique_ptr<ast::Stmt> Parser::parseStatementImpl() {
                 // the next arm. `IOException | TimeoutException` and
                 // `var e: IOException | TimeoutException` both collect here.
                 while (consumePunctuator("|")) {
-                    arm.types.push_back(parseType());
+                    SourceLocation tstart = current_.location;
+                    auto ty = parseType();
+                    arm.types.push_back(
+                        stampSpan(std::move(ty), tstart, current_.location));
                 }
                 if (consumeKeyword("when")) {
                     arm.guard = parseExpression();

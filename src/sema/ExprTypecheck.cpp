@@ -3954,7 +3954,14 @@ TypeRef* ExprTC::catchArmNcb(
         if (allMatch) return candidateRef;
     }
 
-    return nullptr;  // No common base found.
+    // --- §31.2.1's simplified fallback (v0.243, proposal 0080, #3046) --------
+    // "for alternatives sharing nothing more specific, it is `Exception`."
+    // Every listed type is `Exception`-derived (the arm-type rule, enforced by
+    // `checkCatchArmType`) or an interface an `Exception`-derived class may
+    // implement, so `Exception` really is a base of every throwable this arm can
+    // ever bind. The v0.182 `Object`-fallback rejection is unreachable under
+    // that rule and has been deleted rather than left dead.
+    return builtinAncestorTypeRef("Exception");
 }
 
 void ExprTC::typeConditional(const ast::ConditionalExpr& cnd,
@@ -7045,33 +7052,313 @@ Symbol* ExprTC::lookupName(std::string_view name, bool memberBeforeModuleType) {
     return nullptr;
 }
 
+// §31.1 / §31.2.1 (v0.243, proposal 0080, #3046): is `ty` the built-in
+// `Exception` or a CLASS deriving from it? This is the ONE predicate the
+// throw-operand rule (§31.1) and the catch-arm-type rule (§31.2.1) both ask,
+// so the two can never disagree about which types are `Exception`-family.
+//
+// Stated as a POSITIVE list on purpose (this project's own defect taxonomy:
+// a "not X ⇒ assume throwable" negative list fails by silently ACCEPTING).
+// A type is `Exception`-family iff either
+//   * it IS a built-in exception type — those carry no `TypeSymbol` at all, so
+//     membership is the single `kBuiltinExceptionHierarchy` table
+//     (`common::isBuiltinExceptionName`), never a hand-listed copy; or
+//   * its class-ancestor chain reaches one — `sema::builtinExceptionBaseOf`,
+//     the ONE walk that answers this for LOCAL and IMPORTED classes alike
+//     (#2950: an imported ancestor has no AST, so an AST-only walk stops dead
+//     at the module boundary).
+// Everything else — a plain user class, `Object`, an interface, a record, an
+// enum, a primitive, an inline array, a function value, unit — is not.
+// per §31.1, §31.2.1, §31.4
+bool ExprTC::isExceptionDerivedClass(const TypeRef* ty) {
+    if (!ty || ty->kind != TypeRef::Kind::Named) return false;
+    if (ty->declaration)
+        return ty->declaration->kind == ast::TypeDeclKind::Class &&
+               !builtinExceptionBaseOf(ty->declaration).empty();
+    return common::isBuiltinExceptionName(namedRefSimpleName(ty));
+}
+
+// §31.2.1 (v0.243, #3046): is `name` a generic type parameter declared by the
+// enclosing method, type, or extension? Only such a name can be the subject of
+// the arm-type generic-bound rule — every other declaration-less Named ref is a
+// built-in (user classes, local and imported, all carry a `TypeSymbol`).
+// per §14.2, §31.2.1
+bool ExprTC::isEnclosingTypeParamName(std::string_view name) const {
+    auto has = [&](const auto& params) {
+        for (const auto& gp : params)
+            if (gp.name == name) return true;
+        return false;
+    };
+    if (currentMethodDecl_ && has(currentMethodDecl_->genericParams))
+        return true;
+    if (currentType_ && currentType_->decl)
+        if (auto* td = dynamic_cast<const ast::TypeDecl*>(currentType_->decl))
+            if (has(td->genericParams)) return true;
+    if (currentExtension_ && currentExtension_->decl)
+        if (auto* ed =
+                dynamic_cast<const ast::ExtensionDecl*>(currentExtension_->decl))
+            for (const auto& gc : ed->genericConstraints)
+                if (gc.typeParam == name) return true;
+    return false;
+}
+
+// §31.2.1 (v0.243, #3046): does the enclosing declaration's constraint set bound
+// the type parameter `paramName` by an `Exception`-derived CLASS — directly
+// (`where TEx: Exception`, or a class deriving from it) or transitively through
+// a `where TEx: U` chain (§14.2)? §31.2.1 requires exactly this and states it is
+// "decidable from the enclosing declaration's constraint set alone ... so the
+// arm's well-formedness never depends on an instantiation".
+//
+// Deliberately NOT `forEachConstraintBound`: that walk hands `fn` only bounds
+// that carry a `declaration`, and a built-in exception bound (`Exception`,
+// `IOException`, …) has none — the exact population this rule is about.
+// per §14.2, §31.2.1
+bool ExprTC::typeParamHasExceptionBound(std::string_view paramName) {
+    const ast::TypeDecl* typeDecl =
+        (currentType_ && currentType_->decl)
+            ? dynamic_cast<const ast::TypeDecl*>(currentType_->decl)
+            : nullptr;
+    const ast::ExtensionDecl* extDecl =
+        (currentExtension_ && currentExtension_->decl)
+            ? dynamic_cast<const ast::ExtensionDecl*>(currentExtension_->decl)
+            : nullptr;
+    std::unordered_set<std::string_view> visited;
+    std::vector<std::string_view> work{paramName};
+    // A `where T: U` cycle is a declaration error checked elsewhere; the
+    // visited set still guards this walk defensively (the #1624 precedent).
+    while (!work.empty()) {
+        std::string_view nm = work.back();
+        work.pop_back();
+        if (!visited.insert(nm).second) continue;
+        auto scan = [&](const std::vector<ast::GenericConstraint>& gcs) -> bool {
+            for (const auto& gc : gcs) {
+                if (gc.typeParam != nm) continue;
+                for (const auto& item : gc.items) {
+                    // `class` / `value` / `notnull` / `new` carry no typeArg —
+                    // none of them is an `Exception`-derived CLASS bound, so
+                    // §31.2.1 rejects a parameter carrying only those.
+                    if (item.kind != "type" || !item.typeArg) continue;
+                    TypeRef* b = ctx_.resolvedType(*item.typeArg);
+                    if (isExceptionDerivedClass(b)) return true;
+                    // `where nm: U` — follow the chain (§14.2).
+                    if (b && b->kind == TypeRef::Kind::Named && !b->declaration) {
+                        std::string_view bn = namedRefSimpleName(b);
+                        if (!bn.empty() && isEnclosingTypeParamName(bn))
+                            work.push_back(bn);
+                    }
+                }
+            }
+            return false;
+        };
+        if (currentMethodDecl_ && scan(currentMethodDecl_->genericConstraints))
+            return true;
+        if (typeDecl && scan(typeDecl->genericConstraints)) return true;
+        if (extDecl && scan(extDecl->genericConstraints)) return true;
+    }
+    return false;
+}
+
 void ExprTC::checkThrowableType(const ast::Expr& value) {
     TypeRef* vt = ctx_.exprType(value);
     if (!vt) return;  // unresolved type — don't false-positive
-    // §31.1 (v0.182): the throw operand must be an instance of a CLASS type —
-    // any class, deliberately NOT restricted to `Exception`-derived (the #771
-    // ruling: a thrown class is caught by its own type or a base). A Named type
-    // whose declaration is a RECORD or ENUM is a value type and not throwable;
-    // an INTERFACE-typed operand is likewise rejected (its referent may be a
-    // boxed value, which is not throwable — narrow to the class first). A
-    // Named type with a null declaration (an imported builtin exception) is
-    // conservatively treated as throwable. `Object` (Primitive::Object),
-    // `string` (Primitive::String) and the other primitives, an inline array,
-    // a function value, and unit are not Named-class and not throwable.
-    // // per §31.1, §17.12
-    bool throwable = vt->kind == TypeRef::Kind::Named &&
-                     !(vt->declaration &&
-                       (vt->declaration->kind == ast::TypeDeclKind::Record ||
-                        vt->declaration->kind == ast::TypeDeclKind::Enum ||
-                        vt->declaration->kind == ast::TypeDeclKind::Interface));
-    if (!throwable)
+    // §31.1 (v0.243, proposal 0080, #3046 — replacing the v0.182 "any class"
+    // ruling): "`throw expr` requires `expr` to be an owned instance of an
+    // `Exception`-derived class type: the operand's static type, nullability
+    // not admitted, must be `Exception` or a class deriving from it." Appendix
+    // C.5 states the same invariant and enumerates what is rejected: "primitive,
+    // `string`, record, enum, inline-array, unit, function-typed, `Object`-typed,
+    // and interface-typed operands are rejected".
+    //
+    // The check is the positive `isExceptionDerivedClass` list; the branches
+    // below only choose WHICH reason the diagnostic states.
+    //
+    // SCOPE (recorded, #3046): the sentence's "nullability not admitted" clause
+    // is NOT enforced here. `ctx_.exprType` reports the DECLARED type, while
+    // §7.4 flow narrowing lives in this pass's own `nullNarrowed_` side-set, so
+    // a bare `nullable` reject would fire on the narrowed `if e <> null then
+    // throw e; end;` shape the spec admits. Tracked separately (#3076).
+    // // per §31.1, §17.12, Appendix C.5
+    if (isExceptionDerivedClass(vt)) return;
+
+    // A declaration-less Named ref that is neither a reserved built-in nor a
+    // type parameter of the enclosing declaration is not a user class (local
+    // AND imported classes both carry a `TypeSymbol`, #2950) — it is an
+    // unresolved name whose own diagnostic has already fired, or a nameless
+    // synthetic ref. Stay silent there rather than cascade.
+    if (vt->kind == TypeRef::Kind::Named && !vt->declaration) {
+        std::string_view n = namedRefSimpleName(vt);
+        if (n != "Object" && !common::isReservedBuiltinTypeName(n) &&
+            !isEnclosingTypeParamName(n))
+            return;
+    }
+
+    const bool isObject =
+        (vt->kind == TypeRef::Kind::Primitive &&
+         vt->primitive == PrimitiveType::Object) ||
+        (vt->kind == TypeRef::Kind::Named && !vt->declaration &&
+         namedRefSimpleName(vt) == "Object");
+    const bool isInterface =
+        (vt->kind == TypeRef::Kind::Named && vt->declaration &&
+         vt->declaration->kind == ast::TypeDeclKind::Interface) ||
+        (vt->kind == TypeRef::Kind::Named && !vt->declaration &&
+         common::isBuiltinInterfaceHead(namedRefSimpleName(vt)));
+    if (isObject || isInterface) {
+        // §31.1: "An `Object`- or interface-typed operand is likewise rejected
+        // (no interface derives from `Exception`, and an `Object` referent may
+        // be a boxed value); narrow to the exception class first."
         ctx_.diagnostics().report(
             Severity::Error, value.span.begin,
-            "the thrown value must be an exception — an instance of a class "
-            "type (\xc2\xa7""31.1): a primitive, `string`, `Object`, an "
-            "interface, a record, an enum, an inline array, or a function "
-            "value cannot be thrown (an `Object`- or interface-typed value "
-            "must be narrowed to its class type first)");
+            "the thrown value must be an exception — an instance of "
+            "`Exception` or a class deriving from it (\xc2\xa7""31.1): an "
+            "`Object`- or interface-typed value cannot be thrown (no interface "
+            "derives from `Exception`, and an `Object` referent may be a boxed "
+            "value) — narrow to the exception class first");
+        return;
+    }
+    if (vt->kind == TypeRef::Kind::Named && !vt->declaration &&
+        isEnclosingTypeParamName(namedRefSimpleName(vt))) {
+        // A generic type parameter. Its static type is `Exception`-derived only
+        // if its BOUND is — the same decidable-from-the-declaration test
+        // §31.2.1 states for a catch arm's type parameter, applied to §31.1's
+        // operand rule. (Recorded interpretation, #3046: §31.1 states the rule
+        // over "the operand's static type" and does not spell out the
+        // type-parameter case; leaving it unchecked would admit `throw t` for
+        // `T` substituted by `string`, which §31.1's own sentence forbids.)
+        std::string n(namedRefSimpleName(vt));
+        ctx_.diagnostics().report(
+            Severity::Error, value.span.begin,
+            "the thrown value must be an exception — an instance of "
+            "`Exception` or a class deriving from it (\xc2\xa7""31.1): the type "
+            "parameter `" + n + "` carries no `Exception`-derived class bound "
+            "(`where " + n + ": Exception`, or a class deriving from it), so a "
+            "substitution need not be a throwable class");
+        return;
+    }
+    const bool isClassLike =
+        vt->kind == TypeRef::Kind::Named &&
+        !(vt->declaration &&
+          (vt->declaration->kind == ast::TypeDeclKind::Record ||
+           vt->declaration->kind == ast::TypeDeclKind::Enum));
+    if (isClassLike) {
+        // A class outside the `Exception` family — the case the v0.243 rule
+        // newly rejects. The diagnostic names the remedy the v0.243 migration
+        // note states ("derive the class from `Exception`, one token at the
+        // declaration, or throw an `Exception`-derived wrapper") — but only the
+        // WRAPPER half for a type the user cannot edit: a reserved built-in
+        // (`Array`, `Task`, …) has no declaration to add a base to, and a
+        // diagnostic must not tell the reader to do something impossible
+        // (#2983's lesson).
+        std::string name(namedRefSimpleName(vt));
+        const bool userEditable = vt->declaration != nullptr;
+        ctx_.diagnostics().report(
+            Severity::Error, value.span.begin,
+            "the thrown value must be an exception — an instance of "
+            "`Exception` or a class deriving from it (\xc2\xa7""31.1): " +
+            (name.empty() ? std::string("this type")
+                          : "`" + name + "`") +
+            " does not derive from `Exception` — " +
+            (userEditable ? std::string("derive it from `Exception` (one token "
+                                        "at its declaration), or throw an ")
+                          : std::string("throw an ")) +
+            "`Exception`-derived wrapper");
+        return;
+    }
+    ctx_.diagnostics().report(
+        Severity::Error, value.span.begin,
+        "the thrown value must be an exception — an instance of `Exception` "
+        "or a class deriving from it (\xc2\xa7""31.1): a primitive, `string`, "
+        "a record, an enum, an inline array, unit, or a function value cannot "
+        "be thrown");
+}
+
+// §31.2.1 (v0.243, proposal 0080, #3046) — the arm-type rule, verbatim: "Every
+// class type named in an arm pattern — bare, binding, or listed in a multi-type
+// alternative — must be `Exception` or a class deriving from it (an
+// **interface-typed** arm remains admissible — no interface derives from
+// `Exception`, but an `Exception`-derived class may implement one, so the arm
+// matches exactly the throwables whose class implements the interface). With
+// every throwable `Exception`-derived (§31.1) and inheritance single, an arm
+// naming any other class type is **provably dead** ... and is a **compile
+// error** ...; `Object` itself is rejected by the same rule for the opposite
+// reason — as the universal root (§8.1) it matches every throwable, and the
+// spelling for that is the bare `Exception` arm (§31.2.3)."
+//
+// The rule is about CLASS types (Appendix C.7: "an arm naming any other class
+// type (`Object` included) is a compile error"), so an interface-typed arm and a
+// non-class arm type are deliberately left alone here.
+// per §31.2.1, Appendix C.7
+void ExprTC::checkCatchArmType(const ast::Type& armTy, SourceLocation fallback) {
+    TypeRef* rt = ctx_.resolvedType(armTy);
+    if (!rt) return;  // unresolved — its own diagnostic has already fired
+    // `Parser::parseType` never populates `ast::Type::span` (every Type node
+    // carries the degenerate 0:0), so a diagnostic anchored on the arm TYPE
+    // would report `0:0` — the #1307/#2496 degenerate-span class. Anchor on the
+    // arm's own body span, which the parser does populate and which is on the
+    // arm's line, whenever the type's span is unusable.
+    const SourceLocation loc =
+        armTy.span.begin.line != 0 ? armTy.span.begin : fallback;
+    // `Object` resolves as a PRIMITIVE ref (TypeResolution.cpp's name table);
+    // the Named spelling is belt-and-braces so a representation change cannot
+    // silently drop this arm of the rule.
+    if ((rt->kind == TypeRef::Kind::Primitive &&
+         rt->primitive == PrimitiveType::Object) ||
+        (rt->kind == TypeRef::Kind::Named && !rt->declaration &&
+         namedRefSimpleName(rt) == "Object")) {
+        ctx_.diagnostics().report(
+            Severity::Error, loc,
+            "`Object` is not admitted as a `catch` arm type (\xc2\xa7""31.2.1): "
+            "as the universal root (\xc2\xa7""8.1) it matches every throwable, "
+            "and the spelling for a catch-all is the bare `Exception` arm "
+            "(\xc2\xa7""31.2.3)");
+        return;
+    }
+    if (rt->kind != TypeRef::Kind::Named) return;  // not a class type
+    if (isExceptionDerivedClass(rt)) return;       // the admitted case
+    if (rt->declaration) {
+        // An interface-, record-, or enum-typed arm is not a CLASS type; the
+        // interface form is expressly ADMITTED by §31.2.1 (an `Exception`-derived
+        // class may implement it), so an over-broad predicate here would be the
+        // defect this carve exists to prevent.
+        if (rt->declaration->kind != ast::TypeDeclKind::Class) return;
+    } else {
+        std::string_view n = namedRefSimpleName(rt);
+        if (n.empty()) return;
+        if (common::isBuiltinInterfaceHead(n)) return;  // a built-in interface arm
+        if (isEnclosingTypeParamName(n)) {
+            // §31.2.1's generic-parameter clause: the parameter "must carry an
+            // `Exception`-derived class bound (`where TEx: Exception`, or a
+            // class deriving from it) so that every substitution is a throwable
+            // class (§31.1); a parameter that is unconstrained, value-
+            // constrained, bounded only by `where TEx: class` ..., or bounded by
+            // a class outside the `Exception` family is a compile error at the
+            // arm, checked at the generic declaration".
+            if (!typeParamHasExceptionBound(n))
+                ctx_.diagnostics().report(
+                    Severity::Error, loc,
+                    "the `catch` arm's type parameter `" + std::string(n) +
+                    "` must carry an `Exception`-derived class bound (`where " +
+                    std::string(n) +
+                    ": Exception`, or a class deriving from it) — an "
+                    "unconstrained, value-constrained, `where " +
+                    std::string(n) +
+                    ": class`-only, or non-`Exception`-family bound cannot "
+                    "guarantee every substitution is a throwable class "
+                    "(\xc2\xa7""31.2.1)");
+            return;
+        }
+        if (!common::isReservedBuiltinTypeName(n))
+            return;  // an unresolved name — its own diagnostic already fired
+        // else: a reserved built-in CLASS (`Array`, `Task`, …) — dead, below.
+    }
+    std::string name(namedRefSimpleName(rt));
+    ctx_.diagnostics().report(
+        Severity::Error, loc,
+        "`catch` arm type " +
+        (name.empty() ? std::string("here") : "`" + name + "`") +
+        " is not an exception type (\xc2\xa7""31.2.1): every throwable is "
+        "`Exception`-derived (\xc2\xa7""31.1) and inheritance is single, so no "
+        "thrown value can ever match this arm — it is provably dead. Delete the "
+        "arm, or name `Exception` or a class deriving from it");
 }
 
 void ExprTC::validateCaseArms(const std::vector<ast::CaseArm>& arms) {
@@ -12408,6 +12695,16 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
             // design-gated #2012/#2069 scope), matching every other surface.
             for (const auto& armTy : arm.types) {
                 if (!armTy) continue;
+                // §31.2.1 (v0.243, proposal 0080, #3046): the arm-type rule —
+                // every CLASS type named here is `Exception` or a class deriving
+                // from it; `Object` is rejected as universally matching; an
+                // interface-typed arm stays admissible; a generic type parameter
+                // must carry an `Exception`-derived class bound. The arm BODY's
+                // span is passed as the diagnostic anchor: `ast::Type` carries
+                // no span (see checkCatchArmType).
+                checkCatchArmType(*armTy,
+                                  arm.body ? arm.body->span.begin
+                                           : trys->span.begin);
                 TypeRef* rt = ctx_.resolvedType(*armTy);
                 if (rt && rt->kind == TypeRef::Kind::Named &&
                     !rt->genericArgs.empty() &&
@@ -12441,25 +12738,19 @@ void ExprTC::visitStmt(const ast::Stmt& s) {
                 // per §31.2.1: for a multi-type arm the binding's static type
                 // is the nearest common base (NCB) of all listed types; for a
                 // single-type arm it is the type itself.
+                // per §31.2.1 (v0.243, proposal 0080, #3046) — the SIMPLIFIED
+                // binding rule that replaces v0.182's `Object`-base carve:
+                // "When binding, `name` has the static type of the nearest
+                // common base of the listed types ... Every listed type is
+                // `Exception`-derived (the arm-type rule), so the nearest common
+                // base is always `Exception` or a class deriving from it; for
+                // alternatives sharing nothing more specific, it is `Exception`."
+                // `catchArmNcb` therefore never returns null for a well-formed
+                // multi-type list — it falls back to `Exception` — and the old
+                // "no common base more specific than `Object`" REJECTION is gone
+                // rather than left dead: under the arm-type rule the `Object`
+                // case is unreachable, so there is nothing left for it to catch.
                 TypeRef* ncb = catchArmNcb(arm.types);
-                // per §31.2.1 (v0.182): when a multi-type BINDING arm's listed
-                // types share no common base more specific than the implicit
-                // root `Object` (catchArmNcb finds no shared ancestor — only
-                // possible for the multi-type case, since a single listed type
-                // always resolves via the size==1 shortcut), the binding form is
-                // a compile error: `Object` gives the bound name no usable
-                // surface and collides with §31.1's rejection of `Object`-typed
-                // throw operands. The non-binding form (`T1 | T2` with no `var`)
-                // needs no common type and is unrestricted — this caller is
-                // already guarded by `arm.hasBinding`.
-                if (!ncb && arm.types.size() > 1) {
-                    ctx_.diagnostics().report(
-                        Severity::Error, arm.types[0]->span.begin,
-                        "a multi-type `catch` arm that binds a name must list "
-                        "types sharing a common base class more specific than "
-                        "`Object` (§31.2.1) — split into separate arms, or drop "
-                        "the binding");
-                }
                 bnd->declType = ncb ? ncb : ctx_.resolvedType(*arm.types[0]);
                 armScope.names[arm.varName] = bnd;
             }

@@ -75,9 +75,31 @@ std::string wrapDecl() {
 //              NON-OWNED field of the thrown object (§31.1 / #430).
 // =====================================================================
 
-// Direct: `throw new Wrap(ex)` where Wrap's ctor stores ex in a non-owned
-// field `_inner`. The thrown Wrap escapes the handler; ex is freed when
-// the handler completes → Wrap._inner dangles. REJECTED. (§31.1 / #430.)
+// RETARGETED at v0.243 (§31.1, proposal 0080, #3046). The PROGRAM is unchanged;
+// the rule that rejects it is not.
+//
+// This case used to pin the #430 rejection for `throw new Wrap(ex)`, where
+// `Wrap` is a plain class whose constructor stores the caught borrow in a
+// non-owned field. §31.1 v0.243 makes that program ill-formed one step earlier:
+// "the operand's static type, nullability not admitted, must be `Exception` or a
+// class deriving from it", and `Wrap` derives from nothing — so the throw is
+// rejected at the OPERAND and the #430 check is never consulted.
+//
+// Giving `Wrap` an `Exception` base to restore the old coverage does NOT work
+// either, and that is recorded here rather than discovered twice: the
+// §31.2.4/#811 cause-position carve in
+// `MethodOwnership::catchBorrowAmongNonOwnedCtorArgs` skips an exception-typed
+// argument whenever the CONSTRUCTED type is an exception — which §31.1 v0.243
+// makes true at EVERY throw site — so the THROW form of the #430 check is now
+// structurally dead. MEASURED (2026-08-12): adding `: Exception` to `Wrap` makes
+// this program compile with ZERO diagnostics. Filed as issue #3075, which also
+// asks whether the #430 rejection is right here at all — §31.1's
+// exception-ownership paragraph puts a field-held borrow inside a thrown
+// instance under residual trust (a checked-mode `DisposedAccessException`), not
+// under a compile error.
+//
+// The #430 coverage itself is undiminished: the RETURN form below runs the same
+// check over the same `Wrap`, and §31.1 does not touch `return`.
 BEZEL_TEST(catch_borrow_via_ctor, throw_new_with_catch_borrow_arg_rejected_31_1) {
     auto r = parseAndCheckOwnership(wrapDecl() +
         "  public method Handle() "
@@ -88,7 +110,7 @@ BEZEL_TEST(catch_borrow_via_ctor, throw_new_with_catch_borrow_arg_rejected_31_1)
         "end C;");
     BEZEL_EXPECT_TRUE(r.diagnostics.hasErrors());
     BEZEL_EXPECT_TRUE(hasErrorMessage(
-        r, "caught exception `ex` may not be passed to a constructor"));
+        r, "`Wrap` does not derive from `Exception`"));
 }
 
 // =====================================================================

@@ -1419,11 +1419,45 @@ private:
     bool altMemberNamesType(const ast::Expr* c);
     bool altPartsNameType(const std::vector<std::string_view>& parts);
 
-    // §31.1 (issue #739): the operand of `throw` must be an exception — a CLASS
-    // instance. A primitive/string/record/enum/function thrown value miscompiles
-    // (codegen treats it as an exception-object pointer → SIGSEGV); reject it
-    // with a clean diagnostic. No-op when the value's type is not yet resolved.
+    // §31.1 (issue #739; v0.243 / proposal 0080 / #3046): the operand of `throw`
+    // must be an exception — an instance of `Exception` or a class deriving from
+    // it. A primitive/string/record/enum/function thrown value also miscompiles
+    // (codegen treats it as an exception-object pointer → SIGSEGV); reject every
+    // non-`Exception`-family operand with a clean diagnostic naming the
+    // requirement and the remedy. No-op when the value's type is not yet
+    // resolved.
     void checkThrowableType(const ast::Expr& value);
+
+    // §31.2.1 (v0.243, proposal 0080, #3046): every CLASS type named in a catch
+    // arm pattern must be `Exception` or a class deriving from it — any other
+    // class type is provably dead (single inheritance + every throwable is
+    // `Exception`-derived), and `Object` is rejected for the opposite reason
+    // (universally matching; the catch-all's spelling is the bare `Exception`
+    // arm). An INTERFACE-typed arm stays admissible. A generic type parameter
+    // used as an arm type must carry an `Exception`-derived class bound.
+    // `fallback` anchors the diagnostic when the arm type's own span is the
+    // degenerate 0:0 every `ast::Type` carries (Parser::parseType sets none).
+    void checkCatchArmType(const ast::Type& armTy, SourceLocation fallback);
+
+    // §31.1 / §31.2.1 / §31.4 (v0.243, #3046): the ONE `Exception`-family
+    // predicate — a positive list over `common::isBuiltinExceptionName` (the
+    // built-ins, which carry no TypeSymbol) and `sema::builtinExceptionBaseOf`
+    // (the class-ancestor walk that works for local AND imported classes,
+    // #2950). Shared by the throw-operand rule, the arm-type rule, and the
+    // generic-bound rule so all three answer identically.
+    bool isExceptionDerivedClass(const TypeRef* ty);
+
+    // §14.2 / §31.2.1 (v0.243, #3046): is `name` a generic type parameter of the
+    // enclosing method, type, or extension? Only such a declaration-less Named
+    // ref is subject to the arm-type generic-bound rule (every user class,
+    // local or imported, carries a TypeSymbol).
+    bool isEnclosingTypeParamName(std::string_view name) const;
+
+    // §14.2 / §31.2.1 (v0.243, #3046): does the enclosing declaration's
+    // constraint set bound `paramName` by an `Exception`-derived CLASS —
+    // directly or through a `where T: U` chain? Decided from the declaration
+    // alone, never from an instantiation, exactly as §31.2.1 requires.
+    bool typeParamHasExceptionBound(std::string_view paramName);
 
     // §5.1 (issue #738): fold `e` to a compile-time integer constant, resolving
     // `const` identifiers through the typecheck scope. Used to decide whether an

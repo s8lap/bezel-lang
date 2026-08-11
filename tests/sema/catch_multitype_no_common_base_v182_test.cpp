@@ -1,62 +1,59 @@
-// Spec-derived tests for §31.2.1 (v0.182): a multi-type catch-arm BINDING
-// whose listed types share no common base class more specific than `Object`
-// must be rejected, and the nearest-common-base (NCB) computation that types a
-// valid binding must TERMINATE (issue #1624) AND be CORRECT even when a
-// built-in exception type participates (issue #1621, distinct from #1624 —
-// see the dedicated section below).
+// Spec-derived tests for §31.2.1's multi-type catch-arm BINDING rule.
 //
-// §31.2.1 (verbatim): "When binding, the listed types must share a common
-// base class more specific than `Object` ... if the listed types' nearest
-// common base is `Object`, the binding form is a compile error directing to
-// separate arms — the non-binding form `Type1 | Type2` needs no common type
-// and is unrestricted." And: "`name` has the static type of the nearest
-// common base of the listed types (the most specific class that is a base of
-// every listed type)."
+// ── WHY THIS FILE READS AS A POLARITY FLIP ──────────────────────────────────
 //
-// Issue #1624: `ExprTC::catchArmNcb` (src/sema/ExprTypecheck.cpp) computes the
-// NCB via a base-set walk whose visited-set guarded only the RESULT, not the
-// WALK — a revisited node re-pushed its bases, so a base-type cycle (or a deep
-// diamond) made the computation unbounded. The walk is now cycle-guarded and
-// capped; these tests pin both the §31.2.1 rejection and the termination of
-// the shared-base resolution.
+// This file was written at v0.182 to pin the rule its name records: "a
+// multi-type catch-arm BINDING whose listed types share no common base class
+// more specific than `Object` must be rejected". Proposal 0080 (graduated
+// **v0.243**, issue #3046) DELETED that rule together with the permissive
+// throw-operand ruling it existed to serve, so the file now pins what replaced
+// it, on the same programs. The file and suite names are kept deliberately —
+// renaming would break `git log`'s and the gate selector's line to the v0.182
+// history that explains why these exact programs are the ones being asked.
 //
-// Issue #1621 (fixed here, distinct from #1624 above): the NCB was not just
-// occasionally slow (#1624) but OUTRIGHT WRONG whenever a built-in exception
-// type participated in a multi-type catch-arm list. Root cause:
-// `commonTypeOf`'s `convertsInto` helper (src/sema/ExprTypecheck.cpp) had a
-// fallback —
-//   // Other kinds (InlineArray/Function/Unit): conservatively treat
-//   // same-kind as compatible to avoid false positives.
-//   return true;
-// — meant only for genuinely different-KIND pairs (InlineArray/Function/
-// Unit), but it also fired whenever two Named TypeRefs reached it with
-// either side lacking a `declaration` (i.e. a built-in, which carries no
-// TypeSymbol). So `convertsInto(IOException, Dog)` spuriously returned
-// `true`, and `catchArmNcb`'s Step 1 (the `commonTypeOf` fold) returned the
-// FIRST listed type as a bogus "common type" for ANY built-in-involving
-// list — short-circuiting before Step 2 (the ancestor-name walk that
-// actually computes the NCB) ever ran. For `Dog | IOException` this bound
-// `e` at `Dog` with NO §31.2.1 error, even though `Dog` and `IOException`
-// share no base more specific than `Object` — precisely the v0.182
-// changelog's own worked example of what §31.2.1 must reject.
+// What changed, verbatim from §31.2.1 (v0.243):
 //
-// The fix (in `commonTypeOf` and a new `ExprTC::namedAncestorChain` /
-// `hasNamedAncestor` pair, shared by `convertsInto` and `catchArmNcb`'s
-// Step 2): a built-in-involving Named pair is now resolved by NAME through
-// the same ancestor walk Step 2 uses — identity, a user-declared subtype of
-// a built-in base, or a built-in ancestor/descendant pair — never a blanket
-// "declaration-less means compatible" guess. The ancestor walk itself was
-// extended to consult the built-in exception hierarchy
-// (`common::builtinExceptionParentOf`, src/common/BuiltinRegistry.cpp,
-// mirroring codegen's `Emitter::builtinExceptionHierarchy()`) once it
-// reaches a built-in node with no further AST bases, so two SIBLING
-// built-ins (`OverflowException | ArgumentException`, both `Exception`-
-// derived but neither a base of the other) still resolve to their shared
-// ancestor instead of silently mistyping the binding (the masked failure
-// mode `codegen_593.two_builtin_types_message_resolves_spec_31_2_1`,
-// tests/codegen/multitype_catch_ncb_593_test.cpp, could not detect: it only
-// proves SOME built-in exception type was bound, via `.Message` resolving
-// on any of them, not that the NCB itself is correct).
+//   * **Arm types are `Exception`-family.** "Every class type named in an arm
+//     pattern — bare, binding, or listed in a multi-type alternative — must be
+//     `Exception` or a class deriving from it ... an arm naming any other class
+//     type is **provably dead** ... and is a **compile error** naming this
+//     rule". So `Dog | Cat`, `Dog | IOException`, and even the single-type
+//     `catch var e: Dog` are now rejected AT THE ARM TYPE — including in the
+//     NON-binding form, which the v0.182 rule expressly left unrestricted.
+//
+//   * **The binding rule simplifies.** "When binding, `name` has the static
+//     type of the **nearest common base** of the listed types ... Every listed
+//     type is `Exception`-derived (the arm-type rule below), so the nearest
+//     common base is always `Exception` or a class deriving from it; for
+//     alternatives sharing nothing more specific, it is `Exception`." The
+//     `Object`-base carve — and with it the rejection this file was named for
+//     — is gone: under the arm-type rule the `Object` case is unreachable, so
+//     the fallback is `Exception`, not an error. (v0.243 changelog: "the
+//     `Object`-fallback rejection becomes unreachable rather than
+//     repealed-with-changed-behavior" — for every program that remains
+//     accepted the binding types identically.)
+//
+// ── WHAT STILL HOLDS FROM THE ORIGINAL FILE ─────────────────────────────────
+//
+// Issue #1624 (the NCB walk must TERMINATE on a cyclic base graph) and issue
+// #1621 (the NCB must be CORRECT when a built-in exception type participates,
+// rather than short-circuiting on `commonTypeOf`'s old declaration-less
+// fallback) are untouched by v0.243 and keep their pins below, retargeted onto
+// programs the arm-type rule admits where the original program no longer
+// compiles. Their original rationale, preserved:
+//
+//   #1624: `ExprTC::catchArmNcb` computes the NCB via a base-set walk whose
+//   visited-set guarded only the RESULT, not the WALK — a revisited node
+//   re-pushed its bases, so a base-type cycle made the computation unbounded.
+//
+//   #1621: `commonTypeOf`'s `convertsInto` helper had a fallback ("Other kinds
+//   ... conservatively treat same-kind as compatible") meant only for
+//   different-KIND pairs, but it also fired whenever two Named TypeRefs reached
+//   it with either side lacking a `declaration` (i.e. a built-in, which carries
+//   no TypeSymbol). So `convertsInto(IOException, Dog)` spuriously returned
+//   true and Step 1 returned the FIRST listed type as a bogus common type for
+//   ANY built-in-involving list, short-circuiting Step 2 (the ancestor-name
+//   walk that actually computes the NCB) entirely.
 
 #include "support/aot_support.hpp"
 #include "support/codegen_support.hpp"
@@ -69,7 +66,21 @@ int run(const std::string& src) {
     auto r = runAot(src);
     return r.ran ? r.exitCode : -999;
 }
-// True iff the program produced a §31.2.1 no-common-base error diagnostic.
+// True iff the program produced the §31.2.1 v0.243 arm-type error for `type`.
+bool hasDeadArmError(const std::string& src, const std::string& type) {
+    auto r = runAot(src);
+    for (const auto& d : r.diagnostics.diagnostics()) {
+        if (d.severity != bezel::Severity::Error) continue;
+        if (d.message.find("`catch` arm type `" + type +
+                           "` is not an exception type") != std::string::npos &&
+            d.message.find("31.2.1") != std::string::npos)
+            return true;
+    }
+    return false;
+}
+// True iff the program produced the v0.182 "no common base more specific than
+// `Object`" rejection. §31.2.1 v0.243 DELETED that rule, so every assertion on
+// this predicate below is a `false` — it must never fire again.
 bool hasNoCommonBaseError(const std::string& src) {
     auto r = runAot(src);
     for (const auto& d : r.diagnostics.diagnostics()) {
@@ -98,38 +109,101 @@ bool hasNoCommonType20Error(const std::string& src) {
 }
 }  // namespace
 
-// (c) §31.2.1: two unrelated user classes (no shared base beyond the implicit
-// Object) in a BINDING multi-type arm is a compile error.
-BEZEL_TEST(catch_multitype_no_common_base_v182, binding_two_unrelated_classes_rejected_spec_31_2_1) {
-    BEZEL_EXPECT_EQ(hasNoCommonBaseError(
-        "module M; class Dog end Dog; class Cat end Cat; "
+// ── §31.2.1 v0.243: the arm-type rule replaces the no-common-base rule ──────
+
+// (c-flip) The v0.182 file's leading case, `catch var e: Dog | Cat`, is still
+// rejected — but by a DIFFERENT rule, and the difference is the whole point of
+// the flip: `Dog` and `Cat` are no longer "two classes without a shared base",
+// they are two classes that cannot be thrown at all (§31.1), so the arm naming
+// either of them is provably dead (§31.2.1). The old rejection must NOT fire.
+BEZEL_TEST(catch_multitype_no_common_base_v182,
+           binding_two_unrelated_classes_rejected_by_arm_type_spec_31_2_1_v0_243) {
+    const std::string src =
+        "module M; class Dog: Exception end Dog; class Cat end Cat; "
         "class C public static method Main(): int "
         "  try throw new Dog(); "
         "  catch var e: Dog | Cat => return 1; "
         "  end; "
         "  return 0; "
-        "end Main; end C;"),
-        true);
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(hasDeadArmError(src, "Cat"), true);
+    BEZEL_EXPECT_EQ(hasNoCommonBaseError(src), false);
 }
 
-// §31.2.1: the same two types WITHOUT a binding (`Dog | Cat`, no `var`) are
-// unrestricted — "the non-binding form ... needs no common type and is
-// unrestricted." Must compile and run.
-BEZEL_TEST(catch_multitype_no_common_base_v182, nonbinding_two_unrelated_classes_ok_spec_31_2_1) {
-    BEZEL_EXPECT_EQ(run(
-        "module M; class Dog end Dog; class Cat end Cat; "
+// (c-flip) §31.2.1 v0.243: the NON-binding form of the same list — which the
+// v0.182 rule expressly left "unrestricted" and which this file used to pin as
+// ACCEPTED, running to exit 1 — is now rejected too. The arm-type rule is about
+// the TYPES NAMED, not about the binding, so dropping the `var` is no longer a
+// remedy. This is the single largest behavioural delta in the file.
+BEZEL_TEST(catch_multitype_no_common_base_v182,
+           nonbinding_two_unrelated_classes_now_rejected_spec_31_2_1_v0_243) {
+    const std::string src =
+        "module M; class Dog: Exception end Dog; class Cat end Cat; "
         "class C public static method Main(): int "
         "  try throw new Dog(); "
         "  catch Dog | Cat => return 1; "
         "  end; "
         "  return 0; "
-        "end Main; end C;"),
-        1);
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(hasDeadArmError(src, "Cat"), true);
 }
 
-// (b) §31.2.1: two user classes that DO share a user-declared base still
-// compile and bind at that base — the NCB is `AppErr`, so `e.Code()`
-// resolves and runs (#593 behavior, regression guard).
+// (c-flip) §31.2.1 v0.243: a SINGLE-type binding arm naming a non-`Exception`
+// class is rejected by the same rule. The v0.182 file pinned the opposite
+// (`single_type_binding_unaffected_spec_31_2_1`: `catch var e: Dog` ran to
+// exit 7) because the deleted rule examined only the multi-type case.
+BEZEL_TEST(catch_multitype_no_common_base_v182,
+           single_type_binding_non_exception_class_rejected_spec_31_2_1_v0_243) {
+    const std::string src =
+        "module M; class Dog end Dog; "
+        "class C public static method Main(): int "
+        "  try throw new ArgumentException(\"x\"); "
+        "  catch var e: Dog => return 7; "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(hasDeadArmError(src, "Dog"), true);
+}
+
+// (c) §31.2.1 v0.243 — THE BINDING SIMPLIFICATION, and the load-bearing
+// accept for it: "for alternatives sharing nothing more specific, it is
+// `Exception`."
+//
+// An INTERFACE alternative is admissible in an arm (§31.2.1's carve: "an
+// interface-typed arm remains admissible"), and an interface shares no CLASS
+// base with a built-in exception — so `IRetryable | IOException` is exactly the
+// shape whose NCB walk finds nothing. Under v0.182 that was the rejection this
+// file was named for; under v0.243 the binding types as `Exception`, which is
+// what makes `e.Message` resolve. Throwing an `IOException` selects the arm via
+// the second alternative, so the returned length is observed end-to-end.
+//
+// VERIFIED to fail-without / pass-with the fix: pre-fix `catchArmNcb` returns
+// null here and the caller reports "a multi-type `catch` arm that binds a name
+// must list types sharing a common base class more specific than `Object`
+// (§31.2.1)", so the program does not compile at all (r.ran == false, exit
+// -999). Post-fix it compiles and returns 4.
+BEZEL_TEST(catch_multitype_no_common_base_v182,
+           binding_no_shared_base_types_as_exception_spec_31_2_1_v0_243) {
+    const std::string src =
+        "module M; import System.IO; "
+        "interface IRetryable end IRetryable; "
+        "class C public static method Main(): int "
+        "  try throw new IOException(\"boom\"); "
+        "  catch "
+        "    var e: IRetryable | IOException => do return e.Message.Length; end, "
+        "    var f: Exception => do return 99; end "
+        "  end; "
+        "  return 0; "
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(hasNoCommonBaseError(src), false);
+    BEZEL_EXPECT_EQ(run(src), 4);  // "boom".Length = 4, via the Exception binding
+}
+
+// ── unchanged from v0.182: the NCB itself, on lists the arm-type rule admits ─
+
+// §31.2.1: two user classes that share a user-declared `Exception`-derived base
+// compile and bind at that base — the NCB is `AppErr`, so `e.Code()` resolves
+// and runs (#593 behavior, regression guard).
 BEZEL_TEST(catch_multitype_no_common_base_v182, binding_shared_user_base_resolves_spec_31_2_1) {
     BEZEL_EXPECT_EQ(run(
         "module M; "
@@ -153,9 +227,9 @@ BEZEL_TEST(catch_multitype_no_common_base_v182, binding_shared_user_base_resolve
         42);
 }
 
-// (b) §31.2.1: two Exception-derived user classes bind at the built-in
+// §31.2.1: two `Exception`-derived user classes bind at the built-in
 // `Exception` NCB, so `e.Message` resolves without a "no member" error
-// (the exact #593 repro). Must NOT report the new §31.2.1 rejection.
+// (the exact #593 repro). Must NOT report the deleted §31.2.1 rejection.
 BEZEL_TEST(catch_multitype_no_common_base_v182, binding_exception_derived_still_ok_spec_31_2_1) {
     BEZEL_EXPECT_EQ(
         hasNoCommonBaseError(
@@ -172,7 +246,7 @@ BEZEL_TEST(catch_multitype_no_common_base_v182, binding_exception_derived_still_
             "  end; "
             "  return 0; "
             "end Main; end C;"),
-        false);  // must NOT report the §31.2.1 no-common-base error
+        false);  // the v0.182 no-common-base rejection is deleted (v0.243)
 }
 
 // (a) §31.2.1 / #1624: a multi-type catch whose listed types share a base
@@ -204,11 +278,13 @@ BEZEL_TEST(catch_multitype_no_common_base_v182, deep_shared_base_walk_terminates
         99);  // NCB = MidErr; e.Code() returns the constructed _code
 }
 
-// §31.2.1: a single-type binding arm is untouched by the no-common-base
-// check (only the multi-type case is examined) — regression guard.
+// §31.2.1: a single-type binding arm over an `Exception`-derived class binds at
+// that type itself (the `types.size() == 1` shortcut — no NCB walk runs), and
+// the arm-type rule admits it. The v0.243 sibling of this case, a single-type
+// arm over a NON-`Exception` class, is rejected above.
 BEZEL_TEST(catch_multitype_no_common_base_v182, single_type_binding_unaffected_spec_31_2_1) {
     BEZEL_EXPECT_EQ(run(
-        "module M; class Dog end Dog; "
+        "module M; class Dog: Exception end Dog; "
         "class C public static method Main(): int "
         "  try throw new Dog(); "
         "  catch var e: Dog => return 7; "
@@ -222,10 +298,9 @@ BEZEL_TEST(catch_multitype_no_common_base_v182, single_type_binding_unaffected_s
 // fix. The tests above all walk a NON-CYCLIC base graph (a 2-level diamond or a
 // shallow shared base): no node is ever revisited, so dropping the cycle guard
 // would NOT fail them. This case reproduces the actual compile-time hang that
-// #1624 fixed: a CYCLIC base-type graph reaching `catchArmNcb`'s
-// `collectAncestors` walk, where the pre-fix visited-set gated only the RESULT
-// set, not the base WALK — a revisited node re-pushed its bases, so the walk
-// looped forever.
+// #1624 fixed: a CYCLIC base-type graph reaching `catchArmNcb`'s ancestor walk,
+// where the pre-fix visited-set gated only the RESULT set, not the base WALK —
+// a revisited node re-pushed its bases, so the walk looped forever.
 //
 // Spec grounding:
 //  - §12.10: "An inheritance cycle is a compile error ... `class A: B`,
@@ -238,39 +313,37 @@ BEZEL_TEST(catch_multitype_no_common_base_v182, single_type_binding_unaffected_s
 //    of the listed types, computed by `catchArmNcb`. For `A | C` (A in the
 //    A<->B cycle, C unrelated) `commonTypeOf(A, C)` is null — neither converts
 //    into the other (isSubtype's cycle guard makes it return false for the
-//    cyclic chain) — so the Step-2 `collectAncestors(A)` walk runs and, pre-fix,
-//    never terminates on the A->B->A->B cycle.
+//    cyclic chain) — so the Step-2 ancestor walk on A runs and, pre-fix, never
+//    terminates on the A->B->A->B cycle.
+//
+// v0.243 note: the arm types `A` and `C` are now ALSO rejected by §31.2.1's
+// arm-type rule (neither derives from `Exception` — they cannot, being in a
+// cycle with each other), and the throw operand by §31.1. Those rejections are
+// diagnostics; they do not stop `catchArmNcb` from running, so the termination
+// property this test exists for is still exercised on exactly the same graph.
+// The assertion is deliberately NOT on which errors fire — it is that the
+// compile FINISHES and that sema was reached.
 //
 // REPRODUCING THE BUG is only useful if a regression FAILS THE TEST rather than
 // hanging CI. `runAot` (support/aot_support.hpp) already runs the front-end in
 // a forked child under its own hard wall-clock COMPILE deadline
 // (`aotCompileTimeoutSec`, 120s default, `BEZEL_AOT_COMPILE_TIMEOUT_SEC`
-// overrides) and SIGKILLs + reaps on expiry — the exact fork/waitpid/deadline
-// machinery this test used to hand-roll (qr1 M1 "COMPILE TIMEOUT" in
-// aot_support.hpp). Pre-fix, `collectAncestors` loops forever in that forked
-// compile child and the timeout fires, surfacing here as `r.ran == false` with
-// a "did not finish" diagnostic. Post-fix the child returns promptly, and the
-// test additionally asserts the §12.10 "circular inheritance" diagnostic was
-// recorded — confirming the cycle was reached and reported (distinguishing a
-// real termination from an early parse/scope abort), not bypassed.
-//
-// VERIFIED to fail-without / pass-with the fix: pre-fix bezelc on this input
-// hangs in ExprTC::catchArmNcb's collectAncestors (push_back loop); post-fix it
-// terminates reporting both the §12.10 cycle error and the §31.2.1
-// no-common-base error.
+// overrides) and SIGKILLs + reaps on expiry. Pre-#1624 the walk loops forever
+// in that forked compile child and the timeout fires, surfacing here as
+// `r.ran == false` with a "did not finish" diagnostic.
 BEZEL_TEST(catch_multitype_no_common_base_v182,
            cyclic_base_graph_ncb_terminates_spec_31_2_1_1624) {
     // Cyclic base graph (§12.10) + an unrelated class C. `throw new C()`
     // instantiates the UNRELATED C (not a cyclic type), so the only unbounded
-    // walk this input reaches — pre-fix — is `catchArmNcb`'s `collectAncestors`
-    // on A's cyclic ancestor chain (the #1624 hang).
+    // walk this input reaches — pre-fix — is `catchArmNcb`'s ancestor walk on
+    // A's cyclic ancestor chain (the #1624 hang).
     const std::string src =
         "module M; "
         "class A: B end A; "          // cycle: A -> B -> A (§12.10)
         "class B: A end B; "
         "class C end C; "             // unrelated to A/B -> commonTypeOf(A,C) is
                                       // null, forcing catchArmNcb Step 2 onto
-                                      // collectAncestors(A)'s cyclic walk
+                                      // the cyclic ancestor walk
         "class Runner public static method Main(): int "
         "  try throw new C(); "
         "  catch var e: A | C => return 1; "  // §31.2.1 multi-type BINDING arm
@@ -282,10 +355,9 @@ BEZEL_TEST(catch_multitype_no_common_base_v182,
 
     // Assertion 1 (#1624): the §31.2.1 NCB walk TERMINATED on a cyclic base
     // graph — this is the load-bearing assertion. It fails iff the visited-set
-    // cycle guard is dropped: `collectAncestors` then loops forever in the
-    // forked compile child, `runAot` hits its own compile deadline, and the
-    // rejection diagnostic reads "did not finish" instead of carrying the
-    // sema errors below.
+    // cycle guard is dropped: the walk then loops forever in the forked compile
+    // child, `runAot` hits its own compile deadline, and the rejection
+    // diagnostic reads "did not finish" instead of carrying the sema errors.
     bool timedOut = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.message.find("did not finish within") != std::string::npos)
@@ -297,8 +369,8 @@ BEZEL_TEST(catch_multitype_no_common_base_v182,
     // Assertion 2: the §12.10 cycle was reached and reported, confirming sema
     // ran (vs. an early parse/scope abort that would also "not hang"). A
     // compile reject's stderr is captured as a single diagnostic whose message
-    // is the whole driver stderr blob, so both the §12.10 and §31.2.1 errors
-    // are findable as substrings of it.
+    // is the whole driver stderr blob, so every error is findable as a
+    // substring of it.
     bool foundCycle = false;
     for (const auto& d : r.diagnostics.diagnostics()) {
         if (d.message.find("circular inheritance detected") != std::string::npos)
@@ -309,75 +381,70 @@ BEZEL_TEST(catch_multitype_no_common_base_v182,
 
 // ── #1621: NCB reliability when a built-in exception type participates ────
 
-// #1621 / §31.2.1 — THE load-bearing regression pin for this issue: the
-// v0.182 changelog's own worked example, `Dog | IOException` (a mixed
-// user-class / built-in list sharing no base more specific than `Object`),
-// must be REJECTED in binding form.
+// #1621 / §31.2.1 — THE load-bearing regression pin for that issue, FLIPPED by
+// v0.243. Its program is the v0.182 changelog's own worked example,
+// `Dog | IOException` (a mixed user-class / built-in list sharing no base more
+// specific than `Object`), which v0.182 required to be rejected in BINDING form
+// and admitted in non-binding form. Under v0.243 both forms are rejected, and
+// by the ARM-TYPE rule: `Dog` is not `Exception`-derived, so no thrown value
+// can ever match it.
 //
-// VERIFIED to fail-without / pass-with the fix: pre-fix, `convertsInto`'s
-// buggy fallback made `commonTypeOf(Dog, IOException)` return `Dog` (the
-// FIRST listed type, non-null) at Step 1, so `catchArmNcb` returned early —
-// no §31.2.1 error, and `e` silently bound at `Dog` (confirmed by the
-// companion assertion below: `e.Message` — a member IOException/Exception
-// has but Dog does not — fails with "no member `Message` on type `Dog`",
-// proving the pre-fix binding was typed `Dog`, not `Object` and not
-// `Exception`). Post-fix, `convertsInto` resolves built-in-involving Named
-// pairs by ancestor NAME instead of the blanket declaration-less fallback,
-// so Step 1 correctly returns null (neither converts into the other) and
-// Step 2's ancestor walk correctly finds no shared base short of `Object`.
+// The #1621 defect this program was chosen to expose is still what makes the
+// program interesting — it is the mixed declaration-less/declared Named pair
+// that `commonTypeOf`'s old fallback answered wrongly — but the rule that
+// catches it has moved one level earlier, to the arm type itself, which no
+// `commonTypeOf` result can mask. The deleted rejection must not fire.
 BEZEL_TEST(catch_multitype_no_common_base_v182,
-           mixed_user_and_builtin_no_common_base_rejected_spec_31_2_1_1621) {
+           mixed_user_and_builtin_binding_rejected_by_arm_type_spec_31_2_1_v0_243_1621) {
     const std::string src =
         "module M; import System.IO; "
         "class Dog end Dog; "
         "class C public static method Main(): int "
-        "  try throw new Dog(); "
+        "  try throw new ArgumentException(\"x\"); "
         "  catch var e: Dog | IOException => return 1; "
         "  end; "
         "  return 0; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(hasNoCommonBaseError(src), true);
+    BEZEL_EXPECT_EQ(hasDeadArmError(src, "Dog"), true);
+    BEZEL_EXPECT_EQ(hasNoCommonBaseError(src), false);
 }
 
-// #1621 / §31.2.1: the non-binding form of the same mixed list (`Dog |
-// IOException`, no `var`) needs no common type and is unrestricted — must
-// still compile and run. Regression guard: the fix must not over-reject the
-// non-binding form the §31.2.1 rejection never applied to.
+// #1621 / §31.2.1 v0.243: the NON-binding form of the same mixed list, which
+// v0.182 pinned as ACCEPTED and running to exit 1. Now rejected — the arm-type
+// rule does not care whether the arm binds.
 BEZEL_TEST(catch_multitype_no_common_base_v182,
-           mixed_user_and_builtin_nonbinding_ok_spec_31_2_1_1621) {
-    BEZEL_EXPECT_EQ(run(
+           mixed_user_and_builtin_nonbinding_now_rejected_spec_31_2_1_v0_243_1621) {
+    const std::string src =
         "module M; import System.IO; "
         "class Dog end Dog; "
         "class C public static method Main(): int "
-        "  try throw new Dog(); "
+        "  try throw new ArgumentException(\"x\"); "
         "  catch Dog | IOException => return 1; "
         "  end; "
         "  return 0; "
-        "end Main; end C;"),
-        1);
+        "end Main; end C;";
+    BEZEL_EXPECT_EQ(hasDeadArmError(src, "Dog"), true);
 }
 
-// #1621 / §31.2.1: three-way list mixing two SIBLING built-ins
+// #1621 / §31.2.1 v0.243: a three-way list mixing two SIBLING built-ins
 // (`OverflowException`, `ArgumentException` — both `Exception`-derived, but
-// neither a base of the other) with an unrelated user class (`Dog`) must
-// still be rejected. VERIFIED to fail-without the fix: pre-fix,
-// `commonTypeOf`'s buggy fold made EVERY pairwise step in Step 1 return the
-// running (first-listed) type non-null regardless of the actual pair — for
-// this list it folds `OverflowException` the whole way through, so the
-// walk never reaches Step 2 and no §31.2.1 error was ever reported despite
-// `Dog` sharing no base with the other two.
+// neither a base of the other) with an unrelated user class (`Dog`) is rejected
+// at `Dog`. Under v0.182 this was the case `commonTypeOf`'s buggy fold hid: it
+// folded `OverflowException` the whole way through, so Step 2 never ran and no
+// error was reported despite `Dog` sharing no base with the other two. The
+// arm-type rule reaches `Dog` directly, so no fold can mask it.
 BEZEL_TEST(catch_multitype_no_common_base_v182,
-           mixed_builtin_siblings_and_unrelated_user_class_rejected_spec_31_2_1_1621) {
+           mixed_builtin_siblings_and_unrelated_user_class_rejected_spec_31_2_1_v0_243_1621) {
     const std::string src =
         "module M; "
         "class Dog end Dog; "
         "class C public static method Main(): int "
-        "  try throw new Dog(); "
+        "  try throw new ArgumentException(\"x\"); "
         "  catch var e: OverflowException | ArgumentException | Dog => return 1; "
         "  end; "
         "  return 0; "
         "end Main; end C;";
-    BEZEL_EXPECT_EQ(hasNoCommonBaseError(src), true);
+    BEZEL_EXPECT_EQ(hasDeadArmError(src, "Dog"), true);
 }
 
 // #1621 / §31.2.1: two SIBLING built-ins whose only common base is
@@ -393,8 +460,7 @@ BEZEL_TEST(catch_multitype_no_common_base_v182,
 // for that); it pins that the two-sibling-built-ins case still compiles and
 // dispatches correctly after the fix (a regression guard for the built-in
 // exception hierarchy walk added to `namedAncestorChain`, without which
-// Step 2 cannot discover a PURELY built-in shared ancestor and this would
-// wrongly regress into a §31.2.1 rejection).
+// Step 2 cannot discover a PURELY built-in shared ancestor).
 BEZEL_TEST(catch_multitype_no_common_base_v182,
            sibling_builtins_ncb_via_hierarchy_walk_spec_31_2_1_1621) {
     BEZEL_EXPECT_EQ(run(
@@ -414,7 +480,7 @@ BEZEL_TEST(catch_multitype_no_common_base_v182,
 // §31.2.1 the NCB is "the MOST SPECIFIC" shared base, not merely `Exception`
 // — this pins that `namedAncestorChain`'s BFS-order (most-specific-first)
 // walk stops at the first ancestor common to all listed types rather than
-// over-generalizing to the universal `Exception` fallback).
+// over-generalizing to the v0.243 `Exception` fallback).
 BEZEL_TEST(catch_multitype_no_common_base_v182,
            sibling_builtins_ncb_is_most_specific_shared_ancestor_spec_31_2_1_1621) {
     BEZEL_EXPECT_EQ(run(
@@ -441,14 +507,12 @@ BEZEL_TEST(catch_multitype_no_common_base_v182,
 // `convertsInto` were still spuriously returning `true` for any
 // declaration-less Named pair.
 //
-// VERIFIED to fail-without / pass-with the fix: pre-fix, `convertsInto`'s
-// buggy fallback made `commonTypeOf(OverflowException, ArgumentException)`
-// return a (bogus) non-null common type, so this `if`-expression compiled
-// with NO §20 diagnostic — the same underlying defect as the catch-arm bug,
-// manifesting here as a SILENT ACCEPTANCE of a program §20 says must be
-// rejected. Post-fix, `convertsInto` correctly finds neither built-in
-// converts into the other, so `commonTypeOf` returns null and §20's
-// no-common-type error fires.
+// VERIFIED to fail-without / pass-with the #1621 fix: pre-fix,
+// `convertsInto`'s buggy fallback made `commonTypeOf(OverflowException,
+// ArgumentException)` return a (bogus) non-null common type, so this
+// `if`-expression compiled with NO §20 diagnostic — the same underlying
+// defect as the catch-arm bug, manifesting here as a SILENT ACCEPTANCE of a
+// program §20 says must be rejected.
 BEZEL_TEST(catch_multitype_no_common_base_v182,
            if_expr_sibling_builtins_rejected_per_spec_20_1621) {
     const std::string src =
@@ -466,10 +530,10 @@ BEZEL_TEST(catch_multitype_no_common_base_v182,
 // inherits a BUILT-IN exception base (`MyIoErr: IOException`) as one
 // `if`-expression branch, against that SAME built-in base as the other
 // branch, DOES have a common type (`IOException` — an ordinary upcast, §5.1
-// / §12) and must compile and run. Pins that `convertsInto`'s new
-// ancestor-name resolution (used when one side has a declaration and the
-// other does not) still accepts this legitimate case — the fix must not
-// have overcorrected into rejecting every declaration-less pairing.
+// / §12) and must compile and run. Pins that `convertsInto`'s ancestor-name
+// resolution (used when one side has a declaration and the other does not)
+// still accepts this legitimate case — the fix must not have overcorrected
+// into rejecting every declaration-less pairing.
 BEZEL_TEST(catch_multitype_no_common_base_v182,
            if_expr_user_subtype_of_builtin_common_type_ok_spec_20_1621) {
     BEZEL_EXPECT_EQ(run(
