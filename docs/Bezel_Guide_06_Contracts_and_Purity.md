@@ -215,7 +215,7 @@ public static pure method CountOf(text: string, needle: char): int
 end CountOf;
 ```
 
-What stays rejected is a source the checker cannot see concretely: an **interface-typed** source (`IEnumerable<T>` included) or a **generic type parameter** source — even one every caller instantiates at a concrete array type — because there the desugaring would construct an enumerator class instance, and pure-body checking never depends on the substitution (spec §22.15). For those sources the remedy is the index loop over a `Range` — `for var i in 0..<xs.Count do … xs[i] … end;` — now the generic-source spelling rather than the everyday one.
+What stays rejected is a source the checker cannot see concretely: an **interface-typed** source (`IEnumerable<T>` included) or a **generic type parameter** source — even one every caller instantiates at a concrete array type — because there the desugaring would construct an enumerator class instance, and pure-body checking never depends on the substitution (spec §22.15). For those sources the remedy is getting the source to a concrete sequence type: take the parameter as `Array<T>`, or bind the value at a concrete type before the loop. An index loop is *not* the workaround here — inside a pure body it hits the same wall (`IEnumerable<T>` has no `Count` or indexer, and an interface indexer read resolves to a declaration that is not `pure`-declared, so the element access is rejected too; spec §22.15 rule 5).
 
 And the two traps the checker will catch for you, both compile errors with the operation named:
 
