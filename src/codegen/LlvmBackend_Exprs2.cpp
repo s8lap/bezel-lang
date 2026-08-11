@@ -6556,6 +6556,70 @@ llvm::Value* Emitter::enumDeclaredValueTest(const sema::TypeSymbol* ts,
     return acc;
 }
 
+llvm::Value* Emitter::tryLowerEnumFromUnderlyingOrNull(
+        const ast::CallExpr& call) {
+    auto* ma = dynamic_cast<const ast::MemberAccessExpr*>(call.callee.get());
+    if (!ma || ma->member != "FromUnderlyingOrNull" || !ma->target)
+        return nullptr;
+    // The receiver must NAME an enum type — this is a STATIC member. Without
+    // this gate a user class declaring its own
+    // `static FromUnderlyingOrNull(x): SomeEnum?` would be hijacked here: the
+    // member name and the `E?` result type alone do not identify the
+    // compiler-provided member. (Sema's own recognition, ExprTC::
+    // enumTypeNamedBy, applies exactly this gate, so the two agree.)
+    const sema::TypeSymbol* named = nullptr;
+    if (sema::Symbol* tsym = ctx_.exprSymbol(*ma->target)) {
+        if (auto* ts = dynamic_cast<sema::TypeSymbol*>(tsym)) {
+            if (ts->kind == ast::TypeDeclKind::Enum) named = ts;
+        } else if (auto* nts = dynamic_cast<sema::NestedTypeSymbol*>(tsym)) {
+            if (nts->type && nts->type->kind == ast::TypeDeclKind::Enum)
+                named = nts->type;
+        }
+    }
+    if (!named) return nullptr;
+    // Sema types the whole call as `E?` (a nullable Named enum).
+    const sema::TypeRef* rt = ctx_.exprType(call);
+    if (!rt || !rt->nullable || rt->kind != sema::TypeRef::Kind::Named ||
+        rt->declaration != named)
+        return nullptr;
+    if (call.args.size() != 1 || !call.args[0].value) return nullptr;
+    const sema::TypeSymbol* enumTy = rt->declaration;
+
+    llvm::Value* src = lowerExpr(*call.args[0].value);
+    if (!src || !src->getType()->isIntegerTy()) return nullptr;
+    // §10.4: "The parameter type is the underlying type `U` exactly" — sema has
+    // already checked the argument is §5.1-convertible to `U`, so the only work
+    // here is the width/signedness adjustment the enum's own representation
+    // needs (§10.3 / #740), identical to lowerEnumCast's widening arm. No range
+    // guard: a value that does not fit `U` cannot reach here (sema rejected the
+    // narrowing), and the member is TOTAL — it never raises.
+    llvm::Type* uTy = enumLlvmType(enumTy);
+    bool srcUnsigned = false;
+    if (auto* st = ctx_.exprType(*call.args[0].value))
+        if (st->kind == sema::TypeRef::Kind::Primitive)
+            srcUnsigned = isUnsignedPrim(st->primitive);
+    llvm::Value* v = srcUnsigned
+        ? builder_.CreateZExtOrTrunc(src, uTy, "enum.fu")
+        : builder_.CreateSExtOrTrunc(src, uTy, "enum.fu");
+
+    llvm::Value* declared = enumDeclaredValueTest(enumTy, v);
+    llvm::StructType* nt = nullableValueStructTy(rt);
+    llvm::Value* present = builder_.CreateInsertValue(
+        llvm::UndefValue::get(nt),
+        llvm::ConstantInt::get(nullablePrimHasValTy(), 1), {0u});
+    present = builder_.CreateInsertValue(
+        present, reinterpretToType(v, nt->getElementType(1)), {1u});
+    if (!declared) {
+        // Value set unknown (an enum whose constants carry no known values) —
+        // decline to decide and report presence, matching lowerEnumCast's
+        // decline-to-check posture rather than manufacturing a null.
+        return present;
+    }
+    return builder_.CreateSelect(declared, present,
+                                 llvm::Constant::getNullValue(nt),
+                                 "enum.fu.opt");
+}
+
 llvm::Value* Emitter::lowerEnumCast(const ast::CallExpr& call) {
     if (call.args.size() != 1 || !call.args[0].value) return nullptr;
     llvm::Value* src = lowerExpr(*call.args[0].value);

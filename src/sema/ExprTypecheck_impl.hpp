@@ -693,6 +693,15 @@ private:
     // value-builtins, and generic-parameter/unresolved refs return false.
     bool defaultIllFormed(const TypeRef* t);
 
+    // fix #3044 (§10.4 / stdlib §9.9, v0.242): the ENUM TypeSymbol an
+    // expression NAMES as a type (an `E` identifier, or a nested
+    // `Outer.Inner`), or null when the expression is not an enum type name.
+    // Used to recognise the compiler-provided `E.FromUnderlyingOrNull(value)`
+    // static member — a static call, so a receiver that is an enum *value*
+    // deliberately does not match.
+    const TypeSymbol* enumTypeNamedBy(const ast::Expr& e);
+
+
     // Slice DR1 (§21.7): does control definitely leave this statement
     // list abruptly (return / throw / non-terminating loop) before
     // reaching its end? Conservatively returns true only when certain,

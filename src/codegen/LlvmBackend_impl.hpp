@@ -11631,6 +11631,12 @@ private:
     llvm::Value* enumDeclaredValueTest(const sema::TypeSymbol* ts,
                                        llvm::Value* v);
 
+    // fix #3044 (§10.4 / stdlib §9.9, v0.242): lower the compiler-provided
+    // `E.FromUnderlyingOrNull(value): E?` — the declared constant whose
+    // underlying value equals `value`, or null when there is none. Total: it
+    // never raises. Returns nullptr when `call` is not that shape.
+    llvm::Value* tryLowerEnumFromUnderlyingOrNull(const ast::CallExpr& call);
+
     // §22.4/§22.7: can the given call arguments fill the parameter list?
     // (named arguments matched by name, positionals by position, every
     // remaining parameter defaulted). Pure check — no IR emitted — used to

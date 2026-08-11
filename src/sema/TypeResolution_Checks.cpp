@@ -527,6 +527,36 @@ void Resolver::checkTypeMethodBodies(TypeSymbol* t) {
 
 void Resolver::checkEnumRestrictions() {
     if (!ctx_.module()) return;
+    // fix #3044 (§10.4, v0.242): the §10.5 loop below walks MODULE-LEVEL enums
+    // only, so a NESTED enum escapes every check in it. Widening the whole loop
+    // is a broader §10.5 change than this fix owns, but the
+    // `FromUnderlyingOrNull` reject cannot be left out: `enumTypeNamedBy` and
+    // `tryLowerEnumFromUnderlyingOrNull` both resolve a NestedTypeSymbol, so a
+    // nested enum's own declaration of that name would be silently shadowed by
+    // the compiler-provided member at every call site — precisely the outcome
+    // §10.4's "no user declaration may override or overload it" exists to
+    // prevent. (That the other §10.5 restrictions still skip nested enums is a
+    // separate, pre-existing gap.)
+    for (Symbol* child : ctx_.module()->children) {
+        auto* outer = dynamic_cast<TypeSymbol*>(child);
+        if (!outer || outer->kind == ast::TypeDeclKind::Enum) continue;
+        for (Symbol* m : outer->members) {
+            auto* nts = dynamic_cast<NestedTypeSymbol*>(m);
+            if (!nts || !nts->type ||
+                nts->type->kind != ast::TypeDeclKind::Enum)
+                continue;
+            for (Symbol* nm : nts->type->members) {
+                if (nm->name != "FromUnderlyingOrNull") continue;
+                ctx_.diagnostics().report(
+                    Severity::Error, nm->declLoc,
+                    std::string("enum `") + std::string(nts->type->name) +
+                    "` may not declare a member named `FromUnderlyingOrNull` — "
+                    "it is the compiler-provided static member every enum "
+                    "carries, and no user declaration may override or overload "
+                    "it (§10.4)");
+            }
+        }
+    }
     for (Symbol* child : ctx_.module()->children) {
         auto* t = dynamic_cast<TypeSymbol*>(child);
         if (!t || t->kind != ast::TypeDeclKind::Enum) continue;
@@ -538,6 +568,22 @@ void Resolver::checkEnumRestrictions() {
                     "` may not declare " + std::string(what) +
                     " (§10.5)");
             };
+            // fix #3044 (§10.4, v0.242): `FromUnderlyingOrNull` is the
+            // compiler-provided per-enum static member — "no declaration is
+            // written, and no user declaration may override or overload it".
+            // Rejecting the declaration (rather than letting it silently lose
+            // to the compiler-provided member at every call site) is what makes
+            // the member's contract — total, never raises — trustworthy.
+            if (m->name == "FromUnderlyingOrNull") {
+                ctx_.diagnostics().report(
+                    Severity::Error, m->declLoc,
+                    std::string("enum `") + std::string(t->name) +
+                    "` may not declare a member named `FromUnderlyingOrNull` — "
+                    "it is the compiler-provided static member every enum "
+                    "carries, and no user declaration may override or overload "
+                    "it (§10.4)");
+                continue;
+            }
             if (auto* fs = dynamic_cast<FieldSymbol*>(m)) {
                 if (!hasMod(fs, "static")) bad("an instance field");
                 continue;

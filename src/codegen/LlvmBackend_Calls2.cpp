@@ -3421,6 +3421,11 @@ llvm::Value* Emitter::lowerCallDispatch(const ast::CallExpr& call) {
     // and `.Raise(payload)` / `.Raise()`. Checked first so the event member
     // access does not fall through to ordinary (no-such-method) dispatch.
     if (auto v = tryLowerEventCall(call)) return *v;
+    // fix #3044 (§10.4 / stdlib §9.9, v0.242): `E.FromUnderlyingOrNull(value)`
+    // — the compiler-provided per-enum static member. Checked before ordinary
+    // dispatch because no MethodSymbol exists for it (sema types the call
+    // directly), so the ordinary path would find no callee.
+    if (llvm::Value* fu = tryLowerEnumFromUnderlyingOrNull(call)) return fu;
     // §8/§9/§10: compiler-synthesized value-semantics members (ToString,
     // GetHashCode, Equals) on a record/enum receiver. Checked before the
     // ordinary dispatch so a record with no user ToString gets the §9.1 form

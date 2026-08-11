@@ -1544,10 +1544,78 @@ bool ExprTC::checkGenericRefOutExactUnification(const ast::CallExpr& ce,
     return false;
 }
 
+// fix #3044 (§10.4, v0.242): see the declaration in ExprTypecheck_impl.hpp.
+const TypeSymbol* ExprTC::enumTypeNamedBy(const ast::Expr& e) {
+    Symbol* s = ctx_.exprSymbol(e);
+    if (auto* ts = dynamic_cast<TypeSymbol*>(s))
+        if (ts->kind == ast::TypeDeclKind::Enum) return ts;
+    if (auto* nts = dynamic_cast<NestedTypeSymbol*>(s))
+        if (nts->type && nts->type->kind == ast::TypeDeclKind::Enum)
+            return nts->type;
+    return nullptr;
+}
+
 // Slice 3h: resolve a CallExpr's return type from the callee's
 // resolved MethodSymbol.
 void ExprTC::typeCall(const ast::CallExpr& ce) {
     if (!ce.callee) return;
+    // fix #3044 (§10.4 / stdlib §9.9, v0.242): `E.FromUnderlyingOrNull(value)`
+    // — the COMPILER-PROVIDED per-enum static member. "Every enum `E` with
+    // underlying type `U` carries one compiler-provided static member … no
+    // declaration is written, and no user declaration may override or overload
+    // it" (§10.4; the user-declaration reject lives in checkEnumRestrictions).
+    // It is the branch-shaped tier beside §5.4's checked cast: it "returns the
+    // declared constant whose underlying value equals `value`, or `null` when
+    // there is none", is TOTAL (never raises), and its result type is `E?`.
+    // "The parameter type is the underlying type `U` exactly: a wider integer
+    // in hand is narrowed explicitly first (§5.2, checked)" — which is exactly
+    // what routing the argument through the §5.1 assignability check against
+    // `U` delivers (a `byte` argument widens implicitly to an `int` `U`; a
+    // `long` argument to a `byte` `U` is rejected unless it is a §5.1
+    // constant-narrowing constant).
+    if (auto* fma =
+            dynamic_cast<const ast::MemberAccessExpr*>(ce.callee.get())) {
+        if (fma->member == "FromUnderlyingOrNull" && fma->target) {
+            if (const TypeSymbol* ets = enumTypeNamedBy(*fma->target)) {
+                const std::string ename(ets->name);
+                if (ce.args.size() != 1 || !ce.args[0].value) {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ce.span.begin,
+                        "`" + ename +
+                        ".FromUnderlyingOrNull` takes exactly one argument — "
+                        "the underlying-type value to convert (§10.4)");
+                } else {
+                    if (!ce.args[0].name.empty() &&
+                        ce.args[0].name != "value")
+                        ctx_.diagnostics().report(
+                            Severity::Error, ce.span.begin,
+                            "`" + ename +
+                            ".FromUnderlyingOrNull` has one parameter, named "
+                            "`value` — there is no parameter `" +
+                            std::string(ce.args[0].name) + "` (§10.4)");
+                    PrimitiveType up = PrimitiveType::Int;
+                    if (ets->enumUnderlyingType &&
+                        ets->enumUnderlyingType->kind ==
+                            TypeRef::Kind::Primitive)
+                        up = ets->enumUnderlyingType->primitive;
+                    if (TypeRef* at = ctx_.exprType(*ce.args[0].value))
+                        checkAssignable(at, ctx_.primitiveTypeRef(up),
+                                        ce.span.begin,
+                                        "argument to `" + ename +
+                                        ".FromUnderlyingOrNull`",
+                                        ce.args[0].value.get());
+                }
+                // The result is `E?` whatever the argument turned out to be, so
+                // a downstream `?? E.Low` still types even on the error path.
+                TypeRef* rt = ctx_.makeTypeRef();
+                rt->kind = TypeRef::Kind::Named;
+                rt->declaration = const_cast<TypeSymbol*>(ets);
+                rt->nullable = true;
+                ctx_.setExprType(&ce, rt);
+                return;
+            }
+        }
+    }
     // stdlib §2.12 (#753): BitConverter.Reinterpret<TTo>(value) well-formedness.
     // The target type (explicit type arg) and the source value must be primitive
     // numeric types of EQUAL bit width; a width mismatch — or a non-numeric type
@@ -16313,6 +16381,23 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
                 isResultCombinator = true;
             }
         }
+        // fix #3044 (§10.4 / stdlib §9.9, v0.242): `E.FromUnderlyingOrNull` is
+        // the COMPILER-PROVIDED per-enum static member — no MethodSymbol
+        // exists for it, so `lookupMember` returns null and the "no member"
+        // reject below would fire before `typeCall` could type the call.
+        // Exempt the access here (exactly as the #2513 Result-combinator arm
+        // does); typeCall stamps the `E?` result and validates the argument.
+        // Gated on the access being the CALLEE of a call
+        // (`calleeOfCallCtx_`): a bare `E.FromUnderlyingOrNull` reference is
+        // NOT exempted, so it falls through to the ordinary no-member reject
+        // rather than being left silently untyped. §10.4 declares the member
+        // only as a callable static; a §27.6 method-reference form for it is
+        // unspecified, and accepting one here would leave codegen with nothing
+        // to lower.
+        if (targetType->kind == ast::TypeDeclKind::Enum &&
+            ma.member == "FromUnderlyingOrNull" &&
+            calleeOfCallCtx_ == &ma)
+            return;
         if (isResultCombinator) {
             // Do NOT stamp a Function TypeRef on the MemberAccessExpr: the
             // function-call argument gate at typeCall ~line 2819 consults
