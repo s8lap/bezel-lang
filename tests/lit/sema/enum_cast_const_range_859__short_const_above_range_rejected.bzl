@@ -4,8 +4,11 @@
 //   (BEZEL_TEST enum_cast_const_range_859, short_const_above_range_rejected).
 //
 // §5.4: a constant above a short-backed enum's range is rejected.
+//
+// v0.242 (#3044): verdict unchanged, message merged into §5.4's single checked
+// rule — see enum_cast_const_range_859__byte_const_above_range_rejected.bzl.
 
 module M; enum HttpStatus: short Ok := 200; end HttpStatus; class C public static method Main(): int var s: HttpStatus := HttpStatus(40000); return 0; end Main; end C;
 
-// CHECK: :{{[0-9]+}}:{{[0-9]+}}: enum cast `HttpStatus(40000)` — the constant is outside the enum's underlying type range and cannot be represented
+// CHECK: :{{[0-9]+}}:{{[0-9]+}}: enum cast `HttpStatus(40000)` — 40000 is not the underlying value of any declared constant of `HttpStatus`
 // CHECK-SAME: (§5.4)

@@ -1,5 +1,6 @@
 #include "sema/ExprTypecheck.hpp"
 #include "sema/ExprTypecheck_impl.hpp"
+#include "sema/EnumValues.hpp"  // enumDeclaredValues — §10.2/§17.11 (#3044)
 
 #include <cerrno>
 #include <cstdlib>
@@ -540,50 +541,16 @@ void collectEnumPatternNames(const ast::CaseArm& arm,
     collect(arm.pattern.get());
 }
 
-// §10.2 (issue #1577): resolve every declared enum constant's underlying
-// value, honoring an explicit `:= N` initializer and auto-increment
-// continuation from the previous value — the same algorithm as the
-// underlying-type range check in TypeResolution_Checks.cpp's
-// checkEnumRestrictions, recomputed here because EnumConstantSymbol::value
-// (Symbol.hpp) is populated only for an IMPORTED enum (the cross-module
-// carrier); a LOCAL enum's values are always re-derived from its AST. A
-// value that fails to fold (a non-constant initializer — a separate,
-// already-diagnosed concern) falls back to the auto-increment default so
-// later siblings still continue correctly.
-std::unordered_map<std::string_view, long long> computeLocalEnumConstantValues(
-        const ast::TypeDecl& td) {
-    std::unordered_map<std::string_view, long long> values;
-    long long running = 0;
-    for (const auto& ec : td.enumConstants) {
-        long long val = running;
-        if (ec.value) {
-            auto resolve = [&](std::string_view name, int)
-                    -> std::optional<long long> {
-                auto it = values.find(name);
-                if (it != values.end()) return it->second;
-                return std::nullopt;
-            };
-            if (auto folded = foldIntConst(*ec.value, resolve)) val = *folded;
-        }
-        values[ec.name] = val;
-        running = val + 1;
-    }
-    return values;
-}
-
 // §10.2 (issue #1577): the enum-constant-name -> underlying-value map for
-// `sub`. Prefers the AST (local enum, full fidelity including auto-increment
-// continuation); falls back to the per-symbol `value` field for an imported
-// enum, which has no ast::TypeDecl (mirrors the fallback in the exhaustiveness
-// check just below).
+// `sub`. Delegates to the shared sema/EnumValues.hpp computation (#3044), the
+// ONE place the §10.2 explicit-value + auto-increment-continuation rule and the
+// local-AST-vs-imported-symbol split live — so this map, §5.4's checked-cast
+// declared-value test, and §17.11's zero-constant test can never disagree.
 std::unordered_map<std::string_view, long long> enumConstantValues(
         const TypeSymbol& sub) {
-    if (auto* td = dynamic_cast<const ast::TypeDecl*>(sub.decl))
-        return computeLocalEnumConstantValues(*td);
     std::unordered_map<std::string_view, long long> values;
-    for (const Symbol* m : sub.members)
-        if (auto* ec = dynamic_cast<const EnumConstantSymbol*>(m))
-            values[ec->name] = ec->value;
+    for (const auto& c : enumDeclaredValues(sub).constants)
+        values[c.first] = c.second;
     return values;
 }
 

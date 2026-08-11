@@ -4,6 +4,7 @@
 
 #include "common/BuiltinRegistry.hpp"  // isArrayBackedCollectionName/isDictionaryName/isLinkedListName (#2465)
 #include "common/OwnershipFacts.hpp"  // isBorrowBearingRecordOrSpan (§30.1, #1595)
+#include "sema/EnumValues.hpp"  // enumDeclaresValue — §5.4's checked enum cast (#3044)
 #include "sema/Sendability.hpp"  // isSendableType — §30.14 sendability computation (shared with Resolver)
 #include "sema/TypeResolution.hpp"  // typeRefEqual, overrideParamTypeMatches
 
@@ -1932,8 +1933,65 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     // a NestedTypeSymbol; it does NOT inherit TypeSymbol, so the branch below
     // would miss it without this extra check. per §10 the result type is the
     // inner enum's TypeSymbol.
+    //
+    // fix #3044 (§5.4, v0.242): `E(n)` is CHECKED AGAINST THE DECLARED
+    // CONSTANTS — "it succeeds exactly when `n` equals the underlying value of
+    // some declared constant of `E`". When `n` is a §17.14 compile-time
+    // constant equal to no declared constant, the cast is a compile error AT
+    // THE CAST SITE; a non-constant `n` raises OverflowException at runtime
+    // instead (codegen lowerEnumCast).
+    //
+    // This SUBSUMES the former #859 underlying-type range check: §5.4 states
+    // "In-range-vs-out-of-range is not a user-visible distinction: an `n`
+    // outside the underlying type's range is, a fortiori, equal to no declared
+    // constant, so the single rule subsumes the former range check" — hence ONE
+    // diagnostic for both, naming the enum and the value. The range check
+    // survives only as the fallback for an enum whose declared-value set cannot
+    // be decided here (a constant with a non-constant initializer — its own
+    // diagnostic fires elsewhere — or an enum with no constants at all), where
+    // rejecting on the declared set would be a guess.
+    auto checkEnumCastConstantOperand = [&](const TypeSymbol* ets) {
+        if (ce.args.size() != 1 || !ce.args[0].value) return;
+        auto cv = foldIntConstExprTC(*ce.args[0].value);
+        if (!cv) return;
+        std::optional<bool> declared = enumDeclaresValue(*ets, *cv);
+        if (declared) {
+            if (!*declared)
+                ctx_.diagnostics().report(
+                    Severity::Error, ce.span.begin,
+                    "enum cast `" + std::string(ets->name) + "(" +
+                    std::to_string(*cv) + ")` — " + std::to_string(*cv) +
+                    " is not the underlying value of any declared constant of "
+                    "`" + std::string(ets->name) + "` (§5.4)");
+            return;
+        }
+        PrimitiveType up = PrimitiveType::Int;
+        if (ets->enumUnderlyingType &&
+            ets->enumUnderlyingType->kind == TypeRef::Kind::Primitive)
+            up = ets->enumUnderlyingType->primitive;
+        auto fits = [](long long v, PrimitiveType p) -> bool {
+            using P = PrimitiveType;
+            switch (p) {
+                case P::Byte:   return v >= 0 && v <= 255;
+                case P::SByte:  return v >= -128 && v <= 127;
+                case P::Short:  return v >= -32768 && v <= 32767;
+                case P::UShort: return v >= 0 && v <= 65535;
+                case P::Int:    return v >= -2147483648LL && v <= 2147483647LL;
+                case P::UInt:   return v >= 0 && v <= 4294967295LL;
+                default:        return true;  // long/ulong: 64-bit
+            }
+        };
+        if (!fits(*cv, up))
+            ctx_.diagnostics().report(
+                Severity::Error, ce.span.begin,
+                "enum cast `" + std::string(ets->name) + "(" +
+                std::to_string(*cv) +
+                ")` — the constant is outside the enum's underlying type range "
+                "and cannot be represented (§5.4)");
+    };
     if (auto* nts = dynamic_cast<NestedTypeSymbol*>(calleeSym)) {
         if (nts->type && nts->type->kind == ast::TypeDeclKind::Enum) {
+            checkEnumCastConstantOperand(nts->type);
             TypeRef* et = ctx_.makeTypeRef();
             et->kind = TypeRef::Kind::Named;
             et->declaration = nts->type;
@@ -1960,40 +2018,9 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
     }
     if (auto* ts = dynamic_cast<TypeSymbol*>(calleeSym)) {
         if (ts->kind == ast::TypeDeclKind::Enum) {
-            // §5.4 (#859): `E(n)` with a compile-time-constant `n` outside the
-            // enum's underlying type range is a COMPILE ERROR (a runtime cast
-            // raises OverflowException instead — handled in codegen). Mirror the
-            // §10.3 member-range check on the underlying type (explicit
-            // enumUnderlyingType, or the default `int`).
-            if (ce.args.size() == 1 && ce.args[0].value) {
-                if (auto cv = foldIntConstExprTC(*ce.args[0].value)) {
-                    PrimitiveType up = PrimitiveType::Int;
-                    if (ts->enumUnderlyingType &&
-                        ts->enumUnderlyingType->kind ==
-                            TypeRef::Kind::Primitive)
-                        up = ts->enumUnderlyingType->primitive;
-                    auto fits = [](long long v, PrimitiveType p) -> bool {
-                        using P = PrimitiveType;
-                        switch (p) {
-                            case P::Byte:   return v >= 0 && v <= 255;
-                            case P::SByte:  return v >= -128 && v <= 127;
-                            case P::Short:  return v >= -32768 && v <= 32767;
-                            case P::UShort: return v >= 0 && v <= 65535;
-                            case P::Int:    return v >= -2147483648LL &&
-                                                   v <= 2147483647LL;
-                            case P::UInt:   return v >= 0 && v <= 4294967295LL;
-                            default:        return true;  // long/ulong: 64-bit
-                        }
-                    };
-                    if (!fits(*cv, up))
-                        ctx_.diagnostics().report(
-                            Severity::Error, ce.span.begin,
-                            "enum cast `" + std::string(ts->name) + "(" +
-                            std::to_string(*cv) +
-                            ")` — the constant is outside the enum's underlying "
-                            "type range and cannot be represented (§5.4)");
-                }
-            }
+            // fix #3044 (§5.4, v0.242): the checked-cast constant arm — see the
+            // lambda's own comment above.
+            checkEnumCastConstantOperand(ts);
             // per §5.4/§5.1 (#1171): the argument to an enum cast `E(x)` must
             // be an INTEGER value — §5.4 defines `E(n)` only "for an integer
             // n", which is range-checked against the underlying type (at
@@ -2619,9 +2646,24 @@ void ExprTC::typeCall(const ast::CallExpr& ce) {
                                     if (!argDecl) continue;  // built-in/unresolved: defer
                                     bool satisfied = false;
                                     bool decided = false;
-                                    if (argDecl->kind == ast::TypeDeclKind::Enum ||
-                                        argDecl->kind == ast::TypeDeclKind::Record) {
-                                        // Enums and records (positional fields
+                                    if (argDecl->kind == ast::TypeDeclKind::Enum) {
+                                        // fix #3044 (§17.11 / §14.2, v0.242):
+                                        // `new T()` at a value substitution IS
+                                        // `default(T)`, which §17.11 rejects for
+                                        // an enum with no declared constant of
+                                        // underlying value 0. Decide only when
+                                        // the declared-value set is known; an
+                                        // enum WITH a zero constant defers to
+                                        // Resolver::argSatisfiesNew exactly as
+                                        // before.
+                                        std::optional<bool> hasZero =
+                                            enumHasZeroConstant(*argDecl);
+                                        if (!hasZero || *hasZero) continue;
+                                        decided = true;
+                                        satisfied = false;
+                                    } else if (argDecl->kind ==
+                                               ast::TypeDeclKind::Record) {
+                                        // Records (positional fields
                                         // default-constructible when no non-nullable
                                         // ref field) satisfy new(); conservatively
                                         // accept — the exhaustive check is in
