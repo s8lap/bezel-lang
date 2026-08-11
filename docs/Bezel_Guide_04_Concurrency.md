@@ -1,6 +1,6 @@
 # Bezel Guide 4: Concurrency — Tasks, Domains, and Channels
 
-*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.247.*
+*A short, example-first guide. Companion to the Bezel Language Specification — re-validated against v0.249.*
 
 The syntax here is mainstream async: `async` methods, `await`, tasks, cancellation tokens. The model underneath is not, and the habits that come with the syntax elsewhere will fight you. Four ideas carry the whole chapter. A **domain** runs one continuation at a time, so most code needs no locks (§1). A **task is a heap resource you own**, like every other class instance (§2). **No mutable state is ever reachable from two domains** — data crosses by ownership transfer or as immutable copies (§5). And fan-out defaults to a **structured scope**, not loose tasks (§4). If you skim everything else, read the three sections headed **How Bezel does it** and the table in §10.
 
@@ -93,7 +93,7 @@ For value-typed, `string`, or no results, there is nothing to decide — `var n 
 |---|---|---|
 | Awaits | any number — every awaiter sees the same eventual result (spec §30.4) | exactly one — the first await spends the task, whatever the outcome |
 | The result is | a *borrow* through the task; disposing the task disposes the result | *owned* by the awaiter |
-| Canonical consumer | `using var t := Call(); var r := await t;` | `using var r := await Call();` |
+| Canonical consumer | `var r := await Call();` — the compiler pins the task (spec §30.5, v0.249); name it (`using var t := Call();`) to award twice | `using var r := await Call();` |
 | Use for | fan-out: several readers of the same instance (caches) | a fresh single-consumer value — **the default** |
 
 **Pattern B** is the shape you will write most, and it is the one-liner:
@@ -121,16 +121,17 @@ var cfg  := await task;                 // borrow; source: task
 var cfg2 := await task;                 // fine — same instance, multi-award
 ```
 
-The compile error newcomers hit is the one-line bind of a Pattern A await:
+The compile error newcomers *used to* hit here — the one-line bind of a Pattern A await — is gone (spec §30.5's **scoped await-bind**, v0.249): the compiler now writes the pin itself. A fresh `var` (or `const`) bind whose initializer is exactly the await of a fresh producer desugars to the two-line form above, the task held in a hidden slot no code can name, disposed at the end of the enclosing block:
 
 ```bezel
-var cfg := await FetchConfigAsync();    // ERROR: cfg would outlive the temporary
-                                        //   task that owns the Config
-Render(await FetchConfigAsync());       // OK: the borrow stays inside the statement,
-                                        //   the task is disposed at its end
+var cfg := await FetchConfigAsync();    // works (v0.249): the task is pinned to a
+                                        //   hidden slot until the end of this block;
+                                        //   cfg borrows the Config through it
+Render(await FetchConfigAsync());       // also fine: borrow confined to the statement,
+                                        //   the task disposed at its end
 ```
 
-The fix is the two-line canonical form above. The borrow flows like any other (Guide 1 §3): pass it, read it, but no `using var` over it, no store into an `owned` field, no owned return.
+One await is all the hidden slot gives you — it is unnameable, so to award twice (or hold the task) write the two-line form; it stays the shape to reach for whenever the *task itself* matters, and it is exactly what the one-liner desugars to. Two near-misses still reject, each with a diagnostic that teaches (spec §30.5): `using var cfg := await …` (the await produces a *borrow*, and `using var` needs an owned right-hand side — the task is already pinned; write `var`) and `cfg := await …` onto an existing local (`cfg` may outlive this block; bind the task first). The borrow flows like any other (Guide 1 §3): pass it, read it, but no `using var` over it, no store into an `owned` field, no owned return.
 
 **Choosing, as producer** (rationale §12.2): ask *"can a second consumer legitimately need this same result instance?"* If yes — `Task<T>`, and say why at the declaration. If no, or unsure — `OwningTask<T>`. A fan-out façade over a Pattern B core is one line later (`return await FetchOwnedAsync(url);` from a `Task<Config>`-returning body). The reverse migration breaks callers.
 

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | under-review — drafted 2026-08-11 (owner-directed, from the elegance review) |
+| **Status** | **superseded — graduated v0.249** (owner-ruled 2026-08-11; C1/C2/C3 gates passed, stage-1 prototype [#3048](https://github.com/s8lap/bezel-lang/issues/3048)): spec §30.5 scoped await-bind + §28.3/§28.10 anchors + §30.3 `.Result` lockstep + Appendix C.6; rationale §5.24 second-recorded-stretch paragraph + §12.2; Guide 4 §3. Q1 run-first (C1 7/11 strict), Q2 `const` included (sequenced behind #3074), Q3 lockstep, Q4 normative recommended-message text, Q5 fenced. *(prior: under-review — drafted 2026-08-11 (owner-directed, from the elegance review))* |
 | **Tracking issue** | [#3048](https://github.com/s8lap/bezel-lang/issues/3048) |
 | **Target module(s)** | **spec** — §30.5 (consumer-side Pattern A: the scoped-bind admission and its diagnostics), §28.3 (unbound owned temporaries: one paragraph naming the pinned-slot form), §28.10 (the compiler-introduced slot rides the existing cleanup stack — one sentence), Appendix C.6 (the bare-bind invariant reworded). **rationale** — §5.24 (the parallel bounded-stretch paragraph the `case`-scrutinee entry's template anticipates), §12.2 (one sentence). **guides** — Guide 04 §3 rewrite of "the compile error newcomers hit" at graduation. **No grammar change** (the form already parses; the change is semantic admission). |
 | **Written against** | spec/stdlib v0.241 |

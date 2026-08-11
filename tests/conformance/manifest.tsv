@@ -370,7 +370,7 @@ guide4_0005	guide4	2-How-Bezel-does-it-a-task-is-a-resource-you-own	skip	n/a	ski
 guide4_0006	guide4	3-Two-kinds-of-task-TaskT-borrows-OwningTaskT-transfers	skip	n/a	skip:incomplete-fragment
 guide4_0007	guide4	3-Two-kinds-of-task-TaskT-borrows-OwningTaskT-transfers	skip	n/a	skip:incomplete-fragment
 guide4_0008	guide4	3-Two-kinds-of-task-TaskT-borrows-OwningTaskT-transfers	skip	n/a	skip:incomplete-fragment
-guide4_0009	guide4	3-Two-kinds-of-task-TaskT-borrows-OwningTaskT-transfers	error	diagnose	
+guide4_0009	guide4	3-Two-kinds-of-task-TaskT-borrows-OwningTaskT-transfers	skip	n/a	blocked-on-#3048 (docs-ahead: scoped await-bind, v0.249; probed: HEAD rejects the isolated one-line bind per §30.5, and the fragment's context names keep the row a skip after the flip)
 guide4_0010	guide4	4-Structure-first-TaskScope-Parallel-and-the-free-range-exce	skip	n/a	skip:incomplete-fragment
 guide4_0011	guide4	4-Structure-first-TaskScope-Parallel-and-the-free-range-exce	skip	n/a	skip:stdlib-unresolved (Parallel)
 guide4_0012	guide4	4-Structure-first-TaskScope-Parallel-and-the-free-range-exce	skip	n/a	skip:incomplete-fragment
