@@ -16969,6 +16969,47 @@ void ExprTC::resolveMemberAccess(const ast::MemberAccessExpr& ma) {
         checkMemberVisibility(msym, ma.member, ma.span.begin, recvTy);
     }
     ctx_.setExprSymbol(&ma, member);
+    // fix #2838 (§12.3 / §12.5 / §23, v0.240): `base.P` where the resolved
+    // base property is ABSTRACT has no implementation to reach — §12.3's
+    // whole contract is "calls the base class's implementation", and §12.5
+    // is what says an abstract member has none. The named-method form
+    // already rejects this ("cannot call abstract base method `M` via `base`
+    // — it has no implementation (§12.3/§12.5)", ExprTypecheck_Calls.cpp
+    // #874, ~L2143); the indexer form already rejects this ("cannot access
+    // an abstract base indexer via `base` — it has no implementation
+    // (§12.3/§12.5)", ExprTypecheck_Exprs.cpp #2832). The named-property
+    // form silently degraded to 0 — the resolved base has no getter body,
+    // so codegen's `base`-bypass branch (lowerVirtualPropertyGet /
+    // -Set's `baseQualified` decline, paired with the static accessor-body
+    // path) hit no body and zero-init'd. Reject it here so the wrong value
+    // is unreachable on the named-property shape as well. Reads the same
+    // PropertySymbol the #2530 attachment just published (an INDEXER access
+    // is an IndexExpr, not a MemberAccessExpr, and is already covered by
+    // the #2832 sibling). An IMPORTED abstract property has no
+    // ast::PropertyDecl to read modifiers from and is left alone (the
+    // same `!pd` scope limit every other AST-reading named-property
+    // check in this file carries — see propertyDeclIsSetOnly just below,
+    // #2386 / #1614).
+    if (auto* ps = dynamic_cast<PropertySymbol*>(member)) {
+        auto* pd = dynamic_cast<const ast::PropertyDecl*>(ps->decl);
+        bool pAbstract = false;
+        if (pd)
+            for (auto mod : pd->modifiers)
+                if (mod == "abstract") { pAbstract = true; break; }
+        if (pAbstract && ma.target) {
+            if (auto* btid = dynamic_cast<const ast::IdentifierExpr*>(
+                    ma.target.get())) {
+                if (btid->name == "base") {
+                    ctx_.diagnostics().report(
+                        Severity::Error, ma.span.begin,
+                        "cannot access an abstract base property `" +
+                            std::string(ps->name) +
+                            "` via `base` — it has no implementation "
+                            "(\xC2\xA7""12.3/\xC2\xA7""12.5)");
+                }
+            }
+        }
+    }
     // §2.2 / §2.5 (issue #328 inc 3): an imported field/const member has no
     // ast::FieldDecl/ConstDecl, so its resolved type rides the loader's
     // symbol-keyed side table. Attach it for `obj.Field` access typing.
