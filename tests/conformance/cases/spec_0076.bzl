@@ -1,3 +1,2 @@
-var c := 5;
-c++;            // c is 6
-c--;            // c is 5
+var r := 1..10;                       // inclusive: 1 through 10
+var h := 0..<10;                      // half-open: 0 through 9

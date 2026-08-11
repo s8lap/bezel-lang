@@ -1,32 +1,52 @@
-public class Dictionary<K, V>: ICollection<DictionaryEntry<K, V>>
-  public constructor();
-  public constructor(capacity: int);
-  public constructor(comparer: IEqualityComparer<K>);
-  public constructor(capacity: int, comparer: IEqualityComparer<K>);
+public record ReadOnlyStringSpan(Source: string, Start: int, Length: int): IReadOnlySpan<char>
 
-  public readonly property Count: int;
-  public readonly property Keys: ICollection<K>;
-  public readonly property Values: ICollection<V>;
+  public property [i: int]: char
+    get => do
+      if i < 0 or i >= Length then
+        throw new IndexOutOfRangeException();
+      end;
+      return Source[Start + i];
+    end;
+  end;
 
-  public property [key: K]: V;
+  public pure property IsEmpty: bool => Length = 0;
 
-  public method Add(key: K, value: V);
-  public method ContainsKey(key: K): bool;
-  public method Contains(key: K): bool;            // alias for ContainsKey;
-                                                   //   enables `key in dict`
-  public method Remove(key: K): bool;
-  public method TryGetValue(key: K, out value: V): bool;
-  public method GetOrAdd(key: K, factory: (K) -> V): V;
+  // Range construction
+  public pure method Slice(start: int, length: int): ReadOnlyStringSpan =>
+    new ReadOnlyStringSpan(Source, this.Start + start, length);
+  public pure method Slice(start: int): ReadOnlyStringSpan =>       // v0.195: from offset to end
+    Slice(start, Length - start);
+  public pure method Slice(r: Range<int>): ReadOnlyStringSpan;      // v0.241 — Range form: normalized
+                                                                    //   against Length (spec §16.3), then
+                                                                    //   equivalent to Slice(start, length);
+                                                                    //   §4.14's normalization contract
 
-  public method Clear();
-  // (§28.11 v0.213, #2081: `DisposeElements()` removed from Dictionary<K, V> with
-  // axiom A8 — values a holder owns belong in OwningDictionary<K, V>, whose
-  // Clear()/Dispose() cascades over the values.)
-end Dictionary;
+  // Search by char
+  public pure method IndexOf(value: char): int;
+  public pure method Contains(value: char): bool;
 
-public record DictionaryEntry<K, V>(Key: K, Value: V);
+  // Search by substring (span and string forms)
+  public pure method IndexOf(value: ReadOnlyStringSpan): int;
+  public pure method IndexOf(value: string): int;
+  public pure method Contains(value: ReadOnlyStringSpan): bool;
+  public pure method Contains(value: string): bool;
 
-public interface IEqualityComparer<T>
-  method Equals(a: T, b: T): bool;
-  method GetHashCode(value: T): int;
-end IEqualityComparer;
+  // Prefix / suffix (span and string forms)
+  public pure method StartsWith(prefix: ReadOnlyStringSpan): bool;
+  public pure method StartsWith(prefix: string): bool;
+  public pure method EndsWith(suffix: ReadOnlyStringSpan): bool;
+  public pure method EndsWith(suffix: string): bool;
+
+  // Equality (span and string forms)
+  public pure method SequenceEqual(other: ReadOnlyStringSpan): bool;
+  public pure method SequenceEqual(other: string): bool;
+  public pure method SequenceEqual(other: IReadOnlySpan<char>): bool; // v0.108 — interface form
+
+  // Bulk copy (v0.109)
+  public method CopyTo(destination: Span<char>);    // copy chars to destination;
+                                                     //   lengths must match, else
+                                                     //   ArgumentException (the §4.14 rule)
+
+  // Materialization
+  public pure method ToString(): string;
+end ReadOnlyStringSpan;

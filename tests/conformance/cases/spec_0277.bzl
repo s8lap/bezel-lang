@@ -1,17 +1,4 @@
-extern "libc"
-  public method qsort(
-    base: IntPtr,
-    nmemb: UIntPtr,
-    size: UIntPtr,
-    compar: (IntPtr, IntPtr) -> int): ();
+catch
+  var ex: SqlException => throw new DataAccessException("query failed", ex),   // ex borrowed for the ctor call; snapshot taken, instance not retained (§31.4)
+  var ex: Exception => Log(ex)
 end;
-
-public static class IntSorter
-  public static method CompareInts(a: IntPtr, b: IntPtr): int
-    // ...
-  end CompareInts;
-
-  public static method SortInPlace(arrayPtr: IntPtr, count: UIntPtr, sizeOfInt: UIntPtr)
-    qsort(arrayPtr, count, sizeOfInt, IntSorter.CompareInts);
-  end SortInPlace;
-end IntSorter;

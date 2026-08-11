@@ -1,7 +1,7 @@
-// Non-null owned slots; initializer required at declaration
-var fixed: [3 owned]Connection := [
-  Connect("primary"), Connect("secondary"), Connect("tertiary")
-];
+interface IEnumerable<out T>
+  method GetEnumerator(): owned IEnumerator<T>;
+end IEnumerable;
 
-// Nullable owned slots; defaults to all null
-var pool: [16 owned]Connection?;
+interface IComparer<in T>
+  method Compare(a: T, b: T): int;
+end IComparer;

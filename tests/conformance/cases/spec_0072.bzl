@@ -1,1 +1,1 @@
-for var i in 10.. do ... end;     // WARNING: open-ended range cannot be iterated
+public static method FromCollectionLiteral(elements: ReadOnlySpan<T>): owned C<T>;

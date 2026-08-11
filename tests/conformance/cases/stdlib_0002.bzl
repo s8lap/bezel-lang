@@ -12,10 +12,10 @@ public static class Convert
   public static method TryToBoolean(value: string, out result: bool): bool;
 
   public static method ToString(value: int): string;
-  public static method ToString(value: int, toBase: int): string;    // 2, 8, 10, 16
-  public static method ToString(value: long): string;
-  public static method ToString(value: long, toBase: int): string;   // 2, 8, 10, 16
+  public static method ToString(value: long): string;                          // v0.165: elision expanded
   public static method ToString(value: double): string;
   public static method ToString(value: decimal): string;
   public static method ToString(value: bool): string;
+  public static method ToString(value: int, toBase: int): string;              // bases 2, 8, 10, 16; ArgumentException otherwise (v0.195)
+  public static method ToString(value: long, toBase: int): string;
 end Convert;

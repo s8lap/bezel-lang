@@ -1,3 +1,2 @@
-var sortedByAbs := numbers.OrderBy(Math.Abs);     // double or int? Resolved
-                                                  //   from numbers.ElementType
-                                                  //   and OrderBy's target type.
+var callback: ((int) -> bool)?;       // nullable function returning bool
+var nullableReturn: (int) -> bool?;   // non-null function returning a nullable bool

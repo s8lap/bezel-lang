@@ -7,6 +7,6 @@
     end;
     // Merge: `target` is a borrow on both branches, and both sources
     // (the caller's `dest`, or our `_fallback` field) outlive this point.
-    target.Write(payload, 0, payload.Length);
+    target.Write(payload, 0, payload.Count);
     target.Flush();
   end Write;

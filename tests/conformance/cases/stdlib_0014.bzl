@@ -1,56 +1,34 @@
-// Agent: writes primitive and structural tokens in a concrete format.
-// Implemented by JsonSerializer, BinarySerializer, etc.
-public interface ISerializer
-  method WriteInt(value: long);
-  method WriteUInt(value: ulong);
-  method WriteFloat(value: double);
-  method WriteDecimal(value: decimal);
-  method WriteBool(value: bool);
-  method WriteString(value: string);
-  method WriteChar(value: char);
-  method WriteNull();
-  method BeginObject(fieldCount: int);
-  method WriteFieldName(name: string);
-  method EndObject();
-  method BeginArray(elementCount: int);
-  method EndArray();
-end ISerializer;
+public sealed class Type
+  public readonly property Name: string;            // unqualified: "BankAccount"
+  public readonly property FullName: string;        // qualified: "BankingApp.BankAccount"
 
-// Agent: reads the same tokens back. Mirror of ISerializer.
-public interface IDeserializer
-  method ReadInt(): long;
-  method ReadUInt(): ulong;
-  method ReadFloat(): double;
-  method ReadDecimal(): decimal;
-  method ReadBool(): bool;
-  method ReadString(): string;
-  method ReadChar(): char;
-  method TryReadNull(): bool;            // true and consumes if next is null
-  method BeginObject(): int;             // returns field count if the format
-                                         //   provides one, else -1
-  method ReadFieldName(): string;
-  method SkipValue();                    // consume and discard the current
-                                         //   value (including nested object/
-                                         //   array structure); used by
-                                         //   synthesized Deserialize for
-                                         //   unknown fields. A strict
-                                         //   deserializer raises on the
-                                         //   unknown field before this is
-                                         //   reached; a tolerant one skips.
-  method EndObject();
-  method BeginArray(): int;              // element count, or -1 if unknown
-  method HasMoreElements(): bool;        // for count = -1 streaming formats
-  method EndArray();
-end IDeserializer;
+  // Kind predicates. Exactly one of IsClass, IsInterface, IsRecord, IsEnum,
+  // IsPrimitive, IsInlineArray, IsFunctionType is true for any Type.
+  public readonly property IsClass: bool;
+  public readonly property IsInterface: bool;
+  public readonly property IsRecord: bool;
+  public readonly property IsEnum: bool;
+  public readonly property IsPrimitive: bool;       // int, bool, char, float, ...
+  public readonly property IsInlineArray: bool;     // [N]T, [N owned]T?, ...
+  public readonly property IsFunctionType: bool;    // (A, B) -> R
+  public readonly property IsValueType: bool;       // = IsPrimitive or IsEnum
+                                                    //   or IsRecord or IsInlineArray
 
-// Capability: this type can write itself to any ISerializer.
-public interface ISerializable
-  method Serialize(s: ISerializer);
-end ISerializable;
+  // Lattice queries.
+  public readonly property BaseType: Type?;         // direct superclass; null for
+                                                    //   Object, interfaces, value
+                                                    //   types, function types
+  public method Implements(iface: Type): bool;      // true if this type conforms to
+                                                    //   the interface `iface`
+  public method IsAssignableFrom(other: Type): bool;// true if a value of type
+                                                    //   `other` is assignable to a
+                                                    //   location of this type
 
-// Capability: this type can be reconstructed from any IDeserializer.
-// The reconstruction entry point is a static factory; see the note below
-// on why this is recognized by name rather than declared as an interface
-// method in this version.
-public interface IDeserializable
-end IDeserializable;
+  // Enum metadata. Valid only when IsEnum; on any other Type these raise
+  // InvalidOperationException.
+  public readonly property EnumNames: IReadOnlyList<string>;  // member names, declaration
+                                                              //   order; read-only view (§4.1)
+  public readonly property EnumValues: IReadOnlyList<long>;   // member values, same order
+                                                      //   (widened to long; ulong-underlying
+                                                      //   enums bit-reinterpret — see below)
+end Type;

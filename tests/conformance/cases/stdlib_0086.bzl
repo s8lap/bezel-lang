@@ -1,38 +1,93 @@
-public class Task
-  // For non-class T (value types, string, runtime-managed reference types).
-  // For class T, use FromOwnedResult instead.
-  public static method FromResult<T>(value: T): Task<T>;
+public extension IEnumerable<T>
+  // Filtering
+  public method Where(predicate: (T) -> bool): IEnumerable<T>;
+  public method OfType<U>(): IEnumerable<U>;
 
-  // For class T. Produces a Pattern B task; awaiters consume under `using var x := await ...`.
-  public static method FromOwnedResult<T>(owned value: T): OwningTask<T> where T: class;
+  // Projection
+  public method Select<U>(selector: (T) -> U): IEnumerable<U>;
+  public method SelectMany<U>(selector: (T) -> IEnumerable<U>): IEnumerable<U>;
 
-  // For any T: a faulted task never produces its result, so the Pattern A vs
-  // Pattern B distinction does not apply. `FromException<MyClass>(ex)` is correctly
-  // typed as Task<MyClass> even when MyClass is a class type — there is no value
-  // to transfer ownership of, only an exception to re-raise on await.
-  public static method FromException<T>(exception: Exception): Task<T>;
-  public static method FromCancelled<T>(): Task<T>;
+  // Quantifiers
+  public method Any(): bool;
+  public method Any(predicate: (T) -> bool): bool;
+  public method All(predicate: (T) -> bool): bool;
+  public method Count(): int;
+  public method Count(predicate: (T) -> bool): int;
+  public method Contains(value: T): bool;
 
-  public static method Delay(milliseconds: int): Task;
-  public static method Delay(milliseconds: int, token: CancellationToken): Task;
-  public static method Delay(duration: TimeSpan): Task;
-  public static method Delay(duration: TimeSpan, token: CancellationToken): Task;
+  // Element access
+  public method First(): T;                                          // throws if empty
+  public method First(predicate: (T) -> bool): T;
+  public method FirstOrNull(): T?;
+  public method FirstOrNull(predicate: (T) -> bool): T?;
+  public method Last(): T;
+  public method Last(predicate: (T) -> bool): T;
+  public method LastOrNull(): T?;
+  public method LastOrNull(predicate: (T) -> bool): T?;
+  public method Single(): T;                                         // throws if not exactly one
+  public method Single(predicate: (T) -> bool): T;                   // throws unless exactly one matches
+  public method SingleOrNull(): T?;
+  public method SingleOrNull(predicate: (T) -> bool): T?;            // null if none; throws if more than one
+  public method ElementAt(index: int): T;
 
-  public static method WhenAll(tasks: Array<Task>): Task;
+  // Aggregation
+  public method Sum(selector: (T) -> int): int;
+  public method Sum(selector: (T) -> long): long;
+  public method Sum(selector: (T) -> uint): uint;
+  public method Sum(selector: (T) -> ulong): ulong;
+  public method Sum(selector: (T) -> float): float;
+  public method Sum(selector: (T) -> double): double;
+  public method Sum(selector: (T) -> decimal): decimal;
+  public method Min<U>(selector: (T) -> U): U where U: IComparable<U>;
+  public method Max<U>(selector: (T) -> U): U where U: IComparable<U>;
+  public method Average(selector: (T) -> int): double;
+  public method Average(selector: (T) -> long): double;
+  public method Average(selector: (T) -> uint): double;      // v0.195: completing Sum's coverage
+  public method Average(selector: (T) -> ulong): double;     // v0.195
+  public method Average(selector: (T) -> float): float;      // v0.195
+  public method Average(selector: (T) -> double): double;
+  public method Average(selector: (T) -> decimal): decimal;
+  public method Aggregate<TAccum>(seed: TAccum, fold: (TAccum, T) -> TAccum): TAccum;
 
-  // For non-class T (value types, string, runtime-managed reference types).
-  public static method WhenAll<T>(tasks: Array<Task<T>>): Task<Array<T>>;
+  // Ordering
+  public method OrderBy<TKey>(key: (T) -> TKey): IOrderedEnumerable<T> where TKey: IComparable<TKey>;
+  public method OrderByDescending<TKey>(key: (T) -> TKey): IOrderedEnumerable<T> where TKey: IComparable<TKey>;
+  public method Reverse(): IEnumerable<T>;
 
-  // For class T. Aggregates OwningTask<T> results into an owned array of owned elements.
-  // The caller transfers ownership of the input array (and its tasks) to WhenAllOwned;
-  // the returned task produces an owned OwningArray<T>.
-  public static method WhenAllOwned<T>(
-    owned tasks: OwningArray<OwningTask<T>>
-  ): OwningTask<OwningArray<T>> where T: class;
+  // Set-like
+  public method Distinct(): IEnumerable<T>;
+  public method Union(other: IEnumerable<T>): IEnumerable<T>;
+  public method Intersect(other: IEnumerable<T>): IEnumerable<T>;
+  public method Except(other: IEnumerable<T>): IEnumerable<T>;
 
-  public static method WhenAny(tasks: Array<Task>): Task<int>;   // index of first-done task (v0.162)
-  public static method FireAndForget(owned task: Task);
-end Task;
+  // Slicing
+  public method Take(count: int): IEnumerable<T>;
+  public method TakeWhile(predicate: (T) -> bool): IEnumerable<T>;
+  public method Skip(count: int): IEnumerable<T>;
+  public method SkipWhile(predicate: (T) -> bool): IEnumerable<T>;
 
-Task.FireAndForget(DoTelemetryAsync());      // supervised; exceptions logged
-using var t := DoTelemetryAsync();           // unsupervised; disposed at scope end
+  // Combination
+  public method Concat(other: IEnumerable<T>): IEnumerable<T>;
+  public method Zip<U, R>(other: IEnumerable<U>, combine: (T, U) -> R): IEnumerable<R>;
+
+  // Grouping
+  public method GroupBy<TKey>(key: (T) -> TKey): IEnumerable<IGrouping<TKey, T>>;
+
+  // Materialization (eager)
+  public method ToArray(): owned Array<T>;
+  public method ToDictionary<TKey>(key: (T) -> TKey): owned Dictionary<TKey, T>;
+  public method ToDictionary<TKey, TValue>(key: (T) -> TKey, value: (T) -> TValue): owned Dictionary<TKey, TValue>;
+  public method ToSet(): owned Set<T>;
+end;
+
+public interface IGrouping<TKey, T>: IEnumerable<T>
+  readonly property Key: TKey;
+end IGrouping;
+
+public interface IOrderedEnumerable<T>: IEnumerable<T>
+end IOrderedEnumerable;
+
+public extension IOrderedEnumerable<T>
+  public method ThenBy<TKey>(key: (T) -> TKey): IOrderedEnumerable<T> where TKey: IComparable<TKey>;
+  public method ThenByDescending<TKey>(key: (T) -> TKey): IOrderedEnumerable<T> where TKey: IComparable<TKey>;
+end;

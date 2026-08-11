@@ -1,99 +1,57 @@
-public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T?>
-  // class T
+public class OwningDictionary<K, V>: IDisposable where V: class
+  public constructor();
+  public constructor(capacity: int);
+  public constructor(comparer: IEqualityComparer<K>);
+  public constructor(capacity: int, comparer: IEqualityComparer<K>);
 
-  // Indexer (bounds-checked against span Length as of v0.105).
-  public property [i: int]: T?
-    get => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      return Buffer[Start + i];
-    end;
-    set(owned) => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      Buffer[Start + i] := value;
-    end;
+  public pure readonly property Count: int;
+  public readonly property Keys: IReadOnlyCollection<K>;       // borrowing view
+  public readonly property Values: IReadOnlyCollection<V>;     // borrowing view
+
+  public property [key: K]: V
+    get;                                       // borrow of stored value
+    set(owned);                                // owned-taking; disposes previous
   end;
 
-  // Range query (v0.101).
-  public property IsEmpty: bool => Length = 0;
+  public method Add(key: K, owned value: V);   // ArgumentException if the key is present; the passed
+                                                //   value was consumed at the call site and is disposed
+                                                //   on that path (v0.195) — pre-check ContainsKey when
+                                                //   the caller must keep it
+  public method ContainsKey(key: K): bool;
+  public method Contains(key: K): bool;
+  public method Remove(key: K): bool;          // disposes the removed value
+  public method TryGetValue(key: K, out value: V?): bool;      // out is borrow; v0.171 (#1336)
+  public method GetOrNull(key: K): V?;                         // v0.231 (§1 *OrNull tier): absent -> null;
+                                                               //   present -> a borrow of the stored value, the
+                                                               //   indexer's get posture — ownership stays with
+                                                               //   the dictionary: a look, not a take (the take
+                                                               //   forms remain PopValue/TryPopValue). where V:
+                                                               //   class makes V statically non-nullable at
+                                                               //   every instantiation (spec §7.10), so null
+                                                               //   means absent, unambiguously. The §4.8 ??
+                                                               //   limit (spec §7.7) applies at every
+                                                               //   instantiation here: an owned fallback never
+                                                               //   meets this borrow
+  public method GetOrAdd(key: K, factory: (K) -> owned V): V;  // returns borrow
 
-  // Search (v0.101).
-  public method IndexOf(value: T?): int;          // -1 if not found
-  public method Contains(value: T?): bool;        // IndexOf(value) >= 0
+  // Drain
+  public method PopValue(key: K): owned V;     // raises if not present
+  public method TryPopValue(key: K, out owned value: V?): bool;   // v0.171 (#1336)
+  public method Drain(): IOwningEnumerable<DrainedEntry<K, V>>;
+                                               // iteration drains the dictionary;
+                                               //   each yielded entry owns its Value
 
-  // Equality (v0.101).
-  public method SequenceEqual(other: Span<T>): bool;
-  public method SequenceEqual(other: IReadOnlySpan<T?>): bool; // v0.108 — interface form
+  public method Clear();                        // disposes every value
+end OwningDictionary;
 
-  // Range construction (v0.99 / v0.100).
-  public method Slice(start: int, length: int): Span<T> =>
-    new Span<T>(Buffer, this.Start + start, length);
+public class DrainedEntry<K, V>: IDisposable where V: class
+  public constructor(key: K, owned value: V);  // ownership of value transfers in
+  public readonly property Key: K;             // borrow / value copy of the key
+  public owned Value: V;                        // owned — DrainedEntry is a class,
+                                                //   so it may own its Value field
+end DrainedEntry;
 
-  public method AsReadOnly(): ReadOnlySpan<T> =>
-    new ReadOnlySpan<T>(Buffer, Start, Length);
-
-  // Bulk mutation (v0.101).
-  public method Clear();                          // set every slot to null
-                                                   //   (disposes previous contents)
-  public method MoveFrom(source: Span<T>);        // move slot-by-slot from source;
-                                                   //   source slots become null;
-                                                   //   destination's previous
-                                                   //   contents disposed;
-                                                   //   lengths must match
-  public method MoveTo(destination: Span<T>);     // v0.109 — symmetric with MoveFrom;
-                                                   //   move slot-by-slot to destination;
-                                                   //   source slots become null;
-                                                   //   destination's previous
-                                                   //   contents disposed;
-                                                   //   lengths must match
-  public method Reverse();                         // reverse slot ordering in place
-end Span;
-
-public record Span<T>(Buffer: OwningBuffer<T>, Start: int, Length: int): IReadOnlySpan<T>
-  // value T (primitive, record, enum, non-move-only inline array)
-
-  // Indexer (bounds-checked against span Length as of v0.105).
-  public property [i: int]: T
-    get => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      return Buffer[Start + i];
-    end;
-    set => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      Buffer[Start + i] := value;
-    end;
-  end;
-
-  // Range query.
-  public property IsEmpty: bool => Length = 0;
-
-  // Search.
-  public method IndexOf(value: T): int;
-  public method Contains(value: T): bool;
-
-  // Equality.
-  public method SequenceEqual(other: Span<T>): bool;
-  public method SequenceEqual(other: IReadOnlySpan<T>): bool; // v0.108 — interface form
-
-  // Range construction.
-  public method Slice(start: int, length: int): Span<T> =>
-    new Span<T>(Buffer, this.Start + start, length);
-
-  public method AsReadOnly(): ReadOnlySpan<T> =>
-    new ReadOnlySpan<T>(Buffer, Start, Length);
-
-  // Bulk mutation (value-typed forms).
-  public method Fill(value: T);                   // copy `value` into every slot
-  public method CopyFrom(source: ReadOnlySpan<T>); // copy slot-by-slot from source
-                                                    //   lengths must match
-  public method CopyTo(destination: Span<T>);      // v0.109 — copy slot-by-slot to destination
-                                                    //   lengths must match
-  public method Reverse();
-end Span;
+using var pool: OwningDictionary<string, Connection> := [
+  "primary": Connect("p"),
+  "backup":  Connect("b")
+];

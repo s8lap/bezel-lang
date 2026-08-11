@@ -1,13 +1,14 @@
-public class OwnedCache<T> where T: class
-  private owned _items: OwningArray<T>;
+public abstract class DataSource
+  public abstract method LoadAsync(): Task<string>;
+  public abstract method SaveAsync(data: string): Task;
+end DataSource;
 
-  public constructor() _items := new(); end;
+public class FileSource: DataSource
+  public async override method LoadAsync(): Task<string>
+    return await File.ReadAllTextAsync(_path);
+  end LoadAsync;
 
-  public method Add(owned item: T)
-    _items.Add(owned item);
-  end Add;
-
-  public method Drain(): IOwningEnumerable<T>
-    return _items.Drain();
-  end Drain;
-end OwnedCache;
+  public async override method SaveAsync(data: string): Task
+    await File.WriteAllTextAsync(_path, data);
+  end SaveAsync;
+end FileSource;

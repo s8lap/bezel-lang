@@ -1,5 +1,5 @@
-private _onClicked: (ClickedEvent) -> () := lambda(e) => UpdateStatus(e.X, e.Y);
-// ...
-button.Clicked += _onClicked;
-// later:
-button.Clicked -= _onClicked;          // same reference; matches and unsubscribes
+var processItem := lambda(item: Item) => do
+  var normalized := Normalize(item);
+  var enriched := Enrich(normalized);
+  return enriched;
+end;

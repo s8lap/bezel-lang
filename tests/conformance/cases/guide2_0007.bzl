@@ -1,14 +1,3 @@
-private _lastErrorText: string?;
-
-method Handle()
-  try
-    Risky();
-  catch
-    var ex: Exception => RecordError(ex)
-  end;
-end Handle;
-
-private method RecordError(ex: Exception)
-  _lastErrorText := ex.Message;            // string is fine to keep
-  Log($"{ex.Message}\n{ex.StackTrace.ToString()}");
-end RecordError;
+if pool.TryTakeCached("primary", out using var c) then
+  UseConnection(c);                // owned, and narrowed non-null by `when true`
+end;                               // c disposed at the end of the enclosing block

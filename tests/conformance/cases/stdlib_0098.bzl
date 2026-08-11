@@ -1,15 +1,12 @@
-public abstract class TextReader
-  public abstract method Read(): int;             // next char as int, or -1 at EOF
-  public abstract method ReadLine(): string?;      // null at EOF
-  public method ReadToEnd(): string;
-  destructor;       // releases the underlying resource
-end TextReader;
+/// Compiler-intrinsic; T restricted to cell-sized primitive types.
+public class Atomic<T> where T: value
+  public constructor(initial: T);
 
-public abstract class TextWriter
-  public abstract method Write(value: string);
-  public abstract method Write(value: char);
-  public method WriteLine();
-  public method WriteLine(value: string);
-  public abstract method Flush();
-  destructor;       // flushes and releases the underlying resource
-end TextWriter;
+  public property Value: T
+    get;       // hardware-atomic read
+    set;       // hardware-atomic write
+  end Value;
+
+  public method Exchange(value: T): T;
+  public method CompareExchange(expected: T, replacement: T): T;
+end Atomic;

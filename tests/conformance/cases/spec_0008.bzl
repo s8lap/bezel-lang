@@ -1,2 +1,2 @@
-var name: string := "Alice";        // non-nullable
-var middle: string? := null;        // nullable
+var y: long? := long?(x);             // nullable to nullable; null stays null
+var m: int := int(n);                 // raises NullReferenceException if n is null

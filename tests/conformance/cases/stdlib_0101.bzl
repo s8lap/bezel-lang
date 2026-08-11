@@ -1,17 +1,27 @@
-/// Compiler-intrinsic; aliased by the keyword `int`.
-public record Int32: IComparable<int>, IEquatable<int>
-  public static const MinValue: int := -2_147_483_648;
-  public static const MaxValue: int := 2_147_483_647;
+public interface IEvent<out T>
+  method Subscribe(scoped handler: (T) -> ()): owned Subscription;
+end IEvent;
 
-  public static method Parse(s: string): int;
-  public static method TryParse(s: string, out result: int): bool;
-  public static method Parse(s: string, radix: int): int;        // 2, 8, 10, 16
+public interface IAsyncEvent<out T>
+  method Subscribe(scoped handler: (T) -> Task): owned Subscription;
+end IAsyncEvent;
 
-  public method ToString(): string;
-  public method ToString(format: string): string;
-  public method ToString(radix: int): string;
+public class EventSource<T>: IEvent<T>
+  public constructor();
+  public method Subscribe(scoped handler: (T) -> ()): owned Subscription;
+  public method Raise(payload: T);
 
-  public method CompareTo(other: int): int;
-  // Equals(other: int): bool — auto-generated from IEquatable<int>
-  //   per language spec §9.2; not shown explicitly.
-end Int32;
+  public method Add(scoped handler: (T) -> ());         // scoped (v0.180): Add stores — spec §28.14
+  public method Remove(handler: (T) -> ());              // call-bounded: Remove only compares
+  destructor;    // severs the subscriber list before reclamation (spec §28.14 quiescence)
+end EventSource;
+
+public class AsyncEventSource<T>: IAsyncEvent<T>
+  public constructor();
+  public method Subscribe(scoped handler: (T) -> Task): owned Subscription;
+  public async method RaiseAsync(payload: T): Task;
+
+  public method Add(scoped handler: (T) -> Task);        // scoped (v0.180): Add stores — spec §28.14
+  public method Remove(handler: (T) -> Task);             // call-bounded: Remove only compares
+  destructor;    // severs the subscriber list before reclamation (spec §28.14 quiescence)
+end AsyncEventSource;

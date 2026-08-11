@@ -1,7 +1,3 @@
-record TriBool(Value: int)
-  public method Negate(): TriBool => (case Value of
-    0 => new TriBool(1),
-    1 => new TriBool(0),
-    _ => this
-  );
-end TriBool;
+public property Area: decimal => Width * Height;
+public property IsEmpty: bool => _count = 0;
+public property FullName: string => $"{FirstName} {LastName}";

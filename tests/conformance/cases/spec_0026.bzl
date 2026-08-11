@@ -1,10 +1,11 @@
-enum Priority: IComparable<Priority>
-  Low, Medium, High;
-
-  public method CompareTo(other: Priority): int =>
+record Point(X: int, Y: int): IComparable<Point>
+  public method CompareTo(other: Point): int =>
     (when
-      int(this) < int(other) => -1,
-      int(this) > int(other) => 1,
-      _ => 0
-    );
-end Priority;
+      X <> other.X => (when
+        X < other.X => -1,
+        _ => 1),
+      Y <> other.Y => (when
+        Y < other.Y => -1,
+        _ => 1),
+      _ => 0);
+end Point;

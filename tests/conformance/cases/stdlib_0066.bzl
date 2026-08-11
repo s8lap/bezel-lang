@@ -1,11 +1,8 @@
-public interface IReadOnlySpan<TElement>
-  readonly property Length: int;
-  readonly property IsEmpty: bool;
-  property [i: int]: TElement
-    get;
-  end;
+public interface IOwningAsyncEnumerable<T>: IAsyncDisposable where T: class
+  method GetOwningAsyncEnumerator(token: CancellationToken := CancellationToken.None): owned IOwningAsyncEnumerator<T>;
+end IOwningAsyncEnumerable;
 
-  method IndexOf(value: TElement): int;
-  method Contains(value: TElement): bool;
-  method SequenceEqual(other: IReadOnlySpan<TElement>): bool;
-end IReadOnlySpan;
+public interface IOwningAsyncEnumerator<T>: IAsyncDisposable where T: class
+  method TakeCurrent(): owned T;        // transfers ownership (v0.161)
+  method MoveNextAsync(): Task<bool>;
+end IOwningAsyncEnumerator;

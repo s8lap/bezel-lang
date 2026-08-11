@@ -1,12 +1,5 @@
-public class Outer
-  private class NestedPrivate
-    // ...
-  end NestedPrivate;
-  
-  // ERROR: _x is internal, but NestedPrivate is private — the field's
-  //        type is not as visible as the field.
-  internal _x: NestedPrivate;
+public sealed override method Speak(): string => "Woof!";
 
-  // OK: also private, matches NestedPrivate's visibility.
-  private _y: NestedPrivate;
-end Outer;
+public sealed class Bulldog: Dog
+  // ...
+end Bulldog;

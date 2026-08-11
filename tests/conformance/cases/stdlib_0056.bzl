@@ -1,27 +1,52 @@
-public class OwningBuffer<T>                              // no IEnumerable conformance
-                                                          //   (value-typed; see "Iteration" below)
-  public constructor(length: int);                       // all slots default(T)
-                                                          //   requires T to have a default value
-  public constructor(length: int, init: (int) -> T);     // init returns T (no `owned`)
+public class OwningDictionary<K, V>: IDisposable where V: class
+  public constructor();
+  public constructor(capacity: int);
+  public constructor(comparer: IEqualityComparer<K>);
+  public constructor(capacity: int, comparer: IEqualityComparer<K>);
 
-  public readonly property Length: int;
+  public pure readonly property Count: int;
+  public readonly property Keys: IReadOnlyCollection<K>;       // borrowing view
+  public readonly property Values: IReadOnlyCollection<V>;     // borrowing view
 
-  public property [i: int]: T
-    get;                                                  // borrow of slot (value copy
-                                                          //   for primitives at the use site)
-    set;                                                  // overwrites slot
+  public property [key: K]: V
+    get;                                       // borrow of stored value
+    set(owned);                                // owned-taking; disposes previous
   end;
 
-  // move buf[i] NOT admitted (values have no ownership; use plain read)
+  public method Add(key: K, owned value: V);   // ArgumentException if the key is present; the passed
+                                                //   value was consumed at the call site and is disposed
+                                                //   on that path (v0.195) — pre-check ContainsKey when
+                                                //   the caller must keep it
+  public method ContainsKey(key: K): bool;
+  public method Contains(key: K): bool;
+  public method Remove(key: K): bool;          // disposes the removed value
+  public method TryGetValue(key: K, out value: V?): bool;      // out is borrow; v0.171 (#1336)
+  public method GetOrNull(key: K): V?;                         // v0.231 (§1 *OrNull tier): absent -> null;
+                                                               //   present -> a borrow of the stored value, the
+                                                               //   indexer's get posture — ownership stays with
+                                                               //   the dictionary: a look, not a take (the take
+                                                               //   forms remain PopValue/TryPopValue). where V:
+                                                               //   class makes V statically non-nullable at
+                                                               //   every instantiation (spec §7.10), so null
+                                                               //   means absent, unambiguously. The §4.8 ??
+                                                               //   limit (spec §7.7) applies at every
+                                                               //   instantiation here: an owned fallback never
+                                                               //   meets this borrow
+  public method GetOrAdd(key: K, factory: (K) -> owned V): V;  // returns borrow
 
-  // Span views (v0.109)
-  public method AsSpan(): Span<T>;                          // full buffer, writable
-  public method AsSpan(start: int): Span<T>;                // from offset to end
-  public method AsSpan(start: int, length: int): Span<T>;
-  public method AsSpan(r: Range<int>): Span<T>;             // parallels Range slicing
+  // Drain
+  public method PopValue(key: K): owned V;     // raises if not present
+  public method TryPopValue(key: K, out owned value: V?): bool;   // v0.171 (#1336)
+  public method Drain(): IOwningEnumerable<DrainedEntry<K, V>>;
+                                               // iteration drains the dictionary;
+                                               //   each yielded entry owns its Value
 
-  public method AsReadOnlySpan(): ReadOnlySpan<T>;
-  public method AsReadOnlySpan(start: int): ReadOnlySpan<T>;
-  public method AsReadOnlySpan(start: int, length: int): ReadOnlySpan<T>;
-  public method AsReadOnlySpan(r: Range<int>): ReadOnlySpan<T>;
-end OwningBuffer;
+  public method Clear();                        // disposes every value
+end OwningDictionary;
+
+public class DrainedEntry<K, V>: IDisposable where V: class
+  public constructor(key: K, owned value: V);  // ownership of value transfers in
+  public readonly property Key: K;             // borrow / value copy of the key
+  public owned Value: V;                        // owned — DrainedEntry is a class,
+                                                //   so it may own its Value field
+end DrainedEntry;

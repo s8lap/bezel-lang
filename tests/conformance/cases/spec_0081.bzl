@@ -1,5 +1,2 @@
-nameof(amount)              // "amount"
-nameof(_balance)            // "_balance"
-nameof(BankAccount)         // "BankAccount"
-nameof(BankAccount.Deposit) // "Deposit"
-nameof(System.Console)      // "Console"
+import System.Collections.Linq;
+var evenSquares := (1..20).Where(lambda(x) => x mod 2 = 0).Select(lambda(x) => x * x);

@@ -1,2 +1,4 @@
-var callback: ((int) -> bool)?;       // nullable function returning bool
-var nullableReturn: (int) -> bool?;   // non-null function returning a nullable bool
+extension string
+  public property IsBlank: bool => this.Length = 0 or this.Trim().Length = 0;
+  public method Words(): owned Array<string> => this.Split(' ');
+end;

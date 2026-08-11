@@ -1,1 +1,2 @@
-(if condition then trueValue else falseValue)
+var greeting := $"Hello, {name}!";
+var msg := $"({point.X}, {point.Y}) - area = {point.Area()}";

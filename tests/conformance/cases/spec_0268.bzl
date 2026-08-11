@@ -1,2 +1,3 @@
-/// <exception cref="ArgumentException">Thrown when amount is non-positive.</exception>
-public method Deposit(amount: decimal) ...
+using var r := await LoadResourceAsync("/etc/foo");
+Process(r);
+// r disposed at scope end

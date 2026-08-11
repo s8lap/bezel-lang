@@ -1,4 +1,3 @@
-var u := _user;
-if u <> null then
-  u.DoStuff();          // u is narrowed; safe regardless of _user changes
-end;
+var a: int := 2_000_000_000;
+var b: int := 2_000_000_000;
+var c := a + b;                       // OverflowException

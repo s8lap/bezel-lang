@@ -1,12 +1,8 @@
-public async method LoadResourceAsync(path: string): OwningTask<Resource>
-  using var tcs := new OwningTaskCompletionSource<Resource>();
-
-  StartLoadInBackground(path, lambda(loaded: owned Resource) => do
-    tcs.TrySetResult(loaded);                      // ownership moves into tcs's task
-  end);
-
-  return await tcs.Task;                            // moves ownership out of tcs's task
-                                                    //   and into the outer Pattern B task's
-                                                    //   result slot. tcs is then disposed,
-                                                    //   but its task already has no result.
-end LoadResourceAsync;
+public async method ReadLinesAsync(path: string): owned IAsyncEnumerable<string>
+  // OpenAsync, ReadLineAsync, and AtEnd are illustrative; the example shows
+  // the async-iterator shape, not a stream API in the standard library.
+  await using var fs := await OpenAsync(path);
+  while not fs.AtEnd do
+    yield return await fs.ReadLineAsync();
+  end;
+end ReadLinesAsync;

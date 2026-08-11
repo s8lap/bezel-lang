@@ -1,2 +1,7 @@
-var double := lambda(x: int) => x * 2;
-var greet := lambda(name: string) => $"Hello, {name}!";
+extension IEnumerable<T> where T: IComparable<T>
+  public method Sort(): owned Array<T>
+    var items := this.ToArray();
+    // ...
+    return items;
+  end Sort;
+end;

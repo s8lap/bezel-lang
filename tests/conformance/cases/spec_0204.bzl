@@ -1,6 +1,5 @@
-public method RightOrder(): owned Stream
-  var fresh := DangerousFactory();   // may throw — but no move yet
-  var old := move _resource;          // cannot throw
-  _resource := fresh;                  // cannot throw (assignment, not call)
-  return old;                          // cannot throw
-end RightOrder;
+class BankAccount
+  private owned _transactions: Array<Transaction>;       // non-nullable, owned
+  private owned _cache: TransactionCache?;               // nullable, owned
+  private _owner: Customer;                              // back-reference, not owned
+end BankAccount;

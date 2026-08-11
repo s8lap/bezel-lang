@@ -1,7 +1,11 @@
-using var guard := await mutex.AcquireAsync();
-// critical section; guard disposed at scope end.
+public interface IReadOnlySpan<TElement>
+  readonly property Length: int;
+  readonly property IsEmpty: bool;
+  property [i: int]: TElement
+    get;
+  end;
 
-using var maybe := await mutex.TryAcquireAsync(TimeSpan.FromSeconds(5));
-if maybe <> null then
-  // critical section
-end;
+  method IndexOf(value: TElement): int;
+  method Contains(value: TElement): bool;
+  method SequenceEqual(other: IReadOnlySpan<TElement>): bool;
+end IReadOnlySpan;

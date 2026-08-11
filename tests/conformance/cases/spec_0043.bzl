@@ -1,4 +1,1 @@
-var dog: Dog? := animal as Dog;
-if dog <> null then
-  Console.WriteLine(dog.Name);
-end;
+visibility static (async | pure) (abstract | virtual | override | sealed override) (owned | scoped) readonly member-kind Name ...

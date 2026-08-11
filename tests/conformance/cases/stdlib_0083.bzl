@@ -1,25 +1,27 @@
-public interface IEvent<out T>
-  method Subscribe(handler: (T) -> ()): owned Subscription;
-end IEvent;
+/// Compiler-intrinsic; T restricted to sendable value types and `string`.
+public class FrozenArray<T>: IEnumerable<T>
+  // Construction consumes or copies its source — after either, no writer can exist.
+  public static method From(owned buffer: OwningBuffer<T>): owned FrozenArray<T>;
+      // VALUE-TYPED T ONLY: O(1) — steals the storage; the buffer is consumed
+      //   (the call-site transfer marker `move`; the proposal-0006 owned-vs-copy construction shape).
+      //   No string-element form can exist: OwningBuffer<T> does not admit string (§4.14).
+  public static method From(items: Array<T>): owned FrozenArray<T>;
+      // Copies; the only construction form for T = string.
 
-public interface IAsyncEvent<out T>
-  method Subscribe(handler: (T) -> Task): owned Subscription;
-end IAsyncEvent;
+  public readonly property Length: int;
 
-public class EventSource<T>: IEvent<T>
-  // No public constructor; obtained via event declaration.
-  public method Subscribe(handler: (T) -> ()): owned Subscription;
-  public method Raise(payload: T);
+  public property [i: int]: T
+    get;                       // bounds-checked; IndexOutOfRangeException outside 0..<Length
+  end;
 
-  public method Add(handler: (T) -> ());
-  public method Remove(handler: (T) -> ());
-end EventSource;
+  public method ToArray(): owned Array<T>;   // fresh mutable copy back out
 
-public class AsyncEventSource<T>: IAsyncEvent<T>
-  // No public constructor; obtained via event declaration.
-  public method Subscribe(handler: (T) -> Task): owned Subscription;
-  public async method RaiseAsync(payload: T): Task;
+  destructor;                  // releases the backing storage
+end FrozenArray;
 
-  public method Add(handler: (T) -> Task);
-  public method Remove(handler: (T) -> Task);
-end AsyncEventSource;
+var raw := LoadSamples();                                        // owned OwningBuffer<double>
+using var input := new Shared<FrozenArray<double>>(
+    FrozenArray<double>.From(move raw));                         // O(1) freeze
+using var t1 := Domain.Spawn(Program.ScanLow,  input.Clone());   // Shared<FrozenArray<double>>: sendable
+using var t2 := Domain.Spawn(Program.ScanHigh, input.Clone());
+var answer := await t1 + await t2;                               // zero bytes copied

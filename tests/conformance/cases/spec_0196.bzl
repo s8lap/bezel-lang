@@ -1,4 +1,4 @@
-if _cache <> null then
-  _cache.Dispose();
-end;
-_cache := newCache;
+type Handler<T> := (T, string?) -> bool;
+type Lookup<K, V> := Dictionary<K, Array<V>>;
+type Predicate<T> := (T) -> bool;
+type Reducer<T, TAccum> := (TAccum, T) -> TAccum;

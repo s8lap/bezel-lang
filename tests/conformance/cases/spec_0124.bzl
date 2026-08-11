@@ -1,11 +1,13 @@
-public class Logger
-  public method Log(level: int);
-  public method Log(level: long);
-end Logger;
+if amount > 0 then
+  Balance := Balance + amount;
+end;
 
-var lg := new Logger();
-var n: int := 10;
-
-lg.Log(n);            // n is int: exact match — calls Log(int), not the int→long widening
-lg.Log(42);           // 42 is an int literal: exact match — calls Log(int)
-lg.Log(42L);          // 42L is a long literal: exact match — calls Log(long)
+if score >= 90 then
+  grade := "A";
+elif score >= 80 then
+  grade := "B";
+elif score >= 70 then
+  grade := "C";
+else
+  grade := "F";
+end;

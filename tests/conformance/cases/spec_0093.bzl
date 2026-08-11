@@ -1,2 +1,17 @@
-"Hello, Bezel!"
-"Line 1\nLine 2"      // escapes processed
+public property [i: int]: double => (case i of
+  0 => X,
+  1 => Y,
+  2 => Z,
+  _ => throw new IndexOutOfRangeException());
+
+var name := (if user <> null then user.Name
+             else throw new InvalidOperationException("user is null"));
+
+var config := LoadConfig() ?? throw new InvalidOperationException("no config");
+
+try
+  DoWork();
+catch
+  var ex: TransientException => Retry(ex),
+  var ex: Exception => throw          // bare throw: re-raises the current exception
+end;

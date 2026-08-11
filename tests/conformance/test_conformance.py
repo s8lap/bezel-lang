@@ -69,11 +69,56 @@ class ClassifyWrapTest(unittest.TestCase):
         self.assertEqual(mode, cf.WRAP_LIB)
         self.assertTrue(wrapped.startswith("module Conf;\n\n"))
 
+    # The three TopDecl forms added at the v0.247 corpus regeneration
+    # (spec Appendix A.1: ChoiceDecl | TypeAliasDecl | ExternBlock).
+    def test_choice_declaration_wraps_as_lib(self):
+        code = "public choice Result<T, E>\n  Ok(owned value: T),\n  Error(owned error: E);\nend Result;\n"
+        self.assertEqual(self._mode(code), cf.WRAP_LIB)
+
+    def test_type_alias_wraps_as_lib(self):
+        code = "type IntPredicate := Predicate<int>;\n"
+        self.assertEqual(self._mode(code), cf.WRAP_LIB)
+
+    def test_extern_block_wraps_as_lib(self):
+        code = 'extern "libc"\n  public method puts(s: CString): int;\nend;\n'
+        self.assertEqual(self._mode(code), cf.WRAP_LIB)
+
+    def test_public_extension_wraps_as_lib(self):
+        # §26.1 defaults extensions to internal; the docs spell `public extension`.
+        code = "public extension ReadOnlySpan<byte>\n  public method F(): int => 0;\nend;\n"
+        self.assertEqual(self._mode(code), cf.WRAP_LIB)
+
+    def test_pure_method_wraps_as_lib(self):
+        code = "public static pure method Clamp(x: int): int\n  return x;\nend Clamp;\n"
+        mode, wrapped = cf.classify_wrap(code)
+        self.assertEqual(mode, cf.WRAP_LIB)
+        self.assertTrue(wrapped.startswith("module Conf;\nclass W\n"))
+
     def test_import_wraps_as_stmt(self):
         code = "import Bezel.Collections;\nvar xs := new List<int>();\n"
         mode, wrapped = cf.classify_wrap(code)
         self.assertEqual(mode, cf.WRAP_STMT)
         self.assertIn("method Main()", wrapped)
+
+    def test_import_then_statements_lands_in_main(self):
+        # v0.247 regeneration: the leading import block is hoisted and the
+        # remainder dispatches on its own shape — statements go INSIDE Main
+        # (the old template stranded them at module level).
+        code = "import System.Collections.Linq;\nvar xs := (1..3).ToArray();\n"
+        mode, wrapped = cf.classify_wrap(code)
+        self.assertEqual(mode, cf.WRAP_STMT)
+        self.assertIn("    var xs := (1..3).ToArray();", wrapped)
+        self.assertLess(wrapped.index("import System.Collections.Linq;"),
+                        wrapped.index("class W"))
+
+    def test_import_then_declaration_stays_lib(self):
+        code = "import System.Interop;\npublic record R(Raw: IntPtr);\n"
+        mode, wrapped = cf.classify_wrap(code)
+        self.assertEqual(mode, cf.WRAP_LIB)
+        self.assertLess(wrapped.index("module Conf;"),
+                        wrapped.index("import System.Interop;"))
+        self.assertLess(wrapped.index("import System.Interop;"),
+                        wrapped.index("public record R"))
 
     def test_method_declaration_wraps_as_lib(self):
         code = "public method Foo(x: int) => x + 1;\n"
@@ -113,9 +158,19 @@ class ClassifyWrapTest(unittest.TestCase):
 
 class SplicePreambleTest(unittest.TestCase):
     def test_inserts_after_first_module_line(self):
+        # Blank lines directly after `module` are hopped with the import block
+        # (v0.247 regeneration): the stub still precedes every TopDecl.
         wrapped = "module Conf;\n\nclass W\nend W;\n"
         out = cf.splice_preamble(wrapped, "record Point(X: int);\n")
-        self.assertEqual(out, "module Conf;\nrecord Point(X: int);\n\nclass W\nend W;\n")
+        self.assertEqual(out, "module Conf;\n\nrecord Point(X: int);\nclass W\nend W;\n")
+
+    def test_inserts_after_leading_imports(self):
+        # SourceFile ::= ModuleDecl Import* TopDecl* (spec A.1): the stub must
+        # come after the imports, or they would be ill-placed.
+        wrapped = "module Conf;\nimport System.Interop;\nclass W\nend W;\n"
+        out = cf.splice_preamble(wrapped, "record Point(X: int);\n")
+        self.assertEqual(out, "module Conf;\nimport System.Interop;\n"
+                              "record Point(X: int);\nclass W\nend W;\n")
 
     def test_supplies_missing_trailing_newline(self):
         # awk getline+print line-terminates every preamble line.
@@ -383,8 +438,11 @@ class RunCaseTest(unittest.TestCase):
 
         cf.run_case(case, self.bezelc, self.cases, self.tmp,
                     "record Point(X: int);\n", run=fake)
-        # The preamble stub appears right after `module Conf;`.
-        self.assertIn("module Conf;\nrecord Point(X: int);", captured["src"])
+        # The preamble stub appears after `module Conf;` (and any leading
+        # imports/blank lines), before the first TopDecl.
+        self.assertIn("record Point(X: int);", captured["src"])
+        self.assertLess(captured["src"].index("module Conf;"),
+                        captured["src"].index("record Point(X: int);"))
 
     def test_missing_source_file(self):
         case = {"case_id": "nope", "doc": "", "section": "", "cls": "fragment",

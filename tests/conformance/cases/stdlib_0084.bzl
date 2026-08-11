@@ -1,40 +1,14 @@
-// For non-class T (value types, string, runtime-managed reference types).
-// Instantiating with a class T is a compile error pointing to OwningTaskCompletionSource<T>.
-public class TaskCompletionSource<T>
+public class Counter<K>: IEnumerable<DictionaryEntry<K, int>> where K: hashable
   public constructor();
-  public readonly property Task: Task<T>;
 
-  public method SetResult(result: T);
-  public method SetException(exception: Exception);
-  public method SetCancelled();
+  public method Increment(key: K, delta: int := 1);   // absent key is created at `delta`
+  public method CountOf(key: K): int;                 // 0 when absent — not `pure`: compares
+                                                      //   via K's equality (§22.15's line;
+                                                      //   the same reason Contains is not pure)
+  public method ContainsKey(key: K): bool;            // distinguishes present-at-zero from absent
+  public method Remove(key: K): bool;
+  public method Clear();
 
-  public method TrySetResult(result: T): bool;
-  public method TrySetException(exception: Exception): bool;
-  public method TrySetCancelled(): bool;
-end TaskCompletionSource;
-
-// For class T. Result is transferred via `owned` parameter; produced task is Pattern B.
-public class OwningTaskCompletionSource<T> where T: class
-  public constructor();
-  public readonly property Task: OwningTask<T>;
-
-  public method SetResult(owned result: T);
-  public method SetException(exception: Exception);
-  public method SetCancelled();
-
-  public method TrySetResult(owned result: T): bool;
-  public method TrySetException(exception: Exception): bool;
-  public method TrySetCancelled(): bool;
-end OwningTaskCompletionSource;
-
-// Non-generic form for void-completion tasks
-public class TaskCompletionSource
-  public constructor();
-  public readonly property Task: Task;
-  public method SetResult();
-  public method SetException(exception: Exception);
-  public method SetCancelled();
-  public method TrySetResult(): bool;
-  public method TrySetException(exception: Exception): bool;
-  public method TrySetCancelled(): bool;
-end TaskCompletionSource;
+  public pure readonly property Count: int;           // distinct keys currently stored
+  public pure readonly property Total: int;           // sum of all counts (may be negative)
+end Counter;

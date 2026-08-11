@@ -1,11 +1,14 @@
-public property [i: int]: string => _items[i];        // expression-bodied
+public class Pair
+  public method Apply(x: int, y: long): string => "int,long";
+  public method Apply(x: int, y: int): string  => "int,int";
+end Pair;
 
-public property [row: int, col: int]: double => _grid[row * _width + col];
+var p := new Pair();
+var a: int := 5;
+var b: int := 9;
 
-public property [key: string]: int
-  get => _values[key];
-  set => do
-    if value < 0 then throw new ArgumentException("must be non-negative"); end;
-    _values[key] := value;
-  end;
-end;
+p.Apply(a, b);
+// arg x (int): exact in both — tie.
+// arg y (int): exact in Apply(int,int); requires int→long in Apply(int,long).
+// Apply(int,int) is better-or-equal on x and strictly better on y ⇒ unambiguously better.
+// Resolves to Apply(int, int).

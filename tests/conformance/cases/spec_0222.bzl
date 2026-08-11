@@ -1,4 +1,6 @@
-using var primary := new Shared<Connection>(Connect("db"));   // consumes the owned Connection; count = 1
-using var second  := primary.Clone();                          // count = 2; an independent owned handle
-second.Get().Ping();                                           // borrow of the underlying Connection
-// scope end: second disposed (count 1), then primary disposed (count 0) → Connection disposed
+public method TransferToHelperSafe()
+  var fresh := new Stream();
+  var taken := move _resource;
+  _resource := fresh;                      // restore before the call that may throw
+  TakeOwnership(move taken);               // owned argument (call-site marker, §22.3), no field state at risk
+end TransferToHelperSafe;

@@ -1,12 +1,11 @@
-// General use — resizable
-using var data := new Array<int>();
-data.Add(1); data.Add(2); data.Add(3);
+public interface IReadOnlyCollection<out T>: IEnumerable<T>
+  readonly property Count: int;
+end IReadOnlyCollection;
 
-// Fixed-size discipline — pre-allocate via literal, don't resize
-using var snapshot: Array<int> := [1, 2, 3];
-// snapshot.Count == 3 throughout its lifetime; no Add calls
+public interface IReadOnlyList<out T>: IReadOnlyCollection<T>
+  readonly property [i: int]: T;
+end IReadOnlyList;
 
-// Owning heap array
-using var pool: OwningArray<Connection> := [
-  Connect("a"), Connect("b"), Connect("c")
-];
+public interface IList<T>: IReadOnlyList<T>, ICollection<T>
+  property [i: int]: T;
+end IList;

@@ -1,6 +1,2 @@
-public method Log(message: string, level: string := "INFO", timestamp: bool := true)
-  // ...
-end Log;
-
-Log("System started", timestamp := false);
-Log(level := "ERROR", message := "Failed");
+(if condition then trueValue else falseValue)
+(if c1 then v1 elif c2 then v2 else fallback)

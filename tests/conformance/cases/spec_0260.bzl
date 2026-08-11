@@ -1,12 +1,12 @@
-using var inbox := new Channel<Report>();          // unbounded; this domain receives
-using var worker := Domain.Spawn(ProcessAll, inbox.NewSender());   // sender moves to the new domain
+public async method OpenFilesAsync(paths: IEnumerable<string>): owned IOwningAsyncEnumerable<FileStream>
+  for var path in paths do
+    yield return await OpenAsync(path);    // each yielded FileStream is owned
+  end;
+end OpenFilesAsync;
 
-// in this domain:
-using var first := await inbox.Receive();          // ownership of one Report transfers in
-
-// in the spawned domain (static method):
-public static method ProcessAll(owned tx: ChannelSender<Report>)
-  using var sender := tx;
-  sender.Send(BuildReport(1));                     // ownership of each Report transfers out
-  sender.Send(BuildReport(2));
-end ProcessAll;                                    // sender disposed: last sender closes the channel
+public async method ProcessAllAsync(paths: IEnumerable<string>): Task
+  await for var fs in OpenFilesAsync(paths) do
+    using var f := move fs;                 // discharge owned iteration variable
+    await ProcessOneAsync(f);
+  end;
+end ProcessAllAsync;

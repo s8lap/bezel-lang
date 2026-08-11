@@ -1,5 +1,8 @@
-var balance: decimal;                 // explicit type, no initializer
-var count: int := 0;                  // explicit type with initializer
-var greeting := "Hello";              // type inferred
-const Pi: double := 3.14159;          // const with explicit type
-const MaxUsers := 1000;               // const with inferred type
+var name: string? := null;
+Console.WriteLine($"user={name}");     // prints: user=null
+var x: double? := null;
+Console.WriteLine($"[{x,8:F2}]");      // prints: [    null] — the type-formattability check
+                                       //   applies to double; F2 is not invoked on null;
+                                       //   the alignment pads the text
+x := 3.0;
+Console.WriteLine($"[{x,8:F2}]");      // prints: [    3.00] — present value: ordinary dispatch

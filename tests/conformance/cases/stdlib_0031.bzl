@@ -1,45 +1,18 @@
-public record ReadOnlyStringSpan(Source: string, Start: int, Length: int): IReadOnlySpan<char>
+public class Shared<T>: IDisposable where T: class      // proper class types only;
+                                                         //   runtime-managed T rejected at instantiation
+  public constructor(owned value: T);                    // consumes the value; count = 1
 
-  public property [i: int]: char
-    get => do
-      if i < 0 or i >= Length then
-        throw new IndexOutOfRangeException();
-      end;
-      return Source[Start + i];
-    end;
-  end;
+  public method Clone(): owned Shared<T>;                // count + 1; a new independent handle
+  public method Get(): T;                                // borrow of the underlying value;
+                                                         //   source: this handle (valid while it lives)
+  public method Downgrade(): owned Weak<T>;              // mint a non-owning observer
 
-  public property IsEmpty: bool => Length = 0;
+  // Dispose(): count - 1; the last disposal disposes the underlying value.
+end Shared;
 
-  // Range construction
-  public method Slice(start: int, length: int): ReadOnlyStringSpan =>
-    new ReadOnlyStringSpan(Source, this.Start + start, length);
-
-  // Search by char
-  public method IndexOf(value: char): int;
-  public method Contains(value: char): bool;
-
-  // Search by substring (span and string forms)
-  public method IndexOf(value: ReadOnlyStringSpan): int;
-  public method IndexOf(value: string): int;
-  public method Contains(value: ReadOnlyStringSpan): bool;
-  public method Contains(value: string): bool;
-
-  // Prefix / suffix (span and string forms)
-  public method StartsWith(prefix: ReadOnlyStringSpan): bool;
-  public method StartsWith(prefix: string): bool;
-  public method EndsWith(suffix: ReadOnlyStringSpan): bool;
-  public method EndsWith(suffix: string): bool;
-
-  // Equality (span and string forms)
-  public method SequenceEqual(other: ReadOnlyStringSpan): bool;
-  public method SequenceEqual(other: string): bool;
-  public method SequenceEqual(other: IReadOnlySpan<char>): bool; // v0.108 — interface form
-
-  // Bulk copy (v0.109)
-  public method CopyTo(destination: Span<char>);    // copy chars to destination;
-                                                     //   lengths must match
-
-  // Materialization
-  public method ToString(): string;
-end ReadOnlyStringSpan;
+public class Weak<T>: IDisposable where T: class
+  public method TryUpgrade(): owned Shared<T>?;              // a new strong handle if the value
+                                                              //   is still alive; null otherwise
+                                                              //   (§1 Try shape (b))
+  // Does not keep the underlying value alive. Dispose() releases the observer.
+end Weak;

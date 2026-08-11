@@ -1,13 +1,14 @@
-public class Semaphore
-  public constructor(initialCount: int);
-  public constructor(initialCount: int, maxCount: int);
+public interface IReadOnlySpan<TElement>
+  readonly property Length: int;
+  readonly property IsEmpty: bool;
+  property [i: int]: TElement
+    get;
+  end;
 
-  public method Acquire(): owned SemaphoreToken;
-  public method TryAcquire(timeout: TimeSpan): owned SemaphoreToken?;
-  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwningTask<SemaphoreToken>;
-  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwningTask<SemaphoreToken?>;
-end Semaphore;
+  method IndexOf(value: TElement): int;
+  method Contains(value: TElement): bool;
+  method SequenceEqual(other: IReadOnlySpan<TElement>): bool;
+end IReadOnlySpan;
 
-public class SemaphoreToken
-  destructor;       // releases the held permit
-end SemaphoreToken;
+public method Sum(s: ReadOnlySpan<int>): int;    // fast inner loop — direct dispatch
+public method Sum(s: IReadOnlySpan<int>): int;   // convenient and broad — virtual dispatch

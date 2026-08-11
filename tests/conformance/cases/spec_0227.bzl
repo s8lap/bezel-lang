@@ -1,14 +1,17 @@
-public method Squares(n: int): IEnumerable<int>
-  for var i in 0..<n do
-    yield return i * i;
-  end;
-end Squares;
+public method UseEach()
+  using var pool := new OwningArray<Connection>();
+  pool.Add(Connect("primary"));      // ownership transfers in
+  pool.Add(Connect("secondary"));     // ownership transfers in
 
-public method TakeWhilePositive(numbers: IEnumerable<int>): IEnumerable<int>
-  for var n in numbers do
-    if n <= 0 then
-      yield break;
-    end;
-    yield return n;
+  // Default iteration: each conn is a borrow
+  for var conn in pool do
+    conn.Ping();                      // pool still owns conn afterward
   end;
-end TakeWhilePositive;
+
+  // Drain iteration: each conn is owned
+  for var conn in pool.Drain() do
+    using var c := move conn;         // discharge each owned element
+    c.SendShutdown();
+  end;
+  // pool is now empty; using var on pool disposes the (empty) array
+end UseEach;

@@ -1,8 +1,5 @@
-public class Semaphore
-  public async method AcquireAsync(): OwningTask<SemaphoreToken>;
-end Semaphore;
-
-// Caller:
-using var token := await sem.AcquireAsync();
-DoWork();
-// token disposed at scope end -> semaphore released.
+public async method DownloadAsync(url: string): Task<string>
+  using var client := new HttpClient();
+  using var task := client.GetAsync(url);
+  return await task;
+end DownloadAsync;

@@ -55,10 +55,13 @@ end ISerializable;
 public interface IDeserializable
 end IDeserializable;
 
-public abstract class Shape : ISerializable, IDeserializable
-  polymorphic("circle": Circle, "square": Square);
-end Shape;
-
-public class Circle(radius: double) : Shape
-  public property Radius: double => radius;
-end Circle;
+public class Order(id: int, owned customer: Customer,
+                   owned lines: OwningArray<LineItem>): ISerializable, IDeserializable
+  public owned Customer: Customer := customer;        // owned: an owning edge, serialized inline
+  public owned Lines: OwningArray<LineItem> := lines;
+  public property Id: int => id;
+  // compiler synthesizes Serialize / Deserialize; each owned child recurses
+  // through its own synthesized members. The primary constructor binds every
+  // serialized component (id, customer, lines), matched case-insensitively to
+  // the fields — spec §9.8 constructor selection.
+end Order;

@@ -1,13 +1,20 @@
-public class BankAccount(name: string, initialBalance: decimal): IBankAccount
-  private _name: string := name;
-  private _balance: decimal := initialBalance;
-end BankAccount;
+enum Priority
+  Low, Medium, High;
 
-public class BankAccount(name: string, initialBalance: decimal)
-  private _name: string := name;
-  private _balance: decimal := initialBalance;
+  public method IsUrgent(): bool => this = High;
 
-  public constructor(name: string)
-    this(name, 0m);
-  end constructor;
-end BankAccount;
+  public property Name: string => (case this of
+    Low => "Low",
+    Medium => "Medium",
+    High => "High");
+
+  public static readonly All: Array<Priority> := [Low, Medium, High];
+
+  public static method Parse(text: string): Priority?
+    return (case text of
+      "Low" => Low,
+      "Medium" => Medium,
+      "High" => High,
+      _ => null);
+  end Parse;
+end Priority;

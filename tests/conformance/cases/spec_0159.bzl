@@ -1,25 +1,10 @@
-public record PropertyChangedEvent(Sender: Object, PropertyName: string);
+public class Account
+  private _balance: decimal := 0m;
 
-public interface INotifyPropertyChanged
-  event PropertyChanged: PropertyChangedEvent;
-end INotifyPropertyChanged;
+  public property Balance: decimal
+    pure get => _balance;
+    set => _balance := value;
+  end Balance;
 
-public class Person: INotifyPropertyChanged
-  public event PropertyChanged: PropertyChangedEvent;
-
-  private _name: string := "";
-
-  public property Name: string
-    get => _name;
-    set => do
-      if _name <> value then
-        _name := value;
-        PropertyChanged.Raise(new PropertyChangedEvent(this, nameof(Name)));
-      end;
-    end;
-  end Name;
-end Person;
-
-var p: INotifyPropertyChanged := new Person();
-using var sub := p.PropertyChanged.Subscribe(lambda(e) =>
-  Console.WriteLine($"Changed: {e.PropertyName}"));
+  public pure property IsOverdrawn: bool => _balance < 0m;
+end Account;

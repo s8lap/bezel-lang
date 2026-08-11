@@ -1,2 +1,4 @@
-var q := -7 / 3;                      // -2
-var r := -7 mod 3;                    // -1
+var y: short := short(x);
+var i: int := int(d);             // truncates toward zero
+var c: char := char(n);           // n must be a valid code point
+var f: double := double(m);       // decimal to double

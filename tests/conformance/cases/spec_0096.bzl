@@ -1,6 +1,4 @@
-$"{amount:F2}"           // "1234.50"
-$"{ratio:P1}"            // "85.0%"
-$"{value:X}"             // "FF"
-$"{date:yyyy-MM-dd}"
-$"|{name,20}|"           // right-aligned in 20-character field
-$"{amount,12:F2}"
+_ := DoTelemetryAsync();                 // ERROR: Task is non-trivial-dispose
+Task.FireAndForget(DoTelemetryAsync());  // OK — supervised
+
+using var _ := new FileStream(path, FileMode.Open);     // OK — disposed at scope end

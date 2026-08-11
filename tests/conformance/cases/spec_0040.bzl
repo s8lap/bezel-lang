@@ -1,6 +1,3 @@
-public abstract class Shape
-  public abstract method Area(): decimal;
-  public abstract property Name: string;
-
-  public method Describe(): string => $"A {Name} with area {Area()}";
-end Shape;
+public class ResourceHolder(owned resource: Stream)
+  private owned _resource: Stream := resource;
+end ResourceHolder;

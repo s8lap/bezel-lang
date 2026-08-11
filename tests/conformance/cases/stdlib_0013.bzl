@@ -1,42 +1,19 @@
-public sealed class Type
-  public readonly property Name: string;            // unqualified: "BankAccount"
-  public readonly property FullName: string;        // qualified: "BankingApp.BankAccount"
+public static class BitConverter
+  // float (32-bit) ↔ int bit pattern
+  public static method FloatToInt32Bits(value: float): int;
+  public static method Int32BitsToFloat(value: int): float;
 
-  // Kind predicates. Exactly one of IsClass, IsInterface, IsRecord, IsEnum,
-  // IsPrimitive, IsInlineArray, IsFunctionType is true for any Type.
-  public readonly property IsClass: bool;
-  public readonly property IsInterface: bool;
-  public readonly property IsRecord: bool;
-  public readonly property IsEnum: bool;
-  public readonly property IsPrimitive: bool;       // int, bool, char, float, ...
-  public readonly property IsInlineArray: bool;     // [N]T, [N owned]T?, ...
-  public readonly property IsFunctionType: bool;    // (A, B) -> R
-  public readonly property IsValueType: bool;       // = IsPrimitive or IsEnum
-                                                    //   or IsRecord or IsInlineArray
+  // double (64-bit) ↔ long bit pattern
+  public static method DoubleToInt64Bits(value: double): long;
+  public static method Int64BitsToDouble(value: long): double;
 
-  // Lattice queries.
-  public readonly property BaseType: Type?;         // direct superclass; null for
-                                                    //   Object, interfaces, value
-                                                    //   types, function types
-  public method Implements(iface: Type): bool;      // true if this type conforms to
-                                                    //   the interface `iface`
-  public method IsAssignableFrom(other: Type): bool;// true if a value of type
-                                                    //   `other` is assignable to a
-                                                    //   location of this type
-
-  // Enum metadata. Valid only when IsEnum; on any other Type these raise
-  // InvalidOperationException.
-  public readonly property EnumNames: Array<string>;  // member names, declaration
-                                                      //   order
-  public readonly property EnumValues: Array<long>;   // member values, same order
-                                                      //   (widened to long)
-end Type;
-
-public method DescribeEnum(t: Type)
-  if not t.IsEnum then return; end;
-  var names := t.EnumNames;
-  var values := t.EnumValues;
-  for var i in 0..<names.Length do
-    Console.WriteLine($"{names[i]} = {values[i]}");
-  end;
-end DescribeEnum;
+  // Same-width bit reinterpretation (compiler intrinsic). The single type
+  // argument names the TARGET type; the source type is inferred from `value`.
+  // The source and target must be primitive numeric types of equal bit width.
+  public static method Reinterpret<TTo>(value: TFrom): TTo;
+      // Pseudo-signature — compiler intrinsic: TFrom stands for the argument's
+      //   inferred type, not a declared type parameter (not legal user Bezel as
+      //   displayed). The primitive-numeric gate keeps every admissible
+      //   instantiation value-typed, so the signature sits outside spec §28.3's
+      //   bare-type-parameter rule (v0.195).
+end BitConverter;

@@ -1,7 +1,23 @@
-using var thing: Animal := Acquire();          // owned
-var maybeDog := thing as Dog;                  // borrow; thing still owned
-if maybeDog <> null then
-  // maybeDog is a borrowed Dog reference; thing remains the owner.
-  // To transfer ownership, the standard owned-local rules of §28.3 apply
-  // to `thing`, not to the result of `as`.
-end;
+public class RingBuffer<T>
+  private owned _slots: Array<T>;
+  private _head: int;
+
+  public constructor(capacity: int)
+    _slots := new Array<T>(capacity);
+    _head := 0;
+  end;
+
+  public method Push(item: T) ... end;
+
+  public static method FromCollectionLiteral(elements: ReadOnlySpan<T>): owned RingBuffer<T>
+    var rb := new RingBuffer<T>(elements.Length);
+    for var i in 0..<elements.Length do
+      rb.Push(elements[i]);
+    end;
+    return rb;
+  end FromCollectionLiteral;
+end RingBuffer;
+
+// Usage — identical syntax to built-in collections:
+using var rb: RingBuffer<int> := [1, 2, 3, 4];
+using var empty: RingBuffer<int> := [];

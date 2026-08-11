@@ -1,5 +1,5 @@
-case temperature of
-  var t when t > 30 => Console.WriteLine($"Hot: {t}"),
-  var t when t < 0 => Console.WriteLine($"Freezing: {t}"),
-  var t => Console.WriteLine($"Mild: {t}")
-end;
+3.14                // double
+3.14f               // float
+-1.23e-4            // scientific notation, double
+1.23456789m         // decimal
+1.23e2m             // scientific notation, decimal

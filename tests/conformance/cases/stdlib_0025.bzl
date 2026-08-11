@@ -1,49 +1,63 @@
-public class JsonSerializer: ISerializer, IDisposable
-  public constructor();
-  public constructor(options: JsonOptions);
-  // ISerializer surface (§2.14) implemented for JSON text.
-  public method ToBytes(): owned OwningBuffer<byte>;   // UTF-8 encoded result
-  public method ToString(): string;                   // convenience: UTF-8 → string
-end JsonSerializer;
+// Agent: writes primitive and structural tokens in a concrete format.
+// Implemented by JsonSerializer, BinarySerializer, etc.
+public interface ISerializer
+  method WriteInt(value: long);
+  method WriteUInt(value: ulong);
+  method WriteFloat(value: double);
+  method WriteDecimal(value: decimal);
+  method WriteBool(value: bool);
+  method WriteString(value: string);
+  method WriteChar(value: char);
+  method WriteNull();
+  method BeginObject(fieldCount: int);
+  method WriteFieldName(name: string);
+  method EndObject();
+  method BeginArray(elementCount: int);
+  method EndArray();
+end ISerializer;
 
-public class JsonDeserializer: IDeserializer, IDisposable
-  public constructor(input: ReadOnlySpan<byte>);      // UTF-8 JSON
-  public constructor(input: string);                  // convenience
-  public constructor(input: ReadOnlySpan<byte>, options: JsonOptions);
-  // IDeserializer surface (§2.14) implemented for JSON text.
-end JsonDeserializer;
+// Agent: reads the same tokens back. Mirror of ISerializer.
+public interface IDeserializer
+  method ReadInt(): long;
+  method ReadUInt(): ulong;
+  method ReadFloat(): double;
+  method ReadDecimal(): decimal;
+  method ReadBool(): bool;
+  method ReadString(): string;
+  method ReadChar(): char;
+  method TryReadNull(): bool;            // true and consumes if next is null
+  method BeginObject(): int;             // returns field count if the format
+                                         //   provides one, else -1
+  method ReadFieldName(): string;
+  method SkipValue();                    // consume and discard the current
+                                         //   value (including nested object/
+                                         //   array structure); used by
+                                         //   synthesized Deserialize for
+                                         //   unknown fields. A strict
+                                         //   deserializer raises on the
+                                         //   unknown field before this is
+                                         //   reached; a tolerant one skips.
+  method EndObject();
+  method BeginArray(): int;              // element count, or -1 if unknown
+  method HasMoreElements(): bool;        // for count = -1 streaming formats
+  method EndArray();
+end IDeserializer;
 
-public record JsonOptions(
-  Indented: bool,                 // pretty-print (serializer); ignored on read
-  IndentWidth: int,               // spaces per level when Indented; default 2
-  AllowTrailingCommas: bool,      // deserializer leniency; default false
-  IgnoreUnknownFields: bool,      // deserializer: skip input fields that match
-                                  //   no declared component instead of raising;
-                                  //   default false (strict)
-  MaxDepth: int                   // nesting guard; default 64
-);
+// Capability: this type can write itself to any ISerializer.
+public interface ISerializable
+  method Serialize(s: ISerializer);
+end ISerializable;
 
-public class BinarySerializer: ISerializer, IDisposable
-  public constructor();
-  // ISerializer surface (§2.14) implemented for the compact binary format.
-  public method ToBytes(): owned OwningBuffer<byte>;
-end BinarySerializer;
+// Capability: this type can be reconstructed from any IDeserializer.
+// The reconstruction entry point is a static factory; see the note below
+// on why this is recognized by name rather than declared as an interface
+// method in this version.
+public interface IDeserializable
+end IDeserializable;
 
-public class BinaryDeserializer: IDeserializer, IDisposable
-  public constructor(input: ReadOnlySpan<byte>);                     // strict
-  public constructor(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool);
-  // IDeserializer surface (§2.14) implemented for the compact binary format.
-end BinaryDeserializer;
-
-import System.Serialization;
-
-public method SavePoint(p: Point): owned OwningBuffer<byte>
-  using var s := new JsonSerializer();
-  p.Serialize(s);                       // p implements ISerializable (§2.14)
-  return s.ToBytes();                   // ownership of the buffer transfers out
-end SavePoint;
-
-public method LoadPoint(bytes: ReadOnlySpan<byte>): Point
-  using var d := new JsonDeserializer(bytes);
-  return Point.Deserialize(d);          // recognized static factory (§2.14)
-end LoadPoint;
+public class Node(label: string): ISerializable, IDeserializable
+  public owned Next: Shared<Node>?;  // owned handle to the shared spine (identity
+                                     //   participant); nullable to terminate the chain
+  public owned Back: Weak<Node>?;    // back-edge: a weak observer that may close a cycle
+  public property Label: string => label;
+end Node;

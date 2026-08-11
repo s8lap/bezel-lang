@@ -1,14 +1,13 @@
-public class FileStream: Stream
-  public constructor(path: string, mode: FileMode);
-  public constructor(path: string, mode: FileMode, access: FileAccess);
-  // Stream operations plus file-specific:
-  public readonly property Path: string;
-end FileStream;
+public class Semaphore
+  public constructor(initialCount: int);
+  public constructor(initialCount: int, maxCount: int);
 
-public enum FileMode: byte
-  CreateNew, Create, Open, OpenOrCreate, Truncate, Append;
-end FileMode;
+  public method Acquire(): owned SemaphoreToken;
+  public method TryAcquire(timeout: TimeSpan): owned SemaphoreToken?;
+  public async method AcquireAsync(token: CancellationToken := CancellationToken.None): OwningTask<SemaphoreToken>;
+  public async method TryAcquireAsync(timeout: TimeSpan, token: CancellationToken := CancellationToken.None): OwningTask<SemaphoreToken?>;
+end Semaphore;
 
-public enum FileAccess: byte
-  Read, Write, ReadWrite;
-end FileAccess;
+public class SemaphoreToken
+  destructor;       // releases the held permit
+end SemaphoreToken;

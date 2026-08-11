@@ -1,14 +1,7 @@
-public class Pair
-  public method Apply(x: int, y: long): string => "int,long";
-  public method Apply(x: int, y: int): string  => "int,int";
-end Pair;
+for var i in 1..10 do Console.WriteLine(i); end;
+for var i in 0..<n step 2 do Process(i); end;
+for var t in transactions do Process(t); end;
 
-var p := new Pair();
-var a: int := 5;
-var b: int := 9;
-
-p.Apply(a, b);
-// arg x (int): exact in both — tie.
-// arg y (int): exact in Apply(int,int); requires int→long in Apply(int,long).
-// Apply(int,int) is better-or-equal on x and strictly better on y ⇒ unambiguously better.
-// Resolves to Apply(int, int).
+for var entry in dict do
+  Console.WriteLine($"{entry.Key} -> {entry.Value}");
+end;

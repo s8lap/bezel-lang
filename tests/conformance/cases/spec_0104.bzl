@@ -1,9 +1,2 @@
-var grade := (case score of
-  90..100 => "A",
-  _ => "F"
-);                   // ; ends the assignment
-
-case month of
-  1 => Console.WriteLine("Jan"),
-  _ => Console.WriteLine("Other")
-end;                   // ; ends the statement
+"Hello, Bezel!"
+"Line 1\nLine 2"      // escapes processed

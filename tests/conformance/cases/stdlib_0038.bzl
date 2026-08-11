@@ -1,45 +1,22 @@
-public class OwningArray<T>: IOwningList<T> where T: class
-  public constructor();
-  public constructor(capacity: int);
+// Value-payload pipelines over the combinators (value-like instantiations).
+var port := ParsePort(raw).UnwrapOr(8080);
 
-  public readonly property Count: int;
-  public readonly property Capacity: int;
+var label := ParsePort(raw)
+    .Map(lambda(p) => $"listening on {p}")
+    .UnwrapOr($"bad port: {raw}");
 
-  public property [i: int]: T
-    get;                                     // borrow of slot
-    set(owned);                              // takes owned T; disposes previous value
-  end;
+// Re-code the error at a boundary (MapError):
+public record ConfigError(Key: string, Message: string);
 
-  public method Add(owned item: T);
-  public method AddRange(owned items: OwningArray<T>);   // drains items into self
-  public method Insert(index: int, owned item: T);
-  public method RemoveAt(index: int);                    // disposes the removed element
-  public method Remove(item: T): bool;                   // borrow-taking query;
-                                                          //   disposes the matched element
-  public method Clear();                                  // disposes every element
-  public method Contains(item: T): bool;
-  public method IndexOf(item: T): int;
+public method PortSetting(raw: string): Result<int, ConfigError>
+  return ParsePort(raw).MapError(lambda(m) => new ConfigError("port", m));
+end PortSetting;
 
-  public method Sort(comparer: (T, T) -> int);          // comparer takes borrows
-  public method Reverse();
-
-  // Drain methods — transfer ownership of elements out of the collection
-  public method PopAt(index: int): owned T;             // removes and returns owned
-  public method PopFirst(): owned T;                     // = PopAt(0); raises if empty
-  public method PopLast(): owned T;                      // = PopAt(Count - 1); raises if empty
-  public method TryPopFirst(out owned item: T): bool;
-  public method TryPopLast(out owned item: T): bool;
-  public method Drain(): IOwningEnumerable<T>;             // iteration drains the source
-end OwningArray;
-
-public extension OwningArray<T> where T: class, IComparable<T>
-  public method Sort();
-end;
-
-public method Build(): owned OwningArray<Connection>
-  return [
-    Connect("a"),                          // each Connect returns owned Connection
-    Connect("b"),
-    Connect("c")
-  ];                                       // collection literal targets OwningArray<Connection>
-end Build;
+// Sequence two fallible steps without an intermediate case (AndThen); the
+// ascribed lambda's returns are declared-result positions (spec §35.3):
+public method WellKnownPort(text: string): Result<int, string>
+  return ParsePort(text).AndThen(lambda(n): Result<int, string> => do
+    if n > 1023 then return Error($"not a well-known port: {n}"); end;
+    return Ok(n);
+  end);
+end WellKnownPort;

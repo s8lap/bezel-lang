@@ -1,1 +1,2 @@
-throw new ArgumentException("Amount must be positive.", nameof(amount));
+var port     := int.ParseOrNull(raw) ?? 8080;
+var greeting := config.GetOrNull("greeting") ?? "hello";

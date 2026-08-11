@@ -55,11 +55,11 @@ end ISerializable;
 public interface IDeserializable
 end IDeserializable;
 
-public class Node(label: string) : ISerializable, IDeserializable
-  public owned Next: Node;          // owned forward edge
-  public Parent: Node;              // back-edge: may close a cycle
-  public property Label: string => label;
-  // constructor is self-contained: assigns only its own fields,
-  // reads no back-edge, never lets `this` escape — so it is
-  // cyclic-serialization-eligible
-end Node;
+public class Invoice(number: string, owned seller: Company, owned buyer: Company,
+                     accountManager: Employee): ISerializable, IDeserializable
+  public owned Seller: Company := seller;             // owned: in the owning spanning tree
+  public owned Buyer: Company := buyer;               // owned
+  public AccountManager: Employee := accountManager;  // borrow: a back-edge, e.g. an
+                                                      //   Employee owned by Seller
+  public property Number: string => number;
+end Invoice;

@@ -1,10 +1,4 @@
-public sealed abstract class Shape ... end Shape;
-public sealed class Circle: Shape ... end Circle;
-public sealed class Square: Shape ... end Square;
-public sealed class Triangle: Shape ... end Triangle;
-
-var area := (case shape of
-  var c: Circle => Math.Pi * c.Radius * c.Radius,
-  var s: Square => s.Side * s.Side,
-  var t: Triangle => 0.5 * t.Base * t.Height
-);                       // exhaustive: every leaf covered, no _ needed
+'a'         '\n'      '\t'      '\r'      '\\'      '\''
+'\u0041'              // 4 hex digits, BMP
+'\U0001F600'          // 8 hex digits, full code point range
+'\x41'                // 1–4 hex digits

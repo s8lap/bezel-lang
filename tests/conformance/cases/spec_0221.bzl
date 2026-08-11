@@ -1,7 +1,7 @@
-public async method ProcessAsync(): Task
-  // ConnectAsync and SendAsync are illustrative: the standard library's
-  // System.Net module is deferred to a future revision (std lib §11).
-  await using var connection := await ConnectAsync(url);
-  await connection.SendAsync(data);
-  // connection.DisposeAsync() awaited at scope end
-end ProcessAsync;
+// ERROR: TakeOwnership may throw (method calls are throwable, above) — on that
+//        edge _resource is moved but never reassigned: the WrongOrder shape.
+public method TransferToHelper()
+  var fresh := new Stream();
+  TakeOwnership(move _resource);          // owned argument; helper consumes
+  _resource := fresh;                      // restores the normal edge only
+end TransferToHelper;

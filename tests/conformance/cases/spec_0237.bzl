@@ -1,4 +1,9 @@
-using var task := FetchAsync(url);
-var response := await task;              // borrowed reference, OK
-ProcessResponse(response);
-// At end of scope: task is disposed; response disposed with it.
+do
+  using var __source := source;
+  using var __enumerator := __source.GetOwningEnumerator();
+  while __enumerator.MoveNext() do
+    var x := __enumerator.TakeCurrent();     // x is owned; §28.3 rules apply
+                                              //   on every body-exit edge
+    // body
+  end;
+end;

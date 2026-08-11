@@ -1,4 +1,2 @@
-type Result<T> = (success: bool, value: T?, error: string?);
-type Lookup<K, V> = Dictionary<K, Array<V>>;
-type Predicate<T> = (T) -> bool;
-type Reducer<T, TAccum> = (TAccum, T) -> TAccum;
+var labels := entries.Select(lambda(Entry(k, v)) => $"{k}: {v}");
+var positives := points.Where(lambda(Point(x, _)) => x > 0);

@@ -1,16 +1,7 @@
-// Canonical form: using-var binding
-using var token := await semaphore.AcquireAsync();
-DoCriticalWork();
-// At end of scope: token disposed, releasing the semaphore.
-
-// Plain var binding — x is an owned local subject to standard discharge rules
-var token := await semaphore.AcquireAsync();
-TransferToHelper(token);    // owned local consumed by owned parameter
-
-// Direct ownership transfer to a method call accepting owned
-results.Add(await loadTask);     // results: OwningArray<T>; Add takes owned
-
-// Direct return
-public async method Acquire(): OwningTask<Connection>
-  return await ConnectAsync(url);     // owned T flows to owned T return
-end Acquire;
+public method ReadAndClose(owned reader: StreamReader): owned IEnumerable<string>
+  using var r := move reader;             // ownership moves: parameter → local
+  while not r.AtEnd do
+    yield return r.ReadLine();
+  end;
+  // r disposed by using var when the iterator completes or is disposed early.
+end ReadAndClose;

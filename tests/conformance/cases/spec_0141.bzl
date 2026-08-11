@@ -1,3 +1,4 @@
-public property Area: decimal => Width * Height;
-public property IsEmpty: bool => _count = 0;
-public property FullName: string => $"{FirstName} {LastName}";
+if pool.TryTakeCached("primary", out using var c) then
+  // c is owned Connection? — narrowed non-null here by the `when true` postcondition
+  UseConnection(c);
+end;

@@ -1,4 +1,3 @@
-record Point(X: int, Y: int);
-record Person(Name: string, Age: int);
-
-record Point(X: int, Y: int);
+var name: string? := user?.Name;
+var length: int? := user?.Name?.Length;
+user?.Log("Accessed");

@@ -1,22 +1,55 @@
-public class StringBuilder
+public class JsonSerializer: ISerializer, IDisposable
   public constructor();
-  public constructor(capacity: int);
-  public constructor(initial: string);
+  public constructor(options: JsonOptions);
+  // ISerializer surface (§2.14) implemented for JSON text.
+  public method ToBytes(): owned OwningBuffer<byte>;   // UTF-8 encoded result
+  public method ToString(): string;                   // convenience: UTF-8 → string
+end JsonSerializer;
 
-  public readonly property Length: int;
-  public readonly property Capacity: int;
+public class JsonDeserializer: IDeserializer, IDisposable
+  public constructor(input: ReadOnlySpan<byte>);         // UTF-8 JSON
+  public constructor(input: ReadOnlyArraySpan<byte>);    // v0.165 (#1358): Array-world twin;
+                                                          //   borrowed identically for the deserializer's lifetime
+  public constructor(input: string);                  // convenience
+  public constructor(input: ReadOnlySpan<byte>, options: JsonOptions);
+  public constructor(input: ReadOnlyArraySpan<byte>, options: JsonOptions);  // v0.215: options parity
+  public constructor(input: string, options: JsonOptions);                   //   for every input form
+  // IDeserializer surface (§2.14) implemented for JSON text.
+end JsonDeserializer;
 
-  public method Append(value: string): StringBuilder;
-  public method Append(value: char): StringBuilder;
-  public method Append(value: Object): StringBuilder;
-  public method AppendLine(): StringBuilder;
-  public method AppendLine(value: string): StringBuilder;
-  public method AppendFormat(format: string, args: Array<Object>): StringBuilder;
+public record JsonOptions(
+  Indented: bool,                 // pretty-print (serializer); ignored on read
+  IndentWidth: int,               // spaces per level when Indented; default 2
+  AllowTrailingCommas: bool,      // deserializer leniency; default false
+  IgnoreUnknownFields: bool,      // deserializer: skip input fields that match
+                                  //   no declared component instead of raising;
+                                  //   default false (strict)
+  MaxDepth: int                   // nesting guard; default 64
+);
 
-  public method Insert(index: int, value: string): StringBuilder;
-  public method Remove(startIndex: int, length: int): StringBuilder;
-  public method Replace(oldValue: string, newValue: string): StringBuilder;
-  public method Clear(): StringBuilder;
+public class BinarySerializer: ISerializer, IDisposable
+  public constructor();
+  // ISerializer surface (§2.14) implemented for the compact binary format.
+  public method ToBytes(): owned OwningBuffer<byte>;
+end BinarySerializer;
 
-  public method ToString(): string;
-end StringBuilder;
+public class BinaryDeserializer: IDeserializer, IDisposable
+  public constructor(input: ReadOnlySpan<byte>);         // strict
+  public constructor(input: ReadOnlyArraySpan<byte>);    // v0.165 (#1358): Array-world twin;
+                                                          //   borrowed identically for the deserializer's lifetime
+  public constructor(input: ReadOnlySpan<byte>, ignoreUnknownFields: bool);
+  // IDeserializer surface (§2.14) implemented for the compact binary format.
+end BinaryDeserializer;
+
+import System.Serialization;
+
+public method SavePoint(p: Point): owned OwningBuffer<byte>
+  using var s := new JsonSerializer();
+  p.Serialize(s);                       // p implements ISerializable (§2.14)
+  return s.ToBytes();                   // ownership of the buffer transfers out
+end SavePoint;
+
+public method LoadPoint(bytes: ReadOnlySpan<byte>): Point
+  using var d := new JsonDeserializer(bytes);
+  return Point.Deserialize(d);          // recognized static factory (§2.14)
+end LoadPoint;

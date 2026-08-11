@@ -1,4 +1,10 @@
-public property Name: string;                         // read-write
-public property Id: int private set;                  // read-write with private setter
-public readonly property AccountNumber: string;       // read-only
-public readonly property Pi: double := 3.141592653589793;  // read-only with initializer
+private owned _cache: OwningDictionary<string, Connection>;
+
+public method TryTakeCached(name: string, out owned conn: Connection? when true): bool
+  if not _cache.ContainsKey(name) then
+    conn := null;
+    return false;
+  end;
+  conn := _cache.PopValue(name);    // takes ownership, removes from dictionary
+  return true;
+end TryTakeCached;
